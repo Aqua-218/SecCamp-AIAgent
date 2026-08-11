@@ -122,6 +122,22 @@ def Matches (authority : FileAuthority) (request : FileRequest) : Prop :=
 
 end FileAuthority
 
+/-- Returns whether `authority` permits `request`. -/
+def fileMatches (authority : FileAuthority) (request : FileRequest) : Bool :=
+  decide (authority.repository = request.repository) &&
+    authority.effects request.effect &&
+    pathMatches authority.path request.path
+
+/-- The executable file matching decision exactly represents `Matches`. -/
+theorem fileMatches_iff_matches {authority : FileAuthority} {request : FileRequest} :
+    fileMatches authority request = true ↔ authority.Matches request := by
+  simp only [fileMatches, Bool.and_eq_true, decide_eq_true_eq, pathMatches_iff_matches]
+  constructor
+  · intro executableMatches
+    exact ⟨executableMatches.1.1, executableMatches.1.2, executableMatches.2⟩
+  · intro semanticMatches
+    exact ⟨⟨semanticMatches.1, semanticMatches.2.1⟩, semanticMatches.2.2⟩
+
 /-- Returns whether `child` satisfies the structural file-delegation rule. -/
 def fileBodyBelow (child parent : FileAuthority) : Bool :=
   decide (child.repository = parent.repository) &&

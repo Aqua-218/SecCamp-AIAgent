@@ -12,6 +12,7 @@
 | 文書 | 内容 |
 |---|---|
 | [実装ガイド](authority-core/README.md) | 実装範囲、source map、Rust と Lean の依存関係 |
+| [証明の考え方](authority-core/proof-concepts.md) | 証明付きデータ、集合意味論、健全性・完全性、反射律・推移律、空集合の注意点 |
 | [パスモデル](authority-core/paths.md) | `CanonicalPath`、`PathPattern`、matching、containment と証明 |
 | [Repository identity](authority-core/repository-identities.md) | `RepoId` の責務と exact equality 境界 |
 | [File authority](authority-core/file-authorities.md) | effect 集合、request、delegation 判定と証明 |

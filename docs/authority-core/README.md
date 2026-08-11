@@ -4,7 +4,21 @@
 
 > **対象読者:** Authority core を変更する Rust/Lean 実装者、定理と実装の対応をレビューする人
 
-この文書群は、現在実装されている Authority core のファイル責務を説明する。設計理由そのものは[Capability モデル](../design/capability-model.md)と[検証戦略](../design/verification.md)を正とし、ここでは「その設計をどのファイルがどう実現しているか」に集中する。
+この文書群は、現在実装されている Authority core について「各ファイルが何を担当するか」だけでなく、「何を証明し、それが実運用で何を防ぐか」まで説明する。設計理由そのものは[Capability モデル](../design/capability-model.md)と[検証戦略](../design/verification.md)を正とする。
+
+## まず何が保証されるのか
+
+現在の中心は、file authority の子が親より強くならないことを確認する純粋な判定である。
+
+```text
+同じ repository
+∧ 子の effect ⊆ 親の effect
+∧ 子の path ⊆ 親の path
+```
+
+Lean は、この判定が通った子の request は必ず親にも許可されることと、包含関係を何段つないでも崩れないことを証明する。つまり Lean モデル内では、file authority body の委譲判定が原因で親の設定範囲を越えることはない。
+
+証明に使う集合包含、健全性、完全性、推移律を先に知りたい場合は、[Authority core で使う証明の考え方](proof-concepts.md)を参照する。
 
 ## 実装の全体像
 
@@ -78,6 +92,7 @@ Rust と Lean の境界例は現在、両言語の test に手動で対応させ
 
 ## 関連
 
+- [Authority core で使う証明の考え方](proof-concepts.md)
 - [パスモデル](paths.md)
 - [Repository identity](repository-identities.md)
 - [File authority](file-authorities.md)

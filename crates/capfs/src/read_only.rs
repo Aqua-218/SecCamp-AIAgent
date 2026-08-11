@@ -147,6 +147,13 @@ pub enum ReadOnlyFilesystemError {
     Namespace(NamespaceError),
     /// The imported manifest does not contain its required root object.
     MissingNamespaceRoot,
+    /// The mount authority names a different repository than the imported root.
+    RepositoryMismatch {
+        /// Identity assigned when the backing root was imported.
+        imported: RepoId,
+        /// Identity carried by the mount's presented authority.
+        authority: RepoId,
+    },
 }
 
 impl fmt::Display for ReadOnlyFilesystemError {
@@ -156,6 +163,13 @@ impl fmt::Display for ReadOnlyFilesystemError {
             Self::MissingNamespaceRoot => {
                 formatter.write_str("imported namespace has no repository root object")
             }
+            Self::RepositoryMismatch {
+                imported,
+                authority,
+            } => write!(
+                formatter,
+                "imported repository `{imported}` does not match mount authority repository `{authority}`"
+            ),
         }
     }
 }
@@ -164,7 +178,7 @@ impl Error for ReadOnlyFilesystemError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Namespace(error) => Some(error),
-            Self::MissingNamespaceRoot => None,
+            Self::MissingNamespaceRoot | Self::RepositoryMismatch { .. } => None,
         }
     }
 }
@@ -282,7 +296,13 @@ impl ReadOnlyFilesystem {
         authority: MountAuthority,
         clock: Arc<dyn AuthorizationClock>,
     ) -> Result<Self, ReadOnlyFilesystemError> {
-        let (backing, namespace) = imported.into_parts();
+        if imported.repository() != &authority.repository {
+            return Err(ReadOnlyFilesystemError::RepositoryMismatch {
+                imported: imported.repository().clone(),
+                authority: authority.repository.clone(),
+            });
+        }
+        let (_repository, backing, namespace) = imported.into_parts();
         let root = namespace
             .object_at_path_snapshot(&CanonicalPath::root())?
             .ok_or(ReadOnlyFilesystemError::MissingNamespaceRoot)?;
@@ -813,7 +833,10 @@ mod tests {
     use fuser::OpenFlags;
     use tempfile::{TempDir, tempdir};
 
-    use super::{AdapterError, MountAuthority, MountInstanceId, NodeId, ReadOnlyFilesystem};
+    use super::{
+        AdapterError, MountAuthority, MountInstanceId, NodeId, ReadOnlyFilesystem,
+        ReadOnlyFilesystemError,
+    };
     use crate::{
         backing::{ImportedRepository, PreflightLimits},
         namespace::NamespaceObjectKind,
@@ -837,6 +860,7 @@ mod tests {
         fs::write(directory.path().join("hidden.txt"), b"hidden")
             .expect("hidden test file must be writable");
         let imported = ImportedRepository::open(
+            RepoId::new("workspace"),
             directory.path(),
             PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 4),
         )
@@ -995,5 +1019,39 @@ mod tests {
             filesystem.getattr_entry(NodeId::ROOT, None),
             Err(AdapterError::Internal)
         ));
+    }
+
+    #[test]
+    fn constructor_rejects_a_repository_identity_mismatch() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let imported = ImportedRepository::open(
+            RepoId::new("imported-repository"),
+            directory.path(),
+            PreflightLimits::new(NonZeroUsize::new(4).expect("limit must be non-zero"), 1),
+        )
+        .expect("empty repository must pass preflight");
+        let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+            "issuer",
+        ))));
+        let error = ReadOnlyFilesystem::new(
+            imported,
+            kernel,
+            MountAuthority::new(
+                MountInstanceId::new("mismatched-mount"),
+                SubjectId::new("subject"),
+                authority_core::capability::CapId::new("capability"),
+                RepoId::new("authority-repository"),
+            ),
+            Arc::new(MonotonicTime::from_ticks(0)),
+        )
+        .expect_err("a capability must not be paired with a different backing repository");
+
+        assert_eq!(
+            error,
+            ReadOnlyFilesystemError::RepositoryMismatch {
+                imported: RepoId::new("imported-repository"),
+                authority: RepoId::new("authority-repository"),
+            }
+        );
     }
 }

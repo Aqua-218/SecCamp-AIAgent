@@ -41,6 +41,7 @@ fn mounted_read_only_view_denies_read_after_revoke() {
     fs::write(backing.path().join("hidden.txt"), b"hidden")
         .expect("hidden backing file must be writable");
     let imported = ImportedRepository::open(
+        RepoId::new("workspace"),
         backing.path(),
         PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 2),
     )

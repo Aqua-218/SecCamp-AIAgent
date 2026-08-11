@@ -12,7 +12,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use authority_core::path::{CanonicalPath, InvalidPathSegment};
+use authority_core::{
+    path::{CanonicalPath, InvalidPathSegment},
+    repository::RepoId,
+};
 use rustix::{
     fd::OwnedFd,
     fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, StatxFlags, openat, openat2, statx},
@@ -308,18 +311,20 @@ pub struct ValidatedRepository {
     entries: Vec<RepositoryEntry>,
 }
 
-/// A validated backing root and its atomically initialized namespace registry.
+/// A repository identity, validated backing root, and initialized namespace.
 ///
-/// Keeping both values under one owner prevents an adapter from accidentally
-/// pairing a manifest-derived registry with a different backing directory fd.
+/// Keeping all three values under one owner prevents an adapter from pairing a
+/// capability for one repository with another backing fd or manifest-derived
+/// registry.
 #[derive(Debug)]
 pub struct ImportedRepository {
+    repository: RepoId,
     backing: ValidatedRepository,
     namespace: NamespaceRegistry,
 }
 
 impl ImportedRepository {
-    /// Validates a link-free backing tree and imports its complete manifest.
+    /// Binds an identity, validates a link-free tree, and imports its manifest.
     ///
     /// Object identities are assigned in deterministic manifest order and are
     /// never derived from paths, so later rename operations do not change them.
@@ -330,26 +335,40 @@ impl ImportedRepository {
     /// Returns [`RepositoryStartupError`] when preflight rejects the backing
     /// tree or the complete manifest cannot initialize one namespace registry.
     pub fn open(
+        repository: RepoId,
         root: impl AsRef<Path>,
         limits: PreflightLimits,
     ) -> Result<Self, RepositoryStartupError> {
-        Self::from_validated(ValidatedRepository::open(root, limits)?)
+        Self::from_validated(repository, ValidatedRepository::open(root, limits)?)
     }
 
-    /// Atomically imports a repository that already passed preflight.
+    /// Atomically binds and imports a repository that already passed preflight.
     ///
     /// # Errors
     ///
     /// Returns [`RepositoryStartupError::Namespace`] if the validated manifest
     /// cannot initialize a complete namespace registry.
-    pub fn from_validated(backing: ValidatedRepository) -> Result<Self, RepositoryStartupError> {
+    pub fn from_validated(
+        repository: RepoId,
+        backing: ValidatedRepository,
+    ) -> Result<Self, RepositoryStartupError> {
         let namespace = NamespaceRegistry::from_manifest(
             backing
                 .entries()
                 .iter()
                 .map(|entry| (entry.path().clone(), entry.kind())),
         )?;
-        Ok(Self { backing, namespace })
+        Ok(Self {
+            repository,
+            backing,
+            namespace,
+        })
+    }
+
+    /// Returns the host-assigned identity bound to this backing root.
+    #[must_use]
+    pub const fn repository(&self) -> &RepoId {
+        &self.repository
     }
 
     /// Returns the validated backing root and its owned directory fd.
@@ -364,10 +383,10 @@ impl ImportedRepository {
         &self.namespace
     }
 
-    /// Separates the backing root and namespace for transfer into an adapter.
+    /// Separates the identity, backing root, and namespace for an adapter.
     #[must_use]
-    pub fn into_parts(self) -> (ValidatedRepository, NamespaceRegistry) {
-        (self.backing, self.namespace)
+    pub fn into_parts(self) -> (RepoId, ValidatedRepository, NamespaceRegistry) {
+        (self.repository, self.backing, self.namespace)
     }
 }
 

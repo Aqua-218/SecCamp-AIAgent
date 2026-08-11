@@ -329,6 +329,7 @@ mod tests {
         namespace::NamespaceObjectKind,
     };
     use authority_core::path::CanonicalPath;
+    use authority_core::repository::RepoId;
 
     fn limits() -> PreflightLimits {
         PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 4)
@@ -339,9 +340,10 @@ mod tests {
         let directory = tempdir().expect("temporary repository must be creatable");
         fs::write(directory.path().join("notes.txt"), b"capability")
             .expect("test file must be writable");
-        let imported = ImportedRepository::open(directory.path(), limits())
-            .expect("link-free repository must validate");
-        let (backing, namespace) = imported.into_parts();
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
         let path = CanonicalPath::new(["notes.txt"]).expect("test path must be canonical");
         let object = namespace
             .object_at_path_snapshot(&path)
@@ -368,9 +370,10 @@ mod tests {
         let directory = tempdir().expect("temporary repository must be creatable");
         let file_path = directory.path().join("notes.txt");
         fs::write(&file_path, b"safe").expect("test file must be writable");
-        let imported = ImportedRepository::open(directory.path(), limits())
-            .expect("initial regular file must validate");
-        let (backing, namespace) = imported.into_parts();
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial regular file must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
         let path = CanonicalPath::new(["notes.txt"]).expect("test path must be canonical");
         let object = namespace
             .object_at_path_snapshot(&path)
@@ -391,9 +394,10 @@ mod tests {
         let directory = tempdir().expect("temporary repository must be creatable");
         let file_path = directory.path().join("notes.txt");
         fs::write(&file_path, b"safe").expect("test file must be writable");
-        let imported = ImportedRepository::open(directory.path(), limits())
-            .expect("initial regular file must validate");
-        let (backing, namespace) = imported.into_parts();
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial regular file must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
         let path = CanonicalPath::new(["notes.txt"]).expect("test path must be canonical");
         let object = namespace
             .object_at_path_snapshot(&path)

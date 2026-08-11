@@ -10,7 +10,7 @@ use std::{
     os::unix::{ffi::OsStringExt, fs::symlink, net::UnixListener},
 };
 
-use authority_core::path::CanonicalPath;
+use authority_core::{path::CanonicalPath, repository::RepoId};
 use capfs::{
     backing::{
         ImportedRepository, PreflightLimits, RejectedObjectKind, RepositoryPreflightError,
@@ -108,7 +108,8 @@ fn startup_imports_the_complete_manifest_with_registry_assigned_ids() {
     write_file(repository.path().join("README.md"), b"readme");
     write_file(repository.path().join("src/lib.rs"), b"pub fn run() {}");
 
-    let imported = ImportedRepository::open(repository.path(), limits(8, 3))
+    let repository_id = RepoId::new("workspace");
+    let imported = ImportedRepository::open(repository_id.clone(), repository.path(), limits(8, 3))
         .expect("link-free tree should import atomically");
     let expected = [
         (CanonicalPath::root(), NamespaceObjectKind::Directory),
@@ -135,6 +136,7 @@ fn startup_imports_the_complete_manifest_with_registry_assigned_ids() {
         assert_eq!(object.kind(), *kind);
     }
     assert_eq!(imported.backing().canonical_root(), repository.path());
+    assert_eq!(imported.repository(), &repository_id);
     assert_eq!(
         FileType::from_raw_mode(
             fstat(imported.backing().as_fd())
@@ -154,7 +156,7 @@ fn startup_propagates_preflight_failure_before_namespace_publication() {
         .expect("entry symlink should be creatable");
 
     assert!(matches!(
-        ImportedRepository::open(repository.path(), limits(4, 1)),
+        ImportedRepository::open(RepoId::new("workspace"), repository.path(), limits(4, 1)),
         Err(RepositoryStartupError::Preflight(
             RepositoryPreflightError::UnsupportedObject {
                 kind: RejectedObjectKind::Symlink,

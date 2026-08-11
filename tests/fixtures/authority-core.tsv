@@ -1,0 +1,105 @@
+# authority-corpus-v1
+#
+# This corpus is consumed by both the Rust and Lean authority runners.
+# Fields are tab-separated. Paths use `|` between segments, `-` for the
+# repository root, and `\0` for a NUL character inside a segment. Effects use
+# `|` between snake_case names and `-` for the empty set.
+#
+# Schemas after the common `kind, name, expected` fields:
+# path_valid: path
+# path_matches: pattern_kind, pattern_path, request_path
+# path_below: child_kind, child_path, parent_kind, parent_path
+# time_valid: not_before, expires_at
+# time_matches: not_before, expires_at, request_time
+# time_below: child_start, child_end, parent_start, parent_end
+# file_matches: authority_repo, effects, pattern_kind, pattern_path,
+#               request_repo, request_effect, request_path
+# file_below: child_repo, child_effects, child_kind, child_path,
+#             parent_repo, parent_effects, parent_kind, parent_path
+# capability_matches: not_before, expires_at, authority_repo, effects,
+#                     pattern_kind, pattern_path, request_time, request_repo,
+#                     request_effect, request_path
+# weaker_than: child_start, child_end, child_repo, child_effects, child_kind,
+#              child_path, parent_start, parent_end, parent_repo,
+#              parent_effects, parent_kind, parent_path
+
+path_valid	path-root-is-valid	true	-
+path_valid	path-nested-is-valid	true	src|parser|lexer.rs
+path_valid	path-unicode-is-valid	true	資料|設計.md
+path_valid	path-empty-segment-is-rejected	false	src||output
+path_valid	path-current-directory-is-rejected	false	src|.|output
+path_valid	path-parent-directory-is-rejected	false	src|..|output
+path_valid	path-separator-is-rejected	false	src|parser/lexer.rs|output
+path_valid	path-nul-is-rejected	false	src|secret\0name|output
+path_valid	path-wildcard-is-rejected	false	src|*.rs|output
+
+path_matches	exact-path-matches-itself	true	exact	src|main.rs	src|main.rs
+path_matches	exact-path-rejects-sibling	false	exact	src|main.rs	src|lib.rs
+path_matches	prefix-matches-itself	true	prefix	src	src
+path_matches	prefix-matches-descendant	true	prefix	src	src|parser|lexer.rs
+path_matches	prefix-rejects-sibling	false	prefix	src	docs|design.md
+path_matches	root-prefix-matches-descendant	true	prefix	-	src|main.rs
+path_matches	prefix-respects-segment-boundary	false	prefix	src	src-old|main.rs
+
+path_below	exact-below-equal-exact	true	exact	src|main.rs	exact	src|main.rs
+path_below	exact-not-below-different-exact	false	exact	src|main.rs	exact	src|lib.rs
+path_below	exact-below-containing-prefix	true	exact	src|parser|lexer.rs	prefix	src|parser
+path_below	exact-not-below-sibling-prefix	false	exact	src|main.rs	prefix	docs
+path_below	narrow-prefix-below-broad-prefix	true	prefix	src|parser	prefix	src
+path_below	broad-prefix-not-below-narrow-prefix	false	prefix	src	prefix	src|parser
+path_below	prefix-not-below-sibling-prefix	false	prefix	src	prefix	docs
+path_below	prefix-not-below-exact	false	prefix	src	exact	src
+path_below	exact-below-root-prefix	true	exact	src|main.rs	prefix	-
+path_below	root-exact-not-below-source-prefix	false	exact	-	prefix	src
+path_below	root-prefix-below-itself	true	prefix	-	prefix	-
+path_below	root-prefix-not-below-root-exact	false	prefix	-	exact	-
+
+time_valid	nonempty-time-window-is-valid	true	10	11
+time_valid	empty-time-window-is-rejected	false	10	10
+time_valid	reversed-time-window-is-rejected	false	11	10
+time_valid	maximum-u64-end-is-valid	true	0	18446744073709551615
+
+time_matches	time-window-rejects-before-start	false	10	20	9
+time_matches	time-window-includes-lower-bound	true	10	20	10
+time_matches	time-window-includes-last-tick	true	10	20	19
+time_matches	time-window-excludes-upper-bound	false	10	20	20
+time_matches	time-window-handles-maximum-u64-bound	true	18446744073709551614	18446744073709551615	18446744073709551614
+
+time_below	time-window-below-itself	true	10	30	10	30
+time_below	narrow-time-window-below-parent	true	15	20	10	30
+time_below	shared-start-window-below-parent	true	10	20	10	30
+time_below	shared-end-window-below-parent	true	20	30	10	30
+time_below	early-child-window-is-rejected	false	9	20	10	30
+time_below	late-child-window-is-rejected	false	20	31	10	30
+time_below	disjoint-child-window-is-rejected	false	40	50	10	30
+
+file_matches	file-read-descendant-is-allowed	true	workspace	read_data|write_data	prefix	src	workspace	read_data	src|main.rs
+file_matches	file-write-prefix-root-is-allowed	true	workspace	read_data|write_data	prefix	src	workspace	write_data	src
+file_matches	file-extra-effect-is-rejected	false	workspace	read_data|write_data	prefix	src	workspace	rename	src|main.rs
+file_matches	file-other-repository-is-rejected	false	workspace	read_data	prefix	src	other	read_data	src|main.rs
+file_matches	file-outside-path-is-rejected	false	workspace	read_data	prefix	src	workspace	read_data	docs|design.md
+file_matches	file-duplicate-effects-remain-a-set	true	workspace	read_data|write_data|read_data	prefix	src	workspace	write_data	src|main.rs
+
+file_below	file-authority-below-itself	true	workspace	read_data|write_data	prefix	src	workspace	read_data|write_data	prefix	src
+file_below	narrow-file-authority-is-below-parent	true	workspace	read_data	exact	src|main.rs	workspace	read_data|write_data	prefix	src
+file_below	file-effect-escalation-is-rejected	false	workspace	read_data|rename	exact	src|main.rs	workspace	read_data|write_data	prefix	src
+file_below	file-repository-change-is-rejected	false	other	read_data	exact	src|main.rs	workspace	read_data|write_data	prefix	src
+file_below	file-path-expansion-is-rejected	false	workspace	read_data	prefix	-	workspace	read_data|write_data	prefix	src
+file_below	empty-file-effects-remain-structurally-below	true	workspace	-	exact	src|main.rs	workspace	read_data	prefix	src
+file_below	empty-file-effects-do-not-bypass-path-check	false	workspace	-	prefix	-	workspace	read_data	prefix	src
+
+capability_matches	capability-allows-valid-read-at-lower-bound	true	10	20	workspace	read_data	prefix	src	10	workspace	read_data	src|main.rs
+capability_matches	capability-rejects-read-at-expiry	false	10	20	workspace	read_data	prefix	src	20	workspace	read_data	src|main.rs
+capability_matches	capability-rejects-extra-effect	false	10	20	workspace	read_data	prefix	src	15	workspace	write_data	src|main.rs
+capability_matches	capability-rejects-other-repository	false	10	20	workspace	read_data	prefix	src	15	other	read_data	src|main.rs
+capability_matches	capability-rejects-outside-path	false	10	20	workspace	read_data	prefix	src	15	workspace	read_data	docs|design.md
+
+weaker_than	capability-is-below-itself	true	10	30	workspace	read_data|write_data	prefix	src	10	30	workspace	read_data|write_data	prefix	src
+weaker_than	narrow-capability-is-below-parent	true	15	20	workspace	read_data	exact	src|main.rs	10	30	workspace	read_data|write_data	prefix	src
+weaker_than	early-capability-is-rejected	false	9	20	workspace	read_data	exact	src|main.rs	10	30	workspace	read_data|write_data	prefix	src
+weaker_than	late-capability-is-rejected	false	15	31	workspace	read_data	exact	src|main.rs	10	30	workspace	read_data|write_data	prefix	src
+weaker_than	capability-effect-escalation-is-rejected	false	15	20	workspace	read_data|rename	exact	src|main.rs	10	30	workspace	read_data|write_data	prefix	src
+weaker_than	capability-repository-change-is-rejected	false	15	20	other	read_data	exact	src|main.rs	10	30	workspace	read_data|write_data	prefix	src
+weaker_than	capability-path-expansion-is-rejected	false	15	20	workspace	read_data	prefix	-	10	30	workspace	read_data|write_data	prefix	src
+weaker_than	transitive-leaf-capability-is-below-root	true	16	18	workspace	read_data	exact	src|parser|lexer.rs	10	30	workspace	read_data|write_data|rename	prefix	src
+weaker_than	empty-capability-does-not-bypass-structure	false	15	20	workspace	-	prefix	-	10	30	workspace	read_data	prefix	src

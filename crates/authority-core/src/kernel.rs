@@ -91,6 +91,40 @@ impl<E: Error + 'static> Error for EffectCommitError<E> {
     }
 }
 
+/// A failed inspection of active capability authority.
+///
+/// Inspection does not represent an external effect and therefore does not
+/// append an audit attempt. Callers must still use [`CapabilityKernel::authorize_and_commit`]
+/// before reading or mutating protected data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityInspectionError<E> {
+    /// The capability-state lock cannot be trusted after a writer panic.
+    LockPoisoned,
+    /// The supplied capability is not active and held by the caller.
+    NotActive,
+    /// The inspection callback rejected the capability authority.
+    Inspection(E),
+}
+
+impl<E: fmt::Display> fmt::Display for CapabilityInspectionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LockPoisoned => formatter.write_str("capability kernel state lock is poisoned"),
+            Self::NotActive => formatter.write_str("capability is not active for this subject"),
+            Self::Inspection(error) => write!(formatter, "capability inspection failed: {error}"),
+        }
+    }
+}
+
+impl<E: Error + 'static> Error for CapabilityInspectionError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Inspection(error) => Some(error),
+            Self::LockPoisoned | Self::NotActive => None,
+        }
+    }
+}
+
 /// Serializes capability transitions with effect authorization and commit.
 ///
 /// Effect attempts hold shared access from their final authorization check
@@ -299,6 +333,42 @@ impl CapabilityKernel {
     /// panicked while appending an attempt.
     pub fn effect_records(&self) -> Result<Vec<EffectRecord>, AuditError> {
         self.audit.effects()
+    }
+
+    /// Inspects authority metadata while the capability remains active.
+    ///
+    /// The callback runs while a shared state guard is held. Revocation and
+    /// subject shutdown wait for it to return, so a successful inspection is
+    /// linearized before every later exclusive transition. The callback must
+    /// not re-enter this kernel.
+    ///
+    /// This method is for policy-derived metadata decisions only. It does not
+    /// record an effect attempt; protected external effects must pass through
+    /// [`Self::authorize_and_commit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityInspectionError::LockPoisoned`] if capability state
+    /// cannot be trusted, [`CapabilityInspectionError::NotActive`] without
+    /// invoking the callback when the capability is inactive or not held by
+    /// the caller, or [`CapabilityInspectionError::Inspection`] when the
+    /// callback rejects the authority.
+    pub fn with_active_capability<T, E>(
+        &self,
+        caller: &SubjectId,
+        capability_id: &CapId,
+        now: MonotonicTime,
+        inspect: impl FnOnce(&Capability) -> Result<T, E>,
+    ) -> Result<T, CapabilityInspectionError<E>> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| CapabilityInspectionError::LockPoisoned)?;
+        let capability = state
+            .active_capability(caller, capability_id, now)
+            .ok_or(CapabilityInspectionError::NotActive)?;
+
+        inspect(capability).map_err(CapabilityInspectionError::Inspection)
     }
 
     /// Reauthorizes an effect and executes it through its linearization point.

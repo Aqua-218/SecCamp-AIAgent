@@ -709,6 +709,29 @@ impl CapabilityState {
         true
     }
 
+    /// Returns a capability only while it is active and held by `caller`.
+    ///
+    /// This is the common identity, lifecycle, possession, validity, and
+    /// ancestor-revocation check used before inspecting authority metadata or
+    /// matching a concrete effect request.
+    #[must_use]
+    pub fn active_capability(
+        &self,
+        caller: &SubjectId,
+        capability_id: &CapId,
+        now: MonotonicTime,
+    ) -> Option<&Capability> {
+        if self.subject_status(caller) != Some(SubjectStatus::Running) {
+            return None;
+        }
+        let capability = self.capabilities.get(capability_id)?;
+
+        (capability.metadata().subject() == caller
+            && self.is_held_by(caller, capability_id)
+            && self.is_effectively_active(capability_id, now))
+        .then_some(capability)
+    }
+
     /// Returns whether one held capability authorizes a request for `caller`.
     ///
     /// Unknown, copied, expired, or transitively revoked capability IDs all
@@ -721,17 +744,8 @@ impl CapabilityState {
         capability_id: &CapId,
         request: &CapabilityRequest,
     ) -> bool {
-        if self.subject_status(caller) != Some(SubjectStatus::Running) {
-            return false;
-        }
-        let Some(capability) = self.capabilities.get(capability_id) else {
-            return false;
-        };
-
-        capability.metadata().subject() == caller
-            && self.is_held_by(caller, capability_id)
-            && self.is_effectively_active(capability_id, request.time())
-            && capability_matches(capability, request)
+        self.active_capability(caller, capability_id, request.time())
+            .is_some_and(|capability| capability_matches(capability, request))
     }
 
     fn validate_envelope(&self, grant: &CapabilityGrant) -> Result<(), CapabilityStateError> {

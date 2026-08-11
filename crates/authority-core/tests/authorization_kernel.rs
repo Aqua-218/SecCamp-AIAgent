@@ -5,14 +5,24 @@
 //! transition error propagation, ancestor revocation, and pre-commit failures.
 //! Related concurrency model: `authorization_kernel_loom.rs`.
 
-use std::{cell::Cell, convert::Infallible, error::Error, fmt};
+use std::{
+    cell::Cell,
+    convert::Infallible,
+    error::Error,
+    fmt,
+    sync::{Arc, Barrier, mpsc},
+    thread,
+    time::Duration,
+};
 
 use authority_core::{
     audit::AttemptOutcome,
     capability::{AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId},
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
     handle::{HandleId, ObjectId, OpenHandle},
-    kernel::{CapabilityKernel, CapabilityKernelError, EffectCommitError},
+    kernel::{
+        CapabilityInspectionError, CapabilityKernel, CapabilityKernelError, EffectCommitError,
+    },
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     state::{
@@ -184,6 +194,112 @@ fn kernel_derives_and_commits_with_the_exact_authorizing_capability() {
         .expect("the child must authorize a read inside its scope");
 
     assert_eq!(committed_id, child_id);
+}
+
+// Requirement: metadata policy may inspect only an active capability held by
+// the transport-authenticated caller. Category: authorization/security. Risk: critical.
+#[test]
+fn active_capability_inspection_preserves_subject_and_lifecycle_binding() {
+    let (kernel, root_id) = kernel_with_root();
+
+    let inspected_id = kernel
+        .with_active_capability(&root_subject_id(), &root_id, time(30), |capability| {
+            Ok::<_, Infallible>(capability.metadata().id().clone())
+        })
+        .expect("the owner must inspect its active capability");
+    assert_eq!(inspected_id, root_id);
+    assert_eq!(
+        kernel.with_active_capability(&child_subject_id(), &root_id, time(30), |_| Ok::<
+            _,
+            Infallible,
+        >(()),),
+        Err(CapabilityInspectionError::NotActive)
+    );
+
+    kernel
+        .revoke(&root_id)
+        .expect("the active root capability must be revocable");
+    assert_eq!(
+        kernel.with_active_capability(&root_subject_id(), &root_id, time(30), |_| Ok::<
+            _,
+            Infallible,
+        >(()),),
+        Err(CapabilityInspectionError::NotActive)
+    );
+    assert!(
+        kernel
+            .attempt_records()
+            .expect("audit records must remain readable")
+            .is_empty(),
+        "metadata inspection must not fabricate an external effect attempt"
+    );
+}
+
+// Requirement: revoke cannot complete while an earlier authority inspection
+// still relies on the capability. Category: concurrency/security. Risk: critical.
+#[test]
+fn revoke_waits_for_active_capability_inspection() {
+    let (kernel, root_id) = kernel_with_root();
+    let kernel = Arc::new(kernel);
+    let inspection_started = Arc::new(Barrier::new(2));
+    let release_inspection = Arc::new(Barrier::new(2));
+    let (revoke_started_tx, revoke_started_rx) = mpsc::channel();
+    let (revoke_finished_tx, revoke_finished_rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        let inspecting_kernel = Arc::clone(&kernel);
+        let inspecting_id = root_id.clone();
+        let inspecting_started = Arc::clone(&inspection_started);
+        let inspecting_release = Arc::clone(&release_inspection);
+        let inspection = scope.spawn(move || {
+            inspecting_kernel.with_active_capability(
+                &root_subject_id(),
+                &inspecting_id,
+                time(30),
+                |_| {
+                    inspecting_started.wait();
+                    inspecting_release.wait();
+                    Ok::<_, Infallible>(())
+                },
+            )
+        });
+
+        inspection_started.wait();
+        let revoking_kernel = Arc::clone(&kernel);
+        let revoking_id = root_id.clone();
+        let revoke = scope.spawn(move || {
+            revoke_started_tx
+                .send(())
+                .expect("the test observer must remain connected");
+            let result = revoking_kernel.revoke(&revoking_id);
+            revoke_finished_tx
+                .send(())
+                .expect("the test observer must remain connected");
+            result
+        });
+
+        revoke_started_rx
+            .recv()
+            .expect("the revoke thread must begin");
+        assert_eq!(
+            revoke_finished_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "revoke must wait for the shared inspection guard"
+        );
+        release_inspection.wait();
+
+        assert_eq!(
+            inspection.join().expect("inspection thread must not panic"),
+            Ok(())
+        );
+        assert_eq!(
+            revoke.join().expect("revoke thread must not panic"),
+            Ok(RevocationStatus::NewlyRevoked)
+        );
+        revoke_finished_rx
+            .recv()
+            .expect("revoke must finish after inspection releases its guard");
+    });
 }
 
 // Requirement: a failed final check must not invoke the effect executor.

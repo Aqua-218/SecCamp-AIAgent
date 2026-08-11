@@ -78,7 +78,7 @@ flowchart LR
 
 `ObjectId`はmanifestのpath順にregistryが割り当て、path文字列そのものからは作らない。このためrename後も同じobject identityを使える。初期registry全体がgeneration 0であり、entryごとに途中のgenerationを外から観測することはできない。
 
-`ImportedRepository`がbacking rootとregistryを同時に所有するため、adapterはこの2つを別々のrepositoryから取り違えにくい。必要な段階では`into_parts`で分離できるが、それまでは対応関係を1つの値として保つ。
+`ImportedRepository::open`はhostが割り当てた`RepoId`も受け取る。`ImportedRepository`がidentity、backing root、registryを同時に所有するため、adapterはあるrepository向けCapabilityを別repositoryのroot fdやnamespaceへ接続できない。必要な段階では`into_parts`で3値へ分離できるが、それまでは対応関係を1つの値として保つ。read-only adapterは分離前に`MountAuthority`の`RepoId`とのexact equalityを確認する。
 
 ## 何が数学的に扱いやすくなるのか
 
@@ -126,6 +126,7 @@ root や child directory の再照合には、time-of-check to time-of-use race 
 - repository 内外に alias を作る hard link を link count で拒否する。
 - special file、非 UTF-8 名、canonical 規則違反を拒否する。
 - entry 数と深さの上限を越えた木を拒否する。
+- host-assigned `RepoId`、backing root、manifest由来registryを同じownerへ取り込む。
 - manifest全件を同じregistryへ取り込み、path順にstableな`ObjectId`を割り当てる。
 - preflight失敗時に部分的なnamespace所有型を返さない。
 

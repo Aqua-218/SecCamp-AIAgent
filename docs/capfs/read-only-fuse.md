@@ -6,7 +6,7 @@
 
 ## 何ができるようになったのか
 
-AgentはFUSE mountに対して通常の`open`と`read`を使える。adapterはmountに固定されたsubject、Capability ID、repository IDをrequest payloadから受け取らず、trusted runtimeが構築した`MountAuthority`から使う。
+AgentはFUSE mountに対して通常の`open`と`read`を使える。adapterはmountに固定されたsubject、Capability ID、repository IDをrequest payloadから受け取らず、trusted runtimeが構築した`MountAuthority`から使う。`ImportedRepository`もstartup時にhost-assigned `RepoId`を保持し、constructorは両者が一致しない組合せを`RepositoryMismatch`で拒否する。
 
 実装済みのoperationは次である。
 
@@ -143,7 +143,7 @@ FUSE境界では内部構造を細かく漏らさず、失敗の種類を次の�
 
 ## どう検証しているか
 
-`read_only.rs`のmodule testは、許可範囲と祖先だけのlookup、write intent拒否、namespaceとAuthority両方のhandle count、位置指定read、revoke後の既存handle read拒否、releaseによるcleanup、malformed FORGET後のfail closedを直接確認する。
+`read_only.rs`のmodule testは、許可範囲と祖先だけのlookup、backingとCapabilityのrepository identity不一致、write intent拒否、namespaceとAuthority両方のhandle count、位置指定read、revoke後の既存handle read拒否、releaseによるcleanup、malformed FORGET後のfail closedを直接確認する。
 
 [`crates/capfs/tests/read_only_fuse.rs`](../../crates/capfs/tests/read_only_fuse.rs) は実際にLinux FUSEへmountする。`allowed.txt`を開いて読んだ後にCapabilityをrevokeし、同じOS file descriptorで再度readして`PermissionDenied`になることを確認する。同じmount上の権限外 siblingは`NotFound`になる。
 

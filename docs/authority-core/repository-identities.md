@@ -123,7 +123,7 @@ decide (child.repository = parent.repository)
 
 ## 正確な保証範囲
 
-`RepoId` の exact equality が安全に働くには、host が異なる repository へ異なる値を発行する必要がある。現在の2ファイルは、受け取った値を比較するだけで、次を保証しない。
+`RepoId` の exact equality が安全に働くには、host が異なる repository へ異なる値を発行する必要がある。Authority coreの2ファイルは受け取った値を比較するだけで、次を保証しない。
 
 - ID が全 session・全 host で一意であること。
 - snapshot restore 後に古い ID を再利用しないこと。
@@ -132,6 +132,8 @@ decide (child.repository = parent.repository)
 - request を出した subject が、その `RepoId` を保持してよいこと。
 
 これらは identity issuer、Capability state、workspace mapping の責務である。現在の `RepoId` は入力 validation を行わないため、空文字列を含む値の許可・拒否も契約に含まれていない。
+
+実装済みのread-only capfsでは、workspace mappingの入口で`ImportedRepository::open`へhost-assigned `RepoId`を渡し、backing root、manifest由来namespaceと同じownerへ保持する。FUSE adapterのconstructorは、そのidentityと`MountAuthority`のrepositoryがexact equalityで一致しなければmount objectを作らない。これによりadapter設定時の別repository取り違えを型付きerrorで止める。ただし元のIDを正しく発行する責任は引き続きhostにある。[read-only FUSE adapter](../capfs/read-only-fuse.md)
 
 また、Lean の `RepoId` field は直接参照でき、Rust の field は private という表現上の違いがある。概念は対応しているが、Lean の型が Rust newtype のカプセル化を直接証明しているわけではない。
 

@@ -64,7 +64,7 @@ flowchart LR
 
 初期完了時点では symlink と hard link を含む repository を拒否し、`SYMLINK` と `LINK` も `EPERM` にする。これにより、namespace と revoke の基本 invariant を link 解決から独立して検証する。
 
-現在はVM共通のlink-free namespace registry、repository preflight、backing root fd、manifestの原子的なstartup import、subject-local node tableに加え、read-only FUSE adapterまで実装している。`LOOKUP` / `GETATTR` / `FORGET` / `OPEN` / `READ` / `RELEASE`をroot fd、node table、namespace registry、Authority kernelへ接続し、zero TTLとdirect I/Oを使う。実mount上で権限外siblingが`ENOENT`になり、open済みfile descriptorのreadもrevoke後は`EACCES`になることを確認した。詳しい境界は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[read-only FUSE adapter](../capfs/read-only-fuse.md)を参照する。
+現在はVM共通のlink-free namespace registry、repository preflight、`RepoId`とbacking root / namespaceのbinding、manifestの原子的なstartup import、subject-local node tableに加え、read-only FUSE adapterまで実装している。`LOOKUP` / `GETATTR` / `FORGET` / `OPEN` / `READ` / `RELEASE`をroot fd、node table、namespace registry、Authority kernelへ接続し、zero TTLとdirect I/Oを使う。実mount上で権限外siblingが`ENOENT`になり、open済みfile descriptorのreadもrevoke後は`EACCES`になることを確認した。詳しい境界は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[read-only FUSE adapter](../capfs/read-only-fuse.md)を参照する。
 
 次は`READDIR`を`ListDirectory`へ接続する。その後にwrite、create、remove、no-replace renameを追加する。
 

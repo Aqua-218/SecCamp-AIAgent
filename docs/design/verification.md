@@ -65,7 +65,7 @@ backing repository の contract test は実 directory tree に対して、root f
 
 subject-local node table の contract test は、root nodeの固定、同一objectへの反復LOOKUP、最終FORGET後のnodeid非再利用、stale nodeと過剰FORGETの拒否、mount間の数値identity分離、32 threadの同時LOOKUPを検査する。module testはnode sequenceとlookup countの最終値・枯渇、writer panic後のfail closedを検査する。これはmemory内tableの並行性であり、kernelが発行する実FORGETやmount teardownを含むFUSE統合testではない。詳しい境界は[mount ごとの node table](../capfs/node-tables.md)を参照する。
 
-read-only FUSE adapterのmodule testは、許可範囲と祖先だけのmetadata visibility、write intent拒否、namespace / Authority handleの対応、位置指定read、revoke後の既存handle read拒否、malformed FORGET後のfail closedを検査する。Linux統合testは実際にFUSEへmountし、権限外siblingが見えないことと、同じOS file descriptorによる2回目のreadがrevoke後に`PermissionDenied`になることを確認する。`/dev/fuse`が存在しない環境だけskipする。実kernelのFORGET全lifecycle、mount中の敵対的backing差し替え、rename / write競合、複数thread sessionはまだ含まない。詳しい境界は[read-only FUSE adapter](../capfs/read-only-fuse.md)を参照する。
+read-only FUSE adapterのmodule testは、許可範囲と祖先だけのmetadata visibility、backingとCapabilityのrepository identity不一致、write intent拒否、namespace / Authority handleの対応、位置指定read、revoke後の既存handle read拒否、malformed FORGET後のfail closedを検査する。Linux統合testは実際にFUSEへmountし、権限外siblingが見えないことと、同じOS file descriptorによる2回目のreadがrevoke後に`PermissionDenied`になることを確認する。`/dev/fuse`が存在しない環境だけskipする。実kernelのFORGET全lifecycle、mount中の敵対的backing差し替え、rename / write競合、複数thread sessionはまだ含まない。詳しい境界は[read-only FUSE adapter](../capfs/read-only-fuse.md)を参照する。
 
 symlink resolver の test は初期 `capfs` の完了条件には含めない。link-free な namespace と revoke の検証を先に終え、[symlink 対応](capfs.md#symlink-は後続機能として追加する)を実装する段階で追加する。
 

@@ -123,7 +123,7 @@ file body containment では、false allow を防ぐ `fileBodyBelow_sound` は�
 | [`authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | 10 | synchronized API、active inspection、inspection中のrevoke待機、最終認可、lifecycle、handle、audit、祖先 revoke |
 | [`authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | 4 | direct / ancestor revoke、1〜2 effects、audit consistency、negative control |
 
-Authority core packageではproduction moduleの32 test、corpus runnerの7 test、公開APIの状態遷移test 11件、authorization guardのcontract test 10件、property test 1件の合計61 testを実行する。workspace全体では、これにcapfs namespace registryの13件、backing repository preflight・runtime I/Oの14件、subject-local node tableの8件、read-only adapterのmodule / 実mount test 5件を加えた101 testを`cargo test --workspace`で実行する。property testは内部で1,000本の操作列を生成する。これとは別に、runnerは共有fixtureの71件を実行時に評価する。
+Authority core packageではproduction moduleの32 test、corpus runnerの7 test、公開APIの状態遷移test 11件、authorization guardのcontract test 10件、property test 1件の合計61 testを実行する。workspace全体では、これにcapfs namespace registryの13件、backing repository preflight・runtime I/Oの14件、subject-local node tableの8件、read-only adapterのmodule / 実mount test 6件を加えた102 testを`cargo test --workspace`で実行する。property testは内部で1,000本の操作列を生成する。これとは別に、runnerは共有fixtureの71件を実行時に評価する。
 
 loom の4件は `cfg(loom)` 専用なので、通常の `cargo test --workspace` では実行されない。専用コマンドでは production と同じ `CapabilityKernel` の同期 primitive を loom 版に差し替え、direct revoke、ancestor revoke、2 effects の bounded model を探索する。negative control は意図どおり反例を発見して panic することを `#[should_panic]` で成功条件にしている。
 

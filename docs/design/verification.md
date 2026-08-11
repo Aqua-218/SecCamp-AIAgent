@@ -63,6 +63,8 @@ capfs namespace registry は、公開 API の contract test で path/object の�
 
 backing repository の contract test は実 directory tree に対して、root fd の保持、path 順 manifest、root / entry symlink、hard link、socket、非 UTF-8 名、canonical segment 違反、entry・depth limitを検査する。startup testはmanifest全件のregistry import、path順のObject ID、初期generation、preflight失敗時にnamespaceを公開しないことを確認する。module test は nested mount を判定する mount ID の相違と全 unsupported object kind を検査する。実 mount namespace を使った mount crossing、走査中の敵対的な差し替え、FUSE opcodeとの接続はまだ含まない。詳しい前提は[Backing repository の事前検証](../capfs/backing-preflight.md)を参照する。
 
+subject-local node table の contract test は、root nodeの固定、同一objectへの反復LOOKUP、最終FORGET後のnodeid非再利用、stale nodeと過剰FORGETの拒否、mount間の数値identity分離、32 threadの同時LOOKUPを検査する。module testはnode sequenceとlookup countの最終値・枯渇、writer panic後のfail closedを検査する。これはmemory内tableの並行性であり、kernelが発行する実FORGETやmount teardownを含むFUSE統合testではない。詳しい境界は[mount ごとの node table](../capfs/node-tables.md)を参照する。
+
 symlink resolver の test は初期 `capfs` の完了条件には含めない。link-free な namespace と revoke の検証を先に終え、[symlink 対応](capfs.md#symlink-は後続機能として追加する)を実装する段階で追加する。
 
 ## Lean で証明するもの

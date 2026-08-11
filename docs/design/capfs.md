@@ -59,7 +59,7 @@ flowchart LR
 
 ## 現在の実装位置
 
-[`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) に起動時の backing repository 検査、[`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) にVM共通の link-free namespace registry を実装している。
+[`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) に起動時の backing repository 検査、[`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) にVM共通の link-free namespace registry、[`crates/capfs/src/node.rs`](../../crates/capfs/src/node.rs) にsubject mountごとのnode tableを実装している。
 
 - root を symlink follow なしで開き、mount ID と inode の再照合後に directory fd を保持する。
 - `statx` と `openat2` による fd-relative scan で symlink、hard link、special file、nested mount を拒否する。
@@ -73,7 +73,12 @@ flowchart LR
 - read / write adapter が現在 path 取得から backing I/O まで保持できる read-guard 付き closure API を持つ。
 - backing executor 失敗では registry state を公開せず、writer panic 後は lock poison により fail closed にする。
 
-詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)と[共有 namespace registry](../capfs/namespace-registry.md)を参照する。FUSE mount、subject-local node table、runtime backing syscall、Authority core の handle registry と一体化した adapter は次段階である。
+- Linux FUSE の root nodeを`nodeid 1`へ固定し、通常nodeをmount内で単調に割り当てる。
+- 同一objectのLOOKUP参照数を数え、最終FORGET後はmappingを外すがnodeidは再利用しない。
+- stale node、過剰FORGET、counter / sequence枯渇、lock poison、index不一致をfail closedで拒否する。
+- nodeidはsubject mount内だけのidentityとし、VM共通のpath解決には`ObjectId`を使う。
+
+詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)を参照する。FUSE mount、runtime backing syscall、Authority core の handle registry と一体化した adapter は次段階である。
 
 ## 初期実装は workspace を木に限定する
 

@@ -8,8 +8,9 @@
 |---|---|---|
 | [Backing repository の事前検証](backing-preflight.md) | [`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) | root fd、link検査、resource bound、manifestの原子的なstartup import |
 | [共有 namespace registry](namespace-registry.md) | [`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) | `ObjectId`割り当て、現在path、generation、open count、namespace変更の原子性 |
+| [mount ごとの node table](node-tables.md) | [`crates/capfs/src/node.rs`](../../crates/capfs/src/node.rs) | subject-local `nodeid -> ObjectId`、LOOKUP / FORGET参照数、nodeid非再利用 |
 
-現在は、link-freeなworkspaceの検査、root directory fd、初期manifestの原子的なregistry import、VM共通namespace registryまで実装している。FUSE requestの変換、subject-local node table、runtime backing syscall、Capability kernelとのadapter接続はまだ含まない。
+現在は、link-freeなworkspaceの検査、root directory fd、初期manifestの原子的なregistry import、VM共通namespace registry、subject-local node tableまで実装している。FUSE requestの変換、runtime backing syscall、Capability kernelとのadapter接続はまだ含まない。
 
 ## 関連
 

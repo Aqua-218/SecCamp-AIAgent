@@ -59,7 +59,11 @@ flowchart LR
 
 ## 現在の実装位置
 
-[`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) に、VM 共通の link-free namespace registry を実装している。
+[`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) に起動時の backing repository 検査、[`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) にVM共通の link-free namespace registry を実装している。
+
+- root を symlink follow なしで開き、mount ID と inode の再照合後に directory fd を保持する。
+- `statx` と `openat2` による fd-relative scan で symlink、hard link、special file、nested mount を拒否する。
+- UTF-8・canonical segment、entry 数、depth を検査し、path 順の初期 manifest を作る。
 
 - `ObjectId -> NamespaceObject` と `CanonicalPath -> ObjectId` を同じ lock 内で管理する。
 - create、remove、subtree rename が成功したときだけ `namespace_generation` を進める。
@@ -68,7 +72,7 @@ flowchart LR
 - read / write adapter が現在 path 取得から backing I/O まで保持できる read-guard 付き closure API を持つ。
 - backing executor 失敗では registry state を公開せず、writer panic 後は lock poison により fail closed にする。
 
-詳しい API と保証範囲は[共有 namespace registry](../capfs/namespace-registry.md)を参照する。FUSE mount、backing fd、repository import 時の link 検査、Authority core の handle registry と一体化した adapter は次段階である。
+詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)と[共有 namespace registry](../capfs/namespace-registry.md)を参照する。FUSE mount、manifest の registry import、runtime backing syscall、Authority core の handle registry と一体化した adapter は次段階である。
 
 ## 初期実装は workspace を木に限定する
 

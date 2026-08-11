@@ -6,9 +6,10 @@
 
 | 文書 | 対象 | 内容 |
 |---|---|---|
+| [Backing repository の事前検証](backing-preflight.md) | [`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) | root fd の取得、link・special file・mount crossing の拒否、resource bound、初期 manifest |
 | [共有 namespace registry](namespace-registry.md) | [`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) | `ObjectId` と現在 path の対応、generation、open count、create/remove/rename の原子性 |
 
-現在実装されているのは、link-free な workspace を前提としたVM共通 namespace registry である。FUSE request の変換、実 backing fd、repository import 時の link 検査、Capability kernel との adapter 接続はまだ含まない。
+現在は、link-free な workspace を検査して root directory fd と初期 manifest を得る処理、およびVM共通 namespace registry を実装している。FUSE request の変換、manifest から registry への startup import、runtime backing syscall、Capability kernel との adapter 接続はまだ含まない。
 
 ## 関連
 

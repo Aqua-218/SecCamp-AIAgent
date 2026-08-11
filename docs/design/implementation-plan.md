@@ -64,7 +64,9 @@ flowchart LR
 
 初期完了時点では symlink と hard link を含む repository を拒否し、`SYMLINK` と `LINK` も `EPERM` にする。これにより、namespace と revoke の基本 invariant を link 解決から独立して検証する。
 
-現在は `crates/capfs` を workspace へ追加し、VM 共通の link-free namespace registry まで実装している。`ObjectId` と現在 path の一意対応、ID 非再利用、単調な `namespace_generation`、open count、no-replace subtree rename、remove、backing executor 失敗時の atomicity を Rust test で固定した。次は repository preflight と backing directory fd を持つ passthrough adapter を作り、この registry と Authority kernel へ実 syscall を接続する。
+現在はVM共通の link-free namespace registry に加え、repository preflight と backing root fd の所有まで実装している。`statx` / `openat2` による fd-relative scan で symlink、hard link、special file、nested mount、非 canonical 名、resource limit 超過を拒否し、決定的な初期 manifest を作る。詳しい境界は[Backing repository の事前検証](../capfs/backing-preflight.md)を参照する。
+
+次は manifest を namespace registry へ import し、subject-local `nodeid` を `ObjectId` へ対応させる passthrough FUSE adapter を作る。まず lookup / getattr / open / read / release の read-only opcodeを root fd と Authority kernel へ接続し、その後に write、create、remove、no-replace rename を追加する。
 
 その後、repository 内で完結する symlink を[後続機能](capfs.md#symlink-は後続機能として追加する)として追加する。hard link は同じ inode に複数 path を与えるため、symlink と同時には有効化せず、import 時の分離または alias-aware な認可モデルを設計してから扱う。
 

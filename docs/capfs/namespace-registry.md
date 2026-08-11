@@ -121,13 +121,15 @@ executorから同じregistryへ再入するとdeadlockし得るため禁止し�
 
 module内のtestはgenerationとopen countのwraparoundをexecutor呼出前に拒否すること、writer panic後にregistry全体がfail closedになることを確認する。通常の`cargo test --workspace`では、capfsについて合計9件を実行する。
 
+capfs package 全体では、これに[backing repository の事前検証](backing-preflight.md)9件を加えた18件を実行する。
+
 ここで確認できるのはRust APIの具体的な境界と1つのthread競合である。rename、open、close、revokeを組み合わせた全bounded interleavingのLoom modelと、実FUSE mount上の攻撃testは次段階に残る。
 
 ## 現在含まないもの
 
 - FUSE mountとopcode dispatch。
-- backing directory fdと`openat2` / `renameat2`の実syscall。
-- repository import時のsymlink、hard link、device、mountなどの検査。
+- 初期 manifest からregistryへの`ObjectId`割り当て。
+- runtime backing operationの`openat2` / `renameat2` syscall。
 - Authority coreのhandle registryとopen countを一体でcommitするadapter。
 - `nodeid -> ObjectId`のsubject-local mapping。
 - durable stateやsupervisor再起動後の復元。
@@ -137,6 +139,7 @@ module内のtestはgenerationとopen countのwraparoundをexecutor呼出前に�
 ## 関連
 
 - [capfs 設計](../design/capfs.md)
+- [Backing repository の事前検証](backing-preflight.md)
 - [Subject lifecycle と open handle](../authority-core/subject-lifecycle-and-handles.md)
 - [Authorization guard](../authority-core/authorization-guard.md)
 - [検証戦略](../design/verification.md)

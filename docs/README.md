@@ -6,7 +6,7 @@
 |---|---|---|
 | [設計書](design/README.md) | 設計者、実装者、セキュリティレビュー担当者 | 脅威モデル、Capability モデル、失効、隔離、検証戦略、実装順序 |
 | [Authority core 実装ガイド](authority-core/README.md) | Rust/Lean 実装者、証明のレビュー担当者 | 現在の Authority core 各ファイルの責務、Rust と Lean の対応、定理、テスト |
-| [capfs 実装ガイド](capfs/README.md) | filesystem adapter 実装者、並行境界のレビュー担当者 | namespace registry、path/object 対応、generation、open count、rename の原子性 |
+| [capfs 実装ガイド](capfs/README.md) | filesystem adapter 実装者、並行境界のレビュー担当者 | backing root の事前検証、namespace registry、path/object 対応、rename の原子性 |
 
 ## Authority core 文書
 
@@ -30,6 +30,7 @@
 | 文書 | 内容 |
 |---|---|
 | [実装ガイド](capfs/README.md) | 現在の実装範囲と文書一覧 |
+| [Backing repository の事前検証](capfs/backing-preflight.md) | root fd、link-free tree、mount・inode identity、resource bound |
 | [共有 namespace registry](capfs/namespace-registry.md) | `ObjectId` と現在 path の対応、generation、open handle、create/remove/rename の lock 契約 |
 
 ## 文書の使い分け

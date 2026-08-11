@@ -61,6 +61,8 @@ loom は実システム全体の証明ではない。direct / ancestor の 2 thr
 
 capfs namespace registry は、公開 API の contract test で path/object の一意対応、ID 非再利用、generation、open count、create/remove/rename の失敗 atomicity を検査する。標準 thread test では、read operation が現在 path を使い終わるまで並行 rename が write lock を取得できないことも確認する。これは1つの具体的な schedule であり、open / close / rename / revoke の全 interleaving を探索する Loom model ではない。詳しい境界は[共有 namespace registry](../capfs/namespace-registry.md)を参照する。
 
+backing repository の contract test は実 directory tree に対して、root fd の保持、path 順 manifest、root / entry symlink、hard link、socket、非 UTF-8 名、canonical segment 違反、entry・depth limit を検査する。module test は nested mount を判定する mount ID の相違と全 unsupported object kind を検査する。実 mount namespace を使った mount crossing、走査中の敵対的な差し替え、FUSE opcodeとの接続はまだ含まない。詳しい前提は[Backing repository の事前検証](../capfs/backing-preflight.md)を参照する。
+
 symlink resolver の test は初期 `capfs` の完了条件には含めない。link-free な namespace と revoke の検証を先に終え、[symlink 対応](capfs.md#symlink-は後続機能として追加する)を実装する段階で追加する。
 
 ## Lean で証明するもの

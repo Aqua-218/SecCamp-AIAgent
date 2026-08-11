@@ -8,6 +8,7 @@
 use std::{cell::Cell, convert::Infallible, error::Error, fmt};
 
 use authority_core::{
+    audit::AttemptOutcome,
     capability::{AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId},
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
     handle::{HandleId, ObjectId, OpenHandle},
@@ -349,4 +350,65 @@ fn kernel_tracks_live_handles_without_reusing_ids() {
         kernel.close_handle(&handle_id),
         Ok(HandleCloseStatus::AlreadyClosed)
     );
+}
+
+// Requirement: every checked request is an attempt, while only a successful
+// executor creates an effect record. Category: audit/security. Risk: critical.
+#[test]
+fn audit_distinguishes_denied_failed_and_committed_attempts() {
+    let (kernel, root_id) = kernel_with_root();
+    let denied_request = file_request(30, FileEffect::Rename, &["src", "main.rs"]);
+    let failed_request = read_request(30, &["src", "failed.rs"]);
+    let committed_request = read_request(30, &["src", "committed.rs"]);
+
+    assert_eq!(
+        kernel.authorize_and_commit(&root_subject_id(), &root_id, &denied_request, |_| Ok::<
+            _,
+            Infallible,
+        >(
+            ()
+        ),),
+        Err(EffectCommitError::NotAuthorized)
+    );
+    assert_eq!(
+        kernel.authorize_and_commit(&root_subject_id(), &root_id, &failed_request, |_| Err::<
+            (),
+            _,
+        >(
+            ExecutorFailure
+        ),),
+        Err(EffectCommitError::Effect(ExecutorFailure))
+    );
+    kernel
+        .authorize_and_commit(&root_subject_id(), &root_id, &committed_request, |_| {
+            Ok::<_, Infallible>(())
+        })
+        .expect("the final request must commit");
+
+    let attempts = kernel
+        .attempt_records()
+        .expect("the audit trail must remain readable");
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0].id().as_u64(), 0);
+    assert_eq!(attempts[0].outcome(), AttemptOutcome::Denied);
+    assert_eq!(attempts[0].request(), &denied_request);
+    assert_eq!(attempts[1].id().as_u64(), 1);
+    assert_eq!(attempts[1].outcome(), AttemptOutcome::FailedBeforeCommit);
+    assert_eq!(attempts[1].request(), &failed_request);
+    assert_eq!(attempts[2].id().as_u64(), 2);
+    assert_eq!(attempts[2].outcome(), AttemptOutcome::Committed);
+    assert_eq!(attempts[2].request(), &committed_request);
+    assert_eq!(
+        attempts[2].authorization_epoch(),
+        AuthorizationEpoch::default()
+    );
+
+    let effects = kernel
+        .effect_records()
+        .expect("the effect trail must remain readable");
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].attempt_id(), attempts[2].id());
+    assert_eq!(effects[0].caller(), &root_subject_id());
+    assert_eq!(effects[0].capability_id(), &root_id);
+    assert_eq!(effects[0].request(), &committed_request);
 }

@@ -8,6 +8,7 @@ use loom::sync::RwLock;
 use std::sync::RwLock;
 
 use crate::{
+    audit::{AttemptRecord, AuditError, AuditTrail, EffectRecord},
     capability::{CapId, Capability, CapabilityRequest, SubjectId},
     handle::{HandleId, ObjectId, OpenHandle},
     state::{
@@ -60,6 +61,8 @@ pub enum EffectCommitError<E> {
     NotAuthorized,
     /// The effect executor failed before reaching its linearization point.
     Effect(E),
+    /// The attempt could not be recorded before executor invocation.
+    Audit(AuditError),
 }
 
 impl<E: fmt::Display> fmt::Display for EffectCommitError<E> {
@@ -73,6 +76,7 @@ impl<E: fmt::Display> fmt::Display for EffectCommitError<E> {
                     "effect failed before its linearization point: {error}"
                 )
             }
+            Self::Audit(error) => error.fmt(formatter),
         }
     }
 }
@@ -81,6 +85,7 @@ impl<E: Error + 'static> Error for EffectCommitError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Effect(error) => Some(error),
+            Self::Audit(error) => Some(error),
             Self::LockPoisoned | Self::NotAuthorized => None,
         }
     }
@@ -95,6 +100,7 @@ impl<E: Error + 'static> Error for EffectCommitError<E> {
 #[derive(Debug)]
 pub struct CapabilityKernel {
     state: RwLock<CapabilityState>,
+    audit: AuditTrail,
 }
 
 impl CapabilityKernel {
@@ -103,6 +109,7 @@ impl CapabilityKernel {
     pub fn new(state: CapabilityState) -> Self {
         Self {
             state: RwLock::new(state),
+            audit: AuditTrail::new(),
         }
     }
 
@@ -270,6 +277,29 @@ impl CapabilityKernel {
         Ok(state.object_open_handle_count(object))
     }
 
+    /// Returns snapshots of all authorization attempts in start order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditError::LockPoisoned`] if an internal audit writer
+    /// panicked while appending an attempt.
+    pub fn attempt_records(&self) -> Result<Vec<AttemptRecord>, AuditError> {
+        self.audit.attempts()
+    }
+
+    /// Returns committed-effect snapshots in their attempt start order.
+    ///
+    /// Attempts denied by final authorization and executor failures are not
+    /// effect records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditError::LockPoisoned`] if an internal audit writer
+    /// panicked while appending an attempt.
+    pub fn effect_records(&self) -> Result<Vec<EffectRecord>, AuditError> {
+        self.audit.effects()
+    }
+
     /// Reauthorizes an effect and executes it through its linearization point.
     ///
     /// The executor runs while a shared state guard is held. It must return
@@ -296,16 +326,45 @@ impl CapabilityKernel {
             .read()
             .map_err(|_| EffectCommitError::LockPoisoned)?;
 
+        let attempt = self
+            .audit
+            .start_attempt(
+                caller.clone(),
+                capability_id.clone(),
+                request.clone(),
+                state.authorization_epoch(),
+            )
+            .map_err(EffectCommitError::Audit)?;
+
         if !state.authorizes(caller, capability_id, request) {
+            attempt.deny();
+            drop(state);
             return Err(EffectCommitError::NotAuthorized);
         }
 
         // Passing a reference tied to the read guard keeps shared access alive
         // for the entire executor call, rather than only for the check above.
-        let capability = state
-            .capability(capability_id)
-            .ok_or(EffectCommitError::NotAuthorized)?;
-        commit_to_linearization(capability).map_err(EffectCommitError::Effect)
+        let Some(capability) = state.capability(capability_id) else {
+            // Public transitions keep authorization and capability lookup in
+            // sync. Preserve a terminal audit outcome if internal state is
+            // ever inconsistent instead of leaving the attempt as started.
+            attempt.deny();
+            drop(state);
+            return Err(EffectCommitError::NotAuthorized);
+        };
+        let result = commit_to_linearization(capability);
+        match result {
+            Ok(value) => {
+                attempt.commit();
+                drop(state);
+                Ok(value)
+            }
+            Err(error) => {
+                attempt.fail_before_commit();
+                drop(state);
+                Err(EffectCommitError::Effect(error))
+            }
+        }
     }
 
     fn with_state_mut<T>(

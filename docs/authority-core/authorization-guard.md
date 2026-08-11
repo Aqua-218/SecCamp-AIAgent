@@ -44,7 +44,8 @@ flowchart LR
 |---|---|
 | `CapabilityKernel` | `CapabilityState` を同期境界に入れ、発行 transition、revoke、effect commit を直列化する |
 | `CapabilityKernelError` | lock poisoning と逐次状態機械の typed error を区別する |
-| `EffectCommitError<E>` | lock poisoning、認可拒否、executor のpre-commit失敗を区別する |
+| `EffectCommitError<E>` | state/audit lock failure、認可拒否、executor の pre-commit 失敗を区別する |
+| `AttemptRecord` / `EffectRecord` | 全 checked request と、commit 済み effect を区別する |
 
 `register_subject`、`issue_root`、`derive`、`revoke` は exclusive guard の内側で既存の逐次 transition を呼ぶ。逐次状態機械の検査条件を複製せず、同期だけを外側に追加している。
 
@@ -54,15 +55,17 @@ flowchart LR
 
 ```text
 shared guard を取得
+→ `Started` audit entry を作成
 → caller / held / ancestor / time / request を最終確認
 → 認可に使った Capability の参照を executor へ渡す
 → executor が線形化点まで進む
+→ outcome を `Committed` に確定
 → shared guard を解放
 ```
 
 Capability の参照は read guard 内の `CapabilityState` を借用している。この参照を executor 呼び出しへ渡すことで、lock の寿命が認可判定だけで終わらずexecutor完了まで続く。
 
-認可が失敗した場合、executor は呼ばれず `EffectCommitError::NotAuthorized` を返す。executor が線形化点より前に失敗した場合は `EffectCommitError::Effect(error)` となる。
+認可が失敗した場合、executor は呼ばれず `EffectCommitError::NotAuthorized` を返す。executor が線形化点より前に失敗した場合は `EffectCommitError::Effect(error)` となる。executor 前に audit entry を作れない場合は `EffectCommitError::Audit(error)` で fail closed にする。記録の仕組みは[Attempt / effect audit](audit-records.md)を参照する。
 
 ## Executor が守る契約
 
@@ -113,12 +116,14 @@ revoke が `revoked` へ追加してreturnした後、effect は shared guard �
 
 通常buildでは `std::sync::RwLock` を使う。`RUSTFLAGS='--cfg loom'` を付けたmodel testでは、同じ `CapabilityKernel` のlockだけを `loom::sync::RwLock` へ差し替える。
 
-[`crates/authority-core/tests/authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) には2つのmodelがある。
+[`crates/authority-core/tests/authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) には4つの model がある。
 
 | Model | 期待する結果 | 確認すること |
 |---|---|---|
-| production guard | 全interleavingでpass | executorが走るならrevoke returnより前、revokeが先なら認可拒否になる |
-| unlocked negative control | 指定したassertionでpanic | 認可直後にguardを解放すると、revoke return後のcommit順序が実在する |
+| direct revoke / 1 effect | 全 interleaving で pass | executor が走るなら revoke return より前、revoke が先なら認可拒否になる |
+| ancestor revoke / descendant effect | 全 interleaving で pass | root revoke が child Capability の effect も同じ順序で止める |
+| direct revoke / 2 effects | preemption bound 2 で pass | 両 effect が先、revoke が先、effect が1件ずつ両側になる順序で audit と commit 数が一致する |
+| unlocked negative control | 指定した assertion で panic | 認可直後に guard を解放すると、revoke return 後の commit 順序が実在する |
 
 negative controlは「壊れた実装もtestが緑になる」ことを防ぐ検査である。loomはthread実行順を繰り返し変え、bounded model内の可能な並行実行を探索する。[Loom documentation](https://docs.rs/loom/latest/loom/model/fn.model.html) / [Loom repository and limitations](https://github.com/tokio-rs/loom)（2026-08-11参照）
 
@@ -131,22 +136,23 @@ RUSTFLAGS='--cfg loom' cargo clippy --package authority-core --test authorizatio
 
 ## 正確な保証範囲
 
-現在のmodelは1件のeffectと1件の直接revokeを同じroot Capability上で競合させる。`CapabilityState::authorizes` が祖先chainを辿ることは逐次testで別に確認している。
+現在は、1 effect / 1 direct revoke、1 descendant effect / 1 ancestor revoke、2 effects / 1 direct revoke を検査する。最初の2つは model 内の全 interleaving、3 thread の model は同値な schedule の爆発を避けるため preemption bound 2で探索する。各 model は attempt outcome、effect count、`auth_epoch` の対応も確認する。
 
 次はまだ含まれない。
 
-- attempt/effect log と `auth_epoch`。
-- open handle、rename、unlinkを含むfilesystem固有の競合。
-- executor adapterが実際のsyscallを正しい線形化点まで実行すること。
+- open handle、rename、unlink を含む filesystem 固有の競合。
+- executor adapter が実際の syscall を正しい線形化点まで実行すること。
 - writer fairness、revoke latency、負荷時の性能。
-- 3 thread以上、複数Capability、複数effectを組み合わせたmodel。
-- Rust状態機械やlock実装全体の数学的証明。
+- 4 thread 以上、複数 Capability tree、複数 revoke を組み合わせた model。
+- Rust 状態機械や lock 実装全体の数学的証明。
 
 loom自身にもC11 memory modelの未対応部分があるため、bounded modelのpassを実システム全体の証明とは扱わない。今回のmodelはatomicだけで認可を組み立てず、reader-writer lockの排他順序を検査対象にしている。
 
 ## 関連
 
 - [Capability の発行と逐次状態機械](capability-state.md)
+- [Subject lifecycle と open handle](subject-lifecycle-and-handles.md)
+- [Attempt / effect audit](audit-records.md)
 - [検証とテスト](verification.md)
 - [状態機械と revoke の設計](../design/state-and-revocation.md)
 - [検証戦略](../design/verification.md)

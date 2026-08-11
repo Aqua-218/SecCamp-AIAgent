@@ -340,9 +340,10 @@ impl Error for CapabilityStateError {}
 
 /// Session-local sequential state for capability issuance and revocation.
 ///
-/// This type deliberately has no internal synchronization. A later
-/// authorization guard will serialize it with effect commit and revoke; this
-/// layer defines the deterministic transition rules that guard must protect.
+/// This type deliberately has no internal synchronization.
+/// [`crate::kernel::CapabilityKernel`] serializes it with effect commit and
+/// revoke; this layer defines the deterministic transition rules protected by
+/// that synchronization boundary.
 #[derive(Debug)]
 pub struct CapabilityState {
     issuer: IssuerId,

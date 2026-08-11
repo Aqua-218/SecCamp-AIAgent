@@ -292,7 +292,7 @@ repository equality と path containment を同じ body 判定に含めるため
 
 次はこの file body の定理には含まれない。Capability ID の採番、subject binding、親 ID と `delegable`、逐次 revoke は Rust の[Capability state](capability-state.md)で実装・テストするが、この Lean 定理の証明対象ではない。
 
-- 使用回数、attempt/effect log、filesystem adapter を含む revoke と effect commit の end-to-end な並行実行。純粋な同期境界は[Authorization guard](authorization-guard.md)で実装・model 検査する。
+- 使用回数、filesystem adapter を含む revoke と effect commit の end-to-end な並行実行。純粋な同期境界と in-memory audit は[Authorization guard](authorization-guard.md)と[Attempt / effect audit](audit-records.md)で実装・model 検査する。
 - rename の source と destination を2件とも認可する orchestration。
 - FUSE operation から正しい `FileEffect` を選ぶ adapter。
 - symlink、hard link、inode alias、open handle、rename race。

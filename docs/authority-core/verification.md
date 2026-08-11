@@ -23,7 +23,7 @@ unit test、Lean example・theorem、共通 corpus は現在の file-only slice 
 flowchart LR
     examples["具体例<br/>境界値・失敗例"] --> rust["Rust unit test"]
     sequences["生成した Derive / revoke 列"] --> property["stateful property test"]
-    races["1 effect / 1 revoke<br/>全 interleaving"] --> loom["loom model<br/>production + negative control"]
+    races["direct / ancestor revoke<br/>1〜2 effects"] --> loom["loom model<br/>production + negative control"]
     examples --> leanExample["Lean example"]
     spec["全入力に対する仕様"] --> theorem["Lean theorem"]
     corpus["共通 corpus<br/>71件 + 期待値"] --> rustRunner["Rust corpus runner"]
@@ -113,17 +113,19 @@ file body containment では、false allow を防ぐ `fileBodyBelow_sound` は�
 | [`file.rs`](../../crates/authority-core/src/file.rs) | 5 | effect membership と duplicate、空/同値/拡大 subset、request matching の3軸、body containment の3軸、推移性 |
 | [`time.rs`](../../crates/authority-core/src/time.rs) | 4 | 正常/空/逆転区間、半開境界、時刻窓 subset、推移性 |
 | [`capability.rs`](../../crates/authority-core/src/capability.rs) | 5 | typed metadata、時刻付き matching、期間/file の縮小と拡大拒否、反射性、推移性 |
-| [`state.rs`](../../crates/authority-core/src/state.rs) | 1 | `u64::MAX` の最後の ID 発行と、それ以降の exhaustion |
+| [`state.rs`](../../crates/authority-core/src/state.rs) | 2 | `u64::MAX` の最後の Capability ID、authorization epoch の wraparound 拒否 |
+| [`handle.rs`](../../crates/authority-core/src/handle.rs) | 1 | typed handle / subject / object identity の保持 |
+| [`audit.rs`](../../crates/authority-core/src/audit.rs) | 2 | attempt outcome と effect filtering、Attempt ID exhaustion |
 | [`kernel.rs`](../../crates/authority-core/src/kernel.rs) | 1 | exclusive writer の panic 後に poisoned state を再利用せず fail closed にする |
 | [`authority-corpus.rs`](../../crates/authority-core/src/bin/authority-corpus.rs) | 7 | header/schema、未知の判定、必須 field、u64 上限、期待値不一致、case 名重複の拒否 |
-| [`capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 9 | subject 登録、root/Derive の成功と拒否、atomicity、authorization、祖先 revoke、ID 非再利用 |
+| [`capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 11 | 発行・Derive・revoke、atomicity、subject lifecycle、handle ID 非再利用 |
 | [`capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) | 1 | 1〜63操作の Derive/revoke 列を1,000 case 生成し、参照モデルと各 transition を比較 |
-| [`authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | 5 | synchronized API、最終認可、executor 非呼び出し、typed error、祖先 revoke |
-| [`authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | 2 | 1 effect / 1 revoke の全 interleaving と、guard を外した negative control |
+| [`authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | 8 | synchronized API、最終認可、lifecycle、handle、audit、祖先 revoke |
+| [`authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | 4 | direct / ancestor revoke、1〜2 effects、audit consistency、negative control |
 
-production module の25 test、corpus runner の7 test、公開 API の状態遷移 test 9件、authorization guard の contract test 5件、property test 1件の合計47 test を `cargo test --workspace` で実行する。property test は内部で1,000本の操作列を生成する。これとは別に、runner は共有 fixture の71件を実行時に評価する。
+production module の29 test、corpus runner の7 test、公開 API の状態遷移 test 11件、authorization guard の contract test 8件、property test 1件の合計56 test を `cargo test --workspace` で実行する。property test は内部で1,000本の操作列を生成する。これとは別に、runner は共有 fixture の71件を実行時に評価する。
 
-loom の2件は `cfg(loom)` 専用なので、通常の `cargo test --workspace` では実行されない。専用コマンドでは production と同じ `CapabilityKernel` の lock を `loom::sync::RwLock` に差し替え、1 effect / 1 revoke の bounded model を探索する。negative control は意図どおり反例を発見して panic することを `#[should_panic]` で成功条件にしている。
+loom の4件は `cfg(loom)` 専用なので、通常の `cargo test --workspace` では実行されない。専用コマンドでは production と同じ `CapabilityKernel` の同期 primitive を loom 版に差し替え、direct revoke、ancestor revoke、2 effects の bounded model を探索する。negative control は意図どおり反例を発見して panic することを `#[should_panic]` で成功条件にしている。
 
 ここで特に test が助けるのは、Lean の抽象モデルに出にくい Rust 固有の部分である。
 
@@ -135,6 +137,7 @@ loom の2件は `cfg(loom)` 専用なので、通常の `cargo test --workspace`
 - typed metadata の getter と file-only Capability envelope が実際の公開 API で接続される。
 - 失敗 transition が ID sequence や held/capability map を途中まで変更しない。
 - 別 subject にコピーした ID、revoke 済み祖先、静的 envelope 外の grant が拒否される。
+- subject shutdown、stale handle ID、audit outcome が実際の transition と一致する。
 
 test helper の `path` は `CanonicalPath::new(...).expect(...)` を通し、fixture 自体も検証済み path から作る。
 
@@ -197,7 +200,8 @@ theorem を production 定義の隣に置くことで、判定を変更して証
 | 共有した71入力で両言語が期待値どおりか |  |  |  | ✓ | 自動比較済み |
 | 生成した逐次操作列で state と参照モデルが一致するか | ✓ |  |  |  | 1,000 case 検査済み |
 | 全入力で Rust と Lean が同値か |  |  |  |  | 未証明 |
-| 1 effect と 1 revoke の全 bounded interleaving | ✓ |  |  |  | production model と negative control を loom で検査済み |
+| direct / ancestor revoke と 1 effect の全 bounded interleaving | ✓ |  |  |  | production model と negative control を loom で検査済み |
+| 2 effects / 1 revoke の preemption-bound model | ✓ |  |  |  | bound 2 で主要な3順序と audit consistency を検査済み |
 | OS/FUSE を含む end-to-end 認可 |  |  |  |  | Authority core の外 |
 
 Lean theorem は Lean モデル内の全入力を扱い、共通 corpus は両言語の有限の具体例を扱う。どちらか一方から「Rust と Lean は全入力で同値」とは結論しない。OS/FUSE との接続は `capfs` の統合・攻撃テストで別に閉じる。
@@ -248,7 +252,7 @@ scripts/check-authority-corpus.sh
 
 残る限界は、corpus が有限であることと、schema v1 が現在の file-only authority だけを表すことである。File 以外の authority variant を追加するときは、両 runner と corpus を同じ変更で拡張する。互換性のない schema 変更では header の version も上げる。
 
-なお、共通 corpus 自体は revoke を検証しない。逐次 revoke と祖先失効は stateful test、1 effect / 1 revoke の同期境界は loom で検査している。現在の loom model は 3 thread 以上、複数 Capability、open handle、rename、unlink を含まない。filesystem adapter が正しい線形化点まで shared guard を保持することは、実 mount の統合・攻撃テストで別に閉じる必要がある。
+なお、共通 corpus 自体は revoke を検証しない。逐次 revoke と祖先失効は stateful test、1〜2 effects と direct / ancestor revoke の同期境界は loom で検査している。現在の loom model は open handle、rename、unlink、複数 revoke、4 thread 以上を含まない。filesystem adapter が正しい線形化点まで shared guard を保持することは、実 mount の統合・攻撃テストで別に閉じる必要がある。
 
 ## 変更時の確認点
 
@@ -271,6 +275,8 @@ scripts/check-authority-corpus.sh
 - [Capability](capabilities.md)
 - [Capability state](capability-state.md)
 - [Authorization guard](authorization-guard.md)
+- [Subject lifecycle と open handle](subject-lifecycle-and-handles.md)
+- [Attempt / effect audit](audit-records.md)
 - [検証戦略](../design/verification.md)
 - [実装順序](../design/implementation-plan.md)
 - [capfs](../design/capfs.md)

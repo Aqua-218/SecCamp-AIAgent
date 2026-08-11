@@ -212,9 +212,11 @@ Lean で実装・証明済みなのは file variant の Capability envelope、�
 
 `CapabilityKernel` はさらに、最終認可から effect の線形化点まで shared guard を保持し、exclusive revoke と同じ順序へ置く。bounded interleaving は[Authorization guard](authorization-guard.md)の loom test で検査する。
 
+Rust state には、`auth_epoch`、subject lifecycle、open-handle registry、attempt/effect audit も実装している。これらは Lean の純粋な `weakerThan` theorem の対象ではなく、Rust transition test と Loom model で別に検査する。
+
 次はまだ含まれない。
 
-- 使用回数、attempt/effect log、open handle、subject lifecycle。
+- 使用回数、durable audit storage、global namespace registry。
 - HTTP fetch や GitHub authority など、File 以外の variant。
 - OS/FUSE operation を正しい `CapabilityRequest` へ変換する adapter。
 

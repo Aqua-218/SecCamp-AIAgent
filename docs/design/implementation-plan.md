@@ -38,11 +38,13 @@ Rust で typed Capability、正規化型、`Matches`、`PathBelow`、`WeakerThan
 
 subject tree、held、revoke、open handle、attempt、effect、authorization guard を実装する。正常操作だけでなく leak、forge、stale ID、期限切れ、revoke race を proptest と loom に流す。
 
-現在は逐次部分として、subject tree、静的 envelope、server-side ID、root 発行、held、Derive、revoke と祖先失効まで実装している。公開 API の契約 test に加え、1〜63操作の Derive/revoke 列を1,000 case 生成し、独立した参照モデルと毎 transition 比較する property test がある。
+現在は逐次部分として、subject tree、静的 envelope、server-side ID、root 発行、held、Derive、revoke、祖先失効、`auth_epoch`、subject lifecycle、open-handle registry まで実装している。公開 API の契約 test に加え、1〜63操作の Derive/revoke 列を1,000 case 生成し、独立した参照モデルと毎 transition 比較する property test がある。
 
-並行境界では、最終認可から executor の線形化点まで shared guard を保持し、revoke と発行 transition を exclusive guard に置いた。1 effect / 1 revoke の全 bounded interleaving を production wrapper で検査し、guard を認可直後に外す negative control が反例を出すことも loom で固定している。
+並行境界では、最終認可から executor の線形化点と audit outcome 確定まで shared guard を保持し、revoke、subject shutdown、発行 transition を exclusive guard に置いた。全 attempt と commit 済み effect は caller、Capability、typed request、epoch とともに in-memory journal へ記録する。
 
-これにより次の完了条件は、現在の 1 effect / 1 revoke model について満たした。状態機械 phase に残るのは attempt/effect log、`auth_epoch`、open handle、subject lifecycle、supervisor / filesystem / Broker adapter との接続、およびそれらを含む競合 model である。詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)と[Authorization guard](../authority-core/authorization-guard.md)を参照する。
+Loom は direct revoke / 1 effect、ancestor revoke / descendant effect の全 interleaving と、preemption bound 2 の 2 effects / 1 revoke を検査する。guard を認可直後に外す negative control も反例を出す。これにより次の完了条件は現在の Authority core model について満たした。
+
+状態機械 phase に残るのは、durable audit backend、supervisor / filesystem / Broker adapter、global namespace registry、および open handle・rename・unlink・複数 revoke を含む競合 model である。詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)、[Authorization guard](../authority-core/authorization-guard.md)、[Subject lifecycle と open handle](../authority-core/subject-lifecycle-and-handles.md)、[Attempt / effect audit](../authority-core/audit-records.md)を参照する。
 
 **完了条件:** negative control では race の反例が出て、本番 lock では同じ bounded model の反例が消える。
 

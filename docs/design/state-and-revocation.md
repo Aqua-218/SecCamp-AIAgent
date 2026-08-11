@@ -73,10 +73,11 @@ flowchart LR
 
 | 実装済み | 次に実装する |
 |---|---|
-| subject 登録、root 発行、held、caller binding、parent link、`delegable` を検査する Derive | attempt/effect log と `auth_epoch` |
-| `WeakerThan`、target envelope、逐次 revoke、祖先 chain の無効化 | open handle と subject lifecycle |
-| shared effect / exclusive transition の authorization guard と、executor の線形化点までの guard 保持 | supervisor / filesystem / Broker adapter との end-to-end 接続 |
-| 1 effect / 1 revoke の loom model と unlocked negative control | 3 thread 以上・複数 Capability・open handle・rename・unlink を含む model |
+| subject 登録、root 発行、held、caller binding、parent link、`delegable` を検査する Derive | supervisor / filesystem / Broker adapter との end-to-end 接続 |
+| `WeakerThan`、target envelope、逐次 revoke、祖先 chain、`auth_epoch` | durable audit backend と commit receipt |
+| Running→Closing→Closed、held revoke、open-handle registry、ID 非再利用 | global namespace registry と実 fd lifecycle |
+| shared effect / exclusive transition、executor の線形化点までの guard、attempt/effect audit | open handle、rename、unlink を含む capfs 競合 model |
+| direct / ancestor revoke、1〜2 effects、negative control の Loom model | 4 thread 以上・複数 revoke / Capability tree の model |
 
 詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)と[Effect commit と revoke の authorization guard](../authority-core/authorization-guard.md)を参照する。
 
@@ -106,25 +107,24 @@ sequenceDiagram
 
 この順なら effect が先に成立する。逆に revoke が exclusive guard を先に取れば、その後の effect は再認可で落ちる。どちらに転んでも順序は曖昧にならない。
 
-現在の `CapabilityKernel::authorize_and_commit` は、最終認可、executor 呼び出し、revoke との線形化までを実装する。下の `AttemptRecord`、`EffectRecord`、`auth_epoch` を含む記録処理は設計上の次段階であり、まだ production 実装にはない。
+現在の `CapabilityKernel::authorize_and_commit` は、最終認可、executor 呼び出し、revoke との線形化、in-memory の `AttemptRecord` / `EffectRecord` / `auth_epoch` を実装する。durable storage と provider 固有の commit receipt は adapter 側の次段階である。
 
 ```text
 CommitEffect(subject, effect):
-    attempts += Started
     shared_guard.lock()
+    attempt := attempts.append(Started, auth_epoch)
     cap := Authorize(subject, effect, monotonic_now())
     if cap is None:
-        attempts += Denied
+        attempt.finish(Denied)
         return NotAuthorized
     result := ExecuteToLinearizationPoint(effect)
     if result.accepted:
-        effects += EffectRecord(effect, cap, result)
-        attempts += Accepted
+        attempt.finish(Committed)
     else:
-        attempts += FailedBeforeCommit
+        attempt.finish(FailedBeforeCommit)
 ```
 
-拒否した試行は `attempts` に残すが、`effects` には入れない。`NoUnauthorizedCommit` は、実際に成立した `effects` だけを対象に検査する。
+拒否した試行は `attempts` に残すが、`effects` には入れない。現在の in-memory `EffectRecord` は `Committed` attempt だけから作る。`NoUnauthorizedCommit` は、実際に成立した `effects` だけを対象に検査する。
 
 実装には `std::sync::RwLock` を使う。単一の `Mutex` でも安全な順序は作れるが、互いに独立した認可済み effect まで直列化する。認可直後に lock を外し、commit 前に epoch だけ再確認する方式は、外部 effect の線形化点との間に別の gap を作りやすい。そのため現在は、Capability への借用を executor closure に渡し、shared guard の寿命を closure の return まで型と所有権で結び付ける。
 
@@ -143,7 +143,7 @@ revoke は、これより前の操作を巻き戻すものではない。
 
 ## KillSubject
 
-`KillSubject` は subject を `Closing` にして新規操作を止め、コンテナの cgroup 全体を停止する。その後、held Capability の revoke、control fd と open handle の close、`capfs` の unmount を行って `Closed` にする。
+Authority core の `begin_subject_close` は subject を `Closing` にして新規操作を止め、held Capability を revoke して `auth_epoch` を進める。supervisor はその後にコンテナの cgroup、control fd、open handle、`capfs` mount を片付ける。live handle がゼロになってから `finish_subject_close` を呼び、`Closed` にする。
 
 すでに Host Broker が受理した外部操作だけは続行し得る。
 
@@ -160,5 +160,7 @@ revoke は、これより前の操作を巻き戻すものではない。
 - [Capability モデル](capability-model.md)
 - [Capability の発行と逐次状態機械](../authority-core/capability-state.md)
 - [Effect commit と revoke の authorization guard](../authority-core/authorization-guard.md)
+- [Subject lifecycle と open handle](../authority-core/subject-lifecycle-and-handles.md)
+- [Attempt / effect audit](../authority-core/audit-records.md)
 - [capfs](capfs.md)
 - [ネットワークと外部副作用](network-egress.md)

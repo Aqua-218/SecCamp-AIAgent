@@ -26,12 +26,18 @@ flowchart LR
     held[("held<br/>SubjectId → Set&lt;CapId&gt;")]
     revoked[("revoked<br/>Set&lt;CapId&gt;")]
     issued[("issued_ids<br/>Set&lt;CapId&gt;")]
+    lifecycle[("subject_statuses<br/>Running / Closing / Closed")]
+    handles[("open_handles<br/>HandleId → OpenHandle")]
+    epoch["AuthorizationEpoch"]
 
     subject -->|"register_subject"| state
     state -->|"stores immutable grants"| capabilities
     state -->|"binds holder"| held
     state -->|"adds only"| revoked
     state -->|"prevents reuse"| issued
+    state -->|"monotone shutdown"| lifecycle
+    state -->|"tracks live fd identity"| handles
+    state -->|"invalidates caches"| epoch
 ```
 
 | 型 | 責務 |
@@ -41,6 +47,9 @@ flowchart LR
 | `CapabilityGrant` | 新しい Capability に求める subject、期間、authority、`delegable` |
 | `CapabilityState` | ID 発行、metadata 構築、保持関係、親子 link、revoke 集合 |
 | `RevocationStatus` | revoke が新規だったか、すでに revoke 済みだったか |
+| `AuthorizationEpoch` | revoke と shutdown による authorization state の単調 version |
+| `SubjectStatus` | `Running → Closing → Closed` の一方向 lifecycle |
+| `OpenHandle` | live handle の ID、owner subject、namespace object の binding |
 
 `CapabilityGrant` は `id`、`issuer`、`parent` を持たない。これらを外部 request に書かせず、すべての検査が成功した後で state が設定するためである。
 
@@ -116,9 +125,11 @@ Capability が存在する
 
 ## Revoke
 
-`revoke` は発行済み ID を `revoked` set に追加する。2回目以降も成功するが `AlreadyRevoked` を返し、set から取り除く transition はない。
+`revoke` は発行済み ID を `revoked` set に追加し、`auth_epoch` を1増やす。2回目以降も成功するが `AlreadyRevoked` を返し、set から取り除く transition も epoch を余分に進める処理もない。
 
 child 自身を `revoked` に複製して入れる必要はない。`is_effectively_active` と `authorizes` が親 link を root まで辿るため、祖先を1件 revoke すると全子孫が即座に inactive になる。Capability record と held relation は監査可能な履歴として残る。
+
+subject shutdown と open handle の transition は[Subject lifecycle と open handle](subject-lifecycle-and-handles.md)、commit 時の attempt/effect record は[Attempt / effect audit](audit-records.md)で詳しく説明する。
 
 ## どんな数学が効いているのか
 
@@ -143,7 +154,7 @@ leaf ≤ root
 
 ## どう検証しているか
 
-[`crates/authority-core/tests/capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) は、9個の契約 test で各成功・拒否 transition と error、失敗時の atomicity、祖先 revoke、ID 非再利用を確認する。`state.rs` 内には `u64::MAX` の最後の ID と exhaustion を確認する1 test がある。
+[`crates/authority-core/tests/capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) は、11個の契約 test で各成功・拒否 transition と error、失敗時の atomicity、祖先 revoke、Capability/handle ID 非再利用、subject shutdown を確認する。`state.rs` 内には `u64::MAX` の最後の Capability ID と、authorization epoch の wraparound 拒否を確認する2 test がある。
 
 [`crates/authority-core/tests/capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) は、1〜63操作の Derive/revoke 列を1,000 case 生成する。Rust state と独立した小さな参照モデルで各 transition の成否を比較し、毎回すべての発行済み Capability について次を再確認する。
 
@@ -157,11 +168,12 @@ leaf ≤ root
 
 ## 現在の境界
 
-このページの `CapabilityState` が実装するのは、1 thread 上で順番が確定した subject 登録、root 発行、Derive、保持確認、authorization、revoke と祖先失効である。並行利用では、この state を[Authorization guard](authorization-guard.md)の `CapabilityKernel` に入れる。
+このページの `CapabilityState` が実装するのは、1 thread 上で順番が確定した subject 登録、root 発行、Derive、保持確認、authorization、revoke と祖先失効、`auth_epoch`、subject lifecycle、open-handle registry である。並行利用では、この state を[Authorization guard](authorization-guard.md)の `CapabilityKernel` に入れる。
 
 まだ含まれないものは次のとおり。
 
-- attempt/effect log、open handle、subject lifecycle、`KillSubject`。
+- global namespace registry、実 fd、cgroup、mount を片付ける supervisor / capfs orchestration。
+- audit record の永続化と耐改ざん性。
 - supervisor の socket fd から caller identity を決める adapter。
 - File 以外の authority variant。
 
@@ -172,6 +184,8 @@ leaf ≤ root
 - [Capability envelope と委譲証明](capabilities.md)
 - [検証とテスト](verification.md)
 - [Effect commit と revoke の authorization guard](authorization-guard.md)
+- [Subject lifecycle と open handle](subject-lifecycle-and-handles.md)
+- [Attempt / effect audit](audit-records.md)
 - [状態機械と revoke の設計](../design/state-and-revocation.md)
 - [Capability モデル](../design/capability-model.md)
 - [検証戦略](../design/verification.md)

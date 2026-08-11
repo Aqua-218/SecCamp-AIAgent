@@ -76,6 +76,22 @@ impl PathPattern {
     }
 }
 
+/// Returns whether every path selected by `child` is also selected by `parent`.
+///
+/// An exact pattern can be below an equal exact pattern or a containing prefix.
+/// A prefix pattern can only be below another prefix because it always includes
+/// possible descendants beyond its own canonical path.
+#[must_use]
+pub fn path_below(child: &PathPattern, parent: &PathPattern) -> bool {
+    match (child, parent) {
+        (PathPattern::Exact(child), PathPattern::Exact(parent)) => child == parent,
+        (PathPattern::Exact(child) | PathPattern::Prefix(child), PathPattern::Prefix(parent)) => {
+            child.as_segments().starts_with(parent.as_segments())
+        }
+        (PathPattern::Prefix(_), PathPattern::Exact(_)) => false,
+    }
+}
+
 /// Describes why a repository path segment is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidPathSegmentReason {
@@ -162,7 +178,11 @@ fn validate_segment(index: usize, segment: &str) -> Result<(), InvalidPathSegmen
 
 #[cfg(test)]
 mod tests {
-    use super::{CanonicalPath, InvalidPathSegmentReason, PathPattern};
+    use super::{CanonicalPath, InvalidPathSegmentReason, PathPattern, path_below};
+
+    fn path(segments: &[&str]) -> CanonicalPath {
+        CanonicalPath::new(segments).expect("test paths must contain valid segments")
+    }
 
     #[test]
     fn canonical_path_preserves_valid_segments() {
@@ -229,5 +249,86 @@ mod tests {
 
         assert_eq!(exact.path(), &exact_path);
         assert_eq!(prefix.path(), &prefix_path);
+    }
+
+    #[test]
+    fn path_below_matches_pattern_set_inclusion() {
+        let cases = [
+            (
+                PathPattern::Exact(path(&["src", "main.rs"])),
+                PathPattern::Exact(path(&["src", "main.rs"])),
+                true,
+            ),
+            (
+                PathPattern::Exact(path(&["src", "main.rs"])),
+                PathPattern::Exact(path(&["src", "lib.rs"])),
+                false,
+            ),
+            (
+                PathPattern::Exact(path(&["src", "parser", "lexer.rs"])),
+                PathPattern::Prefix(path(&["src", "parser"])),
+                true,
+            ),
+            (
+                PathPattern::Exact(path(&["src", "main.rs"])),
+                PathPattern::Prefix(path(&["docs"])),
+                false,
+            ),
+            (
+                PathPattern::Prefix(path(&["src", "parser"])),
+                PathPattern::Prefix(path(&["src"])),
+                true,
+            ),
+            (
+                PathPattern::Prefix(path(&["src"])),
+                PathPattern::Prefix(path(&["src", "parser"])),
+                false,
+            ),
+            (
+                PathPattern::Prefix(path(&["src"])),
+                PathPattern::Prefix(path(&["docs"])),
+                false,
+            ),
+            (
+                PathPattern::Prefix(path(&["src"])),
+                PathPattern::Exact(path(&["src"])),
+                false,
+            ),
+            (
+                PathPattern::Exact(path(&["src", "main.rs"])),
+                PathPattern::Prefix(CanonicalPath::root()),
+                true,
+            ),
+            (
+                PathPattern::Exact(CanonicalPath::root()),
+                PathPattern::Prefix(path(&["src"])),
+                false,
+            ),
+            (
+                PathPattern::Prefix(CanonicalPath::root()),
+                PathPattern::Prefix(CanonicalPath::root()),
+                true,
+            ),
+            (
+                PathPattern::Prefix(CanonicalPath::root()),
+                PathPattern::Exact(CanonicalPath::root()),
+                false,
+            ),
+        ];
+
+        for (child, parent, expected) in cases {
+            assert_eq!(path_below(&child, &parent), expected);
+        }
+    }
+
+    #[test]
+    fn path_below_is_transitive_across_exact_and_prefix_patterns() {
+        let leaf = PathPattern::Exact(path(&["src", "parser", "lexer.rs"]));
+        let parser = PathPattern::Prefix(path(&["src", "parser"]));
+        let source = PathPattern::Prefix(path(&["src"]));
+
+        assert!(path_below(&leaf, &parser));
+        assert!(path_below(&parser, &source));
+        assert!(path_below(&leaf, &source));
     }
 }

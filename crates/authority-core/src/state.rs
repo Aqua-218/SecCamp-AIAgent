@@ -165,6 +165,28 @@ pub enum RevocationStatus {
     AlreadyRevoked,
 }
 
+/// Monotone version for cached authorization decisions.
+///
+/// A newly effective revocation advances this value. Cache users must include
+/// the observed epoch in their key and discard entries after it changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AuthorizationEpoch(u64);
+
+impl AuthorizationEpoch {
+    /// Returns the numeric session-local epoch.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
+
 /// A rejected subject-registration or capability-state transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityStateError {
@@ -193,6 +215,8 @@ pub enum CapabilityStateError {
     GrantExceedsEnvelope(SubjectId),
     /// The session-local capability ID sequence has no remaining values.
     CapabilityIdExhausted,
+    /// The authorization epoch cannot advance without wrapping.
+    AuthorizationEpochExhausted,
 }
 
 impl fmt::Display for CapabilityStateError {
@@ -235,6 +259,9 @@ impl fmt::Display for CapabilityStateError {
             Self::CapabilityIdExhausted => {
                 formatter.write_str("session-local capability ID sequence is exhausted")
             }
+            Self::AuthorizationEpochExhausted => {
+                formatter.write_str("session-local authorization epoch is exhausted")
+            }
         }
     }
 }
@@ -255,6 +282,7 @@ pub struct CapabilityState {
     held: BTreeMap<SubjectId, BTreeSet<CapId>>,
     revoked: BTreeSet<CapId>,
     issued_ids: BTreeSet<CapId>,
+    authorization_epoch: AuthorizationEpoch,
 }
 
 impl CapabilityState {
@@ -269,6 +297,7 @@ impl CapabilityState {
             held: BTreeMap::new(),
             revoked: BTreeSet::new(),
             issued_ids: BTreeSet::new(),
+            authorization_epoch: AuthorizationEpoch(0),
         }
     }
 
@@ -276,6 +305,12 @@ impl CapabilityState {
     #[must_use]
     pub const fn issuer(&self) -> &IssuerId {
         &self.issuer
+    }
+
+    /// Returns the version of the current authorization state.
+    #[must_use]
+    pub const fn authorization_epoch(&self) -> AuthorizationEpoch {
+        self.authorization_epoch
     }
 
     /// Registers a subject before capabilities may be issued to it.
@@ -400,11 +435,17 @@ impl CapabilityState {
             return Err(CapabilityStateError::UnknownCapability(capability.clone()));
         }
 
-        if self.revoked.insert(capability.clone()) {
-            Ok(RevocationStatus::NewlyRevoked)
-        } else {
-            Ok(RevocationStatus::AlreadyRevoked)
+        if self.revoked.contains(capability) {
+            return Ok(RevocationStatus::AlreadyRevoked);
         }
+
+        let next_epoch = self
+            .authorization_epoch
+            .checked_next()
+            .ok_or(CapabilityStateError::AuthorizationEpochExhausted)?;
+        self.revoked.insert(capability.clone());
+        self.authorization_epoch = next_epoch;
+        Ok(RevocationStatus::NewlyRevoked)
     }
 
     /// Returns whether this capability and every ancestor are active at `now`.
@@ -521,7 +562,7 @@ impl CapabilityState {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapabilityState, CapabilityStateError};
+    use super::{AuthorizationEpoch, CapabilityState, CapabilityStateError};
     use crate::capability::IssuerId;
 
     // Requirement: the final u64 sequence value is usable exactly once and no
@@ -539,6 +580,24 @@ mod tests {
         assert_eq!(
             state.allocate_capability_id(),
             Err(CapabilityStateError::CapabilityIdExhausted)
+        );
+    }
+
+    // Requirement: an authorization epoch must never wrap to a stale value.
+    // Category: numeric boundary. Risk: critical.
+    #[test]
+    fn authorization_epoch_stops_before_wraparound() {
+        let mut state = CapabilityState::new(IssuerId::new("session-issuer"));
+        state.authorization_epoch = AuthorizationEpoch(u64::MAX);
+
+        assert_eq!(
+            state.authorization_epoch.checked_next(),
+            None,
+            "the maximum epoch must not wrap"
+        );
+        assert_eq!(
+            CapabilityStateError::AuthorizationEpochExhausted.to_string(),
+            "session-local authorization epoch is exhausted"
         );
     }
 }

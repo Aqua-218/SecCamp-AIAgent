@@ -9,7 +9,10 @@ use std::sync::RwLock;
 
 use crate::{
     capability::{CapId, Capability, CapabilityRequest, SubjectId},
-    state::{CapabilityGrant, CapabilityState, CapabilityStateError, RevocationStatus, Subject},
+    state::{
+        AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
+        RevocationStatus, Subject,
+    },
     time::MonotonicTime,
 };
 
@@ -149,6 +152,20 @@ impl CapabilityKernel {
     /// panicked, or wraps the sequential revocation error.
     pub fn revoke(&self, capability: &CapId) -> Result<RevocationStatus, CapabilityKernelError> {
         self.with_state_mut(|state| state.revoke(capability))
+    }
+
+    /// Returns the current version for authorization-dependent caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
+    /// panicked while mutating the capability state.
+    pub fn authorization_epoch(&self) -> Result<AuthorizationEpoch, CapabilityKernelError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| CapabilityKernelError::LockPoisoned)?;
+        Ok(state.authorization_epoch())
     }
 
     /// Reauthorizes an effect and executes it through its linearization point.

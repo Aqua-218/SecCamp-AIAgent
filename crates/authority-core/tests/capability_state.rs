@@ -12,8 +12,8 @@ use authority_core::{
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     state::{
-        CapabilityGrant, CapabilityState, CapabilityStateError, RevocationStatus,
-        StaticAuthorityEnvelope, Subject,
+        AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
+        RevocationStatus, StaticAuthorityEnvelope, Subject,
     },
     time::{MonotonicTime, TimeWindow},
 };
@@ -473,6 +473,7 @@ fn authorization_rejects_copied_expired_and_out_of_scope_capabilities() {
 #[test]
 fn ancestor_revocation_invalidates_descendants_and_never_reuses_ids() {
     let mut state = state_with_subjects();
+    assert_eq!(state.authorization_epoch(), AuthorizationEpoch::default());
     let root_id = state
         .issue_root(root_grant(true))
         .expect("root issuance must succeed");
@@ -484,10 +485,12 @@ fn ancestor_revocation_invalidates_descendants_and_never_reuses_ids() {
         .expect("leaf derivation must succeed");
 
     assert_eq!(state.revoke(&child_id), Ok(RevocationStatus::NewlyRevoked));
+    assert_eq!(state.authorization_epoch().as_u64(), 1);
     assert_eq!(
         state.revoke(&child_id),
         Ok(RevocationStatus::AlreadyRevoked)
     );
+    assert_eq!(state.authorization_epoch().as_u64(), 1);
     assert!(state.is_revoked(&child_id));
     assert!(state.is_effectively_active(&root_id, time(40)));
     assert!(!state.is_effectively_active(&child_id, time(40)));

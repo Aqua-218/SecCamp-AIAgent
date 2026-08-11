@@ -14,8 +14,8 @@ use authority_core::{
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     state::{
-        CapabilityGrant, CapabilityState, CapabilityStateError, RevocationStatus,
-        StaticAuthorityEnvelope, Subject,
+        AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
+        RevocationStatus, StaticAuthorityEnvelope, Subject,
     },
     time::{MonotonicTime, TimeWindow},
 };
@@ -261,7 +261,15 @@ fn ancestor_revoke_prevents_every_later_executor_call() {
         .expect("child derivation must succeed before revoke");
     let executor_calls = Cell::new(0_u8);
 
+    assert_eq!(
+        kernel.authorization_epoch(),
+        Ok(AuthorizationEpoch::default())
+    );
     assert_eq!(kernel.revoke(&root_id), Ok(RevocationStatus::NewlyRevoked));
+    assert_eq!(
+        kernel.authorization_epoch().map(AuthorizationEpoch::as_u64),
+        Ok(1)
+    );
     let result = kernel.authorize_and_commit(
         &child_subject_id(),
         &child_id,
@@ -277,5 +285,9 @@ fn ancestor_revoke_prevents_every_later_executor_call() {
     assert_eq!(
         kernel.revoke(&root_id),
         Ok(RevocationStatus::AlreadyRevoked)
+    );
+    assert_eq!(
+        kernel.authorization_epoch().map(AuthorizationEpoch::as_u64),
+        Ok(1)
     );
 }

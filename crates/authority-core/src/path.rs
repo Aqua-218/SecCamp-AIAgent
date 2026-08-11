@@ -1,0 +1,233 @@
+//! Canonical repository paths and path authority patterns.
+
+use std::{error::Error, fmt};
+
+/// A repository-relative path represented as validated segments.
+///
+/// The empty path denotes the repository root. Non-empty paths can only be
+/// created when every segment is safe for capability comparisons.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanonicalPath {
+    segments: Vec<String>,
+}
+
+impl CanonicalPath {
+    /// Creates the canonical path for the repository root.
+    #[must_use]
+    pub const fn root() -> Self {
+        Self {
+            segments: Vec::new(),
+        }
+    }
+
+    /// Creates a canonical path from repository-relative segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPathSegment`] for the first segment that is empty,
+    /// equals `.` or `..`, or contains `/`, NUL, or `*`.
+    pub fn new<I, S>(segments: I) -> Result<Self, InvalidPathSegment>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let segments = segments
+            .into_iter()
+            .enumerate()
+            .map(|(index, segment)| {
+                let segment = segment.as_ref();
+                validate_segment(index, segment)?;
+                Ok(segment.to_owned())
+            })
+            .collect::<Result<Vec<_>, InvalidPathSegment>>()?;
+
+        Ok(Self { segments })
+    }
+
+    /// Returns the validated path segments in order.
+    #[must_use]
+    pub const fn as_segments(&self) -> &[String] {
+        self.segments.as_slice()
+    }
+
+    /// Returns whether this path denotes the repository root.
+    #[must_use]
+    pub const fn is_root(&self) -> bool {
+        self.segments.is_empty()
+    }
+}
+
+/// A path selector used by file authorities.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PathPattern {
+    /// Selects exactly one canonical path.
+    Exact(CanonicalPath),
+    /// Selects a canonical path and every path below it.
+    Prefix(CanonicalPath),
+}
+
+impl PathPattern {
+    /// Returns the canonical path carried by this pattern.
+    #[must_use]
+    pub const fn path(&self) -> &CanonicalPath {
+        match self {
+            Self::Exact(path) | Self::Prefix(path) => path,
+        }
+    }
+}
+
+/// Describes why a repository path segment is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidPathSegmentReason {
+    /// The segment is empty.
+    Empty,
+    /// The segment is `.`.
+    CurrentDirectory,
+    /// The segment is `..`.
+    ParentDirectory,
+    /// The segment contains `/`.
+    ContainsSeparator,
+    /// The segment contains a NUL character.
+    ContainsNul,
+    /// The segment contains `*`.
+    ContainsWildcard,
+}
+
+impl fmt::Display for InvalidPathSegmentReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let expectation = match self {
+            Self::Empty => "must not be empty",
+            Self::CurrentDirectory => "must not be `.`",
+            Self::ParentDirectory => "must not be `..`",
+            Self::ContainsSeparator => "must not contain `/`",
+            Self::ContainsNul => "must not contain NUL",
+            Self::ContainsWildcard => "must not contain `*`",
+        };
+        formatter.write_str(expectation)
+    }
+}
+
+/// Reports the position and reason for an invalid repository path segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidPathSegment {
+    index: usize,
+    reason: InvalidPathSegmentReason,
+}
+
+impl InvalidPathSegment {
+    /// Returns the zero-based index of the invalid segment.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.index
+    }
+
+    /// Returns why the segment is invalid.
+    #[must_use]
+    pub const fn reason(self) -> InvalidPathSegmentReason {
+        self.reason
+    }
+}
+
+impl fmt::Display for InvalidPathSegment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid repository path segment at index {}: segment {}",
+            self.index, self.reason
+        )
+    }
+}
+
+impl Error for InvalidPathSegment {}
+
+fn validate_segment(index: usize, segment: &str) -> Result<(), InvalidPathSegment> {
+    let reason = if segment.is_empty() {
+        InvalidPathSegmentReason::Empty
+    } else if segment == "." {
+        InvalidPathSegmentReason::CurrentDirectory
+    } else if segment == ".." {
+        InvalidPathSegmentReason::ParentDirectory
+    } else if segment.contains('/') {
+        InvalidPathSegmentReason::ContainsSeparator
+    } else if segment.contains('\0') {
+        InvalidPathSegmentReason::ContainsNul
+    } else if segment.contains('*') {
+        InvalidPathSegmentReason::ContainsWildcard
+    } else {
+        return Ok(());
+    };
+
+    Err(InvalidPathSegment { index, reason })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CanonicalPath, InvalidPathSegmentReason, PathPattern};
+
+    #[test]
+    fn canonical_path_preserves_valid_segments() {
+        let path = CanonicalPath::new(["src", "parser", "lexer.rs"])
+            .expect("valid segments should create a canonical path");
+
+        assert_eq!(path.as_segments(), ["src", "parser", "lexer.rs"]);
+        assert!(!path.is_root());
+    }
+
+    #[test]
+    fn canonical_path_allows_repository_root() {
+        let from_empty_segments = CanonicalPath::new(std::iter::empty::<&str>())
+            .expect("an empty path should denote the repository root");
+
+        assert_eq!(from_empty_segments, CanonicalPath::root());
+        assert!(from_empty_segments.is_root());
+    }
+
+    #[test]
+    fn canonical_path_rejects_every_invalid_segment_class() {
+        let invalid_segments = [
+            ("", InvalidPathSegmentReason::Empty),
+            (".", InvalidPathSegmentReason::CurrentDirectory),
+            ("..", InvalidPathSegmentReason::ParentDirectory),
+            (
+                "parser/lexer.rs",
+                InvalidPathSegmentReason::ContainsSeparator,
+            ),
+            ("secret\0name", InvalidPathSegmentReason::ContainsNul),
+            ("*.rs", InvalidPathSegmentReason::ContainsWildcard),
+        ];
+
+        for (segment, expected_reason) in invalid_segments {
+            let error = CanonicalPath::new(["src", segment, "output"])
+                .expect_err("an invalid segment must reject the whole path");
+
+            assert_eq!(error.index(), 1);
+            assert_eq!(error.reason(), expected_reason);
+        }
+    }
+
+    #[test]
+    fn canonical_path_reports_the_first_invalid_segment() {
+        let error = CanonicalPath::new(["src/main.rs", "*"])
+            .expect_err("validation should stop at the first invalid segment");
+
+        assert_eq!(error.index(), 0);
+        assert_eq!(error.reason(), InvalidPathSegmentReason::ContainsSeparator);
+        assert_eq!(
+            error.to_string(),
+            "invalid repository path segment at index 0: segment must not contain `/`"
+        );
+    }
+
+    #[test]
+    fn path_patterns_retain_their_canonical_paths() {
+        let exact_path = CanonicalPath::new(["src", "main.rs"])
+            .expect("valid segments should create a canonical path");
+        let prefix_path = CanonicalPath::new(["src", "parser"])
+            .expect("valid segments should create a canonical path");
+        let exact = PathPattern::Exact(exact_path.clone());
+        let prefix = PathPattern::Prefix(prefix_path.clone());
+
+        assert_eq!(exact.path(), &exact_path);
+        assert_eq!(prefix.path(), &prefix_path);
+    }
+}

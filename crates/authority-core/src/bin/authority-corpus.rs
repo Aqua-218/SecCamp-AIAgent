@@ -419,6 +419,17 @@ mod tests {
         assert!(error.contains("missing path at field 4"));
     }
 
+    // Category: boundary/error. Mutation target: accepting ticks outside Rust's u64 domain.
+    #[test]
+    fn corpus_rejects_a_tick_above_the_u64_maximum() {
+        let input =
+            format!("{CORPUS_HEADER}\ntime_valid\toverflow\ttrue\t0\t18446744073709551616\n");
+
+        let error = evaluate_corpus(&input).expect_err("out-of-domain ticks must fail closed");
+
+        assert!(error.contains("expected u64 ticks"));
+    }
+
     // Category: contract. Mutation target: two implementations agreeing on the wrong answer.
     #[test]
     fn corpus_rejects_a_result_that_disagrees_with_the_oracle() {

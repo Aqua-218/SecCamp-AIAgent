@@ -12,8 +12,11 @@ use std::{
 
 use authority_core::path::CanonicalPath;
 use capfs::{
-    backing::{PreflightLimits, RejectedObjectKind, RepositoryPreflightError, ValidatedRepository},
-    namespace::NamespaceObjectKind,
+    backing::{
+        ImportedRepository, PreflightLimits, RejectedObjectKind, RepositoryPreflightError,
+        RepositoryStartupError, ValidatedRepository,
+    },
+    namespace::{NamespaceGeneration, NamespaceObjectKind},
 };
 use rustix::fs::{Dir, FileType, fstat};
 use tempfile::TempDir;
@@ -94,6 +97,71 @@ fn preflight_accepts_a_link_free_tree_and_keeps_the_root_fd() {
         entries >= 4,
         "directory stream includes dot entries and repository objects"
     );
+}
+
+// Requirement: startup publishes one complete registry whose stable object IDs
+// correspond to the validated manifest order. Category: startup/atomicity. Risk: critical.
+#[test]
+fn startup_imports_the_complete_manifest_with_registry_assigned_ids() {
+    let repository = TempDir::new().expect("test repository should be creatable");
+    fs::create_dir(repository.path().join("src")).expect("source directory should be creatable");
+    write_file(repository.path().join("README.md"), b"readme");
+    write_file(repository.path().join("src/lib.rs"), b"pub fn run() {}");
+
+    let imported = ImportedRepository::open(repository.path(), limits(8, 3))
+        .expect("link-free tree should import atomically");
+    let expected = [
+        (CanonicalPath::root(), NamespaceObjectKind::Directory),
+        (path(&["README.md"]), NamespaceObjectKind::RegularFile),
+        (path(&["src"]), NamespaceObjectKind::Directory),
+        (path(&["src", "lib.rs"]), NamespaceObjectKind::RegularFile),
+    ];
+
+    assert_eq!(imported.namespace().object_count(), Ok(expected.len()));
+    assert_eq!(
+        imported
+            .namespace()
+            .generation()
+            .map(NamespaceGeneration::as_u64),
+        Ok(0)
+    );
+    for (sequence, (object_path, kind)) in expected.iter().enumerate() {
+        let object = imported
+            .namespace()
+            .object_at_path_snapshot(object_path)
+            .expect("imported registry should be readable")
+            .expect("every manifest path should be imported");
+        assert_eq!(object.id().as_str(), format!("object-{sequence}"));
+        assert_eq!(object.kind(), *kind);
+    }
+    assert_eq!(imported.backing().canonical_root(), repository.path());
+    assert_eq!(
+        FileType::from_raw_mode(
+            fstat(imported.backing().as_fd())
+                .expect("imported root fd should remain valid")
+                .st_mode
+        ),
+        FileType::Directory
+    );
+}
+
+// Requirement: an invalid backing tree returns no partially initialized
+// namespace owner. Category: startup/atomicity. Risk: critical.
+#[test]
+fn startup_propagates_preflight_failure_before_namespace_publication() {
+    let repository = TempDir::new().expect("test repository should be creatable");
+    symlink("outside", repository.path().join("entry-link"))
+        .expect("entry symlink should be creatable");
+
+    assert!(matches!(
+        ImportedRepository::open(repository.path(), limits(4, 1)),
+        Err(RepositoryStartupError::Preflight(
+            RepositoryPreflightError::UnsupportedObject {
+                kind: RejectedObjectKind::Symlink,
+                ..
+            }
+        ))
+    ));
 }
 
 // Requirement: neither the configured root nor any entry may be a symlink.

@@ -19,7 +19,7 @@ use rustix::{
     io::fcntl_dupfd_cloexec,
 };
 
-use crate::namespace::NamespaceObjectKind;
+use crate::namespace::{NamespaceError, NamespaceObjectKind, NamespaceRegistry};
 
 /// Resource bounds applied while validating an untrusted repository tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -254,6 +254,47 @@ impl Error for RepositoryPreflightError {
     }
 }
 
+/// A failed repository validation or atomic namespace import.
+#[derive(Debug)]
+pub enum RepositoryStartupError {
+    /// The backing tree did not satisfy the link-free repository contract.
+    Preflight(RepositoryPreflightError),
+    /// The validated manifest could not initialize the namespace registry.
+    Namespace(NamespaceError),
+}
+
+impl fmt::Display for RepositoryStartupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preflight(error) => write!(formatter, "repository preflight failed: {error}"),
+            Self::Namespace(error) => {
+                write!(formatter, "repository namespace import failed: {error}")
+            }
+        }
+    }
+}
+
+impl Error for RepositoryStartupError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Preflight(error) => Some(error),
+            Self::Namespace(error) => Some(error),
+        }
+    }
+}
+
+impl From<RepositoryPreflightError> for RepositoryStartupError {
+    fn from(error: RepositoryPreflightError) -> Self {
+        Self::Preflight(error)
+    }
+}
+
+impl From<NamespaceError> for RepositoryStartupError {
+    fn from(error: NamespaceError) -> Self {
+        Self::Namespace(error)
+    }
+}
+
 /// An opened repository root that passed the initial link-free preflight.
 ///
 /// The owned directory fd is the anchor for later `openat2` operations. The
@@ -265,6 +306,69 @@ pub struct ValidatedRepository {
     canonical_root: PathBuf,
     root_mount_id: u64,
     entries: Vec<RepositoryEntry>,
+}
+
+/// A validated backing root and its atomically initialized namespace registry.
+///
+/// Keeping both values under one owner prevents an adapter from accidentally
+/// pairing a manifest-derived registry with a different backing directory fd.
+#[derive(Debug)]
+pub struct ImportedRepository {
+    backing: ValidatedRepository,
+    namespace: NamespaceRegistry,
+}
+
+impl ImportedRepository {
+    /// Validates a link-free backing tree and imports its complete manifest.
+    ///
+    /// Object identities are assigned in deterministic manifest order and are
+    /// never derived from paths, so later rename operations do not change them.
+    /// The registry is returned only after every manifest entry is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryStartupError`] when preflight rejects the backing
+    /// tree or the complete manifest cannot initialize one namespace registry.
+    pub fn open(
+        root: impl AsRef<Path>,
+        limits: PreflightLimits,
+    ) -> Result<Self, RepositoryStartupError> {
+        Self::from_validated(ValidatedRepository::open(root, limits)?)
+    }
+
+    /// Atomically imports a repository that already passed preflight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryStartupError::Namespace`] if the validated manifest
+    /// cannot initialize a complete namespace registry.
+    pub fn from_validated(backing: ValidatedRepository) -> Result<Self, RepositoryStartupError> {
+        let namespace = NamespaceRegistry::from_manifest(
+            backing
+                .entries()
+                .iter()
+                .map(|entry| (entry.path().clone(), entry.kind())),
+        )?;
+        Ok(Self { backing, namespace })
+    }
+
+    /// Returns the validated backing root and its owned directory fd.
+    #[must_use]
+    pub const fn backing(&self) -> &ValidatedRepository {
+        &self.backing
+    }
+
+    /// Returns the registry initialized from this backing root's manifest.
+    #[must_use]
+    pub const fn namespace(&self) -> &NamespaceRegistry {
+        &self.namespace
+    }
+
+    /// Separates the backing root and namespace for transfer into an adapter.
+    #[must_use]
+    pub fn into_parts(self) -> (ValidatedRepository, NamespaceRegistry) {
+        (self.backing, self.namespace)
+    }
 }
 
 impl ValidatedRepository {

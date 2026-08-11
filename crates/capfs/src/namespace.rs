@@ -1,7 +1,7 @@
 //! VM-wide namespace identity, path, generation, and open-count state.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     error::Error,
     fmt,
     sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -9,12 +9,20 @@ use std::{
 
 use authority_core::{handle::ObjectId, path::CanonicalPath};
 
+const ROOT_OBJECT_SEQUENCE: u64 = 0;
+
+fn object_id(sequence: u64) -> ObjectId {
+    // Object identities deliberately carry no path material, so rename cannot
+    // alter or accidentally rebind the identity used by open handles.
+    ObjectId::new(format!("object-{sequence}"))
+}
+
 /// A monotone version of the shared namespace path mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NamespaceGeneration(u64);
 
 impl NamespaceGeneration {
-    /// Returns the initial generation assigned to a registry containing only root.
+    /// Returns the generation assigned to a complete initial namespace snapshot.
     #[must_use]
     pub const fn initial() -> Self {
         Self(0)
@@ -50,6 +58,37 @@ pub struct NamespaceObject {
     path: CanonicalPath,
     kind: NamespaceObjectKind,
     open_handle_count: u64,
+}
+
+/// The committed result of creating one namespace object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceObjectCreation<T> {
+    object: ObjectId,
+    value: T,
+}
+
+impl<T> NamespaceObjectCreation<T> {
+    const fn new(object: ObjectId, value: T) -> Self {
+        Self { object, value }
+    }
+
+    /// Returns the fresh session-local identity assigned to the object.
+    #[must_use]
+    pub const fn object(&self) -> &ObjectId {
+        &self.object
+    }
+
+    /// Returns the backing executor's committed result.
+    #[must_use]
+    pub const fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Separates the fresh object identity from the executor result.
+    #[must_use]
+    pub fn into_parts(self) -> (ObjectId, T) {
+        (self.object, self.value)
+    }
 }
 
 impl NamespaceObject {
@@ -148,8 +187,10 @@ impl RenamePlan {
 pub enum NamespaceError {
     /// The registry lock was poisoned by a panicking writer.
     LockPoisoned,
-    /// An object identity was already used earlier in this VM session.
-    ObjectIdAlreadyIssued(ObjectId),
+    /// A startup manifest does not begin with exactly one directory root.
+    InvalidManifestRoot,
+    /// The session-local object identity sequence has no remaining values.
+    ObjectIdExhausted,
     /// A live object already owns the requested path.
     PathOccupied(CanonicalPath),
     /// No live object has the requested identity.
@@ -182,8 +223,11 @@ impl fmt::Display for NamespaceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LockPoisoned => formatter.write_str("namespace registry lock is poisoned"),
-            Self::ObjectIdAlreadyIssued(object) => {
-                write!(formatter, "namespace object `{object}` was already issued")
+            Self::InvalidManifestRoot => {
+                formatter.write_str("namespace manifest must begin with one directory root")
+            }
+            Self::ObjectIdExhausted => {
+                formatter.write_str("session-local namespace object ID sequence is exhausted")
             }
             Self::PathOccupied(path) => {
                 write!(
@@ -286,25 +330,38 @@ impl<E: Error + 'static> Error for NamespaceOperationError<E> {
 struct NamespaceState {
     objects: BTreeMap<ObjectId, NamespaceObject>,
     paths: HashMap<CanonicalPath, ObjectId>,
-    issued_ids: BTreeSet<ObjectId>,
+    next_object_sequence: Option<u64>,
     generation: NamespaceGeneration,
 }
 
 impl NamespaceState {
+    fn with_root() -> Self {
+        let root = object_id(ROOT_OBJECT_SEQUENCE);
+        let root_object = NamespaceObject::new(
+            root.clone(),
+            CanonicalPath::root(),
+            NamespaceObjectKind::Directory,
+        );
+        let mut objects = BTreeMap::new();
+        objects.insert(root.clone(), root_object);
+        let mut paths = HashMap::new();
+        paths.insert(CanonicalPath::root(), root);
+
+        Self {
+            objects,
+            paths,
+            next_object_sequence: ROOT_OBJECT_SEQUENCE.checked_add(1),
+            generation: NamespaceGeneration::initial(),
+        }
+    }
+
     fn next_generation(&self) -> Result<NamespaceGeneration, NamespaceError> {
         self.generation
             .checked_next()
             .ok_or(NamespaceError::NamespaceGenerationExhausted)
     }
 
-    fn validate_new_object(
-        &self,
-        object: &ObjectId,
-        path: &CanonicalPath,
-    ) -> Result<(), NamespaceError> {
-        if self.issued_ids.contains(object) {
-            return Err(NamespaceError::ObjectIdAlreadyIssued(object.clone()));
-        }
+    fn validate_new_path(&self, path: &CanonicalPath) -> Result<(), NamespaceError> {
         if self.paths.contains_key(path) {
             return Err(NamespaceError::PathOccupied(path.clone()));
         }
@@ -327,10 +384,23 @@ impl NamespaceState {
         Ok(())
     }
 
-    fn insert_object(&mut self, object: NamespaceObject) {
+    fn allocate_object(
+        &mut self,
+        path: CanonicalPath,
+        kind: NamespaceObjectKind,
+    ) -> Result<NamespaceObject, NamespaceError> {
+        let sequence = self
+            .next_object_sequence
+            .ok_or(NamespaceError::ObjectIdExhausted)?;
+        let object_id = object_id(sequence);
+        if self.objects.contains_key(&object_id) {
+            return Err(NamespaceError::InvariantViolation);
+        }
+        self.next_object_sequence = sequence.checked_add(1);
+        let object = NamespaceObject::new(object_id, path, kind);
         self.paths.insert(object.path.clone(), object.id.clone());
-        self.issued_ids.insert(object.id.clone());
-        self.objects.insert(object.id.clone(), object);
+        self.objects.insert(object.id.clone(), object.clone());
+        Ok(object)
     }
 }
 
@@ -348,30 +418,41 @@ pub struct NamespaceRegistry {
     state: RwLock<NamespaceState>,
 }
 
+impl Default for NamespaceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NamespaceRegistry {
     /// Creates a registry with one directory object at the repository root.
     #[must_use]
-    pub fn new(root: ObjectId) -> Self {
-        let root_object = NamespaceObject::new(
-            root.clone(),
-            CanonicalPath::root(),
-            NamespaceObjectKind::Directory,
-        );
-        let mut objects = BTreeMap::new();
-        objects.insert(root.clone(), root_object);
-        let mut paths = HashMap::new();
-        paths.insert(CanonicalPath::root(), root.clone());
-        let mut issued_ids = BTreeSet::new();
-        issued_ids.insert(root);
-
+    pub fn new() -> Self {
         Self {
-            state: RwLock::new(NamespaceState {
-                objects,
-                paths,
-                issued_ids,
-                generation: NamespaceGeneration::initial(),
-            }),
+            state: RwLock::new(NamespaceState::with_root()),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_manifest(
+        entries: impl IntoIterator<Item = (CanonicalPath, NamespaceObjectKind)>,
+    ) -> Result<Self, NamespaceError> {
+        let mut entries = entries.into_iter();
+        let Some((root_path, root_kind)) = entries.next() else {
+            return Err(NamespaceError::InvalidManifestRoot);
+        };
+        if !root_path.is_root() || root_kind != NamespaceObjectKind::Directory {
+            return Err(NamespaceError::InvalidManifestRoot);
+        }
+
+        let mut state = NamespaceState::with_root();
+        for (path, kind) in entries {
+            state.validate_new_path(&path)?;
+            state.allocate_object(path, kind)?;
+        }
+        Ok(Self {
+            state: RwLock::new(state),
+        })
     }
 
     /// Returns the current namespace generation.
@@ -422,29 +503,6 @@ impl NamespaceRegistry {
             .get(path)
             .and_then(|object| state.objects.get(object))
             .cloned())
-    }
-
-    /// Registers an object that already exists in a validated backing tree.
-    ///
-    /// This method is intended for startup import before the registry is exposed
-    /// to workloads. Runtime creation must use [`Self::create_object`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a reused ID, occupied path, missing directory parent,
-    /// exhausted generation, or poisoned registry.
-    pub fn register_existing_object(
-        &self,
-        object: ObjectId,
-        path: CanonicalPath,
-        kind: NamespaceObjectKind,
-    ) -> Result<(), NamespaceError> {
-        let mut state = self.write_state()?;
-        state.validate_new_object(&object, &path)?;
-        let next_generation = state.next_generation()?;
-        state.insert_object(NamespaceObject::new(object, path, kind));
-        state.generation = next_generation;
-        Ok(())
     }
 
     /// Executes an object operation while its current path is protected from rename.
@@ -538,28 +596,30 @@ impl NamespaceRegistry {
 
     /// Creates an object and publishes it only after the backing executor succeeds.
     ///
+    /// The registry stages a path-independent object identity and returns it only
+    /// after `operation` commits. Executor failure leaves that identity unissued.
+    ///
     /// # Errors
     ///
-    /// Returns an error for a reused ID, occupied path, invalid parent, exhausted
-    /// generation, poisoned registry, or backing operation failure.
+    /// Returns an error for an occupied path, invalid parent, exhausted object
+    /// identity or generation, poisoned registry, or backing operation failure.
     pub fn create_object<T, E>(
         &self,
-        object: ObjectId,
         path: CanonicalPath,
         kind: NamespaceObjectKind,
         operation: impl FnOnce(&NamespaceObject) -> Result<T, E>,
-    ) -> Result<T, NamespaceOperationError<E>> {
+    ) -> Result<NamespaceObjectCreation<T>, NamespaceOperationError<E>> {
         let mut state = self.write_state()?;
-        state.validate_new_object(&object, &path)?;
+        state.validate_new_path(&path)?;
         let next_generation = state.next_generation()?;
-        let object_record = NamespaceObject::new(object, path, kind);
         let mut next_state = state.clone();
-        next_state.insert_object(object_record.clone());
+        let object_record = next_state.allocate_object(path, kind)?;
         next_state.generation = next_generation;
 
         let result = operation(&object_record).map_err(NamespaceOperationError::Executor)?;
+        let object_id = object_record.id.clone();
         *state = next_state;
-        Ok(result)
+        Ok(NamespaceObjectCreation::new(object_id, result))
     }
 
     /// Removes an empty, unopened object after the backing executor succeeds.
@@ -719,7 +779,7 @@ mod tests {
         panic::{AssertUnwindSafe, catch_unwind},
     };
 
-    use authority_core::{handle::ObjectId, path::CanonicalPath};
+    use authority_core::path::CanonicalPath;
 
     use super::{
         NamespaceError, NamespaceGeneration, NamespaceObjectKind, NamespaceOperationError,
@@ -732,7 +792,7 @@ mod tests {
 
     #[test]
     fn generation_exhaustion_rejects_before_executor() {
-        let registry = NamespaceRegistry::new(ObjectId::new("root"));
+        let registry = NamespaceRegistry::new();
         registry
             .state
             .write()
@@ -740,15 +800,11 @@ mod tests {
             .generation = NamespaceGeneration(u64::MAX);
         let mut executor_called = false;
 
-        let result = registry.create_object(
-            ObjectId::new("file"),
-            path(&["file"]),
-            NamespaceObjectKind::RegularFile,
-            |_| {
+        let result =
+            registry.create_object(path(&["file"]), NamespaceObjectKind::RegularFile, |_| {
                 executor_called = true;
                 Ok::<_, Infallible>(())
-            },
-        );
+            });
 
         assert_eq!(
             result,
@@ -762,15 +818,14 @@ mod tests {
 
     #[test]
     fn open_count_exhaustion_rejects_before_executor() {
-        let file = ObjectId::new("file");
-        let registry = NamespaceRegistry::new(ObjectId::new("root"));
-        registry
-            .register_existing_object(
-                file.clone(),
-                path(&["file"]),
-                NamespaceObjectKind::RegularFile,
-            )
-            .expect("test file should register");
+        let registry = NamespaceRegistry::new();
+        let file = registry
+            .create_object(path(&["file"]), NamespaceObjectKind::RegularFile, |_| {
+                Ok::<_, Infallible>(())
+            })
+            .expect("test file should register")
+            .object()
+            .clone();
         registry
             .state
             .write()
@@ -796,11 +851,71 @@ mod tests {
     }
 
     #[test]
+    fn object_id_sequence_accepts_its_last_value_then_rejects() {
+        let registry = NamespaceRegistry::new();
+        registry
+            .state
+            .write()
+            .expect("test registry must be writable")
+            .next_object_sequence = Some(u64::MAX);
+        let last_object = registry
+            .create_object(path(&["last"]), NamespaceObjectKind::RegularFile, |_| {
+                Ok::<_, Infallible>(())
+            })
+            .expect("the final object ID should remain usable");
+        assert_eq!(
+            last_object.object().as_str(),
+            format!("object-{}", u64::MAX)
+        );
+        let mut executor_called = false;
+
+        let result =
+            registry.create_object(path(&["next"]), NamespaceObjectKind::RegularFile, |_| {
+                executor_called = true;
+                Ok::<_, Infallible>(())
+            });
+
+        assert_eq!(
+            result,
+            Err(NamespaceOperationError::Namespace(
+                NamespaceError::ObjectIdExhausted
+            ))
+        );
+        assert!(!executor_called);
+        assert_eq!(registry.object_count(), Ok(2));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn manifest_import_rejects_an_invalid_root_or_missing_parent() {
+        assert!(matches!(
+            NamespaceRegistry::from_manifest([]),
+            Err(NamespaceError::InvalidManifestRoot)
+        ));
+        assert!(matches!(
+            NamespaceRegistry::from_manifest([(
+                CanonicalPath::root(),
+                NamespaceObjectKind::RegularFile,
+            )]),
+            Err(NamespaceError::InvalidManifestRoot)
+        ));
+        assert!(matches!(
+            NamespaceRegistry::from_manifest([
+                (CanonicalPath::root(), NamespaceObjectKind::Directory),
+                (
+                    path(&["missing", "child"]),
+                    NamespaceObjectKind::RegularFile,
+                ),
+            ]),
+            Err(NamespaceError::MissingParent(parent)) if parent == path(&["missing"])
+        ));
+    }
+
+    #[test]
     fn writer_panic_poisons_every_later_registry_operation() {
-        let registry = NamespaceRegistry::new(ObjectId::new("root"));
+        let registry = NamespaceRegistry::new();
         let panic_result = catch_unwind(AssertUnwindSafe(|| {
             let _ = registry.create_object(
-                ObjectId::new("file"),
                 path(&["file"]),
                 NamespaceObjectKind::RegularFile,
                 |_| -> Result<(), Infallible> { panic!("simulated backing panic") },

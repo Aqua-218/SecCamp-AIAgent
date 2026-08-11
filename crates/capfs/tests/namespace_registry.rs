@@ -34,64 +34,68 @@ fn path(segments: &[&str]) -> CanonicalPath {
     CanonicalPath::new(segments).expect("test paths must be canonical")
 }
 
-fn registry_with_source_tree() -> NamespaceRegistry {
-    let registry = NamespaceRegistry::new(ObjectId::new("root"));
+fn create_object(
+    registry: &NamespaceRegistry,
+    object_path: CanonicalPath,
+    kind: NamespaceObjectKind,
+) -> ObjectId {
     registry
-        .register_existing_object(
-            ObjectId::new("src"),
-            path(&["src"]),
-            NamespaceObjectKind::Directory,
-        )
-        .expect("source directory should register");
-    registry
-        .register_existing_object(
-            ObjectId::new("parser"),
-            path(&["src", "parser"]),
-            NamespaceObjectKind::Directory,
-        )
-        .expect("parser directory should register");
-    registry
-        .register_existing_object(
-            ObjectId::new("lexer"),
-            path(&["src", "parser", "lexer.rs"]),
-            NamespaceObjectKind::RegularFile,
-        )
-        .expect("lexer file should register");
-    registry
-        .register_existing_object(
-            ObjectId::new("lib"),
-            path(&["lib"]),
-            NamespaceObjectKind::Directory,
-        )
-        .expect("destination parent should register");
-    registry
+        .create_object(object_path, kind, |_| Ok::<_, Infallible>(()))
+        .expect("test namespace object should be creatable")
+        .object()
+        .clone()
 }
 
-// Requirement: every live object has exactly one canonical path, and neither
-// object IDs nor live paths can be reused. Category: namespace/security. Risk: critical.
+struct SourceTree {
+    registry: NamespaceRegistry,
+    parser: ObjectId,
+    lexer: ObjectId,
+}
+
+fn registry_with_source_tree() -> SourceTree {
+    let registry = NamespaceRegistry::new();
+    create_object(&registry, path(&["src"]), NamespaceObjectKind::Directory);
+    let parser = create_object(
+        &registry,
+        path(&["src", "parser"]),
+        NamespaceObjectKind::Directory,
+    );
+    let lexer = create_object(
+        &registry,
+        path(&["src", "parser", "lexer.rs"]),
+        NamespaceObjectKind::RegularFile,
+    );
+    create_object(&registry, path(&["lib"]), NamespaceObjectKind::Directory);
+    SourceTree {
+        registry,
+        parser,
+        lexer,
+    }
+}
+
+// Requirement: every live object has exactly one canonical path, and object
+// identities come only from the registry. Category: namespace/security. Risk: critical.
 #[test]
 fn registry_enforces_unique_paths_parents_and_object_ids() {
-    let registry = NamespaceRegistry::new(ObjectId::new("root"));
-    let source_id = ObjectId::new("source");
+    let registry = NamespaceRegistry::new();
     let source_path = path(&["src"]);
 
     assert_eq!(
         registry.generation().map(NamespaceGeneration::as_u64),
         Ok(0)
     );
-    assert_eq!(
-        registry.create_object(
-            source_id.clone(),
+    let creation = registry
+        .create_object(
             source_path.clone(),
             NamespaceObjectKind::Directory,
             |object| {
-                assert_eq!(object.id(), &source_id);
                 assert_eq!(object.path(), &source_path);
                 Ok::<_, Infallible>("created")
             },
-        ),
-        Ok("created")
-    );
+        )
+        .expect("source directory should be created");
+    let source_id = creation.object().clone();
+    assert_eq!(creation.value(), &"created");
     assert_eq!(registry.object_count(), Ok(2));
     assert_eq!(
         registry.generation().map(NamespaceGeneration::as_u64),
@@ -105,44 +109,36 @@ fn registry_enforces_unique_paths_parents_and_object_ids() {
     );
 
     assert_eq!(
-        registry.register_existing_object(
-            ObjectId::new("other"),
+        registry.create_object(
             source_path.clone(),
             NamespaceObjectKind::Directory,
+            |_| Ok::<_, Infallible>(()),
         ),
-        Err(NamespaceError::PathOccupied(source_path.clone()))
+        Err(NamespaceOperationError::Namespace(
+            NamespaceError::PathOccupied(source_path.clone())
+        ))
     );
     assert_eq!(
-        registry.register_existing_object(
-            source_id.clone(),
-            path(&["other"]),
-            NamespaceObjectKind::Directory,
-        ),
-        Err(NamespaceError::ObjectIdAlreadyIssued(source_id))
-    );
-    assert_eq!(
-        registry.register_existing_object(
-            ObjectId::new("orphan"),
+        registry.create_object(
             path(&["missing", "orphan"]),
             NamespaceObjectKind::RegularFile,
+            |_| Ok::<_, Infallible>(()),
         ),
-        Err(NamespaceError::MissingParent(path(&["missing"])))
+        Err(NamespaceOperationError::Namespace(
+            NamespaceError::MissingParent(path(&["missing"]))
+        ))
     );
 
-    registry
-        .register_existing_object(
-            ObjectId::new("file"),
-            path(&["file"]),
-            NamespaceObjectKind::RegularFile,
-        )
-        .expect("root may contain a regular file");
+    create_object(&registry, path(&["file"]), NamespaceObjectKind::RegularFile);
     assert_eq!(
-        registry.register_existing_object(
-            ObjectId::new("child"),
+        registry.create_object(
             path(&["file", "child"]),
             NamespaceObjectKind::RegularFile,
+            |_| Ok::<_, Infallible>(()),
         ),
-        Err(NamespaceError::ParentNotDirectory(path(&["file"])))
+        Err(NamespaceOperationError::Namespace(
+            NamespaceError::ParentNotDirectory(path(&["file"]))
+        ))
     );
 }
 
@@ -150,16 +146,18 @@ fn registry_enforces_unique_paths_parents_and_object_ids() {
 // Category: namespace/atomicity. Risk: critical.
 #[test]
 fn failed_create_leaves_generation_and_identity_unmodified() {
-    let registry = NamespaceRegistry::new(ObjectId::new("root"));
-    let object = ObjectId::new("file");
+    let registry = NamespaceRegistry::new();
     let object_path = path(&["file"]);
+    let mut failed_object = None;
 
     assert_eq!(
         registry.create_object(
-            object.clone(),
             object_path.clone(),
             NamespaceObjectKind::RegularFile,
-            |_| Err::<(), _>(BackingFailure),
+            |object| {
+                failed_object = Some(object.id().clone());
+                Err::<(), _>(BackingFailure)
+            },
         ),
         Err(NamespaceOperationError::Executor(BackingFailure))
     );
@@ -167,19 +165,17 @@ fn failed_create_leaves_generation_and_identity_unmodified() {
         registry.generation().map(NamespaceGeneration::as_u64),
         Ok(0)
     );
-    assert_eq!(registry.object_snapshot(&object), Ok(None));
-    assert_eq!(
-        registry.create_object(
-            object.clone(),
-            object_path,
-            NamespaceObjectKind::RegularFile,
-            |_| Ok::<_, Infallible>(()),
-        ),
-        Ok(())
-    );
+    let failed_object = failed_object.expect("failed executor should observe the staged object");
+    assert_eq!(registry.object_snapshot(&failed_object), Ok(None));
+    let creation = registry
+        .create_object(object_path, NamespaceObjectKind::RegularFile, |_| {
+            Ok::<_, Infallible>(())
+        })
+        .expect("a later create should succeed");
+    assert_eq!(creation.object(), &failed_object);
     assert!(
         registry
-            .object_snapshot(&object)
+            .object_snapshot(creation.object())
             .is_ok_and(|value| value.is_some())
     );
 }
@@ -188,8 +184,9 @@ fn failed_create_leaves_generation_and_identity_unmodified() {
 // failed open/close executors roll counts back. Category: namespace/security. Risk: critical.
 #[test]
 fn live_handles_block_namespace_mutation_and_counts_roll_back() {
-    let registry = registry_with_source_tree();
-    let lexer = ObjectId::new("lexer");
+    let SourceTree {
+        registry, lexer, ..
+    } = registry_with_source_tree();
     let source = path(&["src"]);
     let generation_before_open = registry.generation().expect("registry should be readable");
 
@@ -251,10 +248,11 @@ fn live_handles_block_namespace_mutation_and_counts_roll_back() {
 // no-replace backing operation. Category: namespace/atomicity. Risk: critical.
 #[test]
 fn rename_subtree_is_no_replace_and_failure_atomic() {
-    let registry = registry_with_source_tree();
+    let SourceTree {
+        registry, lexer, ..
+    } = registry_with_source_tree();
     let source = path(&["src", "parser"]);
     let destination = path(&["lib", "parser"]);
-    let lexer = ObjectId::new("lexer");
     let generation = registry.generation().expect("registry should be readable");
 
     assert_eq!(
@@ -315,9 +313,11 @@ fn rename_subtree_is_no_replace_and_failure_atomic() {
 // releases an ObjectId for reuse. Category: namespace/security. Risk: critical.
 #[test]
 fn remove_requires_an_empty_object_and_reserves_deleted_ids() {
-    let registry = registry_with_source_tree();
-    let parser = ObjectId::new("parser");
-    let lexer = ObjectId::new("lexer");
+    let SourceTree {
+        registry,
+        parser,
+        lexer,
+    } = registry_with_source_tree();
 
     assert_eq!(
         registry.remove_object(&parser, |_| Ok::<_, Infallible>(())),
@@ -343,16 +343,24 @@ fn remove_requires_an_empty_object_and_reserves_deleted_ids() {
         .remove_object(&parser, |_| Ok::<_, Infallible>(()))
         .expect("empty directory should be removable");
     assert_eq!(registry.object_snapshot(&lexer), Ok(None));
-    assert_eq!(
-        registry.register_existing_object(
-            lexer.clone(),
+    let replacement = registry
+        .create_object(
             path(&["lib", "replacement.rs"]),
             NamespaceObjectKind::RegularFile,
-        ),
-        Err(NamespaceError::ObjectIdAlreadyIssued(lexer))
-    );
+            |_| Ok::<_, Infallible>(()),
+        )
+        .expect("replacement file should be creatable")
+        .object()
+        .clone();
+    assert_ne!(replacement, lexer);
+    let root = registry
+        .object_at_path_snapshot(&CanonicalPath::root())
+        .expect("registry should be readable")
+        .expect("root should remain live")
+        .id()
+        .clone();
     assert_eq!(
-        registry.remove_object(&ObjectId::new("root"), |_| Ok::<_, Infallible>(())),
+        registry.remove_object(&root, |_| Ok::<_, Infallible>(())),
         Err(NamespaceOperationError::Namespace(
             NamespaceError::CannotModifyRoot
         ))
@@ -363,8 +371,10 @@ fn remove_requires_an_empty_object_and_reserves_deleted_ids() {
 // linearization point. Category: namespace/concurrency. Risk: critical.
 #[test]
 fn object_operation_holds_read_lock_against_concurrent_rename() {
-    let registry = Arc::new(registry_with_source_tree());
-    let lexer = ObjectId::new("lexer");
+    let SourceTree {
+        registry, lexer, ..
+    } = registry_with_source_tree();
+    let registry = Arc::new(registry);
     let source = path(&["src", "parser"]);
     let destination = path(&["lib", "parser"]);
     let (reader_entered_sender, reader_entered_receiver) = mpsc::channel();

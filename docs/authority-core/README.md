@@ -33,10 +33,12 @@ flowchart LR
         rustFile["file.rs<br/>file request / body decision"]
         rustTime["time.rs<br/>validity window"]
         rustCap["capability.rs<br/>envelope / weaker_than"]
+        rustState["state.rs<br/>sequential issue / derive / revoke"]
         rustRepo -->|"exact identity"| rustFile
         rustPath -->|"path decisions"| rustFile
         rustFile -->|"typed file body"| rustCap
         rustTime -->|"validity"| rustCap
+        rustCap -->|"checked grants"| rustState
     end
 
     subgraph lean["Lean: 意味論と証明"]
@@ -89,6 +91,9 @@ Rust は実際の認可経路から呼ぶ純粋な `bool` 判定を担当する�
 | [`lean/Authority/Time.lean`](../../lean/Authority/Time.lean) | 時刻窓の集合意味論、端点判定の健全性・完全性・推移性 | [有効期間](validity-windows.md) |
 | [`crates/authority-core/src/capability.rs`](../../crates/authority-core/src/capability.rs) | typed ID、metadata、file-only tagged body、時刻付き matching、`weaker_than` | [Capability](capabilities.md) |
 | [`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) | Capability の集合意味論、matching 同値、`weakerThan` の健全性・完全性・推移性 | [Capability](capabilities.md) |
+| [`crates/authority-core/src/state.rs`](../../crates/authority-core/src/state.rs) | subject 登録、静的 envelope、root 発行、保持、逐次 Derive、revoke と祖先失効 | [Capability state](capability-state.md) |
+| [`crates/authority-core/tests/capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 状態遷移の成功・拒否条件と失敗時の atomicity | [Capability state](capability-state.md) |
+| [`crates/authority-core/tests/capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) | 生成した操作列を独立した参照モデルと比較する stateful property test | [Capability state](capability-state.md) |
 | [`crates/authority-core/src/lib.rs`](../../crates/authority-core/src/lib.rs) | Rust module の公開と `unsafe` 禁止 | 各 Rust ページ |
 | [`lean/Authority.lean`](../../lean/Authority.lean) | production Lean library の入口 | 各 Lean ページ |
 | [`lean/AuthorityTests.lean`](../../lean/AuthorityTests.lean) | 独立した具体的境界を固定する Lean の executable example | [検証とテスト](verification.md) |
@@ -97,7 +102,7 @@ Rust は実際の認可経路から呼ぶ純粋な `bool` 判定を担当する�
 | [`lean/AuthorityCorpus.lean`](../../lean/AuthorityCorpus.lean) | 共通 corpus を Lean の production 判定で評価する test driver | [検証とテスト](verification.md) |
 | [`scripts/check-authority-corpus.sh`](../../scripts/check-authority-corpus.sh) | 両 runner の正規化済み出力を比較する入口 | [検証とテスト](verification.md) |
 
-Rust の production unit test は各実装ファイル内、corpus parser の unit test は runner 内にあるため、[検証とテスト](verification.md)でまとめて説明する。
+Rust の production unit test は各実装ファイル内、公開 API の状態遷移 test と property test は `tests/`、corpus parser の unit test は runner 内にあるため、[検証とテスト](verification.md)でまとめて説明する。
 
 ## 判定の積み上げ
 
@@ -122,9 +127,9 @@ flowchart LR
 
 ## 現在の実装境界
 
-実装済みなのは repository identity、repository-relative path、file effect と request、file authority body、単調時刻の有効期間、typed metadata と file-only Capability、matching、`weakerThan` である。
+実装済みなのは repository identity、repository-relative path、file effect と request、file authority body、単調時刻の有効期間、typed metadata と file-only Capability、matching、`weakerThan` である。Rust 側にはさらに、subject と静的 envelope の登録、root 発行、保持、逐次 Derive、revoke、祖先失効を扱う `CapabilityState` がある。
 
-未実装なのは、File 以外の authority variant、Capability の保持・発行・revoke を扱う状態機械、OS/FUSE adapter である。`parent` と `delegable` は型として存在するが、発行時に検証する `Derive` transition はまだない。
+未実装なのは、File 以外の authority variant、revoke と effect commit を同じ順序に置く並行 authorization guard、attempt/effect log、open handle と subject lifecycle、OS/FUSE adapter である。現在の state は1 thread 上で順番が決まったモデルであり、進行中の外部副作用との線形化までは扱わない。
 
 現在の file-only slice には、71件の共通 corpus を両言語の production 判定へ流す自動差分テストがある。各 runner は期待値を個別に検査し、その後に出力同士も比較する。ただしこれは選んだ具体例についての回帰検査であり、Rust と Lean が全入力で等しいという証明ではない。
 
@@ -136,6 +141,7 @@ flowchart LR
 - [File authority](file-authorities.md)
 - [有効期間](validity-windows.md)
 - [Capability](capabilities.md)
+- [Capability state](capability-state.md)
 - [検証とテスト](verification.md)
 - [Capability モデル](../design/capability-model.md)
 - [検証戦略](../design/verification.md)

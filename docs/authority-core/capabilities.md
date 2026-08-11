@@ -195,7 +195,7 @@ Capability 全体の定理があるため、「path は狭いが期限は広い�
 
 ### 発行ポリシーとの責務境界が明確になる
 
-`weakerThan` が `delegable` や subject binding を確認しないことを明示している。後続の状態機械は、それらを省略できない独立条件として実装できる。
+`weakerThan` が `delegable` や subject binding を確認しないことを明示している。[逐次状態機械](capability-state.md)は、それらを省略できない独立条件として `Derive` transition で検査する。
 
 ### 新しい authority family の追加漏れが見える
 
@@ -203,16 +203,21 @@ typed enum に variant を増やすと、matching と containment の `match` �
 
 ## 正確な保証範囲
 
-現在実装・証明済みなのは file variant の Capability envelope、時刻付き matching、純粋な `weakerThan` である。次はまだ含まれない。
+Lean で実装・証明済みなのは file variant の Capability envelope、時刻付き matching、純粋な `weakerThan` である。Rust ではこれに加え、逐次 `CapabilityState` が次を実装している。
 
 - Capability ID の一意な採番と再利用防止。
 - caller と `SubjectId` の binding、held set、parent link の検証。
 - `delegable` を確認して子を発行する `Derive` transition。
-- revoke、祖先失効、静的 envelope、使用回数、並行 commit。
+- revoke、祖先失効、target subject の静的 envelope。
+
+次はまだ含まれない。
+
+- revoke と effect commit の並行実行を線形化する authorization guard。
+- 使用回数、attempt/effect log、open handle、subject lifecycle。
 - HTTP fetch や GitHub authority など、File 以外の variant。
 - OS/FUSE operation を正しい `CapabilityRequest` へ変換する adapter。
 
-したがって `weakerThan_sound` は「Capability システム全体が完成した」という定理ではない。現在の型付き file request と単調時刻のモデル内で、受理した包含判定が authority を増幅しないという定理である。
+したがって `weakerThan_sound` は「Capability システム全体が完成した」という定理でも、Rust の状態遷移全体の証明でもない。現在の型付き file request と単調時刻の Lean モデル内で、受理した包含判定が authority を増幅しないという定理である。逐次状態遷移は契約 test と参照モデルを使った property test で別に検査する。
 
 ## 定理と実装の対応
 
@@ -236,6 +241,7 @@ typed enum に variant を増やすと、matching と containment の `match` �
 - `weakerThan` の条件を増やしたら `refl` と `trans` が本当に成立する関係か確認する。
 - matching に入力軸を増やしたら、`CapabilityRequest` の意味論と `capabilityMatches_iff_matches` に漏れなく反映する。
 - 完全性を維持する場合は、authority の非空条件が新しい variant でも十分かを確認する。
+- metadata や発行条件を変えたら、`CapabilityState` の transition test と参照モデルを同時に更新する。
 
 ## 関連
 
@@ -244,4 +250,5 @@ typed enum に variant を増やすと、matching と containment の `match` �
 - [Authority core で使う証明の考え方](proof-concepts.md)
 - [検証とテスト](verification.md)
 - [Capability モデル](../design/capability-model.md)
+- [Capability の発行と逐次状態機械](capability-state.md)
 - [状態機械と revoke](../design/state-and-revocation.md)

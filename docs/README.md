@@ -18,7 +18,8 @@
 | [File authority](authority-core/file-authorities.md) | effect 集合、request、delegation 判定と証明 |
 | [有効期間](authority-core/validity-windows.md) | 単調時刻、半開区間、時刻窓の containment と証明 |
 | [Capability](authority-core/capabilities.md) | typed metadata、file-only envelope、時刻付き matching、`weakerThan` と証明 |
-| [検証とテスト](authority-core/verification.md) | Rust unit test、Lean example、Lean theorem の役割分担 |
+| [Capability state](authority-core/capability-state.md) | subject、静的 envelope、発行、保持、逐次 Derive、revoke と祖先失効 |
+| [検証とテスト](authority-core/verification.md) | Rust unit・状態遷移・property test、Lean example・theorem、共通 corpus の役割分担 |
 
 ## 文書の使い分け
 

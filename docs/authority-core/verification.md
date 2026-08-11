@@ -2,7 +2,7 @@
 
 [Authority core 実装ガイド](README.md) / 検証とテスト
 
-このページは、Rust unit test、Lean executable example、Lean theorem、共通 corpus の差分テストがそれぞれ何を確認し、組み合わせると何が分かるかを説明する。プロジェクト全体の検証方針は[検証戦略](../design/verification.md)を参照する。
+このページは、Rust の unit・状態遷移・property test、Lean executable example、Lean theorem、共通 corpus の差分テストがそれぞれ何を確認し、組み合わせると何が分かるかを説明する。プロジェクト全体の検証方針は[検証戦略](../design/verification.md)を参照する。
 
 ## 検証方法ごとの役割
 
@@ -10,22 +10,25 @@ Authority core では、1つの手段ですべてを保証しようとせず、�
 
 | 検証 | 答える問い |
 |---|---|
-| Rust unit test | 実際の Rust API は、この具体的な入力で期待どおり動くか |
+| Rust unit / transition test | 実際の Rust API は、この具体的な入力と操作順で期待どおり動くか |
+| Stateful property test | 生成した多数の操作列で production state と参照モデルが一致するか |
 | Lean executable example | Lean の `Bool` 判定は、この具体的な境界入力で期待どおりか |
 | Lean theorem | Lean モデルのすべての型付き入力で、一般的な性質が成り立つか |
 | 共通 corpus の差分テスト | 同じ入力に対して Rust と Lean が同じ結果を返すか |
 
-4つとも現在の file-only slice に実装済みである。ただし、具体例を実行する3つの検査と、全入力を扱う Lean theorem では保証範囲が異なる。
+unit test、Lean example・theorem、共通 corpus は現在の file-only slice に実装済みである。逐次 Capability state には Rust の transition test と stateful property test がある。ただし、具体例や生成列を実行する検査と、全入力を扱う Lean theorem では保証範囲が異なる。
 
 ```mermaid
 flowchart LR
     examples["具体例<br/>境界値・失敗例"] --> rust["Rust unit test"]
+    sequences["生成した Derive / revoke 列"] --> property["stateful property test"]
     examples --> leanExample["Lean example"]
     spec["全入力に対する仕様"] --> theorem["Lean theorem"]
     corpus["共通 corpus<br/>71件 + 期待値"] --> rustRunner["Rust corpus runner"]
     corpus --> leanRunner["Lean corpus runner"]
 
     rust --> confidence["Rust の具体的な挙動"]
+    property --> stateConfidence["逐次 state と参照モデルの一致"]
     leanExample --> confidence
     theorem --> guarantee["Lean モデル内の一般保証"]
     rustRunner --> oracle["各実装と期待値の一致"]
@@ -96,9 +99,9 @@ file body containment では、false allow を防ぐ `fileBodyBelow_sound` は�
 
 実環境全体のバグ発生確率を数値として測定した主張ではない。どこまでがモデル内かは[証明の考え方: 言えること、まだ言えないこと](proof-concepts.md#証明から言えることまだ言えないこと)を参照する。
 
-## Rust unit test は何を確認するか
+## Rust test は何を確認するか
 
-Rust test は対象実装と同じファイルの `#[cfg(test)] mod tests` に置く。
+純粋関数の unit test は対象実装と同じファイルの `#[cfg(test)] mod tests` に置く。公開 API をまたぐ状態遷移 test と property test は `crates/authority-core/tests/` に置く。
 
 | ソース | test 数 | 主な確認内容 |
 |---|---:|---|
@@ -107,9 +110,12 @@ Rust test は対象実装と同じファイルの `#[cfg(test)] mod tests` に�
 | [`file.rs`](../../crates/authority-core/src/file.rs) | 5 | effect membership と duplicate、空/同値/拡大 subset、request matching の3軸、body containment の3軸、推移性 |
 | [`time.rs`](../../crates/authority-core/src/time.rs) | 4 | 正常/空/逆転区間、半開境界、時刻窓 subset、推移性 |
 | [`capability.rs`](../../crates/authority-core/src/capability.rs) | 5 | typed metadata、時刻付き matching、期間/file の縮小と拡大拒否、反射性、推移性 |
+| [`state.rs`](../../crates/authority-core/src/state.rs) | 1 | `u64::MAX` の最後の ID 発行と、それ以降の exhaustion |
 | [`authority-corpus.rs`](../../crates/authority-core/src/bin/authority-corpus.rs) | 7 | header/schema、未知の判定、必須 field、u64 上限、期待値不一致、case 名重複の拒否 |
+| [`capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 9 | subject 登録、root/Derive の成功と拒否、atomicity、authorization、祖先 revoke、ID 非再利用 |
+| [`capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) | 1 | 1〜63操作の Derive/revoke 列を1,000 case 生成し、参照モデルと各 transition を比較 |
 
-production module の23 test と corpus runner の7 test、合計30 test を `cargo test --workspace` で実行する。これとは別に、runner は共有 fixture の71件を実行時に評価する。
+production module の24 test、corpus runner の7 test、公開 API の状態遷移 test 9件、property test 1件の合計41 test を `cargo test --workspace` で実行する。property test は内部で1,000本の操作列を生成する。これとは別に、runner は共有 fixture の71件を実行時に評価する。
 
 ここで特に test が助けるのは、Lean の抽象モデルに出にくい Rust 固有の部分である。
 
@@ -119,6 +125,8 @@ production module の23 test と corpus runner の7 test、合計30 test を `ca
 - Rust の enum variant と match 分岐が concrete boundary で正しく接続される。
 - `TimeWindow::new` が不正な端点を structured error として拒否する。
 - typed metadata の getter と file-only Capability envelope が実際の公開 API で接続される。
+- 失敗 transition が ID sequence や held/capability map を途中まで変更しない。
+- 別 subject にコピーした ID、revoke 済み祖先、静的 envelope 外の grant が拒否される。
 
 test helper の `path` は `CanonicalPath::new(...).expect(...)` を通し、fixture 自体も検証済み path から作る。
 
@@ -179,7 +187,9 @@ theorem を production 定義の隣に置くことで、判定を変更して証
 | Lean 判定の具体的挙動 |  | ✓ |  | ✓ | 確認済み |
 | Lean モデルの全入力での性質 |  |  | ✓ |  | 証明済み |
 | 共有した71入力で両言語が期待値どおりか |  |  |  | ✓ | 自動比較済み |
+| 生成した逐次操作列で state と参照モデルが一致するか | ✓ |  |  |  | 1,000 case 検査済み |
 | 全入力で Rust と Lean が同値か |  |  |  |  | 未証明 |
+| revoke と effect commit の全 bounded interleaving |  |  |  |  | loom 未実装 |
 | OS/FUSE を含む end-to-end 認可 |  |  |  |  | Authority core の外 |
 
 Lean theorem は Lean モデル内の全入力を扱い、共通 corpus は両言語の有限の具体例を扱う。どちらか一方から「Rust と Lean は全入力で同値」とは結論しない。OS/FUSE との接続は `capfs` の統合・攻撃テストで別に閉じる。
@@ -228,7 +238,7 @@ scripts/check-authority-corpus.sh
 
 残る限界は、corpus が有限であることと、schema v1 が現在の file-only authority だけを表すことである。File 以外の authority variant を追加するときは、両 runner と corpus を同じ変更で拡張する。互換性のない schema 変更では header の version も上げる。
 
-なお、共通 corpus でも filesystem race や revoke は検証できない。それらは stateful test、loom、実 mount の統合・攻撃テストという別レイヤーを使う。
+なお、共通 corpus 自体は revoke を検証しない。逐次 revoke と祖先失効は stateful test で検査している。revoke と effect commit の race は loom、filesystem との接続は実 mount の統合・攻撃テストという別レイヤーが必要で、いずれもまだ未実装である。
 
 ## 変更時の確認点
 
@@ -238,6 +248,7 @@ scripts/check-authority-corpus.sh
 - test が通っても、sound theorem の request 型に新しい入力軸が反映されているかを確認する。
 - test 数、example 数、corpus の case 数が変わったら、このページの集計を更新する。
 - corpus の field を増減するときは両 runner を同時に変更し、互換性が壊れる場合は header の version を上げる。
+- state transition を変えたら、公開 API の契約 test と独立した参照モデルを同時に更新し、失敗時の atomicity も確認する。
 
 ## 関連
 
@@ -247,6 +258,7 @@ scripts/check-authority-corpus.sh
 - [File authority](file-authorities.md)
 - [有効期間](validity-windows.md)
 - [Capability](capabilities.md)
+- [Capability state](capability-state.md)
 - [検証戦略](../design/verification.md)
 - [実装順序](../design/implementation-plan.md)
 - [capfs](../design/capfs.md)

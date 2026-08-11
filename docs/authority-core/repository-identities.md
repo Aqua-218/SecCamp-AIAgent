@@ -17,7 +17,7 @@ repo-A の src/main.rs
 
 path と effect が同じでも、`RepoId` が違えば別 repository の request として拒否される。これにより、ある repository 向けの権限が、同じ directory 構造を持つ別 repository に流用されることを防ぐ。
 
-このファイル自体が identity の一意性や再利用禁止を証明しているわけではない。正しい ID を発行し、session を越えて再利用しない責任は host と将来の状態機械にある。
+このファイル自体が identity の一意性や再利用禁止を証明しているわけではない。正しい ID を発行し、session を越えて再利用しない責任は host の identity issuer と workspace mapping にある。現在の `CapabilityState` は、すでに割り当てられた `RepoId` が subject の静的 envelope と親 Capability の内側かだけを検査する。
 
 ## 何を防ぎたいのか
 
@@ -149,4 +149,5 @@ decide (child.repository = parent.repository)
 - [パスモデル](paths.md)
 - [File authority](file-authorities.md)
 - [Capability モデル: ID、時間、回数](../design/capability-model.md#id時間回数)
+- [Capability state](capability-state.md)
 - [状態機械と revoke](../design/state-and-revocation.md)

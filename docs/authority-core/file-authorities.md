@@ -290,10 +290,9 @@ repository equality と path containment を同じ body 判定に含めるため
 
 このページの証明対象は file authority **body** の repository、effect、path と、1件の `FileRequest` である。これを有効期間や metadata と組み合わせた file-only Capability は[Capability envelope と委譲証明](capabilities.md)で別に扱う。
 
-次はまだ含まれない。
+次はこの file body の定理には含まれない。Capability ID の採番、subject binding、親 ID と `delegable`、逐次 revoke は Rust の[Capability state](capability-state.md)で実装・テストするが、この Lean 定理の証明対象ではない。
 
-- Capability ID の採番、subject binding、親 ID と `delegable` を検査する発行状態機械。
-- revoke や使用回数、状態遷移、並行実行。
+- 使用回数、revoke と effect commit の並行実行。
 - rename の source と destination を2件とも認可する orchestration。
 - FUSE operation から正しい `FileEffect` を選ぶ adapter。
 - symlink、hard link、inode alias、open handle、rename race。

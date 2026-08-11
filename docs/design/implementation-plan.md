@@ -38,6 +38,10 @@ Rust で typed Capability、正規化型、`Matches`、`PathBelow`、`WeakerThan
 
 subject tree、held、revoke、open handle、attempt、effect、authorization guard を実装する。正常操作だけでなく leak、forge、stale ID、期限切れ、revoke race を proptest と loom に流す。
 
+現在は逐次部分として、subject tree、静的 envelope、server-side ID、root 発行、held、Derive、revoke と祖先失効まで実装している。公開 API の契約 test に加え、1〜63操作の Derive/revoke 列を1,000 case 生成し、独立した参照モデルと毎 transition 比較する property test がある。詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)を参照する。
+
+次は shared/exclusive authorization guard、attempt/effect log、open handle を実装し、revoke と effect commit の bounded interleaving を loom へ載せる。negative control を含む次の完了条件は、まだ満たしていない。
+
 **完了条件:** negative control では race の反例が出て、本番 lock では同じ bounded model の反例が消える。
 
 ## 3. capfs

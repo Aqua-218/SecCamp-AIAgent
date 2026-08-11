@@ -53,17 +53,33 @@ flowchart LR
     held -->|"no"| deny["拒否"]
     held -->|"yes"| valid{"親と祖先が有効?"}
     valid -->|"no"| deny
-    valid -->|"yes"| weaker{"WeakerThan?"}
+    valid -->|"yes"| delegable{"親が delegable?"}
+    delegable -->|"no"| deny
+    delegable -->|"yes"| weaker{"WeakerThan?"}
     weaker -->|"no"| deny
     weaker -->|"yes"| envelope{"静的 envelope 内?"}
     envelope -->|"no"| deny
-    envelope -->|"yes"| issue["新しい ID と subject を<br/>server 側で設定して発行"]
+    envelope -->|"yes"| issue["新しい ID・issuer・parent を<br/>server 側で設定して発行"]
 
     classDef denied fill:#b71c1c,color:#fff;
     classDef issued fill:#2e7d32,color:#fff;
     class deny denied;
     class issue issued;
 ```
+
+## 現在の実装位置
+
+[`crates/authority-core/src/state.rs`](../../crates/authority-core/src/state.rs) には、並行処理を入れる前の逐次状態機械がある。現在は次の境界まで実装している。
+
+| 実装済み | 次に実装する |
+|---|---|
+| subject と静的 envelope の登録 | shared/exclusive authorization guard |
+| server-side ID による root 発行 | attempt/effect log と線形化点 |
+| held、caller binding、parent link、`delegable` を検査する Derive | open handle と subject lifecycle |
+| `WeakerThan` と target envelope による権限縮小 | revoke / commit の loom model と negative control |
+| 逐次 revoke と祖先 chain の無効化 | supervisor channel から caller を決める adapter |
+
+詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)を参照する。逐次モデルで revoke 後の認可は止まるが、すでに進行している副作用と revoke の順序を確定するのは次節の guard の責務である。
 
 ## commit と revoke の競合
 
@@ -126,8 +142,17 @@ revoke は、これより前の操作を巻き戻すものではない。
 
 すでに Host Broker が受理した外部操作だけは続行し得る。
 
+## 設計の背景
+
+派生元を明示した tree と祖先 revoke は、seL4 の capability derivation tree と descendant revocation の考え方を参考にしている。[seL4 Reference Manual](https://sel4.systems/Info/Docs/seL4-manual-latest.pdf)
+
+また「既存 authority から作る authority は縮小だけ」という方向は、FreeBSD Capsicum の `cap_rights_limit` が rights を追加できず削減だけを許す性質とも一致する。[FreeBSD `cap_rights_limit(2)`](https://man.freebsd.org/cgi/man.cgi?query=cap_rights_limit&sektion=2)
+
+どちらもこの実装の正しさを自動的に証明するものではない。ここでは、派生 link を保存する理由と、権限変更を単調な縮小に限定する設計上の先例として参照している。
+
 ## 関連文書
 
 - [Capability モデル](capability-model.md)
+- [Capability の発行と逐次状態機械](../authority-core/capability-state.md)
 - [capfs](capfs.md)
 - [ネットワークと外部副作用](network-egress.md)

@@ -215,12 +215,15 @@ effect を1つも持たない file authority は、どの request にも match �
 | path の `Bool` 包含判定と集合意味論が一致する | Lean の `PathPattern` モデル内 |
 | file body 判定が通れば、子の全 request は親にも許可される | Lean の repository・effect・path モデル内 |
 | 多段の file body 委譲でも最上位の包含境界を越えない | 各段で `fileBodyBelow = true` が成り立つ有限の連鎖 |
+| 時刻窓の端点判定と時刻集合の包含が一致する | 同じ session-local clock の単調 tick モデル内 |
+| `weakerThan` が通れば、子の全時刻付き request は親にも許可される | file-only `AuthorityBody` と `CapabilityRequest` のモデル内 |
+| 多段の Capability 委譲でも root の期間・file 境界を越えない | 各段で `weakerThan = true` が成り立つ有限の連鎖 |
 
 一方、次はこの証明だけでは言えない。
 
 - Rust 実装が Lean と将来も自動的に一致し続けること。現在は対応実装と手動で揃えた境界 test で確認しており、共通 corpus は未実装である。
 - symlink、hard link、rename、open handle、OS path 解決が安全であること。これは `capfs` と統合・並行性テストの範囲である。
-- Capability の subject、issuer、期限、revoke を含むシステム全体が安全であること。現在の Authority core は file authority body までを実装している。
+- Capability の subject binding、保持、発行、祖先失効、revoke を含む状態機械全体が安全であること。metadata と期限は Authority core にあるが、それらを検査する state transition は未実装である。
 - Lean の外にあるコンパイラ、OS、ホストの identity 発行規則まで正しいこと。
 
 したがって、「数学的に不可能」と表現するときは、**Lean で定義したモデルと前提の範囲内で**という条件を付けるのが正確である。
@@ -230,5 +233,7 @@ effect を1つも持たない file authority は、どの request にも match �
 - [Authority core 実装ガイド](README.md)
 - [パスモデル](paths.md)
 - [File authority](file-authorities.md)
+- [有効期間](validity-windows.md)
+- [Capability](capabilities.md)
 - [検証とテスト](verification.md)
 - [設計上の検証戦略](../design/verification.md)

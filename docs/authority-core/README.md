@@ -8,15 +8,18 @@
 
 ## 現在証明している範囲
 
-現在の中心は、file authority の子が親より強くならないことを確認する純粋な判定である。
+現在の中心は、file Capability の子が親より強くならないことを確認する純粋な判定である。
 
 ```text
-同じ repository
+子の有効期間 ⊆ 親の有効期間
+∧ 同じ repository
 ∧ 子の effect ⊆ 親の effect
 ∧ 子の path ⊆ 親の path
 ```
 
-Lean は、この判定が通った子の request は必ず親にも許可されることと、包含関係を何段つないでも崩れないことを証明する。つまり Lean モデル内では、file authority body の委譲判定が原因で親の設定範囲を越えることはない。
+Lean は、この判定が通った子の時刻付き request は必ず親にも許可されることと、包含関係を何段つないでも崩れないことを証明する。非空 authority については逆向きも証明しているため、本当に包含される子を判定が誤って拒否するずれもない。
+
+つまり Lean モデル内では、`weakerThan` が原因で親の期間・repository・effect・path 境界を越えることはなく、何段の委譲でも root の境界を保つ。
 
 証明に使う集合包含、健全性、完全性、推移律を先に知りたい場合は、[Authority core で使う証明の考え方](proof-concepts.md)を参照する。
 
@@ -27,25 +30,34 @@ flowchart LR
     subgraph rust["Rust: 実行時判定"]
         rustRepo["repository.rs<br/>repository identity"]
         rustPath["path.rs<br/>canonical path / path decision"]
-        rustFile["file.rs<br/>file request / delegation decision"]
-        rustRepo -->|"exact identity comparison"| rustFile
-        rustPath -->|"path_matches / path_below"| rustFile
+        rustFile["file.rs<br/>file request / body decision"]
+        rustTime["time.rs<br/>validity window"]
+        rustCap["capability.rs<br/>envelope / weaker_than"]
+        rustRepo -->|"exact identity"| rustFile
+        rustPath -->|"path decisions"| rustFile
+        rustFile -->|"typed file body"| rustCap
+        rustTime -->|"validity"| rustCap
     end
 
     subgraph lean["Lean: 意味論と証明"]
-        leanRepo["Repository.lean<br/>repository identity model"]
+        leanRepo["Repository.lean<br/>identity model"]
         leanPath["Path.lean<br/>path semantics / proofs"]
         leanFile["File.lean<br/>file semantics / proofs"]
-        leanTests["AuthorityTests.lean<br/>executable boundary examples"]
+        leanTime["Time.lean<br/>interval semantics / proofs"]
+        leanCap["Capability.lean<br/>envelope semantics / proofs"]
+        leanTests["AuthorityTests.lean<br/>boundary examples"]
         leanRepo -->|"repository equality"| leanFile
-        leanPath -->|"Matches / pathBelow"| leanFile
-        leanPath -->|"examples"| leanTests
-        leanFile -->|"examples"| leanTests
+        leanPath -->|"path containment"| leanFile
+        leanFile -->|"typed file body"| leanCap
+        leanTime -->|"validity containment"| leanCap
+        leanCap -->|"examples"| leanTests
     end
 
     rustRepo -.->|"same concept"| leanRepo
     rustPath -.->|"same decisions"| leanPath
     rustFile -.->|"same decisions"| leanFile
+    rustTime -.->|"same decisions"| leanTime
+    rustCap -.->|"same decisions"| leanCap
 ```
 
 Rust は実際の認可経路から呼ぶ純粋な `bool` 判定を担当する。Lean は同じ入力領域を命題として定義し、実行可能な `Bool` 判定が意味論と一致すること、包含判定が権限を増幅しないことを証明する。
@@ -58,8 +70,14 @@ Rust は実際の認可経路から呼ぶ純粋な `bool` 判定を担当する�
 | [`lean/Authority/Path.lean`](../../lean/Authority/Path.lean) | path の命題的意味論、実行可能判定、健全性・完全性・推移性の証明 | [パスモデル](paths.md) |
 | [`crates/authority-core/src/repository.rs`](../../crates/authority-core/src/repository.rs) | host が割り当てる `RepoId` の Rust newtype | [Repository identity](repository-identities.md) |
 | [`lean/Authority/Repository.lean`](../../lean/Authority/Repository.lean) | `RepoId` の Lean モデルと決定可能な等価性 | [Repository identity](repository-identities.md) |
-| [`crates/authority-core/src/file.rs`](../../crates/authority-core/src/file.rs) | file effect 集合、request matching、file delegation 判定、unit test | [File authority](file-authorities.md) |
+| [`crates/authority-core/src/file.rs`](../../crates/authority-core/src/file.rs) | file effect 集合、request matching、file body containment、unit test | [File authority](file-authorities.md) |
 | [`lean/Authority/File.lean`](../../lean/Authority/File.lean) | file authority の意味論、実行可能判定、包含定理 | [File authority](file-authorities.md) |
+| [`crates/authority-core/src/time.rs`](../../crates/authority-core/src/time.rs) | session-local monotonic time、有効な半開区間、membership と containment | [有効期間](validity-windows.md) |
+| [`lean/Authority/Time.lean`](../../lean/Authority/Time.lean) | 時刻窓の集合意味論、端点判定の健全性・完全性・推移性 | [有効期間](validity-windows.md) |
+| [`crates/authority-core/src/capability.rs`](../../crates/authority-core/src/capability.rs) | typed ID、metadata、file-only tagged body、時刻付き matching、`weaker_than` | [Capability](capabilities.md) |
+| [`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) | Capability の集合意味論、matching 同値、`weakerThan` の健全性・完全性・推移性 | [Capability](capabilities.md) |
+| [`crates/authority-core/src/lib.rs`](../../crates/authority-core/src/lib.rs) | Rust module の公開と `unsafe` 禁止 | 各 Rust ページ |
+| [`lean/Authority.lean`](../../lean/Authority.lean) | production Lean library の入口 | 各 Lean ページ |
 | [`lean/AuthorityTests.lean`](../../lean/AuthorityTests.lean) | Rust の境界 test と対応する Lean の executable example | [検証とテスト](verification.md) |
 
 Rust の test は各実装ファイル内の `#[cfg(test)]` module にあるため、[検証とテスト](verification.md)でまとめて説明する。
@@ -70,23 +88,26 @@ Rust の test は各実装ファイル内の `#[cfg(test)]` module にあるた�
 flowchart LR
     segments["validated segments"] --> canonical["CanonicalPath"]
     canonical --> pattern["PathPattern"]
-    pattern --> pathMatch["path match"]
-    pattern --> pathBelow["path containment"]
-    repo["RepoId"] --> authority["FileAuthority"]
-    effects["FileEffects"] --> authority
-    pattern --> authority
-    request["FileRequest"] --> fileMatch["file match"]
-    authority --> fileMatch
-    authority --> bodyBelow["file body containment"]
-    pathBelow --> bodyBelow
-    bodyBelow --> sound["semantic subset guarantee"]
+    repo["RepoId"] --> fileAuthority["FileAuthority"]
+    effects["FileEffects"] --> fileAuthority
+    pattern --> fileAuthority
+    fileAuthority --> fileBelow["file_body_below"]
+    window["TimeWindow"] --> weaker["weaker_than"]
+    fileBelow --> typedBelow["authority_body_below"]
+    typedBelow --> weaker
+    request["CapabilityRequest"] --> capMatch["capability_matches"]
+    window --> capMatch
+    fileAuthority --> capMatch
+    weaker --> sound["child requests ⊆ parent requests"]
 ```
 
-`fileMatches` / `file_matches` は1件の request を許可するかを判定する。`fileBodyBelow` / `file_body_below` は子 authority を親から委譲してよいかを判定する。Lean の `fileBodyBelow_sound` は、後者が `true` なら、子が許す全 request を親も許すことを保証する。
+`capability_matches` / `capabilityMatches` は、ある時刻の1件の request を許可するか判定する。`weaker_than` / `weakerThan` は、子 Capability を親から委譲しても authority が広がらないか判定する。Lean の `weakerThan_sound` は、後者が `true` なら、子が許す全時刻付き request を親も許すことを保証する。
 
 ## 現在の実装境界
 
-実装済みなのは repository identity、repository-relative path、file effect、file request、file authority body の matching と containment である。Capability 全体の ID、subject、issuer、有効期間、`delegable`、異なる authority body を束ねる tagged union、`WeakerThan` はまだこのファイル群にはない。
+実装済みなのは repository identity、repository-relative path、file effect と request、file authority body、単調時刻の有効期間、typed metadata と file-only Capability、matching、`weakerThan` である。
+
+未実装なのは、File 以外の authority variant、Capability の保持・発行・revoke を扱う状態機械、OS/FUSE adapter、Rust と Lean を同じ fixture で比較する共通 corpus である。`parent` と `delegable` は型として存在するが、発行時に検証する `Derive` transition はまだない。
 
 Rust と Lean の境界例は現在、両言語の test に手動で対応させている。[実装順序](../design/implementation-plan.md)にある共通 corpus による自動差分テストは未実装である。
 
@@ -96,6 +117,8 @@ Rust と Lean の境界例は現在、両言語の test に手動で対応させ
 - [パスモデル](paths.md)
 - [Repository identity](repository-identities.md)
 - [File authority](file-authorities.md)
+- [有効期間](validity-windows.md)
+- [Capability](capabilities.md)
 - [検証とテスト](verification.md)
 - [Capability モデル](../design/capability-model.md)
 - [検証戦略](../design/verification.md)

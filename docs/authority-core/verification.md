@@ -80,6 +80,8 @@ path containment では、Lean が次の両方向を証明する。
 
 file body containment では、false allow を防ぐ `fileBodyBelow_sound` は無条件に成立する。false deny まで排除する完全性は、child の effect 集合が非空の場合に成立する。空 effect では request 集合が空になり、構造判定との意味に差が出るためである。
 
+時刻窓では `timeWindowBelow_iff_subset` により、端点判定と全 tick の集合包含が無条件に一致する。Capability 全体では `weakerThan_sound` が無条件に false allow を防ぎ、authority body が非空なら `weakerThan_iff_matches_subset_of_authority_nonempty` により false deny も排除する。
+
 この主張を「数学的に0%」と言い換えるなら、正確には次のようになる。
 
 > Lean で定義したモデルと前提の範囲内では、その性質に反する型付き入力は存在しない。
@@ -95,8 +97,10 @@ Rust test は対象実装と同じファイルの `#[cfg(test)] mod tests` に�
 | [`repository.rs`](../../crates/authority-core/src/repository.rs) | 1 | host-assigned value の保持、`as_str`、`Display` |
 | [`path.rs`](../../crates/authority-core/src/path.rs) | 8 | valid/root path、6種類の invalid segment、最初の error、Exact/Prefix matching、containment matrix、推移性 |
 | [`file.rs`](../../crates/authority-core/src/file.rs) | 5 | effect membership と duplicate、空/同値/拡大 subset、request matching の3軸、body containment の3軸、推移性 |
+| [`time.rs`](../../crates/authority-core/src/time.rs) | 4 | 正常/空/逆転区間、半開境界、時刻窓 subset、推移性 |
+| [`capability.rs`](../../crates/authority-core/src/capability.rs) | 5 | typed metadata、時刻付き matching、期間/file の縮小と拡大拒否、反射性、推移性 |
 
-合計14 test を `cargo test --workspace` で実行する。
+合計23 test を `cargo test --workspace` で実行する。
 
 ここで特に test が助けるのは、Lean の抽象モデルに出にくい Rust 固有の部分である。
 
@@ -104,12 +108,14 @@ Rust test は対象実装と同じファイルの `#[cfg(test)] mod tests` に�
 - private field と constructor を通した実際の API が使える。
 - `u16` bitset が duplicate を無視し、期待どおり membership を返す。
 - Rust の enum variant と match 分岐が concrete boundary で正しく接続される。
+- `TimeWindow::new` が不正な端点を structured error として拒否する。
+- typed metadata の getter と file-only Capability envelope が実際の公開 API で接続される。
 
 test helper の `path` は `CanonicalPath::new(...).expect(...)` を通し、fixture 自体も検証済み path から作る。
 
 ## `AuthorityTests.lean` は何を確認するか
 
-[`lean/AuthorityTests.lean`](../../lean/AuthorityTests.lean) は production theorem を置くファイルではない。Rust test と対応する値を作り、Lean の実行可能な `Bool` 判定を28個の `example` で評価する。
+[`lean/AuthorityTests.lean`](../../lean/AuthorityTests.lean) は production theorem を置くファイルではない。Rust test と対応する値を作り、Lean の実行可能な `Bool` 判定を40個の `example` で評価する。
 
 | 対象 | 具体的に確認する境界 |
 |---|---|
@@ -118,6 +124,8 @@ test helper の `path` は `CanonicalPath::new(...).expect(...)` を通し、fix
 | `FileEffects` / `fileEffectsBelow` | duplicate、membership、空集合、反射、subset、effect escalation |
 | `fileMatches` | allow、effect 不一致、repository 不一致、path 不一致 |
 | `fileBodyBelow` | 反射、effect escalation、repository 不一致、path 拡大、具体的な推移 chain |
+| `TimeWindow` / `timeWindowBelow` | 正常/空/逆転区間、半開境界、期間拡大の拒否、具体的な推移 chain |
+| `capabilityMatches` / `weakerThan` | 時刻と body の積、反射、期間拡大の拒否、逆向き包含、具体的な多段委譲 |
 
 多くの example は `by decide` で閉じる。Lean が命題を計算し、その結果が真である proof term を kernel が検査する。
 
@@ -127,7 +135,7 @@ Lean example が役立つ点は、定理だけでは見えにくい「この具�
 
 ## Production theorem は何を確認するか
 
-production theorem は [`lean/Authority/Path.lean`](../../lean/Authority/Path.lean) と [`lean/Authority/File.lean`](../../lean/Authority/File.lean) に置く。
+production theorem は [`lean/Authority/Path.lean`](../../lean/Authority/Path.lean)、[`lean/Authority/File.lean`](../../lean/Authority/File.lean)、[`lean/Authority/Time.lean`](../../lean/Authority/Time.lean)、[`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) に置く。
 
 | 対象 | 証明する一般性質 | 実務上の意味 |
 |---|---|---|
@@ -137,6 +145,12 @@ production theorem は [`lean/Authority/Path.lean`](../../lean/Authority/Path.le
 | file matching | `fileMatches_iff_matches` | repository・effect・path の3条件と `Bool` が一致する |
 | file body containment | `refl`, `trans`, `sound` | 多段委譲でも child request は必ず root request の内側にある |
 | file body completeness | effect 非空条件付き `complete`, `iff` | 非空 child では本当の包含を誤拒否しない |
+| time matching | `timeMatches_iff_contains` | 半開区間の membership と `Bool` が一致する |
+| time containment | `refl`, `trans`, `sound`, `complete`, `iff` | 多段でも期限を広げず、端点判定と時刻集合包含が一致する |
+| typed body matching / containment | matching `iff`、containment の `refl`, `trans`, `sound` | tagged body の分岐後も file semantics を保つ |
+| Capability matching | `capabilityMatches_iff_matches` | 時刻と typed request の2条件が `Bool` と一致する |
+| Capability containment | `weakerThan_refl`, `trans`, `sound` | 多段でも root の全時刻付き request 集合を越えない |
+| Capability completeness | authority 非空条件付き `complete`, `iff` | 非空 child では本当の包含を誤拒否しない |
 
 theorem を production 定義の隣に置くことで、判定を変更して証明が壊れた場合に build で分かる。具体例だけでなく、意味論との橋渡しまで変更対象になる。
 
@@ -185,6 +199,8 @@ lake test
 - `Exact` / `Prefix` matching の結果。
 - `pathBelow` の4組み合わせと root 境界。
 - effect subset、file matching、file body containment の3軸。
+- 時刻窓の構築、半開 membership、端点 containment。
+- Capability matching と、期間・body を1軸ずつ壊した `weakerThan`。
 - positive case と、各条件を1つだけ壊した negative case。
 
 これにより、Lean theorem が証明するモデルと Rust 実装の間にある「同じ定義を実装しているはず」という手動確認を、自動回帰 test へ変えられる。
@@ -206,6 +222,8 @@ lake test
 - [Authority core 実装ガイド](README.md)
 - [パスモデル](paths.md)
 - [File authority](file-authorities.md)
+- [有効期間](validity-windows.md)
+- [Capability](capabilities.md)
 - [検証戦略](../design/verification.md)
 - [実装順序](../design/implementation-plan.md)
 - [capfs](../design/capfs.md)

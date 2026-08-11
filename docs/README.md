@@ -16,6 +16,8 @@
 | [パスモデル](authority-core/paths.md) | `CanonicalPath`、`PathPattern`、matching、containment と証明 |
 | [Repository identity](authority-core/repository-identities.md) | `RepoId` の責務と exact equality 境界 |
 | [File authority](authority-core/file-authorities.md) | effect 集合、request、delegation 判定と証明 |
+| [有効期間](authority-core/validity-windows.md) | 単調時刻、半開区間、時刻窓の containment と証明 |
+| [Capability](authority-core/capabilities.md) | typed metadata、file-only envelope、時刻付き matching、`weakerThan` と証明 |
 | [検証とテスト](authority-core/verification.md) | Rust unit test、Lean example、Lean theorem の役割分担 |
 
 ## 文書の使い分け

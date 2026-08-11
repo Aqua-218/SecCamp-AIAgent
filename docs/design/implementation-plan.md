@@ -32,6 +32,8 @@ Rust で typed Capability、正規化型、`Matches`、`PathBelow`、`WeakerThan
 
 **完了条件:** repository、host、path、time、response size の境界値まで Rust と Lean が一致する。
 
+現在は file-only slice として repository、path、file effect、time、typed Capability、`Matches`、`WeakerThan` の Rust/Lean 実装と Lean の包含証明まで完了している。共通 corpus、host/response size を持つ authority variant、両言語の自動差分テストは未実装である。
+
 ## 2. 状態機械
 
 subject tree、held、revoke、open handle、attempt、effect、authorization guard を実装する。正常操作だけでなく leak、forge、stale ID、期限切れ、revoke race を proptest と loom に流す。

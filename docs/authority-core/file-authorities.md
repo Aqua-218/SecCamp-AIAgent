@@ -288,9 +288,11 @@ repository equality と path containment を同じ body 判定に含めるため
 
 ## 正確な保証範囲
 
-現在の証明対象は file authority **body** の repository、effect、path と、1件の `FileRequest` である。次はまだ含まれない。
+このページの証明対象は file authority **body** の repository、effect、path と、1件の `FileRequest` である。これを有効期間や metadata と組み合わせた file-only Capability は[Capability envelope と委譲証明](capabilities.md)で別に扱う。
 
-- Capability ID、subject、issuer、親 ID、有効期間、`delegable`。
+次はまだ含まれない。
+
+- Capability ID の採番、subject binding、親 ID と `delegable` を検査する発行状態機械。
 - revoke や使用回数、状態遷移、並行実行。
 - rename の source と destination を2件とも認可する orchestration。
 - FUSE operation から正しい `FileEffect` を選ぶ adapter。
@@ -332,5 +334,6 @@ OS・FUSE との接続は [`capfs`](../design/capfs.md)、state と revoke は[�
 - [Repository identity](repository-identities.md)
 - [パスモデル](paths.md)
 - [検証とテスト](verification.md)
+- [Capability envelope と委譲証明](capabilities.md)
 - [Capability モデル: ファイル権限](../design/capability-model.md#ファイル権限)
 - [capfs: 実装する操作](../design/capfs.md#実装する操作)

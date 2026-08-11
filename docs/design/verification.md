@@ -64,12 +64,12 @@ flowchart LR
     parser["正規化済み型"] --> path["PathBelow"]
     path --> body["BodyBelow"]
     body --> weaker["WeakerThan"]
-    denotes["Authority semantics"] --> sound["weaker_sound"]
+    denotes["Authority semantics"] --> sound["weakerThan_sound"]
     weaker --> sound
     sound --> guarantee["Authority(child) ⊆ Authority(parent)"]
 ```
 
-必須定理は `pathBelow_refl/trans/sound`、`bodyBelow_refl/trans/sound`、`weaker_refl/trans/sound`。安全性には sound で十分だが、path については実行可能な判定と集合意味論のずれをなくすため、`pathBelow_complete` と `pathBelow_iff_matches_subset` まで証明する。body と weaker の完全性は必要になった時点で検討する。
+必須定理は containment 各層の `refl`、`trans`、`sound` とする。現在の file-only Authority core では、path に `pathBelow_complete` / `pathBelow_iff_matches_subset`、時刻窓に `timeWindowBelow_complete` / `timeWindowBelow_iff_subset` まで実装している。file body と Capability 全体についても、空 authority の空虚な真を避ける非空条件付きで `complete` / `iff` を証明している。
 
 ## 正常系だけを生成しない
 

@@ -1,4 +1,5 @@
 import Authority.File
+import Authority.Time
 
 /-!
 # Authority

@@ -1,4 +1,5 @@
 import Authority.File
+import Authority.Time
 
 /-!
 # Authority Decision Tests
@@ -11,6 +12,52 @@ namespace AuthorityTests
 open Authority
 
 private def root : CanonicalPath := CanonicalPath.root
+
+private def tick (value : Nat) : MonotonicTime := { ticks := value }
+
+private def broadWindow : TimeWindow :=
+  { notBefore := tick 10
+    expiresAt := tick 30
+    isValid := by decide }
+
+private def narrowWindow : TimeWindow :=
+  { notBefore := tick 15
+    expiresAt := tick 20
+    isValid := by decide }
+
+private def laterWindow : TimeWindow :=
+  { notBefore := tick 20
+    expiresAt := tick 40
+    isValid := by decide }
+
+example : (TimeWindow.ofBounds (tick 10) (tick 11)).isSome = true := by decide
+
+example :
+    (TimeWindow.ofBounds (tick 10) (tick 10)).isSome = false ∧
+      (TimeWindow.ofBounds (tick 11) (tick 10)).isSome = false := by
+  decide
+
+example :
+    timeMatches broadWindow (tick 10) = true ∧
+      timeMatches broadWindow (tick 29) = true ∧
+      timeMatches broadWindow (tick 30) = false := by
+  decide
+
+example :
+    timeWindowBelow narrowWindow broadWindow = true ∧
+      timeWindowBelow broadWindow narrowWindow = false ∧
+      timeWindowBelow laterWindow broadWindow = false := by
+  decide
+
+example :
+    let middleWindow : TimeWindow :=
+      { notBefore := tick 12
+        expiresAt := tick 25
+        isValid := by decide }
+    timeWindowBelow narrowWindow middleWindow = true ∧
+      timeWindowBelow middleWindow broadWindow = true ∧
+      timeWindowBelow narrowWindow broadWindow = true := by
+  decide
 
 private def src : CanonicalPath :=
   { segments := ["src"]

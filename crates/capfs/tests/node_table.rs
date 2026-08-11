@@ -40,6 +40,7 @@ fn root_node_is_pinned_to_the_mount_root_object() {
 fn lookup_forget_and_relookup_never_reuse_a_node_id() {
     let table = NodeTable::new(SubjectId::new("subject-reader"), ObjectId::new("root"));
     let object = ObjectId::new("object-file");
+    assert_eq!(table.node_for_object(&object), Ok(None));
 
     let first = table
         .remember_lookup(&object)
@@ -51,6 +52,7 @@ fn lookup_forget_and_relookup_never_reuse_a_node_id() {
     assert_eq!(first.lookup_count(), 1);
     assert_eq!(repeated.lookup_count(), 2);
     assert_eq!(table.resolve(first.node()), Ok(object.clone()));
+    assert_eq!(table.node_for_object(&object), Ok(Some(first.node())));
 
     let retained = table
         .forget(first.node(), lookup_count(1))
@@ -69,6 +71,7 @@ fn lookup_forget_and_relookup_never_reuse_a_node_id() {
         table.resolve(first.node()),
         Err(NodeTableError::UnknownNode(first.node()))
     );
+    assert_eq!(table.node_for_object(&object), Ok(None));
 
     let replacement = table
         .remember_lookup(&object)

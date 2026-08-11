@@ -29,7 +29,7 @@ use authority_core::{
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
-    ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL,
 };
 use rustix::fs::OFlags;
 
@@ -190,31 +190,52 @@ impl From<NamespaceError> for ReadOnlyFilesystemError {
 }
 
 #[derive(Debug)]
-struct OpenFile {
+struct OpenResource {
     node: NodeId,
     object: ObjectId,
     authority_handle: HandleId,
-    backing: OpenedBackingFile,
+    backing: OpenBacking,
+}
+
+#[derive(Debug)]
+enum OpenBacking {
+    File(OpenedBackingFile),
+    Directory,
+}
+
+impl OpenBacking {
+    const fn kind(&self) -> OpenResourceKind {
+        match self {
+            Self::File(_) => OpenResourceKind::File,
+            Self::Directory => OpenResourceKind::Directory,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenResourceKind {
+    File,
+    Directory,
 }
 
 #[derive(Debug)]
 struct HandleState {
     next_sequence: Option<u64>,
-    files: BTreeMap<u64, OpenFile>,
+    resources: BTreeMap<u64, OpenResource>,
 }
 
 impl HandleState {
     const fn new() -> Self {
         Self {
             next_sequence: Some(1),
-            files: BTreeMap::new(),
+            resources: BTreeMap::new(),
         }
     }
 
     fn reserve(&mut self) -> Result<u64, AdapterError> {
         let sequence = self.next_sequence.take().ok_or(AdapterError::Internal)?;
         self.next_sequence = sequence.checked_add(1);
-        if self.files.contains_key(&sequence) {
+        if self.resources.contains_key(&sequence) {
             return Err(AdapterError::Internal);
         }
         Ok(sequence)
@@ -227,6 +248,7 @@ enum AdapterError {
     AccessDenied,
     ReadOnly,
     IsDirectory,
+    NotDirectory,
     InvalidRequest,
     BadHandle,
     Internal,
@@ -239,6 +261,7 @@ impl AdapterError {
             Self::AccessDenied => Errno::EACCES,
             Self::ReadOnly => Errno::EROFS,
             Self::IsDirectory => Errno::EISDIR,
+            Self::NotDirectory => Errno::ENOTDIR,
             Self::InvalidRequest => Errno::EINVAL,
             Self::BadHandle => Errno::EBADF,
             Self::Internal => Errno::EIO,
@@ -249,6 +272,14 @@ impl AdapterError {
 struct Entry {
     node: NodeId,
     metadata: BackingMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryEntry {
+    node: Option<NodeId>,
+    kind: NamespaceObjectKind,
+    name: String,
+    next_offset: u64,
 }
 
 /// A subject-local, read-only FUSE view of one validated repository.
@@ -347,11 +378,14 @@ impl ReadOnlyFilesystem {
         let object = match handle {
             Some(handle) => {
                 let handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
-                let file = handles.files.get(&handle).ok_or(AdapterError::BadHandle)?;
-                if file.node != node {
+                let resource = handles
+                    .resources
+                    .get(&handle)
+                    .ok_or(AdapterError::BadHandle)?;
+                if resource.node != node {
                     return Err(AdapterError::BadHandle);
                 }
-                file.object.clone()
+                resource.object.clone()
             }
             None => self
                 .nodes
@@ -399,6 +433,41 @@ impl ReadOnlyFilesystem {
     }
 
     fn open_file(&self, node: NodeId, flags: OpenFlags) -> Result<u64, AdapterError> {
+        self.open_resource(
+            node,
+            flags,
+            NamespaceObjectKind::RegularFile,
+            AdapterError::IsDirectory,
+            FileEffect::ReadData,
+            |object| {
+                self.backing
+                    .open_runtime_file(object)
+                    .map(OpenBacking::File)
+                    .map_err(|_| AdapterError::Internal)
+            },
+        )
+    }
+
+    fn open_directory(&self, node: NodeId, flags: OpenFlags) -> Result<u64, AdapterError> {
+        self.open_resource(
+            node,
+            flags,
+            NamespaceObjectKind::Directory,
+            AdapterError::NotDirectory,
+            FileEffect::ListDirectory,
+            |_| Ok(OpenBacking::Directory),
+        )
+    }
+
+    fn open_resource(
+        &self,
+        node: NodeId,
+        flags: OpenFlags,
+        expected_kind: NamespaceObjectKind,
+        kind_error: AdapterError,
+        effect: FileEffect,
+        open_backing: impl FnOnce(&NamespaceObject) -> Result<OpenBacking, AdapterError>,
+    ) -> Result<u64, AdapterError> {
         self.ensure_healthy()?;
         validate_open_flags(flags)?;
         let object = self
@@ -410,8 +479,8 @@ impl ReadOnlyFilesystem {
         let authority_handle =
             HandleId::new(format!("{}:fuse-handle:{sequence}", self.authority.mount));
         let opened = self.namespace.open_object(&object, |object| {
-            if object.kind() != NamespaceObjectKind::RegularFile {
-                return Err(AdapterError::IsDirectory);
+            if object.kind() != expected_kind {
+                return Err(kind_error);
             }
             self.kernel
                 .register_open_handle(OpenHandle::new(
@@ -421,16 +490,12 @@ impl ReadOnlyFilesystem {
                 ))
                 .map_err(|_| AdapterError::Internal)?;
 
-            let request = self.file_request(FileEffect::ReadData, object.path().clone());
+            let request = self.file_request(effect, object.path().clone());
             match self.kernel.authorize_and_commit(
                 &self.authority.subject,
                 &self.authority.capability,
                 &request,
-                |_| {
-                    self.backing
-                        .open_runtime_file(object)
-                        .map_err(|_| AdapterError::Internal)
-                },
+                |_| open_backing(object),
             ) {
                 Ok(backing) => Ok(backing),
                 Err(error) => {
@@ -447,9 +512,9 @@ impl ReadOnlyFilesystem {
             }
         });
         let backing = opened.map_err(|error| map_namespace_operation_error(&error))?;
-        let replaced = handles.files.insert(
+        let replaced = handles.resources.insert(
             sequence,
-            OpenFile {
+            OpenResource {
                 node,
                 object,
                 authority_handle,
@@ -475,13 +540,19 @@ impl ReadOnlyFilesystem {
             return Err(AdapterError::InvalidRequest);
         }
         let handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
-        let file = handles.files.get(&handle).ok_or(AdapterError::BadHandle)?;
-        if file.node != node {
+        let resource = handles
+            .resources
+            .get(&handle)
+            .ok_or(AdapterError::BadHandle)?;
+        if resource.node != node {
             return Err(AdapterError::BadHandle);
         }
+        let OpenBacking::File(backing) = &resource.backing else {
+            return Err(AdapterError::BadHandle);
+        };
 
         self.namespace
-            .with_object(&file.object, |object| {
+            .with_object(&resource.object, |object| {
                 let request = self.file_request(FileEffect::ReadData, object.path().clone());
                 self.kernel
                     .authorize_and_commit(
@@ -489,7 +560,7 @@ impl ReadOnlyFilesystem {
                         &self.authority.capability,
                         &request,
                         |_| {
-                            file.backing
+                            backing
                                 .read_at(offset, size as usize)
                                 .map_err(|_| AdapterError::Internal)
                         },
@@ -499,15 +570,112 @@ impl ReadOnlyFilesystem {
             .map_err(|error| map_namespace_operation_error(&error))
     }
 
-    fn release_file(&self, node: NodeId, handle: u64) -> Result<(), AdapterError> {
+    fn read_directory(
+        &self,
+        node: NodeId,
+        handle: u64,
+        offset: u64,
+    ) -> Result<Vec<DirectoryEntry>, AdapterError> {
         self.ensure_healthy()?;
-        let mut handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
-        let file = handles.files.get(&handle).ok_or(AdapterError::BadHandle)?;
-        if file.node != node {
+        let offset = usize::try_from(offset).map_err(|_| AdapterError::InvalidRequest)?;
+        let handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+        let resource = handles
+            .resources
+            .get(&handle)
+            .ok_or(AdapterError::BadHandle)?;
+        if resource.node != node || resource.backing.kind() != OpenResourceKind::Directory {
             return Err(AdapterError::BadHandle);
         }
-        let object = file.object.clone();
-        let authority_handle = file.authority_handle.clone();
+
+        self.namespace
+            .with_directory_children(&resource.object, |directory, parent, children| {
+                let request =
+                    self.file_request(FileEffect::ListDirectory, directory.path().clone());
+                self.kernel
+                    .authorize_and_commit(
+                        &self.authority.subject,
+                        &self.authority.capability,
+                        &request,
+                        |capability| {
+                            let mut entries = Vec::with_capacity(children.len() + 2);
+                            entries.push((Some(node), NamespaceObjectKind::Directory, ".".into()));
+                            entries.push((
+                                self.nodes
+                                    .node_for_object(parent.id())
+                                    .map_err(|_| AdapterError::Internal)?,
+                                NamespaceObjectKind::Directory,
+                                "..".into(),
+                            ));
+                            for child in children {
+                                if !self.capability_may_observe(capability, child.path()) {
+                                    continue;
+                                }
+                                let name = child
+                                    .path()
+                                    .as_segments()
+                                    .last()
+                                    .cloned()
+                                    .ok_or(AdapterError::Internal)?;
+                                entries.push((
+                                    self.nodes
+                                        .node_for_object(child.id())
+                                        .map_err(|_| AdapterError::Internal)?,
+                                    child.kind(),
+                                    name,
+                                ));
+                            }
+                            if offset > entries.len() {
+                                return Err(AdapterError::InvalidRequest);
+                            }
+                            entries
+                                .into_iter()
+                                .enumerate()
+                                .skip(offset)
+                                .map(|(index, (node, kind, name))| {
+                                    let next_offset = index
+                                        .checked_add(1)
+                                        .and_then(|value| u64::try_from(value).ok())
+                                        .ok_or(AdapterError::Internal)?;
+                                    Ok(DirectoryEntry {
+                                        node,
+                                        kind,
+                                        name,
+                                        next_offset,
+                                    })
+                                })
+                                .collect()
+                        },
+                    )
+                    .map_err(|error| map_effect_error(&error))
+            })
+            .map_err(|error| map_namespace_operation_error(&error))
+    }
+
+    fn release_file(&self, node: NodeId, handle: u64) -> Result<(), AdapterError> {
+        self.release_resource(node, handle, OpenResourceKind::File)
+    }
+
+    fn release_directory(&self, node: NodeId, handle: u64) -> Result<(), AdapterError> {
+        self.release_resource(node, handle, OpenResourceKind::Directory)
+    }
+
+    fn release_resource(
+        &self,
+        node: NodeId,
+        handle: u64,
+        expected_kind: OpenResourceKind,
+    ) -> Result<(), AdapterError> {
+        self.ensure_healthy()?;
+        let mut handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+        let resource = handles
+            .resources
+            .get(&handle)
+            .ok_or(AdapterError::BadHandle)?;
+        if resource.node != node || resource.backing.kind() != expected_kind {
+            return Err(AdapterError::BadHandle);
+        }
+        let object = resource.object.clone();
+        let authority_handle = resource.authority_handle.clone();
 
         self.namespace
             .close_object(&object, |_| {
@@ -520,7 +688,7 @@ impl ReadOnlyFilesystem {
                 }
             })
             .map_err(|error| map_namespace_operation_error(&error))?;
-        handles.files.remove(&handle).ok_or_else(|| {
+        handles.resources.remove(&handle).ok_or_else(|| {
             self.mark_fatal();
             AdapterError::Internal
         })?;
@@ -554,9 +722,15 @@ impl ReadOnlyFilesystem {
             return;
         };
         let pending = handles
-            .files
+            .resources
             .iter()
-            .map(|(handle, file)| (*handle, file.object.clone(), file.authority_handle.clone()))
+            .map(|(handle, resource)| {
+                (
+                    *handle,
+                    resource.object.clone(),
+                    resource.authority_handle.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         for (handle, object, authority_handle) in pending {
             let closed = self.namespace.close_object(&object, |_| {
@@ -569,7 +743,7 @@ impl ReadOnlyFilesystem {
                 }
             });
             if closed.is_ok() {
-                handles.files.remove(&handle);
+                handles.resources.remove(&handle);
             } else {
                 self.mark_fatal();
             }
@@ -664,6 +838,48 @@ impl Filesystem for ReadOnlyFilesystem {
         }
     }
 
+    fn opendir(&self, _request: &Request, node: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let Some(node) = NodeId::new(node.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match self.open_directory(node, flags) {
+            Ok(handle) => reply.opened(FileHandle(handle), FopenFlags::empty()),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    fn readdir(
+        &self,
+        _request: &Request,
+        node: INodeNo,
+        handle: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
+        let Some(node) = NodeId::new(node.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match self.read_directory(node, handle.0, offset) {
+            Ok(entries) => {
+                for entry in entries {
+                    let inode = entry.node.map_or(INodeNo(0), |node| INodeNo(node.as_u64()));
+                    if reply.add(
+                        inode,
+                        entry.next_offset,
+                        namespace_file_type(entry.kind),
+                        entry.name,
+                    ) {
+                        break;
+                    }
+                }
+                reply.ok();
+            }
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
     fn read(
         &self,
         _request: &Request,
@@ -700,6 +916,24 @@ impl Filesystem for ReadOnlyFilesystem {
             return;
         };
         match self.release_file(node, handle.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    fn releasedir(
+        &self,
+        _request: &Request,
+        node: INodeNo,
+        handle: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        let Some(node) = NodeId::new(node.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match self.release_directory(node, handle.0) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(error.errno()),
         }
@@ -749,10 +983,7 @@ fn file_attr(node: NodeId, metadata: BackingMetadata) -> FileAttr {
         mtime: metadata.mtime,
         ctime: metadata.ctime,
         crtime: UNIX_EPOCH,
-        kind: match metadata.kind {
-            NamespaceObjectKind::Directory => FileType::Directory,
-            NamespaceObjectKind::RegularFile => FileType::RegularFile,
-        },
+        kind: namespace_file_type(metadata.kind),
         perm: metadata.permissions,
         nlink: metadata.link_count,
         uid: metadata.uid,
@@ -763,15 +994,22 @@ fn file_attr(node: NodeId, metadata: BackingMetadata) -> FileAttr {
     }
 }
 
+const fn namespace_file_type(kind: NamespaceObjectKind) -> FileType {
+    match kind {
+        NamespaceObjectKind::Directory => FileType::Directory,
+        NamespaceObjectKind::RegularFile => FileType::RegularFile,
+    }
+}
+
 fn validate_open_flags(flags: OpenFlags) -> Result<(), AdapterError> {
     if flags.acc_mode() != OpenAccMode::O_RDONLY {
         return Err(AdapterError::ReadOnly);
     }
     let raw = u32::try_from(flags.0).map_err(|_| AdapterError::InvalidRequest)?;
     let flags = OFlags::from_bits_retain(raw);
-    if flags.intersects(
-        OFlags::APPEND | OFlags::CREATE | OFlags::EXCL | OFlags::TRUNC | OFlags::TMPFILE,
-    ) {
+    if flags.intersects(OFlags::APPEND | OFlags::CREATE | OFlags::EXCL | OFlags::TRUNC)
+        || flags.contains(OFlags::TMPFILE)
+    {
         return Err(AdapterError::ReadOnly);
     }
     Ok(())
@@ -852,6 +1090,17 @@ mod tests {
         Arc<CapabilityKernel>,
         authority_core::capability::CapId,
     ) {
+        test_filesystem_with_pattern(PathPattern::Prefix(path(&["scoped"])))
+    }
+
+    fn test_filesystem_with_pattern(
+        authority_path: PathPattern,
+    ) -> (
+        TempDir,
+        ReadOnlyFilesystem,
+        Arc<CapabilityKernel>,
+        authority_core::capability::CapId,
+    ) {
         let directory = tempdir().expect("temporary repository must be creatable");
         fs::create_dir(directory.path().join("scoped"))
             .expect("authorized test directory must be creatable");
@@ -874,7 +1123,7 @@ mod tests {
             validity,
             AuthorityBody::File(FileAuthority::new(
                 repository.clone(),
-                FileEffects::only(FileEffect::ReadData),
+                FileEffects::from_effects([FileEffect::ReadData, FileEffect::ListDirectory]),
                 PathPattern::Prefix(CanonicalPath::root()),
             )),
         );
@@ -890,8 +1139,8 @@ mod tests {
                 validity,
                 AuthorityBody::File(FileAuthority::new(
                     repository.clone(),
-                    FileEffects::only(FileEffect::ReadData),
-                    PathPattern::Prefix(path(&["scoped"])),
+                    FileEffects::from_effects([FileEffect::ReadData, FileEffect::ListDirectory]),
+                    authority_path,
                 )),
             ))
             .expect("test capability issuance must succeed");
@@ -976,6 +1225,114 @@ mod tests {
                 .map(|value| value.map(|record| record.open_handle_count())),
             Ok(Some(0))
         );
+    }
+
+    #[test]
+    fn directory_listing_uses_capability_visibility_and_offset_cookies() {
+        let (_directory, filesystem, kernel, _capability) = test_filesystem();
+        assert_eq!(
+            filesystem.open_directory(NodeId::ROOT, OpenFlags(0)),
+            Err(AdapterError::AccessDenied),
+            "an ancestor's metadata visibility must not imply ListDirectory"
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("authorized directory must resolve");
+        let handle = filesystem
+            .open_directory(scoped.node, OpenFlags(0))
+            .expect("authorized directory must open");
+        let object = filesystem
+            .nodes
+            .resolve(scoped.node)
+            .expect("opened directory node must stay bound");
+        assert_eq!(kernel.object_open_handle_count(&object), Ok(1));
+
+        let entries = filesystem
+            .read_directory(scoped.node, handle, 0)
+            .expect("authorized directory listing must succeed");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.next_offset))
+                .collect::<Vec<_>>(),
+            [(".", 1), ("..", 2), ("allowed.txt", 3)]
+        );
+        assert_eq!(
+            filesystem
+                .read_directory(scoped.node, handle, 2)
+                .expect("a returned offset must resume after its entry"),
+            entries[2..]
+        );
+        assert_eq!(
+            filesystem
+                .read_directory(scoped.node, handle, 3)
+                .expect("the final offset must report end of stream"),
+            []
+        );
+        assert_eq!(
+            filesystem.read_directory(scoped.node, handle, 4),
+            Err(AdapterError::InvalidRequest)
+        );
+
+        filesystem
+            .release_directory(scoped.node, handle)
+            .expect("directory release must close both handle registries");
+        assert_eq!(kernel.object_open_handle_count(&object), Ok(0));
+        assert_eq!(
+            filesystem
+                .namespace
+                .object_snapshot(&object)
+                .map(|value| value.map(|record| record.open_handle_count())),
+            Ok(Some(0))
+        );
+    }
+
+    #[test]
+    fn every_directory_read_reauthorizes_an_existing_handle() {
+        let (_directory, filesystem, kernel, capability) = test_filesystem();
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("authorized directory must resolve");
+        let handle = filesystem
+            .open_directory(scoped.node, OpenFlags(0))
+            .expect("initial authorized directory open must succeed");
+
+        assert!(filesystem.read_directory(scoped.node, handle, 0).is_ok());
+        kernel
+            .revoke(&capability)
+            .expect("test capability must be revocable");
+        assert_eq!(
+            filesystem.read_directory(scoped.node, handle, 0),
+            Err(AdapterError::AccessDenied)
+        );
+        filesystem
+            .release_directory(scoped.node, handle)
+            .expect("revocation must not prevent directory release");
+    }
+
+    #[test]
+    fn directory_listing_filters_children_outside_exact_visibility() {
+        let (_directory, filesystem, _kernel, _capability) =
+            test_filesystem_with_pattern(PathPattern::Exact(path(&["scoped"])));
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("exactly authorized directory must resolve");
+        let handle = filesystem
+            .open_directory(scoped.node, OpenFlags(0))
+            .expect("exact ListDirectory authority must open its directory");
+
+        assert_eq!(
+            filesystem
+                .read_directory(scoped.node, handle, 0)
+                .expect("directory listing must apply entry visibility")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            [".", ".."]
+        );
+        filesystem
+            .release_directory(scoped.node, handle)
+            .expect("exact directory handle must release");
     }
 
     #[test]

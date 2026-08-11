@@ -274,6 +274,31 @@ impl NodeTable {
             .ok_or(NodeTableError::UnknownNode(node))
     }
 
+    /// Returns the live mount-local node for an object without adding a lookup reference.
+    ///
+    /// This is intended for basic `READDIR` inode hints. A directory reply does
+    /// not create a kernel lookup reference, so callers must not use
+    /// [`Self::remember_lookup`] for this purpose.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeTableError::LockPoisoned`] after a writer panic, or
+    /// [`NodeTableError::InvariantViolation`] if the two indexes disagree.
+    pub fn node_for_object(&self, object: &ObjectId) -> Result<Option<NodeId>, NodeTableError> {
+        let state = self.read_state()?;
+        let Some(node) = state.objects.get(object).copied() else {
+            return Ok(None);
+        };
+        let binding = state
+            .nodes
+            .get(&node)
+            .ok_or(NodeTableError::InvariantViolation)?;
+        if binding.object != *object {
+            return Err(NodeTableError::InvariantViolation);
+        }
+        Ok(Some(node))
+    }
+
     /// Applies a non-zero FUSE FORGET count to one ordinary node.
     ///
     /// The method rejects excessive counts without changing either index. When

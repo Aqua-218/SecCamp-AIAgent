@@ -47,9 +47,14 @@ flowchart LR
     passthrough["passthrough"] --> auth["操作ごとの認可"]
     auth --> namespace["global namespace registry"]
     namespace --> race["rename / revoke 攻撃テスト"]
+    race -.-> symlink["後続拡張<br/>安全な symlink 解決"]
 ```
 
 **完了条件:** 実 mount 上で read-after-revoke と rename/write 競合を再現しても、権限外アクセスが成立しない。
+
+初期完了時点では symlink と hard link を含む repository を拒否し、`SYMLINK` と `LINK` も `EPERM` にする。これにより、namespace と revoke の基本 invariant を link 解決から独立して検証する。
+
+その後、repository 内で完結する symlink を[後続機能](capfs.md#symlink-は後続機能として追加する)として追加する。hard link は同じ inode に複数 path を与えるため、symlink と同時には有効化せず、import 時の分離または alias-aware な認可モデルを設計してから扱う。
 
 ## 4. コンテナ隔離
 

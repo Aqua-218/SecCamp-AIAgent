@@ -46,11 +46,14 @@ flowchart LR
 | revoke / commit | loom | 小さく切った model 内の全 interleaving |
 | FUSE operation | 実 mount の統合テスト | syscall が正しい effect へ変換されること |
 | namespace race | loom + stress test | rename、unlink、open handle の競合 |
+| symlink resolver（後続機能） | stateful proptest + 実 mount の攻撃テスト | 解決後 path での認可、root 脱出・cycle・stale resolution の拒否 |
 | SSRF | resolver / redirect test | 非公開宛先と rebinding の拒否 |
 | VM 境界 | escape 試行 | 実際の jailer、kernel、mount、seccomp 設定 |
 | snapshot | 同一 snapshot の複数 restore | ID、workspace、Broker session の一意性 |
 
 loom は実システム全体の証明ではない。production と同じ synchronization wrapper を使った bounded model の検査である、と範囲を明記する。
+
+symlink resolver の test は初期 `capfs` の完了条件には含めない。link-free な namespace と revoke の検証を先に終え、[symlink 対応](capfs.md#symlink-は後続機能として追加する)を実装する段階で追加する。
 
 ## Lean で証明するもの
 

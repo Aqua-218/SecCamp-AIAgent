@@ -72,17 +72,26 @@ supervisor は TCB なので、侵害後も細粒度 Capability が守られる�
 
 コンテナ境界は普段の分離には使うが、guest kernel breakout に対する最後の壁とは数えない。
 
-## この設計で扱わないもの
+## 保証対象外と初期実装の制限
+
+次はシステム全体として保証対象に含めない。
 
 - VM escape、ホスト侵害、物理攻撃、サイドチャネル。
 - commit 済み外部操作の巻き戻し。
 - VM を跨ぐ Capability 委譲。
 - supervisor 再起動後の Capability 復元。
-- workspace 上の symlink、hard link、共有書き込み `mmap`。
 - Agent / Tool からの raw TCP / UDP。
+
+次は初期実装で拒否する。symlink には後続の対応計画があり、hard link と共有書き込み `mmap` は別の認可モデルができるまで拒否を維持する。
+
+- symlink または hard link を含む workspace。
+- `SYMLINK`、`LINK`、共有書き込み `mmap`。
+
+symlink は、link 解決後の canonical target path で認可する後続機能として追加する。hard link は複数 path が同じ inode を共有するため、別の alias-aware な認可モデルまたは import 時の分離を必要とする。詳細は[capfs](capfs.md#symlink-は後続機能として追加する)を参照する。
 
 ## 関連文書
 
 - [Capability モデル](capability-model.md)
+- [capfs](capfs.md)
 - [隔離基盤](runtime-isolation.md)
 - [ネットワークと外部副作用](network-egress.md)

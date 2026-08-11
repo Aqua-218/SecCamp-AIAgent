@@ -6,4 +6,5 @@ pub mod capability;
 pub mod file;
 pub mod path;
 pub mod repository;
+pub mod state;
 pub mod time;

@@ -13,7 +13,8 @@ use authority_core::{
     repository::RepoId,
     state::{
         AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
-        RevocationStatus, StaticAuthorityEnvelope, Subject,
+        RevocationStatus, StaticAuthorityEnvelope, Subject, SubjectCloseStatus,
+        SubjectFinishStatus, SubjectStatus,
     },
     time::{MonotonicTime, TimeWindow},
 };
@@ -517,5 +518,66 @@ fn ancestor_revocation_invalidates_descendants_and_never_reuses_ids() {
     assert_eq!(
         state.revoke(&unknown),
         Err(CapabilityStateError::UnknownCapability(unknown))
+    );
+}
+
+// Requirement: beginning shutdown blocks new authority immediately, revokes
+// held roots, and never allows a closed subject to run again.
+// Category: lifecycle/security. Risk: critical.
+#[test]
+fn subject_shutdown_is_monotone_and_invalidates_descendants() {
+    let mut state = state_with_subjects();
+    let root_id = state
+        .issue_root(root_grant(true))
+        .expect("root issuance must succeed");
+    let child_id = state
+        .derive(&root_subject_id(), &root_id, child_grant(false), time(25))
+        .expect("child derivation must succeed before shutdown");
+
+    assert_eq!(
+        state.finish_subject_close(&root_subject_id()),
+        Err(CapabilityStateError::SubjectNotClosing(root_subject_id()))
+    );
+    assert_eq!(
+        state.begin_subject_close(&root_subject_id()),
+        Ok(SubjectCloseStatus::Started)
+    );
+    assert_eq!(
+        state.subject_status(&root_subject_id()),
+        Some(SubjectStatus::Closing)
+    );
+    assert_eq!(state.authorization_epoch().as_u64(), 1);
+    assert!(state.is_revoked(&root_id));
+    assert!(!state.is_effectively_active(&child_id, time(30)));
+    assert!(!state.authorizes(
+        &root_subject_id(),
+        &root_id,
+        &read_request(30, &["src", "main.rs"]),
+    ));
+    assert_eq!(
+        state.issue_root(root_grant(false)),
+        Err(CapabilityStateError::SubjectNotRunning(root_subject_id()))
+    );
+    assert_eq!(
+        state.begin_subject_close(&root_subject_id()),
+        Ok(SubjectCloseStatus::AlreadyClosing)
+    );
+    assert_eq!(state.authorization_epoch().as_u64(), 1);
+
+    assert_eq!(
+        state.finish_subject_close(&root_subject_id()),
+        Ok(SubjectFinishStatus::Closed)
+    );
+    assert_eq!(
+        state.subject_status(&root_subject_id()),
+        Some(SubjectStatus::Closed)
+    );
+    assert_eq!(
+        state.begin_subject_close(&root_subject_id()),
+        Ok(SubjectCloseStatus::AlreadyClosed)
+    );
+    assert_eq!(
+        state.finish_subject_close(&root_subject_id()),
+        Ok(SubjectFinishStatus::AlreadyClosed)
     );
 }

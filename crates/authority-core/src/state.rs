@@ -62,6 +62,41 @@ pub struct Subject {
     envelope: StaticAuthorityEnvelope,
 }
 
+/// Lifecycle state for a registered subject.
+///
+/// Registration publishes a fully initialized [`Subject`] as running. Closing
+/// immediately blocks new authorization and capability issuance; the external
+/// supervisor may then stop resources before marking the subject closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubjectStatus {
+    /// The subject may receive and exercise capabilities.
+    Running,
+    /// New authority use is blocked while external resources are torn down.
+    Closing,
+    /// Teardown completed and the subject cannot become running again.
+    Closed,
+}
+
+/// Reports the result of beginning subject shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectCloseStatus {
+    /// The subject changed from running to closing.
+    Started,
+    /// The subject was already closing.
+    AlreadyClosing,
+    /// The subject had already completed shutdown.
+    AlreadyClosed,
+}
+
+/// Reports the result of completing subject shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectFinishStatus {
+    /// The subject changed from closing to closed.
+    Closed,
+    /// The subject was already closed.
+    AlreadyClosed,
+}
+
 impl Subject {
     /// Creates a root subject without a parent.
     #[must_use]
@@ -196,6 +231,10 @@ pub enum CapabilityStateError {
     UnknownParentSubject(SubjectId),
     /// A capability grant names a subject that is not registered.
     UnknownSubject(SubjectId),
+    /// A transition requires a subject that is still running.
+    SubjectNotRunning(SubjectId),
+    /// Shutdown completion was requested before shutdown began.
+    SubjectNotClosing(SubjectId),
     /// A transition refers to a capability that was never issued.
     UnknownCapability(CapId),
     /// The caller does not hold the requested parent capability.
@@ -230,6 +269,12 @@ impl fmt::Display for CapabilityStateError {
             }
             Self::UnknownSubject(subject) => {
                 write!(formatter, "target subject `{subject}` is not registered")
+            }
+            Self::SubjectNotRunning(subject) => {
+                write!(formatter, "subject `{subject}` is not running")
+            }
+            Self::SubjectNotClosing(subject) => {
+                write!(formatter, "subject `{subject}` is not closing")
             }
             Self::UnknownCapability(capability) => {
                 write!(
@@ -278,6 +323,7 @@ pub struct CapabilityState {
     issuer: IssuerId,
     next_capability_sequence: Option<u64>,
     subjects: BTreeMap<SubjectId, Subject>,
+    subject_statuses: BTreeMap<SubjectId, SubjectStatus>,
     capabilities: BTreeMap<CapId, Capability>,
     held: BTreeMap<SubjectId, BTreeSet<CapId>>,
     revoked: BTreeSet<CapId>,
@@ -293,6 +339,7 @@ impl CapabilityState {
             issuer,
             next_capability_sequence: Some(0),
             subjects: BTreeMap::new(),
+            subject_statuses: BTreeMap::new(),
             capabilities: BTreeMap::new(),
             held: BTreeMap::new(),
             revoked: BTreeSet::new(),
@@ -329,9 +376,14 @@ impl CapabilityState {
         {
             return Err(CapabilityStateError::UnknownParentSubject(parent.clone()));
         }
+        if let Some(parent) = subject.parent() {
+            self.ensure_subject_running(parent)?;
+        }
 
         let subject_id = subject.id().clone();
         self.held.insert(subject_id.clone(), BTreeSet::new());
+        self.subject_statuses
+            .insert(subject_id.clone(), SubjectStatus::Running);
         self.subjects.insert(subject_id, subject);
         Ok(())
     }
@@ -340,6 +392,12 @@ impl CapabilityState {
     #[must_use]
     pub fn subject(&self, subject: &SubjectId) -> Option<&Subject> {
         self.subjects.get(subject)
+    }
+
+    /// Returns the lifecycle status of a registered subject.
+    #[must_use]
+    pub fn subject_status(&self, subject: &SubjectId) -> Option<SubjectStatus> {
+        self.subject_statuses.get(subject).copied()
     }
 
     /// Returns an issued capability, including one that is now revoked.
@@ -394,6 +452,7 @@ impl CapabilityState {
         grant: CapabilityGrant,
         now: MonotonicTime,
     ) -> Result<CapId, CapabilityStateError> {
+        self.ensure_subject_running(caller)?;
         let parent = self
             .capabilities
             .get(parent_id)
@@ -448,6 +507,64 @@ impl CapabilityState {
         Ok(RevocationStatus::NewlyRevoked)
     }
 
+    /// Begins monotone shutdown and revokes every capability held by a subject.
+    ///
+    /// The transition from running to closing advances the authorization epoch
+    /// exactly once, even when the subject holds no capabilities. Existing
+    /// records remain available for audit and descendant capabilities become
+    /// inactive through their revoked ancestor chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityStateError::UnknownSubject`] for an unregistered
+    /// identity, or [`CapabilityStateError::AuthorizationEpochExhausted`] if
+    /// the transition cannot invalidate cached decisions without wrapping.
+    pub fn begin_subject_close(
+        &mut self,
+        subject: &SubjectId,
+    ) -> Result<SubjectCloseStatus, CapabilityStateError> {
+        match self.subject_status(subject) {
+            None => return Err(CapabilityStateError::UnknownSubject(subject.clone())),
+            Some(SubjectStatus::Closing) => return Ok(SubjectCloseStatus::AlreadyClosing),
+            Some(SubjectStatus::Closed) => return Ok(SubjectCloseStatus::AlreadyClosed),
+            Some(SubjectStatus::Running) => {}
+        }
+
+        let next_epoch = self.next_authorization_epoch()?;
+        if let Some(capabilities) = self.held.get(subject) {
+            self.revoked.extend(capabilities.iter().cloned());
+        }
+        self.subject_statuses
+            .insert(subject.clone(), SubjectStatus::Closing);
+        self.authorization_epoch = next_epoch;
+        Ok(SubjectCloseStatus::Started)
+    }
+
+    /// Marks a closing subject as fully torn down.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityStateError::UnknownSubject`] for an unregistered
+    /// identity or [`CapabilityStateError::SubjectNotClosing`] when shutdown
+    /// has not begun.
+    pub fn finish_subject_close(
+        &mut self,
+        subject: &SubjectId,
+    ) -> Result<SubjectFinishStatus, CapabilityStateError> {
+        match self.subject_status(subject) {
+            None => Err(CapabilityStateError::UnknownSubject(subject.clone())),
+            Some(SubjectStatus::Running) => {
+                Err(CapabilityStateError::SubjectNotClosing(subject.clone()))
+            }
+            Some(SubjectStatus::Closing) => {
+                self.subject_statuses
+                    .insert(subject.clone(), SubjectStatus::Closed);
+                Ok(SubjectFinishStatus::Closed)
+            }
+            Some(SubjectStatus::Closed) => Ok(SubjectFinishStatus::AlreadyClosed),
+        }
+    }
+
     /// Returns whether this capability and every ancestor are active at `now`.
     #[must_use]
     pub fn is_effectively_active(&self, capability: &CapId, now: MonotonicTime) -> bool {
@@ -484,6 +601,9 @@ impl CapabilityState {
         capability_id: &CapId,
         request: &CapabilityRequest,
     ) -> bool {
+        if self.subject_status(caller) != Some(SubjectStatus::Running) {
+            return false;
+        }
         let Some(capability) = self.capabilities.get(capability_id) else {
             return false;
         };
@@ -495,6 +615,7 @@ impl CapabilityState {
     }
 
     fn validate_envelope(&self, grant: &CapabilityGrant) -> Result<(), CapabilityStateError> {
+        self.ensure_subject_running(grant.subject())?;
         let subject = self
             .subjects
             .get(grant.subject())
@@ -510,6 +631,22 @@ impl CapabilityState {
                 grant.subject().clone(),
             ))
         }
+    }
+
+    fn ensure_subject_running(&self, subject: &SubjectId) -> Result<(), CapabilityStateError> {
+        match self.subject_status(subject) {
+            None => Err(CapabilityStateError::UnknownSubject(subject.clone())),
+            Some(SubjectStatus::Running) => Ok(()),
+            Some(SubjectStatus::Closing | SubjectStatus::Closed) => {
+                Err(CapabilityStateError::SubjectNotRunning(subject.clone()))
+            }
+        }
+    }
+
+    fn next_authorization_epoch(&self) -> Result<AuthorizationEpoch, CapabilityStateError> {
+        self.authorization_epoch
+            .checked_next()
+            .ok_or(CapabilityStateError::AuthorizationEpochExhausted)
     }
 
     fn issue(

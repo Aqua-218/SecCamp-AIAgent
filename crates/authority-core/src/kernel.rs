@@ -11,7 +11,7 @@ use crate::{
     capability::{CapId, Capability, CapabilityRequest, SubjectId},
     state::{
         AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
-        RevocationStatus, Subject,
+        RevocationStatus, Subject, SubjectCloseStatus, SubjectFinishStatus, SubjectStatus,
     },
     time::MonotonicTime,
 };
@@ -166,6 +166,49 @@ impl CapabilityKernel {
             .read()
             .map_err(|_| CapabilityKernelError::LockPoisoned)?;
         Ok(state.authorization_epoch())
+    }
+
+    /// Returns the lifecycle status of a registered subject.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
+    /// panicked while mutating the capability state.
+    pub fn subject_status(
+        &self,
+        subject: &SubjectId,
+    ) -> Result<Option<SubjectStatus>, CapabilityKernelError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| CapabilityKernelError::LockPoisoned)?;
+        Ok(state.subject_status(subject))
+    }
+
+    /// Begins subject shutdown under exclusive state access.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
+    /// panicked, or wraps the sequential lifecycle error.
+    pub fn begin_subject_close(
+        &self,
+        subject: &SubjectId,
+    ) -> Result<SubjectCloseStatus, CapabilityKernelError> {
+        self.with_state_mut(|state| state.begin_subject_close(subject))
+    }
+
+    /// Marks external teardown for a closing subject as complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
+    /// panicked, or wraps the sequential lifecycle error.
+    pub fn finish_subject_close(
+        &self,
+        subject: &SubjectId,
+    ) -> Result<SubjectFinishStatus, CapabilityKernelError> {
+        self.with_state_mut(|state| state.finish_subject_close(subject))
     }
 
     /// Reauthorizes an effect and executes it through its linearization point.

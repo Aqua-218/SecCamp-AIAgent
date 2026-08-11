@@ -15,7 +15,8 @@ use authority_core::{
     repository::RepoId,
     state::{
         AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
-        RevocationStatus, StaticAuthorityEnvelope, Subject,
+        RevocationStatus, StaticAuthorityEnvelope, Subject, SubjectCloseStatus,
+        SubjectFinishStatus, SubjectStatus,
     },
     time::{MonotonicTime, TimeWindow},
 };
@@ -289,5 +290,38 @@ fn ancestor_revoke_prevents_every_later_executor_call() {
     assert_eq!(
         kernel.authorization_epoch().map(AuthorizationEpoch::as_u64),
         Ok(1)
+    );
+}
+
+// Requirement: the synchronized lifecycle API blocks authorization before it
+// reports that shutdown has begun. Category: lifecycle/security. Risk: critical.
+#[test]
+fn subject_close_blocks_later_executor_calls() {
+    let (kernel, root_id) = kernel_with_root();
+    let executor_calls = Cell::new(0_u8);
+
+    assert_eq!(
+        kernel.begin_subject_close(&root_subject_id()),
+        Ok(SubjectCloseStatus::Started)
+    );
+    assert_eq!(
+        kernel.subject_status(&root_subject_id()),
+        Ok(Some(SubjectStatus::Closing))
+    );
+    let result = kernel.authorize_and_commit(
+        &root_subject_id(),
+        &root_id,
+        &read_request(30, &["src", "main.rs"]),
+        |_| {
+            executor_calls.set(executor_calls.get() + 1);
+            Ok::<_, Infallible>(())
+        },
+    );
+
+    assert_eq!(result, Err(EffectCommitError::NotAuthorized));
+    assert_eq!(executor_calls.get(), 0);
+    assert_eq!(
+        kernel.finish_subject_close(&root_subject_id()),
+        Ok(SubjectFinishStatus::Closed)
     );
 }

@@ -1,10 +1,14 @@
 name = "authority"
 version = "0.1.0"
 defaultTargets = ["Authority"]
-testDriver = "AuthorityTests"
+testDriver = "authority_corpus"
 
 [[lean_lib]]
 name = "Authority"
 
 [[lean_lib]]
 name = "AuthorityTests"
+
+[[lean_exe]]
+name = "authority_corpus"
+root = "AuthorityCorpus"

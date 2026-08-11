@@ -1,5 +1,4 @@
-import Authority.Repository
-import Authority.Path
+import Authority.File
 
 /-!
 # Authority

@@ -157,22 +157,21 @@ leaf ≤ root
 
 ## 現在の境界
 
-実装済みなのは、1 thread 上で順番が確定した subject 登録、root 発行、Derive、保持確認、authorization、revoke と祖先失効である。
+このページの `CapabilityState` が実装するのは、1 thread 上で順番が確定した subject 登録、root 発行、Derive、保持確認、authorization、revoke と祖先失効である。並行利用では、この state を[Authorization guard](authorization-guard.md)の `CapabilityKernel` に入れる。
 
 まだ含まれないものは次のとおり。
 
-- effect commit と revoke に同じ順序を与える shared/exclusive authorization guard。
-- guard の全 interleaving を検査する loom test と、lock を外す negative control。
 - attempt/effect log、open handle、subject lifecycle、`KillSubject`。
 - supervisor の socket fd から caller identity を決める adapter。
 - File 以外の authority variant。
 
-そのため、現在の revoke は逐次モデル上では即時に子孫を止めるが、すでに並行して走っている filesystem や外部 effect との線形化までは保証しない。
+`CapabilityKernel` は executor closure と revoke の順序を線形化する。ただし closure が実際の filesystem や外部 effect の正しい線形化点まで進んでから return する責任は adapter 側にあり、現在は実 mount や Broker との end-to-end 検証まではない。
 
 ## 関連
 
 - [Capability envelope と委譲証明](capabilities.md)
 - [検証とテスト](verification.md)
+- [Effect commit と revoke の authorization guard](authorization-guard.md)
 - [状態機械と revoke の設計](../design/state-and-revocation.md)
 - [Capability モデル](../design/capability-model.md)
 - [検証戦略](../design/verification.md)

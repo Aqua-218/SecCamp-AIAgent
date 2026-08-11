@@ -69,17 +69,16 @@ flowchart LR
 
 ## 現在の実装位置
 
-[`crates/authority-core/src/state.rs`](../../crates/authority-core/src/state.rs) には、並行処理を入れる前の逐次状態機械がある。現在は次の境界まで実装している。
+[`crates/authority-core/src/state.rs`](../../crates/authority-core/src/state.rs) に逐次状態機械、[`crates/authority-core/src/kernel.rs`](../../crates/authority-core/src/kernel.rs) にそれを並行利用するための同期境界がある。現在は次の境界まで実装している。
 
 | 実装済み | 次に実装する |
 |---|---|
-| subject と静的 envelope の登録 | shared/exclusive authorization guard |
-| server-side ID による root 発行 | attempt/effect log と線形化点 |
-| held、caller binding、parent link、`delegable` を検査する Derive | open handle と subject lifecycle |
-| `WeakerThan` と target envelope による権限縮小 | revoke / commit の loom model と negative control |
-| 逐次 revoke と祖先 chain の無効化 | supervisor channel から caller を決める adapter |
+| subject 登録、root 発行、held、caller binding、parent link、`delegable` を検査する Derive | attempt/effect log と `auth_epoch` |
+| `WeakerThan`、target envelope、逐次 revoke、祖先 chain の無効化 | open handle と subject lifecycle |
+| shared effect / exclusive transition の authorization guard と、executor の線形化点までの guard 保持 | supervisor / filesystem / Broker adapter との end-to-end 接続 |
+| 1 effect / 1 revoke の loom model と unlocked negative control | 3 thread 以上・複数 Capability・open handle・rename・unlink を含む model |
 
-詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)を参照する。逐次モデルで revoke 後の認可は止まるが、すでに進行している副作用と revoke の順序を確定するのは次節の guard の責務である。
+詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)と[Effect commit と revoke の authorization guard](../authority-core/authorization-guard.md)を参照する。
 
 ## commit と revoke の競合
 
@@ -99,13 +98,15 @@ sequenceDiagram
     K->>K: 現在時刻で再認可
     K->>E: 線形化点まで実行
     E-->>K: accepted
-    K->>K: EffectRecord を追記して guard 解放
+    K->>K: executor return 後に guard 解放
     K-->>R: exclusive guard を取得
-    R->>K: revoked に追加 / auth_epoch++
+    R->>K: revoked に追加
     K-->>R: revoke 完了
 ```
 
 この順なら effect が先に成立する。逆に revoke が exclusive guard を先に取れば、その後の effect は再認可で落ちる。どちらに転んでも順序は曖昧にならない。
+
+現在の `CapabilityKernel::authorize_and_commit` は、最終認可、executor 呼び出し、revoke との線形化までを実装する。下の `AttemptRecord`、`EffectRecord`、`auth_epoch` を含む記録処理は設計上の次段階であり、まだ production 実装にはない。
 
 ```text
 CommitEffect(subject, effect):
@@ -124,6 +125,10 @@ CommitEffect(subject, effect):
 ```
 
 拒否した試行は `attempts` に残すが、`effects` には入れない。`NoUnauthorizedCommit` は、実際に成立した `effects` だけを対象に検査する。
+
+実装には `std::sync::RwLock` を使う。単一の `Mutex` でも安全な順序は作れるが、互いに独立した認可済み effect まで直列化する。認可直後に lock を外し、commit 前に epoch だけ再確認する方式は、外部 effect の線形化点との間に別の gap を作りやすい。そのため現在は、Capability への借用を executor closure に渡し、shared guard の寿命を closure の return まで型と所有権で結び付ける。
+
+この lock が保証するのは safety であり、writer fairness や revoke latency の上限ではない。また executor closure から同じ kernel の exclusive transition を呼ぶと deadlock し得るため、adapter は再入してはならない。詳しい契約と loom の検査範囲は[Authorization guard](../authority-core/authorization-guard.md)に記載する。
 
 ## 線形化点
 
@@ -154,5 +159,6 @@ revoke は、これより前の操作を巻き戻すものではない。
 
 - [Capability モデル](capability-model.md)
 - [Capability の発行と逐次状態機械](../authority-core/capability-state.md)
+- [Effect commit と revoke の authorization guard](../authority-core/authorization-guard.md)
 - [capfs](capfs.md)
 - [ネットワークと外部副作用](network-egress.md)

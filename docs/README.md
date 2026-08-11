@@ -19,7 +19,8 @@
 | [有効期間](authority-core/validity-windows.md) | 単調時刻、半開区間、時刻窓の containment と証明 |
 | [Capability](authority-core/capabilities.md) | typed metadata、file-only envelope、時刻付き matching、`weakerThan` と証明 |
 | [Capability state](authority-core/capability-state.md) | subject、静的 envelope、発行、保持、逐次 Derive、revoke と祖先失効 |
-| [検証とテスト](authority-core/verification.md) | Rust unit・状態遷移・property test、Lean example・theorem、共通 corpus の役割分担 |
+| [Authorization guard](authority-core/authorization-guard.md) | effect commit と revoke の線形化、executor 契約、loom の positive / negative control |
+| [検証とテスト](authority-core/verification.md) | Rust unit・状態遷移・property・loom test、Lean example・theorem、共通 corpus の役割分担 |
 
 ## 文書の使い分け
 

@@ -55,7 +55,9 @@ flowchart LR
 
 逐次状態機械では、1〜63操作の Derive/revoke 列を1,000 case 生成し、production state と独立した参照モデルを各 transition 後に比較する。subject binding、ID 非再利用、親以下の authority、静的 envelope、祖先失効をまとめて検査するが、これは生成した有限の操作列に対する test であり、状態機械全体の数学的証明ではない。[Capability state の検証範囲](../authority-core/capability-state.md#どう検証しているか)
 
-loom は実システム全体の証明ではない。production と同じ synchronization wrapper を使った bounded model の検査である、と範囲を明記する。
+revoke / commit については、production の `CapabilityKernel` と同じ synchronization wrapper を使い、1 effect / 1 revoke の bounded model を loom で検査している。effect が実行される場合は revoke return より前に線形化点へ到達し、revoke が先なら executor を呼ばず認可拒否になる。詳しい実装と executor 契約は[Authorization guard](../authority-core/authorization-guard.md)を参照する。
+
+loom は実システム全体の証明ではない。現在の model は 3 thread 以上、複数 Capability、open handle、rename、unlink、実 syscall adapter を含まず、loom 自身にも完全な C11 memory model ではないという制限がある。したがって、ここで言えるのは選んだ bounded model の全 interleaving に対する結果である。
 
 symlink resolver の test は初期 `capfs` の完了条件には含めない。link-free な namespace と revoke の検証を先に終え、[symlink 対応](capfs.md#symlink-は後続機能として追加する)を実装する段階で追加する。
 
@@ -88,7 +90,7 @@ stateful test には、攻撃者が選びそうな操作を最初から入れる
 - open 中 object を rename / unlink する。
 - DNS answer や redirect を接続直前に差し替える。
 
-loom には negative control を置く。commit 時の再確認を無効にした版で反例が出て、有効にした版で同じ model の反例が消えることを CI の条件にする。
+loom には negative control を置いている。認可直後に shared guard を解放する壊れた版では、revoke が return した後に commit する反例が出る。production guard では同じ model の全 interleaving が pass する。negative control 自体は期待した assertion で panic することを `#[should_panic]` で test 成功条件にしている。
 
 ## 守る不変条件
 

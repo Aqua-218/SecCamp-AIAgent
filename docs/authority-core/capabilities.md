@@ -210,9 +210,10 @@ Lean で実装・証明済みなのは file variant の Capability envelope、�
 - `delegable` を確認して子を発行する `Derive` transition。
 - revoke、祖先失効、target subject の静的 envelope。
 
+`CapabilityKernel` はさらに、最終認可から effect の線形化点まで shared guard を保持し、exclusive revoke と同じ順序へ置く。bounded interleaving は[Authorization guard](authorization-guard.md)の loom test で検査する。
+
 次はまだ含まれない。
 
-- revoke と effect commit の並行実行を線形化する authorization guard。
 - 使用回数、attempt/effect log、open handle、subject lifecycle。
 - HTTP fetch や GitHub authority など、File 以外の variant。
 - OS/FUSE operation を正しい `CapabilityRequest` へ変換する adapter。
@@ -251,4 +252,5 @@ Lean で実装・証明済みなのは file variant の Capability envelope、�
 - [検証とテスト](verification.md)
 - [Capability モデル](../design/capability-model.md)
 - [Capability の発行と逐次状態機械](capability-state.md)
+- [Effect commit と revoke の authorization guard](authorization-guard.md)
 - [状態機械と revoke](../design/state-and-revocation.md)

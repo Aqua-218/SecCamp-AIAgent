@@ -53,11 +53,24 @@ flowchart LR
         leanCap -->|"examples"| leanTests
     end
 
+    subgraph differential["共有 fixture による差分テスト"]
+        corpus["authority-core.tsv<br/>71 oracle cases"]
+        rustRunner["Rust corpus runner"]
+        leanRunner["Lean corpus runner"]
+        compare["normalized output diff"]
+        corpus --> rustRunner
+        corpus --> leanRunner
+        rustRunner --> compare
+        leanRunner --> compare
+    end
+
     rustRepo -.->|"same concept"| leanRepo
     rustPath -.->|"same decisions"| leanPath
     rustFile -.->|"same decisions"| leanFile
     rustTime -.->|"same decisions"| leanTime
     rustCap -.->|"same decisions"| leanCap
+    rustCap --> rustRunner
+    leanCap --> leanRunner
 ```
 
 Rust は実際の認可経路から呼ぶ純粋な `bool` 判定を担当する。Lean は同じ入力領域を命題として定義し、実行可能な `Bool` 判定が意味論と一致すること、包含判定が権限を増幅しないことを証明する。
@@ -78,9 +91,13 @@ Rust は実際の認可経路から呼ぶ純粋な `bool` 判定を担当する�
 | [`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) | Capability の集合意味論、matching 同値、`weakerThan` の健全性・完全性・推移性 | [Capability](capabilities.md) |
 | [`crates/authority-core/src/lib.rs`](../../crates/authority-core/src/lib.rs) | Rust module の公開と `unsafe` 禁止 | 各 Rust ページ |
 | [`lean/Authority.lean`](../../lean/Authority.lean) | production Lean library の入口 | 各 Lean ページ |
-| [`lean/AuthorityTests.lean`](../../lean/AuthorityTests.lean) | Rust の境界 test と対応する Lean の executable example | [検証とテスト](verification.md) |
+| [`lean/AuthorityTests.lean`](../../lean/AuthorityTests.lean) | 独立した具体的境界を固定する Lean の executable example | [検証とテスト](verification.md) |
+| [`tests/fixtures/authority-core.tsv`](../../tests/fixtures/authority-core.tsv) | Rust/Lean 共通の入力、期待値、versioned schema | [検証とテスト](verification.md) |
+| [`crates/authority-core/src/bin/authority-corpus.rs`](../../crates/authority-core/src/bin/authority-corpus.rs) | 共通 corpus を Rust の公開 API で評価する runner | [検証とテスト](verification.md) |
+| [`lean/AuthorityCorpus.lean`](../../lean/AuthorityCorpus.lean) | 共通 corpus を Lean の production 判定で評価する test driver | [検証とテスト](verification.md) |
+| [`scripts/check-authority-corpus.sh`](../../scripts/check-authority-corpus.sh) | 両 runner の正規化済み出力を比較する入口 | [検証とテスト](verification.md) |
 
-Rust の test は各実装ファイル内の `#[cfg(test)]` module にあるため、[検証とテスト](verification.md)でまとめて説明する。
+Rust の production unit test は各実装ファイル内、corpus parser の unit test は runner 内にあるため、[検証とテスト](verification.md)でまとめて説明する。
 
 ## 判定の積み上げ
 
@@ -107,9 +124,9 @@ flowchart LR
 
 実装済みなのは repository identity、repository-relative path、file effect と request、file authority body、単調時刻の有効期間、typed metadata と file-only Capability、matching、`weakerThan` である。
 
-未実装なのは、File 以外の authority variant、Capability の保持・発行・revoke を扱う状態機械、OS/FUSE adapter、Rust と Lean を同じ fixture で比較する共通 corpus である。`parent` と `delegable` は型として存在するが、発行時に検証する `Derive` transition はまだない。
+未実装なのは、File 以外の authority variant、Capability の保持・発行・revoke を扱う状態機械、OS/FUSE adapter である。`parent` と `delegable` は型として存在するが、発行時に検証する `Derive` transition はまだない。
 
-Rust と Lean の境界例は現在、両言語の test に手動で対応させている。[実装順序](../design/implementation-plan.md)にある共通 corpus による自動差分テストは未実装である。
+現在の file-only slice には、71件の共通 corpus を両言語の production 判定へ流す自動差分テストがある。各 runner は期待値を個別に検査し、その後に出力同士も比較する。ただしこれは選んだ具体例についての回帰検査であり、Rust と Lean が全入力で等しいという証明ではない。
 
 ## 関連
 

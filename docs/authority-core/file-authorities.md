@@ -26,7 +26,7 @@ Lean の `fileBodyBelow_sound` は、この判定が `true` なら、child が�
 
 さらに `fileBodyBelow_trans` により、何段階委譲しても最上位の親より強い file authority にはならない。
 
-Rust は同じ3条件を実行可能な純粋関数として実装する。Lean が Rust バイナリそのものを直接証明しているわけではなく、両実装の自動比較は今後の共通 corpus が担当する。
+Rust は同じ3条件を実行可能な純粋関数として実装する。共通 corpus は選んだ file case を両言語へ流し、期待値と判定結果を自動比較する。ただし Lean が Rust バイナリそのものを直接証明しているわけではなく、corpus にない全入力まで同値だとは言わない。
 
 ## 何を防ぎたいのか
 
@@ -297,7 +297,6 @@ repository equality と path containment を同じ body 判定に含めるため
 - rename の source と destination を2件とも認可する orchestration。
 - FUSE operation から正しい `FileEffect` を選ぶ adapter。
 - symlink、hard link、inode alias、open handle、rename race。
-- Rust と Lean の判定を共通入力で自動比較する仕組み。
 
 したがって `fileBodyBelow_sound` は「filesystem システム全体にバグがない」という定理ではない。Lean でモデル化した authority body と request の範囲内で、委譲判定が権限を増幅しないという定理である。
 

@@ -20,7 +20,7 @@ pathBelow child parent = true
 
 したがって Lean モデル内では、`pathBelow` が誤って範囲外の委譲を許可することも、本当に範囲内の委譲を誤って拒否することもない。さらに推移律があるため、何段委譲しても最上位の親が定めた path 境界を越えない。
 
-Rust はこれと対になる型と判定を実装し、実際の認可経路で使えるようにしている。ただし、Rust と Lean の実装が自動的に同一だと証明済みなわけではない。現在は対応する実装と両言語の境界 test で確認しており、共通 corpus による自動差分テストはまだない。
+Rust はこれと対になる型と判定を実装し、実際の認可経路で使えるようにしている。現在は共通 corpus の path case を両言語へ流し、期待値との一致と両実装の一致を自動確認する。ただし有限の具体例による検査なので、Rust と Lean が全入力で同一だと証明したものではない。
 
 ## 何を防ぎたいのか
 
@@ -217,7 +217,7 @@ Lean モデル内では `pathBelow = true` になった委譲について、chil
 - OS の path resolution や FUSE 実装がこの canonical path と一致すること。
 - Rust の `path_below` と Lean の `pathBelow` が将来の全変更後も自動的に一致すること。
 
-最初の3点は [`capfs`](../design/capfs.md) と統合・並行性テストの責務である。最後の点は、[検証とテスト](verification.md)に記載した共通 corpus の差分テストで埋める予定である。
+最初の3点は [`capfs`](../design/capfs.md) と統合・並行性テストの責務である。最後の点には[検証とテスト](verification.md)に記載した共通 corpus の差分テストを当てているが、有限の case を越えた全入力の同値までは保証しない。
 
 また、segment validation は現在列挙した6規則を保証するものであり、あらゆる OS や filesystem の path 表現を一般に正規化する定理ではない。
 

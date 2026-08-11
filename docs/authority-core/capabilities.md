@@ -210,7 +210,6 @@ typed enum に variant を増やすと、matching と containment の `match` �
 - `delegable` を確認して子を発行する `Derive` transition。
 - revoke、祖先失効、静的 envelope、使用回数、並行 commit。
 - HTTP fetch や GitHub authority など、File 以外の variant。
-- Rust と Lean を同じ fixture で自動比較する共通 corpus。
 - OS/FUSE operation を正しい `CapabilityRequest` へ変換する adapter。
 
 したがって `weakerThan_sound` は「Capability システム全体が完成した」という定理ではない。現在の型付き file request と単調時刻のモデル内で、受理した包含判定が authority を増幅しないという定理である。
@@ -228,7 +227,7 @@ typed enum に variant を増やすと、matching と containment の `match` �
 | `weakerThan_complete_of_authority_nonempty` | 非空 child の本当の包含を誤拒否しない | `weaker_than` の受理側仕様 |
 | `weakerThan_iff_matches_subset_of_authority_nonempty` | 非空 child では判定と集合包含が同値 | `weaker_than` 全体の仕様 |
 
-この対応は定義と責務の対応であり、Lean が Rust の machine code を直接検証しているという意味ではない。両実装の一致を自動化する共通 corpus は今後の作業である。
+この対応は定義と責務の対応であり、Lean が Rust の machine code を直接検証しているという意味ではない。現在は共通 corpus の Capability case について期待値と両実装の結果を自動比較するが、有限の case から全入力の同値を結論しない。
 
 ## 変更時の確認点
 

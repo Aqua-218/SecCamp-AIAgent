@@ -51,6 +51,8 @@ flowchart LR
 | VM 境界 | escape 試行 | 実際の jailer、kernel、mount、seccomp 設定 |
 | snapshot | 同一 snapshot の複数 restore | ID、workspace、Broker session の一意性 |
 
+現在の file-only Authority core では、versioned TSV の71件を Rust と Lean の production 判定へ流す。各 runner が fixture の期待値を検査したうえで、正規化した全出力も比較する。これは現在の具体的な境界のずれを自動検出する手段であり、両実装が全入力で同値だという証明ではない。
+
 loom は実システム全体の証明ではない。production と同じ synchronization wrapper を使った bounded model の検査である、と範囲を明記する。
 
 symlink resolver の test は初期 `capfs` の完了条件には含めない。link-free な namespace と revoke の検証を先に終え、[symlink 対応](capfs.md#symlink-は後続機能として追加する)を実装する段階で追加する。

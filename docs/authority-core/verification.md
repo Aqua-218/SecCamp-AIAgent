@@ -2,7 +2,7 @@
 
 [Authority core 実装ガイド](README.md) / 検証とテスト
 
-このページは、Rust unit test、Lean executable example、Lean theorem がそれぞれ何を確認し、組み合わせると何が分かるかを説明する。プロジェクト全体の検証方針は[検証戦略](../design/verification.md)を参照する。
+このページは、Rust unit test、Lean executable example、Lean theorem、共通 corpus の差分テストがそれぞれ何を確認し、組み合わせると何が分かるかを説明する。プロジェクト全体の検証方針は[検証戦略](../design/verification.md)を参照する。
 
 ## 検証方法ごとの役割
 
@@ -15,19 +15,23 @@ Authority core では、1つの手段ですべてを保証しようとせず、�
 | Lean theorem | Lean モデルのすべての型付き入力で、一般的な性質が成り立つか |
 | 共通 corpus の差分テスト | 同じ入力に対して Rust と Lean が同じ結果を返すか |
 
-最初の3つは実装済みである。最後の共通 corpus はまだ未実装で、現在は Rust test と Lean example を人間が対応させている。
+4つとも現在の file-only slice に実装済みである。ただし、具体例を実行する3つの検査と、全入力を扱う Lean theorem では保証範囲が異なる。
 
 ```mermaid
 flowchart LR
     examples["具体例<br/>境界値・失敗例"] --> rust["Rust unit test"]
     examples --> leanExample["Lean example"]
     spec["全入力に対する仕様"] --> theorem["Lean theorem"]
-    corpus["同じ入力 corpus<br/>未実装"] -.-> rust
-    corpus -.-> leanExample
+    corpus["共通 corpus<br/>71件 + 期待値"] --> rustRunner["Rust corpus runner"]
+    corpus --> leanRunner["Lean corpus runner"]
 
     rust --> confidence["Rust の具体的な挙動"]
     leanExample --> confidence
     theorem --> guarantee["Lean モデル内の一般保証"]
+    rustRunner --> oracle["各実装と期待値の一致"]
+    leanRunner --> oracle
+    rustRunner --> diff["正規化出力の一致"]
+    leanRunner --> diff
 ```
 
 証明が test の代わりになるわけでも、test が証明の代わりになるわけでもない。両者は失敗の種類が違う。
@@ -62,7 +66,11 @@ test は、実際の関数を動かし、API の接続、error の内容、内�
 
 Lean theorem が `pathBelow` の性質を証明しても、Rust の `path_below` に同じ変更が入っているとは限らない。両言語で同じ入力を読み、結果を比較する差分テストがこの隙間を埋める。
 
-現在は同じ境界を Rust と Lean に別々に手書きしているため、片方だけ変更しても tooling は自動検出しない。これは現在の検証で最も明確な残課題である。
+[`tests/fixtures/authority-core.tsv`](../../tests/fixtures/authority-core.tsv) は、判定種別、case 名、期待する `Bool`、判定に必要な入力を持つ versioned TSV である。現在は path、time、file、Capability の10種類の判定を71件で検査する。
+
+Rust と Lean の runner は同じ fixture を別々に parse し、それぞれ production 判定を呼ぶ。各 runner は自分の結果が期待値と違えば失敗し、成功時だけ `case名<TAB>実結果` を出力する。[`scripts/check-authority-corpus.sh`](../../scripts/check-authority-corpus.sh) はその正規化出力も比較する。このため、両実装が同じ誤答を返した場合も、両出力が食い違った場合も検出できる。
+
+ただし差分テストは71件の具体例に対する回帰検査である。corpus にない任意の入力について Rust と Lean の一致を証明するものではない。
 
 ## 「権限漏えいしない」と何を根拠に言えるのか
 
@@ -99,8 +107,9 @@ Rust test は対象実装と同じファイルの `#[cfg(test)] mod tests` に�
 | [`file.rs`](../../crates/authority-core/src/file.rs) | 5 | effect membership と duplicate、空/同値/拡大 subset、request matching の3軸、body containment の3軸、推移性 |
 | [`time.rs`](../../crates/authority-core/src/time.rs) | 4 | 正常/空/逆転区間、半開境界、時刻窓 subset、推移性 |
 | [`capability.rs`](../../crates/authority-core/src/capability.rs) | 5 | typed metadata、時刻付き matching、期間/file の縮小と拡大拒否、反射性、推移性 |
+| [`authority-corpus.rs`](../../crates/authority-core/src/bin/authority-corpus.rs) | 7 | header/schema、未知の判定、必須 field、u64 上限、期待値不一致、case 名重複の拒否 |
 
-合計23 test を `cargo test --workspace` で実行する。
+production module の23 test と corpus runner の7 test、合計30 test を `cargo test --workspace` で実行する。これとは別に、runner は共有 fixture の71件を実行時に評価する。
 
 ここで特に test が助けるのは、Lean の抽象モデルに出にくい Rust 固有の部分である。
 
@@ -133,6 +142,14 @@ fixture の `CanonicalPath` も `isValid := by decide` で構築する。その�
 
 Lean example が役立つ点は、定理だけでは見えにくい「この具体例はどちらになるか」を読みやすく固定できることである。たとえば root prefix や `Prefix` 対 `Exact` の向きを、仕様例として残せる。
 
+## `AuthorityCorpus.lean` は何を確認するか
+
+[`lean/AuthorityCorpus.lean`](../../lean/AuthorityCorpus.lean) は共有 fixture の parser と Lean runner を担当する。Rust と同じ schema を独立に解釈し、production の `pathMatches`、`timeWindowBelow`、`fileMatches`、`weakerThan` などを呼ぶ。
+
+parser 自体についても6個の executable example があり、header 欠落、未知の判定種別、必須 field 欠落、`u64` を越える tick、期待値不一致、case 名重複を拒否する。Lean の `Nat` は `u64` より広いため、tick 上限を runner で明示的に揃えている。
+
+`lake test` は `AuthorityTests` を import したこの runner を test driver として構築し、標準の共有 fixture 71件を評価する。そのため、独立した40個の境界 example と、共通入力による両実装の比較を併用できる。
+
 ## Production theorem は何を確認するか
 
 production theorem は [`lean/Authority/Path.lean`](../../lean/Authority/Path.lean)、[`lean/Authority/File.lean`](../../lean/Authority/File.lean)、[`lean/Authority/Time.lean`](../../lean/Authority/Time.lean)、[`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) に置く。
@@ -154,18 +171,18 @@ production theorem は [`lean/Authority/Path.lean`](../../lean/Authority/Path.le
 
 theorem を production 定義の隣に置くことで、判定を変更して証明が壊れた場合に build で分かる。具体例だけでなく、意味論との橋渡しまで変更対象になる。
 
-## 3つを組み合わせると何が分かるか
+## 検証を組み合わせると何が分かるか
 
-| 確認したいこと | Rust test | Lean example | Lean theorem | 現状 |
-|---|---:|---:|---:|---|
-| Rust API の具体的挙動 | ✓ |  |  | 確認済み |
-| Lean 判定の具体的挙動 |  | ✓ |  | 確認済み |
-| Lean モデルの全入力での性質 |  |  | ✓ | 証明済み |
-| 両言語の手書き境界が同じ意図か | ✓ | ✓ |  | 人間がレビュー |
-| 同一入力で Rust と Lean が常に同じ結果か |  |  |  | 共通 corpus 未実装 |
-| OS/FUSE を含む end-to-end 認可 |  |  |  | Authority core の外 |
+| 確認したいこと | Rust test | Lean example | Lean theorem | 共通 corpus | 現状 |
+|---|---:|---:|---:|---:|---|
+| Rust API の具体的挙動 | ✓ |  |  | ✓ | 確認済み |
+| Lean 判定の具体的挙動 |  | ✓ |  | ✓ | 確認済み |
+| Lean モデルの全入力での性質 |  |  | ✓ |  | 証明済み |
+| 共有した71入力で両言語が期待値どおりか |  |  |  | ✓ | 自動比較済み |
+| 全入力で Rust と Lean が同値か |  |  |  |  | 未証明 |
+| OS/FUSE を含む end-to-end 認可 |  |  |  |  | Authority core の外 |
 
-この表の最後の2行を、既存の proof だけで「済んでいる」と解釈してはいけない。設計上は、共通 corpus の差分テストと `capfs` の統合・攻撃テストで別に閉じる。
+Lean theorem は Lean モデル内の全入力を扱い、共通 corpus は両言語の有限の具体例を扱う。どちらか一方から「Rust と Lean は全入力で同値」とは結論しない。OS/FUSE との接続は `capfs` の統合・攻撃テストで別に閉じる。
 
 ## 実行コマンド
 
@@ -187,13 +204,17 @@ lake check-test
 lake test
 ```
 
-[`lean/lakefile.toml`](../../lean/lakefile.toml) は `AuthorityTests` を `testDriver` に設定している。`lake build` は production library を構築し、`lake check-test` / `lake test` は executable example を含む test target を検査する。
+repository root から両実装の共通 corpus を比較する。
+
+```bash
+scripts/check-authority-corpus.sh
+```
+
+[`lean/lakefile.toml`](../../lean/lakefile.toml) は `authority_corpus` executable を `testDriver` に設定する。この executable は `AuthorityTests` を import するため、`lake check-test` では既存40個と parser 6個の executable example が一緒に型検査される。`lake test` はそれに加えて標準の共有 fixture 71件を実行する。
 
 ## 現在の限界と次に埋めるもの
 
-現在の最大の対応ギャップは、Rust test と Lean example の入力が別々のファイルに手書きされていることである。
-
-次に共通 corpus を導入するときは、少なくとも次を同じ fixture から両言語へ流す。
+現在の共通 corpus は、次の境界を同じ fixture から両言語へ流す。
 
 - canonical path の受理・拒否と invalid segment class。
 - `Exact` / `Prefix` matching の結果。
@@ -203,18 +224,20 @@ lake test
 - Capability matching と、期間・body を1軸ずつ壊した `weakerThan`。
 - positive case と、各条件を1つだけ壊した negative case。
 
-これにより、Lean theorem が証明するモデルと Rust 実装の間にある「同じ定義を実装しているはず」という手動確認を、自動回帰 test へ変えられる。
+これにより、Lean theorem が証明するモデルと Rust 実装の間にある「同じ定義を実装しているはず」という確認の一部を、自動回帰 test にしている。
+
+残る限界は、corpus が有限であることと、schema v1 が現在の file-only authority だけを表すことである。File 以外の authority variant を追加するときは、両 runner と corpus を同じ変更で拡張する。互換性のない schema 変更では header の version も上げる。
 
 なお、共通 corpus でも filesystem race や revoke は検証できない。それらは stateful test、loom、実 mount の統合・攻撃テストという別レイヤーを使う。
 
 ## 変更時の確認点
 
-- production の判定を変えたら、Rust unit test と Lean example の両方へ同じ positive / negative boundary を追加する。
+- production の判定を変えたら、Rust unit test と Lean example に加え、共通 corpus へ同じ positive / negative boundary を追加する。
 - Lean の意味論を変えたら、executable decision との `_iff_` theorem を先に通し、その上で containment theorem を確認する。
 - `sorry`、独自 `axiom`、`admit` を production proof に入れない。
 - test が通っても、sound theorem の request 型に新しい入力軸が反映されているかを確認する。
-- test 数や example 数が変わったら、このページの集計を更新する。
-- 共通 corpus を導入した後は、「手動対応」「未実装」という記述と実行コマンドを更新する。
+- test 数、example 数、corpus の case 数が変わったら、このページの集計を更新する。
+- corpus の field を増減するときは両 runner を同時に変更し、互換性が壊れる場合は header の version を上げる。
 
 ## 関連
 

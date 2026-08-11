@@ -1,6 +1,10 @@
 name = "authority"
 version = "0.1.0"
 defaultTargets = ["Authority"]
+testDriver = "AuthorityTests"
 
 [[lean_lib]]
 name = "Authority"
+
+[[lean_lib]]
+name = "AuthorityTests"

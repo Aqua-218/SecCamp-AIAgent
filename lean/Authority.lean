@@ -1,3 +1,5 @@
+import Authority.Path
+
 /-!
 # Authority
 

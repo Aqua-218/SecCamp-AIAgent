@@ -66,6 +66,17 @@ def Matches (pattern : PathPattern) (path : CanonicalPath) : Prop :=
 
 end PathPattern
 
+/-- Returns whether `pattern` selects `path`. -/
+def pathMatches (pattern : PathPattern) (path : CanonicalPath) : Bool :=
+  match pattern with
+  | .exact selected => selected.segments == path.segments
+  | .prefix selected => selected.segments.isPrefixOf path.segments
+
+/-- The executable path matching decision exactly represents `Matches`. -/
+theorem pathMatches_iff_matches {pattern : PathPattern} {path : CanonicalPath} :
+    pathMatches pattern path = true ↔ pattern.Matches path := by
+  cases pattern <;> simp [pathMatches, PathPattern.Matches]
+
 /-- Returns whether every path selected by `child` is also selected by `parent`. -/
 def pathBelow (child parent : PathPattern) : Bool :=
   match child, parent with

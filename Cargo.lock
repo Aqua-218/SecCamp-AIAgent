@@ -51,6 +51,8 @@ name = "capfs"
 version = "0.1.0"
 dependencies = [
  "authority-core",
+ "rustix",
+ "tempfile",
 ]
 
 [[package]]

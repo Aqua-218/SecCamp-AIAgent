@@ -10,12 +10,13 @@ use std::{cell::Cell, convert::Infallible, error::Error, fmt};
 use authority_core::{
     capability::{AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId},
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
+    handle::{HandleId, ObjectId, OpenHandle},
     kernel::{CapabilityKernel, CapabilityKernelError, EffectCommitError},
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     state::{
         AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
-        RevocationStatus, StaticAuthorityEnvelope, Subject, SubjectCloseStatus,
+        HandleCloseStatus, RevocationStatus, StaticAuthorityEnvelope, Subject, SubjectCloseStatus,
         SubjectFinishStatus, SubjectStatus,
     },
     time::{MonotonicTime, TimeWindow},
@@ -323,5 +324,29 @@ fn subject_close_blocks_later_executor_calls() {
     assert_eq!(
         kernel.finish_subject_close(&root_subject_id()),
         Ok(SubjectFinishStatus::Closed)
+    );
+}
+
+// Requirement: the synchronized handle API preserves object counts and keeps
+// stale IDs closed. Category: state/security. Risk: high.
+#[test]
+fn kernel_tracks_live_handles_without_reusing_ids() {
+    let (kernel, _) = kernel_with_root();
+    let handle_id = HandleId::new("handle-1");
+    let object_id = ObjectId::new("object-1");
+    let handle = OpenHandle::new(handle_id.clone(), root_subject_id(), object_id.clone());
+
+    assert_eq!(kernel.register_open_handle(handle.clone()), Ok(()));
+    assert_eq!(kernel.open_handle(&handle_id), Ok(Some(handle)));
+    assert_eq!(kernel.object_open_handle_count(&object_id), Ok(1));
+    assert_eq!(
+        kernel.close_handle(&handle_id),
+        Ok(HandleCloseStatus::Closed)
+    );
+    assert_eq!(kernel.open_handle(&handle_id), Ok(None));
+    assert_eq!(kernel.object_open_handle_count(&object_id), Ok(0));
+    assert_eq!(
+        kernel.close_handle(&handle_id),
+        Ok(HandleCloseStatus::AlreadyClosed)
     );
 }

@@ -9,9 +9,11 @@ use std::sync::RwLock;
 
 use crate::{
     capability::{CapId, Capability, CapabilityRequest, SubjectId},
+    handle::{HandleId, ObjectId, OpenHandle},
     state::{
         AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
-        RevocationStatus, Subject, SubjectCloseStatus, SubjectFinishStatus, SubjectStatus,
+        HandleCloseStatus, RevocationStatus, Subject, SubjectCloseStatus, SubjectFinishStatus,
+        SubjectStatus,
     },
     time::MonotonicTime,
 };
@@ -209,6 +211,63 @@ impl CapabilityKernel {
         subject: &SubjectId,
     ) -> Result<SubjectFinishStatus, CapabilityKernelError> {
         self.with_state_mut(|state| state.finish_subject_close(subject))
+    }
+
+    /// Registers a live handle under exclusive state access.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
+    /// panicked, or wraps the sequential handle-registration error.
+    pub fn register_open_handle(&self, handle: OpenHandle) -> Result<(), CapabilityKernelError> {
+        self.with_state_mut(|state| state.register_open_handle(handle))
+    }
+
+    /// Closes a handle under exclusive state access.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
+    /// panicked, or wraps the sequential close error.
+    pub fn close_handle(
+        &self,
+        handle: &HandleId,
+    ) -> Result<HandleCloseStatus, CapabilityKernelError> {
+        self.with_state_mut(|state| state.close_handle(handle))
+    }
+
+    /// Returns a copy of one live handle record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
+    /// panicked while mutating the capability state.
+    pub fn open_handle(
+        &self,
+        handle: &HandleId,
+    ) -> Result<Option<OpenHandle>, CapabilityKernelError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| CapabilityKernelError::LockPoisoned)?;
+        Ok(state.open_handle(handle).cloned())
+    }
+
+    /// Returns the number of live handles for one namespace object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
+    /// panicked while mutating the capability state.
+    pub fn object_open_handle_count(
+        &self,
+        object: &ObjectId,
+    ) -> Result<usize, CapabilityKernelError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| CapabilityKernelError::LockPoisoned)?;
+        Ok(state.object_open_handle_count(object))
     }
 
     /// Reauthorizes an effect and executes it through its linearization point.

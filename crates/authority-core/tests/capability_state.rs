@@ -9,11 +9,12 @@ use authority_core::{
         AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId, weaker_than,
     },
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
+    handle::{HandleId, ObjectId, OpenHandle},
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     state::{
         AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
-        RevocationStatus, StaticAuthorityEnvelope, Subject, SubjectCloseStatus,
+        HandleCloseStatus, RevocationStatus, StaticAuthorityEnvelope, Subject, SubjectCloseStatus,
         SubjectFinishStatus, SubjectStatus,
     },
     time::{MonotonicTime, TimeWindow},
@@ -579,5 +580,74 @@ fn subject_shutdown_is_monotone_and_invalidates_descendants() {
     assert_eq!(
         state.finish_subject_close(&root_subject_id()),
         Ok(SubjectFinishStatus::AlreadyClosed)
+    );
+}
+
+// Requirement: live handles remain subject/object bound, close is idempotent,
+// and an issued ID can never name a later handle. Category: state/security. Risk: critical.
+#[test]
+fn open_handle_registry_rejects_reuse_and_blocks_early_subject_close() {
+    let mut state = state_with_subjects();
+    let object = ObjectId::new("object-source");
+    let root_handle_id = HandleId::new("handle-root");
+    let child_handle_id = HandleId::new("handle-child");
+    let root_handle = OpenHandle::new(root_handle_id.clone(), root_subject_id(), object.clone());
+    let child_handle = OpenHandle::new(child_handle_id.clone(), child_subject_id(), object.clone());
+
+    state
+        .register_open_handle(root_handle.clone())
+        .expect("a running subject may own a new handle");
+    state
+        .register_open_handle(child_handle)
+        .expect("a second subject may open the same object");
+    assert_eq!(state.open_handle(&root_handle_id), Some(&root_handle));
+    assert_eq!(state.object_open_handle_count(&object), 2);
+    assert_eq!(state.subject_open_handle_count(&root_subject_id()), 1);
+    assert_eq!(
+        state.register_open_handle(OpenHandle::new(
+            root_handle_id.clone(),
+            root_subject_id(),
+            ObjectId::new("different-object"),
+        )),
+        Err(CapabilityStateError::HandleIdAlreadyIssued(
+            root_handle_id.clone()
+        ))
+    );
+
+    assert_eq!(
+        state.begin_subject_close(&root_subject_id()),
+        Ok(SubjectCloseStatus::Started)
+    );
+    assert_eq!(
+        state.finish_subject_close(&root_subject_id()),
+        Err(CapabilityStateError::SubjectHasOpenHandles(
+            root_subject_id()
+        ))
+    );
+    assert_eq!(
+        state.close_handle(&root_handle_id),
+        Ok(HandleCloseStatus::Closed)
+    );
+    assert_eq!(
+        state.close_handle(&root_handle_id),
+        Ok(HandleCloseStatus::AlreadyClosed)
+    );
+    assert_eq!(state.object_open_handle_count(&object), 1);
+    assert_eq!(
+        state.register_open_handle(OpenHandle::new(
+            root_handle_id.clone(),
+            child_subject_id(),
+            object,
+        )),
+        Err(CapabilityStateError::HandleIdAlreadyIssued(root_handle_id))
+    );
+    assert_eq!(
+        state.finish_subject_close(&root_subject_id()),
+        Ok(SubjectFinishStatus::Closed)
+    );
+    let unknown = HandleId::new("handle-unknown");
+    assert_eq!(
+        state.close_handle(&unknown),
+        Err(CapabilityStateError::UnknownHandle(unknown))
     );
 }

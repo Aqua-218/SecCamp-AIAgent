@@ -4,6 +4,7 @@
 
 pub mod capability;
 pub mod file;
+pub mod handle;
 pub mod kernel;
 pub mod path;
 pub mod repository;

@@ -11,6 +11,7 @@ use crate::{
         AuthorityBody, CapId, Capability, CapabilityMetadata, CapabilityRequest, IssuerId,
         SubjectId, authority_body_below, capability_matches,
     },
+    handle::{HandleId, ObjectId, OpenHandle},
     time::{MonotonicTime, TimeWindow},
 };
 
@@ -94,6 +95,15 @@ pub enum SubjectFinishStatus {
     /// The subject changed from closing to closed.
     Closed,
     /// The subject was already closed.
+    AlreadyClosed,
+}
+
+/// Reports whether closing a handle changed the live-handle registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleCloseStatus {
+    /// The handle was live and is now closed.
+    Closed,
+    /// The handle identity was issued previously and was already closed.
     AlreadyClosed,
 }
 
@@ -235,6 +245,12 @@ pub enum CapabilityStateError {
     SubjectNotRunning(SubjectId),
     /// Shutdown completion was requested before shutdown began.
     SubjectNotClosing(SubjectId),
+    /// Shutdown completion was requested while the subject still owns handles.
+    SubjectHasOpenHandles(SubjectId),
+    /// A handle identity was already used earlier in this session.
+    HandleIdAlreadyIssued(HandleId),
+    /// A transition refers to a handle identity never issued in this session.
+    UnknownHandle(HandleId),
     /// A transition refers to a capability that was never issued.
     UnknownCapability(CapId),
     /// The caller does not hold the requested parent capability.
@@ -275,6 +291,15 @@ impl fmt::Display for CapabilityStateError {
             }
             Self::SubjectNotClosing(subject) => {
                 write!(formatter, "subject `{subject}` is not closing")
+            }
+            Self::SubjectHasOpenHandles(subject) => {
+                write!(formatter, "subject `{subject}` still has open handles")
+            }
+            Self::HandleIdAlreadyIssued(handle) => {
+                write!(formatter, "handle `{handle}` was already issued")
+            }
+            Self::UnknownHandle(handle) => {
+                write!(formatter, "handle `{handle}` was not issued by this state")
             }
             Self::UnknownCapability(capability) => {
                 write!(
@@ -329,6 +354,8 @@ pub struct CapabilityState {
     revoked: BTreeSet<CapId>,
     issued_ids: BTreeSet<CapId>,
     authorization_epoch: AuthorizationEpoch,
+    open_handles: BTreeMap<HandleId, OpenHandle>,
+    issued_handle_ids: BTreeSet<HandleId>,
 }
 
 impl CapabilityState {
@@ -345,6 +372,8 @@ impl CapabilityState {
             revoked: BTreeSet::new(),
             issued_ids: BTreeSet::new(),
             authorization_epoch: AuthorizationEpoch(0),
+            open_handles: BTreeMap::new(),
+            issued_handle_ids: BTreeSet::new(),
         }
     }
 
@@ -398,6 +427,72 @@ impl CapabilityState {
     #[must_use]
     pub fn subject_status(&self, subject: &SubjectId) -> Option<SubjectStatus> {
         self.subject_statuses.get(subject).copied()
+    }
+
+    /// Returns a live open-handle record.
+    #[must_use]
+    pub fn open_handle(&self, handle: &HandleId) -> Option<&OpenHandle> {
+        self.open_handles.get(handle)
+    }
+
+    /// Returns the number of live handles owned by a subject.
+    #[must_use]
+    pub fn subject_open_handle_count(&self, subject: &SubjectId) -> usize {
+        self.open_handles
+            .values()
+            .filter(|handle| handle.subject() == subject)
+            .count()
+    }
+
+    /// Returns the number of live handles referring to a namespace object.
+    #[must_use]
+    pub fn object_open_handle_count(&self, object: &ObjectId) -> usize {
+        self.open_handles
+            .values()
+            .filter(|handle| handle.object() == object)
+            .count()
+    }
+
+    /// Records a newly opened handle without caching its authorization.
+    ///
+    /// Handle identities remain reserved after close, preventing a delayed
+    /// request from being rebound to a different live handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the owner is unknown or not running, or when the
+    /// handle identity has ever been issued in this session.
+    pub fn register_open_handle(&mut self, handle: OpenHandle) -> Result<(), CapabilityStateError> {
+        self.ensure_subject_running(handle.subject())?;
+        if self.issued_handle_ids.contains(handle.id()) {
+            return Err(CapabilityStateError::HandleIdAlreadyIssued(
+                handle.id().clone(),
+            ));
+        }
+
+        self.issued_handle_ids.insert(handle.id().clone());
+        self.open_handles.insert(handle.id().clone(), handle);
+        Ok(())
+    }
+
+    /// Removes a live handle while retaining its identity as permanently used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityStateError::UnknownHandle`] when the identity was
+    /// never issued in this session.
+    pub fn close_handle(
+        &mut self,
+        handle: &HandleId,
+    ) -> Result<HandleCloseStatus, CapabilityStateError> {
+        if self.open_handles.remove(handle).is_some() {
+            return Ok(HandleCloseStatus::Closed);
+        }
+        if self.issued_handle_ids.contains(handle) {
+            Ok(HandleCloseStatus::AlreadyClosed)
+        } else {
+            Err(CapabilityStateError::UnknownHandle(handle.clone()))
+        }
     }
 
     /// Returns an issued capability, including one that is now revoked.
@@ -557,6 +652,9 @@ impl CapabilityState {
                 Err(CapabilityStateError::SubjectNotClosing(subject.clone()))
             }
             Some(SubjectStatus::Closing) => {
+                if self.subject_open_handle_count(subject) != 0 {
+                    return Err(CapabilityStateError::SubjectHasOpenHandles(subject.clone()));
+                }
                 self.subject_statuses
                     .insert(subject.clone(), SubjectStatus::Closed);
                 Ok(SubjectFinishStatus::Closed)

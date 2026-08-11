@@ -76,6 +76,15 @@ impl PathPattern {
     }
 }
 
+/// Returns whether `pattern` selects `path`.
+#[must_use]
+pub fn path_matches(pattern: &PathPattern, path: &CanonicalPath) -> bool {
+    match pattern {
+        PathPattern::Exact(selected) => selected == path,
+        PathPattern::Prefix(selected) => path.as_segments().starts_with(selected.as_segments()),
+    }
+}
+
 /// Returns whether every path selected by `child` is also selected by `parent`.
 ///
 /// An exact pattern can be below an equal exact pattern or a containing prefix.
@@ -178,7 +187,7 @@ fn validate_segment(index: usize, segment: &str) -> Result<(), InvalidPathSegmen
 
 #[cfg(test)]
 mod tests {
-    use super::{CanonicalPath, InvalidPathSegmentReason, PathPattern, path_below};
+    use super::{CanonicalPath, InvalidPathSegmentReason, PathPattern, path_below, path_matches};
 
     fn path(segments: &[&str]) -> CanonicalPath {
         CanonicalPath::new(segments).expect("test paths must contain valid segments")
@@ -249,6 +258,42 @@ mod tests {
 
         assert_eq!(exact.path(), &exact_path);
         assert_eq!(prefix.path(), &prefix_path);
+    }
+
+    #[test]
+    fn path_matches_exact_and_prefix_boundaries() {
+        let cases = [
+            (
+                PathPattern::Exact(path(&["src", "main.rs"])),
+                path(&["src", "main.rs"]),
+                true,
+            ),
+            (
+                PathPattern::Exact(path(&["src", "main.rs"])),
+                path(&["src", "lib.rs"]),
+                false,
+            ),
+            (PathPattern::Prefix(path(&["src"])), path(&["src"]), true),
+            (
+                PathPattern::Prefix(path(&["src"])),
+                path(&["src", "parser", "lexer.rs"]),
+                true,
+            ),
+            (
+                PathPattern::Prefix(path(&["src"])),
+                path(&["docs", "design.md"]),
+                false,
+            ),
+            (
+                PathPattern::Prefix(CanonicalPath::root()),
+                path(&["src", "main.rs"]),
+                true,
+            ),
+        ];
+
+        for (pattern, candidate, expected) in cases {
+            assert_eq!(path_matches(&pattern, &candidate), expected);
+        }
     }
 
     #[test]

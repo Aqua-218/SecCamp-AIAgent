@@ -14,32 +14,32 @@ private def root : CanonicalPath := CanonicalPath.root
 
 private def src : CanonicalPath :=
   { segments := ["src"]
-    isValid := by native_decide }
+    isValid := by decide }
 
 private def docs : CanonicalPath :=
   { segments := ["docs"]
-    isValid := by native_decide }
+    isValid := by decide }
 
 private def parser : CanonicalPath :=
   { segments := ["src", "parser"]
-    isValid := by native_decide }
+    isValid := by decide }
 
 private def main : CanonicalPath :=
   { segments := ["src", "main.rs"]
-    isValid := by native_decide }
+    isValid := by decide }
 
 private def lib : CanonicalPath :=
   { segments := ["src", "lib.rs"]
-    isValid := by native_decide }
+    isValid := by decide }
 
 private def lexer : CanonicalPath :=
   { segments := ["src", "parser", "lexer.rs"]
-    isValid := by native_decide }
+    isValid := by decide }
 
-example : (CanonicalPath.ofSegments []).isSome = true := by native_decide
+example : (CanonicalPath.ofSegments []).isSome = true := by decide
 
 example : (CanonicalPath.ofSegments ["src", "parser", "lexer.rs"]).isSome = true := by
-  native_decide
+  decide
 
 example :
     (CanonicalPath.ofSegments ["src", "", "output"]).isSome = false ∧
@@ -48,7 +48,7 @@ example :
     (CanonicalPath.ofSegments ["src", "parser/lexer.rs", "output"]).isSome = false ∧
     (CanonicalPath.ofSegments ["src", "secret\x00name", "output"]).isSome = false ∧
     (CanonicalPath.ofSegments ["src", "*.rs", "output"]).isSome = false := by
-  native_decide
+  decide
 
 example : pathBelow (.exact main) (.exact main) = true := by decide
 

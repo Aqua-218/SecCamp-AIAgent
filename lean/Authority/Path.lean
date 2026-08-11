@@ -2,19 +2,20 @@
 # Canonical Repository Paths
 
 Validated repository paths, path authority patterns, and proofs that the
-executable containment decision is reflexive, transitive, and sound.
+executable containment decision exactly characterizes semantic containment.
 -/
 
 namespace Authority
 
 /-- Returns whether a string is a valid repository path segment. -/
 def isValidPathSegment (segment : String) : Bool :=
-  !segment.isEmpty &&
-    segment != "." &&
-    segment != ".." &&
-    !segment.contains '/' &&
-    !segment.contains '\x00' &&
-    !segment.contains '*'
+  let characters := segment.toList
+  !characters.isEmpty &&
+    characters != ['.'] &&
+    characters != ['.', '.'] &&
+    !characters.contains '/' &&
+    !characters.contains '\x00' &&
+    !characters.contains '*'
 
 /--
 A repository-relative path whose segments have passed validation.
@@ -40,6 +41,11 @@ def ofSegments (segments : List String) : Option CanonicalPath :=
     some { segments, isValid }
   else
     none
+
+/-- Concatenates two canonical paths while preserving segment validity. -/
+def append (path suffix : CanonicalPath) : CanonicalPath :=
+  { segments := path.segments ++ suffix.segments
+    isValid := by simp [List.all_append, path.isValid, suffix.isValid] }
 
 end CanonicalPath
 
@@ -97,5 +103,34 @@ theorem pathBelow_sound {child parent : PathPattern}
   · rw [← childMatches]
     exact isBelow
   · exact isBelow.trans childMatches
+
+private def strictSuffix : CanonicalPath :=
+  { segments := ["_"]
+    isValid := by decide }
+
+/-- Semantic set inclusion implies a successful path containment decision. -/
+theorem pathBelow_complete {child parent : PathPattern}
+    (isSubset : ∀ path, child.Matches path → parent.Matches path) :
+    pathBelow child parent = true := by
+  cases child <;> cases parent <;>
+    simp [pathBelow, PathPattern.Matches] at isSubset ⊢
+  · exact (isSubset _ rfl).symm
+  · exact isSubset _ rfl
+  · rename_i childPath parentPath
+    have parentMatchesChild := isSubset childPath List.prefix_rfl
+    have parentMatchesDescendant :=
+      isSubset (CanonicalPath.append childPath strictSuffix) (by
+        simp [CanonicalPath.append])
+    simp [CanonicalPath.append, strictSuffix, parentMatchesChild] at parentMatchesDescendant
+  · exact isSubset _ List.prefix_rfl
+
+/--
+The executable decision is true exactly when the child's denotation is a
+subset of the parent's denotation.
+-/
+theorem pathBelow_iff_matches_subset {child parent : PathPattern} :
+    pathBelow child parent = true ↔
+      ∀ path, child.Matches path → parent.Matches path :=
+  ⟨pathBelow_sound, pathBelow_complete⟩
 
 end Authority

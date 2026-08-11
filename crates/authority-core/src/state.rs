@@ -251,6 +251,13 @@ pub enum CapabilityStateError {
     HandleIdAlreadyIssued(HandleId),
     /// A transition refers to a handle identity never issued in this session.
     UnknownHandle(HandleId),
+    /// A subject tried to close a handle owned by a different subject.
+    HandleNotOwned {
+        /// The authenticated caller.
+        caller: SubjectId,
+        /// The handle the caller tried to close.
+        handle: HandleId,
+    },
     /// A transition refers to a capability that was never issued.
     UnknownCapability(CapId),
     /// The caller does not hold the requested parent capability.
@@ -300,6 +307,12 @@ impl fmt::Display for CapabilityStateError {
             }
             Self::UnknownHandle(handle) => {
                 write!(formatter, "handle `{handle}` was not issued by this state")
+            }
+            Self::HandleNotOwned { caller, handle } => {
+                write!(
+                    formatter,
+                    "subject `{caller}` does not own handle `{handle}`"
+                )
             }
             Self::UnknownCapability(capability) => {
                 write!(
@@ -356,7 +369,7 @@ pub struct CapabilityState {
     issued_ids: BTreeSet<CapId>,
     authorization_epoch: AuthorizationEpoch,
     open_handles: BTreeMap<HandleId, OpenHandle>,
-    issued_handle_ids: BTreeSet<HandleId>,
+    issued_handle_owners: BTreeMap<HandleId, SubjectId>,
 }
 
 impl CapabilityState {
@@ -374,7 +387,7 @@ impl CapabilityState {
             issued_ids: BTreeSet::new(),
             authorization_epoch: AuthorizationEpoch(0),
             open_handles: BTreeMap::new(),
-            issued_handle_ids: BTreeSet::new(),
+            issued_handle_owners: BTreeMap::new(),
         }
     }
 
@@ -465,13 +478,14 @@ impl CapabilityState {
     /// handle identity has ever been issued in this session.
     pub fn register_open_handle(&mut self, handle: OpenHandle) -> Result<(), CapabilityStateError> {
         self.ensure_subject_running(handle.subject())?;
-        if self.issued_handle_ids.contains(handle.id()) {
+        if self.issued_handle_owners.contains_key(handle.id()) {
             return Err(CapabilityStateError::HandleIdAlreadyIssued(
                 handle.id().clone(),
             ));
         }
 
-        self.issued_handle_ids.insert(handle.id().clone());
+        self.issued_handle_owners
+            .insert(handle.id().clone(), handle.subject().clone());
         self.open_handles.insert(handle.id().clone(), handle);
         Ok(())
     }
@@ -481,19 +495,26 @@ impl CapabilityState {
     /// # Errors
     ///
     /// Returns [`CapabilityStateError::UnknownHandle`] when the identity was
-    /// never issued in this session.
+    /// never issued in this session, or [`CapabilityStateError::HandleNotOwned`]
+    /// when `caller` is not its original owner.
     pub fn close_handle(
         &mut self,
+        caller: &SubjectId,
         handle: &HandleId,
     ) -> Result<HandleCloseStatus, CapabilityStateError> {
+        let Some(owner) = self.issued_handle_owners.get(handle) else {
+            return Err(CapabilityStateError::UnknownHandle(handle.clone()));
+        };
+        if owner != caller {
+            return Err(CapabilityStateError::HandleNotOwned {
+                caller: caller.clone(),
+                handle: handle.clone(),
+            });
+        }
         if self.open_handles.remove(handle).is_some() {
             return Ok(HandleCloseStatus::Closed);
         }
-        if self.issued_handle_ids.contains(handle) {
-            Ok(HandleCloseStatus::AlreadyClosed)
-        } else {
-            Err(CapabilityStateError::UnknownHandle(handle.clone()))
-        }
+        Ok(HandleCloseStatus::AlreadyClosed)
     }
 
     /// Returns an issued capability, including one that is now revoked.

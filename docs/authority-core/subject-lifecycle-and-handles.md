@@ -72,11 +72,11 @@ close 済み `HandleId` を別 object に再利用すると、遅れて届いた
 `CapabilityState` は live handle の map とは別に、過去に発行した全 `HandleId` を保持する。
 
 ```text
-open_handles       : 現在 live な HandleId → OpenHandle
-issued_handle_ids  : 過去に一度でも使った HandleId
+open_handles          : 現在 live な HandleId → OpenHandle
+issued_handle_owners  : 過去の HandleId → 最初に発行された SubjectId
 ```
 
-`close_handle` は live map からだけ削除する。2回目の close は `AlreadyClosed` になるが、同じ ID を再登録する操作は `HandleIdAlreadyIssued` で拒否される。
+`close_handle` は、認証済み caller が最初に登録された owner と一致するときだけ live map から削除する。他 subject の handle は閉じられず、close 後にも owner を残すため、別 subject から届いた stale close も拒否できる。正しい owner による2回目の close は `AlreadyClosed` になるが、同じ ID を再登録する操作は `HandleIdAlreadyIssued` で拒否される。
 
 ## Object ごとの count が何を助けるか
 

@@ -328,8 +328,8 @@ fn subject_close_blocks_later_executor_calls() {
     );
 }
 
-// Requirement: the synchronized handle API preserves object counts and keeps
-// stale IDs closed. Category: state/security. Risk: high.
+// Requirement: the synchronized handle API preserves object counts, rejects
+// foreign close, and keeps stale IDs closed. Category: state/security. Risk: high.
 #[test]
 fn kernel_tracks_live_handles_without_reusing_ids() {
     let (kernel, _) = kernel_with_root();
@@ -341,13 +341,23 @@ fn kernel_tracks_live_handles_without_reusing_ids() {
     assert_eq!(kernel.open_handle(&handle_id), Ok(Some(handle)));
     assert_eq!(kernel.object_open_handle_count(&object_id), Ok(1));
     assert_eq!(
-        kernel.close_handle(&handle_id),
+        kernel.close_handle(&child_subject_id(), &handle_id),
+        Err(CapabilityKernelError::StateTransition(
+            CapabilityStateError::HandleNotOwned {
+                caller: child_subject_id(),
+                handle: handle_id.clone(),
+            }
+        ))
+    );
+    assert_eq!(kernel.object_open_handle_count(&object_id), Ok(1));
+    assert_eq!(
+        kernel.close_handle(&root_subject_id(), &handle_id),
         Ok(HandleCloseStatus::Closed)
     );
     assert_eq!(kernel.open_handle(&handle_id), Ok(None));
     assert_eq!(kernel.object_open_handle_count(&object_id), Ok(0));
     assert_eq!(
-        kernel.close_handle(&handle_id),
+        kernel.close_handle(&root_subject_id(), &handle_id),
         Ok(HandleCloseStatus::AlreadyClosed)
     );
 }

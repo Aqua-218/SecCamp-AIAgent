@@ -238,9 +238,10 @@ impl CapabilityKernel {
     /// panicked, or wraps the sequential close error.
     pub fn close_handle(
         &self,
+        caller: &SubjectId,
         handle: &HandleId,
     ) -> Result<HandleCloseStatus, CapabilityKernelError> {
-        self.with_state_mut(|state| state.close_handle(handle))
+        self.with_state_mut(|state| state.close_handle(caller, handle))
     }
 
     /// Returns a copy of one live handle record.

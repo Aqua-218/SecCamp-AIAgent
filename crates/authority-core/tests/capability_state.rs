@@ -625,12 +625,27 @@ fn open_handle_registry_rejects_reuse_and_blocks_early_subject_close() {
         ))
     );
     assert_eq!(
-        state.close_handle(&root_handle_id),
+        state.close_handle(&child_subject_id(), &root_handle_id),
+        Err(CapabilityStateError::HandleNotOwned {
+            caller: child_subject_id(),
+            handle: root_handle_id.clone(),
+        })
+    );
+    assert_eq!(state.object_open_handle_count(&object), 2);
+    assert_eq!(
+        state.close_handle(&root_subject_id(), &root_handle_id),
         Ok(HandleCloseStatus::Closed)
     );
     assert_eq!(
-        state.close_handle(&root_handle_id),
+        state.close_handle(&root_subject_id(), &root_handle_id),
         Ok(HandleCloseStatus::AlreadyClosed)
+    );
+    assert_eq!(
+        state.close_handle(&child_subject_id(), &root_handle_id),
+        Err(CapabilityStateError::HandleNotOwned {
+            caller: child_subject_id(),
+            handle: root_handle_id.clone(),
+        })
     );
     assert_eq!(state.object_open_handle_count(&object), 1);
     assert_eq!(
@@ -647,7 +662,7 @@ fn open_handle_registry_rejects_reuse_and_blocks_early_subject_close() {
     );
     let unknown = HandleId::new("handle-unknown");
     assert_eq!(
-        state.close_handle(&unknown),
+        state.close_handle(&root_subject_id(), &unknown),
         Err(CapabilityStateError::UnknownHandle(unknown))
     );
 }

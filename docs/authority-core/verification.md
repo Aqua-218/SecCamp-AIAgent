@@ -109,7 +109,7 @@ file body containment では、false allow を防ぐ `fileBodyBelow_sound` は�
 | ソース | test 数 | 主な確認内容 |
 |---|---:|---|
 | [`repository.rs`](../../crates/authority-core/src/repository.rs) | 1 | host-assigned value の保持、`as_str`、`Display` |
-| [`path.rs`](../../crates/authority-core/src/path.rs) | 10 | valid/root path、6種類の invalid segment、最初の error、tree relationship、rebase、Exact/Prefix matching、containment matrix、推移性 |
+| [`path.rs`](../../crates/authority-core/src/path.rs) | 11 | valid/root path、child append、6種類の invalid segment、最初の error、tree relationship、rebase、Exact/Prefix matching、containment matrix、推移性 |
 | [`file.rs`](../../crates/authority-core/src/file.rs) | 5 | effect membership と duplicate、空/同値/拡大 subset、request matching の3軸、body containment の3軸、推移性 |
 | [`time.rs`](../../crates/authority-core/src/time.rs) | 4 | 正常/空/逆転区間、半開境界、時刻窓 subset、推移性 |
 | [`capability.rs`](../../crates/authority-core/src/capability.rs) | 5 | typed metadata、時刻付き matching、期間/file の縮小と拡大拒否、反射性、推移性 |
@@ -120,10 +120,10 @@ file body containment では、false allow を防ぐ `fileBodyBelow_sound` は�
 | [`authority-corpus.rs`](../../crates/authority-core/src/bin/authority-corpus.rs) | 7 | header/schema、未知の判定、必須 field、u64 上限、期待値不一致、case 名重複の拒否 |
 | [`capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 11 | 発行・Derive・revoke、atomicity、subject lifecycle、handle ID 非再利用 |
 | [`capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) | 1 | 1〜63操作の Derive/revoke 列を1,000 case 生成し、参照モデルと各 transition を比較 |
-| [`authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | 8 | synchronized API、最終認可、lifecycle、handle、audit、祖先 revoke |
+| [`authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | 10 | synchronized API、active inspection、inspection中のrevoke待機、最終認可、lifecycle、handle、audit、祖先 revoke |
 | [`authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | 4 | direct / ancestor revoke、1〜2 effects、audit consistency、negative control |
 
-Authority core package では production module の31 test、corpus runner の7 test、公開 API の状態遷移 test 11件、authorization guard の contract test 8件、property test 1件の合計58 testを実行する。workspace 全体では、これに capfs namespace registry の11件、backing repository preflight・startup import の11件、subject-local node table の8件を加えた88 testを `cargo test --workspace` で実行する。property test は内部で1,000本の操作列を生成する。これとは別に、runner は共有 fixture の71件を実行時に評価する。
+Authority core packageではproduction moduleの32 test、corpus runnerの7 test、公開APIの状態遷移test 11件、authorization guardのcontract test 10件、property test 1件の合計61 testを実行する。workspace全体では、これにcapfs namespace registryの13件、backing repository preflight・runtime I/Oの14件、subject-local node tableの8件、read-only adapterのmodule / 実mount test 5件を加えた101 testを`cargo test --workspace`で実行する。property testは内部で1,000本の操作列を生成する。これとは別に、runnerは共有fixtureの71件を実行時に評価する。
 
 loom の4件は `cfg(loom)` 専用なので、通常の `cargo test --workspace` では実行されない。専用コマンドでは production と同じ `CapabilityKernel` の同期 primitive を loom 版に差し替え、direct revoke、ancestor revoke、2 effects の bounded model を探索する。negative control は意図どおり反例を発見して panic することを `#[should_panic]` で成功条件にしている。
 
@@ -202,7 +202,7 @@ theorem を production 定義の隣に置くことで、判定を変更して証
 | 全入力で Rust と Lean が同値か |  |  |  |  | 未証明 |
 | direct / ancestor revoke と 1 effect の全 bounded interleaving | ✓ |  |  |  | production model と negative control を loom で検査済み |
 | 2 effects / 1 revoke の preemption-bound model | ✓ |  |  |  | bound 2 で主要な3順序と audit consistency を検査済み |
-| OS/FUSE を含む end-to-end 認可 |  |  |  |  | Authority core の外 |
+| OS/FUSE を含む end-to-end 認可 | ✓ |  |  |  | read-onlyのlookup/open/read/releaseとread-after-revokeをcapfsで検査済み |
 
 Lean theorem は Lean モデル内の全入力を扱い、共通 corpus は両言語の有限の具体例を扱う。どちらか一方から「Rust と Lean は全入力で同値」とは結論しない。OS/FUSE との接続は `capfs` の統合・攻撃テストで別に閉じる。
 
@@ -252,7 +252,7 @@ scripts/check-authority-corpus.sh
 
 残る限界は、corpus が有限であることと、schema v1 が現在の file-only authority だけを表すことである。File 以外の authority variant を追加するときは、両 runner と corpus を同じ変更で拡張する。互換性のない schema 変更では header の version も上げる。
 
-なお、共通 corpus 自体は revoke を検証しない。逐次 revoke と祖先失効は stateful test、1〜2 effects と direct / ancestor revoke の同期境界は loom で検査している。現在の loom model は open handle、rename、unlink、複数 revoke、4 thread 以上を含まない。filesystem adapter が正しい線形化点まで shared guard を保持することは、実 mount の統合・攻撃テストで別に閉じる必要がある。
+なお、共通corpus自体はrevokeを検証しない。逐次revokeと祖先失効はstateful test、1〜2 effectsとdirect / ancestor revokeの同期境界はloomで検査している。現在のloom modelはopen handle、rename、unlink、複数revoke、4 thread以上を含まない。read-only filesystem adapterは実mountのread-after-revoke testで`OPEN` / `READ`の線形化点を検査しているが、変更系operationは今後の統合・攻撃testで別に閉じる必要がある。
 
 ## 変更時の確認点
 

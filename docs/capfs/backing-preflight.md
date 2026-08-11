@@ -137,14 +137,15 @@ module 内の test は mount ID の相違と、Linux が返し得る全 unsuppor
 
 supervisor は、事前検証を始める前から `capfs` の稼働終了まで、workload や他の非信頼 process が backing tree を直接変更できない配置にする必要がある。検証後の create、remove、rename は namespace registry と同じ transaction に置き、通常の read / write も root fd から `openat2` で解決する。
 
+read-only範囲では、[`runtime.rs`](../../crates/capfs/src/runtime.rs)と[`read_only.rs`](../../crates/capfs/src/read_only.rs)がroot fdからのruntime metadata、open、readをFUSE opcodeとCapability guardへ接続している。実装内容は[read-only FUSE adapter](read-only-fuse.md)を参照する。
+
 まだ実装していないのは次である。
 
-- FUSE opcode を fd-relative backing syscall へ変換する adapter。
-- Capability kernel の認可 guard と namespace lock を同じ operation へ接続する処理。
-- runtime の create、remove、rename を `openat2` / `renameat2` で実行する処理。
-- 実 FUSE mount 上の race・越境攻撃 test。
+- `READDIR`のdirectory streamとvisibility filter。
+- write、create、remove、renameを`openat2` / `renameat2`で実行する処理。
+- 実 FUSE mount 上のrename race、mount越境、敵対的な差し替えtest。
 
-したがって、この実装で「不適切な初期 repository を受理しない」境界はできたが、「全 workload syscall が認可を通る」隔離境界はまだ完成していない。
+したがって、read-onlyの既知pathについては起動時検査から実I/Oまで接続されたが、「全 workload syscall が認可を通る」隔離境界はまだ完成していない。
 
 ## 関連
 

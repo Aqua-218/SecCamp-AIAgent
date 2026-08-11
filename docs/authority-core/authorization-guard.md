@@ -45,6 +45,7 @@ flowchart LR
 | `CapabilityKernel` | `CapabilityState` を同期境界に入れ、発行 transition、revoke、effect commit を直列化する |
 | `CapabilityKernelError` | lock poisoning と逐次状態機械の typed error を区別する |
 | `EffectCommitError<E>` | state/audit lock failure、認可拒否、executor の pre-commit 失敗を区別する |
+| `CapabilityInspectionError<E>` | effectを起こさないauthority inspectionのinactive、lock、callback errorを区別する |
 | `AttemptRecord` / `EffectRecord` | 全 checked request と、commit 済み effect を区別する |
 
 `register_subject`、`issue_root`、`derive`、`revoke` は exclusive guard の内側で既存の逐次 transition を呼ぶ。逐次状態機械の検査条件を複製せず、同期だけを外側に追加している。
@@ -66,6 +67,19 @@ shared guard を取得
 Capability の参照は read guard 内の `CapabilityState` を借用している。この参照を executor 呼び出しへ渡すことで、lock の寿命が認可判定だけで終わらずexecutor完了まで続く。
 
 認可が失敗した場合、executor は呼ばれず `EffectCommitError::NotAuthorized` を返す。executor が線形化点より前に失敗した場合は `EffectCommitError::Effect(error)` となる。executor 前に audit entry を作れない場合は `EffectCommitError::Audit(error)` で fail closed にする。記録の仕組みは[Attempt / effect audit](audit-records.md)を参照する。
+
+## effectを起こさないauthority inspection
+
+filesystemのpath walkでは、file内容を読む前に「このpathのmetadataを見せてよいか」をCapabilityのpath patternから導く必要がある。この判定を`ReadData`のeffectとして記録すると、実data readが起きていないのにeffect auditが作られる。
+
+`with_active_capability`は、caller binding、held、subject lifecycle、有効期間、祖先revokeを確認し、activeなCapabilityの参照をcallbackへ渡す。callbackがreturnするまで同じshared guardを保持するので、途中でrevokeが完了することはない。ただし外部effect用ではなく、attempt / effect auditも作らない。
+
+```text
+with_active_capability: authority metadataからvisibilityを導く
+authorize_and_commit:  backing read/writeなど外部effectを実行する
+```
+
+この2つを混同しないことが契約である。現在のread-only capfsは、`LOOKUP` / `GETATTR`のvisibilityに前者、`OPEN` / `READ`の実操作に後者を使う。[read-only FUSE adapter](../capfs/read-only-fuse.md)
 
 ## Executor が守る契約
 
@@ -141,10 +155,12 @@ RUSTFLAGS='--cfg loom' cargo clippy --package authority-core --test authorizatio
 次はまだ含まれない。
 
 - open handle、rename、unlink を含む filesystem 固有の競合。
-- executor adapter が実際の syscall を正しい線形化点まで実行すること。
+- read-only範囲を越えるexecutor adapterが、実際のsyscallを正しい線形化点まで実行すること。
 - writer fairness、revoke latency、負荷時の性能。
 - 4 thread 以上、複数 Capability tree、複数 revoke を組み合わせた model。
 - Rust 状態機械や lock 実装全体の数学的証明。
+
+read-only capfsの`OPEN` / `READ`については、executorがfd openまたは`pread`の完了までreturnしない実装と、実FUSE mount上のread-after-revoke testを追加している。これはwrite、rename、unlinkまで一般化した検証ではない。
 
 loom自身にもC11 memory modelの未対応部分があるため、bounded modelのpassを実システム全体の証明とは扱わない。今回のmodelはatomicだけで認可を組み立てず、reader-writer lockの排他順序を検査対象にしている。
 

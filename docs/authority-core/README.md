@@ -102,8 +102,8 @@ Rust は実際の認可経路から呼ぶ純粋な `bool` 判定を担当する�
 | [`crates/authority-core/tests/capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) | 生成した操作列を独立した参照モデルと比較する stateful property test | [Capability state](capability-state.md) |
 | [`crates/authority-core/src/handle.rs`](../../crates/authority-core/src/handle.rs) | `HandleId`、`ObjectId`、subject-bound `OpenHandle` | [Subject lifecycle と open handle](subject-lifecycle-and-handles.md) |
 | [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs) | attempt journal、terminal outcome、commit 済み effect snapshot | [Attempt / effect audit](audit-records.md) |
-| [`crates/authority-core/src/kernel.rs`](../../crates/authority-core/src/kernel.rs) | shared/exclusive guard、commit 時の最終認可、同期 transition、audit integration | [Authorization guard](authorization-guard.md) / [Attempt / effect audit](audit-records.md) |
-| [`crates/authority-core/tests/authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | guard 公開 API の成功・拒否・error 契約 | [Authorization guard](authorization-guard.md) |
+| [`crates/authority-core/src/kernel.rs`](../../crates/authority-core/src/kernel.rs) | shared/exclusive guard、active authority inspection、commit 時の最終認可、同期 transition、audit integration | [Authorization guard](authorization-guard.md) / [Attempt / effect audit](audit-records.md) |
+| [`crates/authority-core/tests/authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | guard 公開 API の成功・拒否・error契約、inspection中のrevoke待機 | [Authorization guard](authorization-guard.md) |
 | [`crates/authority-core/tests/authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | revoke/commit interleaving と unlocked negative control | [Authorization guard](authorization-guard.md) |
 | [`crates/authority-core/src/lib.rs`](../../crates/authority-core/src/lib.rs) | Rust module の公開と `unsafe` 禁止 | 各 Rust ページ |
 | [`lean/Authority.lean`](../../lean/Authority.lean) | production Lean library の入口 | 各 Lean ページ |
@@ -140,7 +140,7 @@ flowchart LR
 
 実装済みなのは repository identity、repository-relative path、file effect と request、file authority body、単調時刻の有効期間、typed metadata と file-only Capability、matching、`weakerThan` である。Rust 側にはさらに、subject と静的 envelope の登録、root 発行、保持、逐次 Derive、revoke、祖先失効、`auth_epoch`、subject lifecycle、open-handle registry、attempt/effect audit と、effect commit を revoke と線形化する `CapabilityKernel` がある。
 
-未実装なのは、File 以外の authority variant、durable audit backend、supervisor・OS/FUSE・Broker adapter である。global namespace registry は [`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) に実装したが、Authority core の handle registry と同じ transaction で更新する adapter はまだない。現在の guard は executor closure が線形化点まで処理する契約を保護するが、実際の syscall adapter がその契約を守ることまでは検証していない。
+未実装なのは、File以外のauthority variant、durable audit backend、supervisor / Broker adapter、FUSEの`READDIR`と変更系operationである。read-only範囲では[`capfs` adapter](../capfs/read-only-fuse.md)がglobal namespace registry、Authority handle registry、実backing syscallを接続し、実mount上のread-after-revokeまで検査している。write、rename、unlinkを含むtransactionと競合検証はまだない。
 
 現在の file-only slice には、71件の共通 corpus を両言語の production 判定へ流す自動差分テストがある。各 runner は期待値を個別に検査し、その後に出力同士も比較する。ただしこれは選んだ具体例についての回帰検査であり、Rust と Lean が全入力で等しいという証明ではない。
 

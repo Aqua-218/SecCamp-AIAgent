@@ -121,7 +121,9 @@ lock を保持した writer が panic した場合は table を回復したも�
 
 module test は nodeid と lookup count の `u64` 最終値、次の操作での枯渇拒否、writer panic 後の lock poison を直接検査する。
 
-ここで閉じたのは memory 内の node identity と参照数である。まだ実装していないのは、実 FUSE mount、opcode decode / reply、namespace lookup と node 公開をつなぐ adapter、`ObjectId` の現在 path に対する Capability 判定、fd-relative backing I/O である。
+memory内のnode identityと参照数は、現在[read-only FUSE adapter](read-only-fuse.md)の`LOOKUP`、`GETATTR`、`FORGET`へ接続されている。namespace lookup中にnodeを公開し、`ObjectId`の現在pathに対するCapability判定とfd-relative backing I/Oまで同じoperationへつないだ。
+
+実mount testはlookupとread-after-revokeを通すが、kernelが送るFORGETの全順序やmount teardown時の参照状態まではまだ固定していない。`READDIR`、変更系opcode、複数thread sessionも後続である。
 
 ## 関連
 

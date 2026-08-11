@@ -123,7 +123,7 @@ file body containment では、false allow を防ぐ `fileBodyBelow_sound` は�
 | [`authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | 10 | synchronized API、active inspection、inspection中のrevoke待機、最終認可、lifecycle、handle、audit、祖先 revoke |
 | [`authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | 4 | direct / ancestor revoke、1〜2 effects、audit consistency、negative control |
 
-Authority core packageではproduction moduleの32 test、corpus runnerの7 test、公開APIの状態遷移test 11件、authorization guardのcontract test 10件、property test 1件の合計61 testを実行する。workspace全体では、これにcapfs namespace registryの13件、backing repository preflight・runtime I/Oの14件、subject-local node tableの8件、read-only adapterのmodule / 実mount test 6件を加えた102 testを`cargo test --workspace`で実行する。property testは内部で1,000本の操作列を生成する。これとは別に、runnerは共有fixtureの71件を実行時に評価する。
+Authority core packageではproduction moduleの32 test、corpus runnerの7 test、公開APIの状態遷移test 11件、authorization guardのcontract test 10件、property test 1件の合計61 testを実行する。workspace全体では、これにcapfs namespace registryの15件、backing repository preflight・runtime I/Oの14件、subject-local node tableの8件、read-only adapterのmodule / 実mount test 11件を加えた109 testを`cargo test --workspace`で実行する。property testは内部で1,000本の操作列を生成する。これとは別に、runnerは共有fixtureの71件を実行時に評価する。
 
 loom の4件は `cfg(loom)` 専用なので、通常の `cargo test --workspace` では実行されない。専用コマンドでは production と同じ `CapabilityKernel` の同期 primitive を loom 版に差し替え、direct revoke、ancestor revoke、2 effects の bounded model を探索する。negative control は意図どおり反例を発見して panic することを `#[should_panic]` で成功条件にしている。
 
@@ -202,7 +202,7 @@ theorem を production 定義の隣に置くことで、判定を変更して証
 | 全入力で Rust と Lean が同値か |  |  |  |  | 未証明 |
 | direct / ancestor revoke と 1 effect の全 bounded interleaving | ✓ |  |  |  | production model と negative control を loom で検査済み |
 | 2 effects / 1 revoke の preemption-bound model | ✓ |  |  |  | bound 2 で主要な3順序と audit consistency を検査済み |
-| OS/FUSE を含む end-to-end 認可 | ✓ |  |  |  | read-onlyのlookup/open/read/releaseとread-after-revokeをcapfsで検査済み |
+| OS/FUSE を含む end-to-end 認可 | ✓ |  |  |  | read-onlyのlookup/open/read/readdir/releaseとread/readdir-after-revokeをcapfsで検査済み |
 
 Lean theorem は Lean モデル内の全入力を扱い、共通 corpus は両言語の有限の具体例を扱う。どちらか一方から「Rust と Lean は全入力で同値」とは結論しない。OS/FUSE との接続は `capfs` の統合・攻撃テストで別に閉じる。
 
@@ -252,7 +252,7 @@ scripts/check-authority-corpus.sh
 
 残る限界は、corpus が有限であることと、schema v1 が現在の file-only authority だけを表すことである。File 以外の authority variant を追加するときは、両 runner と corpus を同じ変更で拡張する。互換性のない schema 変更では header の version も上げる。
 
-なお、共通corpus自体はrevokeを検証しない。逐次revokeと祖先失効はstateful test、1〜2 effectsとdirect / ancestor revokeの同期境界はloomで検査している。現在のloom modelはopen handle、rename、unlink、複数revoke、4 thread以上を含まない。read-only filesystem adapterは実mountのread-after-revoke testで`OPEN` / `READ`の線形化点を検査しているが、変更系operationは今後の統合・攻撃testで別に閉じる必要がある。
+なお、共通corpus自体はrevokeを検証しない。逐次revokeと祖先失効はstateful test、1〜2 effectsとdirect / ancestor revokeの同期境界はloomで検査している。現在のloom modelはopen handle、rename、unlink、複数revoke、4 thread以上を含まない。read-only filesystem adapterは実mountのread-after-revokeとreaddir-after-revoke testで`OPEN` / `READ`、`OPENDIR` / `READDIR`の線形化点を検査しているが、変更系operationは今後の統合・攻撃testで別に閉じる必要がある。
 
 ## 変更時の確認点
 

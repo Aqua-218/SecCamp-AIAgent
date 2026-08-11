@@ -1,5 +1,4 @@
-import Authority.File
-import Authority.Time
+import Authority.Capability
 
 /-!
 # Authority Decision Tests
@@ -234,5 +233,85 @@ example :
       fileBodyBelow parserReadWrite sourceReadWriteRename = true ∧
       fileBodyBelow readLexer sourceReadWriteRename = true := by
   decide
+
+private def rootMetadata : CapabilityMetadata :=
+  { id := { value := "cap-root" }
+    subject := { value := "subject-root" }
+    issuer := { value := "host" }
+    parent := none
+    delegable := true }
+
+private def childMetadata : CapabilityMetadata :=
+  { id := { value := "cap-child" }
+    subject := { value := "subject-child" }
+    issuer := { value := "host" }
+    parent := some rootMetadata.id
+    delegable := false }
+
+private def rootCapability : Capability :=
+  { metadata := rootMetadata
+    validity := broadWindow
+    authority := .file sourceReadWriteRename }
+
+private def childCapability : Capability :=
+  { metadata := childMetadata
+    validity := narrowWindow
+    authority := .file readMain }
+
+private def parserCapability : Capability :=
+  { metadata := childMetadata
+    validity :=
+      { notBefore := tick 12
+        expiresAt := tick 25
+        isValid := by decide }
+    authority := .file parserReadWrite }
+
+private def lexerCapability : Capability :=
+  { metadata := childMetadata
+    validity := narrowWindow
+    authority := .file readLexer }
+
+private def earlyChildCapability : Capability :=
+  { metadata := childMetadata
+    validity :=
+      { notBefore := tick 9
+        expiresAt := tick 20
+        isValid := by decide }
+    authority := .file readMain }
+
+private def sourceReadRequest (ticks : Nat) : CapabilityRequest :=
+  { time := tick ticks
+    authority := .file
+      { repository := workspace
+        effect := .readData
+        path := main } }
+
+example :
+    capabilityMatches childCapability (sourceReadRequest 15) = true ∧
+      capabilityMatches childCapability (sourceReadRequest 20) = false := by
+  decide
+
+example :
+    capabilityMatches childCapability
+      { time := tick 15
+        authority := .file
+          { repository := workspace
+            effect := .readData
+            path := design } } = false := by
+  decide
+
+example : weakerThan rootCapability rootCapability = true := by decide
+
+example : weakerThan childCapability rootCapability = true := by decide
+
+example :
+    weakerThan lexerCapability parserCapability = true ∧
+      weakerThan parserCapability rootCapability = true ∧
+      weakerThan lexerCapability rootCapability = true := by
+  decide
+
+example : weakerThan earlyChildCapability rootCapability = false := by decide
+
+example : weakerThan rootCapability childCapability = false := by decide
 
 end AuthorityTests

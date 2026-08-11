@@ -1,5 +1,4 @@
-import Authority.File
-import Authority.Time
+import Authority.Capability
 
 /-!
 # Authority

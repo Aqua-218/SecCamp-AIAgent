@@ -55,6 +55,33 @@ impl CanonicalPath {
     pub const fn is_root(&self) -> bool {
         self.segments.is_empty()
     }
+
+    /// Returns the immediate parent, or `None` for the repository root.
+    #[must_use]
+    pub fn parent(&self) -> Option<Self> {
+        let (_, parent_segments) = self.segments.split_last()?;
+        Some(Self {
+            segments: parent_segments.to_vec(),
+        })
+    }
+
+    /// Returns whether this path equals or descends from `ancestor`.
+    #[must_use]
+    pub fn is_at_or_below(&self, ancestor: &Self) -> bool {
+        self.segments.starts_with(&ancestor.segments)
+    }
+
+    /// Replaces `source` with `destination` while preserving the relative suffix.
+    ///
+    /// Returns `None` when this path is outside `source`.
+    #[must_use]
+    pub fn rebase(&self, source: &Self, destination: &Self) -> Option<Self> {
+        let suffix = self.segments.strip_prefix(source.segments.as_slice())?;
+        let mut segments = Vec::with_capacity(destination.segments.len() + suffix.len());
+        segments.extend(destination.segments.iter().cloned());
+        segments.extend(suffix.iter().cloned());
+        Some(Self { segments })
+    }
 }
 
 /// A path selector used by file authorities.
@@ -81,7 +108,7 @@ impl PathPattern {
 pub fn path_matches(pattern: &PathPattern, path: &CanonicalPath) -> bool {
     match pattern {
         PathPattern::Exact(selected) => selected == path,
-        PathPattern::Prefix(selected) => path.as_segments().starts_with(selected.as_segments()),
+        PathPattern::Prefix(selected) => path.is_at_or_below(selected),
     }
 }
 
@@ -95,7 +122,7 @@ pub fn path_below(child: &PathPattern, parent: &PathPattern) -> bool {
     match (child, parent) {
         (PathPattern::Exact(child), PathPattern::Exact(parent)) => child == parent,
         (PathPattern::Exact(child) | PathPattern::Prefix(child), PathPattern::Prefix(parent)) => {
-            child.as_segments().starts_with(parent.as_segments())
+            child.is_at_or_below(parent)
         }
         (PathPattern::Prefix(_), PathPattern::Exact(_)) => false,
     }
@@ -244,6 +271,37 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "invalid repository path segment at index 0: segment must not contain `/`"
+        );
+    }
+
+    #[test]
+    fn canonical_path_exposes_tree_relationships_without_reparsing() {
+        let source = path(&["src"]);
+        let parser = path(&["src", "parser"]);
+        let lexer = path(&["src", "parser", "lexer.rs"]);
+
+        assert_eq!(lexer.parent(), Some(parser.clone()));
+        assert_eq!(source.parent(), Some(CanonicalPath::root()));
+        assert_eq!(CanonicalPath::root().parent(), None);
+        assert!(lexer.is_at_or_below(&source));
+        assert!(source.is_at_or_below(&source));
+        assert!(!source.is_at_or_below(&parser));
+    }
+
+    #[test]
+    fn canonical_path_rebases_only_paths_inside_the_source_subtree() {
+        let source = path(&["src", "parser"]);
+        let destination = path(&["lib", "syntax"]);
+        let descendant = path(&["src", "parser", "lexer.rs"]);
+
+        assert_eq!(
+            descendant.rebase(&source, &destination),
+            Some(path(&["lib", "syntax", "lexer.rs"]))
+        );
+        assert_eq!(source.rebase(&source, &destination), Some(destination));
+        assert_eq!(
+            path(&["src", "main.rs"]).rebase(&source, &path(&["lib"])),
+            None
         );
     }
 

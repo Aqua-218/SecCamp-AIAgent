@@ -7,7 +7,10 @@ use std::{
     sync::{RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use authority_core::{handle::ObjectId, path::CanonicalPath};
+use authority_core::{
+    handle::ObjectId,
+    path::{CanonicalPath, InvalidPathSegment},
+};
 
 const ROOT_OBJECT_SEQUENCE: u64 = 0;
 
@@ -201,6 +204,8 @@ pub enum NamespaceError {
     MissingParent(CanonicalPath),
     /// The requested parent exists but is not a directory.
     ParentNotDirectory(CanonicalPath),
+    /// A child lookup name is not one safe canonical path segment.
+    InvalidChildName(InvalidPathSegment),
     /// The repository root cannot be renamed or removed.
     CannotModifyRoot,
     /// A directory cannot be moved into its own subtree.
@@ -256,6 +261,7 @@ impl fmt::Display for NamespaceError {
                 "namespace parent `{}` is not a directory",
                 DisplayPath(path)
             ),
+            Self::InvalidChildName(error) => write!(formatter, "invalid child name: {error}"),
             Self::CannotModifyRoot => {
                 formatter.write_str("the namespace root cannot be renamed or removed")
             }
@@ -289,7 +295,14 @@ impl fmt::Display for NamespaceError {
     }
 }
 
-impl Error for NamespaceError {}
+impl Error for NamespaceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidChildName(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// A namespace rejection or a backing operation failure before commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -525,6 +538,48 @@ impl NamespaceRegistry {
             .get(object)
             .ok_or_else(|| NamespaceError::UnknownObject(object.clone()))?;
         operation(object).map_err(NamespaceOperationError::Executor)
+    }
+
+    /// Resolves one child and executes an operation under a single read guard.
+    ///
+    /// Parent validation, child-path construction, path-to-object resolution,
+    /// and `operation` all share the same namespace snapshot. A concurrent
+    /// rename therefore cannot substitute a different object between lookup
+    /// and the operation's linearization point.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace error for an unknown parent, a non-directory
+    /// parent, an invalid child name, or a missing child. Executor failures are
+    /// preserved without changing namespace state.
+    pub fn with_child<T, E>(
+        &self,
+        parent: &ObjectId,
+        child_name: &str,
+        operation: impl FnOnce(&NamespaceObject) -> Result<T, E>,
+    ) -> Result<T, NamespaceOperationError<E>> {
+        let state = self.read_state()?;
+        let parent = state
+            .objects
+            .get(parent)
+            .ok_or_else(|| NamespaceError::UnknownObject(parent.clone()))?;
+        if parent.kind != NamespaceObjectKind::Directory {
+            return Err(NamespaceError::ParentNotDirectory(parent.path.clone()).into());
+        }
+        let child_path = parent
+            .path
+            .child(child_name)
+            .map_err(NamespaceError::InvalidChildName)?;
+        let child_id = state
+            .paths
+            .get(&child_path)
+            .ok_or_else(|| NamespaceError::UnknownPath(child_path.clone()))?;
+        let child = state
+            .objects
+            .get(child_id)
+            .ok_or(NamespaceError::InvariantViolation)?;
+
+        operation(child).map_err(NamespaceOperationError::Executor)
     }
 
     /// Commits one open while preventing concurrent rename or removal.

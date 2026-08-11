@@ -13,7 +13,10 @@ use std::{
     time::Duration,
 };
 
-use authority_core::{handle::ObjectId, path::CanonicalPath};
+use authority_core::{
+    handle::ObjectId,
+    path::{CanonicalPath, InvalidPathSegmentReason},
+};
 use capfs::namespace::{
     NamespaceError, NamespaceGeneration, NamespaceObjectKind, NamespaceOperationError,
     NamespaceRegistry,
@@ -140,6 +143,108 @@ fn registry_enforces_unique_paths_parents_and_object_ids() {
             NamespaceError::ParentNotDirectory(path(&["file"]))
         ))
     );
+}
+
+// Requirement: child lookup validates the parent and name, then resolves the
+// child without releasing the namespace guard. Category: lookup/security. Risk: critical.
+#[test]
+fn child_lookup_is_canonical_and_parent_relative() {
+    let SourceTree {
+        registry,
+        parser,
+        lexer,
+    } = registry_with_source_tree();
+
+    let resolved = registry
+        .with_child(&parser, "lexer.rs", |object| {
+            Ok::<_, Infallible>((object.id().clone(), object.path().clone()))
+        })
+        .expect("the live direct child must resolve");
+    assert_eq!(resolved, (lexer, path(&["src", "parser", "lexer.rs"])));
+
+    assert!(matches!(
+        registry.with_child(&parser, "../lib", |_| Ok::<_, Infallible>(())),
+        Err(NamespaceOperationError::Namespace(
+            NamespaceError::InvalidChildName(error)
+        )) if error.index() == 2
+            && error.reason() == InvalidPathSegmentReason::ContainsSeparator
+    ));
+    assert_eq!(
+        registry.with_child(&parser, "missing.rs", |_| Ok::<_, Infallible>(())),
+        Err(NamespaceOperationError::Namespace(
+            NamespaceError::UnknownPath(path(&["src", "parser", "missing.rs"]))
+        ))
+    );
+    assert_eq!(
+        registry.with_child(&resolved.0, "nested", |_| Ok::<_, Infallible>(())),
+        Err(NamespaceOperationError::Namespace(
+            NamespaceError::ParentNotDirectory(path(&["src", "parser", "lexer.rs"]))
+        ))
+    );
+}
+
+// Requirement: a resolved child and its current path stay fixed until the
+// child lookup operation returns. Category: concurrency/security. Risk: critical.
+#[test]
+fn child_lookup_holds_read_lock_against_concurrent_rename() {
+    let SourceTree {
+        registry,
+        parser,
+        lexer: _,
+    } = registry_with_source_tree();
+    let registry = Arc::new(registry);
+    let (reader_entered_sender, reader_entered_receiver) = mpsc::channel();
+    let (release_reader_sender, release_reader_receiver) = mpsc::channel();
+
+    let reader_registry = Arc::clone(&registry);
+    let reader = thread::spawn(move || {
+        reader_registry.with_child(&parser, "lexer.rs", |object| {
+            assert_eq!(object.path(), &path(&["src", "parser", "lexer.rs"]));
+            reader_entered_sender
+                .send(())
+                .expect("test should observe the held child lookup guard");
+            release_reader_receiver
+                .recv()
+                .expect("test should release the child lookup");
+            Ok::<_, Infallible>(())
+        })
+    });
+    reader_entered_receiver
+        .recv()
+        .expect("child lookup should enter its operation");
+
+    let writer_registry = Arc::clone(&registry);
+    let (writer_done_sender, writer_done_receiver) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let result = writer_registry.rename_subtree(
+            &path(&["src", "parser"]),
+            path(&["lib", "parser"]),
+            |_| Ok::<_, Infallible>(()),
+        );
+        writer_done_sender
+            .send(result)
+            .expect("test should receive the writer result");
+    });
+
+    assert_eq!(
+        writer_done_receiver.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "rename must wait while child resolution is in use"
+    );
+    release_reader_sender
+        .send(())
+        .expect("child lookup should be releasable");
+    assert_eq!(
+        reader.join().expect("reader thread should not panic"),
+        Ok(())
+    );
+    assert_eq!(
+        writer_done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("rename should finish after lookup releases"),
+        Ok(())
+    );
+    writer.join().expect("writer thread should not panic");
 }
 
 // Requirement: executor failures never publish new objects or consume their IDs.

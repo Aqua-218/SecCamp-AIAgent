@@ -65,6 +65,20 @@ impl CanonicalPath {
         })
     }
 
+    /// Appends one validated child name to this canonical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPathSegment`] when `child` is empty, equals `.` or
+    /// `..`, or contains `/`, NUL, or `*`.
+    pub fn child(&self, child: &str) -> Result<Self, InvalidPathSegment> {
+        validate_segment(self.segments.len(), child)?;
+        let mut segments = Vec::with_capacity(self.segments.len() + 1);
+        segments.extend(self.segments.iter().cloned());
+        segments.push(child.to_owned());
+        Ok(Self { segments })
+    }
+
     /// Returns whether this path equals or descends from `ancestor`.
     #[must_use]
     pub fn is_at_or_below(&self, ancestor: &Self) -> bool {
@@ -236,6 +250,23 @@ mod tests {
 
         assert_eq!(from_empty_segments, CanonicalPath::root());
         assert!(from_empty_segments.is_root());
+    }
+
+    #[test]
+    fn canonical_path_appends_only_one_valid_child_segment() {
+        let source = path(&["src"]);
+
+        assert_eq!(
+            source
+                .child("lib.rs")
+                .expect("a valid child name must append"),
+            path(&["src", "lib.rs"])
+        );
+        let error = source
+            .child("../secret")
+            .expect_err("a child name must not embed a separator");
+        assert_eq!(error.index(), 1);
+        assert_eq!(error.reason(), InvalidPathSegmentReason::ContainsSeparator);
     }
 
     #[test]

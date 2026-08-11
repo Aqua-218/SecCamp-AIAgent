@@ -2,5 +2,6 @@
 
 #![forbid(unsafe_code)]
 
+pub mod file;
 pub mod path;
 pub mod repository;

@@ -66,7 +66,7 @@ flowchart LR
     sound --> guarantee["Authority(child) ⊆ Authority(parent)"]
 ```
 
-必須定理は `pathBelow_refl/trans/sound`、`bodyBelow_refl/trans/sound`、`weaker_refl/trans/sound`。完全性は安全性に必要ないので追わない。
+必須定理は `pathBelow_refl/trans/sound`、`bodyBelow_refl/trans/sound`、`weaker_refl/trans/sound`。安全性には sound で十分だが、path については実行可能な判定と集合意味論のずれをなくすため、`pathBelow_complete` と `pathBelow_iff_matches_subset` まで証明する。body と weaker の完全性は必要になった時点で検討する。
 
 ## 正常系だけを生成しない
 

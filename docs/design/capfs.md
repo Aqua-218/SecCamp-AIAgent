@@ -57,6 +57,19 @@ flowchart LR
 
 `ObjectId` と mount 内の `nodeid` は再利用しない。
 
+## 現在の実装位置
+
+[`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) に、VM 共通の link-free namespace registry を実装している。
+
+- `ObjectId -> NamespaceObject` と `CanonicalPath -> ObjectId` を同じ lock 内で管理する。
+- create、remove、subtree rename が成功したときだけ `namespace_generation` を進める。
+- `ObjectId` は remove 後も再利用せず、rename 先は no-replace とする。
+- subtree に open handle が1件でもあれば rename / remove executor を呼ばない。
+- read / write adapter が現在 path 取得から backing I/O まで保持できる read-guard 付き closure API を持つ。
+- backing executor 失敗では registry state を公開せず、writer panic 後は lock poison により fail closed にする。
+
+詳しい API と保証範囲は[共有 namespace registry](../capfs/namespace-registry.md)を参照する。FUSE mount、backing fd、repository import 時の link 検査、Authority core の handle registry と一体化した adapter は次段階である。
+
 ## 初期実装は workspace を木に限定する
 
 最初の `capfs` は、path-based authority と相性が悪い alias を扱わない。これは初期実装の安全境界であり、symlink を恒久的に非対応とする決定ではない。

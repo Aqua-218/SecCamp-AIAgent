@@ -140,7 +140,7 @@ flowchart LR
 
 実装済みなのは repository identity、repository-relative path、file effect と request、file authority body、単調時刻の有効期間、typed metadata と file-only Capability、matching、`weakerThan` である。Rust 側にはさらに、subject と静的 envelope の登録、root 発行、保持、逐次 Derive、revoke、祖先失効、`auth_epoch`、subject lifecycle、open-handle registry、attempt/effect audit と、effect commit を revoke と線形化する `CapabilityKernel` がある。
 
-未実装なのは、File 以外の authority variant、durable audit backend、global namespace registry、supervisor・OS/FUSE・Broker adapter である。現在の guard は executor closure が線形化点まで処理する契約を保護するが、実際の syscall adapter がその契約を守ることまでは検証していない。
+未実装なのは、File 以外の authority variant、durable audit backend、supervisor・OS/FUSE・Broker adapter である。global namespace registry は [`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) に実装したが、Authority core の handle registry と同じ transaction で更新する adapter はまだない。現在の guard は executor closure が線形化点まで処理する契約を保護するが、実際の syscall adapter がその契約を守ることまでは検証していない。
 
 現在の file-only slice には、71件の共通 corpus を両言語の production 判定へ流す自動差分テストがある。各 runner は期待値を個別に検査し、その後に出力同士も比較する。ただしこれは選んだ具体例についての回帰検査であり、Rust と Lean が全入力で等しいという証明ではない。
 
@@ -157,5 +157,6 @@ flowchart LR
 - [Subject lifecycle と open handle](subject-lifecycle-and-handles.md)
 - [Attempt / effect audit](audit-records.md)
 - [検証とテスト](verification.md)
+- [capfs の共有 namespace registry](../capfs/namespace-registry.md)
 - [Capability モデル](../design/capability-model.md)
 - [検証戦略](../design/verification.md)

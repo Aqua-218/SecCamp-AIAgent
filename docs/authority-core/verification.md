@@ -109,7 +109,7 @@ file body containment では、false allow を防ぐ `fileBodyBelow_sound` は�
 | ソース | test 数 | 主な確認内容 |
 |---|---:|---|
 | [`repository.rs`](../../crates/authority-core/src/repository.rs) | 1 | host-assigned value の保持、`as_str`、`Display` |
-| [`path.rs`](../../crates/authority-core/src/path.rs) | 8 | valid/root path、6種類の invalid segment、最初の error、Exact/Prefix matching、containment matrix、推移性 |
+| [`path.rs`](../../crates/authority-core/src/path.rs) | 10 | valid/root path、6種類の invalid segment、最初の error、tree relationship、rebase、Exact/Prefix matching、containment matrix、推移性 |
 | [`file.rs`](../../crates/authority-core/src/file.rs) | 5 | effect membership と duplicate、空/同値/拡大 subset、request matching の3軸、body containment の3軸、推移性 |
 | [`time.rs`](../../crates/authority-core/src/time.rs) | 4 | 正常/空/逆転区間、半開境界、時刻窓 subset、推移性 |
 | [`capability.rs`](../../crates/authority-core/src/capability.rs) | 5 | typed metadata、時刻付き matching、期間/file の縮小と拡大拒否、反射性、推移性 |
@@ -123,7 +123,7 @@ file body containment では、false allow を防ぐ `fileBodyBelow_sound` は�
 | [`authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | 8 | synchronized API、最終認可、lifecycle、handle、audit、祖先 revoke |
 | [`authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | 4 | direct / ancestor revoke、1〜2 effects、audit consistency、negative control |
 
-production module の29 test、corpus runner の7 test、公開 API の状態遷移 test 11件、authorization guard の contract test 8件、property test 1件の合計56 test を `cargo test --workspace` で実行する。property test は内部で1,000本の操作列を生成する。これとは別に、runner は共有 fixture の71件を実行時に評価する。
+Authority core package では production module の31 test、corpus runner の7 test、公開 API の状態遷移 test 11件、authorization guard の contract test 8件、property test 1件の合計58 testを実行する。workspace 全体では、これに capfs namespace registry の9件を加えた67 testを `cargo test --workspace` で実行する。property test は内部で1,000本の操作列を生成する。これとは別に、runner は共有 fixture の71件を実行時に評価する。
 
 loom の4件は `cfg(loom)` 専用なので、通常の `cargo test --workspace` では実行されない。専用コマンドでは production と同じ `CapabilityKernel` の同期 primitive を loom 版に差し替え、direct revoke、ancestor revoke、2 effects の bounded model を探索する。negative control は意図どおり反例を発見して panic することを `#[should_panic]` で成功条件にしている。
 

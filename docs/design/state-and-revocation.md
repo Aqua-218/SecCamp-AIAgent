@@ -75,8 +75,9 @@ flowchart LR
 |---|---|
 | subject 登録、root 発行、held、caller binding、parent link、`delegable` を検査する Derive | supervisor / filesystem / Broker adapter との end-to-end 接続 |
 | `WeakerThan`、target envelope、逐次 revoke、祖先 chain、`auth_epoch` | durable audit backend と commit receipt |
-| Running→Closing→Closed、held revoke、open-handle registry、ID 非再利用 | global namespace registry と実 fd lifecycle |
+| Running→Closing→Closed、held revoke、open-handle registry、ID 非再利用 | 実 fd lifecycle と capfs registry を一体化する adapter |
 | shared effect / exclusive transition、executor の線形化点までの guard、attempt/effect audit | open handle、rename、unlink を含む capfs 競合 model |
+| capfs の path/object 対応、generation、open count、no-replace subtree rename | FUSE opcode と backing syscall の end-to-end 接続 |
 | direct / ancestor revoke、1〜2 effects、negative control の Loom model | 4 thread 以上・複数 revoke / Capability tree の model |
 
 詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)と[Effect commit と revoke の authorization guard](../authority-core/authorization-guard.md)を参照する。

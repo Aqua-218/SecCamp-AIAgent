@@ -6,6 +6,7 @@
 |---|---|---|
 | [設計書](design/README.md) | 設計者、実装者、セキュリティレビュー担当者 | 脅威モデル、Capability モデル、失効、隔離、検証戦略、実装順序 |
 | [Authority core 実装ガイド](authority-core/README.md) | Rust/Lean 実装者、証明のレビュー担当者 | 現在の Authority core 各ファイルの責務、Rust と Lean の対応、定理、テスト |
+| [capfs 実装ガイド](capfs/README.md) | filesystem adapter 実装者、並行境界のレビュー担当者 | namespace registry、path/object 対応、generation、open count、rename の原子性 |
 
 ## Authority core 文書
 
@@ -24,10 +25,18 @@
 | [Attempt / effect audit](authority-core/audit-records.md) | 全認可試行と commit 済み effect の区別、記録失敗時の fail closed |
 | [検証とテスト](authority-core/verification.md) | Rust unit・状態遷移・property・loom test、Lean example・theorem、共通 corpus の役割分担 |
 
+## capfs 文書
+
+| 文書 | 内容 |
+|---|---|
+| [実装ガイド](capfs/README.md) | 現在の実装範囲と文書一覧 |
+| [共有 namespace registry](capfs/namespace-registry.md) | `ObjectId` と現在 path の対応、generation、open handle、create/remove/rename の lock 契約 |
+
 ## 文書の使い分け
 
 - 「なぜこの構造にするか」は[設計書](design/README.md)を読む。
 - 「どのファイルが何を実装・証明しているか」は[Authority core 実装ガイド](authority-core/README.md)を読む。
+- 「rename 中にも現在 path をどう固定するか」は[capfs 実装ガイド](capfs/README.md)を読む。
 - 設計と実装が食い違って見える場合は、両方を照合し、実装済み範囲を Authority core 実装ガイドで確認する。
 
 ## 関連

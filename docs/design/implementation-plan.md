@@ -44,7 +44,7 @@ subject tree、held、revoke、open handle、attempt、effect、authorization gu
 
 Loom は direct revoke / 1 effect、ancestor revoke / descendant effect の全 interleaving と、preemption bound 2 の 2 effects / 1 revoke を検査する。guard を認可直後に外す negative control も反例を出す。これにより次の完了条件は現在の Authority core model について満たした。
 
-状態機械 phase に残るのは、durable audit backend、supervisor / filesystem / Broker adapter、global namespace registry、および open handle・rename・unlink・複数 revoke を含む競合 model である。詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)、[Authorization guard](../authority-core/authorization-guard.md)、[Subject lifecycle と open handle](../authority-core/subject-lifecycle-and-handles.md)、[Attempt / effect audit](../authority-core/audit-records.md)を参照する。
+状態機械 phase に残るのは、durable audit backend、supervisor / filesystem / Broker adapter、および open handle・rename・unlink・複数 revoke を含む競合 model である。global namespace registry は capfs crate へ移り、path/object 対応と mutation lock を実装済みである。詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)、[Authorization guard](../authority-core/authorization-guard.md)、[Subject lifecycle と open handle](../authority-core/subject-lifecycle-and-handles.md)、[Attempt / effect audit](../authority-core/audit-records.md)、[共有 namespace registry](../capfs/namespace-registry.md)を参照する。
 
 **完了条件:** negative control では race の反例が出て、本番 lock では同じ bounded model の反例が消える。
 
@@ -63,6 +63,8 @@ flowchart LR
 **完了条件:** 実 mount 上で read-after-revoke と rename/write 競合を再現しても、権限外アクセスが成立しない。
 
 初期完了時点では symlink と hard link を含む repository を拒否し、`SYMLINK` と `LINK` も `EPERM` にする。これにより、namespace と revoke の基本 invariant を link 解決から独立して検証する。
+
+現在は `crates/capfs` を workspace へ追加し、VM 共通の link-free namespace registry まで実装している。`ObjectId` と現在 path の一意対応、ID 非再利用、単調な `namespace_generation`、open count、no-replace subtree rename、remove、backing executor 失敗時の atomicity を Rust test で固定した。次は repository preflight と backing directory fd を持つ passthrough adapter を作り、この registry と Authority kernel へ実 syscall を接続する。
 
 その後、repository 内で完結する symlink を[後続機能](capfs.md#symlink-は後続機能として追加する)として追加する。hard link は同じ inode に複数 path を与えるため、symlink と同時には有効化せず、import 時の分離または alias-aware な認可モデルを設計してから扱う。
 

@@ -96,7 +96,7 @@ Authority core の `finish_subject_close` は、その subject に live handle �
 
 - backing `open` の成功と `register_open_handle` を失敗処理込みで接続すること。登録が拒否された場合は、adapter が開いた fd を必ず閉じる。
 - FUSE request の `fh` を trusted `HandleId` へ変換し、request payload の subject identity を信用しないこと。
-- `ObjectId` の現在 canonical path、subtree count、`namespace_generation` を管理する global namespace registry。
+- 実装済みの[global namespace registry](../capfs/namespace-registry.md)と Authority core の handle 登録・close を、失敗処理込みで同じ adapter transition へ接続すること。
 - cgroup stop、fd close、unmount を実行してから `finish_subject_close` を呼ぶ supervisor orchestration。
 - open handle、rename、unlink、revoke を組み合わせた capfs の Loom・実 mount test。
 

@@ -59,6 +59,8 @@ revoke / commit については、production の `CapabilityKernel` と同じ sy
 
 loom は実システム全体の証明ではない。direct / ancestor の 2 thread model は全 interleaving を探索するが、3 thread model は CI での state explosion を避けるため preemption bound 2 である。open handle、rename、unlink、複数 revoke、実 syscall adapter は含まず、loom 自身にも完全な C11 memory model ではないという制限がある。したがって、ここで言えるのは選んだ bounded model の範囲内の結果である。
 
+capfs namespace registry は、公開 API の contract test で path/object の一意対応、ID 非再利用、generation、open count、create/remove/rename の失敗 atomicity を検査する。標準 thread test では、read operation が現在 path を使い終わるまで並行 rename が write lock を取得できないことも確認する。これは1つの具体的な schedule であり、open / close / rename / revoke の全 interleaving を探索する Loom model ではない。詳しい境界は[共有 namespace registry](../capfs/namespace-registry.md)を参照する。
+
 symlink resolver の test は初期 `capfs` の完了条件には含めない。link-free な namespace と revoke の検証を先に終え、[symlink 対応](capfs.md#symlink-は後続機能として追加する)を実装する段階で追加する。
 
 ## Lean で証明するもの

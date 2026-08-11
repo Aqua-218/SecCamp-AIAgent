@@ -31,7 +31,7 @@ flowchart LR
 ```text
 objects     : ObjectId -> NamespaceObject
 paths       : CanonicalPath -> ObjectId
-issued_ids  : 一度でも発行した ObjectId
+next_object_sequence : 次に割り当てる単調な ObjectId sequence
 generation  : namespace変更ごとに増える単調なversion
 ```
 
@@ -42,14 +42,31 @@ generation  : namespace変更ごとに増える単調なversion
 この対応があることで、次を拒否できる。
 
 - 同じpathへ2つのobjectを登録する。
-- 1つの `ObjectId` を remove 後に別 object として再利用する。
+- remove 済み object の `ObjectId` を新しい object に再利用する。
 - 存在しないdirectoryやregular fileの下へchildを作る。
 - repository rootをrename / removeする。
 - directoryを自分自身のsubtreeへ移してcycleを作る。
 
+## 初期 manifest と `ObjectId` をどう対応させるのか
+
+[`ImportedRepository`](../../crates/capfs/src/backing.rs) は、事前検証済み manifest と backing root fd を受け取り、完全な registry を構築してから両方を1つの所有型として返す。途中の entry だけが登録された registry は外へ出ない。
+
+manifest は canonical path 順なので、root を `object-0`、以後を `object-1`、`object-2` と単調に割り当てる。これは永続 ID ではなくVM session内だけの identity である。同じ repositoryでも別sessionでは対応が変わってよく、外部入力がIDを指定することはできない。
+
+```text
+/                  -> object-0
+/README.md         -> object-1
+/src               -> object-2
+/src/lib.rs        -> object-3
+```
+
+IDにpathを埋め込まないため、`/src/lib.rs` がrenameされても `ObjectId` は変わらない。runtime createでもregistryが次のsequenceを割り当てる。executorがcommit前に失敗したIDは発行されず、removeまで成功したIDはsequenceを巻き戻さないため再利用されない。`u64::MAX`を割り当てた後は`ObjectIdExhausted`としてfail closedになる。
+
+backing root fdとregistryを同じ`ImportedRepository`が所有するのは、別repositoryから作ったregistryを誤って別fdへ接続する事故を型の境界で減らすためである。
+
 ## Generation は何に使うのか
 
-`NamespaceGeneration` はcreate、remove、rename、startup importで1ずつ増える。open / closeではpath対応が変わらないため増えない。
+startup import全体はworkloadへ公開される前の初期snapshotなのでgeneration 0になる。公開後のcreate、remove、renameは成功ごとに1ずつ進む。open / closeではpath対応が変わらないため増えない。
 
 ```text
 authorization cache key
@@ -112,26 +129,26 @@ executorから同じregistryへ再入するとdeadlockし得るため禁止し�
 
 [`crates/capfs/tests/namespace_registry.rs`](../../crates/capfs/tests/namespace_registry.rs) は公開APIを通して次を確認する。
 
-- pathとobject IDの重複、missing parent、file parentの拒否。
+- pathの重複、missing parent、file parentの拒否とregistry内でのID割り当て。
 - create / remove / rename executor失敗時にstateとgenerationが変わらないこと。
+- create失敗ではstaged IDが未発行のままで、remove後は発行済みIDを再利用しないこと。
 - subtree renameが全descendant pathを同じsuffixのまま移すこと。
 - no-replace、root変更、source subtree内へのrenameの拒否。
 - open handleがrename / removeを止め、open / close失敗時にcountがrollbackされること。
 - read operationが終わるまで並行renameのwrite lockが進まないこと。
 
-module内のtestはgenerationとopen countのwraparoundをexecutor呼出前に拒否すること、writer panic後にregistry全体がfail closedになることを確認する。通常の`cargo test --workspace`では、capfsについて合計9件を実行する。
+module内のtestはgeneration、open count、Object ID sequenceの上限、manifest rootとparent関係、writer panic後のfail closedを確認する。namespace registryについて合計11件を実行する。
 
-capfs package 全体では、これに[backing repository の事前検証](backing-preflight.md)9件を加えた18件を実行する。
+capfs package 全体では、これに[backing repository の事前検証とstartup import](backing-preflight.md)11件を加えた22件を実行する。
 
 ここで確認できるのはRust APIの具体的な境界と1つのthread競合である。rename、open、close、revokeを組み合わせた全bounded interleavingのLoom modelと、実FUSE mount上の攻撃testは次段階に残る。
 
 ## 現在含まないもの
 
 - FUSE mountとopcode dispatch。
-- 初期 manifest からregistryへの`ObjectId`割り当て。
 - runtime backing operationの`openat2` / `renameat2` syscall。
 - Authority coreのhandle registryとopen countを一体でcommitするadapter。
-- `nodeid -> ObjectId`のsubject-local mapping。
+- `nodeid -> ObjectId`のsubject-local mappingとnodeid非再利用。
 - durable stateやsupervisor再起動後の復元。
 
 したがって、namespace registryの不変条件は実装済みだが、workloadのsyscallが必ずこのregistryを通る隔離境界はまだ完成していない。

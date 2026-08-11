@@ -64,9 +64,9 @@ flowchart LR
 
 初期完了時点では symlink と hard link を含む repository を拒否し、`SYMLINK` と `LINK` も `EPERM` にする。これにより、namespace と revoke の基本 invariant を link 解決から独立して検証する。
 
-現在はVM共通の link-free namespace registry に加え、repository preflight と backing root fd の所有まで実装している。`statx` / `openat2` による fd-relative scan で symlink、hard link、special file、nested mount、非 canonical 名、resource limit 超過を拒否し、決定的な初期 manifest を作る。詳しい境界は[Backing repository の事前検証](../capfs/backing-preflight.md)を参照する。
+現在はVM共通のlink-free namespace registry、repository preflight、backing root fd、manifestの原子的なstartup importまで実装している。registryがpath非依存の`ObjectId`を単調に割り当て、root fdと完成したregistryを同じ`ImportedRepository`が所有する。`ObjectId`はremove後も再利用せず、sequence枯渇時はfail closedになる。詳しい境界は[Backing repository の事前検証](../capfs/backing-preflight.md)と[共有 namespace registry](../capfs/namespace-registry.md)を参照する。
 
-次は manifest を namespace registry へ import し、subject-local `nodeid` を `ObjectId` へ対応させる passthrough FUSE adapter を作る。まず lookup / getattr / open / read / release の read-only opcodeを root fd と Authority kernel へ接続し、その後に write、create、remove、no-replace rename を追加する。
+次はsubject-local `nodeid`を`ObjectId`へ対応させるnode tableとpassthrough FUSE adapterを作る。まずlookup / getattr / open / read / releaseのread-only opcodeをroot fdとAuthority kernelへ接続し、その後にwrite、create、remove、no-replace renameを追加する。
 
 その後、repository 内で完結する symlink を[後続機能](capfs.md#symlink-は後続機能として追加する)として追加する。hard link は同じ inode に複数 path を与えるため、symlink と同時には有効化せず、import 時の分離または alias-aware な認可モデルを設計してから扱う。
 

@@ -59,9 +59,9 @@ revoke / commit については、production の `CapabilityKernel` と同じ sy
 
 loom は実システム全体の証明ではない。direct / ancestor の 2 thread model は全 interleaving を探索するが、3 thread model は CI での state explosion を避けるため preemption bound 2 である。open handle、rename、unlink、複数 revoke、実 syscall adapter は含まず、loom 自身にも完全な C11 memory model ではないという制限がある。したがって、ここで言えるのは選んだ bounded model の範囲内の結果である。
 
-capfs namespace registry は、公開 API の contract test で path/object の一意対応、ID 非再利用、generation、open count、create/remove/rename の失敗 atomicity を検査する。標準 thread test では、read operation が現在 path を使い終わるまで並行 rename が write lock を取得できないことも確認する。これは1つの具体的な schedule であり、open / close / rename / revoke の全 interleaving を探索する Loom model ではない。詳しい境界は[共有 namespace registry](../capfs/namespace-registry.md)を参照する。
+capfs namespace registry は、公開 API の contract test で path/object の一意対応、registry内のID割り当て、失敗したcreateのID未発行、remove後のID非再利用、generation、open count、create/remove/rename の失敗 atomicity を検査する。標準 thread test では、read operation が現在 path を使い終わるまで並行 rename が write lock を取得できないことも確認する。module testではObject ID sequenceの最終値と枯渇、invalid manifestの拒否を検査する。これは1つの具体的な schedule であり、open / close / rename / revoke の全 interleaving を探索する Loom model ではない。詳しい境界は[共有 namespace registry](../capfs/namespace-registry.md)を参照する。
 
-backing repository の contract test は実 directory tree に対して、root fd の保持、path 順 manifest、root / entry symlink、hard link、socket、非 UTF-8 名、canonical segment 違反、entry・depth limit を検査する。module test は nested mount を判定する mount ID の相違と全 unsupported object kind を検査する。実 mount namespace を使った mount crossing、走査中の敵対的な差し替え、FUSE opcodeとの接続はまだ含まない。詳しい前提は[Backing repository の事前検証](../capfs/backing-preflight.md)を参照する。
+backing repository の contract test は実 directory tree に対して、root fd の保持、path 順 manifest、root / entry symlink、hard link、socket、非 UTF-8 名、canonical segment 違反、entry・depth limitを検査する。startup testはmanifest全件のregistry import、path順のObject ID、初期generation、preflight失敗時にnamespaceを公開しないことを確認する。module test は nested mount を判定する mount ID の相違と全 unsupported object kind を検査する。実 mount namespace を使った mount crossing、走査中の敵対的な差し替え、FUSE opcodeとの接続はまだ含まない。詳しい前提は[Backing repository の事前検証](../capfs/backing-preflight.md)を参照する。
 
 symlink resolver の test は初期 `capfs` の完了条件には含めない。link-free な namespace と revoke の検証を先に終え、[symlink 対応](capfs.md#symlink-は後続機能として追加する)を実装する段階で追加する。
 

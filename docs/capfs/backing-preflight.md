@@ -63,6 +63,23 @@ directory を開く前後でも `(mount ID, inode)` を比較する。entry 名�
 
 entry 数と深さには [`PreflightLimits`](../../crates/capfs/src/backing.rs) を必須にしている。攻撃者が巨大な directory tree を渡しても、manifest 用 memory や走査時間を無制限には使わせない。走査自体も再帰関数ではなく fd の work list を使うため、深い木で process stack を消費しない。
 
+## Manifest を一度に registry へ取り込む
+
+[`ImportedRepository::open`](../../crates/capfs/src/backing.rs) は事前検証とstartup importを1つの入口にする。preflightが成功した後、manifest全件からnamespace registryを構築し、完成後にだけ`ImportedRepository`を返す。
+
+```mermaid
+flowchart LR
+    preflight["ValidatedRepository<br/>root fd + manifest"] --> build["全pathへObjectIdを割り当て"]
+    build --> validate["root・parent・重複を検査"]
+    validate --> publish["ImportedRepository<br/>backing + registry"]
+    build -->|failure| discard["両方を破棄"]
+    validate -->|failure| discard
+```
+
+`ObjectId`はmanifestのpath順にregistryが割り当て、path文字列そのものからは作らない。このためrename後も同じobject identityを使える。初期registry全体がgeneration 0であり、entryごとに途中のgenerationを外から観測することはできない。
+
+`ImportedRepository`がbacking rootとregistryを同時に所有するため、adapterはこの2つを別々のrepositoryから取り違えにくい。必要な段階では`into_parts`で分離できるが、それまでは対応関係を1つの値として保つ。
+
 ## 何が数学的に扱いやすくなるのか
 
 namespace registry は、生きている canonical path と `ObjectId` の一対一対応を不変条件にしている。backing 側に hard link があると、2つの path が同じ inode を指し、この対応だけでは実 object の別名を表せない。
@@ -97,6 +114,8 @@ root や child directory の再照合には、time-of-check to time-of-use race 
 
 必要な kernel metadata が欠けた場合も推測で続行せず、repository 全体を拒否する。
 
+高水準の`ImportedRepository::open`は、これらを`RepositoryStartupError::Preflight`、registry構築の失敗を`RepositoryStartupError::Namespace`として区別する。どちらでも`ImportedRepository`は返らない。
+
 ## どう検証しているか
 
 [`crates/capfs/tests/repository_preflight.rs`](../../crates/capfs/tests/repository_preflight.rs) は実 directory、file、symlink、hard link、Unix socket、非 UTF-8 名を作り、公開 API を通して次を確認する。
@@ -107,6 +126,8 @@ root や child directory の再照合には、time-of-check to time-of-use race 
 - repository 内外に alias を作る hard link を link count で拒否する。
 - special file、非 UTF-8 名、canonical 規則違反を拒否する。
 - entry 数と深さの上限を越えた木を拒否する。
+- manifest全件を同じregistryへ取り込み、path順にstableな`ObjectId`を割り当てる。
+- preflight失敗時に部分的なnamespace所有型を返さない。
 
 module 内の test は mount ID の相違と、Linux が返し得る全 unsupported object kind の分類を直接検査する。実 nested mount の作成には mount namespace の権限が要るため、通常の unit test では metadata 判定までを固定している。実 mount を使った越境 test は FUSE 統合 test の段階で追加する。
 
@@ -118,7 +139,6 @@ supervisor は、事前検証を始める前から `capfs` の稼働終了まで
 
 まだ実装していないのは次である。
 
-- manifest から namespace registry へ `ObjectId` を割り当てる startup import。
 - FUSE opcode を fd-relative backing syscall へ変換する adapter。
 - Capability kernel の認可 guard と namespace lock を同じ operation へ接続する処理。
 - runtime の create、remove、rename を `openat2` / `renameat2` で実行する処理。

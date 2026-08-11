@@ -64,9 +64,9 @@ flowchart LR
 
 初期完了時点では symlink と hard link を含む repository を拒否し、`SYMLINK` と `LINK` も `EPERM` にする。これにより、namespace と revoke の基本 invariant を link 解決から独立して検証する。
 
-現在はVM共通のlink-free namespace registry、repository preflight、`RepoId`とbacking root / namespaceのbinding、manifestの原子的なstartup import、subject-local node tableに加え、read-only FUSE adapterまで実装している。`LOOKUP` / `GETATTR` / `FORGET` / `OPEN` / `READ` / `RELEASE`をroot fd、node table、namespace registry、Authority kernelへ接続し、zero TTLとdirect I/Oを使う。実mount上で権限外siblingが`ENOENT`になり、open済みfile descriptorのreadもrevoke後は`EACCES`になることを確認した。詳しい境界は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[read-only FUSE adapter](../capfs/read-only-fuse.md)を参照する。
+現在はVM共通のlink-free namespace registry、repository preflight、`RepoId`とbacking root / namespaceのbinding、manifestの原子的なstartup import、subject-local node tableに加え、read-only FUSE adapterまで実装している。`LOOKUP` / `GETATTR` / `FORGET` / `OPEN` / `READ` / `RELEASE` / `OPENDIR` / `READDIR` / `RELEASEDIR`をroot fd、node table、namespace registry、Authority kernelへ接続し、zero TTLとdirect I/Oを使う。`READDIR`は`ListDirectory`を通常のpath patternで確認したうえで、同一namespace guard内のdirect childだけをvisibility filterへ通す。実mount上で権限外siblingが`ENOENT`になり、open済みfile descriptorのreadと既存directory streamの次のlistingがrevoke後は`EACCES`になることを確認した。詳しい境界は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[read-only FUSE adapter](../capfs/read-only-fuse.md)を参照する。
 
-次は`READDIR`を`ListDirectory`へ接続する。その後にwrite、create、remove、no-replace renameを追加する。
+次は`WRITE`を追加し、open済みfile descriptorに対する毎回の`WriteData`再認可とdirect I/Oを接続する。その後にcreate、remove、no-replace renameを追加する。
 
 その後、repository 内で完結する symlink を[後続機能](capfs.md#symlink-は後続機能として追加する)として追加する。hard link は同じ inode に複数 path を与えるため、symlink と同時には有効化せず、import 時の分離または alias-aware な認可モデルを設計してから扱う。
 

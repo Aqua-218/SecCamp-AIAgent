@@ -101,6 +101,7 @@ FORGET(k > c):       遷移しない
 | `NodeTable::new` | subject と root `ObjectId` を1つの mount tableへ固定する |
 | `remember_lookup` | 成功した LOOKUP 1件を数え、live node の再利用または新規 node の単調割り当てを行う |
 | `resolve` | request の nodeid を `ObjectId` へ変換する |
+| `node_for_object` | READDIR用にlive nodeがあれば返す。lookup referenceは増やさない |
 | `forget` | 非0の `nlookup` を原子的に反映し、最後の参照なら live mapping を外す |
 | `binding` / `node_count` | test・診断用の point-in-time snapshot を返す |
 
@@ -114,6 +115,7 @@ lock を保持した writer が panic した場合は table を回復したも�
 
 - root が `nodeid 1` と root object に固定され、forget できない。
 - 同一 object の反復 lookup が同じ live node を返し、参照数を増やす。
+- `node_for_object`がlive nodeだけを参照数を変えずに返す。
 - 最終 FORGET 後の stale node が拒否され、再 lookup では別番号になる。
 - 過剰 FORGET が参照数と対応を変えない。
 - 2 subject の table で同じ数値を独立して解決できる。
@@ -121,9 +123,9 @@ lock を保持した writer が panic した場合は table を回復したも�
 
 module test は nodeid と lookup count の `u64` 最終値、次の操作での枯渇拒否、writer panic 後の lock poison を直接検査する。
 
-memory内のnode identityと参照数は、現在[read-only FUSE adapter](read-only-fuse.md)の`LOOKUP`、`GETATTR`、`FORGET`へ接続されている。namespace lookup中にnodeを公開し、`ObjectId`の現在pathに対するCapability判定とfd-relative backing I/Oまで同じoperationへつないだ。
+memory内のnode identityと参照数は、現在[read-only FUSE adapter](read-only-fuse.md)の`LOOKUP`、`GETATTR`、`FORGET`、`READDIR`へ接続されている。namespace lookup中にnodeを公開し、`ObjectId`の現在pathに対するCapability判定とfd-relative backing I/Oまで同じoperationへつないだ。
 
-実mount testはlookupとread-after-revokeを通すが、kernelが送るFORGETの全順序やmount teardown時の参照状態まではまだ固定していない。`READDIR`、変更系opcode、複数thread sessionも後続である。
+basic `READDIR`はlookup済みobjectのlive nodeだけをinode hintとして使い、未lookupのentryには0を返す。directory reply自体はlookup referenceを発生させないため、`remember_lookup`を呼んで架空の参照数を増やさない。実mount testはlookup、read-after-revoke、readdir-after-revokeを通すが、kernelが送るFORGETの全順序やmount teardown時の参照状態まではまだ固定していない。変更系opcodeと複数thread sessionも後続である。
 
 ## 関連
 

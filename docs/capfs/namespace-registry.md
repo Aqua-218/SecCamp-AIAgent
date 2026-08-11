@@ -107,9 +107,9 @@ renameはsource subtree内を調べ、1件でもlive handleがあればexecutor�
 
 これにより初期実装では、rename / unlink後にpathを失ったinodeをopen fdだけで使い続ける状態を作らない。POSIX互換性より「live objectは必ず1つのcanonical pathを持つ」という認可上の単純さを優先している。
 
-Authority coreにもsubject-boundな`OpenHandle` recordがある。現時点では両者を同じtransactionで更新するfilesystem adapterは未実装である。adapterは必ずnamespace lockを先、Capability kernelのguardを後に取得し、全経路でlock順を統一する必要がある。
+read-only FUSE adapterは、fileとdirectoryのopen時にnamespace open countとAuthority coreのsubject-boundな`OpenHandle` recordを同じobjectへ登録する。片方の登録や認可に失敗すればcountをrollbackし、releaseでは両方を閉じる。adapterはlocal handle table、namespace、Capability kernelの順にlockを取得し、全経路で順序を統一している。変更系operationにも同じtransaction境界を適用する作業は残っている。
 
-## 通常のread / writeでpathを固定する
+## 通常のread / listingでpathを固定する
 
 `object_snapshot`は観測用のcopyなので、認可には使わない。snapshotを取得してからwriteするまでにrenameされる可能性があるためである。
 
@@ -125,6 +125,8 @@ unlock
 
 executorから同じregistryへ再入するとdeadlockし得るため禁止している。lock順は常に`namespace -> Capability kernel`であり、逆順の経路をadapterへ作らない。
 
+directory listingでは`with_directory_children`を使う。対象directory、親、direct childを同一read guardから取り出し、childをcanonical name順へ並べたままexecutorへ渡す。FUSE adapterはこのguard中に`ListDirectory`を再認可し、各childのvisibilityを判定する。したがってrenameで名前や親が変わる途中の一覧を返さず、nested descendantをdirect childとして混ぜることもない。
+
 ## どう検証しているか
 
 [`crates/capfs/tests/namespace_registry.rs`](../../crates/capfs/tests/namespace_registry.rs) は公開APIを通して次を確認する。
@@ -136,22 +138,22 @@ executorから同じregistryへ再入するとdeadlockし得るため禁止し�
 - no-replace、root変更、source subtree内へのrenameの拒否。
 - open handleがrename / removeを止め、open / close失敗時にcountがrollbackされること。
 - read operationが終わるまで並行renameのwrite lockが進まないこと。
+- direct childだけをcanonical name順に列挙し、listing operationが終わるまで並行renameが進まないこと。
 
-module内のtestはgeneration、open count、Object ID sequenceの上限、manifest rootとparent関係、writer panic後のfail closedを確認する。namespace registryについて合計11件を実行する。
+module内のtestはgeneration、open count、Object ID sequenceの上限、manifest rootとparent関係、writer panic後のfail closedを確認する。namespace registryについてcontract test 10件とmodule test 5件を実行する。
 
-capfs package 全体では、これに[backing repository の事前検証とstartup import](backing-preflight.md)11件を加えた22件を実行する。
+capfs package全体では、backing、runtime、node table、read-only FUSEを含めて48件を実行する。
 
-ここで確認できるのはRust APIの具体的な境界と1つのthread競合である。rename、open、close、revokeを組み合わせた全bounded interleavingのLoom modelと、実FUSE mount上の攻撃testは次段階に残る。
+ここで確認できるのはRust APIの具体的な境界と1つのthread競合である。実FUSE mountではread / readdir後のrevokeを検査しているが、rename、open、close、revokeを組み合わせた全bounded interleavingのLoom modelは次段階に残る。
 
 ## 現在含まないもの
 
-- FUSE mountとopcode dispatch。
-- runtime backing operationの`openat2` / `renameat2` syscall。
-- Authority coreのhandle registryとopen countを一体でcommitするadapter。
-- `nodeid -> ObjectId`のsubject-local mappingとnodeid非再利用。
+- write、create、remove、renameのFUSE opcodeとbacking transaction。
+- runtime backing operationのwrite系syscallと`renameat2`。
+- 変更系operationをAuthority coreのhandle registryとnamespace更新へ一体でcommitするadapter。
 - durable stateやsupervisor再起動後の復元。
 
-したがって、namespace registryの不変条件は実装済みだが、workloadのsyscallが必ずこのregistryを通る隔離境界はまだ完成していない。
+したがって、read-only syscallはこのregistryを通るが、変更系syscallを含む隔離境界はまだ完成していない。
 
 ## 関連
 

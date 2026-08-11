@@ -85,7 +85,7 @@ flowchart LR
 - runtime metadata/open/readはroot fdから`openat2`で解決し、symlink、mount越境、hard linkの出現をfail closedで拒否する。
 - FUSE handle、namespace open count、Authority open handleを同じ`ObjectId`へ結び、`RELEASE`で一緒に閉じる。
 
-詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[read-only FUSE adapter](../capfs/read-only-fuse.md)を参照する。次段階は`READDIR`と変更系operationである。
+詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[read-only FUSE adapter](../capfs/read-only-fuse.md)を参照する。`READDIR`まで実装済みであり、次段階はwrite、create、remove、no-replace renameである。
 
 ## 初期実装は workspace を木に限定する
 

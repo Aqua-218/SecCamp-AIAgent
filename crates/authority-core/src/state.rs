@@ -518,3 +518,27 @@ impl CapabilityState {
         Ok(capability_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CapabilityState, CapabilityStateError};
+    use crate::capability::IssuerId;
+
+    // Requirement: the final u64 sequence value is usable exactly once and no
+    // wrapped ID can be issued. Category: numeric boundary. Risk: critical.
+    #[test]
+    fn capability_id_allocation_stops_after_the_u64_maximum() {
+        let mut state = CapabilityState::new(IssuerId::new("session-issuer"));
+        state.next_capability_sequence = Some(u64::MAX);
+
+        let final_id = state
+            .allocate_capability_id()
+            .expect("the maximum sequence value must remain available");
+
+        assert_eq!(final_id.as_str(), "session-issuer:18446744073709551615");
+        assert_eq!(
+            state.allocate_capability_id(),
+            Err(CapabilityStateError::CapabilityIdExhausted)
+        );
+    }
+}

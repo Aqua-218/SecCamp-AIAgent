@@ -4,7 +4,7 @@
 
 このページは [`crates/authority-core/src/repository.rs`](../../crates/authority-core/src/repository.rs) と [`lean/Authority/Repository.lean`](../../lean/Authority/Repository.lean) が、repository の境界をどう表しているかを説明する。
 
-## 30秒で分かる要点
+## Repository を名前ではなく identity で分ける
 
 `RepoId` は repository 名でも filesystem path でもない。session host が「これはこの repository である」と割り当てる、不透明な identity である。
 

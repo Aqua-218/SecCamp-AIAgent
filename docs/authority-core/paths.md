@@ -4,7 +4,7 @@
 
 このページは [`crates/authority-core/src/path.rs`](../../crates/authority-core/src/path.rs) と [`lean/Authority/Path.lean`](../../lean/Authority/Path.lean) が、パスによる権限漏えいをどう防ぎ、その判定が仕様どおりであることをどう証明しているかを説明する。
 
-## 30秒で分かる要点
+## この2ファイルが守るもの
 
 この2ファイルが扱う問題は、大きく2つある。
 

@@ -4,7 +4,7 @@
 
 このページは [`crates/authority-core/src/file.rs`](../../crates/authority-core/src/file.rs) と [`lean/Authority/File.lean`](../../lean/Authority/File.lean) が、file request の認可と子権限への委譲をどう判定し、何を証明しているかを説明する。
 
-## 30秒で分かる要点
+## 委譲で3つの境界を広げない
 
 file authority は、次の3つをひとまとめにした権限である。
 

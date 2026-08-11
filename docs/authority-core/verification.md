@@ -4,7 +4,7 @@
 
 このページは、Rust unit test、Lean executable example、Lean theorem がそれぞれ何を確認し、組み合わせると何が分かるかを説明する。プロジェクト全体の検証方針は[検証戦略](../design/verification.md)を参照する。
 
-## 30秒で分かる要点
+## 検証方法ごとの役割
 
 Authority core では、1つの手段ですべてを保証しようとせず、違う問いに違う検証を当てる。
 

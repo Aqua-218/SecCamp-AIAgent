@@ -247,6 +247,139 @@ fn child_lookup_holds_read_lock_against_concurrent_rename() {
     writer.join().expect("writer thread should not panic");
 }
 
+// Requirement: READDIR receives only direct children in canonical-name order.
+// Category: listing/correctness. Risk: high.
+#[test]
+fn directory_listing_is_direct_ordered_and_requires_a_directory() {
+    let registry = NamespaceRegistry::new();
+    let root = registry
+        .object_at_path_snapshot(&CanonicalPath::root())
+        .expect("test registry should be readable")
+        .expect("test registry should contain its root")
+        .id()
+        .clone();
+    let source = create_object(&registry, path(&["source"]), NamespaceObjectKind::Directory);
+    create_object(
+        &registry,
+        path(&["zeta.txt"]),
+        NamespaceObjectKind::RegularFile,
+    );
+    create_object(
+        &registry,
+        path(&["alpha.txt"]),
+        NamespaceObjectKind::RegularFile,
+    );
+    create_object(
+        &registry,
+        path(&["source", "nested.txt"]),
+        NamespaceObjectKind::RegularFile,
+    );
+
+    registry
+        .with_directory_children(&root, |directory, parent, children| {
+            assert_eq!(directory.id(), parent.id(), "root must be its own parent");
+            assert_eq!(
+                children
+                    .iter()
+                    .map(|object| {
+                        object
+                            .path()
+                            .as_segments()
+                            .last()
+                            .expect("a direct child must have a name")
+                            .as_str()
+                    })
+                    .collect::<Vec<_>>(),
+                ["alpha.txt", "source", "zeta.txt"]
+            );
+            Ok::<_, Infallible>(())
+        })
+        .expect("root directory listing should succeed");
+
+    let regular_file = registry
+        .object_at_path_snapshot(&path(&["alpha.txt"]))
+        .expect("test registry should be readable")
+        .expect("test file should remain live")
+        .id()
+        .clone();
+    assert_eq!(
+        registry.with_directory_children(&regular_file, |_, _, _| Ok::<_, Infallible>(())),
+        Err(NamespaceOperationError::Namespace(
+            NamespaceError::ParentNotDirectory(path(&["alpha.txt"]))
+        ))
+    );
+    assert_eq!(
+        registry.with_directory_children(&source, |_, _, children| {
+            Ok::<_, Infallible>(children.len())
+        }),
+        Ok(1)
+    );
+}
+
+// Requirement: the READDIR child view remains fixed through its operation.
+// Category: listing/concurrency. Risk: critical.
+#[test]
+fn directory_listing_holds_read_lock_against_concurrent_rename() {
+    let SourceTree { registry, .. } = registry_with_source_tree();
+    let root = registry
+        .object_at_path_snapshot(&CanonicalPath::root())
+        .expect("test registry should be readable")
+        .expect("test registry should contain its root")
+        .id()
+        .clone();
+    let registry = Arc::new(registry);
+    let (reader_entered_sender, reader_entered_receiver) = mpsc::channel();
+    let (release_reader_sender, release_reader_receiver) = mpsc::channel();
+    let reader_registry = Arc::clone(&registry);
+    let reader = thread::spawn(move || {
+        reader_registry.with_directory_children(&root, |_, _, _| {
+            reader_entered_sender
+                .send(())
+                .expect("test should observe the held listing guard");
+            release_reader_receiver
+                .recv()
+                .expect("test should release the listing guard");
+            Ok::<_, Infallible>(())
+        })
+    });
+    reader_entered_receiver
+        .recv()
+        .expect("directory listing should enter its operation");
+
+    let writer_registry = Arc::clone(&registry);
+    let (writer_done_sender, writer_done_receiver) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let result = writer_registry.rename_subtree(
+            &path(&["src", "parser"]),
+            path(&["lib", "parser"]),
+            |_| Ok::<_, Infallible>(()),
+        );
+        writer_done_sender
+            .send(result)
+            .expect("test should receive the writer result");
+    });
+
+    assert_eq!(
+        writer_done_receiver.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout),
+        "rename must wait while the direct-child view is in use"
+    );
+    release_reader_sender
+        .send(())
+        .expect("directory listing should be releasable");
+    assert_eq!(
+        reader.join().expect("reader thread should not panic"),
+        Ok(())
+    );
+    assert_eq!(
+        writer_done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("rename should finish after listing releases"),
+        Ok(())
+    );
+    writer.join().expect("writer thread should not panic");
+}
+
 // Requirement: executor failures never publish new objects or consume their IDs.
 // Category: namespace/atomicity. Risk: critical.
 #[test]

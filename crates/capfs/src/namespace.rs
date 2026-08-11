@@ -582,6 +582,67 @@ impl NamespaceRegistry {
         operation(child).map_err(NamespaceOperationError::Executor)
     }
 
+    /// Enumerates one directory's direct children under a single read guard.
+    ///
+    /// The directory, its parent, the ordered child set, and `operation` all
+    /// share one namespace snapshot. Children are sorted by canonical name,
+    /// independent of object allocation or backing-directory iteration order.
+    /// A concurrent create, remove, or rename cannot change the supplied view
+    /// before `operation` reaches its linearization point.
+    ///
+    /// The repository root is its own parent for the `..` directory entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a namespace error for an unknown object, a non-directory object,
+    /// a missing parent, poisoned state, or inconsistent indexes. Executor
+    /// failures are preserved without changing namespace state.
+    pub fn with_directory_children<T, E>(
+        &self,
+        directory: &ObjectId,
+        operation: impl FnOnce(&NamespaceObject, &NamespaceObject, &[&NamespaceObject]) -> Result<T, E>,
+    ) -> Result<T, NamespaceOperationError<E>> {
+        let state = self.read_state()?;
+        let directory = state
+            .objects
+            .get(directory)
+            .ok_or_else(|| NamespaceError::UnknownObject(directory.clone()))?;
+        if directory.kind != NamespaceObjectKind::Directory {
+            return Err(NamespaceError::ParentNotDirectory(directory.path.clone()).into());
+        }
+
+        let parent = match directory.path.parent() {
+            Some(parent_path) => {
+                let parent_id = state
+                    .paths
+                    .get(&parent_path)
+                    .ok_or_else(|| NamespaceError::MissingParent(parent_path.clone()))?;
+                state
+                    .objects
+                    .get(parent_id)
+                    .ok_or(NamespaceError::InvariantViolation)?
+            }
+            None => directory,
+        };
+        let child_depth = directory.path.as_segments().len() + 1;
+        let mut children = state
+            .objects
+            .values()
+            .filter(|candidate| {
+                candidate.path.as_segments().len() == child_depth
+                    && candidate.path.is_at_or_below(&directory.path)
+            })
+            .collect::<Vec<_>>();
+        children.sort_unstable_by(|left, right| {
+            left.path
+                .as_segments()
+                .last()
+                .cmp(&right.path.as_segments().last())
+        });
+
+        operation(directory, parent, children.as_slice()).map_err(NamespaceOperationError::Executor)
+    }
+
     /// Commits one open while preventing concurrent rename or removal.
     ///
     /// The open count is rolled back when `operation` returns `Err`. A panic

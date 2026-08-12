@@ -3,9 +3,11 @@ import Authority.State
 /-!
 # Capability Filesystem Namespace
 
-An abstract link-free namespace with reciprocal object/path indexes, monotone
-object identity reservation, generation tracking, and open-handle exclusion.
-FUSE and host-filesystem calls refine this sequential specification.
+An abstract namespace with reciprocal object/path indexes, monotone object
+identity reservation, generation tracking, open-handle exclusion, finite alias
+sets, and contained symbolic-link targets. The original single-primary-path
+operations remain as the sequential core; the CapFS refinement layer gives the
+transactional interpretation of aliases and failure outcomes.
 -/
 
 namespace Authority
@@ -17,19 +19,64 @@ instance : DecidableEq CanonicalPath := fun first second => by
   simp only [CanonicalPath.mk.injEq]
   infer_instance
 
-/-- Object kinds accepted by the link-free namespace. -/
+/-- Object kinds accepted by the capability namespace. -/
 inductive NamespaceObjectKind where
   | directory
   | regularFile
+  | symlink
   deriving Repr, BEq, DecidableEq
 
 /-- Current record for one live namespace object. -/
 structure NamespaceObject where
   id : ObjectId
+  /-- Stable representative used by the backwards-compatible sequential core. -/
   path : CanonicalPath
   kind : NamespaceObjectKind
   openHandleCount : Nat
+  /-- Every live hard-link name, including `path`; finite by construction. -/
+  aliases : List CanonicalPath := [path]
+  /-- A validated repository-relative target exists exactly for symlinks. -/
+  symlinkTarget : Option CanonicalPath := none
   deriving DecidableEq
+
+namespace NamespaceObject
+
+/-- Alias records are nonempty sets containing their stable representative. -/
+def AliasesWellFormed (object : NamespaceObject) : Prop :=
+  object.aliases.Nodup ∧ object.path ∈ object.aliases
+
+/-- Object kind and optional symbolic-link target agree exactly. -/
+def TargetWellFormed (object : NamespaceObject) : Prop :=
+  match object.kind with
+  | .symlink => object.symlinkTarget.isSome
+  | .directory | .regularFile => object.symlinkTarget = none
+
+/-- Complete per-object shape imported from Rust's manifest records. -/
+def ShapeWellFormed (object : NamespaceObject) : Prop :=
+  object.AliasesWellFormed ∧ object.TargetWellFormed
+
+/-- A primary-only object remains a valid singleton alias set. -/
+theorem singleton_aliases_wellFormed (object : NamespaceObject)
+    (aliases : object.aliases = [object.path]) : object.AliasesWellFormed := by
+  simp [AliasesWellFormed, aliases]
+
+/-- A well-formed alias collection can never be empty. -/
+theorem AliasesWellFormed.nonempty {object : NamespaceObject}
+    (wellFormed : object.AliasesWellFormed) : object.aliases ≠ [] := by
+  intro emptyAliases
+  have representativePresent := wellFormed.2
+  rw [emptyAliases] at representativePresent
+  simp at representativePresent
+
+/-- A symlink shape carries one concrete contained target. -/
+theorem TargetWellFormed.symlink_has_target {object : NamespaceObject}
+    (isSymlink : object.kind = .symlink)
+    (wellFormed : object.TargetWellFormed) :
+    ∃ target, object.symlinkTarget = some target := by
+  rw [TargetWellFormed, isSymlink] at wellFormed
+  exact Option.isSome_iff_exists.mp wellFormed
+
+end NamespaceObject
 
 /-- VM-wide namespace state before synchronization and backing operations. -/
 structure NamespaceState where
@@ -180,7 +227,7 @@ structure WellFormed (state : NamespaceState) : Prop where
       object.id = objectId ∧ state.paths object.path = some objectId
   pathToObject : ∀ path objectId,
     state.paths path = some objectId →
-      ∃ object, state.objects objectId = some object ∧ object.path = path
+      ∃ object, state.objects objectId = some object
   liveWasIssued : ∀ objectId object,
     state.objects objectId = some object → state.issuedObjects objectId = true
 
@@ -201,6 +248,56 @@ structure TreeWellFormed (state : NamespaceState) : Prop where
         parent.kind = .directory ∧
         DirectParent parent.path object.path
 
+/-- Every path index is exactly one member of a finite nonempty alias set. -/
+structure AliasWellFormed (state : NamespaceState) : Prop where
+  objectIdentity : ∀ objectId object,
+    state.objects objectId = some object → object.id = objectId
+  objectShape : ∀ objectId object,
+    state.objects objectId = some object → object.ShapeWellFormed
+  aliasToPath : ∀ objectId object path,
+    state.objects objectId = some object →
+      path ∈ object.aliases → state.paths path = some objectId
+  pathToAlias : ∀ path objectId,
+    state.paths path = some objectId →
+      ∃ object, state.objects objectId = some object ∧ path ∈ object.aliases
+  liveWasIssued : ∀ objectId object,
+    state.objects objectId = some object → state.issuedObjects objectId = true
+
+/-- Exact aliases, object shape, and every per-name parent edge form one namespace. -/
+structure CompleteWellFormed (state : NamespaceState) : Prop where
+  tree : state.TreeWellFormed
+  aliases : state.AliasWellFormed
+  directorySingleton : ∀ objectId object,
+    state.objects objectId = some object → object.kind = .directory →
+      object.aliases = [object.path]
+  namedParentDirectory : ∀ objectId object name,
+    state.objects objectId = some object →
+      name ∈ object.aliases →
+      name ≠ CanonicalPath.root →
+      ∃ parentId parent,
+        state.objects parentId = some parent ∧
+        state.paths parent.path = some parentId ∧
+        parent.kind = .directory ∧
+        DirectParent parent.path name
+
+/-- A complete state exposes its exact path-to-object relation. -/
+theorem CompleteWellFormed.path_exact {state : NamespaceState}
+    (wellFormed : state.CompleteWellFormed) {path : CanonicalPath}
+    {objectId : ObjectId} :
+    state.paths path = some objectId ↔
+      ∃ object, state.objects objectId = some object ∧ path ∈ object.aliases := by
+  constructor
+  · exact wellFormed.aliases.pathToAlias path objectId
+  · rintro ⟨object, objectLookup, aliasMember⟩
+    exact wellFormed.aliases.aliasToPath objectId object path objectLookup aliasMember
+
+/-- The root record has one name and no symbolic-link target. -/
+theorem rootObject_shapeWellFormed (rootId : ObjectId) :
+    (rootObject rootId).ShapeWellFormed := by
+  simp [NamespaceObject.ShapeWellFormed,
+    NamespaceObject.AliasesWellFormed,
+    NamespaceObject.TargetWellFormed, rootObject]
+
 /-- The singleton root namespace satisfies all reciprocal-index invariants. -/
 theorem withRoot_wellFormed (rootId : ObjectId) : (withRoot rootId).WellFormed := by
   constructor
@@ -216,13 +313,45 @@ theorem withRoot_wellFormed (rootId : ObjectId) : (withRoot rootId).WellFormed :
     · subst path
       simp [withRoot, replace] at pathLookup
       subst objectId
-      exact ⟨rootObject rootId, by simp [withRoot, replace], by simp [rootObject]⟩
+      exact ⟨rootObject rootId, by simp [withRoot, replace]⟩
     · simp [withRoot, replace, samePath] at pathLookup
   · intro objectId object objectLookup
     by_cases sameId : objectId = rootId
     · subst objectId
       simp [withRoot, replace]
     · simp [withRoot, replace, sameId] at objectLookup
+
+/-- The singleton root indexes exactly its singleton alias set. -/
+theorem withRoot_aliasWellFormed (rootId : ObjectId) :
+    (withRoot rootId).AliasWellFormed := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · intro objectId object objectLookup
+    exact (withRoot_wellFormed rootId).objectToPath objectId object objectLookup |>.1
+  · intro objectId object objectLookup
+    by_cases sameId : objectId = rootId
+    · subst objectId
+      simp [withRoot, replace] at objectLookup
+      subst object
+      exact rootObject_shapeWellFormed rootId
+    · simp [withRoot, replace, sameId] at objectLookup
+  · intro objectId object path objectLookup aliasMember
+    by_cases sameId : objectId = rootId
+    · subst objectId
+      simp [withRoot, replace] at objectLookup
+      subst object
+      simp [rootObject] at aliasMember
+      subst path
+      simp [withRoot, replace]
+    · simp [withRoot, replace, sameId] at objectLookup
+  · intro path objectId pathLookup
+    by_cases samePath : path = CanonicalPath.root
+    · subst path
+      simp [withRoot, replace] at pathLookup
+      subst objectId
+      exact ⟨rootObject rootId, by simp [withRoot, replace], by simp [rootObject]⟩
+    · simp [withRoot, replace, samePath] at pathLookup
+  · intro objectId object objectLookup
+    exact (withRoot_wellFormed rootId).liveWasIssued objectId object objectLookup
 
 /-- The singleton initial namespace is a rooted directory tree. -/
 theorem withRoot_treeWellFormed (rootId : ObjectId) :
@@ -236,6 +365,60 @@ theorem withRoot_treeWellFormed (rootId : ObjectId) :
     subst object
     exact False.elim (notRoot rfl)
   · simp [withRoot, replace, sameId] at objectLookup
+
+/-- The singleton root satisfies the complete alias-aware tree invariant. -/
+theorem withRoot_completeWellFormed (rootId : ObjectId) :
+    (withRoot rootId).CompleteWellFormed := by
+  refine ⟨withRoot_treeWellFormed rootId, withRoot_aliasWellFormed rootId,
+    ?_, ?_⟩
+  · intro objectId object objectLookup _isDirectory
+    by_cases sameId : objectId = rootId
+    · subst objectId
+      simp [withRoot, replace] at objectLookup
+      subst object
+      rfl
+    · simp [withRoot, replace, sameId] at objectLookup
+  · intro objectId object name objectLookup nameMember notRoot
+    by_cases sameId : objectId = rootId
+    · subst objectId
+      simp [withRoot, replace] at objectLookup
+      subst object
+      simp [rootObject] at nameMember
+      exact False.elim (notRoot nameMember)
+    · simp [withRoot, replace, sameId] at objectLookup
+
+/-- Trusted import evidence enumerates every object in a complete namespace. -/
+structure CompleteImport (state : NamespaceState) where
+  manifest : List NamespaceObject
+  manifestIdsNodup : (manifest.map NamespaceObject.id).Nodup
+  objectsExact : ∀ objectId object,
+    state.objects objectId = some object ↔
+      object ∈ manifest ∧ object.id = objectId
+  complete : state.CompleteWellFormed
+
+/-- The concrete root import is constructively complete. -/
+def withRoot_completeImport (rootId : ObjectId) :
+    (withRoot rootId).CompleteImport := by
+  refine ⟨[rootObject rootId], by simp, ?_, withRoot_completeWellFormed rootId⟩
+  intro objectId object
+  by_cases sameId : objectId = rootId
+  · subst objectId
+    constructor
+    · intro objectLookup
+      simp [withRoot, replace] at objectLookup
+      subst object
+      simp [rootObject]
+    · rintro ⟨objectMember, identity⟩
+      simp at objectMember
+      subst object
+      simp [withRoot, replace]
+  · constructor
+    · intro objectLookup
+      simp [withRoot, replace, sameId] at objectLookup
+    · rintro ⟨objectMember, identity⟩
+      simp at objectMember
+      subst object
+      exact False.elim (sameId identity.symm)
 
 /-- A well-formed namespace maps one object identity to only one current path. -/
 theorem WellFormed.object_path_unique {state : NamespaceState}
@@ -352,12 +535,12 @@ theorem create_preserves_wellFormed {state : NamespaceState}
       have exactId : queriedId = object.id := Option.some.inj
         (queriedLookup.symm.trans (create_stores_path state object))
       subst queriedId
-      exact ⟨object, create_stores_object state object, rfl⟩
+      exact ⟨object, create_stores_object state object⟩
     · have oldLookup : state.paths queriedPath = some queriedId := by
         simpa [create, replace, samePath] using queriedLookup
       rcases wellFormed.pathToObject queriedPath queriedId oldLookup with
-        ⟨oldObject, objectLookup, pathMatches⟩
-      refine ⟨oldObject, ?_, pathMatches⟩
+        ⟨oldObject, objectLookup⟩
+      refine ⟨oldObject, ?_⟩
       have differentId : queriedId ≠ object.id := by
         intro sameId
         subst queriedId
@@ -436,6 +619,847 @@ theorem create_preserves_treeWellFormed {state : NamespaceState}
         simpa [create, replace, parentPathDiffers] using parentPathLookup,
       parentKind, directParent⟩
 
+/-! ## Alias-aware namespace transactions -/
+
+/-- Add one name to a live object's finite alias set. -/
+def withAddedAlias (object : NamespaceObject) (alias : CanonicalPath) :
+    NamespaceObject :=
+  { object with aliases := object.aliases ++ [alias] }
+
+/-- Appending one fresh name preserves finite-set representation. -/
+private theorem nodup_append_singleton {items : List α} {item : α}
+    (nodup : items.Nodup) (fresh : item ∉ items) :
+    (items ++ [item]).Nodup := by
+  induction items with
+  | nil => simp
+  | cons head tail inductionHypothesis =>
+      simp only [List.nodup_cons, List.mem_cons, not_or] at nodup fresh
+      simp only [List.cons_append, List.nodup_cons, List.mem_append,
+        List.mem_singleton, not_or]
+      exact ⟨⟨nodup.1, fun equality => fresh.1 equality.symm⟩,
+        inductionHypothesis nodup.2 fresh.2⟩
+
+/-- Preconditions for Rust's no-replace hard-link publish. -/
+structure MayAddHardLink (state : NamespaceState) (objectId : ObjectId)
+    (alias : CanonicalPath) where
+  generationCanIncrement : CanIncrementU64 state.generation
+  complete : state.CompleteWellFormed
+  object : NamespaceObject
+  objectLookup : state.objects objectId = some object
+  sourceIsNotDirectory : object.kind ≠ .directory
+  aliasAbsent : state.paths alias = none
+  aliasNotRoot : alias ≠ CanonicalPath.root
+  parentId : ObjectId
+  parent : NamespaceObject
+  parentLookup : state.objects parentId = some parent
+  parentPathLookup : state.paths parent.path = some parentId
+  parentIsDirectory : parent.kind = .directory
+  directChild : DirectParent parent.path alias
+
+/-- Atomically publish one additional hard-link name and its exact alias record. -/
+def addHardLink (state : NamespaceState) (objectId : ObjectId)
+    (object : NamespaceObject) (alias : CanonicalPath) : NamespaceState :=
+  { state with
+    objects := replace state.objects objectId (some (withAddedAlias object alias))
+    paths := replace state.paths alias (some objectId)
+    generation := state.generation + 1 }
+
+/-- Hard-link publish stores the extended finite alias record. -/
+theorem addHardLink_stores_object (state : NamespaceState) (objectId : ObjectId)
+    (object : NamespaceObject) (alias : CanonicalPath) :
+    (state.addHardLink objectId object alias).objects objectId =
+      some (withAddedAlias object alias) := by
+  simp [addHardLink]
+
+/-- Hard-link publish installs the new reciprocal path index. -/
+theorem addHardLink_stores_path (state : NamespaceState) (objectId : ObjectId)
+    (object : NamespaceObject) (alias : CanonicalPath) :
+    (state.addHardLink objectId object alias).paths alias = some objectId := by
+  simp [addHardLink]
+
+/-- A no-replace hard link is genuinely a new member of the alias set. -/
+theorem MayAddHardLink.aliasFresh {state : NamespaceState} {objectId : ObjectId}
+    {alias : CanonicalPath} (allowed : state.MayAddHardLink objectId alias) :
+    alias ∉ allowed.object.aliases := by
+  intro aliasMember
+  have indexed := allowed.complete.aliases.aliasToPath objectId allowed.object alias
+    allowed.objectLookup aliasMember
+  rw [allowed.aliasAbsent] at indexed
+  contradiction
+
+/-- The hard-link target and its parent are different objects. -/
+theorem MayAddHardLink.parentId_ne {state : NamespaceState} {objectId : ObjectId}
+    {alias : CanonicalPath} (allowed : state.MayAddHardLink objectId alias) :
+    allowed.parentId ≠ objectId := by
+  intro sameId
+  have sameObject : allowed.parent = allowed.object := by
+    have lookup := allowed.parentLookup
+    rw [sameId, allowed.objectLookup] at lookup
+    exact Option.some.inj lookup.symm
+  apply allowed.sourceIsNotDirectory
+  rw [← sameObject]
+  exact allowed.parentIsDirectory
+
+/-- The new hard-link path is distinct from every previously indexed path. -/
+theorem MayAddHardLink.ne_indexed_path {state : NamespaceState}
+    {objectId : ObjectId} {alias path : CanonicalPath}
+    (allowed : state.MayAddHardLink objectId alias)
+    {owner : ObjectId} (indexed : state.paths path = some owner) :
+    path ≠ alias := by
+  intro samePath
+  subst path
+  rw [allowed.aliasAbsent] at indexed
+  contradiction
+
+/-- A checked hard-link publish preserves the complete alias-aware tree. -/
+theorem addHardLink_preserves_completeWellFormed {state : NamespaceState}
+    {objectId : ObjectId} {alias : CanonicalPath}
+    (allowed : state.MayAddHardLink objectId alias) :
+    (state.addHardLink objectId allowed.object alias).CompleteWellFormed := by
+  let updated := withAddedAlias allowed.object alias
+  have targetIdentity : allowed.object.id = objectId :=
+    allowed.complete.aliases.objectIdentity objectId allowed.object
+      allowed.objectLookup
+  have aliasFresh := allowed.aliasFresh
+  have objectShape := allowed.complete.aliases.objectShape objectId
+    allowed.object allowed.objectLookup
+  have primaryIndexed := allowed.complete.aliases.aliasToPath objectId allowed.object
+    allowed.object.path allowed.objectLookup objectShape.1.2
+  have primaryNeAlias : allowed.object.path ≠ alias :=
+    allowed.ne_indexed_path primaryIndexed
+  have parentPathNeAlias : allowed.parent.path ≠ alias :=
+    allowed.ne_indexed_path allowed.parentPathLookup
+  have parentIdNe := allowed.parentId_ne
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · -- The legacy primary-path tree is unchanged except for the target record.
+    refine ⟨?_, ?_, ?_⟩
+    · refine ⟨?_, ?_, ?_⟩
+      · intro queriedId queriedObject queriedLookup
+        by_cases target : queriedId = objectId
+        · subst queriedId
+          have exactObject : queriedObject = updated := Option.some.inj
+            (queriedLookup.symm.trans (addHardLink_stores_object state objectId
+              allowed.object alias))
+          subst queriedObject
+          refine ⟨by simpa [updated, withAddedAlias] using targetIdentity, ?_⟩
+          change replace state.paths alias (some objectId) allowed.object.path =
+            some objectId
+          simp [replace, primaryNeAlias, primaryIndexed]
+        · have oldLookup : state.objects queriedId = some queriedObject := by
+            simpa [addHardLink, replace, target] using queriedLookup
+          rcases allowed.complete.tree.indexes.objectToPath queriedId queriedObject
+            oldLookup with ⟨identity, pathLookup⟩
+          exact ⟨identity, by
+            have pathNe := allowed.ne_indexed_path pathLookup
+            simpa [addHardLink, replace, pathNe] using pathLookup⟩
+      · intro path queriedId pathLookup
+        by_cases isAlias : path = alias
+        · subst path
+          have exactId : queriedId = objectId := Option.some.inj
+            (pathLookup.symm.trans (addHardLink_stores_path state objectId
+              allowed.object alias))
+          subst queriedId
+          exact ⟨updated, addHardLink_stores_object state objectId
+            allowed.object alias⟩
+        · have oldPath : state.paths path = some queriedId := by
+            simpa [addHardLink, replace, isAlias] using pathLookup
+          rcases allowed.complete.tree.indexes.pathToObject path queriedId oldPath with
+            ⟨object, objectLookup⟩
+          by_cases target : queriedId = objectId
+          · subst queriedId
+            exact ⟨updated, addHardLink_stores_object state objectId
+              allowed.object alias⟩
+          · exact ⟨object, by
+              simpa [addHardLink, replace, target] using objectLookup⟩
+      · intro queriedId queriedObject queriedLookup
+        by_cases target : queriedId = objectId
+        · subst queriedId
+          exact allowed.complete.tree.indexes.liveWasIssued objectId
+            allowed.object allowed.objectLookup
+        · exact allowed.complete.tree.indexes.liveWasIssued queriedId queriedObject
+            (by simpa [addHardLink, replace, target] using queriedLookup)
+    · rcases allowed.complete.tree.rootExists with
+        ⟨rootId, root, rootLookup, rootIdentity, rootPath, rootKind⟩
+      have rootIdNe : rootId ≠ objectId := by
+        intro sameId
+        have sameObject : root = allowed.object := Option.some.inj
+          (rootLookup.symm.trans (sameId ▸ allowed.objectLookup))
+        apply allowed.sourceIsNotDirectory
+        rw [← sameObject]
+        exact rootKind
+      exact ⟨rootId, root,
+        by simpa [addHardLink, replace, rootIdNe] using rootLookup,
+        rootIdentity, rootPath, rootKind⟩
+    · intro queriedId queriedObject queriedLookup notRoot
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans (addHardLink_stores_object state objectId
+            allowed.object alias))
+        subst queriedObject
+        rcases allowed.complete.tree.parentDirectory objectId allowed.object
+          allowed.objectLookup (by simpa [updated, withAddedAlias] using notRoot) with
+          ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
+        have parentIdDiffers : parentId ≠ objectId := by
+          intro sameId
+          have sameParent : parent = allowed.object := Option.some.inj
+            (parentLookup.symm.trans (sameId ▸ allowed.objectLookup))
+          subst parent
+          exact directParent_irrefl allowed.object.path direct
+        exact ⟨parentId, parent,
+          by simpa [addHardLink, replace, parentIdDiffers] using parentLookup,
+          by simpa [addHardLink, replace,
+            allowed.ne_indexed_path parentPathLookup] using parentPathLookup,
+          parentKind, by simpa [updated, withAddedAlias] using direct⟩
+      · have oldLookup : state.objects queriedId = some queriedObject := by
+          simpa [addHardLink, replace, target] using queriedLookup
+        rcases allowed.complete.tree.parentDirectory queriedId queriedObject
+          oldLookup notRoot with
+          ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
+        have parentIdDiffers : parentId ≠ objectId := by
+          intro sameId
+          have sameParent : parent = allowed.object := Option.some.inj
+            (parentLookup.symm.trans (sameId ▸ allowed.objectLookup))
+          have kindTarget : allowed.object.kind = .directory := by
+            rw [← sameParent]
+            exact parentKind
+          exact allowed.sourceIsNotDirectory kindTarget
+        exact ⟨parentId, parent,
+          by simpa [addHardLink, replace, parentIdDiffers] using parentLookup,
+          by simpa [addHardLink, replace,
+            allowed.ne_indexed_path parentPathLookup] using parentPathLookup,
+          parentKind, direct⟩
+  · -- Exact aliases and object shape.
+    refine ⟨?_, ?_, ?_, ?_, ?_⟩
+    · intro queriedId queriedObject queriedLookup
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans (addHardLink_stores_object state objectId
+            allowed.object alias))
+        subst queriedObject
+        simpa [updated, withAddedAlias] using targetIdentity
+      · exact allowed.complete.aliases.objectIdentity queriedId queriedObject
+          (by simpa [addHardLink, replace, target] using queriedLookup)
+    · intro queriedId queriedObject queriedLookup
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans (addHardLink_stores_object state objectId
+            allowed.object alias))
+        subst queriedObject
+        rcases allowed.complete.aliases.objectShape objectId allowed.object
+          allowed.objectLookup with ⟨⟨nodup, representative⟩, targetShape⟩
+        exact ⟨⟨by simpa [updated, withAddedAlias] using
+          nodup_append_singleton nodup aliasFresh,
+          by simpa [updated, withAddedAlias] using
+            List.mem_append_left [alias] representative⟩,
+          by simpa [updated, withAddedAlias] using targetShape⟩
+      · exact allowed.complete.aliases.objectShape queriedId queriedObject
+          (by simpa [addHardLink, replace, target] using queriedLookup)
+    · intro queriedId queriedObject path queriedLookup member
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans (addHardLink_stores_object state objectId
+            allowed.object alias))
+        subst queriedObject
+        simp [updated, withAddedAlias] at member
+        rcases member with oldMember | rfl
+        · have oldPath := allowed.complete.aliases.aliasToPath objectId
+            allowed.object path allowed.objectLookup oldMember
+          simpa [addHardLink, replace, allowed.ne_indexed_path oldPath] using oldPath
+        · simp [addHardLink]
+      · have oldLookup : state.objects queriedId = some queriedObject := by
+          simpa [addHardLink, replace, target] using queriedLookup
+        have oldPath := allowed.complete.aliases.aliasToPath queriedId queriedObject
+          path oldLookup member
+        simpa [addHardLink, replace, allowed.ne_indexed_path oldPath] using oldPath
+    · intro path queriedId pathLookup
+      by_cases isAlias : path = alias
+      · subst path
+        have exactId : queriedId = objectId := Option.some.inj
+          (pathLookup.symm.trans (addHardLink_stores_path state objectId
+            allowed.object alias))
+        subst queriedId
+        exact ⟨updated, addHardLink_stores_object state objectId allowed.object alias,
+          by simp [updated, withAddedAlias]⟩
+      · have oldPath : state.paths path = some queriedId := by
+          simpa [addHardLink, replace, isAlias] using pathLookup
+        rcases allowed.complete.aliases.pathToAlias path queriedId oldPath with
+          ⟨object, objectLookup, member⟩
+        by_cases target : queriedId = objectId
+        · subst queriedId
+          have sameObject : object = allowed.object := Option.some.inj
+            (objectLookup.symm.trans allowed.objectLookup)
+          subst object
+          exact ⟨updated, addHardLink_stores_object state objectId
+            allowed.object alias, by simp [updated, withAddedAlias, member]⟩
+        · exact ⟨object, by simpa [addHardLink, replace, target] using objectLookup,
+            member⟩
+    · intro queriedId queriedObject queriedLookup
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        exact allowed.complete.aliases.liveWasIssued objectId allowed.object
+          allowed.objectLookup
+      · exact allowed.complete.aliases.liveWasIssued queriedId queriedObject
+          (by simpa [addHardLink, replace, target] using queriedLookup)
+  · intro queriedId queriedObject queriedLookup isDirectory
+    by_cases target : queriedId = objectId
+    · subst queriedId
+      have exactObject : queriedObject = updated := Option.some.inj
+        (queriedLookup.symm.trans (addHardLink_stores_object state objectId
+          allowed.object alias))
+      subst queriedObject
+      have impossible : allowed.object.kind = .directory := by
+        simpa [updated, withAddedAlias] using isDirectory
+      exact False.elim (allowed.sourceIsNotDirectory impossible)
+    · exact allowed.complete.directorySingleton queriedId queriedObject
+        (by simpa [addHardLink, replace, target] using queriedLookup) isDirectory
+  · intro queriedId queriedObject name queriedLookup member notRoot
+    by_cases target : queriedId = objectId
+    · subst queriedId
+      have exactObject : queriedObject = updated := Option.some.inj
+        (queriedLookup.symm.trans (addHardLink_stores_object state objectId
+          allowed.object alias))
+      subst queriedObject
+      simp [updated, withAddedAlias] at member
+      rcases member with oldMember | rfl
+      · rcases allowed.complete.namedParentDirectory objectId allowed.object name
+          allowed.objectLookup oldMember notRoot with
+          ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
+        have parentIdDiffers : parentId ≠ objectId := by
+          intro sameId
+          have sameParent : parent = allowed.object := Option.some.inj
+            (parentLookup.symm.trans (sameId ▸ allowed.objectLookup))
+          have targetDirectory : allowed.object.kind = .directory := by
+            rw [← sameParent]
+            exact parentKind
+          exact allowed.sourceIsNotDirectory targetDirectory
+        exact ⟨parentId, parent,
+          by simpa [addHardLink, replace, parentIdDiffers] using parentLookup,
+          by simpa [addHardLink, replace,
+            allowed.ne_indexed_path parentPathLookup] using parentPathLookup,
+          parentKind, direct⟩
+      · exact ⟨allowed.parentId, allowed.parent,
+          by simpa [addHardLink, replace, parentIdNe] using allowed.parentLookup,
+          by simpa [addHardLink, replace, parentPathNeAlias] using
+            allowed.parentPathLookup,
+          allowed.parentIsDirectory, allowed.directChild⟩
+    · have oldLookup : state.objects queriedId = some queriedObject := by
+        simpa [addHardLink, replace, target] using queriedLookup
+      rcases allowed.complete.namedParentDirectory queriedId queriedObject name
+        oldLookup member notRoot with
+        ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
+      have parentIdDiffers : parentId ≠ objectId := by
+        intro sameId
+        have sameParent : parent = allowed.object := Option.some.inj
+          (parentLookup.symm.trans (sameId ▸ allowed.objectLookup))
+        have targetDirectory : allowed.object.kind = .directory := by
+          rw [← sameParent]
+          exact parentKind
+        exact allowed.sourceIsNotDirectory targetDirectory
+      exact ⟨parentId, parent,
+        by simpa [addHardLink, replace, parentIdDiffers] using parentLookup,
+        by simpa [addHardLink, replace,
+          allowed.ne_indexed_path parentPathLookup] using parentPathLookup,
+        parentKind, direct⟩
+
+/-- Replace an object's representative with the first surviving alias. -/
+def withRemainingAliases (object : NamespaceObject) (newPrimary : CanonicalPath)
+    (remaining : List CanonicalPath) : NamespaceObject :=
+  { object with path := newPrimary, aliases := newPrimary :: remaining }
+
+/-- Preconditions for unlinking one name while retaining the live object. -/
+structure MayUnlinkName (state : NamespaceState) (objectId : ObjectId)
+    (alias : CanonicalPath) where
+  generationCanIncrement : CanIncrementU64 state.generation
+  complete : state.CompleteWellFormed
+  object : NamespaceObject
+  objectLookup : state.objects objectId = some object
+  sourceIsNotDirectory : object.kind ≠ .directory
+  noOpenHandles : object.openHandleCount = 0
+  aliasIndexed : state.paths alias = some objectId
+  newPrimary : CanonicalPath
+  remaining : List CanonicalPath
+  /-- This both selects the removed name and proves at least one name survives. -/
+  partition : object.aliases.Perm (alias :: newPrimary :: remaining)
+  newPrimaryIndexed : state.paths newPrimary = some objectId
+  newPrimaryNotRoot : newPrimary ≠ CanonicalPath.root
+  parentId : ObjectId
+  parent : NamespaceObject
+  parentLookup : state.objects parentId = some parent
+  parentPathLookup : state.paths parent.path = some parentId
+  parentIsDirectory : parent.kind = .directory
+  directChild : DirectParent parent.path newPrimary
+
+/-- Atomically remove one name and publish a surviving representative. -/
+def unlinkName (state : NamespaceState) (objectId : ObjectId)
+    (object : NamespaceObject) (alias newPrimary : CanonicalPath)
+    (remaining : List CanonicalPath) : NamespaceState :=
+  { state with
+    objects := replace state.objects objectId
+      (some (withRemainingAliases object newPrimary remaining))
+    paths := replace state.paths alias none
+    generation := state.generation + 1 }
+
+/-- Name unlink stores exactly the selected surviving alias list. -/
+theorem unlinkName_stores_object (state : NamespaceState) (objectId : ObjectId)
+    (object : NamespaceObject) (alias newPrimary : CanonicalPath)
+    (remaining : List CanonicalPath) :
+    (state.unlinkName objectId object alias newPrimary remaining).objects objectId =
+      some (withRemainingAliases object newPrimary remaining) := by
+  simp [unlinkName]
+
+/-- Name unlink removes exactly the selected path index. -/
+theorem unlinkName_clears_path (state : NamespaceState) (objectId : ObjectId)
+    (object : NamespaceObject) (alias newPrimary : CanonicalPath)
+    (remaining : List CanonicalPath) :
+    (state.unlinkName objectId object alias newPrimary remaining).paths alias = none := by
+  simp [unlinkName]
+
+/-- Surviving aliases are precisely old aliases other than the removed name. -/
+theorem MayUnlinkName.member_partition {state : NamespaceState}
+    {objectId : ObjectId} {alias name : CanonicalPath}
+    (allowed : state.MayUnlinkName objectId alias) :
+    name ∈ allowed.object.aliases ↔
+      name = alias ∨ name ∈ allowed.newPrimary :: allowed.remaining := by
+  rw [allowed.partition.mem_iff]
+  simp only [List.mem_cons]
+
+/-- The selected removed name is absent from the surviving finite set. -/
+theorem MayUnlinkName.alias_not_surviving {state : NamespaceState}
+    {objectId : ObjectId} {alias : CanonicalPath}
+    (allowed : state.MayUnlinkName objectId alias) :
+    alias ∉ allowed.newPrimary :: allowed.remaining := by
+  have oldNodup := (allowed.complete.aliases.objectShape objectId allowed.object
+    allowed.objectLookup).1.1
+  have partitionNodup := allowed.partition.nodup_iff.mp oldNodup
+  exact (List.nodup_cons.mp partitionNodup).1
+
+/-- The unlinked object cannot be its directory parent. -/
+theorem MayUnlinkName.parentId_ne {state : NamespaceState} {objectId : ObjectId}
+    {alias : CanonicalPath} (allowed : state.MayUnlinkName objectId alias) :
+    allowed.parentId ≠ objectId := by
+  intro sameId
+  have lookup := allowed.parentLookup
+  rw [sameId, allowed.objectLookup] at lookup
+  have sameObject : allowed.parent = allowed.object := Option.some.inj lookup.symm
+  have targetDirectory : allowed.object.kind = .directory := by
+    rw [← sameObject]
+    exact allowed.parentIsDirectory
+  exact allowed.sourceIsNotDirectory targetDirectory
+
+/-- A checked name unlink preserves the complete alias-aware tree. -/
+theorem unlinkName_preserves_completeWellFormed {state : NamespaceState}
+    {objectId : ObjectId} {alias : CanonicalPath}
+    (allowed : state.MayUnlinkName objectId alias) :
+    (state.unlinkName objectId allowed.object alias allowed.newPrimary
+      allowed.remaining).CompleteWellFormed := by
+  let updated := withRemainingAliases allowed.object allowed.newPrimary
+    allowed.remaining
+  have targetIdentity := allowed.complete.aliases.objectIdentity objectId
+    allowed.object allowed.objectLookup
+  have aliasNotSurviving := allowed.alias_not_surviving
+  have newPrimaryNeAlias : allowed.newPrimary ≠ alias := by
+    intro equality
+    apply aliasNotSurviving
+    simp [equality]
+  have parentIdNe := allowed.parentId_ne
+  have parentPathNeAlias : allowed.parent.path ≠ alias := by
+    intro equality
+    have sameOwner := Option.some.inj
+      (allowed.parentPathLookup.symm.trans (equality ▸ allowed.aliasIndexed))
+    exact parentIdNe sameOwner
+  have oldShape := allowed.complete.aliases.objectShape objectId allowed.object
+    allowed.objectLookup
+  have partitionNodup := allowed.partition.nodup_iff.mp oldShape.1.1
+  have survivingNodup : (allowed.newPrimary :: allowed.remaining).Nodup :=
+    (List.nodup_cons.mp partitionNodup).2
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_⟩
+    · refine ⟨?_, ?_, ?_⟩
+      · intro queriedId queriedObject queriedLookup
+        by_cases target : queriedId = objectId
+        · subst queriedId
+          have exactObject : queriedObject = updated := Option.some.inj
+            (queriedLookup.symm.trans (unlinkName_stores_object state objectId
+              allowed.object alias allowed.newPrimary allowed.remaining))
+          subst queriedObject
+          refine ⟨by simpa [updated, withRemainingAliases] using targetIdentity, ?_⟩
+          change replace state.paths alias none allowed.newPrimary = some objectId
+          simp [replace, newPrimaryNeAlias, allowed.newPrimaryIndexed]
+        · have oldLookup : state.objects queriedId = some queriedObject := by
+            simpa [unlinkName, replace, target] using queriedLookup
+          rcases allowed.complete.tree.indexes.objectToPath queriedId queriedObject
+            oldLookup with ⟨identity, pathLookup⟩
+          have pathNeAlias : queriedObject.path ≠ alias := by
+            intro equality
+            have sameOwner := Option.some.inj
+              (pathLookup.symm.trans (equality ▸ allowed.aliasIndexed))
+            exact target sameOwner
+          exact ⟨identity, by
+            simpa [unlinkName, replace, pathNeAlias] using pathLookup⟩
+      · intro path queriedId pathLookup
+        have pathNeAlias : path ≠ alias := by
+          intro equality
+          subst path
+          simp [unlinkName] at pathLookup
+        have oldPath : state.paths path = some queriedId := by
+          simpa [unlinkName, replace, pathNeAlias] using pathLookup
+        rcases allowed.complete.tree.indexes.pathToObject path queriedId oldPath with
+          ⟨object, objectLookup⟩
+        by_cases target : queriedId = objectId
+        · subst queriedId
+          exact ⟨updated, unlinkName_stores_object state objectId allowed.object
+            alias allowed.newPrimary allowed.remaining⟩
+        · exact ⟨object, by simpa [unlinkName, replace, target] using objectLookup⟩
+      · intro queriedId queriedObject queriedLookup
+        by_cases target : queriedId = objectId
+        · subst queriedId
+          exact allowed.complete.tree.indexes.liveWasIssued objectId allowed.object
+            allowed.objectLookup
+        · exact allowed.complete.tree.indexes.liveWasIssued queriedId queriedObject
+            (by simpa [unlinkName, replace, target] using queriedLookup)
+    · rcases allowed.complete.tree.rootExists with
+        ⟨rootId, root, rootLookup, rootIdentity, rootPath, rootKind⟩
+      have rootIdNe : rootId ≠ objectId := by
+        intro sameId
+        have lookup := rootLookup
+        rw [sameId, allowed.objectLookup] at lookup
+        have sameObject : root = allowed.object := (Option.some.inj lookup).symm
+        have targetDirectory : allowed.object.kind = .directory := by
+          rw [← sameObject]
+          exact rootKind
+        exact allowed.sourceIsNotDirectory targetDirectory
+      exact ⟨rootId, root, by
+        simpa [unlinkName, replace, rootIdNe] using rootLookup,
+        rootIdentity, rootPath, rootKind⟩
+    · intro queriedId queriedObject queriedLookup notRoot
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans (unlinkName_stores_object state objectId
+            allowed.object alias allowed.newPrimary allowed.remaining))
+        subst queriedObject
+        exact ⟨allowed.parentId, allowed.parent,
+          by simpa [unlinkName, replace, parentIdNe] using allowed.parentLookup,
+          by simpa [unlinkName, replace, parentPathNeAlias] using
+            allowed.parentPathLookup,
+          allowed.parentIsDirectory, by
+            simpa [updated, withRemainingAliases] using allowed.directChild⟩
+      · have oldLookup : state.objects queriedId = some queriedObject := by
+          simpa [unlinkName, replace, target] using queriedLookup
+        rcases allowed.complete.tree.parentDirectory queriedId queriedObject
+          oldLookup notRoot with
+          ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
+        have parentIdDiffers : parentId ≠ objectId := by
+          intro sameId
+          have lookup := parentLookup
+          rw [sameId, allowed.objectLookup] at lookup
+          have sameObject : parent = allowed.object := (Option.some.inj lookup).symm
+          have targetDirectory : allowed.object.kind = .directory := by
+            rw [← sameObject]
+            exact parentKind
+          exact allowed.sourceIsNotDirectory targetDirectory
+        have parentPathDiffers : parent.path ≠ alias := by
+          intro equality
+          have sameOwner := Option.some.inj
+            (parentPathLookup.symm.trans (equality ▸ allowed.aliasIndexed))
+          exact parentIdDiffers sameOwner
+        exact ⟨parentId, parent,
+          by simpa [unlinkName, replace, parentIdDiffers] using parentLookup,
+          by simpa [unlinkName, replace, parentPathDiffers] using parentPathLookup,
+          parentKind, direct⟩
+  · refine ⟨?_, ?_, ?_, ?_, ?_⟩
+    · intro queriedId queriedObject queriedLookup
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans (unlinkName_stores_object state objectId
+            allowed.object alias allowed.newPrimary allowed.remaining))
+        subst queriedObject
+        simpa [updated, withRemainingAliases] using targetIdentity
+      · exact allowed.complete.aliases.objectIdentity queriedId queriedObject
+          (by simpa [unlinkName, replace, target] using queriedLookup)
+    · intro queriedId queriedObject queriedLookup
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans (unlinkName_stores_object state objectId
+            allowed.object alias allowed.newPrimary allowed.remaining))
+        subst queriedObject
+        exact ⟨⟨by simpa [updated, withRemainingAliases] using survivingNodup,
+          by simp [updated, withRemainingAliases]⟩,
+          by simpa [updated, withRemainingAliases] using oldShape.2⟩
+      · exact allowed.complete.aliases.objectShape queriedId queriedObject
+          (by simpa [unlinkName, replace, target] using queriedLookup)
+    · intro queriedId queriedObject path queriedLookup member
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans (unlinkName_stores_object state objectId
+            allowed.object alias allowed.newPrimary allowed.remaining))
+        subst queriedObject
+        have surviving : path ∈ allowed.newPrimary :: allowed.remaining := by
+          simpa [updated, withRemainingAliases] using member
+        have oldMember : path ∈ allowed.object.aliases :=
+          allowed.member_partition.mpr (Or.inr surviving)
+        have oldPath := allowed.complete.aliases.aliasToPath objectId allowed.object
+          path allowed.objectLookup oldMember
+        have pathNeAlias : path ≠ alias := by
+          intro equality
+          subst path
+          exact aliasNotSurviving surviving
+        simpa [unlinkName, replace, pathNeAlias] using oldPath
+      · have oldLookup : state.objects queriedId = some queriedObject := by
+          simpa [unlinkName, replace, target] using queriedLookup
+        have oldPath := allowed.complete.aliases.aliasToPath queriedId queriedObject
+          path oldLookup member
+        have pathNeAlias : path ≠ alias := by
+          intro equality
+          have sameOwner := Option.some.inj
+            (oldPath.symm.trans (equality ▸ allowed.aliasIndexed))
+          exact target sameOwner
+        simpa [unlinkName, replace, pathNeAlias] using oldPath
+    · intro path queriedId pathLookup
+      have pathNeAlias : path ≠ alias := by
+        intro equality
+        subst path
+        simp [unlinkName] at pathLookup
+      have oldPath : state.paths path = some queriedId := by
+        simpa [unlinkName, replace, pathNeAlias] using pathLookup
+      rcases allowed.complete.aliases.pathToAlias path queriedId oldPath with
+        ⟨object, objectLookup, oldMember⟩
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        have sameObject : object = allowed.object := Option.some.inj
+          (objectLookup.symm.trans allowed.objectLookup)
+        subst object
+        have surviving : path ∈ allowed.newPrimary :: allowed.remaining :=
+          (allowed.member_partition.mp oldMember).resolve_left pathNeAlias
+        exact ⟨updated, unlinkName_stores_object state objectId allowed.object
+          alias allowed.newPrimary allowed.remaining,
+          by simpa [updated, withRemainingAliases] using surviving⟩
+      · exact ⟨object, by simpa [unlinkName, replace, target] using objectLookup,
+          oldMember⟩
+    · intro queriedId queriedObject queriedLookup
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        exact allowed.complete.aliases.liveWasIssued objectId allowed.object
+          allowed.objectLookup
+      · exact allowed.complete.aliases.liveWasIssued queriedId queriedObject
+          (by simpa [unlinkName, replace, target] using queriedLookup)
+  · intro queriedId queriedObject queriedLookup isDirectory
+    by_cases target : queriedId = objectId
+    · subst queriedId
+      have exactObject : queriedObject = updated := Option.some.inj
+        (queriedLookup.symm.trans (unlinkName_stores_object state objectId
+          allowed.object alias allowed.newPrimary allowed.remaining))
+      subst queriedObject
+      have targetDirectory : allowed.object.kind = .directory := by
+        simpa [updated, withRemainingAliases] using isDirectory
+      exact False.elim (allowed.sourceIsNotDirectory targetDirectory)
+    · exact allowed.complete.directorySingleton queriedId queriedObject
+        (by simpa [unlinkName, replace, target] using queriedLookup) isDirectory
+  · intro queriedId queriedObject name queriedLookup member notRoot
+    by_cases target : queriedId = objectId
+    · subst queriedId
+      have exactObject : queriedObject = updated := Option.some.inj
+        (queriedLookup.symm.trans (unlinkName_stores_object state objectId
+          allowed.object alias allowed.newPrimary allowed.remaining))
+      subst queriedObject
+      have surviving : name ∈ allowed.newPrimary :: allowed.remaining := by
+        simpa [updated, withRemainingAliases] using member
+      have oldMember : name ∈ allowed.object.aliases :=
+        allowed.member_partition.mpr (Or.inr surviving)
+      rcases allowed.complete.namedParentDirectory objectId allowed.object name
+        allowed.objectLookup oldMember notRoot with
+        ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
+      have parentIdDiffers : parentId ≠ objectId := by
+        intro sameId
+        have lookup := parentLookup
+        rw [sameId, allowed.objectLookup] at lookup
+        have sameObject : parent = allowed.object := (Option.some.inj lookup).symm
+        have targetDirectory : allowed.object.kind = .directory := by
+          rw [← sameObject]
+          exact parentKind
+        exact allowed.sourceIsNotDirectory targetDirectory
+      have parentPathDiffers : parent.path ≠ alias := by
+        intro equality
+        have sameOwner := Option.some.inj
+          (parentPathLookup.symm.trans (equality ▸ allowed.aliasIndexed))
+        exact parentIdDiffers sameOwner
+      exact ⟨parentId, parent,
+        by simpa [unlinkName, replace, parentIdDiffers] using parentLookup,
+        by simpa [unlinkName, replace, parentPathDiffers] using parentPathLookup,
+        parentKind, direct⟩
+    · have oldLookup : state.objects queriedId = some queriedObject := by
+        simpa [unlinkName, replace, target] using queriedLookup
+      rcases allowed.complete.namedParentDirectory queriedId queriedObject name
+        oldLookup member notRoot with
+        ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
+      have parentIdDiffers : parentId ≠ objectId := by
+        intro sameId
+        have lookup := parentLookup
+        rw [sameId, allowed.objectLookup] at lookup
+        have sameObject : parent = allowed.object := (Option.some.inj lookup).symm
+        have targetDirectory : allowed.object.kind = .directory := by
+          rw [← sameObject]
+          exact parentKind
+        exact allowed.sourceIsNotDirectory targetDirectory
+      have parentPathDiffers : parent.path ≠ alias := by
+        intro equality
+        have sameOwner := Option.some.inj
+          (parentPathLookup.symm.trans (equality ▸ allowed.aliasIndexed))
+        exact parentIdDiffers sameOwner
+      exact ⟨parentId, parent,
+        by simpa [unlinkName, replace, parentIdDiffers] using parentLookup,
+        by simpa [unlinkName, replace, parentPathDiffers] using parentPathLookup,
+        parentKind, direct⟩
+
+/-- Preconditions for publishing one contained symbolic link. -/
+structure MayCreateSymlink (state : NamespaceState) (object : NamespaceObject) where
+  complete : state.CompleteWellFormed
+  creation : state.MayCreate object
+  kindIsSymlink : object.kind = .symlink
+  aliasesSingleton : object.aliases = [object.path]
+  target : CanonicalPath
+  targetStored : object.symlinkTarget = some target
+
+/-- Symlink publication is the ordinary atomic object/index publication. -/
+def createSymlink (state : NamespaceState) (object : NamespaceObject) :
+    NamespaceState := state.create object
+
+/-- A checked symlink publication preserves the complete alias-aware tree. -/
+theorem createSymlink_preserves_completeWellFormed {state : NamespaceState}
+    {object : NamespaceObject} (allowed : state.MayCreateSymlink object) :
+    (state.createSymlink object).CompleteWellFormed := by
+  have objectShape : object.ShapeWellFormed := by
+    refine ⟨object.singleton_aliases_wellFormed allowed.aliasesSingleton, ?_⟩
+    rw [NamespaceObject.TargetWellFormed, allowed.kindIsSymlink,
+      allowed.targetStored]
+    simp
+  have parentIdNe : allowed.creation.parentId ≠ object.id := by
+    intro equality
+    have lookup := allowed.creation.parentLookup
+    rw [equality, allowed.creation.objectAbsent] at lookup
+    contradiction
+  have parentPathNe : allowed.creation.parent.path ≠ object.path := by
+    intro equality
+    have lookup := allowed.creation.parentPathLookup
+    rw [equality, allowed.creation.pathAbsent] at lookup
+    contradiction
+  refine ⟨create_preserves_treeWellFormed allowed.complete.tree allowed.creation,
+    ?_, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_, ?_, ?_⟩
+    · intro objectId queried queriedLookup
+      by_cases created : objectId = object.id
+      · subst objectId
+        have exactObject : queried = object := Option.some.inj
+          (queriedLookup.symm.trans (create_stores_object state object))
+        subst queried
+        rfl
+      · exact allowed.complete.aliases.objectIdentity objectId queried
+          (by simpa [createSymlink, create, replace, created] using queriedLookup)
+    · intro objectId queried queriedLookup
+      by_cases created : objectId = object.id
+      · subst objectId
+        have exactObject : queried = object := Option.some.inj
+          (queriedLookup.symm.trans (create_stores_object state object))
+        simpa [exactObject] using objectShape
+      · exact allowed.complete.aliases.objectShape objectId queried
+          (by simpa [createSymlink, create, replace, created] using queriedLookup)
+    · intro objectId queried path queriedLookup member
+      by_cases created : objectId = object.id
+      · subst objectId
+        have exactObject : queried = object := Option.some.inj
+          (queriedLookup.symm.trans (create_stores_object state object))
+        subst queried
+        rw [allowed.aliasesSingleton] at member
+        simp at member
+        subst path
+        exact create_stores_path state object
+      · have oldLookup : state.objects objectId = some queried := by
+          simpa [createSymlink, create, replace, created] using queriedLookup
+        have oldPath := allowed.complete.aliases.aliasToPath objectId queried path
+          oldLookup member
+        have pathNe : path ≠ object.path := by
+          intro equality
+          rw [equality, allowed.creation.pathAbsent] at oldPath
+          contradiction
+        simpa [createSymlink, create, replace, pathNe] using oldPath
+    · intro path objectId pathLookup
+      by_cases createdPath : path = object.path
+      · subst path
+        have exactId : objectId = object.id := Option.some.inj
+          (pathLookup.symm.trans (create_stores_path state object))
+        subst objectId
+        exact ⟨object, create_stores_object state object, by
+          simp [allowed.aliasesSingleton]⟩
+      · have oldPath : state.paths path = some objectId := by
+          simpa [createSymlink, create, replace, createdPath] using pathLookup
+        rcases allowed.complete.aliases.pathToAlias path objectId oldPath with
+          ⟨queried, queriedLookup, member⟩
+        have objectIdNe : objectId ≠ object.id := by
+          intro equality
+          subst objectId
+          rw [allowed.creation.objectAbsent] at queriedLookup
+          contradiction
+        exact ⟨queried, by
+          simpa [createSymlink, create, replace, objectIdNe] using queriedLookup,
+          member⟩
+    · intro objectId queried queriedLookup
+      by_cases created : objectId = object.id
+      · subst objectId
+        exact create_reserves_identity state object
+      · simpa [createSymlink, create, replace, created] using
+          allowed.complete.aliases.liveWasIssued objectId queried
+            (by simpa [createSymlink, create, replace, created] using queriedLookup)
+  · intro objectId queried queriedLookup isDirectory
+    by_cases created : objectId = object.id
+    · subst objectId
+      have exactObject : queried = object := Option.some.inj
+        (queriedLookup.symm.trans (create_stores_object state object))
+      subst queried
+      rw [allowed.kindIsSymlink] at isDirectory
+      contradiction
+    · exact allowed.complete.directorySingleton objectId queried
+        (by simpa [createSymlink, create, replace, created] using queriedLookup)
+        isDirectory
+  · intro objectId queried name queriedLookup member notRoot
+    by_cases created : objectId = object.id
+    · subst objectId
+      have exactObject : queried = object := Option.some.inj
+        (queriedLookup.symm.trans (create_stores_object state object))
+      subst queried
+      rw [allowed.aliasesSingleton] at member
+      simp at member
+      subst name
+      exact ⟨allowed.creation.parentId, allowed.creation.parent,
+        by simpa [createSymlink, create, replace, parentIdNe] using
+          allowed.creation.parentLookup,
+        by simpa [createSymlink, create, replace, parentPathNe] using
+          allowed.creation.parentPathLookup,
+        allowed.creation.parentIsDirectory, allowed.creation.directChild⟩
+    · have oldLookup : state.objects objectId = some queried := by
+        simpa [createSymlink, create, replace, created] using queriedLookup
+      rcases allowed.complete.namedParentDirectory objectId queried name oldLookup
+        member notRoot with
+        ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
+      have oldParentIdNe : parentId ≠ object.id := by
+        intro equality
+        rw [equality, allowed.creation.objectAbsent] at parentLookup
+        contradiction
+      have oldParentPathNe : parent.path ≠ object.path := by
+        intro equality
+        rw [equality, allowed.creation.pathAbsent] at parentPathLookup
+        contradiction
+      exact ⟨parentId, parent,
+        by simpa [createSymlink, create, replace, oldParentIdNe] using parentLookup,
+        by simpa [createSymlink, create, replace, oldParentPathNe] using
+          parentPathLookup,
+        parentKind, direct⟩
 /-- Preconditions for removing one live, unopened object. -/
 structure MayRemove (state : NamespaceState) (objectId : ObjectId) where
   generationCanIncrement : CanIncrementU64 state.generation
@@ -443,6 +1467,8 @@ structure MayRemove (state : NamespaceState) (objectId : ObjectId) where
   objectLookup : state.objects objectId = some object
   identityMatches : object.id = objectId
   pathLookup : state.paths object.path = some objectId
+  /-- Object removal is reserved for the final indexed name. -/
+  onlyIndexedPath : ∀ path, state.paths path = some objectId → path = object.path
   noOpenHandles : object.openHandleCount = 0
   notRoot : object.path ≠ CanonicalPath.root
   directoryEmpty : object.kind = .directory →
@@ -505,16 +1531,13 @@ theorem remove_preserves_wellFormed {state : NamespaceState}
     have oldPathLookup : state.paths queriedPath = some queriedId := by
       simpa [remove, replace, differentPath] using queriedLookup
     rcases wellFormed.pathToObject queriedPath queriedId oldPathLookup with
-      ⟨queriedObject, oldObjectLookup, pathMatches⟩
+      ⟨queriedObject, oldObjectLookup⟩
     have differentId : queriedId ≠ objectId := by
       intro sameId
       subst queriedId
-      have sameObject := Option.some.inj
-        (oldObjectLookup.symm.trans allowed.objectLookup)
-      have samePath := congrArg NamespaceObject.path sameObject
-      exact differentPath (pathMatches.symm.trans samePath)
+      exact differentPath (allowed.onlyIndexedPath queriedPath oldPathLookup)
     exact ⟨queriedObject,
-      by simpa [remove, replace, differentId] using oldObjectLookup, pathMatches⟩
+      by simpa [remove, replace, differentId] using oldObjectLookup⟩
   · intro queriedId queriedObject queriedLookup
     have differentId : queriedId ≠ objectId := by
       intro sameId
@@ -795,10 +1818,9 @@ theorem rename_preserves_wellFormed {state : NamespaceState}
     · rename_i destinationPrefix
       have inDestination := isPrefixOf_eq_true_iff_atOrBelow.mp destinationPrefix
       rcases wellFormed.pathToObject (pathMapping.inverse renamedPath) objectId
-          renamedLookup with ⟨oldObject, objectLookup, pathMatches⟩
-      refine ⟨{ oldObject with path := pathMapping.forward oldObject.path },
-        rename_preserves_object_fields objectLookup, ?_⟩
-      rw [pathMatches, pathMapping.forwardInverse_atOrBelow inDestination]
+          renamedLookup with ⟨oldObject, objectLookup⟩
+      exact ⟨{ oldObject with path := pathMapping.forward oldObject.path },
+        rename_preserves_object_fields objectLookup⟩
     · rename_i _outsideDestination
       split at renamedLookup
       · simp at renamedLookup
@@ -807,10 +1829,9 @@ theorem rename_preserves_wellFormed {state : NamespaceState}
           intro inSource
           exact sourcePrefix (isPrefixOf_eq_true_iff_atOrBelow.mpr inSource)
         rcases wellFormed.pathToObject renamedPath objectId renamedLookup with
-          ⟨oldObject, objectLookup, pathMatches⟩
-        refine ⟨{ oldObject with path := pathMapping.forward oldObject.path },
-          rename_preserves_object_fields objectLookup, ?_⟩
-        rw [pathMatches, pathMapping.forward_outside outsideSource]
+          ⟨oldObject, objectLookup⟩
+        exact ⟨{ oldObject with path := pathMapping.forward oldObject.path },
+          rename_preserves_object_fields objectLookup⟩
   · intro objectId renamedObject renamedLookup
     simp only [renamePaths] at renamedLookup
     cases oldLookup : state.objects objectId with
@@ -930,17 +1951,16 @@ theorem openObject_preserves_wellFormed {state : NamespaceState}
         (by simpa [openObject, updateOpenHandleCount, replace, sameId] using queriedLookup)
   · intro path queriedId pathLookup
     rcases wellFormed.pathToObject path queriedId pathLookup with
-      ⟨queriedObject, oldLookup, pathMatches⟩
+      ⟨queriedObject, oldLookup⟩
     by_cases sameId : queriedId = objectId
     · subst queriedId
       have exactObject : queriedObject = object := Option.some.inj
         (oldLookup.symm.trans objectLookup)
       subst queriedObject
       exact ⟨withOpenHandleCount object (object.openHandleCount + 1),
-        openObject_increments_count state objectId object, pathMatches⟩
+        openObject_increments_count state objectId object⟩
     · exact ⟨queriedObject,
-        by simpa [openObject, updateOpenHandleCount, replace, sameId] using oldLookup,
-        pathMatches⟩
+        by simpa [openObject, updateOpenHandleCount, replace, sameId] using oldLookup⟩
   · intro queriedId queriedObject queriedLookup
     by_cases sameId : queriedId = objectId
     · subst queriedId
@@ -969,17 +1989,16 @@ theorem closeObject_preserves_wellFormed {state : NamespaceState}
         (by simpa [closeObject, updateOpenHandleCount, replace, sameId] using queriedLookup)
   · intro path queriedId pathLookup
     rcases wellFormed.pathToObject path queriedId pathLookup with
-      ⟨queriedObject, oldLookup, pathMatches⟩
+      ⟨queriedObject, oldLookup⟩
     by_cases sameId : queriedId = objectId
     · subst queriedId
       have exactObject : queriedObject = object := Option.some.inj
         (oldLookup.symm.trans objectLookup)
       subst queriedObject
       exact ⟨withOpenHandleCount object (object.openHandleCount - 1),
-        closeObject_decrements_count state objectId object, pathMatches⟩
+        closeObject_decrements_count state objectId object⟩
     · exact ⟨queriedObject,
-        by simpa [closeObject, updateOpenHandleCount, replace, sameId] using oldLookup,
-        pathMatches⟩
+        by simpa [closeObject, updateOpenHandleCount, replace, sameId] using oldLookup⟩
   · intro queriedId queriedObject queriedLookup
     by_cases sameId : queriedId = objectId
     · subst queriedId
@@ -1110,6 +2129,18 @@ inductive Step : NamespaceState → NamespaceState → Prop
       Step state (state.remove objectId allowed.object)
   | renamePaths {state : NamespaceState} {pathMapping : PathRenaming} :
       MayRename state pathMapping → Step state (state.renamePaths pathMapping)
+  | addHardLink {state : NamespaceState} {objectId : ObjectId}
+      {alias : CanonicalPath} :
+      (allowed : MayAddHardLink state objectId alias) →
+      Step state (state.addHardLink objectId allowed.object alias)
+  | unlinkName {state : NamespaceState} {objectId : ObjectId}
+      {alias : CanonicalPath} :
+      (allowed : MayUnlinkName state objectId alias) →
+      Step state (state.unlinkName objectId allowed.object alias
+        allowed.newPrimary allowed.remaining)
+  | createSymlink {state : NamespaceState} {object : NamespaceObject} :
+      (allowed : MayCreateSymlink state object) →
+      Step state (state.createSymlink object)
   | openObject {state : NamespaceState} {objectId : ObjectId}
       {object : NamespaceObject} :
       state.objects objectId = some object →
@@ -1128,6 +2159,9 @@ theorem Step.generation_monotone {before after : NamespaceState}
   | createOpen => exact Nat.le_succ _
   | remove => exact Nat.le_succ _
   | renamePaths => exact Nat.le_succ _
+  | addHardLink => exact Nat.le_succ _
+  | unlinkName => exact Nat.le_succ _
+  | createSymlink => exact Nat.le_succ _
   | openObject => exact Nat.le_refl _
   | closeObject => exact Nat.le_refl _
 
@@ -1250,6 +2284,70 @@ theorem Step.preserves_countersRepresentable {before after : NamespaceState}
             subst renamedObject
             exact representable.2.1 objectId oldObject oldLookup
       · exact representable.2.2
+  | addHardLink allowed =>
+      constructor
+      · exact allowed.generationCanIncrement.increment_fits
+      constructor
+      · intro queriedId queriedObject queriedLookup
+        rename_i linkedId alias
+        by_cases target : queriedId = linkedId
+        · subst queriedId
+          have exactObject : queriedObject =
+              withAddedAlias allowed.object alias := Option.some.inj
+            (queriedLookup.symm.trans
+              (addHardLink_stores_object before linkedId allowed.object alias))
+          subst queriedObject
+          simpa [withAddedAlias] using
+            representable.2.1 linkedId allowed.object allowed.objectLookup
+        · exact representable.2.1 queriedId queriedObject
+            (by simpa [NamespaceState.addHardLink, replace, target] using queriedLookup)
+      · exact representable.2.2
+  | unlinkName allowed =>
+      constructor
+      · exact allowed.generationCanIncrement.increment_fits
+      constructor
+      · intro queriedId queriedObject queriedLookup
+        rename_i unlinkedId alias
+        by_cases target : queriedId = unlinkedId
+        · subst queriedId
+          have exactObject : queriedObject = withRemainingAliases allowed.object
+              allowed.newPrimary allowed.remaining := Option.some.inj
+            (queriedLookup.symm.trans (unlinkName_stores_object before unlinkedId
+              allowed.object alias allowed.newPrimary allowed.remaining))
+          subst queriedObject
+          simpa [withRemainingAliases] using
+            representable.2.1 unlinkedId allowed.object allowed.objectLookup
+        · exact representable.2.1 queriedId queriedObject
+            (by simpa [NamespaceState.unlinkName, replace, target] using queriedLookup)
+      · exact representable.2.2
+  | createSymlink allowed =>
+      rename_i createdObject
+      constructor
+      · exact allowed.creation.generationCanIncrement.increment_fits
+      constructor
+      · intro queriedId queriedObject queriedLookup
+        by_cases sameId : queriedId = createdObject.id
+        · subst queriedId
+          have exactObject : queriedObject = createdObject := Option.some.inj
+            (queriedLookup.symm.trans (create_stores_object before createdObject))
+          subst queriedObject
+          simp [allowed.creation.startsClosed, FitsU64, u64Maximum]
+        · exact representable.2.1 queriedId queriedObject
+            (by simpa [NamespaceState.createSymlink, NamespaceState.create,
+              replace, sameId] using queriedLookup)
+      · intro sequence cursor
+        rw [NamespaceState.createSymlink, NamespaceState.create,
+          allowed.creation.cursorExpected] at cursor
+        simp only [Option.bind] at cursor
+        unfold advanceObjectCursor at cursor
+        split at cursor
+        · rename_i canIncrement
+          have exactSequence : sequence = allowed.creation.allocationSequence + 1 :=
+            Option.some.inj cursor.symm
+          subst sequence
+          exact (show CanIncrementU64 allowed.creation.allocationSequence from
+            canIncrement).increment_fits
+        · simp at cursor
   | openObject objectLookup canIncrement =>
       constructor
       · exact representable.1
@@ -1302,6 +2400,9 @@ theorem Step.issued_identity_monotone {before after : NamespaceState}
       exact create_preserves_issued_identity _ _ issuedBefore
   | remove => exact issuedBefore
   | renamePaths => exact issuedBefore
+  | addHardLink => exact issuedBefore
+  | unlinkName => exact issuedBefore
+  | createSymlink => exact create_preserves_issued_identity _ _ issuedBefore
   | openObject => exact issuedBefore
   | closeObject => exact issuedBefore
 
@@ -1314,6 +2415,12 @@ theorem Step.preserves_wellFormed {before after : NamespaceState}
   | createOpen allowed => exact createOpen_preserves_wellFormed wellFormed allowed
   | remove allowed => exact remove_preserves_wellFormed wellFormed allowed
   | renamePaths allowed => exact rename_preserves_wellFormed wellFormed _ allowed
+  | addHardLink allowed =>
+      exact (addHardLink_preserves_completeWellFormed allowed).tree.indexes
+  | unlinkName allowed =>
+      exact (unlinkName_preserves_completeWellFormed allowed).tree.indexes
+  | createSymlink allowed =>
+      exact (createSymlink_preserves_completeWellFormed allowed).tree.indexes
   | openObject objectLookup =>
       exact openObject_preserves_wellFormed wellFormed objectLookup
   | closeObject objectLookup _ =>
@@ -1329,10 +2436,62 @@ theorem Step.preserves_treeWellFormed {before after : NamespaceState}
   | remove allowed => exact remove_preserves_treeWellFormed treeWellFormed allowed
   | renamePaths allowed =>
       exact rename_preserves_treeWellFormed treeWellFormed _ allowed
+  | addHardLink allowed =>
+      exact (addHardLink_preserves_completeWellFormed allowed).tree
+  | unlinkName allowed =>
+      exact (unlinkName_preserves_completeWellFormed allowed).tree
+  | createSymlink allowed =>
+      exact (createSymlink_preserves_completeWellFormed allowed).tree
   | openObject objectLookup =>
       exact openObject_preserves_treeWellFormed treeWellFormed objectLookup
   | closeObject objectLookup _ =>
       exact closeObject_preserves_treeWellFormed treeWellFormed objectLookup
+
+/-- Alias-aware successful mutations whose preconditions establish full shape. -/
+inductive CompleteStep : NamespaceState → NamespaceState → Prop
+  | addHardLink {state : NamespaceState} {objectId : ObjectId}
+      {alias : CanonicalPath} :
+      (allowed : MayAddHardLink state objectId alias) →
+      CompleteStep state (state.addHardLink objectId allowed.object alias)
+  | unlinkName {state : NamespaceState} {objectId : ObjectId}
+      {alias : CanonicalPath} :
+      (allowed : MayUnlinkName state objectId alias) →
+      CompleteStep state (state.unlinkName objectId allowed.object alias
+        allowed.newPrimary allowed.remaining)
+  | createSymlink {state : NamespaceState} {object : NamespaceObject} :
+      (allowed : MayCreateSymlink state object) →
+      CompleteStep state (state.createSymlink object)
+
+/-- Every alias-aware successful mutation is also an ordinary namespace step. -/
+theorem CompleteStep.toStep {before after : NamespaceState}
+    (transition : CompleteStep before after) : Step before after := by
+  cases transition with
+  | addHardLink allowed => exact Step.addHardLink allowed
+  | unlinkName allowed => exact Step.unlinkName allowed
+  | createSymlink allowed => exact Step.createSymlink allowed
+
+/-- Every alias-aware successful mutation preserves the complete invariant. -/
+theorem CompleteStep.preserves_completeWellFormed {before after : NamespaceState}
+    (transition : CompleteStep before after) : after.CompleteWellFormed := by
+  cases transition with
+  | addHardLink allowed => exact addHardLink_preserves_completeWellFormed allowed
+  | unlinkName allowed => exact unlinkName_preserves_completeWellFormed allowed
+  | createSymlink allowed => exact createSymlink_preserves_completeWellFormed allowed
+
+/-- Reflexive-transitive closure of complete alias-aware mutations. -/
+inductive CompleteSteps : NamespaceState → NamespaceState → Prop
+  | refl (state : NamespaceState) : CompleteSteps state state
+  | tail {first middle last : NamespaceState} :
+      CompleteSteps first middle → CompleteStep middle last →
+      CompleteSteps first last
+
+/-- Arbitrary finite alias-aware executions preserve exact indexes and tree shape. -/
+theorem CompleteSteps.preserve_completeWellFormed {before after : NamespaceState}
+    (transitions : CompleteSteps before after)
+    (wellFormed : before.CompleteWellFormed) : after.CompleteWellFormed := by
+  induction transitions with
+  | refl => exact wellFormed
+  | tail _ transition _ => exact transition.preserves_completeWellFormed
 
 /-- Reflexive-transitive closure of accepted namespace transitions. -/
 inductive Steps : NamespaceState → NamespaceState → Prop

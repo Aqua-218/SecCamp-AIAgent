@@ -30,6 +30,7 @@ budget が別に要るのは、Capability の委譲では総量を縛れない�
 | [Canonical Broker CBOR](canonical-cbor.md) | [`cbor.rs`](../../crates/egress-protocol/src/cbor.rs) | v1 schema、拒否する表現、payload を外側から分ける理由 |
 | [Broker session envelope](session-envelopes.md) | [`session.rs`](../../crates/egress-protocol/src/session.rs) | session、sequence、request ID、payload hash、retry の判定 |
 | [session budget](session-budget.md) | [`budget.rs`](../../crates/egress-protocol/src/budget.rs) | 3 種の上限、予約と計上、失敗時の解放 |
+| [検証対応表](verification.md) | — | unit test で見た範囲と、この crate の外にある境界 |
 
 frame の境界は [transport 契約](../egress-broker/transport.md)、operation と response の型は [Host Egress Broker](../egress-broker/README.md) 側の各ページで扱う。
 

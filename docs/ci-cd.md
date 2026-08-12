@@ -65,7 +65,7 @@ Semgrep and Gitleaks run from digest-pinned containers in both hosted pipelines.
 
 The YAML is ready without repository secrets. Configure the following controls in repository settings:
 
-1. Create a ruleset for `main`. Require pull requests, owner approval for CODEOWNERS changes, conversation resolution, a current branch, signed commits if the contributor workflow supports them, and the `CI complete` and `Security complete` status checks. Block force pushes and deletion.
+1. Create a ruleset for `main`. Require pull requests, owner approval for CODEOWNERS changes, conversation resolution, a current branch, signed commits if the contributor workflow supports them, and the `CI complete` and `Security complete` status checks. Enable merge queue for high-concurrency development; both workflows handle its `merge_group` event. Block force pushes and deletion.
 2. Create an environment named `release`. Restrict it to protected semantic-version tags and require at least one independent reviewer. Do not allow administrators to bypass protection.
 3. Create a tag ruleset for `v*.*.*` that blocks update and deletion after creation.
 4. Enable GitHub Advanced Security default setup prerequisites if the repository visibility or organization policy requires them for CodeQL.
@@ -92,7 +92,7 @@ gh attestation verify authority-corpus-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
 
 Mirror or push the same repository and configure these controls in the GitLab project:
 
-1. Protect the default branch. Require merge requests, successful pipelines, resolved discussions, and Code Owner approval. Disable direct pushes except for the release automation role if one is required.
+1. Protect the default branch. Require merge requests, successful pipelines, resolved discussions, and Code Owner approval. Enable merged-results pipelines and merge trains for high-concurrency development. Disable direct pushes except for the release automation role if one is required.
 2. Protect the `v*.*.*` tag pattern and limit tag creation to release maintainers.
 3. Protect the `release` environment and restrict deployments to release maintainers. The `publish_release` job is an explicit, blocking, confirmed manual approval on semantic-version tag pipelines. Configure deployment approval rules as an additional control when the GitLab tier supports them.
 4. Configure a scheduled default-branch pipeline for recurring advisory and secret scans.

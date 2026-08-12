@@ -67,6 +67,7 @@ ledger は domain をまたいで拒否する。VM identity として使った�
 - ledger が単調に増える。session ごとに 7 値を追加するので、長期運用では file が育つ。圧縮や打ち切りの仕組みは無い。古い値を捨てると非再利用の保証が切れるので、捨てるなら「どこまで遡って拒否するか」を決める別の決定が要る。
 - `sync_data` を毎 append で呼ぶので、session 起動のたびに fsync 相当のコストがかかる。
 - test では process-local ledger を使う。したがって durable ledger の破損検出、排他取得の失敗、`sync_data` の失敗はいずれも実環境で未検証。
+- `reserve_batch` の `Err` は「その identity がまだ free である」ことを意味する。2 つの `sync_data` が終われば予約は commit しており、それ以降の失敗は `Ok` を返して ledger を poison するだけにしてある。ここを `Err` にすると、disk 上に残った値を caller が free と解釈する。
 - [firecracker-runtime](../firecracker-runtime/snapshot-and-identity.md) 側は snapshot の `forbidden_identities` しか見ない。host が割り当てた identity を ledger 全体と照合するのは orchestrator の責務で、2 つの検査は別の層にある。
 
 ## 関連

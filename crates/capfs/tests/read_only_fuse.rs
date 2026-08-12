@@ -7,6 +7,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     num::NonZeroUsize,
+    os::unix::fs::PermissionsExt,
     path::Path,
     sync::Arc,
 };
@@ -523,6 +524,117 @@ fn mounted_view_removes_and_renames_only_with_live_effects() {
     );
     assert!(scoped_backing.join("revoked.txt").is_file());
 
+    drop(session);
+}
+
+// Requirement: FUSE SETATTR(mode) requires SetMetadata even on an existing
+// descriptor, and privileged mode bits never reach the backing inode.
+// Category: FUSE/metadata. Risk: critical.
+#[test]
+fn mounted_view_authorizes_metadata_changes_and_rechecks_after_revoke() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let backing = tempdir().expect("temporary backing directory must be creatable");
+    let mountpoint = tempdir().expect("temporary mountpoint must be creatable");
+    let scoped_backing = backing.path().join("scoped");
+    fs::create_dir(&scoped_backing).expect("authorized backing directory must be creatable");
+    let backing_file = scoped_backing.join("metadata.txt");
+    fs::write(&backing_file, b"metadata").expect("test backing file must be writable");
+    let repository = RepoId::new("workspace");
+    let imported = ImportedRepository::open(
+        repository.clone(),
+        backing.path(),
+        PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 2),
+    )
+    .expect("test backing must pass preflight");
+    let subject = SubjectId::new("fuse-metadata-subject");
+    let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+        .expect("test validity window must be non-empty");
+    let effects = FileEffects::from_effects([
+        FileEffect::ListDirectory,
+        FileEffect::ReadData,
+        FileEffect::SetMetadata,
+    ]);
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "fuse-metadata-session",
+    ))));
+    kernel
+        .register_subject(Subject::new(
+            subject.clone(),
+            StaticAuthorityEnvelope::new(
+                validity,
+                AuthorityBody::File(FileAuthority::new(
+                    repository.clone(),
+                    effects,
+                    PathPattern::Prefix(CanonicalPath::root()),
+                )),
+            ),
+        ))
+        .expect("test subject registration must succeed");
+    let capability = kernel
+        .issue_root(CapabilityGrant::new(
+            subject.clone(),
+            validity,
+            AuthorityBody::File(FileAuthority::new(
+                repository.clone(),
+                effects,
+                PathPattern::Exact(
+                    CanonicalPath::new(["scoped", "metadata.txt"])
+                        .expect("test path must be canonical"),
+                ),
+            )),
+        ))
+        .expect("test capability issuance must succeed");
+    let filesystem = CapabilityFilesystem::new(
+        imported,
+        Arc::clone(&kernel),
+        MountAuthority::new(
+            MountInstanceId::new("fuse-metadata-integration"),
+            subject,
+            capability.clone(),
+            repository,
+        ),
+        Arc::new(MonotonicTime::from_ticks(5)),
+    )
+    .expect("filesystem must initialize");
+    let session = spawn_mount(filesystem, mountpoint.path()).expect("FUSE mount must succeed");
+
+    let file = File::open(mountpoint.path().join("scoped/metadata.txt"))
+        .expect("ReadData must authorize opening the FUSE file");
+    file.set_permissions(fs::Permissions::from_mode(0o4750))
+        .expect("SetMetadata must authorize FUSE chmod");
+    assert_eq!(
+        fs::metadata(&backing_file)
+            .expect("updated backing metadata must remain readable")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o750,
+        "set-ID bits must be stripped by the FUSE metadata policy"
+    );
+
+    kernel
+        .revoke(&capability)
+        .expect("test capability must be revocable");
+    assert_eq!(
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .expect_err("an existing descriptor must reauthorize SETATTR")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        fs::metadata(&backing_file)
+            .expect("revoked metadata update must leave backing metadata readable")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o750
+    );
+
+    drop(file);
     drop(session);
 }
 

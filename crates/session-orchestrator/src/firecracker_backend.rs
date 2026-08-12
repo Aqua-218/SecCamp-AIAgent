@@ -5,7 +5,10 @@
 //! lease, configuration, and runtime instance in one state record prevents a
 //! VM handle and a workload handle from observing different lifecycle points.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 use firecracker_runtime::{
     ApiClient, CommandRunner, FileSystem, IdentitySource, Runtime, RuntimeConfig, RuntimeError,
@@ -63,7 +66,10 @@ where
     G: ApiClient,
     I: IdentitySource,
 {
-    /// Creates a factory around one runtime, immutable base configuration, and snapshot.
+    /// Creates a factory around one runtime, immutable base configuration, and snapshot manifest.
+    ///
+    /// The manifest remains untrusted here. Each VM start first derives the exact session config,
+    /// then asks the runtime to produce a config-bound verified snapshot before restore.
     #[must_use]
     pub fn new(
         runtime: Runtime<C, F, A, G, I>,
@@ -97,6 +103,9 @@ where
 }
 
 /// Creates separate VM and workload adapters over one Firecracker runtime.
+///
+/// The supplied snapshot manifest is verified against the final session-scoped runtime config on
+/// every start attempt and is never passed directly to the runtime restore boundary.
 #[must_use]
 pub fn new_firecracker_backends<C, F, A, G, I>(
     runtime: Runtime<C, F, A, G, I>,
@@ -161,9 +170,13 @@ where
 
         let bundle = to_firecracker_identity_bundle(identity)
             .map_err(|error| runtime_failure("identity conversion", &error))?;
-        let mut config = state.base_config.clone();
+        let config =
+            rebind_runtime_config(&state.base_config, identity.workspace_id().to_string())?;
         let snapshot = state.snapshot.clone();
-        config.workspace.clone_id = identity.workspace_id().to_string();
+        let snapshot = state
+            .runtime
+            .verify_snapshot(&config, snapshot)
+            .map_err(|error| runtime_failure("snapshot verification", &error))?;
         let instance = state
             .runtime
             .restore_with_identities(&config, &snapshot, bundle)
@@ -350,6 +363,111 @@ fn verify_broker_binding(
     Ok(())
 }
 
+fn rebind_runtime_config(
+    base_config: &RuntimeConfig,
+    clone_id: String,
+) -> Result<RuntimeConfig, BackendError> {
+    let old_jail_root = runtime_jail_root(base_config, &base_config.workspace.clone_id)?;
+    let new_jail_root = runtime_jail_root(base_config, &clone_id)?;
+    let mut config = base_config.clone();
+
+    config.kernel.path = rebind_jail_path(
+        "kernel",
+        &config.kernel.path,
+        &old_jail_root,
+        &new_jail_root,
+    )?;
+    config.workspace.clone_root = rebind_jail_path(
+        "workspace clone root",
+        &config.workspace.clone_root,
+        &old_jail_root,
+        &new_jail_root,
+    )?;
+    config.api_socket = rebind_jail_path(
+        "API socket",
+        &config.api_socket,
+        &old_jail_root,
+        &new_jail_root,
+    )?;
+    config.isolation.seccomp.filter.path = rebind_jail_path(
+        "seccomp filter",
+        &config.isolation.seccomp.filter.path,
+        &old_jail_root,
+        &new_jail_root,
+    )?;
+    config.vsock.uds_path = rebind_jail_path(
+        "vsock UDS",
+        &config.vsock.uds_path,
+        &old_jail_root,
+        &new_jail_root,
+    )?;
+    config.dm_verity.jailed_device_path = rebind_jail_path(
+        "jailed dm-verity device",
+        &config.dm_verity.jailed_device_path,
+        &old_jail_root,
+        &new_jail_root,
+    )?;
+    config.isolation.cgroup.path = rebind_cgroup_path(
+        &config.isolation.cgroup.path,
+        &config.workspace.clone_id,
+        &clone_id,
+    )?;
+    config.dm_verity.mapper_name = format!("{}-{clone_id}", config.dm_verity.mapper_name);
+    config.workspace.clone_id = clone_id;
+    config
+        .validate()
+        .map_err(|error| runtime_failure("session configuration", &error))?;
+    Ok(config)
+}
+
+fn runtime_jail_root(config: &RuntimeConfig, clone_id: &str) -> Result<PathBuf, BackendError> {
+    let executable = config
+        .firecracker
+        .path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| BackendError::new("Firecracker executable path has no file name"))?;
+    Ok(config
+        .jailer_config
+        .chroot_base_dir
+        .join(executable)
+        .join(clone_id)
+        .join("root"))
+}
+
+fn rebind_jail_path(
+    label: &str,
+    path: &Path,
+    old_jail_root: &Path,
+    new_jail_root: &Path,
+) -> Result<PathBuf, BackendError> {
+    let relative = path.strip_prefix(old_jail_root).map_err(|_| {
+        BackendError::new(format!(
+            "configured Firecracker {label} path '{}' is not beneath template jail root '{}'",
+            path.display(),
+            old_jail_root.display()
+        ))
+    })?;
+    Ok(new_jail_root.join(relative))
+}
+
+fn rebind_cgroup_path(
+    path: &Path,
+    old_clone_id: &str,
+    new_clone_id: &str,
+) -> Result<PathBuf, BackendError> {
+    if path.file_name().and_then(|name| name.to_str()) != Some(old_clone_id) {
+        return Err(BackendError::new(format!(
+            "configured Firecracker cgroup path '{}' is not bound to template clone ID '{old_clone_id}'",
+            path.display()
+        )));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        BackendError::new("configured Firecracker cgroup path has no parent directory")
+    })?;
+    Ok(parent.join(new_clone_id))
+}
+
 fn runtime_failure(operation: &str, error: &RuntimeError) -> BackendError {
     BackendError::new(format!("Firecracker {operation} failed: {error}"))
 }
@@ -360,9 +478,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use firecracker_runtime::{
-        ApiRequest, ApiResponse, CommandOutput, CommandSpec, DmVerityConfig, HostIsolationConfig,
-        IdentityId, NamespaceConfig, PinnedArtifact, ProcessHandle, Runtime, SeccompConfig,
-        Sha256Digest, VsockConfig, WorkspaceConfig, sha256,
+        ApiRequest, ApiResponse, CgroupVersion, CommandOutput, CommandSpec, DmVerityConfig,
+        HostIsolationConfig, IdentityId, JailerConfig, NamespaceConfig, PinnedArtifact,
+        ProcessHandle, ProcessOwnership, Runtime, SeccompConfig, VsockConfig, WorkspaceConfig,
+        sha256,
     };
 
     use super::*;
@@ -389,6 +508,18 @@ mod tests {
         fn start(&mut self, _command: &CommandSpec) -> Result<ProcessHandle, RuntimeError> {
             self.next_pid += 1;
             Ok(ProcessHandle { pid: self.next_pid })
+        }
+
+        fn start_owned(
+            &mut self,
+            command: &CommandSpec,
+            _ownership: &ProcessOwnership,
+        ) -> Result<ProcessHandle, RuntimeError> {
+            self.start(command)
+        }
+
+        fn verify_running(&mut self, _process: ProcessHandle) -> Result<(), RuntimeError> {
+            Ok(())
         }
 
         fn stop(&mut self, _process: ProcessHandle) -> Result<(), RuntimeError> {
@@ -418,6 +549,14 @@ mod tests {
                 .lock()
                 .expect("test filesystem mutex must not be poisoned")
                 .push(destination.to_owned());
+            Ok(())
+        }
+
+        fn verify_block_device_binding(
+            &mut self,
+            _source: &Path,
+            _jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
             Ok(())
         }
 
@@ -451,6 +590,27 @@ mod tests {
                 status: 200,
                 body: String::new(),
             })
+        }
+
+        fn verify_restore_resources(
+            &mut self,
+            workspace_path: &Path,
+            vsock_uds_path: &Path,
+            guest_cid: u32,
+        ) -> Result<(), RuntimeError> {
+            self.requests
+                .lock()
+                .expect("test API mutex must not be poisoned")
+                .push(ApiRequest {
+                    method: firecracker_runtime::HttpMethod::Get,
+                    path: "/vm/config".to_owned(),
+                    body: format!(
+                        "{}:{}:{guest_cid}",
+                        workspace_path.display(),
+                        vsock_uds_path.display()
+                    ),
+                });
+            Ok(())
         }
     }
 
@@ -486,10 +646,16 @@ mod tests {
     }
 
     fn test_config() -> RuntimeConfig {
+        let jail_root = Path::new("/test/jailer/firecracker/base/root");
         let rootfs = artifact("/test/rootfs");
         RuntimeConfig {
             firecracker: artifact("/test/firecracker"),
-            kernel: artifact("/test/kernel"),
+            kernel: artifact(
+                jail_root
+                    .join("artifacts/kernel")
+                    .to_str()
+                    .expect("test kernel path must be UTF-8"),
+            ),
             rootfs: rootfs.clone(),
             verity_hash: artifact("/test/verity"),
             dm_verity: DmVerityConfig {
@@ -497,30 +663,43 @@ mod tests {
                 hash_device: PathBuf::from("/test/verity"),
                 mapper_name: "test-verity".to_owned(),
                 root_hash: sha256(b"test root hash"),
+                jailed_device_path: jail_root.join("dev/rootfs"),
             },
             workspace: WorkspaceConfig {
                 source: PathBuf::from("/test/source"),
-                clone_root: PathBuf::from("/test/clones"),
+                clone_root: jail_root.join("workspace"),
                 clone_id: "base".to_owned(),
             },
             jailer: artifact("/test/jailer"),
-            api_socket: PathBuf::from("/test/firecracker.sock"),
+            jailer_config: JailerConfig {
+                uid: 1000,
+                gid: 1000,
+                chroot_base_dir: PathBuf::from("/test/jailer"),
+                cgroup_version: CgroupVersion::V2,
+            },
+            api_socket: jail_root.join("run/firecracker.sock"),
             isolation: HostIsolationConfig {
                 namespaces: NamespaceConfig {
-                    user: true,
+                    user: false,
                     pid: true,
                     mount: true,
-                    network: true,
-                    ipc: true,
-                    uts: true,
+                    network: false,
+                    ipc: false,
+                    uts: false,
                 },
                 cgroup: firecracker_runtime::CgroupConfig {
-                    path: PathBuf::from("/test/cgroup"),
+                    path: PathBuf::from("/sys/fs/cgroup/test/base"),
                     memory_max_bytes: 1,
                     cpu_quota_micros: 1,
+                    cpu_period_micros: 1,
                 },
                 seccomp: SeccompConfig {
-                    filter: artifact("/test/seccomp"),
+                    filter: artifact(
+                        jail_root
+                            .join("artifacts/seccomp")
+                            .to_str()
+                            .expect("test seccomp path must be UTF-8"),
+                    ),
                     blocked_syscalls: [
                         "bpf",
                         "connect",
@@ -538,30 +717,13 @@ mod tests {
             },
             vsock: VsockConfig {
                 guest_cid: 3,
-                uds_path: PathBuf::from("/test/vsock.sock"),
+                uds_path: jail_root.join("run/vsock.sock"),
             },
             network_devices: Vec::new(),
             vcpu_count: 1,
             memory_mib: 1,
             boot_args: "console=ttyS0".to_owned(),
         }
-    }
-
-    fn config_fingerprint(config: &RuntimeConfig) -> Sha256Digest {
-        let mut bytes = Vec::new();
-        for artifact in [
-            &config.firecracker,
-            &config.kernel,
-            &config.rootfs,
-            &config.verity_hash,
-            &config.jailer,
-            &config.isolation.seccomp.filter,
-        ] {
-            bytes.extend_from_slice(&artifact.digest.as_bytes());
-        }
-        bytes.extend_from_slice(&config.dm_verity.root_hash.as_bytes());
-        bytes.extend_from_slice(&config.vsock.guest_cid.to_be_bytes());
-        sha256(&bytes)
     }
 
     fn test_identity() -> SessionIdentity {
@@ -585,6 +747,7 @@ mod tests {
         api_failures: impl IntoIterator<Item = bool>,
     ) -> TestBackends {
         let config = test_config();
+        let identity = test_identity();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let failures = Arc::new(Mutex::new(api_failures.into_iter().collect()));
         let clones = Arc::new(Mutex::new(Vec::new()));
@@ -606,10 +769,14 @@ mod tests {
             },
             TestIdentitySource,
         );
+        let session_jail_root = runtime_jail_root(&config, &identity.workspace_id().to_string())
+            .expect("test session jail root must resolve");
         let snapshot = Snapshot::new(
-            "/test/snapshot",
-            "/test/memory",
-            config_fingerprint(&config),
+            session_jail_root.join("snapshots/state"),
+            session_jail_root.join("snapshots/memory"),
+            config.snapshot_fingerprint(),
+            sha256(&[]),
+            sha256(&[]),
             Vec::new(),
         );
         let (vm, workload) = FirecrackerBackendFactory::new(
@@ -619,11 +786,49 @@ mod tests {
             SnapshotId::new([9; crate::ID_BYTES]),
         )
         .into_handles();
-        (vm, workload, test_identity(), requests, clones)
+        (vm, workload, identity, requests, clones)
     }
 
     fn snapshot_descriptor() -> SnapshotDescriptor {
         SnapshotDescriptor::clean(SnapshotId::new([9; crate::ID_BYTES]))
+    }
+
+    #[test]
+    fn rebinds_every_session_scoped_runtime_resource_to_the_workspace_identity() {
+        let base = test_config();
+        let clone_id = test_identity().workspace_id().to_string();
+        let rebound = rebind_runtime_config(&base, clone_id.clone())
+            .expect("session-scoped runtime configuration should rebind");
+        let jail_root = PathBuf::from(format!("/test/jailer/firecracker/{clone_id}/root"));
+
+        assert_eq!(rebound.workspace.clone_id, clone_id);
+        assert_eq!(rebound.kernel.path, jail_root.join("artifacts/kernel"));
+        assert_eq!(rebound.workspace.clone_root, jail_root.join("workspace"));
+        assert_eq!(rebound.api_socket, jail_root.join("run/firecracker.sock"));
+        assert_eq!(
+            rebound.isolation.seccomp.filter.path,
+            jail_root.join("artifacts/seccomp")
+        );
+        assert_eq!(rebound.vsock.uds_path, jail_root.join("run/vsock.sock"));
+        assert_eq!(
+            rebound.dm_verity.jailed_device_path,
+            jail_root.join("dev/rootfs")
+        );
+        assert_eq!(
+            rebound.isolation.cgroup.path,
+            PathBuf::from(format!(
+                "/sys/fs/cgroup/test/{}",
+                rebound.workspace.clone_id
+            ))
+        );
+        assert_eq!(
+            rebound.dm_verity.mapper_name,
+            format!("test-verity-{}", rebound.workspace.clone_id)
+        );
+        assert_eq!(rebound.snapshot_fingerprint(), base.snapshot_fingerprint());
+        rebound
+            .validate()
+            .expect("rebound runtime configuration should remain valid");
     }
 
     #[test]
@@ -658,7 +863,7 @@ mod tests {
                 .expect("test filesystem mutex must not be poisoned")
                 .as_slice(),
             [PathBuf::from(
-                "/test/clones/05050505050505050505050505050505"
+                "/test/jailer/firecracker/05050505050505050505050505050505/root/workspace/05050505050505050505050505050505"
             )]
         );
 
@@ -702,6 +907,37 @@ mod tests {
             vm.start_vm(&foreign, &identity, &workspace, &broker)
                 .is_err()
         );
+        assert!(
+            requests
+                .lock()
+                .expect("test API mutex must not be poisoned")
+                .is_empty()
+        );
+        assert!(
+            clones
+                .lock()
+                .expect("test filesystem mutex must not be poisoned")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_snapshot_not_bound_to_the_final_config_before_runtime_effects() {
+        let (mut vm, _workload, identity, requests, clones) = test_backends([]);
+        let workspace = WorkspaceLease::new(identity.session_id(), identity.workspace_id());
+        let broker = BrokerLease::new(identity.session_id(), identity.broker_session_id());
+        vm.shared
+            .lock()
+            .expect("test backend mutex must not be poisoned")
+            .base_config
+            .boot_args
+            .push_str(" changed");
+
+        let error = vm
+            .start_vm(&snapshot_descriptor(), &identity, &workspace, &broker)
+            .expect_err("snapshot from a different config must be rejected");
+
+        assert!(error.to_string().contains("snapshot verification"));
         assert!(
             requests
                 .lock()

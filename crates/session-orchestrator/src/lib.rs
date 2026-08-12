@@ -1909,6 +1909,18 @@ impl<R, L> SessionOrchestrator<R, L> {
             .flatten()
     }
 
+    /// Returns the exact Broker lease retained by a running or stopping session.
+    ///
+    /// This is intentionally read-only: the session owner uses it to bind a
+    /// service-status observation to the currently retained resource before
+    /// deciding whether cleanup must begin.
+    #[must_use]
+    pub fn active_broker_lease(&self) -> Option<&BrokerLease> {
+        self.active
+            .as_ref()
+            .and_then(|session| session.broker.as_ref())
+    }
+
     fn finish_failed_start(&mut self, active: ActiveSession, rollback_failures: &[CleanupFailure]) {
         if rollback_failures.is_empty() {
             self.state = LifecycleState::Ready;

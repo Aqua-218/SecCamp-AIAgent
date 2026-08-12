@@ -10,6 +10,7 @@ use egress_protocol::{
     frame::ControlFrame,
     response::{
         BrokerWireOutcome, BrokerWireRejection, CanonicalBrokerResponse, ResponseCborError,
+        ResponseChunkError,
     },
 };
 
@@ -93,6 +94,8 @@ pub enum ServerError {
     Dispatch(DispatchError),
     /// A typed outcome could not fit the closed response schema.
     Response(ResponseCborError),
+    /// A large response could not be represented as canonical bounded chunks.
+    ResponseChunk(ResponseChunkError),
 }
 
 impl fmt::Display for ServerError {
@@ -106,6 +109,7 @@ impl fmt::Display for ServerError {
             Self::Transport(error) => error.fmt(formatter),
             Self::Dispatch(error) => error.fmt(formatter),
             Self::Response(error) => error.fmt(formatter),
+            Self::ResponseChunk(error) => error.fmt(formatter),
         }
     }
 }
@@ -189,12 +193,7 @@ where
             )
         );
         let wire = response_to_wire(response);
-        let payload = wire.encode().map_err(ServerError::Response)?;
-        let response_frame = ControlFrame::new(payload)
-            .map_err(|error| ServerError::Transport(TransportError::Frame(error)))?;
-        transport
-            .write_frame(&response_frame)
-            .map_err(ServerError::Transport)?;
+        write_wire_response(&mut transport, &wire)?;
         if close_after_response {
             return Ok(ConnectionReport {
                 requests_served: request_index + 1,
@@ -206,6 +205,40 @@ where
         requests_served: max_requests.get(),
         accounting_invariant_closed: false,
     })
+}
+
+fn write_wire_response<S>(
+    transport: &mut FramedTransport<S>,
+    wire: &CanonicalBrokerResponse,
+) -> Result<(), ServerError>
+where
+    S: Read + Write,
+{
+    match wire.encode() {
+        Ok(payload) => write_payload_frame(transport, payload),
+        Err(ResponseCborError::PayloadTooLarge { .. }) => {
+            for chunk in wire.chunks().map_err(ServerError::ResponseChunk)? {
+                let payload = chunk.encode().map_err(ServerError::ResponseChunk)?;
+                write_payload_frame(transport, payload)?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(ServerError::Response(error)),
+    }
+}
+
+fn write_payload_frame<S>(
+    transport: &mut FramedTransport<S>,
+    payload: Vec<u8>,
+) -> Result<(), ServerError>
+where
+    S: Read + Write,
+{
+    let response_frame = ControlFrame::new(payload)
+        .map_err(|error| ServerError::Transport(TransportError::Frame(error)))?;
+    transport
+        .write_frame(&response_frame)
+        .map_err(ServerError::Transport)
 }
 
 fn response_to_wire(response: BrokerResponse) -> CanonicalBrokerResponse {
@@ -241,18 +274,23 @@ mod tests {
 
     use authority_core::{
         capability::{CapId, SubjectId},
+        http::{CanonicalHost, CanonicalUrlPath},
         time::MonotonicTime,
     };
     use egress_protocol::{
         frame::ControlFrame,
-        response::{BrokerWireOutcome, BrokerWireRejection, CanonicalBrokerResponse},
-        session::BrokerRequestId,
+        response::{
+            BrokerWireOutcome, BrokerWireRejection, CanonicalBrokerResponse, CanonicalResponseChunk,
+        },
+        session::{BrokerRequestId, MAX_CONTROL_FRAME_BYTES},
     };
 
     use crate::{
         dispatch::{
-            BrokerOutcome, BrokerRejection, BrokerResponse, DispatchContext, DispatchError,
+            BrokerEffect, BrokerOutcome, BrokerRejection, BrokerResponse, DispatchContext,
+            DispatchError,
         },
+        public_fetch::PublicResponse,
         transport::PeerBoundListener,
     };
 
@@ -355,6 +393,17 @@ mod tests {
             encoded = &encoded[4 + length..];
         }
         responses
+    }
+
+    fn decode_frame_payloads(mut encoded: &[u8]) -> Vec<Vec<u8>> {
+        let mut payloads = Vec::new();
+        while !encoded.is_empty() {
+            let length = u32::from_be_bytes(encoded[..4].try_into().expect("length prefix"));
+            let length = usize::try_from(length).expect("frame length must fit");
+            payloads.push(encoded[4..4 + length].to_vec());
+            encoded = &encoded[4 + length..];
+        }
+        payloads
     }
 
     // Requirement: a capability whose validity window closes mid-connection stops authorizing there.
@@ -472,6 +521,59 @@ mod tests {
         assert!(report.accounting_invariant_closed());
         assert_eq!(dispatcher.calls, 1);
         assert_eq!(decode_frames(&output.lock().expect("output lock")).len(), 1);
+    }
+
+    #[test]
+    fn expanded_response_is_written_as_reassemblable_bounded_chunks() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let stream = DuplexBuffer {
+            input: Cursor::new(request_frame(1)),
+            output: Arc::clone(&output),
+        };
+        let request = BrokerRequestId::new([7; 16]);
+        let response = PublicResponse::new(
+            200,
+            CanonicalHost::new("public.example").expect("fixture host"),
+            CanonicalUrlPath::new("/large").expect("fixture path"),
+            vec![0x5a; MAX_CONTROL_FRAME_BYTES],
+        )
+        .expect("expanded response must fit the public cap");
+        let mut dispatcher = FakeDispatcher {
+            outcomes: VecDeque::from([BrokerResponse {
+                request,
+                outcome: BrokerOutcome::Succeeded(BrokerEffect::Public(response)),
+            }]),
+            calls: 0,
+        };
+
+        let report = serve_connection(
+            stream,
+            &mut dispatcher,
+            &context(),
+            &mut || MonotonicTime::from_ticks(7),
+            NonZeroUsize::new(1).expect("bound must be non-zero"),
+        )
+        .expect("large response must be served");
+
+        let payloads = decode_frame_payloads(&output.lock().expect("output lock"));
+        assert!(payloads.len() > 1);
+        assert!(
+            payloads
+                .iter()
+                .all(|payload| payload.len() <= MAX_CONTROL_FRAME_BYTES)
+        );
+        let chunks = payloads
+            .iter()
+            .map(|payload| CanonicalResponseChunk::decode(payload).expect("canonical chunk"))
+            .collect::<Vec<_>>();
+        let reassembled = CanonicalBrokerResponse::from_chunks(&chunks)
+            .expect("complete chunk sequence must reassemble");
+        assert_eq!(reassembled.request(), request);
+        assert!(
+            matches!(reassembled.outcome(), BrokerWireOutcome::Public(public) if public.body().len() == MAX_CONTROL_FRAME_BYTES)
+        );
+        assert_eq!(report.requests_served(), 1);
+        assert_eq!(dispatcher.calls, 1);
     }
 
     #[test]

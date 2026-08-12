@@ -25,6 +25,7 @@ use authority_core::{
     handle::{HandleId, ObjectId, OpenHandle},
     kernel::{
         CapabilityInspectionError, CapabilityKernel, CapabilityKernelError, EffectCommitError,
+        EffectExecution,
     },
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
@@ -443,6 +444,38 @@ fn pre_commit_effect_failure_is_reported_and_releases_the_guard() {
     assert_eq!(
         error.source().map(ToString::to_string),
         Some("backing operation was rejected".to_owned())
+    );
+    assert_eq!(kernel.revoke(&root_id), Ok(RevocationStatus::NewlyRevoked));
+}
+
+// Requirement: an ambiguous provider result is durable but never counted as a committed effect.
+// Category: audit/external-effect boundary. Risk: critical.
+#[test]
+fn commit_unknown_is_terminal_without_creating_an_effect_record() {
+    let (kernel, root_id) = kernel_with_root();
+
+    let error = kernel
+        .authorize_and_execute_classified(
+            &root_subject_id(),
+            &root_id,
+            &read_request(30, &["src", "main.rs"]),
+            |_| EffectExecution::<(), ExecutorFailure>::CommitUnknown {
+                evidence: b"provider-request-id:unknown".to_vec(),
+            },
+        )
+        .expect_err("unknown completion must require reconciliation");
+
+    assert_eq!(error, EffectCommitError::CommitUnknown);
+    let attempts = kernel
+        .attempt_records()
+        .expect("audit records must remain readable");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].outcome(), AttemptOutcome::CommitUnknown);
+    assert!(
+        kernel
+            .effect_records()
+            .expect("effect records must remain readable")
+            .is_empty()
     );
     assert_eq!(kernel.revoke(&root_id), Ok(RevocationStatus::NewlyRevoked));
 }

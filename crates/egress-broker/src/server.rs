@@ -188,7 +188,7 @@ where
                 BrokerRejection::AccountingInvariant | BrokerRejection::CommittedButUnrecorded
             )
         );
-        let wire = response_to_wire(response).map_err(ServerError::Response)?;
+        let wire = response_to_wire(response);
         let payload = wire.encode().map_err(ServerError::Response)?;
         let response_frame = ControlFrame::new(payload)
             .map_err(|error| ServerError::Transport(TransportError::Frame(error)))?;
@@ -208,15 +208,13 @@ where
     })
 }
 
-fn response_to_wire(
-    response: BrokerResponse,
-) -> Result<CanonicalBrokerResponse, ResponseCborError> {
+fn response_to_wire(response: BrokerResponse) -> CanonicalBrokerResponse {
     let outcome = match response.outcome {
         BrokerOutcome::Succeeded(BrokerEffect::Public(public)) => {
             BrokerWireOutcome::Public(public.into_wire())
         }
         BrokerOutcome::Succeeded(BrokerEffect::GitHub(github)) => {
-            BrokerWireOutcome::GitHub(github.into_wire()?)
+            BrokerWireOutcome::GitHub(github.into_wire())
         }
         BrokerOutcome::Rejected(rejection) => BrokerWireOutcome::Rejected(match rejection {
             BrokerRejection::NotAuthorized => BrokerWireRejection::NotAuthorized,
@@ -229,7 +227,7 @@ fn response_to_wire(
             BrokerRejection::CommittedButUnrecorded => BrokerWireRejection::CommittedButUnrecorded,
         }),
     };
-    Ok(CanonicalBrokerResponse::new(response.request, outcome))
+    CanonicalBrokerResponse::new(response.request, outcome)
 }
 
 #[cfg(test)]

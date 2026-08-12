@@ -387,19 +387,36 @@ where
     Work: WorkloadBackend,
 {
     fn drop(&mut self) {
-        if matches!(
-            self.orchestrator.state(),
-            LifecycleState::Running | LifecycleState::Stopping
-        ) {
-            let _ = self.stop_active();
+        match self.orchestrator.state() {
+            LifecycleState::Ready | LifecycleState::Closed => {}
+            LifecycleState::Running | LifecycleState::Stopping => {
+                // One pass calls each unfinished stage at most once; Drop never spins on a
+                // retryable backend while still enforcing that no lease is detached.
+                let cleanup = self.stop_active();
+                if cleanup.is_err()
+                    || self.orchestrator.state() != LifecycleState::Closed
+                    || self.orchestrator.active.is_some()
+                {
+                    abort_incomplete_drop();
+                }
+            }
+            _ => abort_incomplete_drop(),
         }
     }
+}
+
+#[cold]
+fn abort_incomplete_drop() -> ! {
+    // Fail-stop must not risk blocking on an inherited diagnostic stream while ownership is live.
+    std::process::abort();
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
         collections::VecDeque,
+        os::unix::process::ExitStatusExt,
+        process::Command,
         sync::{Arc, Mutex},
     };
 
@@ -850,5 +867,58 @@ mod tests {
         let events = events.lock().expect("test event lock must not be poisoned");
         assert_eq!(events.iter().filter(|event| **event == "kill").count(), 2);
         assert_eq!(events.last(), Some(&"isolate"));
+    }
+
+    fn run_drop_subprocess(test_name: &str, marker: &str) -> std::process::ExitStatus {
+        Command::new(std::env::current_exe().expect("test executable must resolve"))
+            .args(["--exact", test_name, "--nocapture"])
+            .env(marker, "1")
+            .output()
+            .expect("drop behavior subprocess must start")
+            .status
+    }
+
+    #[test]
+    fn persistent_drop_cleanup_failure_aborts_the_process() {
+        const CHILD_MARKER: &str = "SESSION_OWNER_PERSISTENT_DROP_FAILURE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let (mut owner, _) = owner([Ok(BrokerRuntimeStatus::Exited)], [true, true], []);
+            start(&mut owner);
+            owner
+                .poll(OwnerPollRequest::Continue)
+                .expect_err("first VM kill failure must retain ownership");
+            assert_eq!(owner.state(), LifecycleState::Stopping);
+            drop(owner);
+            panic!("persistent cleanup failure must fail-stop during drop");
+        }
+
+        let status = run_drop_subprocess(
+            "session_owner::tests::persistent_drop_cleanup_failure_aborts_the_process",
+            CHILD_MARKER,
+        );
+
+        assert_eq!(status.signal(), Some(6));
+    }
+
+    #[test]
+    fn transient_drop_cleanup_retry_exits_without_aborting() {
+        const CHILD_MARKER: &str = "SESSION_OWNER_TRANSIENT_DROP_FAILURE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let (mut owner, _) = owner([Ok(BrokerRuntimeStatus::Exited)], [true, false], []);
+            start(&mut owner);
+            owner
+                .poll(OwnerPollRequest::Continue)
+                .expect_err("first VM kill failure must retain ownership");
+            assert_eq!(owner.state(), LifecycleState::Stopping);
+            drop(owner);
+            return;
+        }
+
+        let status = run_drop_subprocess(
+            "session_owner::tests::transient_drop_cleanup_retry_exits_without_aborting",
+            CHILD_MARKER,
+        );
+
+        assert!(status.success());
     }
 }

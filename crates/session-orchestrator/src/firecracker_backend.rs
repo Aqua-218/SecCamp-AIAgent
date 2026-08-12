@@ -147,6 +147,10 @@ where
                 "Firecracker VM backend already has an active VM",
             ));
         }
+        state
+            .runtime
+            .retry_pending_cleanup()
+            .map_err(|error| runtime_failure("pending startup cleanup", &error))?;
         if snapshot.snapshot_id() != state.snapshot_id {
             return Err(BackendError::new(
                 "snapshot descriptor does not match the configured Firecracker snapshot",
@@ -187,6 +191,19 @@ where
         });
         state.last_closed = None;
         Ok(lease)
+    }
+
+    fn cleanup_failed_start(&mut self) -> Result<(), BackendError> {
+        let mut state = lock_state(&self.shared)?;
+        if state.active.is_some() {
+            return Err(BackendError::new(
+                "cannot clean up a failed Firecracker start while a VM is active",
+            ));
+        }
+        state
+            .runtime
+            .retry_pending_cleanup()
+            .map_err(|error| runtime_failure("failed startup cleanup", &error))
     }
 
     fn kill_vm(&mut self, lease: &VmLease) -> Result<(), BackendError> {
@@ -412,6 +429,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestApi {
         requests: Arc<Mutex<Vec<ApiRequest>>>,
+        failures: Arc<Mutex<VecDeque<bool>>>,
     }
 
     impl ApiClient for TestApi {
@@ -420,6 +438,15 @@ mod tests {
                 .lock()
                 .expect("test API mutex must not be poisoned")
                 .push(request.clone());
+            if self
+                .failures
+                .lock()
+                .expect("test API failure mutex must not be poisoned")
+                .pop_front()
+                .unwrap_or(false)
+            {
+                return Err(RuntimeError::Api("test API failure".to_owned()));
+            }
             Ok(ApiResponse {
                 status: 200,
                 body: String::new(),
@@ -550,8 +577,16 @@ mod tests {
     }
 
     fn test_backends(stop_failures: impl IntoIterator<Item = bool>) -> TestBackends {
+        test_backends_with_failures(stop_failures, [])
+    }
+
+    fn test_backends_with_failures(
+        stop_failures: impl IntoIterator<Item = bool>,
+        api_failures: impl IntoIterator<Item = bool>,
+    ) -> TestBackends {
         let config = test_config();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let failures = Arc::new(Mutex::new(api_failures.into_iter().collect()));
         let clones = Arc::new(Mutex::new(Vec::new()));
         let runtime = Runtime::new(
             TestRunner {
@@ -563,9 +598,11 @@ mod tests {
             },
             TestApi {
                 requests: Arc::clone(&requests),
+                failures: Arc::clone(&failures),
             },
             TestApi {
                 requests: Arc::clone(&requests),
+                failures,
             },
             TestIdentitySource,
         );
@@ -699,5 +736,41 @@ mod tests {
             identity.broker_session_id(),
         );
         assert!(vm.kill_vm(&unknown).is_err());
+    }
+
+    #[test]
+    fn failed_start_cleanup_retries_runtime_rollback_before_reporting_success() {
+        let (mut vm, _workload, identity, _requests, _clones) =
+            test_backends_with_failures([true, true, false], [true]);
+        let workspace = WorkspaceLease::new(identity.session_id(), identity.workspace_id());
+        let broker = BrokerLease::new(identity.session_id(), identity.broker_session_id());
+
+        assert!(
+            vm.start_vm(&snapshot_descriptor(), &identity, &workspace, &broker)
+                .is_err()
+        );
+        assert!(vm.cleanup_failed_start().is_err());
+        assert!(vm.cleanup_failed_start().is_ok());
+        assert!(
+            vm.start_vm(&snapshot_descriptor(), &identity, &workspace, &broker)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn start_vm_drains_retained_runtime_cleanup_before_a_new_restore() {
+        let (mut vm, _workload, identity, _requests, _clones) =
+            test_backends_with_failures([true, false], [true]);
+        let workspace = WorkspaceLease::new(identity.session_id(), identity.workspace_id());
+        let broker = BrokerLease::new(identity.session_id(), identity.broker_session_id());
+
+        assert!(
+            vm.start_vm(&snapshot_descriptor(), &identity, &workspace, &broker)
+                .is_err()
+        );
+        assert!(
+            vm.start_vm(&snapshot_descriptor(), &identity, &workspace, &broker)
+                .is_ok()
+        );
     }
 }

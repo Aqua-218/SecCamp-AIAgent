@@ -1,4 +1,4 @@
-//! Contract tests for the VM-wide link-free namespace registry.
+//! Contract tests for the VM-wide namespace registry.
 
 use std::{
     convert::Infallible,
@@ -18,8 +18,8 @@ use authority_core::{
     path::{CanonicalPath, InvalidPathSegmentReason},
 };
 use capfs::namespace::{
-    NamespaceError, NamespaceGeneration, NamespaceObjectKind, NamespaceOperationError,
-    NamespaceRegistry,
+    NamespaceError, NamespaceGeneration, NamespaceObjectKind, NamespaceObjectSpec,
+    NamespaceOperationError, NamespaceRegistry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +40,7 @@ fn path(segments: &[&str]) -> CanonicalPath {
 fn create_object(
     registry: &NamespaceRegistry,
     object_path: CanonicalPath,
-    kind: NamespaceObjectKind,
+    kind: NamespaceObjectSpec,
 ) -> ObjectId {
     registry
         .create_object(object_path, kind, |_| Ok::<_, Infallible>(()))
@@ -57,18 +57,18 @@ struct SourceTree {
 
 fn registry_with_source_tree() -> SourceTree {
     let registry = NamespaceRegistry::new();
-    create_object(&registry, path(&["src"]), NamespaceObjectKind::Directory);
+    create_object(&registry, path(&["src"]), NamespaceObjectSpec::Directory);
     let parser = create_object(
         &registry,
         path(&["src", "parser"]),
-        NamespaceObjectKind::Directory,
+        NamespaceObjectSpec::Directory,
     );
     let lexer = create_object(
         &registry,
         path(&["src", "parser", "lexer.rs"]),
-        NamespaceObjectKind::RegularFile,
+        NamespaceObjectSpec::RegularFile,
     );
-    create_object(&registry, path(&["lib"]), NamespaceObjectKind::Directory);
+    create_object(&registry, path(&["lib"]), NamespaceObjectSpec::Directory);
     SourceTree {
         registry,
         parser,
@@ -90,9 +90,9 @@ fn registry_enforces_unique_paths_parents_and_object_ids() {
     let creation = registry
         .create_object(
             source_path.clone(),
-            NamespaceObjectKind::Directory,
+            NamespaceObjectSpec::Directory,
             |object| {
-                assert_eq!(object.path(), &source_path);
+                assert_eq!(object.primary_path(), &source_path);
                 Ok::<_, Infallible>("created")
             },
         )
@@ -114,7 +114,7 @@ fn registry_enforces_unique_paths_parents_and_object_ids() {
     assert_eq!(
         registry.create_object(
             source_path.clone(),
-            NamespaceObjectKind::Directory,
+            NamespaceObjectSpec::Directory,
             |_| Ok::<_, Infallible>(()),
         ),
         Err(NamespaceOperationError::Namespace(
@@ -124,7 +124,7 @@ fn registry_enforces_unique_paths_parents_and_object_ids() {
     assert_eq!(
         registry.create_object(
             path(&["missing", "orphan"]),
-            NamespaceObjectKind::RegularFile,
+            NamespaceObjectSpec::RegularFile,
             |_| Ok::<_, Infallible>(()),
         ),
         Err(NamespaceOperationError::Namespace(
@@ -132,11 +132,11 @@ fn registry_enforces_unique_paths_parents_and_object_ids() {
         ))
     );
 
-    create_object(&registry, path(&["file"]), NamespaceObjectKind::RegularFile);
+    create_object(&registry, path(&["file"]), NamespaceObjectSpec::RegularFile);
     assert_eq!(
         registry.create_object(
             path(&["file", "child"]),
-            NamespaceObjectKind::RegularFile,
+            NamespaceObjectSpec::RegularFile,
             |_| Ok::<_, Infallible>(()),
         ),
         Err(NamespaceOperationError::Namespace(
@@ -151,7 +151,7 @@ fn registry_enforces_unique_paths_parents_and_object_ids() {
 #[test]
 fn child_creation_uses_the_current_parent_path_and_can_start_open() {
     let registry = NamespaceRegistry::new();
-    let source = create_object(&registry, path(&["source"]), NamespaceObjectKind::Directory);
+    let source = create_object(&registry, path(&["source"]), NamespaceObjectSpec::Directory);
     registry
         .rename_subtree(&path(&["source"]), path(&["renamed"]), |_| {
             Ok::<_, Infallible>(())
@@ -162,9 +162,9 @@ fn child_creation_uses_the_current_parent_path_and_can_start_open() {
         .create_open_child(
             &source,
             "created.txt",
-            NamespaceObjectKind::RegularFile,
+            NamespaceObjectSpec::RegularFile,
             |_parent, object| {
-                assert_eq!(object.path(), &path(&["renamed", "created.txt"]));
+                assert_eq!(object.primary_path(), &path(&["renamed", "created.txt"]));
                 assert_eq!(object.open_handle_count(), 1);
                 Ok::<_, Infallible>("backing file created")
             },
@@ -197,14 +197,14 @@ fn child_creation_uses_the_current_parent_path_and_can_start_open() {
 #[test]
 fn failed_child_creation_has_no_visible_namespace_effect() {
     let registry = NamespaceRegistry::new();
-    let parent = create_object(&registry, path(&["parent"]), NamespaceObjectKind::Directory);
+    let parent = create_object(&registry, path(&["parent"]), NamespaceObjectSpec::Directory);
     let target = path(&["parent", "failed.txt"]);
 
     assert_eq!(
         registry.create_child(
             &parent,
             "failed.txt",
-            NamespaceObjectKind::RegularFile,
+            NamespaceObjectSpec::RegularFile,
             |_, _| Err::<(), _>(BackingFailure),
         ),
         Err(NamespaceOperationError::Executor(BackingFailure))
@@ -224,17 +224,17 @@ fn failed_child_creation_has_no_visible_namespace_effect() {
 #[test]
 fn child_mutations_use_current_parent_paths_and_preserve_object_kind() {
     let registry = NamespaceRegistry::new();
-    let source_parent = create_object(&registry, path(&["source"]), NamespaceObjectKind::Directory);
+    let source_parent = create_object(&registry, path(&["source"]), NamespaceObjectSpec::Directory);
     let destination_parent = create_object(
         &registry,
         path(&["destination"]),
-        NamespaceObjectKind::Directory,
+        NamespaceObjectSpec::Directory,
     );
     registry
         .create_child(
             &source_parent,
             "entry.txt",
-            NamespaceObjectKind::RegularFile,
+            NamespaceObjectSpec::RegularFile,
             |_, _| Ok::<_, Infallible>(()),
         )
         .expect("test source child must be creatable");
@@ -281,9 +281,9 @@ fn child_mutations_use_current_parent_paths_and_preserve_object_kind() {
     );
 
     registry
-        .remove_child(&destination_parent, "moved.txt", |parent, child| {
-            assert_eq!(parent.path(), &path(&["renamed-destination"]));
-            assert_eq!(child.path(), &moved_path);
+        .remove_child(&destination_parent, "moved.txt", |parent, child, _| {
+            assert_eq!(parent.primary_path(), &path(&["renamed-destination"]));
+            assert_eq!(child.primary_path(), &moved_path);
             assert_eq!(child.kind(), NamespaceObjectKind::RegularFile);
             Ok::<_, Infallible>(())
         })
@@ -296,19 +296,19 @@ fn child_mutations_use_current_parent_paths_and_preserve_object_kind() {
 #[test]
 fn failed_child_removal_preserves_the_named_object_and_generation() {
     let registry = NamespaceRegistry::new();
-    let parent = create_object(&registry, path(&["parent"]), NamespaceObjectKind::Directory);
+    let parent = create_object(&registry, path(&["parent"]), NamespaceObjectSpec::Directory);
     let child_path = path(&["parent", "entry.txt"]);
     create_object(
         &registry,
         child_path.clone(),
-        NamespaceObjectKind::RegularFile,
+        NamespaceObjectSpec::RegularFile,
     );
     let generation = registry
         .generation()
         .expect("generation must be readable before failed removal");
 
     assert_eq!(
-        registry.remove_child(&parent, "entry.txt", |_, _| Err::<(), _>(BackingFailure)),
+        registry.remove_child(&parent, "entry.txt", |_, _, _| Err::<(), _>(BackingFailure)),
         Err(NamespaceOperationError::Executor(BackingFailure))
     );
     assert!(
@@ -336,7 +336,7 @@ fn child_lookup_is_canonical_and_parent_relative() {
 
     let resolved = registry
         .with_child(&parser, "lexer.rs", |object| {
-            Ok::<_, Infallible>((object.id().clone(), object.path().clone()))
+            Ok::<_, Infallible>((object.id().clone(), object.primary_path().clone()))
         })
         .expect("the live direct child must resolve");
     assert_eq!(resolved, (lexer, path(&["src", "parser", "lexer.rs"])));
@@ -378,7 +378,7 @@ fn child_lookup_holds_read_lock_against_concurrent_rename() {
     let reader_registry = Arc::clone(&registry);
     let reader = thread::spawn(move || {
         reader_registry.with_child(&parser, "lexer.rs", |object| {
-            assert_eq!(object.path(), &path(&["src", "parser", "lexer.rs"]));
+            assert_eq!(object.primary_path(), &path(&["src", "parser", "lexer.rs"]));
             reader_entered_sender
                 .send(())
                 .expect("test should observe the held child lookup guard");
@@ -437,21 +437,21 @@ fn directory_listing_is_direct_ordered_and_requires_a_directory() {
         .expect("test registry should contain its root")
         .id()
         .clone();
-    let source = create_object(&registry, path(&["source"]), NamespaceObjectKind::Directory);
+    let source = create_object(&registry, path(&["source"]), NamespaceObjectSpec::Directory);
     create_object(
         &registry,
         path(&["zeta.txt"]),
-        NamespaceObjectKind::RegularFile,
+        NamespaceObjectSpec::RegularFile,
     );
     create_object(
         &registry,
         path(&["alpha.txt"]),
-        NamespaceObjectKind::RegularFile,
+        NamespaceObjectSpec::RegularFile,
     );
     create_object(
         &registry,
         path(&["source", "nested.txt"]),
-        NamespaceObjectKind::RegularFile,
+        NamespaceObjectSpec::RegularFile,
     );
 
     registry
@@ -513,7 +513,7 @@ fn directory_listing_rejects_a_stale_generation_before_its_executor() {
     create_object(
         &registry,
         path(&["created.txt"]),
-        NamespaceObjectKind::RegularFile,
+        NamespaceObjectSpec::RegularFile,
     );
     let actual = registry
         .generation()
@@ -613,7 +613,7 @@ fn failed_create_leaves_generation_and_identity_unmodified() {
     assert_eq!(
         registry.create_object(
             object_path.clone(),
-            NamespaceObjectKind::RegularFile,
+            NamespaceObjectSpec::RegularFile,
             |object| {
                 failed_object = Some(object.id().clone());
                 Err::<(), _>(BackingFailure)
@@ -628,7 +628,7 @@ fn failed_create_leaves_generation_and_identity_unmodified() {
     let failed_object = failed_object.expect("failed executor should observe the staged object");
     assert_eq!(registry.object_snapshot(&failed_object), Ok(None));
     let creation = registry
-        .create_object(object_path, NamespaceObjectKind::RegularFile, |_| {
+        .create_object(object_path, NamespaceObjectSpec::RegularFile, |_| {
             Ok::<_, Infallible>(())
         })
         .expect("a later create should succeed");
@@ -728,7 +728,7 @@ fn rename_subtree_is_no_replace_and_failure_atomic() {
     assert_eq!(
         registry
             .object_snapshot(&lexer)
-            .map(|object| object.map(|record| record.path().clone())),
+            .map(|object| object.map(|record| record.primary_path().clone())),
         Ok(Some(path(&["src", "parser", "lexer.rs"])))
     );
 
@@ -738,7 +738,7 @@ fn rename_subtree_is_no_replace_and_failure_atomic() {
     assert_eq!(
         registry
             .object_snapshot(&lexer)
-            .map(|object| object.map(|record| record.path().clone())),
+            .map(|object| object.map(|record| record.primary_path().clone())),
         Ok(Some(path(&["lib", "parser", "lexer.rs"])))
     );
     assert_eq!(
@@ -806,7 +806,7 @@ fn remove_requires_an_empty_object_and_reserves_deleted_ids() {
     let replacement = registry
         .create_object(
             path(&["lib", "replacement.rs"]),
-            NamespaceObjectKind::RegularFile,
+            NamespaceObjectSpec::RegularFile,
             |_| Ok::<_, Infallible>(()),
         )
         .expect("replacement file should be creatable")
@@ -843,7 +843,7 @@ fn object_operation_holds_read_lock_against_concurrent_rename() {
     let reader_registry = Arc::clone(&registry);
     let reader = thread::spawn(move || {
         reader_registry.with_object(&lexer, |object| {
-            assert_eq!(object.path(), &path(&["src", "parser", "lexer.rs"]));
+            assert_eq!(object.primary_path(), &path(&["src", "parser", "lexer.rs"]));
             reader_entered_sender
                 .send(())
                 .expect("test should observe the held read lock");

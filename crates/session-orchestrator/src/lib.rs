@@ -1459,6 +1459,18 @@ pub trait VmBackend {
         broker: &BrokerLease,
     ) -> Result<VmLease, BackendError>;
 
+    /// Cleans up backend state left by a failed [`Self::start_vm`] attempt
+    /// that did not return a lease. The operation must be idempotent.
+    ///
+    /// Backends whose failed startup is effect-free may use the default no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] if failed-start cleanup cannot be committed.
+    fn cleanup_failed_start(&mut self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Kills the VM and all workload processes. The operation must be idempotent.
     ///
     /// # Errors
@@ -1783,6 +1795,7 @@ struct ActiveSession {
     workspace: WorkspaceLease,
     broker: Option<BrokerLease>,
     vm: Option<VmLease>,
+    vm_start_attempted: bool,
     capability: Option<CapabilityLease>,
     cleanup: CleanupProgress,
 }
@@ -1804,6 +1817,7 @@ impl ActiveSession {
         vm: Option<VmLease>,
         capability: Option<CapabilityLease>,
     ) -> Self {
+        let vm_start_attempted = vm.is_some();
         Self {
             info,
             workspace,
@@ -1815,6 +1829,7 @@ impl ActiveSession {
             },
             broker,
             vm,
+            vm_start_attempted,
             capability,
         }
     }
@@ -1961,19 +1976,22 @@ where
         let identity = self
             .allocate_session_identity()
             .map_err(|failure| StartError::new(StartStage::IdentityAllocation, failure))?;
+        let info = SessionInfo { identity };
         let workspace = match workspace_backend.clone_workspace(&identity, workspace_template) {
             Ok(lease) => {
                 if let Some(error) = validate_workspace(&identity, &lease) {
-                    // The clone exists on disk even though its lease is not
-                    // usable. Every other stage rolls back; without this the
-                    // directory is left behind with no lease to reach it.
-                    let mut rollback = Vec::new();
-                    if let Err(cleanup) = workspace_backend.isolate_workspace(&lease) {
-                        rollback.push(CleanupFailure {
-                            stage: CleanupStage::WorkspaceIsolation,
-                            error: cleanup,
-                        });
-                    }
+                    // `Ok` means the backend effect committed even when the
+                    // returned lease is incorrectly bound. Retain that exact
+                    // lease until isolation succeeds so stop can retry it.
+                    let mut active = ActiveSession::pending(info, lease, None, None, None);
+                    let rollback = cleanup_active(
+                        &mut active,
+                        workspace_backend,
+                        broker_backend,
+                        vm_backend,
+                        capability_backend,
+                    );
+                    self.finish_failed_start(active, &rollback);
                     return Err(StartError::with_rollback(
                         StartStage::WorkspaceClone,
                         error,
@@ -1990,11 +2008,12 @@ where
                 ));
             }
         };
-        let info = SessionInfo { identity };
         let mut active = ActiveSession::pending(info, workspace, None, None, None);
 
         let broker = match broker_backend.establish_broker_session(&identity) {
             Ok(lease) => {
+                active.broker = Some(lease.clone());
+                active.cleanup.broker_closed = false;
                 if let Some(error) = validate_broker(&identity, &lease) {
                     let rollback = cleanup_active(
                         &mut active,
@@ -2029,11 +2048,12 @@ where
                 ));
             }
         };
-        active.broker = Some(broker.clone());
-        active.cleanup.broker_closed = false;
 
+        active.vm_start_attempted = true;
+        active.cleanup.vm_killed = false;
         let vm = match vm_backend.start_vm(snapshot, &identity, &active.workspace, &broker) {
             Ok(lease) => {
+                active.vm = Some(lease.clone());
                 if let Some(error) = validate_vm(&identity, &lease) {
                     let rollback = cleanup_active(
                         &mut active,
@@ -2068,11 +2088,11 @@ where
                 ));
             }
         };
-        active.vm = Some(vm.clone());
-        active.cleanup.vm_killed = false;
 
         let capability = match capability_backend.inject_root_capability(&identity, grant) {
             Ok(lease) => {
+                active.capability = Some(lease.clone());
+                active.cleanup.capability_revoked = false;
                 if let Some(error) = validate_capability(&identity, &lease) {
                     let rollback = cleanup_active(
                         &mut active,
@@ -2107,8 +2127,6 @@ where
                 ));
             }
         };
-        active.capability = Some(capability.clone());
-        active.cleanup.capability_revoked = false;
 
         match workload_backend.release_workload(&identity, &vm, &capability) {
             Ok(lease) => {
@@ -2359,10 +2377,15 @@ where
         }
     }
 
-    if !active.cleanup.vm_killed
-        && let Some(vm) = active.vm.as_ref()
-    {
-        match vm_backend.kill_vm(vm) {
+    if !active.cleanup.vm_killed {
+        let result = if let Some(vm) = active.vm.as_ref() {
+            vm_backend.kill_vm(vm)
+        } else if active.vm_start_attempted {
+            vm_backend.cleanup_failed_start()
+        } else {
+            Ok(())
+        };
+        match result {
             Ok(()) => active.cleanup.vm_killed = true,
             Err(error) => failures.push(CleanupFailure {
                 stage: CleanupStage::VmKill,
@@ -2397,4 +2420,411 @@ where
     }
 
     failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FOREIGN_SESSION: SessionId = SessionId::new([0xee; ID_BYTES]);
+
+    #[derive(Debug, Default)]
+    struct TestRandom(u8);
+
+    impl CryptographicRandom for TestRandom {
+        fn random_128(&mut self) -> Result<[u8; ID_BYTES], EntropyError> {
+            self.0 = self.0.wrapping_add(1);
+            Ok([self.0; ID_BYTES])
+        }
+    }
+
+    #[derive(Default)]
+    struct TestWorkspace {
+        mismatch: bool,
+        fail_isolate: bool,
+        isolated: Vec<WorkspaceLease>,
+    }
+
+    impl WorkspaceBackend for TestWorkspace {
+        fn clone_workspace(
+            &mut self,
+            identity: &SessionIdentity,
+            _template: &WorkspaceTemplateId,
+        ) -> Result<WorkspaceLease, BackendError> {
+            Ok(WorkspaceLease::new(
+                if self.mismatch {
+                    FOREIGN_SESSION
+                } else {
+                    identity.session_id()
+                },
+                identity.workspace_id(),
+            ))
+        }
+
+        fn isolate_workspace(&mut self, lease: &WorkspaceLease) -> Result<(), BackendError> {
+            self.isolated.push(lease.clone());
+            if self.fail_isolate {
+                Err(BackendError::new("workspace isolation failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct TestBroker {
+        mismatch: bool,
+        fail_close: bool,
+        closed: Vec<BrokerLease>,
+    }
+
+    impl BrokerBackend for TestBroker {
+        fn establish_broker_session(
+            &mut self,
+            identity: &SessionIdentity,
+        ) -> Result<BrokerLease, BackendError> {
+            Ok(BrokerLease::new(
+                if self.mismatch {
+                    FOREIGN_SESSION
+                } else {
+                    identity.session_id()
+                },
+                identity.broker_session_id(),
+            ))
+        }
+
+        fn close_broker_session(&mut self, lease: &BrokerLease) -> Result<(), BackendError> {
+            self.closed.push(lease.clone());
+            if self.fail_close {
+                Err(BackendError::new("Broker close failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    enum FailedStartCleanup {
+        #[default]
+        Succeed,
+        FailOnce,
+        AlwaysFail,
+    }
+
+    #[derive(Default)]
+    struct TestVm {
+        mismatch: bool,
+        fail_start: bool,
+        fail_kill: bool,
+        failed_start_cleanup: FailedStartCleanup,
+        failed_start_cleanup_calls: usize,
+        killed: Vec<VmLease>,
+    }
+
+    impl VmBackend for TestVm {
+        fn start_vm(
+            &mut self,
+            _snapshot: &SnapshotDescriptor,
+            identity: &SessionIdentity,
+            _workspace: &WorkspaceLease,
+            _broker: &BrokerLease,
+        ) -> Result<VmLease, BackendError> {
+            if self.fail_start {
+                return Err(BackendError::new("VM start failed"));
+            }
+            Ok(VmLease::new(
+                if self.mismatch {
+                    FOREIGN_SESSION
+                } else {
+                    identity.session_id()
+                },
+                identity.vm_id(),
+                identity.workspace_id(),
+                identity.broker_session_id(),
+            ))
+        }
+
+        fn cleanup_failed_start(&mut self) -> Result<(), BackendError> {
+            self.failed_start_cleanup_calls += 1;
+            let fail = match self.failed_start_cleanup {
+                FailedStartCleanup::Succeed => false,
+                FailedStartCleanup::FailOnce => self.failed_start_cleanup_calls == 1,
+                FailedStartCleanup::AlwaysFail => true,
+            };
+            if fail {
+                Err(BackendError::new("failed VM start cleanup failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn kill_vm(&mut self, lease: &VmLease) -> Result<(), BackendError> {
+            self.killed.push(lease.clone());
+            if self.fail_kill {
+                Err(BackendError::new("VM kill failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct TestCapability {
+        mismatch: bool,
+        fail_revoke: bool,
+        revoked: Vec<CapabilityLease>,
+    }
+
+    impl CapabilityRevocationBackend for TestCapability {
+        fn revoke_root_capability(&mut self, lease: &CapabilityLease) -> Result<(), BackendError> {
+            self.revoked.push(lease.clone());
+            if self.fail_revoke {
+                Err(BackendError::new("capability revoke failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl CapabilityBackend<()> for TestCapability {
+        fn inject_root_capability(
+            &mut self,
+            identity: &SessionIdentity,
+            _grant: &(),
+        ) -> Result<CapabilityLease, BackendError> {
+            Ok(CapabilityLease::new(
+                if self.mismatch {
+                    FOREIGN_SESSION
+                } else {
+                    identity.session_id()
+                },
+                identity.subject_id(),
+                identity.capability_id(),
+            ))
+        }
+    }
+
+    struct TestWorkload;
+
+    impl WorkloadBackend for TestWorkload {
+        fn release_workload(
+            &mut self,
+            identity: &SessionIdentity,
+            _vm: &VmLease,
+            _capability: &CapabilityLease,
+        ) -> Result<WorkloadLease, BackendError> {
+            Ok(WorkloadLease::new(
+                identity.session_id(),
+                identity.vm_id(),
+                identity.subject_id(),
+                identity.capability_id(),
+            ))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum MismatchCase {
+        Workspace,
+        Broker,
+        Vm,
+        Capability,
+    }
+
+    fn start(
+        orchestrator: &mut SessionOrchestrator<TestRandom>,
+        workspace: &mut TestWorkspace,
+        broker: &mut TestBroker,
+        vm: &mut TestVm,
+        capability: &mut TestCapability,
+    ) -> Result<SessionInfo, StartError> {
+        orchestrator.start_session(
+            &SnapshotDescriptor::clean(SnapshotId::new([0xa0; ID_BYTES])),
+            &WorkspaceTemplateId::new("test-template"),
+            &(),
+            workspace,
+            broker,
+            vm,
+            capability,
+            &mut TestWorkload,
+        )
+    }
+
+    fn mismatched_lease_cleanup_is_retryable(case: MismatchCase) {
+        let mut workspace = TestWorkspace::default();
+        let mut broker = TestBroker::default();
+        let mut vm = TestVm::default();
+        let mut capability = TestCapability::default();
+        let (resource, cleanup_stage) = match case {
+            MismatchCase::Workspace => {
+                workspace.mismatch = true;
+                workspace.fail_isolate = true;
+                (ResourceKind::Workspace, CleanupStage::WorkspaceIsolation)
+            }
+            MismatchCase::Broker => {
+                broker.mismatch = true;
+                broker.fail_close = true;
+                (ResourceKind::Broker, CleanupStage::BrokerClose)
+            }
+            MismatchCase::Vm => {
+                vm.mismatch = true;
+                vm.fail_kill = true;
+                (ResourceKind::Vm, CleanupStage::VmKill)
+            }
+            MismatchCase::Capability => {
+                capability.mismatch = true;
+                capability.fail_revoke = true;
+                (ResourceKind::Capability, CleanupStage::CapabilityRevoke)
+            }
+        };
+        let mut orchestrator = SessionOrchestrator::new(TestRandom::default());
+
+        let error = start(
+            &mut orchestrator,
+            &mut workspace,
+            &mut broker,
+            &mut vm,
+            &mut capability,
+        )
+        .expect_err("mismatched lease must fail startup");
+        assert!(matches!(
+            error.failure(),
+            StartFailure::CrossSessionLease {
+                resource: actual,
+                received: FOREIGN_SESSION,
+                ..
+            } if *actual == resource
+        ));
+        assert_eq!(error.rollback_failures()[0].stage(), cleanup_stage);
+        assert_eq!(orchestrator.state(), LifecycleState::Stopping);
+
+        workspace.fail_isolate = false;
+        broker.fail_close = false;
+        vm.fail_kill = false;
+        capability.fail_revoke = false;
+        orchestrator
+            .stop_session(&mut workspace, &mut broker, &mut vm, &mut capability)
+            .expect("cleanup retry must close the session");
+        assert_eq!(orchestrator.state(), LifecycleState::Closed);
+
+        match case {
+            MismatchCase::Workspace => assert_eq!(
+                workspace
+                    .isolated
+                    .iter()
+                    .map(WorkspaceLease::session_id)
+                    .collect::<Vec<_>>(),
+                vec![FOREIGN_SESSION, FOREIGN_SESSION]
+            ),
+            MismatchCase::Broker => assert_eq!(
+                broker
+                    .closed
+                    .iter()
+                    .map(BrokerLease::session_id)
+                    .collect::<Vec<_>>(),
+                vec![FOREIGN_SESSION, FOREIGN_SESSION]
+            ),
+            MismatchCase::Vm => assert_eq!(
+                vm.killed
+                    .iter()
+                    .map(VmLease::session_id)
+                    .collect::<Vec<_>>(),
+                vec![FOREIGN_SESSION, FOREIGN_SESSION]
+            ),
+            MismatchCase::Capability => assert_eq!(
+                capability
+                    .revoked
+                    .iter()
+                    .map(CapabilityLease::session_id)
+                    .collect::<Vec<_>>(),
+                vec![FOREIGN_SESSION, FOREIGN_SESSION]
+            ),
+        }
+    }
+
+    #[test]
+    fn mismatched_workspace_lease_cleanup_is_retained_for_retry() {
+        mismatched_lease_cleanup_is_retryable(MismatchCase::Workspace);
+    }
+
+    #[test]
+    fn mismatched_broker_lease_cleanup_is_retained_for_retry() {
+        mismatched_lease_cleanup_is_retryable(MismatchCase::Broker);
+    }
+
+    #[test]
+    fn mismatched_vm_lease_cleanup_is_retained_for_retry() {
+        mismatched_lease_cleanup_is_retryable(MismatchCase::Vm);
+    }
+
+    #[test]
+    fn mismatched_capability_lease_cleanup_is_retained_for_retry() {
+        mismatched_lease_cleanup_is_retryable(MismatchCase::Capability);
+    }
+
+    #[test]
+    fn transient_failed_vm_start_cleanup_is_retried_to_closed() {
+        let mut workspace = TestWorkspace::default();
+        let mut broker = TestBroker::default();
+        let mut vm = TestVm {
+            fail_start: true,
+            failed_start_cleanup: FailedStartCleanup::FailOnce,
+            ..TestVm::default()
+        };
+        let mut capability = TestCapability::default();
+        let mut orchestrator = SessionOrchestrator::new(TestRandom::default());
+
+        let error = start(
+            &mut orchestrator,
+            &mut workspace,
+            &mut broker,
+            &mut vm,
+            &mut capability,
+        )
+        .expect_err("VM start must fail");
+        assert_eq!(error.rollback_failures()[0].stage(), CleanupStage::VmKill);
+        assert_eq!(orchestrator.state(), LifecycleState::Stopping);
+        assert!(workspace.isolated.is_empty());
+
+        orchestrator
+            .stop_session(&mut workspace, &mut broker, &mut vm, &mut capability)
+            .expect("transient failed-start cleanup must be retryable");
+        assert_eq!(vm.failed_start_cleanup_calls, 2);
+        assert!(vm.killed.is_empty());
+        assert_eq!(workspace.isolated.len(), 1);
+        assert_eq!(orchestrator.state(), LifecycleState::Closed);
+    }
+
+    #[test]
+    fn persistent_failed_vm_start_cleanup_remains_stopping() {
+        let mut workspace = TestWorkspace::default();
+        let mut broker = TestBroker::default();
+        let mut vm = TestVm {
+            fail_start: true,
+            failed_start_cleanup: FailedStartCleanup::AlwaysFail,
+            ..TestVm::default()
+        };
+        let mut capability = TestCapability::default();
+        let mut orchestrator = SessionOrchestrator::new(TestRandom::default());
+
+        let start_error = start(
+            &mut orchestrator,
+            &mut workspace,
+            &mut broker,
+            &mut vm,
+            &mut capability,
+        )
+        .expect_err("VM start must fail");
+        assert_eq!(
+            start_error.rollback_failures()[0].stage(),
+            CleanupStage::VmKill
+        );
+        let stop_error = orchestrator
+            .stop_session(&mut workspace, &mut broker, &mut vm, &mut capability)
+            .expect_err("persistent cleanup failure must remain retryable");
+        assert!(matches!(stop_error, StopError::Cleanup(_)));
+        assert_eq!(vm.failed_start_cleanup_calls, 2);
+        assert!(vm.killed.is_empty());
+        assert!(workspace.isolated.is_empty());
+        assert_eq!(orchestrator.state(), LifecycleState::Stopping);
+    }
 }

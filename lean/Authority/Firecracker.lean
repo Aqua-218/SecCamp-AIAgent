@@ -23,9 +23,20 @@ structure PinnedArtifact where
   digest : Digest
   deriving DecidableEq
 
+/-- Exact lexical path checks performed by the Firecracker runtime boundary. -/
+def RuntimePathValid (path : Isolation.HostPath) : Prop :=
+  path.absolute = true ∧ ".." ∉ path.components ∧
+    (∀ component, component ∈ path.components → component.toLower ≠ "latest") ∧
+    ∀ component, component ∈ path.components → '\u0000' ∉ component.toList
+
+/-- Rust's nonempty ASCII alphanumeric/underscore/hyphen identifier grammar. -/
+def SafeName (name : String) : Prop :=
+  name ≠ "" ∧ ∀ character, character ∈ name.toList →
+    character.isAlphanum = true ∨ character = '_' ∨ character = '-'
+
 /-- Pure artifact validation predicate. -/
 def PinnedArtifact.Valid (artifact : PinnedArtifact) : Prop :=
-  artifact.path.CleanAbsolute ∧ artifact.digest.value ≠ 0
+  RuntimePathValid artifact.path ∧ artifact.digest.value ≠ 0
 
 /-- Six host namespaces required by the jailer boundary. -/
 structure NamespaceSwitches where
@@ -53,11 +64,11 @@ structure RuntimeConfig where
   apiSocket : Isolation.HostPath
   workspaceSource : Isolation.HostPath
   workspaceRoot : Isolation.HostPath
-  workspaceCloneIdSafe : Bool
+  workspaceCloneId : String
   verityDataDevice : Isolation.HostPath
   verityHashDevice : Isolation.HostPath
   verityRootHash : Digest
-  mapperNameSafe : Bool
+  mapperName : String
   vsockCid : Nat
   vsockSocket : Isolation.HostPath
   networkDevices : List String
@@ -106,18 +117,18 @@ structure RuntimeConfig.Valid (config : RuntimeConfig) : Prop where
   verityHashValid : config.verityHash.Valid
   jailerValid : config.jailer.Valid
   seccompFilterValid : config.seccompFilter.Valid
-  apiSocketSafe : config.apiSocket.CleanAbsolute
-  workspaceSourceSafe : config.workspaceSource.CleanAbsolute
-  workspaceRootSafe : config.workspaceRoot.CleanAbsolute
-  verityDataSafe : config.verityDataDevice.CleanAbsolute
-  verityHashDeviceSafe : config.verityHashDevice.CleanAbsolute
-  vsockSocketSafe : config.vsockSocket.CleanAbsolute
-  cgroupPathSafe : config.cgroupPath.CleanAbsolute
+  apiSocketSafe : RuntimePathValid config.apiSocket
+  workspaceSourceSafe : RuntimePathValid config.workspaceSource
+  workspaceRootSafe : RuntimePathValid config.workspaceRoot
+  verityDataSafe : RuntimePathValid config.verityDataDevice
+  verityHashDeviceSafe : RuntimePathValid config.verityHashDevice
+  vsockSocketSafe : RuntimePathValid config.vsockSocket
+  cgroupPathSafe : RuntimePathValid config.cgroupPath
   verityDataMatchesRootfs : config.verityDataDevice = config.rootfs.path
   verityHashMatchesArtifact : config.verityHashDevice = config.verityHash.path
   verityRootHashNonzero : config.verityRootHash.value ≠ 0
-  mapperNameValid : config.mapperNameSafe = true
-  cloneIdValid : config.workspaceCloneIdSafe = true
+  mapperNameValid : SafeName config.mapperName
+  cloneIdValid : SafeName config.workspaceCloneId
   workspaceDisjoint :
     ¬ config.workspaceSource.AtOrBelow config.workspaceRoot ∧
     ¬ config.workspaceRoot.AtOrBelow config.workspaceSource
@@ -391,6 +402,41 @@ theorem CleanupState.removed_implies_dependencies {state : CleanupState}
     (safe : state.Safe) (removed : state.workspaceRemoved = true) :
     state.processStopped = true ∧ state.verityOpened = false :=
   safe removed
+
+/-- Observable success/failure results of Rust's best-effort rollback calls. -/
+structure RollbackResults where
+  processStopSucceeded : Bool
+  verityCloseSucceeded : Bool
+  workspaceRemoveSucceeded : Bool
+  deriving DecidableEq
+
+/-- Rust rollback attempts all owned resources even after process-stop failure. -/
+def CleanupState.rollbackAttempt (state : CleanupState)
+    (results : RollbackResults) : CleanupState where
+  processStopped := state.processStopped || results.processStopSucceeded
+  verityOpened := state.verityOpened && !results.verityCloseSucceeded
+  workspaceRemoved := state.workspaceRemoved || results.workspaceRemoveSucceeded
+
+/-- Concrete failing-stop/successful-dependency rollback outcome. -/
+def unsafeRollbackResults : RollbackResults where
+  processStopSucceeded := false
+  verityCloseSucceeded := true
+  workspaceRemoveSucceeded := true
+
+/-- Current Rust rollback can remove backing resources while the process remains live. -/
+theorem rollback_stop_failure_can_violate_dependency_safety :
+    ¬ (CleanupState.live.rollbackAttempt unsafeRollbackResults).Safe := by
+  intro safe
+  have dependencies := safe (by rfl)
+  simp [CleanupState.live, CleanupState.rollbackAttempt, unsafeRollbackResults] at dependencies
+
+/-- Dependency-gated shutdown and best-effort rollback are distinct contracts. -/
+theorem unsafe_rollback_is_not_a_cleanup_step :
+    ¬ CleanupStep CleanupState.live
+      (CleanupState.live.rollbackAttempt unsafeRollbackResults) := by
+  intro transition
+  have violatesSafety := rollback_stop_failure_can_violate_dependency_safety
+  exact violatesSafety (transition.preserves_safety CleanupState.live_safe)
 
 end Firecracker
 

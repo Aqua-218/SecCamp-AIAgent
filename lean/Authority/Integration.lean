@@ -993,7 +993,7 @@ theorem capabilityStep_preserves_liveHandleOwnerExact
       have oldLookup : before.openHandles handleId = some handle := by
         simpa [CapabilityState.closeHandle, replace, differentId] using handleLookup
       exact ownerExact handleId handle oldLookup
-  | registerSubject | issueRoot | issueAllocatedRoot | derive | revoke |
+  | registerSubject | issueRoot | issueAllocatedRoot | derive | allocatorExhausted | revoke |
       beginClose | finishClose | successfulNoop =>
       exact ownerExact
 

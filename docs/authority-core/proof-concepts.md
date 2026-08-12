@@ -211,7 +211,7 @@ effect を1つも持たない file authority は、どの request にも match �
 
 この差があるため、file authority の完全性と同値には `child.effects.Nonempty` という前提が付く。健全性にはこの前提は不要で、空 effect でも「`true` なら権限を増幅しない」は常に成立する。
 
-## 証明から言えること、まだ言えないこと
+## 正確な保証範囲
 
 | 言えること | 条件・範囲 |
 |---|---|
@@ -231,6 +231,13 @@ effect を1つも持たない file authority は、どの request にも match �
 - Lean の外にあるコンパイラ、OS、ホストの identity 発行規則まで正しいこと。
 
 したがって、「数学的に不可能」と表現するときは、**Lean で定義したモデルと前提の範囲内で**という条件を付けるのが正確である。
+
+## 変更時の確認点
+
+- 新しい authority family を足すときは、このページの型（`Bool` 判定と `Prop` 仕様を分け、`iff` で結ぶ）に合わせる。判定だけ、あるいは仕様だけを書くと、以降の証明が組み立てられない。
+- 健全性と完全性のどちらが条件付きかを、定理名と仮定に明記する。[`crates/authority-core/src/file.rs`](../../crates/authority-core/src/file.rs) に対応する `fileBodyBelow_complete_of_effects_nonempty` が例。
+- 空集合が絡む命題を書くときは、空虚な真になっていないかを先に確認する。反例が作れないことと、主張が強いことは別。
+- 反射律・推移律を証明しないまま多段委譲を許さない。1 段ずつの判定だけでは、末端が root 以下である保証にならない。
 
 ## 関連
 

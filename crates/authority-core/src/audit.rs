@@ -15,6 +15,7 @@ use std::sync::{
 
 use crate::{
     capability::{CapId, CapabilityRequest, CapabilityRequestSet, SubjectId},
+    durable_audit::{CommitReceipt, DurableAuditError, DurableAuditLog},
     state::AuthorizationEpoch,
 };
 
@@ -28,6 +29,12 @@ const OUTCOME_COMMITTED: u8 = 3;
 pub struct AttemptId(u64);
 
 impl AttemptId {
+    /// Creates an attempt identity from a recovered session-local sequence.
+    #[must_use]
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
     /// Returns the numeric session-local identity.
     #[must_use]
     pub const fn as_u64(self) -> u64 {
@@ -180,12 +187,14 @@ impl EffectRecord {
 }
 
 /// A failure that prevents reliable audit recording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditError {
     /// An internal audit writer panicked while holding the record lock.
     LockPoisoned,
     /// The session-local attempt identity sequence cannot advance.
     AttemptIdExhausted,
+    /// The durable backend rejected or could not persist the journal update.
+    Durable(DurableAuditError),
 }
 
 impl fmt::Display for AuditError {
@@ -195,11 +204,25 @@ impl fmt::Display for AuditError {
             Self::AttemptIdExhausted => {
                 formatter.write_str("session-local attempt ID sequence is exhausted")
             }
+            Self::Durable(error) => error.fmt(formatter),
         }
     }
 }
 
-impl Error for AuditError {}
+impl Error for AuditError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Durable(error) => Some(error),
+            Self::LockPoisoned | Self::AttemptIdExhausted => None,
+        }
+    }
+}
+
+impl From<DurableAuditError> for AuditError {
+    fn from(error: DurableAuditError) -> Self {
+        Self::Durable(error)
+    }
+}
 
 #[derive(Debug)]
 struct AttemptJournal {
@@ -256,6 +279,7 @@ struct AuditState {
 #[derive(Debug)]
 pub(crate) struct AuditTrail {
     state: Mutex<AuditState>,
+    backend: Option<Arc<DurableAuditLog>>,
 }
 
 impl AuditTrail {
@@ -265,7 +289,19 @@ impl AuditTrail {
                 next_attempt_sequence: Some(0),
                 attempts: Vec::new(),
             }),
+            backend: None,
         }
+    }
+
+    pub(crate) fn new_with_backend(backend: Arc<DurableAuditLog>) -> Result<Self, AuditError> {
+        let next_attempt_sequence = backend.next_attempt_sequence()?;
+        Ok(Self {
+            state: Mutex::new(AuditState {
+                next_attempt_sequence,
+                attempts: Vec::new(),
+            }),
+            backend: Some(backend),
+        })
     }
 
     #[cfg(test)]
@@ -298,6 +334,18 @@ impl AuditTrail {
             .take()
             .ok_or(AuditError::AttemptIdExhausted)?;
         state.next_attempt_sequence = sequence.checked_add(1);
+        if let Some(backend) = &self.backend
+            && let Err(error) = backend.begin_attempt(
+                AttemptId::from_u64(sequence),
+                &caller,
+                &capability_id,
+                requests,
+                authorization_epoch,
+            )
+        {
+            state.next_attempt_sequence = Some(sequence);
+            return Err(AuditError::Durable(error));
+        }
         let journal = Arc::new(AttemptJournal {
             id: AttemptId(sequence),
             caller,
@@ -308,7 +356,10 @@ impl AuditTrail {
             outcome: AtomicU8::new(OUTCOME_STARTED),
         });
         state.attempts.push(Arc::clone(&journal));
-        Ok(AttemptGuard { journal })
+        Ok(AttemptGuard {
+            journal,
+            backend: self.backend.clone(),
+        })
     }
 
     pub(crate) fn attempts(&self) -> Result<Vec<AttemptRecord>, AuditError> {
@@ -332,19 +383,42 @@ impl AuditTrail {
 
 pub(crate) struct AttemptGuard {
     journal: Arc<AttemptJournal>,
+    backend: Option<Arc<DurableAuditLog>>,
 }
 
 impl AttemptGuard {
-    pub(crate) fn deny(self) {
-        self.journal.finish(AttemptOutcome::Denied);
+    pub(crate) fn id(&self) -> AttemptId {
+        self.journal.id
     }
 
-    pub(crate) fn fail_before_commit(self) {
-        self.journal.finish(AttemptOutcome::FailedBeforeCommit);
+    pub(crate) fn deny(self) -> Result<(), AuditError> {
+        self.finish(AttemptOutcome::Denied, None)
     }
 
-    pub(crate) fn commit(self) {
-        self.journal.finish(AttemptOutcome::Committed);
+    pub(crate) fn fail_before_commit(self) -> Result<(), AuditError> {
+        self.finish(AttemptOutcome::FailedBeforeCommit, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit(self) -> Result<(), AuditError> {
+        let receipt = CommitReceipt::kernel_success(self.journal.id);
+        self.commit_with_receipt(&receipt)
+    }
+
+    pub(crate) fn commit_with_receipt(self, receipt: &CommitReceipt) -> Result<(), AuditError> {
+        self.finish(AttemptOutcome::Committed, Some(receipt))
+    }
+
+    fn finish(
+        self,
+        outcome: AttemptOutcome,
+        receipt: Option<&CommitReceipt>,
+    ) -> Result<(), AuditError> {
+        if let Some(backend) = &self.backend {
+            backend.finish_attempt(self.journal.id, outcome, receipt)?;
+        }
+        self.journal.finish(outcome);
+        Ok(())
     }
 }
 
@@ -385,9 +459,11 @@ mod tests {
     #[test]
     fn effect_snapshots_include_only_committed_attempts() {
         let trail = AuditTrail::new();
-        start(&trail, 0).deny();
-        start(&trail, 1).fail_before_commit();
-        start(&trail, 2).commit();
+        start(&trail, 0).deny().expect("denial must be recorded");
+        start(&trail, 1)
+            .fail_before_commit()
+            .expect("pre-commit failure must be recorded");
+        start(&trail, 2).commit().expect("commit must be recorded");
 
         let attempts = trail
             .attempts()
@@ -424,6 +500,30 @@ mod tests {
                 .attempts()
                 .expect("the audit lock must remain healthy")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn poisoned_audit_lock_rejects_new_attempts() {
+        let trail = AuditTrail::new();
+        let poisoned = &trail;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = poisoned
+                        .state
+                        .lock()
+                        .expect("test audit lock must initially be healthy");
+                    panic!("poison in-memory audit lock");
+                })
+                .join()
+                .expect_err("the fixture thread must panic");
+        });
+
+        assert_eq!(
+            trail.attempts(),
+            Err(AuditError::LockPoisoned),
+            "a poisoned audit lock must not expose partial records"
         );
     }
 }

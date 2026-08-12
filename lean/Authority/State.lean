@@ -196,13 +196,27 @@ structure MayRegisterSubject (state : CapabilityState) (subject : Subject) where
     (∃ parent, state.subjects parentId = some parent) ∧
       state.subjectStatuses parentId = some .running
 
-/-- A direct parent edge records exact lineage and non-amplification. -/
+/-- A direct parent edge follows the immutable metadata pointer exactly. -/
 def DirectParent (state : CapabilityState) (child parent : CapId) : Prop :=
   ∃ childCapability parentCapability,
     state.capabilities child = some childCapability ∧
     state.capabilities parent = some parentCapability ∧
-    childCapability.metadata.parent = some parent ∧
-    weakerThan childCapability parentCapability = true
+    childCapability.metadata.parent = some parent
+
+/-- Every stored parent pointer resolves and is non-amplifying. -/
+def GraphWellFormed (state : CapabilityState) : Prop :=
+  ∀ childId childCapability parentId,
+    state.capabilities childId = some childCapability →
+    childCapability.metadata.parent = some parentId →
+    ∃ parentCapability,
+      state.capabilities parentId = some parentCapability ∧
+      weakerThan childCapability parentCapability = true
+
+/-- The empty capability graph is well formed. -/
+theorem empty_graphWellFormed (issuer : IssuerId) :
+    (empty issuer).GraphWellFormed := by
+  intro childId childCapability parentId childLookup
+  simp [empty] at childLookup
 
 /-- A capability lies on its own finite parent chain. -/
 inductive OnChain (state : CapabilityState) : CapId → CapId → Prop
@@ -224,6 +238,7 @@ theorem OnChain.ancestor_was_issued {state : CapabilityState}
 
 /-- Every member of a capability chain is no stronger than every ancestor. -/
 theorem OnChain.weakerThan {state : CapabilityState} {child ancestor : CapId}
+    (graphWellFormed : state.GraphWellFormed)
     (chain : OnChain state child ancestor) :
     ∀ {childCapability ancestorCapability : Capability},
       state.capabilities child = some childCapability →
@@ -243,20 +258,26 @@ theorem OnChain.weakerThan {state : CapabilityState} {child ancestor : CapId}
       intro childCapability ancestorCapability childLookup ancestorLookup
       rcases directParent with
         ⟨directChild, directParentCapability, directChildLookup, directParentLookup,
-          _, directNonAmplification⟩
+          parentPointer⟩
       have childIsStored : childCapability = directChild :=
         Option.some.inj (childLookup.symm.trans directChildLookup)
       subst childCapability
+      rcases graphWellFormed _ _ _ directChildLookup parentPointer with
+        ⟨verifiedParent, verifiedParentLookup, directNonAmplification⟩
+      have parentIsVerified : directParentCapability = verifiedParent := Option.some.inj
+        (directParentLookup.symm.trans verifiedParentLookup)
+      subst verifiedParent
       exact weakerThan_trans directNonAmplification
         (inductionResult directParentLookup ancestorLookup)
 
 /-- Arbitrarily deep delegation preserves the complete request set. -/
 theorem OnChain.matches_subset {state : CapabilityState} {child ancestor : CapId}
+    (graphWellFormed : state.GraphWellFormed)
     (chain : OnChain state child ancestor) {childCapability ancestorCapability : Capability}
     (childLookup : state.capabilities child = some childCapability)
     (ancestorLookup : state.capabilities ancestor = some ancestorCapability) :
     ∀ request, childCapability.Matches request → ancestorCapability.Matches request :=
-  weakerThan_sound (chain.weakerThan childLookup ancestorLookup)
+  weakerThan_sound (chain.weakerThan graphWellFormed childLookup ancestorLookup)
 
 /-- Every capability and ancestor must be unrevoked and time-valid. -/
 def EffectivelyActive (state : CapabilityState) (capability : CapId)
@@ -494,7 +515,7 @@ theorem derive_creates_direct_parent {state : CapabilityState}
   refine ⟨state.capabilityFromGrant childId (some parentId) grant,
     allowed.parentCapability,
     issue_stores_exact_capability state childId (some parentId) grant, ?_,
-    by simp [capabilityFromGrant], allowed.child_weakerThan_parent⟩
+    by simp [capabilityFromGrant]⟩
   have differentIds : parentId ≠ childId := by
     intro sameIdentity
     subst childId
@@ -512,6 +533,70 @@ theorem derive_extends_chain {state : CapabilityState}
     (parentChain : OnChain (state.issue childId (some parentId) grant) parentId ancestor) :
     OnChain (state.issue childId (some parentId) grant) childId ancestor :=
   .next (derive_creates_direct_parent allowed) parentChain
+
+/-- Fresh issuance preserves graph integrity when its optional parent is valid. -/
+theorem issue_preserves_graphWellFormed {state : CapabilityState}
+    (graphWellFormed : state.GraphWellFormed) {issuedId : CapId}
+    {parent : Option CapId} {grant : CapabilityGrant}
+    (fresh : state.capabilities issuedId = none)
+    (parentValid : ∀ parentId, parent = some parentId →
+      ∃ parentCapability,
+        state.capabilities parentId = some parentCapability ∧
+        weakerThan (state.capabilityFromGrant issuedId parent grant)
+          parentCapability = true) :
+    (state.issue issuedId parent grant).GraphWellFormed := by
+  intro childId childCapability parentId childLookup parentPointer
+  by_cases newChild : childId = issuedId
+  · subst childId
+    have exactChild : childCapability =
+        state.capabilityFromGrant issuedId parent grant := Option.some.inj
+      (childLookup.symm.trans (issue_stores_exact_capability state issuedId parent grant))
+    subst childCapability
+    have exactParent : parent = some parentId := by
+      simpa [capabilityFromGrant] using parentPointer
+    rcases parentValid parentId exactParent with
+      ⟨parentCapability, parentLookup, nonAmplification⟩
+    refine ⟨parentCapability, ?_, nonAmplification⟩
+    have differentIds : parentId ≠ issuedId := by
+      intro sameId
+      subst parentId
+      rw [fresh] at parentLookup
+      cases parentLookup
+    simpa [issue, replace, differentIds] using parentLookup
+  · have oldChildLookup : state.capabilities childId = some childCapability := by
+      simpa [issue, replace, newChild] using childLookup
+    rcases graphWellFormed childId childCapability parentId oldChildLookup parentPointer with
+      ⟨parentCapability, parentLookup, nonAmplification⟩
+    refine ⟨parentCapability, ?_, nonAmplification⟩
+    have differentIds : parentId ≠ issuedId := by
+      intro sameId
+      subst parentId
+      rw [fresh] at parentLookup
+      cases parentLookup
+    simpa [issue, replace, differentIds] using parentLookup
+
+/-- Root issuance adds no parent pointer and preserves graph integrity. -/
+theorem MayIssueRoot.preserves_graphWellFormed {state : CapabilityState}
+    {capabilityId : CapId} {grant : CapabilityGrant}
+    (allowed : MayIssueRoot state capabilityId grant)
+    (graphWellFormed : state.GraphWellFormed) :
+    (state.issue capabilityId none grant).GraphWellFormed := by
+  apply issue_preserves_graphWellFormed graphWellFormed allowed.capabilityFresh
+  intro parentId impossibleParent
+  cases impossibleParent
+
+/-- Derived issuance extends the graph with one verified non-amplifying edge. -/
+theorem MayDerive.preserves_graphWellFormed {state : CapabilityState}
+    {caller : SubjectId} {parentId childId : CapId} {grant : CapabilityGrant}
+    {now : MonotonicTime} (allowed : MayDerive state caller parentId childId grant now)
+    (graphWellFormed : state.GraphWellFormed) :
+    (state.issue childId (some parentId) grant).GraphWellFormed := by
+  apply issue_preserves_graphWellFormed graphWellFormed allowed.childFresh
+  intro queriedParent exactParent
+  have sameParent : queriedParent = parentId := Option.some.inj exactParent.symm
+  subst queriedParent
+  exact ⟨allowed.parentCapability, allowed.parentLookup,
+    allowed.child_weakerThan_parent⟩
 
 /-- Direct revocation changes only the monotone revoke set and epoch. -/
 def revoke (state : CapabilityState) (capabilityId : CapId) : CapabilityState :=
@@ -639,6 +724,21 @@ def MayCloseHandle (state : CapabilityState) (caller : SubjectId)
     (handleId : HandleId) : Prop :=
   state.issuedHandleOwners handleId = some caller
 
+/-- Successful idempotent calls that deliberately leave the state unchanged. -/
+inductive MaySucceedWithoutChange (state : CapabilityState) : Prop
+  | revokeAlready {capabilityId : CapId} :
+      state.WasIssued capabilityId → state.revoked capabilityId = true →
+      MaySucceedWithoutChange state
+  | beginCloseAlreadyClosing {subject : SubjectId} :
+      state.subjectStatuses subject = some .closing → MaySucceedWithoutChange state
+  | beginCloseAlreadyClosed {subject : SubjectId} :
+      state.subjectStatuses subject = some .closed → MaySucceedWithoutChange state
+  | finishCloseAlreadyClosed {subject : SubjectId} :
+      state.subjectStatuses subject = some .closed → MaySucceedWithoutChange state
+  | closeHandleAlreadyClosed {caller : SubjectId} {handleId : HandleId} :
+      state.MayCloseHandle caller handleId → state.openHandles handleId = none →
+      MaySucceedWithoutChange state
+
 /-- Ownership remains true after an authorized close. -/
 theorem closeHandle_preserves_ownership {state : CapabilityState}
     {caller : SubjectId} {handleId : HandleId}
@@ -677,6 +777,8 @@ inductive Step : CapabilityState → CapabilityState → Prop
   | closeHandle {state : CapabilityState} {caller : SubjectId} {handleId : HandleId} :
       state.MayCloseHandle caller handleId →
       Step state (state.closeHandle handleId)
+  | successfulNoop {state : CapabilityState} :
+      MaySucceedWithoutChange state → Step state state
 
 /-- Authorization epochs never decrease across accepted transitions. -/
 theorem Step.epoch_monotone {before after : CapabilityState}
@@ -691,6 +793,7 @@ theorem Step.epoch_monotone {before after : CapabilityState}
   | finishClose => exact Nat.le_refl _
   | registerHandle => exact Nat.le_refl _
   | closeHandle => exact Nat.le_refl _
+  | successfulNoop => exact Nat.le_refl _
 
 /-- Accepted transitions never remove an issued capability record. -/
 theorem Step.capability_records_persist {before after : CapabilityState}
@@ -724,6 +827,18 @@ theorem Step.capability_records_persist {before after : CapabilityState}
   | finishClose _ _ => exact lookupBefore
   | registerHandle _ _ => exact lookupBefore
   | closeHandle _ => exact lookupBefore
+  | successfulNoop _ => exact lookupBefore
+
+/-- Every accepted transition preserves non-amplifying parent graph integrity. -/
+theorem Step.graphWellFormed {before after : CapabilityState}
+    (transition : Step before after) (wellFormed : before.GraphWellFormed) :
+    after.GraphWellFormed := by
+  cases transition with
+  | registerSubject => exact wellFormed
+  | issueRoot allowed => exact allowed.preserves_graphWellFormed wellFormed
+  | derive allowed => exact allowed.preserves_graphWellFormed wellFormed
+  | revoke | beginClose | finishClose | registerHandle | closeHandle |
+      successfulNoop => exact wellFormed
 
 /-- Accepted transitions never undo a direct revocation. -/
 theorem Step.revocation_monotone {before after : CapabilityState}
@@ -739,6 +854,7 @@ theorem Step.revocation_monotone {before after : CapabilityState}
   | finishClose => exact revokedBefore
   | registerHandle => exact revokedBefore
   | closeHandle => exact revokedBefore
+  | successfulNoop => exact revokedBefore
 
 /-- Accepted transitions never forget that a handle identity was issued. -/
 theorem Step.handle_identity_persists {before after : CapabilityState}
@@ -759,6 +875,7 @@ theorem Step.handle_identity_persists {before after : CapabilityState}
       rw [ownerBefore] at fresh
       cases fresh
   | closeHandle _ => exact ownerBefore
+  | successfulNoop _ => exact ownerBefore
 
 /-- Held capabilities are never silently removed by an accepted transition. -/
 theorem Step.holdings_persist {before after : CapabilityState}
@@ -775,6 +892,7 @@ theorem Step.holdings_persist {before after : CapabilityState}
   | finishClose => exact heldBefore
   | registerHandle => exact heldBefore
   | closeHandle => exact heldBefore
+  | successfulNoop => exact heldBefore
 
 /-- Once a registered subject is closed, accepted transitions cannot revive it. -/
 theorem Step.closed_subject_remains_closed {before after : CapabilityState}
@@ -792,6 +910,128 @@ theorem Step.closed_subject_remains_closed {before after : CapabilityState}
   | finishClose => exact finishSubjectClose_preserves_closed _ _ _ closedBefore
   | registerHandle => exact closedBefore
   | closeHandle => exact closedBefore
+  | successfulNoop => exact closedBefore
+
+/-- Metadata parent edges persist because capability records are immutable. -/
+theorem Step.directParent_persists {before after : CapabilityState}
+    (transition : Step before after) {child parent : CapId}
+    (edge : before.DirectParent child parent) :
+    after.DirectParent child parent := by
+  rcases edge with ⟨childCapability, parentCapability, childLookup, parentLookup,
+    parentPointer⟩
+  exact ⟨childCapability, parentCapability,
+    transition.capability_records_persist childLookup,
+    transition.capability_records_persist parentLookup, parentPointer⟩
+
+/-- Complete raw parent ancestry persists across every accepted transition. -/
+theorem Step.onChain_persists {before after : CapabilityState}
+    (transition : Step before after) {child ancestor : CapId}
+    (chain : before.OnChain child ancestor) : after.OnChain child ancestor := by
+  induction chain with
+  | self capability lookup =>
+      exact .self capability (transition.capability_records_persist lookup)
+  | next edge _ inductionResult =>
+      exact .next (transition.directParent_persists edge) inductionResult
+
+/-- A closed, permanently reserved handle identity cannot be reopened by one step. -/
+theorem Step.closed_handle_stays_closed {before after : CapabilityState}
+    (transition : Step before after) {handleId : HandleId} {owner : SubjectId}
+    (issued : before.issuedHandleOwners handleId = some owner)
+    (closed : before.openHandles handleId = none) :
+    after.openHandles handleId = none := by
+  cases transition with
+  | registerSubject | issueRoot | derive | revoke | beginClose | finishClose |
+      successfulNoop => exact closed
+  | registerHandle running fresh =>
+      rename_i handle
+      have differentId : handleId ≠ handle.id := by
+        intro sameId
+        subst handleId
+        rw [issued] at fresh
+        cases fresh
+      simpa [registerOpenHandle, replace, differentId] using closed
+  | closeHandle owned =>
+      rename_i caller closedId
+      by_cases sameId : handleId = closedId
+      · subst handleId
+        exact closeHandle_removes_live_record before closedId
+      · simpa [CapabilityState.closeHandle, replace, sameId] using closed
+
+/-- Finite accepted executions of the complete capability state machine. -/
+inductive Steps : CapabilityState → CapabilityState → Prop
+  | refl (state : CapabilityState) : Steps state state
+  | tail {first middle last : CapabilityState} :
+      Steps first middle → Step middle last → Steps first last
+
+/-- Authorization epochs never decrease across a finite execution. -/
+theorem Steps.epoch_monotone {before after : CapabilityState}
+    (transitions : Steps before after) :
+    before.authorizationEpoch ≤ after.authorizationEpoch := by
+  induction transitions with
+  | refl => exact Nat.le_refl _
+  | tail _ transition inductionHypothesis =>
+      exact Nat.le_trans inductionHypothesis transition.epoch_monotone
+
+/-- Capability records remain immutable across a finite execution. -/
+theorem Steps.capability_records_persist {before after : CapabilityState}
+    (transitions : Steps before after) {capabilityId : CapId} {record : Capability}
+    (lookup : before.capabilities capabilityId = some record) :
+    after.capabilities capabilityId = some record := by
+  induction transitions with
+  | refl => exact lookup
+  | tail _ transition inductionHypothesis =>
+      exact transition.capability_records_persist inductionHypothesis
+
+/-- Revocation remains effective across a finite execution. -/
+theorem Steps.revocation_monotone {before after : CapabilityState}
+    (transitions : Steps before after) {capabilityId : CapId}
+    (revoked : before.revoked capabilityId = true) :
+    after.revoked capabilityId = true := by
+  induction transitions with
+  | refl => exact revoked
+  | tail _ transition inductionHypothesis =>
+      exact transition.revocation_monotone inductionHypothesis
+
+/-- Graph integrity is inductive across every finite execution. -/
+theorem Steps.graphWellFormed {before after : CapabilityState}
+    (transitions : Steps before after) (wellFormed : before.GraphWellFormed) :
+    after.GraphWellFormed := by
+  induction transitions with
+  | refl => exact wellFormed
+  | tail _ transition inductionHypothesis =>
+      exact transition.graphWellFormed inductionHypothesis
+
+/-- Raw parent ancestry remains stable across every finite execution. -/
+theorem Steps.onChain_persists {before after : CapabilityState}
+    (transitions : Steps before after) {child ancestor : CapId}
+    (chain : before.OnChain child ancestor) : after.OnChain child ancestor := by
+  induction transitions with
+  | refl => exact chain
+  | tail _ transition inductionHypothesis =>
+      exact transition.onChain_persists inductionHypothesis
+
+/-- Handle identity ownership remains permanent across every finite execution. -/
+theorem Steps.handle_identity_persists {before after : CapabilityState}
+    (transitions : Steps before after) {handleId : HandleId} {owner : SubjectId}
+    (issued : before.issuedHandleOwners handleId = some owner) :
+    after.issuedHandleOwners handleId = some owner := by
+  induction transitions with
+  | refl => exact issued
+  | tail _ transition inductionHypothesis =>
+      exact transition.handle_identity_persists inductionHypothesis
+
+/-- Closed issued handle identities remain closed across every finite execution. -/
+theorem Steps.closed_handle_never_reopens {before after : CapabilityState}
+    (transitions : Steps before after) {handleId : HandleId} {owner : SubjectId}
+    (issued : before.issuedHandleOwners handleId = some owner)
+    (closed : before.openHandles handleId = none) :
+    after.openHandles handleId = none := by
+  induction transitions with
+  | refl => exact closed
+  | tail firstTransitions transition inductionHypothesis =>
+      exact transition.closed_handle_stays_closed
+        (firstTransitions.handle_identity_persists issued)
+        inductionHypothesis
 
 end CapabilityState
 

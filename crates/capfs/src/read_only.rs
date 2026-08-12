@@ -764,6 +764,9 @@ impl CapabilityFilesystem {
         let opened = self
             .namespace
             .open_object_with_commit_outcome(&object, |object| {
+                if let Err(error) = self.ensure_healthy() {
+                    return NamespaceExecutorOutcome::FailedBeforeCommit(error);
+                }
                 if object.kind() != expected_kind {
                     return NamespaceExecutorOutcome::FailedBeforeCommit(kind_error);
                 }
@@ -842,6 +845,9 @@ impl CapabilityFilesystem {
             name,
             NamespaceObjectSpec::RegularFile,
             |live_parent, child| {
+                if let Err(error) = self.ensure_healthy() {
+                    return NamespaceExecutorOutcome::FailedBeforeCommit(error);
+                }
                 if self
                     .kernel
                     .register_open_handle(OpenHandle::new(
@@ -942,6 +948,9 @@ impl CapabilityFilesystem {
             name,
             NamespaceObjectSpec::Directory,
             |live_parent, child| {
+                if let Err(error) = self.ensure_healthy() {
+                    return NamespaceExecutorOutcome::FailedBeforeCommit(error);
+                }
                 let requests = match self.object_requests(&[FileEffect::CreateDirectory], child) {
                     Ok(requests) => requests,
                     Err(error) => {
@@ -1044,6 +1053,9 @@ impl CapabilityFilesystem {
             name,
             NamespaceObjectSpec::Symlink(target.clone()),
             |live_parent, child| {
+                if let Err(error) = self.ensure_healthy() {
+                    return NamespaceExecutorOutcome::FailedBeforeCommit(error);
+                }
                 let requests = match self.object_requests(&[FileEffect::CreateSymlink], child) {
                     Ok(requests) => requests,
                     Err(error) => {
@@ -1117,6 +1129,9 @@ impl CapabilityFilesystem {
                 new_name,
                 &source,
                 |live_parent, linked, link_path| {
+                    if let Err(error) = self.ensure_healthy() {
+                        return NamespaceExecutorOutcome::FailedBeforeCommit(error);
+                    }
                     let Some(source_path) = linked.paths().find(|path| *path != link_path).cloned()
                     else {
                         return NamespaceExecutorOutcome::FailedBeforeCommit(
@@ -1206,6 +1221,9 @@ impl CapabilityFilesystem {
             .map_err(|error| map_node_lookup_error(&error))?;
         self.namespace
             .remove_child_with_commit_outcome(&parent, name, |live_parent, child, removed_path| {
+                if let Err(error) = self.ensure_healthy() {
+                    return NamespaceExecutorOutcome::FailedBeforeCommit(error);
+                }
                 if child.kind() != expected_kind {
                     return NamespaceExecutorOutcome::FailedBeforeCommit(kind_error);
                 }
@@ -1248,6 +1266,9 @@ impl CapabilityFilesystem {
                 &destination_parent,
                 destination_name,
                 |plan| {
+                    if let Err(error) = self.ensure_healthy() {
+                        return NamespaceExecutorOutcome::FailedBeforeCommit(error);
+                    }
                     let requests = match self.rename_requests(plan) {
                         Ok(requests) => requests,
                         Err(error) => {
@@ -1412,7 +1433,8 @@ impl CapabilityFilesystem {
         };
 
         self.namespace
-            .with_object(&resource.object, |object| {
+            .with_object_mutation(&resource.object, |object| {
+                self.ensure_healthy()?;
                 self.with_authorized_object(object, FileEffect::WriteData, || {
                     backing
                         .write_at(offset, bytes)
@@ -1478,7 +1500,6 @@ impl CapabilityFilesystem {
                 })
             })
         }
-        .and_then(|commit| self.finish_truncate(commit))
     }
 
     /// Converts a post-syscall metadata observation into the FUSE result.
@@ -1510,7 +1531,8 @@ impl CapabilityFilesystem {
             .resolve(node)
             .map_err(|error| map_node_lookup_error(&error))?;
         self.namespace
-            .with_object(&object, |object| {
+            .with_object_mutation(&object, |object| {
+                self.ensure_healthy()?;
                 self.with_authorized_object(object, FileEffect::SetMetadata, || match update {
                     MetadataUpdate::Permissions(permissions) => self
                         .backing
@@ -1525,17 +1547,24 @@ impl CapabilityFilesystem {
             .map_err(|error| map_namespace_operation_error(&error))
     }
 
-    fn with_authorized_truncate<T>(
+    fn with_authorized_truncate(
         &self,
         object: &ObjectId,
-        operation: impl FnOnce(&NamespaceObject) -> Result<T, AdapterError>,
-    ) -> Result<T, AdapterError> {
+        operation: impl FnOnce(&NamespaceObject) -> Result<TruncateCommit, AdapterError>,
+    ) -> Result<BackingMetadata, AdapterError> {
         self.namespace
-            .with_object(object, |object| {
+            .with_object_mutation(object, |object| {
+                self.ensure_healthy()?;
                 if object.kind() != NamespaceObjectKind::RegularFile {
                     return Err(AdapterError::IsDirectory);
                 }
-                self.with_authorized_object(object, FileEffect::Truncate, || operation(object))
+                // The kernel first records the truncate as committed. Only
+                // then do we interpret its already-captured reply metadata;
+                // an unavailable observation quarantines while the repository
+                // mutation gate is still held.
+                let commit = self
+                    .with_authorized_object(object, FileEffect::Truncate, || operation(object))?;
+                self.finish_truncate(commit)
             })
             .map_err(|error| map_namespace_operation_error(&error))
     }
@@ -1923,15 +1952,20 @@ impl Filesystem for CapabilityFilesystem {
             return;
         }
 
-        let mutation = match supported_setattr_mutation(size, mode, atime, mtime) {
+        let entry = match supported_setattr_mutation(size, mode, atime, mtime) {
+            // `truncate_file` returns the metadata captured immediately after
+            // the mutation while the repository gate is still exclusive. Do
+            // not fetch attributes a second time after releasing that gate.
             Ok(SetattrMutation::Truncate(size)) => self
                 .truncate_file(node, handle.map(|value| value.0), size)
-                .map(|_| ()),
-            Ok(SetattrMutation::Metadata(update)) => self.set_metadata(node, update),
+                .map(|metadata| Entry { node, metadata }),
+            Ok(SetattrMutation::Metadata(update)) => self
+                .set_metadata(node, update)
+                .and_then(|()| self.getattr_entry(node, None)),
             Err(error) => Err(error),
         };
 
-        match mutation.and_then(|()| self.getattr_entry(node, None)) {
+        match entry {
             Ok(entry) => reply.attr(&ATTRIBUTE_TTL, &file_attr(entry.node, entry.metadata)),
             Err(error) => reply.error(error.errno()),
         }
@@ -2685,7 +2719,7 @@ mod tests {
     };
 
     use authority_core::{
-        audit::AuditError,
+        audit::{AttemptOutcome, AuditError},
         capability::{AuthorityBody, AuthorityRequest, IssuerId, SubjectId},
         file::{FileAuthority, FileEffect, FileEffects},
         kernel::{CapabilityKernel, EffectCommitError},
@@ -3516,13 +3550,37 @@ mod tests {
     // effect as failed-before-commit.
     #[test]
     fn post_truncate_metadata_failure_quarantines_the_repository() {
-        let (_directory, filesystem, _kernel, _capability) = test_filesystem();
+        let (_directory, filesystem, kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::only(FileEffect::Truncate),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("truncate authority must make its ancestor visible");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("truncate authority must make its target visible");
+        let object = filesystem
+            .nodes
+            .resolve(allowed.node)
+            .expect("test node must resolve to the truncated object");
 
         assert_eq!(
-            filesystem.finish_truncate(TruncateCommit::MetadataUnavailable),
+            filesystem
+                .with_authorized_truncate(&object, |_| { Ok(TruncateCommit::MetadataUnavailable) }),
             Err(AdapterError::Internal)
         );
         assert!(filesystem.namespace.is_in_doubt());
+        assert_eq!(
+            kernel
+                .attempt_records()
+                .expect("truncate audit must remain readable")
+                .last()
+                .expect("truncate must append one audit attempt")
+                .outcome(),
+            AttemptOutcome::Committed,
+            "reply metadata failure must not falsify the committed truncate"
+        );
         assert_eq!(filesystem.ensure_healthy(), Err(AdapterError::Internal));
         assert!(matches!(
             filesystem.lookup_entry(NodeId::ROOT, "scoped"),

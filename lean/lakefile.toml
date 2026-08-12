@@ -12,3 +12,7 @@ name = "AuthorityTests"
 [[lean_exe]]
 name = "authority_corpus"
 root = "AuthorityCorpus"
+
+[[lean_exe]]
+name = "authority_runtime_corpus"
+root = "AuthorityRuntimeCorpus"

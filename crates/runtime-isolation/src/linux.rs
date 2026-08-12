@@ -5,6 +5,7 @@ mod implementation {
     use std::{
         ffi::CString,
         fs, io,
+        num::NonZeroU32,
         os::fd::RawFd,
         os::unix::ffi::OsStrExt,
         os::unix::fs::MetadataExt,
@@ -13,7 +14,8 @@ mod implementation {
 
     use crate::{
         BackendError, BindMountConfig, CapabilityReport, CgroupConfig, IdentityMap,
-        IsolationBackend, IsolationConfig, IsolationStep, LandlockConfig, SeccompPolicy,
+        IsolatedChildProcess, IsolationBackend, IsolationConfig, IsolationStep, LandlockConfig,
+        NamespaceIdentity, NamespacePreparation, PidNamespaceChild, SeccompPolicy, SpawnOutcome,
     };
 
     const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
@@ -79,21 +81,9 @@ mod implementation {
     const PID_NAMESPACE_FOR_CHILDREN: &str = "/proc/self/ns/pid_for_children";
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct NamespaceIdentity {
-        device: u64,
-        inode: u64,
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct PidNamespaceObservation {
         current: NamespaceIdentity,
         for_children: NamespaceIdentity,
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct PidNamespaceHandoff {
-        parent: NamespaceIdentity,
-        child: NamespaceIdentity,
     }
 
     #[repr(C)]
@@ -141,6 +131,7 @@ mod implementation {
         created_cgroup: Option<PathBuf>,
         rootfs_pivoted: bool,
         max_capability_index: Option<libc::c_int>,
+        prepared_pid_namespaces: Option<(NamespaceIdentity, NamespaceIdentity)>,
     }
 
     impl LinuxBackend {
@@ -151,6 +142,7 @@ mod implementation {
                 created_cgroup: None,
                 rootfs_pivoted: false,
                 max_capability_index: None,
+                prepared_pid_namespaces: None,
             }
         }
     }
@@ -228,13 +220,106 @@ mod implementation {
             report
         }
 
+        fn prepare_namespaces(
+            &mut self,
+            _config: &IsolationConfig,
+        ) -> Result<NamespacePreparation, BackendError> {
+            if self.prepared_pid_namespaces.is_some() {
+                return Err(BackendError::new(
+                    IsolationStep::Namespaces,
+                    "namespace preparation already has an unconsumed child handoff",
+                    None,
+                ));
+            }
+            let preparation = prepare_namespaces(IsolationStep::Namespaces)?;
+            self.prepared_pid_namespaces = Some((preparation.parent(), preparation.child()));
+            Ok(preparation)
+        }
+
+        fn spawn_isolated<T, F>(
+            &mut self,
+            preparation: NamespacePreparation,
+            child_entry: F,
+        ) -> Result<SpawnOutcome<T>, BackendError>
+        where
+            F: FnOnce(&mut Self, NamespacePreparation) -> T,
+        {
+            let expected_namespaces = self.prepared_pid_namespaces.take().ok_or_else(|| {
+                BackendError::new(
+                    IsolationStep::Namespaces,
+                    "PID namespace handoff has no matching backend preparation",
+                    None,
+                )
+            })?;
+            if expected_namespaces != (preparation.parent(), preparation.child()) {
+                return Err(BackendError::new(
+                    IsolationStep::Namespaces,
+                    "PID namespace handoff token does not match backend preparation",
+                    None,
+                ));
+            }
+            if !process_is_single_threaded(IsolationStep::Namespaces)? {
+                return Err(BackendError::new(
+                    IsolationStep::Namespaces,
+                    "PID namespace handoff requires a single-threaded launcher process",
+                    None,
+                ));
+            }
+            let child_namespace = preparation.child();
+            // SAFETY: Namespace preparation can succeed only for a single-threaded
+            // launcher. The parent returns immediately; the child invokes the
+            // caller-provided continuation in its independent address space.
+            let fork_result = unsafe { libc::fork() };
+            match fork_result {
+                -1 => Err(last_error(
+                    IsolationStep::Namespaces,
+                    "fork prepared PID namespace child",
+                )),
+                0 => {
+                    validate_pid_namespace_child_entry(
+                        IsolationStep::Namespaces,
+                        &preparation,
+                        observe_pid_namespaces(IsolationStep::Namespaces)?,
+                    )?;
+                    Ok(SpawnOutcome::Child(child_entry(self, preparation)))
+                }
+                child_pid => {
+                    let child_pid = u32::try_from(child_pid)
+                        .ok()
+                        .and_then(NonZeroU32::new)
+                        .ok_or_else(|| {
+                            BackendError::new(
+                                IsolationStep::Namespaces,
+                                "fork returned an invalid child PID",
+                                None,
+                            )
+                        })?;
+                    Ok(SpawnOutcome::Parent(IsolatedChildProcess::attest(
+                        child_pid,
+                        child_namespace,
+                    )))
+                }
+            }
+        }
+
+        fn verify_pid_namespace_child(
+            &mut self,
+            preparation: NamespacePreparation,
+        ) -> Result<PidNamespaceChild, BackendError> {
+            verify_pid_namespace_child_entry(IsolationStep::Namespaces, preparation)
+        }
+
         fn apply_step(
             &mut self,
             step: IsolationStep,
             config: &IsolationConfig,
         ) -> Result<(), BackendError> {
             match step {
-                IsolationStep::Namespaces => create_namespaces(step),
+                IsolationStep::Namespaces => Err(BackendError::new(
+                    step,
+                    "namespace setup requires the explicit prepare and child handoff API",
+                    None,
+                )),
                 IsolationStep::IdentityMap => install_identity_map(step, config.identity),
                 IsolationStep::CgroupV2 => self.configure_cgroup(step, &config.cgroup),
                 IsolationStep::ReadOnlyRootfs => self.mount_rootfs(step, config),
@@ -446,12 +531,7 @@ mod implementation {
         }
     }
 
-    fn create_namespaces(step: IsolationStep) -> Result<(), BackendError> {
-        let handoff = prepare_namespaces(step)?;
-        verify_pid_namespace_child_entry(step, handoff)
-    }
-
-    fn prepare_namespaces(step: IsolationStep) -> Result<PidNamespaceHandoff, BackendError> {
+    fn prepare_namespaces(step: IsolationStep) -> Result<NamespacePreparation, BackendError> {
         let before = observe_pid_namespaces(step)?;
         let flags = libc::CLONE_NEWUSER
             | libc::CLONE_NEWNS
@@ -482,32 +562,36 @@ mod implementation {
             ));
         }
 
-        Ok(PidNamespaceHandoff {
-            parent: prepared.current,
-            child: prepared.for_children,
-        })
+        Ok(NamespacePreparation::attest(
+            prepared.current,
+            prepared.for_children,
+        ))
     }
 
+    // Consuming the preparation token prevents a caller from verifying it twice.
+    #[allow(clippy::needless_pass_by_value)]
     fn verify_pid_namespace_child_entry(
         step: IsolationStep,
-        handoff: PidNamespaceHandoff,
-    ) -> Result<(), BackendError> {
-        validate_pid_namespace_child_entry(step, handoff, observe_pid_namespaces(step)?)
+        preparation: NamespacePreparation,
+    ) -> Result<PidNamespaceChild, BackendError> {
+        validate_pid_namespace_child_entry(step, &preparation, observe_pid_namespaces(step)?)?;
+        let child_namespace = preparation.child();
+        Ok(PidNamespaceChild::attest(child_namespace))
     }
 
     fn validate_pid_namespace_child_entry(
         step: IsolationStep,
-        handoff: PidNamespaceHandoff,
+        preparation: &NamespacePreparation,
         observed: PidNamespaceObservation,
     ) -> Result<(), BackendError> {
-        if observed.current == handoff.parent {
+        if observed.current == preparation.parent() {
             return Err(BackendError::new(
                 step,
                 "PID namespace is prepared only for the next child, but no child handoff occurred; refusing to report namespace isolation complete",
                 None,
             ));
         }
-        if observed.current != handoff.child {
+        if observed.current != preparation.child() {
             return Err(BackendError::new(
                 step,
                 "workload child entered an unexpected PID namespace; refusing to report namespace isolation complete",
@@ -1107,16 +1191,34 @@ mod implementation {
         })
     }
 
+    fn process_is_single_threaded(step: IsolationStep) -> Result<bool, BackendError> {
+        let mut tasks = fs::read_dir("/proc/self/task")
+            .map_err(|error| io_error(step, "inspect launcher thread count", &error))?;
+        let Some(first_task) = tasks.next() else {
+            return Err(BackendError::new(
+                step,
+                "launcher task directory contained no threads",
+                None,
+            ));
+        };
+        first_task.map_err(|error| io_error(step, "inspect launcher thread entry", &error))?;
+        match tasks.next() {
+            None => Ok(true),
+            Some(Ok(_)) => Ok(false),
+            Some(Err(error)) => Err(io_error(step, "inspect launcher thread entry", &error)),
+        }
+    }
+
     fn namespace_identity(
         step: IsolationStep,
         path: &Path,
     ) -> Result<NamespaceIdentity, BackendError> {
         let metadata = fs::metadata(path)
             .map_err(|error| io_error(step, "observe PID namespace identity", &error))?;
-        Ok(NamespaceIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
+        Ok(NamespaceIdentity::from_kernel(
+            metadata.dev(),
+            metadata.ino(),
+        ))
     }
 
     fn errno() -> i32 {
@@ -1207,8 +1309,8 @@ mod implementation {
             let observation = observe_pid_namespaces(IsolationStep::Namespaces)
                 .expect("procfs namespace links must be observable");
 
-            assert_ne!(observation.current.inode, 0);
-            assert_ne!(observation.for_children.inode, 0);
+            assert_ne!(observation.current.inode(), 0);
+            assert_ne!(observation.for_children.inode(), 0);
             assert_eq!(
                 observation.current,
                 namespace_identity(IsolationStep::Namespaces, Path::new(CURRENT_PID_NAMESPACE))
@@ -1218,17 +1320,11 @@ mod implementation {
 
         #[test]
         fn pid_namespace_verification_rejects_missing_child_handoff() {
-            let parent = NamespaceIdentity {
-                device: 4,
-                inode: 10,
-            };
-            let child = NamespaceIdentity {
-                device: 4,
-                inode: 11,
-            };
+            let parent = NamespaceIdentity::from_kernel(4, 10);
+            let child = NamespaceIdentity::from_kernel(4, 11);
             let error = validate_pid_namespace_child_entry(
                 IsolationStep::Namespaces,
-                PidNamespaceHandoff { parent, child },
+                &NamespacePreparation::attest(parent, child),
                 PidNamespaceObservation {
                     current: parent,
                     for_children: child,
@@ -1241,18 +1337,12 @@ mod implementation {
 
         #[test]
         fn pid_namespace_verification_accepts_the_expected_child() {
-            let parent = NamespaceIdentity {
-                device: 4,
-                inode: 10,
-            };
-            let child = NamespaceIdentity {
-                device: 4,
-                inode: 11,
-            };
+            let parent = NamespaceIdentity::from_kernel(4, 10);
+            let child = NamespaceIdentity::from_kernel(4, 11);
 
             validate_pid_namespace_child_entry(
                 IsolationStep::Namespaces,
-                PidNamespaceHandoff { parent, child },
+                &NamespacePreparation::attest(parent, child),
                 PidNamespaceObservation {
                     current: child,
                     for_children: child,
@@ -1263,21 +1353,12 @@ mod implementation {
 
         #[test]
         fn pid_namespace_verification_rejects_a_nested_pending_namespace() {
-            let parent = NamespaceIdentity {
-                device: 4,
-                inode: 10,
-            };
-            let child = NamespaceIdentity {
-                device: 4,
-                inode: 11,
-            };
-            let nested = NamespaceIdentity {
-                device: 4,
-                inode: 12,
-            };
+            let parent = NamespaceIdentity::from_kernel(4, 10);
+            let child = NamespaceIdentity::from_kernel(4, 11);
+            let nested = NamespaceIdentity::from_kernel(4, 12);
             let error = validate_pid_namespace_child_entry(
                 IsolationStep::Namespaces,
-                PidNamespaceHandoff { parent, child },
+                &NamespacePreparation::attest(parent, child),
                 PidNamespaceObservation {
                     current: child,
                     for_children: nested,
@@ -1286,6 +1367,151 @@ mod implementation {
             .expect_err("a second pending PID namespace must fail verification");
 
             assert!(error.message.contains("different pending PID namespace"));
+        }
+
+        #[test]
+        fn fork_rejects_a_handoff_not_owned_by_the_backend() {
+            let mut backend = LinuxBackend::new();
+            let preparation = NamespacePreparation::attest(
+                NamespaceIdentity::from_kernel(4, 10),
+                NamespaceIdentity::from_kernel(4, 11),
+            );
+
+            let error = backend
+                .spawn_isolated(preparation, |_child_backend, _child_preparation| ())
+                .expect_err("an unattested direct handoff must fail before fork");
+
+            assert!(error.message.contains("no matching backend preparation"));
+        }
+
+        #[test]
+        fn fork_rejects_a_multithreaded_launcher() {
+            let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(0);
+            let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+            let extra_thread = std::thread::spawn(move || {
+                ready_sender
+                    .send(())
+                    .expect("the test must announce its extra thread");
+                release_receiver
+                    .recv()
+                    .expect("the test must release its extra thread");
+            });
+            ready_receiver
+                .recv()
+                .expect("the extra thread must become live");
+
+            let parent_namespace = NamespaceIdentity::from_kernel(4, 10);
+            let child_namespace = NamespaceIdentity::from_kernel(4, 11);
+            let preparation = NamespacePreparation::attest(parent_namespace, child_namespace);
+            let mut backend = LinuxBackend::new();
+            backend.prepared_pid_namespaces = Some((parent_namespace, child_namespace));
+            let result: Result<SpawnOutcome<()>, BackendError> = backend
+                .spawn_isolated(preparation, |_child_backend, _child_preparation| {
+                    unreachable!("fork must not occur")
+                });
+
+            release_sender
+                .send(())
+                .expect("the test must release its extra thread");
+            extra_thread.join().expect("the extra thread must exit");
+            let error = result.expect_err("a multithreaded launcher must fail before fork");
+            assert!(error.message.contains("single-threaded launcher"));
+        }
+
+        #[test]
+        fn fork_parent_returns_handle_and_child_runs_continuation() {
+            if !process_is_single_threaded(IsolationStep::Namespaces)
+                .expect("the fork test must inspect its thread count")
+            {
+                // Rust's parallel test harness is multi-threaded. The production
+                // prepare call cannot succeed in that state, so exercise the real
+                // fork only when this test itself runs single-threaded.
+                return;
+            }
+            let mut pipe_fds = [-1; 2];
+            // SAFETY: `pipe_fds` points to storage for exactly two descriptors.
+            let pipe_result = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            assert_eq!(pipe_result, 0, "pipe creation failed: {}", errno());
+            let [read_fd, write_fd] = pipe_fds;
+            let observed = observe_pid_namespaces(IsolationStep::Namespaces)
+                .expect("the fork test must observe its current PID namespace");
+            assert_eq!(observed.current, observed.for_children);
+            let child_namespace = observed.current;
+            let parent_namespace = NamespaceIdentity::from_kernel(
+                child_namespace.device(),
+                child_namespace.inode() ^ 1,
+            );
+            let preparation = NamespacePreparation::attest(parent_namespace, child_namespace);
+            let mut backend = LinuxBackend::new();
+            backend.prepared_pid_namespaces = Some((parent_namespace, child_namespace));
+
+            let outcome: Result<SpawnOutcome<()>, BackendError> =
+                backend.spawn_isolated(preparation, move |_child_backend, _child_preparation| {
+                    // After fork, restrict the test child to async-signal-safe syscalls so it
+                    // cannot acquire a lock held by another test-harness thread.
+                    // SAFETY: Both descriptors were returned by `pipe2` and are process-local.
+                    unsafe {
+                        libc::close(read_fd);
+                        let marker = [0x5a_u8];
+                        let written = libc::write(write_fd, marker.as_ptr().cast(), marker.len());
+                        libc::close(write_fd);
+                        libc::_exit(i32::from(written != 1));
+                    }
+                });
+
+            // SAFETY: The parent owns both inherited descriptors after `fork` returns.
+            unsafe { libc::close(write_fd) };
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // SAFETY: The read descriptor remains owned by this parent on fork failure.
+                    unsafe { libc::close(read_fd) };
+                    panic!("fork must succeed for the isolated fork test: {error}");
+                }
+            };
+            let SpawnOutcome::Parent(child) = outcome else {
+                // The child branch exits in the continuation and cannot reach this assertion.
+                panic!("only the fork parent may return to the test harness");
+            };
+
+            let mut marker = [0_u8; 1];
+            let bytes_read = loop {
+                // SAFETY: `marker` is writable for one byte and `read_fd` remains open.
+                let result =
+                    unsafe { libc::read(read_fd, marker.as_mut_ptr().cast(), marker.len()) };
+                if result == -1 && errno() == libc::EINTR {
+                    continue;
+                }
+                break result;
+            };
+            // SAFETY: The parent no longer needs the read descriptor.
+            unsafe { libc::close(read_fd) };
+
+            let mut status = 0;
+            let waited_pid = loop {
+                // SAFETY: The PID came from `fork`; `status` is valid writable storage.
+                let result = unsafe {
+                    libc::waitpid(
+                        libc::pid_t::try_from(child.pid().get()).expect("child PID must fit pid_t"),
+                        &raw mut status,
+                        0,
+                    )
+                };
+                if result == -1 && errno() == libc::EINTR {
+                    continue;
+                }
+                break result;
+            };
+
+            assert_eq!(bytes_read, 1);
+            assert_eq!(marker, [0x5a]);
+            assert_eq!(
+                waited_pid,
+                libc::pid_t::try_from(child.pid().get()).expect("child PID must fit pid_t")
+            );
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+            assert_eq!(child.pid_namespace(), child_namespace);
         }
     }
 }

@@ -25,7 +25,7 @@ use capfs::{
     filesystem::{CapabilityFilesystem, MountAuthority, MountInstanceId, spawn_mount},
 };
 use fuser::BackgroundSession;
-use rustix::fs::{Mode, OFlags, RawDir, mkdirat, open};
+use rustix::fs::{AtFlags, Mode, OFlags, RawDir, mkdirat, open, unlinkat};
 use tempfile::tempdir;
 
 type MountedDirectoryView = (
@@ -413,6 +413,115 @@ fn mounted_view_creates_files_and_directories_with_capability_effects() {
         rustix::io::Errno::ACCESS
     );
     assert!(!backing.path().join("scoped/revoked-dir").exists());
+
+    drop(session);
+}
+
+// Requirement: FUSE UNLINK, RMDIR, and no-replace RENAME reach the same
+// authorized namespace transaction as their backing syscall. Category:
+// FUSE/mutation. Risk: critical.
+#[test]
+fn mounted_view_removes_and_renames_only_with_live_effects() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let backing = tempdir().expect("temporary backing directory must be creatable");
+    let mountpoint = tempdir().expect("temporary mountpoint must be creatable");
+    let scoped_backing = backing.path().join("scoped");
+    fs::create_dir(&scoped_backing).expect("authorized backing directory must be creatable");
+    fs::write(scoped_backing.join("old.txt"), b"rename me")
+        .expect("test backing file must be writable");
+    fs::write(scoped_backing.join("revoked.txt"), b"keep me")
+        .expect("revocation test file must be writable");
+    fs::create_dir(scoped_backing.join("empty")).expect("test backing directory must be creatable");
+    let repository = RepoId::new("workspace");
+    let imported = ImportedRepository::open(
+        repository.clone(),
+        backing.path(),
+        PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 2),
+    )
+    .expect("test backing must pass preflight");
+    let subject = SubjectId::new("fuse-mutation-subject");
+    let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+        .expect("test validity window must be non-empty");
+    let effects = FileEffects::from_effects([
+        FileEffect::ListDirectory,
+        FileEffect::RemoveFile,
+        FileEffect::RemoveDirectory,
+        FileEffect::Rename,
+    ]);
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "fuse-mutation-session",
+    ))));
+    kernel
+        .register_subject(Subject::new(
+            subject.clone(),
+            StaticAuthorityEnvelope::new(
+                validity,
+                AuthorityBody::File(FileAuthority::new(
+                    repository.clone(),
+                    effects,
+                    PathPattern::Prefix(CanonicalPath::root()),
+                )),
+            ),
+        ))
+        .expect("test subject registration must succeed");
+    let capability = kernel
+        .issue_root(CapabilityGrant::new(
+            subject.clone(),
+            validity,
+            AuthorityBody::File(FileAuthority::new(
+                repository.clone(),
+                effects,
+                PathPattern::Prefix(
+                    CanonicalPath::new(["scoped"]).expect("test path must be canonical"),
+                ),
+            )),
+        ))
+        .expect("test capability issuance must succeed");
+    let filesystem = CapabilityFilesystem::new(
+        imported,
+        Arc::clone(&kernel),
+        MountAuthority::new(
+            MountInstanceId::new("fuse-mutation-integration"),
+            subject,
+            capability.clone(),
+            repository,
+        ),
+        Arc::new(MonotonicTime::from_ticks(5)),
+    )
+    .expect("filesystem must initialize");
+    let session = spawn_mount(filesystem, mountpoint.path()).expect("FUSE mount must succeed");
+    let scoped_mount = mountpoint.path().join("scoped");
+
+    fs::rename(scoped_mount.join("old.txt"), scoped_mount.join("moved.txt"))
+        .expect("Rename must authorize both the source and destination");
+    assert_eq!(
+        fs::read(scoped_backing.join("moved.txt")).expect("renamed file must be readable"),
+        b"rename me"
+    );
+    fs::remove_file(scoped_mount.join("moved.txt")).expect("RemoveFile must authorize FUSE UNLINK");
+    fs::remove_dir(scoped_mount.join("empty")).expect("RemoveDirectory must authorize FUSE RMDIR");
+    assert!(!scoped_backing.join("moved.txt").exists());
+    assert!(!scoped_backing.join("empty").exists());
+
+    let scoped_directory = open(
+        &scoped_mount,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("ListDirectory must authorize opening the parent before revoke");
+    kernel
+        .revoke(&capability)
+        .expect("test capability must be revocable");
+    assert_eq!(
+        unlinkat(&scoped_directory, "revoked.txt", AtFlags::empty())
+            .expect_err("a revoked capability must not reach FUSE UNLINK"),
+        rustix::io::Errno::NOENT
+    );
+    assert!(scoped_backing.join("revoked.txt").is_file());
 
     drop(session);
 }

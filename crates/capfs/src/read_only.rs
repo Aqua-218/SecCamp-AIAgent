@@ -30,8 +30,8 @@ use authority_core::{
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyWrite, Request, SessionACL, TimeOrNow, WriteFlags,
+    RenameFlags as FuseRenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 use rustix::fs::OFlags;
 
@@ -39,7 +39,7 @@ use crate::{
     backing::{ImportedRepository, ValidatedRepository},
     namespace::{
         NamespaceError, NamespaceObject, NamespaceObjectKind, NamespaceOperationError,
-        NamespaceRegistry,
+        NamespaceRegistry, RenamePlan,
     },
     node::{ForgetOutcome, NodeId, NodeTable, NodeTableError},
     runtime::{BackingMetadata, CreationPermissions, OpenedBackingFile},
@@ -332,6 +332,8 @@ enum AdapterError {
     Unsupported,
     IsDirectory,
     NotDirectory,
+    DirectoryNotEmpty,
+    Busy,
     InvalidRequest,
     BadHandle,
     Internal,
@@ -346,6 +348,8 @@ impl AdapterError {
             Self::Unsupported => Errno::EPERM,
             Self::IsDirectory => Errno::EISDIR,
             Self::NotDirectory => Errno::ENOTDIR,
+            Self::DirectoryNotEmpty => Errno::ENOTEMPTY,
+            Self::Busy => Errno::EBUSY,
             Self::InvalidRequest => Errno::EINVAL,
             Self::BadHandle => Errno::EBADF,
             Self::Internal => Errno::EIO,
@@ -773,6 +777,109 @@ impl CapabilityFilesystem {
             .map_err(|error| map_namespace_operation_error(&error))
     }
 
+    fn remove_file(&self, parent: NodeId, name: &str) -> Result<(), AdapterError> {
+        self.remove_child(
+            parent,
+            name,
+            NamespaceObjectKind::RegularFile,
+            AdapterError::IsDirectory,
+            FileEffect::RemoveFile,
+        )
+    }
+
+    fn remove_directory(&self, parent: NodeId, name: &str) -> Result<(), AdapterError> {
+        self.remove_child(
+            parent,
+            name,
+            NamespaceObjectKind::Directory,
+            AdapterError::NotDirectory,
+            FileEffect::RemoveDirectory,
+        )
+    }
+
+    fn remove_child(
+        &self,
+        parent: NodeId,
+        name: &str,
+        expected_kind: NamespaceObjectKind,
+        kind_error: AdapterError,
+        effect: FileEffect,
+    ) -> Result<(), AdapterError> {
+        self.ensure_healthy()?;
+        let parent = self
+            .nodes
+            .resolve(parent)
+            .map_err(|error| map_node_lookup_error(&error))?;
+        self.namespace
+            .remove_child(&parent, name, |live_parent, child| {
+                if child.kind() != expected_kind {
+                    return Err(kind_error);
+                }
+                let request = self.file_request(effect, child.path().clone());
+                self.kernel
+                    .authorize_and_commit(
+                        &self.authority.subject,
+                        &self.authority.capability,
+                        &request,
+                        |_| {
+                            self.backing
+                                .remove_runtime_object(live_parent, child)
+                                .map_err(|_| AdapterError::Internal)
+                        },
+                    )
+                    .map_err(|error| map_effect_error(&error))
+            })
+            .map_err(|error| map_namespace_operation_error(&error))
+    }
+
+    fn rename_entry(
+        &self,
+        source_parent: NodeId,
+        source_name: &str,
+        destination_parent: NodeId,
+        destination_name: &str,
+        flags: FuseRenameFlags,
+    ) -> Result<(), AdapterError> {
+        self.ensure_healthy()?;
+        if !flags
+            .difference(FuseRenameFlags::RENAME_NOREPLACE)
+            .is_empty()
+        {
+            return Err(AdapterError::Unsupported);
+        }
+        let source_parent = self
+            .nodes
+            .resolve(source_parent)
+            .map_err(|error| map_node_lookup_error(&error))?;
+        let destination_parent = self
+            .nodes
+            .resolve(destination_parent)
+            .map_err(|error| map_node_lookup_error(&error))?;
+        self.namespace
+            .rename_child(
+                &source_parent,
+                source_name,
+                &destination_parent,
+                destination_name,
+                |plan| {
+                    let requests = self.rename_requests(plan)?;
+                    self.kernel
+                        .authorize_all_and_commit(
+                            &self.authority.subject,
+                            &self.authority.capability,
+                            &requests,
+                            |_| {
+                                self.backing
+                                    .rename_runtime_subtree(plan)
+                                    .map_err(|_| AdapterError::Internal)
+                            },
+                        )
+                        .map_err(|error| map_effect_error(&error))
+                },
+            )
+            .map_err(|error| map_namespace_operation_error(&error))
+    }
+
     fn close_failed_authority_handle(
         &self,
         authority_handle: &HandleId,
@@ -1158,6 +1265,22 @@ impl CapabilityFilesystem {
         CapabilityRequestSet::new(self.file_request(creation_effect, path), additional)
     }
 
+    fn rename_requests(&self, plan: &RenamePlan) -> Result<CapabilityRequestSet, AdapterError> {
+        let mut requests = Vec::with_capacity(plan.moved_objects().len().saturating_mul(2));
+        for movement in plan.moved_objects() {
+            requests.push(self.file_request(FileEffect::Rename, movement.source().clone()));
+            requests.push(self.file_request(FileEffect::Rename, movement.destination().clone()));
+        }
+        let Some(first) = requests.first().cloned() else {
+            self.mark_fatal();
+            return Err(AdapterError::Internal);
+        };
+        Ok(CapabilityRequestSet::new(
+            first,
+            requests.into_iter().skip(1),
+        ))
+    }
+
     fn forget_node(&self, node: NodeId, count: u64) {
         let Some(count) = NonZeroU64::new(count) else {
             self.mark_fatal();
@@ -1378,6 +1501,68 @@ impl Filesystem for CapabilityFilesystem {
                 FileHandle(created.handle),
                 FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_NOFLUSH,
             ),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    fn unlink(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(parent) = NodeId::new(parent.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match self.remove_file(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    fn rmdir(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(parent) = NodeId::new(parent.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match self.remove_directory(parent, name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    fn rename(
+        &self,
+        _request: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: FuseRenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let Some(parent) = NodeId::new(parent.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(newparent) = NodeId::new(newparent.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(newname) = newname.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match self.rename_entry(parent, name, newparent, newname, flags) {
+            Ok(()) => reply.ok(),
             Err(error) => reply.error(error.errno()),
         }
     }
@@ -1619,6 +1804,15 @@ const fn map_namespace_operation_error(
         NamespaceOperationError::Namespace(NamespaceError::ParentNotDirectory(_)) => {
             AdapterError::NotDirectory
         }
+        NamespaceOperationError::Namespace(NamespaceError::OpenHandleInSubtree(_)) => {
+            AdapterError::Busy
+        }
+        NamespaceOperationError::Namespace(NamespaceError::DirectoryNotEmpty(_)) => {
+            AdapterError::DirectoryNotEmpty
+        }
+        NamespaceOperationError::Namespace(NamespaceError::DestinationInsideSource) => {
+            AdapterError::InvalidRequest
+        }
         NamespaceOperationError::Namespace(_) => AdapterError::Internal,
         NamespaceOperationError::Executor(error) => *error,
     }
@@ -1647,7 +1841,7 @@ mod tests {
     use std::{fs, num::NonZeroUsize, sync::Arc};
 
     use authority_core::{
-        capability::{AuthorityBody, IssuerId, SubjectId},
+        capability::{AuthorityBody, AuthorityRequest, IssuerId, SubjectId},
         file::{FileAuthority, FileEffect, FileEffects},
         kernel::CapabilityKernel,
         path::{CanonicalPath, PathPattern},
@@ -1655,7 +1849,7 @@ mod tests {
         state::{CapabilityGrant, CapabilityState, StaticAuthorityEnvelope, Subject},
         time::{MonotonicTime, TimeWindow},
     };
-    use fuser::OpenFlags;
+    use fuser::{OpenFlags, RenameFlags};
     use rustix::fs::OFlags;
     use tempfile::{TempDir, tempdir};
 
@@ -1982,6 +2176,148 @@ mod tests {
             ),
             Err(AdapterError::NotDirectory)
         ));
+    }
+
+    // Requirement: UNLINK requires RemoveFile at the child path and must not
+    // remove a file while any handle is live. Category: FUSE/remove. Risk: critical.
+    #[test]
+    fn remove_file_reauthorizes_the_named_child_and_respects_open_handles() {
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::only(FileEffect::ReadData),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("metadata visibility must expose the authorized ancestor");
+        assert_eq!(
+            filesystem.remove_file(scoped.node, "allowed.txt"),
+            Err(AdapterError::AccessDenied)
+        );
+        assert!(directory.path().join("scoped/allowed.txt").is_file());
+
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::from_effects([FileEffect::ReadData, FileEffect::RemoveFile]),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("remove authority must expose the parent directory");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("remove authority must expose the target file");
+        let handle = filesystem
+            .open_file(allowed.node, OpenFlags(0))
+            .expect("ReadData must authorize a test open handle");
+
+        assert_eq!(
+            filesystem.remove_file(scoped.node, "allowed.txt"),
+            Err(AdapterError::Busy),
+            "removal must not detach a namespace object while its handle is live"
+        );
+        filesystem
+            .release_file(allowed.node, handle)
+            .expect("the test handle must release normally");
+        filesystem
+            .remove_file(scoped.node, "allowed.txt")
+            .expect("RemoveFile must delete a closed regular file");
+        assert!(!directory.path().join("scoped/allowed.txt").exists());
+    }
+
+    // Requirement: RMDIR has its own effect and only commits for an empty
+    // directory. Category: FUSE/remove. Risk: critical.
+    #[test]
+    fn remove_directory_requires_remove_directory_and_an_empty_child() {
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::from_effects([FileEffect::CreateDirectory, FileEffect::RemoveDirectory]),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("directory authority must expose its parent");
+        filesystem
+            .create_directory(scoped.node, "empty", 0o755, 0)
+            .expect("CreateDirectory must create an empty test directory");
+
+        filesystem
+            .remove_directory(scoped.node, "empty")
+            .expect("RemoveDirectory must remove an empty directory");
+        assert!(!directory.path().join("scoped/empty").exists());
+        assert_eq!(
+            filesystem.remove_directory(scoped.node, "allowed.txt"),
+            Err(AdapterError::NotDirectory),
+            "RMDIR must not silently remove a regular file"
+        );
+    }
+
+    // Requirement: a subtree rename checks Rename on both the source and
+    // destination of every moved object. Category: FUSE/rename. Risk: critical.
+    #[test]
+    fn rename_authorizes_every_subtree_source_and_destination_path() {
+        let (directory, filesystem, kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::from_effects([
+                FileEffect::CreateDirectory,
+                FileEffect::CreateFile,
+                FileEffect::WriteData,
+                FileEffect::Rename,
+            ]),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("rename authority must expose its parent directory");
+        let source = filesystem
+            .create_directory(scoped.node, "source", 0o755, 0)
+            .expect("test source directory must be creatable");
+        let child = filesystem
+            .create_file(
+                source.node,
+                "child.txt",
+                0o600,
+                0,
+                create_flags(OFlags::WRONLY),
+            )
+            .expect("test child file must be creatable");
+        filesystem
+            .release_file(child.node, child.handle)
+            .expect("the test child handle must release before rename");
+
+        filesystem
+            .rename_entry(
+                scoped.node,
+                "source",
+                scoped.node,
+                "moved",
+                RenameFlags::empty(),
+            )
+            .expect("Rename authority must move a closed subtree without replacement");
+        assert!(directory.path().join("scoped/moved/child.txt").is_file());
+        assert!(!directory.path().join("scoped/source").exists());
+
+        let record = kernel
+            .effect_records()
+            .expect("audit records must remain available")
+            .pop()
+            .expect("successful rename must produce an effect record");
+        let requests = record
+            .requests()
+            .map(|request| match request.authority() {
+                AuthorityRequest::File(request) => (request.effect(), request.path().clone()),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        for expected_path in [
+            path(&["scoped", "source"]),
+            path(&["scoped", "moved"]),
+            path(&["scoped", "source", "child.txt"]),
+            path(&["scoped", "moved", "child.txt"]),
+        ] {
+            assert!(
+                requests.iter().any(|(effect, request_path)| {
+                    *effect == FileEffect::Rename && request_path == &expected_path
+                }),
+                "rename audit must include `{expected_path:?}`"
+            );
+        }
     }
 
     // Requirement: each positioned write checks WriteData at the object's

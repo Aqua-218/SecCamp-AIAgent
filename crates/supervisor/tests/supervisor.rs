@@ -5,7 +5,7 @@ use std::{error::Error, fmt};
 use authority_core::{
     capability::{AuthorityBody, IssuerId, SubjectId},
     file::{FileAuthority, FileEffect, FileEffects},
-    handle::{HandleId, ObjectId, OpenHandle},
+    handle::{HandleId, ObjectId},
     kernel::CapabilityKernel,
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
@@ -169,7 +169,8 @@ fn new_supervisor() -> (
         .expect("caller binding must be unique");
     let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("session")));
     let resources = FakeResources::default();
-    let mut supervisor = Supervisor::new(kernel, resources, callers);
+    let mut supervisor = Supervisor::new(kernel, resources, callers)
+        .expect("pristine kernel must initialize supervisor");
     supervisor
         .create_subject(Subject::new(root_subject(), root_envelope()), identity)
         .expect("subject setup must succeed");
@@ -231,7 +232,8 @@ fn root_derive_and_revoke_use_typed_authority_kernel_transitions() {
         .expect("child caller binding must be unique");
     let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("session")));
     let resources = FakeResources::default();
-    let mut supervisor = Supervisor::new(kernel, resources, callers);
+    let mut supervisor = Supervisor::new(kernel, resources, callers)
+        .expect("pristine kernel must initialize supervisor");
     supervisor
         .create_subject(Subject::new(root_subject(), root_envelope()), root_identity)
         .expect("root setup must succeed");
@@ -309,7 +311,8 @@ fn authenticated_foreign_subject_cannot_close_another_subjects_handle() {
         .expect("child caller binding must be unique");
     let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("session")));
     let resources = FakeResources::default();
-    let mut supervisor = Supervisor::new(kernel, resources, callers);
+    let mut supervisor = Supervisor::new(kernel, resources, callers)
+        .expect("pristine kernel must initialize supervisor");
     supervisor
         .create_subject(Subject::new(root_subject(), root_envelope()), root_identity)
         .expect("root setup must succeed");
@@ -340,7 +343,8 @@ fn partial_setup_rolls_back_already_acquired_resources() {
     let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("session")));
     let mut resources = FakeResources::default();
     resources.fail_once("mount");
-    let mut supervisor = Supervisor::new(kernel, resources, callers);
+    let mut supervisor = Supervisor::new(kernel, resources, callers)
+        .expect("pristine kernel must initialize supervisor");
     let subject = SubjectId::new("subject-partial");
 
     let error = supervisor
@@ -376,7 +380,8 @@ fn setup_rollback_retains_prerequisites_when_control_close_fails() {
     let mut resources = FakeResources::default();
     resources.fail_once("start_workload");
     resources.fail_once("close_control");
-    let mut supervisor = Supervisor::new(kernel, resources, callers);
+    let mut supervisor = Supervisor::new(kernel, resources, callers)
+        .expect("pristine kernel must initialize supervisor");
 
     let error = supervisor
         .create_subject(Subject::new(subject.clone(), root_envelope()), identity)
@@ -513,65 +518,6 @@ fn closed_handle_id_cannot_be_reused() {
     assert_eq!(supervisor.resources().events.len(), before);
 }
 
-#[test]
-fn failed_handle_registration_retains_runtime_cleanup_and_reserves_id() {
-    let identity = ConnectionIdentity::new(6, 106, 1000, 1000);
-    let mut callers = StaticCallerResolver::new();
-    callers
-        .bind(identity, root_subject())
-        .expect("caller binding must be unique");
-    let handle = HandleId::new("already-issued");
-    let foreign = SubjectId::new("subject-foreign");
-    let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("session")));
-    kernel
-        .register_subject(Subject::new(foreign.clone(), root_envelope()))
-        .expect("foreign subject setup must succeed");
-    kernel
-        .register_open_handle(OpenHandle::new(
-            handle.clone(),
-            foreign,
-            ObjectId::new("foreign-object"),
-        ))
-        .expect("foreign handle setup must succeed");
-    let mut resources = FakeResources::default();
-    resources.fail_once("close_handle");
-    let mut supervisor = Supervisor::new(kernel, resources, callers);
-    supervisor
-        .create_subject(Subject::new(root_subject(), root_envelope()), identity)
-        .expect("target subject setup must succeed");
-
-    let error = supervisor
-        .open_handle(&identity, handle.clone(), ObjectId::new("target-object"))
-        .expect_err("authority duplicate must reject registration");
-    assert!(matches!(
-        error,
-        SupervisorError::SetupFailed {
-            rollback,
-            ..
-        } if rollback.iter().any(|failure| failure.step == CleanupStep::CloseHandle)
-    ));
-    let before = supervisor.resources().events.len();
-    assert!(matches!(
-        supervisor.open_handle(&identity, handle.clone(), ObjectId::new("retry-object")),
-        Err(SupervisorError::StaleHandle(_))
-    ));
-    assert_eq!(supervisor.resources().events.len(), before);
-
-    supervisor
-        .shutdown_subject(&root_subject())
-        .expect("shutdown must retry the pending runtime close");
-    assert_eq!(
-        supervisor.resources().events[before..],
-        [
-            "stop_workload",
-            "close_control",
-            "close_handle",
-            "unmount",
-            "remove_cgroup"
-        ]
-    );
-}
-
 // Requirement: revocation is gated on the connection like every other authority operation.
 // Category: unit/security. Risk: high.
 #[test]
@@ -582,7 +528,8 @@ fn revoke_requires_a_bound_running_connection() {
         .bind(root_identity, root_subject())
         .expect("root caller binding must be unique");
     let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("session")));
-    let mut supervisor = Supervisor::new(kernel, FakeResources::default(), callers);
+    let mut supervisor = Supervisor::new(kernel, FakeResources::default(), callers)
+        .expect("pristine kernel must initialize supervisor");
     supervisor
         .create_subject(Subject::new(root_subject(), root_envelope()), root_identity)
         .expect("root setup must succeed");

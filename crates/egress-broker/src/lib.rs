@@ -11,4 +11,5 @@ pub mod dispatch;
 pub mod github;
 pub mod ip_policy;
 pub mod public_fetch;
+pub mod server;
 pub mod transport;

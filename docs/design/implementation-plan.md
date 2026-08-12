@@ -76,7 +76,7 @@ namespace、cgroup v2、read-only rootfs、tmpfs、Landlock、capability drop、
 
 ## 5. Host Egress Broker
 
-vsock framing と session envelope を先に作り、その上に公開 HTTPS fetch、最後に GitHub の `PublishBranch` と `CreatePullRequest` を載せる。
+vsock framing と session envelope を先に作り、その上に公開 HTTPS fetch、最後に GitHub の `PublishBranch` と `CreatePullRequest` を載せる。現在は `egress-protocol` crate に session ID、strict sequence、128-bit request ID、canonical payload の SHA-256、bounded deduplication を実装済みである。CBOR framing / vsock I/O と typed dispatch は未実装である。
 
 **完了条件:** redirect、DNS rebinding、private IP の test が通り、guest に credential がなく、任意の認証付き HTTP 転送口も存在しない。
 

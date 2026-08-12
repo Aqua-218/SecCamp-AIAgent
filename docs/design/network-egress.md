@@ -103,6 +103,8 @@ flowchart TD
 
 guest と Broker の間は length-prefixed canonical CBOR とする。control frame は最大1 MiB。session ID、単調増加 sequence、128-bit request ID、payload hash を持たせ、同じ ID で違う内容が来たら拒否する。snapshot restore 後は接続と sequence を作り直す。
 
+このうち session ID、sequence、request ID、SHA-256 payload hash、bounded deduplication table は [`egress-protocol`](../../crates/egress-protocol/src/session.rs) に実装済みである。新しい envelope は一度だけ dispatch でき、完全に同じ retry は `Duplicate` として保存済み outcome を返す。session 不一致、順序違反、同じ request ID の別 payload、capacity / sequence exhaustion は dispatch 前に拒否する。canonical CBOR framing、vsock I/O、response cache は次の実装段階である。
+
 request 回数、累積 byte、同時 fetch 数は Capability ではなく session budget から配る。子 Capability を何枚作っても予算は増えない。
 
 ## 関連文書

@@ -7,6 +7,7 @@
 | [設計書](design/README.md) | 設計者、実装者、セキュリティレビュー担当者 | 脅威モデル、Capability モデル、失効、隔離、検証戦略、実装順序 |
 | [Authority core 実装ガイド](authority-core/README.md) | Rust/Lean 実装者、証明のレビュー担当者 | 現在の Authority core 各ファイルの責務、Rust と Lean の対応、定理、テスト |
 | [capfs 実装ガイド](capfs/README.md) | filesystem adapter 実装者、並行境界のレビュー担当者 | backing root、startup import、ObjectId、namespace変更、mount-local node identity |
+| [Broker session envelope](egress-protocol/session-envelopes.md) | Broker / transport 実装者 | session、sequence、request ID、payload hash、retry と replay 防止 |
 
 ## Authority core 文書
 

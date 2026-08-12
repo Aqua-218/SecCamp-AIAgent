@@ -81,6 +81,18 @@ impl AuthorityRootGrant {
 /// Descriptive alias for callers that refer to the policy as a specification.
 pub type AuthorityRootSpec = AuthorityRootGrant;
 
+/// Authority identities supplied to one session's Broker worker.
+///
+/// These values are derived only from the host-allocated [`SessionIdentity`]
+/// and can be moved directly into an egress Broker dispatch context.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AuthorityBrokerBinding {
+    /// Authority Core subject authenticated for the Broker connection.
+    pub caller: AuthoritySubjectId,
+    /// Root capability selected for final Broker authorization.
+    pub capability: CapId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BindingStatus {
     Active,
@@ -121,6 +133,28 @@ impl AuthorityCoreBackend {
     pub fn kernel(&self) -> &Arc<CapabilityKernel> {
         &self.kernel
     }
+
+    /// Returns an owned reference to the exact kernel shared with this backend.
+    ///
+    /// A production Broker worker can move this value into its dispatcher;
+    /// issuance, Broker authorization, and revocation then use one serialized
+    /// Authority Core state instance.
+    #[must_use]
+    pub fn broker_executor(&self) -> Arc<CapabilityKernel> {
+        Arc::clone(&self.kernel)
+    }
+
+    /// Derives the exact Authority Core identities for one Broker worker.
+    ///
+    /// This is the sole conversion point from orchestrator subject and
+    /// capability identities into their Authority Core representations.
+    #[must_use]
+    pub fn broker_binding(&self, identity: &SessionIdentity) -> AuthorityBrokerBinding {
+        AuthorityBrokerBinding {
+            caller: AuthoritySubjectId::new(to_lower_hex(identity.subject_id().as_bytes())),
+            capability: CapId::new(to_lower_hex(identity.capability_id().as_bytes())),
+        }
+    }
 }
 
 /// Short name for [`AuthorityCoreBackend`].
@@ -139,8 +173,10 @@ impl CapabilityBackend<AuthorityRootGrant> for AuthorityCoreBackend {
             )));
         }
 
-        let subject = authority_subject_id(identity);
-        let capability = authority_capability_id(identity);
+        let AuthorityBrokerBinding {
+            caller: subject,
+            capability,
+        } = self.broker_binding(identity);
         let lease = CapabilityLease::new(
             identity.session_id(),
             identity.subject_id(),
@@ -265,14 +301,6 @@ fn close_result_detail<T: std::fmt::Debug>(result: &Result<T, CapabilityKernelEr
     }
 }
 
-fn authority_subject_id(identity: &SessionIdentity) -> AuthoritySubjectId {
-    AuthoritySubjectId::new(to_lower_hex(identity.subject_id().as_bytes()))
-}
-
-fn authority_capability_id(identity: &SessionIdentity) -> CapId {
-    CapId::new(to_lower_hex(identity.capability_id().as_bytes()))
-}
-
 fn to_lower_hex(bytes: [u8; ID_BYTES]) -> String {
     let mut encoded = String::with_capacity(ID_BYTES * 2);
     for byte in bytes {
@@ -378,8 +406,10 @@ mod tests {
             "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
         );
 
-        let subject = authority_subject_id(&identity);
-        let capability = authority_capability_id(&identity);
+        let AuthorityBrokerBinding {
+            caller: subject,
+            capability,
+        } = backend.broker_binding(&identity);
         backend
             .kernel()
             .with_active_capability(&subject, &capability, time(10), |issued| {
@@ -401,15 +431,29 @@ mod tests {
             .inject_root_capability(&identity, &grant())
             .expect("root capability injection must succeed");
 
+        let binding = backend.broker_binding(&identity);
         backend
             .kernel()
-            .authorize_and_commit(
-                &authority_subject_id(&identity),
-                &authority_capability_id(&identity),
-                &request(),
-                |_| Ok::<_, Infallible>(()),
-            )
+            .authorize_and_commit(&binding.caller, &binding.capability, &request(), |_| {
+                Ok::<_, Infallible>(())
+            })
             .expect("a request inside the root grant must authorize");
+    }
+
+    #[test]
+    fn broker_binding_and_executor_preserve_the_exact_production_identity() {
+        let backend = backend();
+        let identity = identity();
+
+        let binding = backend.broker_binding(&identity);
+        let executor = backend.broker_executor();
+
+        assert_eq!(binding.caller.as_str(), "000102030405060708090a0b0c0d0e0f");
+        assert_eq!(
+            binding.capability.as_str(),
+            "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+        );
+        assert!(Arc::ptr_eq(&executor, backend.kernel()));
     }
 
     #[test]
@@ -429,7 +473,7 @@ mod tests {
         assert_eq!(
             backend
                 .kernel()
-                .subject_status(&authority_subject_id(&identity))
+                .subject_status(&backend.broker_binding(&identity).caller)
                 .expect("subject status lookup must succeed"),
             Some(SubjectStatus::Closed)
         );
@@ -452,7 +496,7 @@ mod tests {
         assert_eq!(
             backend
                 .kernel()
-                .subject_status(&authority_subject_id(&identity))
+                .subject_status(&backend.broker_binding(&identity).caller)
                 .expect("subject status lookup must succeed"),
             Some(SubjectStatus::Running)
         );

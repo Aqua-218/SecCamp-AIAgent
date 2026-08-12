@@ -278,8 +278,27 @@ pub trait IsolationBackend {
 pub struct RuntimeIsolation;
 
 impl RuntimeIsolation {
-    /// Applies a policy and rolls completed operations back on failure.
+    /// Applies a policy, rolling back reversible operations on failure.
+    ///
+    /// This function aborts the current process if an irreversible operation
+    /// may have been partially applied. It must therefore run only in the
+    /// expendable child process that will execute the workload.
     pub fn apply<B: IsolationBackend>(
+        backend: &mut B,
+        config: &IsolationConfig,
+    ) -> Result<IsolationReceipt, IsolationError> {
+        match Self::apply_transaction(backend, config) {
+            Err(IsolationError::TerminationRequired { .. }) => std::process::abort(),
+            outcome => outcome,
+        }
+    }
+
+    /// Runs the isolation transaction without enforcing required termination.
+    ///
+    /// This is crate-visible only so tests can inspect the typed obligation
+    /// without aborting the test process. Production callers must use
+    /// [`Self::apply`].
+    pub(crate) fn apply_transaction<B: IsolationBackend>(
         backend: &mut B,
         config: &IsolationConfig,
     ) -> Result<IsolationReceipt, IsolationError> {

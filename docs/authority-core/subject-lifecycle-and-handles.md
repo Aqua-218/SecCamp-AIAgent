@@ -118,6 +118,22 @@ shutdown の競合を防ぐが、OS fd や FUSE lifecycle との接続まで完�
 
 これらは Rust transition の具体的な契約 test であり、subject lifecycle 全状態の数学的証明や OS adapter の end-to-end test ではない。
 
+## 正確な保証範囲
+
+この module が保証するのは、subject の shutdown が単調に進むこと、`auth_epoch` が revoke で進むこと、handle が subject と object の両方に binding され ID を再利用しないことだけ。
+
+- OS の resource が実際に解放されることは扱わない。fd の close、mount の解除、cgroup の削除は [supervisor](../../docs/supervisor/README.md) の担当。
+- handle が指す object が存在し続けることは保証しない。binding は identity の対応であって、生存の保証ではない。
+- `auth_epoch` を cache の key に含めるかどうかは利用側の責務。この module は epoch を進めるだけ。
+- shutdown 中に進行中の操作が完了するのを待つ仕組みは無い。`Closing` は新規要求を拒否するが、実行中のものを止めはしない。
+
+## 変更時の確認点
+
+- `auth_epoch` を減らす、あるいは巻き戻す経路を作らない。cache 側が「変化したら破棄」で判断しているので、同じ値に戻ると古い entry が有効に見える。
+- `HandleId` を再利用可能にしない。close 後の rebinding を禁止している前提が崩れる。
+- shutdown の phase を増やすときは、各 phase が `Closing` を保持したまま retry できることを確認する。途中で `Running` へ戻す経路を作らない。
+- handle の binding を subject だけ、または object だけに減らさない。両方あることで、foreign handle と stale handle を別々に検出している。
+
 ## 関連
 
 - [Capability の発行と逐次状態機械](capability-state.md)

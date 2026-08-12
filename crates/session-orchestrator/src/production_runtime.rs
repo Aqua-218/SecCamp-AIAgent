@@ -21,7 +21,15 @@ use authority_core::{
     state::CapabilityState,
     time::MonotonicTime,
 };
-use egress_broker::{dispatch::DispatchContext, server::RequestDispatcher, transport::VsockStream};
+use egress_broker::{
+    dispatch::{BrokerDispatcher, DispatchContext, PublicDispatchAdapter},
+    durable::DurableSessionConfig,
+    github::GitHubAdapter,
+    transport::VsockStream,
+};
+use egress_protocol::{
+    budget::SessionBudgetLimits, session::BrokerSessionId as WireBrokerSessionId,
+};
 use firecracker_runtime::{
     ApiClient, ApiRequest, ApiResponse, RealCommandRunner, RealFileSystem, Runtime, RuntimeConfig,
     RuntimeError, Snapshot, SystemIdentitySource,
@@ -32,7 +40,7 @@ use crate::{
     OsEntropy, SessionIdentity, SessionInfo, SessionOrchestrator, SnapshotDescriptor, SnapshotId,
     StartError, VmBackend, VmLease, WorkloadBackend, WorkloadLease, WorkspaceLease,
     WorkspaceTemplateId,
-    authority_backend::{AuthorityBrokerBinding, AuthorityCoreBackend, AuthorityRootGrant},
+    authority_backend::{AuthorityCoreBackend, AuthorityRootGrant},
     egress_backend::{
         BrokerBackend, BrokerRuntimeFactory, BuiltBrokerRuntime, ProductionBrokerBackend,
     },
@@ -362,13 +370,9 @@ pub trait PerSessionFirecrackerFactory: Send + 'static {
     ) -> Result<PreparedFirecrackerSession, BackendError>;
 }
 
-/// Exact authority and durability values a Broker dispatcher factory must consume.
+/// Exact session identity for which host-owned egress adapters must be prepared.
 pub struct SessionEgressRequest {
     identity: SessionIdentity,
-    authority: AuthorityBrokerBinding,
-    executor: Arc<CapabilityKernel>,
-    wal_path: PathBuf,
-    limits: ProductionBrokerLimits,
 }
 
 impl SessionEgressRequest {
@@ -377,92 +381,86 @@ impl SessionEgressRequest {
     pub const fn identity(&self) -> SessionIdentity {
         self.identity
     }
+}
 
-    /// Returns the exact Authority Core subject and capability binding.
-    #[must_use]
-    pub const fn authority(&self) -> &AuthorityBrokerBinding {
-        &self.authority
-    }
+struct BoxedPublicAdapter(Box<dyn PublicDispatchAdapter + Send>);
 
-    /// Returns the same kernel used by root issuance and revocation.
-    #[must_use]
-    pub const fn executor(&self) -> &Arc<CapabilityKernel> {
-        &self.executor
-    }
-
-    /// Returns the fresh, session-identity-derived WAL path the dispatcher must exclusively own.
-    #[must_use]
-    pub fn wal_path(&self) -> &Path {
-        &self.wal_path
-    }
-
-    /// Returns the mandatory durable replay and budget limits.
-    #[must_use]
-    pub const fn limits(&self) -> ProductionBrokerLimits {
-        self.limits
+impl PublicDispatchAdapter for BoxedPublicAdapter {
+    fn fetch(
+        &self,
+        request: &authority_core::http::HttpFetchRequest,
+        authority: &authority_core::http::HttpFetchAuthority,
+    ) -> Result<egress_broker::public_fetch::PublicResponse, egress_broker::public_fetch::FetchError>
+    {
+        self.0.fetch(request, authority)
     }
 }
 
-/// Verified dispatcher, monotonic clock, and exact-request proof for one Broker worker.
+struct BoxedGitHubAdapter(Box<dyn GitHubAdapter>);
+
+impl GitHubAdapter for BoxedGitHubAdapter {
+    fn execute(
+        &mut self,
+        request_id: egress_protocol::session::BrokerRequestId,
+        request: &authority_core::github::GitHubRequest,
+        authority: &authority_core::github::GitHubAuthority,
+        max_response_bytes: u64,
+    ) -> Result<egress_broker::github::GitHubResponse, egress_broker::github::GitHubAdapterError>
+    {
+        self.0
+            .execute(request_id, request, authority, max_response_bytes)
+    }
+}
+
+/// Host adapter and clock inputs sealed for one Broker worker.
+///
+/// Authority, durable WAL, replay, and budget state cannot be supplied here. The production
+/// runtime constructs those controls itself after this value is returned.
 pub struct PreparedEgressSession {
     identity: SessionIdentity,
-    authority: AuthorityBrokerBinding,
-    executor: Arc<CapabilityKernel>,
-    wal_path: PathBuf,
-    limits: ProductionBrokerLimits,
-    dispatcher: Box<dyn RequestDispatcher + Send>,
+    public_adapter: BoxedPublicAdapter,
+    github_adapter: BoxedGitHubAdapter,
     clock: Box<dyn FnMut() -> MonotonicTime + Send>,
 }
 
 impl PreparedEgressSession {
-    /// Verifies that a dispatcher created the exact requested durable WAL and seals its proof.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SessionPreparationError`] if the requested WAL is absent, empty, a symlink, or
-    /// not a regular file. The factory contract additionally requires the dispatcher to own that
-    /// WAL and bind all request limits; no unchecked constructor exists.
-    pub fn verify<D, C>(
+    /// Seals provider adapters and a monotonic clock for exactly `request`.
+    #[must_use]
+    pub fn new<P, G, C>(
         request: &SessionEgressRequest,
-        dispatcher: D,
+        public_adapter: P,
+        github_adapter: G,
         clock: C,
-    ) -> Result<Self, SessionPreparationError>
+    ) -> Self
     where
-        D: RequestDispatcher + Send + 'static,
+        P: PublicDispatchAdapter + Send + 'static,
+        G: GitHubAdapter + 'static,
         C: FnMut() -> MonotonicTime + Send + 'static,
     {
-        verify_created_wal(&request.wal_path)?;
-        Ok(Self {
+        Self {
             identity: request.identity,
-            authority: request.authority.clone(),
-            executor: Arc::clone(&request.executor),
-            wal_path: request.wal_path.clone(),
-            limits: request.limits,
-            dispatcher: Box::new(dispatcher),
+            public_adapter: BoxedPublicAdapter(Box::new(public_adapter)),
+            github_adapter: BoxedGitHubAdapter(Box::new(github_adapter)),
             clock: Box::new(clock),
-        })
+        }
     }
 
     fn matches(&self, request: &SessionEgressRequest) -> bool {
         self.identity == request.identity
-            && self.authority == request.authority
-            && Arc::ptr_eq(&self.executor, &request.executor)
-            && self.wal_path == request.wal_path
-            && self.limits == request.limits
     }
 }
 
-/// Mandatory host-owned adapter, secret, plan, clock, and durable-dispatch boundary.
+/// Mandatory host-owned provider-adapter, secret, plan, and clock boundary.
 pub trait PerSessionEgressFactory: Send + Sync + 'static {
-    /// Builds a durable dispatcher for exactly `request`.
+    /// Builds only provider adapters and a clock for exactly `request`.
     ///
-    /// Implementations must use the supplied kernel, authority identities, fresh WAL path, and
-    /// every limit. Secret material remains inside the returned dispatcher's provider adapters.
+    /// Secret material remains inside the returned provider adapters. The runtime retains sole
+    /// control of the authority kernel, caller/capability binding, durable WAL, and all limits.
     ///
     /// # Errors
     ///
-    /// Returns [`BackendError`] if the exact session's durable dispatcher, provider adapters, or
-    /// monotonic clock cannot be prepared and sealed into [`PreparedEgressSession`].
+    /// Returns [`BackendError`] if the exact session's provider adapters or monotonic clock cannot
+    /// be prepared and sealed into [`PreparedEgressSession`].
     fn prepare(
         &self,
         request: &SessionEgressRequest,
@@ -494,8 +492,6 @@ pub enum SessionPreparationError {
     },
     /// Snapshot compatibility is not bound to the exact Runtime configuration.
     SnapshotFingerprintMismatch,
-    /// The requested Broker WAL did not become an owned regular nonempty file.
-    BrokerWal(String),
 }
 
 impl fmt::Display for SessionPreparationError {
@@ -516,7 +512,6 @@ impl fmt::Display for SessionPreparationError {
             }
             Self::SnapshotFingerprintMismatch => formatter
                 .write_str("prepared snapshot fingerprint does not match the exact Runtime config"),
-            Self::BrokerWal(message) => write!(formatter, "Broker WAL proof failed: {message}"),
         }
     }
 }
@@ -528,8 +523,7 @@ impl Error for SessionPreparationError {
             Self::RuntimeConfigMismatch
             | Self::SnapshotIdMismatch
             | Self::SnapshotPathMismatch { .. }
-            | Self::SnapshotFingerprintMismatch
-            | Self::BrokerWal(_) => None,
+            | Self::SnapshotFingerprintMismatch => None,
         }
     }
 }
@@ -1116,10 +1110,6 @@ impl BrokerRuntimeFactory<VsockStream> for ProductionBrokerRuntimeFactory {
         }
         let request = SessionEgressRequest {
             identity: *identity,
-            authority: self.authority.broker_binding(identity),
-            executor: self.authority.broker_executor(),
-            wal_path,
-            limits: self.limits,
         };
         let prepared = self.egress_factory.prepare(&request)?;
         if !prepared.matches(&request) {
@@ -1127,13 +1117,36 @@ impl BrokerRuntimeFactory<VsockStream> for ProductionBrokerRuntimeFactory {
                 "egress factory returned a proof for another session request",
             ));
         }
+        let authority = self.authority.broker_binding(identity);
         let context = DispatchContext {
-            caller: prepared.authority.caller.clone(),
-            capability: prepared.authority.capability.clone(),
+            caller: authority.caller,
+            capability: authority.capability,
             now: MonotonicTime::from_ticks(0),
         };
+        let durable_config = DurableSessionConfig::new(
+            WireBrokerSessionId::new(identity.broker_session_id().as_bytes()),
+            self.limits.replay_capacity,
+            SessionBudgetLimits::new(
+                self.limits.budget_requests,
+                self.limits.budget_response_bytes,
+                self.limits.budget_concurrent,
+            ),
+        );
+        let dispatcher = BrokerDispatcher::new_durable(
+            self.authority.broker_executor(),
+            prepared.public_adapter,
+            prepared.github_adapter,
+            durable_config,
+            self.limits.github_response_cap,
+            &wal_path,
+        )
+        .map_err(|error| {
+            BackendError::new(format!(
+                "host-owned durable Broker dispatcher creation failed: {error}"
+            ))
+        })?;
         Ok(BuiltBrokerRuntime::new(
-            prepared.dispatcher,
+            Box::new(dispatcher),
             context,
             prepared.clock,
             self.limits.max_connection_requests,
@@ -1428,22 +1441,6 @@ fn validate_owned_absolute_path(label: &str, path: &Path) -> Result<(), Producti
     Ok(())
 }
 
-fn verify_created_wal(path: &Path) -> Result<(), SessionPreparationError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        SessionPreparationError::BrokerWal(format!(
-            "dispatcher did not create {}: {error}",
-            path.display()
-        ))
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
-        return Err(SessionPreparationError::BrokerWal(format!(
-            "dispatcher WAL is not a nonempty regular file: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
 fn executable_jail_root(config: &RuntimeConfig) -> Result<PathBuf, ProductionBuildError> {
     let executable = config
         .firecracker
@@ -1551,14 +1548,11 @@ fn rebind_cgroup_path(
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::OpenOptions,
-        io::Write,
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use egress_broker::dispatch::{BrokerResponse, DispatchError};
-    use egress_protocol::frame::ControlFrame;
+    use egress_broker::durable::DurableBrokerView;
     use firecracker_runtime::{
         ApiResponse, CgroupConfig, CgroupVersion, CommandOutput, CommandRunner, CommandSpec,
         DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, JailerConfig, NamespaceConfig,
@@ -1724,28 +1718,43 @@ mod tests {
         }
     }
 
-    struct TestDispatcher;
+    struct TestPublicAdapter;
 
-    impl RequestDispatcher for TestDispatcher {
-        fn dispatch_request(
+    impl PublicDispatchAdapter for TestPublicAdapter {
+        fn fetch(
+            &self,
+            _request: &authority_core::http::HttpFetchRequest,
+            _authority: &authority_core::http::HttpFetchAuthority,
+        ) -> Result<
+            egress_broker::public_fetch::PublicResponse,
+            egress_broker::public_fetch::FetchError,
+        > {
+            Err(egress_broker::public_fetch::FetchError::OperationRejected)
+        }
+    }
+
+    struct TestGitHubAdapter;
+
+    impl GitHubAdapter for TestGitHubAdapter {
+        fn execute(
             &mut self,
-            _frame: &ControlFrame,
-            _context: &DispatchContext,
-        ) -> Result<BrokerResponse, DispatchError> {
-            unreachable!("identity-binding test never serves a connection")
+            _request_id: egress_protocol::session::BrokerRequestId,
+            _request: &authority_core::github::GitHubRequest,
+            _authority: &authority_core::github::GitHubAuthority,
+            _max_response_bytes: u64,
+        ) -> Result<egress_broker::github::GitHubResponse, egress_broker::github::GitHubAdapterError>
+        {
+            Err(egress_broker::github::GitHubAdapterError::NotAuthorized)
         }
     }
 
     struct ObservedEgressRequest {
         identity: SessionIdentity,
-        caller: String,
-        capability: String,
-        wal_path: PathBuf,
-        exact_kernel: bool,
+        wal_absent_during_prepare: bool,
     }
 
     struct CapturingEgressFactory {
-        expected_kernel: Arc<CapabilityKernel>,
+        expected_wal: PathBuf,
         observed: Arc<Mutex<Option<ObservedEgressRequest>>>,
     }
 
@@ -1754,31 +1763,43 @@ mod tests {
             &self,
             request: &SessionEgressRequest,
         ) -> Result<PreparedEgressSession, BackendError> {
-            let mut wal = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(request.wal_path())
-                .map_err(|error| {
-                    BackendError::new(format!("test Broker WAL creation failed: {error}"))
-                })?;
-            wal.write_all(b"durable-test-header")
-                .and_then(|()| wal.sync_data())
-                .map_err(|error| {
-                    BackendError::new(format!("test Broker WAL sync failed: {error}"))
-                })?;
             *self
                 .observed
                 .lock()
                 .map_err(|_| BackendError::new("test observation mutex is poisoned"))? =
                 Some(ObservedEgressRequest {
                     identity: request.identity(),
-                    caller: request.authority().caller.as_str().to_owned(),
-                    capability: request.authority().capability.as_str().to_owned(),
-                    wal_path: request.wal_path().to_owned(),
-                    exact_kernel: Arc::ptr_eq(request.executor(), &self.expected_kernel),
+                    wal_absent_during_prepare: matches!(
+                        fs::symlink_metadata(&self.expected_wal),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    ),
                 });
-            PreparedEgressSession::verify(request, TestDispatcher, || MonotonicTime::from_ticks(1))
-                .map_err(|error| BackendError::new(error.to_string()))
+            Ok(PreparedEgressSession::new(
+                request,
+                TestPublicAdapter,
+                TestGitHubAdapter,
+                || MonotonicTime::from_ticks(1),
+            ))
+        }
+    }
+
+    struct PrecreatingEgressFactory {
+        wal_path: PathBuf,
+    }
+
+    impl PerSessionEgressFactory for PrecreatingEgressFactory {
+        fn prepare(
+            &self,
+            request: &SessionEgressRequest,
+        ) -> Result<PreparedEgressSession, BackendError> {
+            fs::write(&self.wal_path, b"factory-controlled")
+                .map_err(|error| BackendError::new(format!("test precreation failed: {error}")))?;
+            Ok(PreparedEgressSession::new(
+                request,
+                TestPublicAdapter,
+                TestGitHubAdapter,
+                || MonotonicTime::from_ticks(1),
+            ))
         }
     }
 
@@ -2249,26 +2270,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_wal_proof_rejects_missing_and_empty_files() {
-        let root = TestDirectory::new();
-        let wal = root.0.join("broker.wal");
-        assert!(matches!(
-            verify_created_wal(&wal),
-            Err(SessionPreparationError::BrokerWal(_))
-        ));
-
-        fs::write(&wal, []).expect("empty test WAL must be writable");
-        assert!(matches!(
-            verify_created_wal(&wal),
-            Err(SessionPreparationError::BrokerWal(_))
-        ));
-
-        fs::write(&wal, b"durable-header").expect("test WAL must be writable");
-        verify_created_wal(&wal).expect("nonempty regular WAL must satisfy the filesystem proof");
-    }
-
-    #[test]
-    fn broker_runtime_factory_forwards_one_exact_identity_kernel_and_wal_path() {
+    fn broker_runtime_factory_owns_the_exact_kernel_wal_and_limits() {
         let root = TestDirectory::new();
         let wal_root = root.0.join("broker-wal");
         fs::create_dir(&wal_root).expect("Broker WAL root must be creatable");
@@ -2276,20 +2278,24 @@ mod tests {
             "production-test",
         ))));
         let observed = Arc::new(Mutex::new(None));
+        let exact_identity = identity(0x31);
+        let wal_path = wal_root.join(format!("{}.wal", exact_identity.broker_session_id()));
+        let limits = broker_limits();
         let factory = ProductionBrokerRuntimeFactory {
             authority: AuthorityCoreBackend::new(Arc::clone(&kernel)),
             egress_factory: Arc::new(CapturingEgressFactory {
-                expected_kernel: Arc::clone(&kernel),
+                expected_wal: wal_path.clone(),
                 observed: Arc::clone(&observed),
             }),
-            wal_root: wal_root.clone(),
-            limits: broker_limits(),
+            wal_root,
+            limits,
         };
-        let exact_identity = identity(0x31);
+        assert_eq!(Arc::strong_count(&kernel), 2);
 
-        let _runtime = factory
+        let runtime = factory
             .build(&exact_identity)
             .expect("an exact prepared dispatcher must build");
+        assert_eq!(Arc::strong_count(&kernel), 3);
         let observed = observed
             .lock()
             .expect("test observation mutex must be healthy")
@@ -2297,13 +2303,59 @@ mod tests {
             .expect("the per-session factory must be invoked");
 
         assert_eq!(observed.identity, exact_identity);
-        assert_eq!(observed.caller, "34".repeat(crate::ID_BYTES));
-        assert_eq!(observed.capability, "37".repeat(crate::ID_BYTES));
+        assert!(observed.wal_absent_during_prepare);
+        assert!(wal_path.is_file());
+
+        drop(runtime);
+        assert_eq!(Arc::strong_count(&kernel), 2);
+        let recovered =
+            DurableBrokerView::open(&wal_path).expect("host-created WAL must be fully recoverable");
         assert_eq!(
-            observed.wal_path,
-            wal_root.join(format!("{}.wal", exact_identity.broker_session_id()))
+            recovered.config(),
+            DurableSessionConfig::new(
+                WireBrokerSessionId::new(exact_identity.broker_session_id().as_bytes()),
+                limits.replay_capacity,
+                SessionBudgetLimits::new(
+                    limits.budget_requests,
+                    limits.budget_response_bytes,
+                    limits.budget_concurrent,
+                ),
+            )
         );
-        assert!(observed.exact_kernel);
+    }
+
+    #[test]
+    fn egress_factory_cannot_substitute_a_precreated_wal() {
+        let root = TestDirectory::new();
+        let wal_root = root.0.join("broker-wal");
+        fs::create_dir(&wal_root).expect("Broker WAL root must be creatable");
+        let exact_identity = identity(0x41);
+        let wal_path = wal_root.join(format!("{}.wal", exact_identity.broker_session_id()));
+        let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+            "production-test",
+        ))));
+        let factory = ProductionBrokerRuntimeFactory {
+            authority: AuthorityCoreBackend::new(kernel),
+            egress_factory: Arc::new(PrecreatingEgressFactory {
+                wal_path: wal_path.clone(),
+            }),
+            wal_root,
+            limits: broker_limits(),
+        };
+
+        let error = factory
+            .build(&exact_identity)
+            .err()
+            .expect("factory-controlled WAL precreation must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("host-owned durable Broker dispatcher creation failed")
+        );
+        assert_eq!(
+            fs::read(&wal_path).expect("malicious fixture must remain inspectable"),
+            b"factory-controlled"
+        );
     }
 
     #[test]

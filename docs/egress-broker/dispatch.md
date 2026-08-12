@@ -127,13 +127,17 @@ executor の失敗は 5 種類に分かれ、そのうち 2 つは「外部副�
 
 `serve_connection` は caller / capability の identity と clock を別々に受け取り、request ごとに `DispatchContext` を作り直す。1 connection で 1 つの時刻を使い回すと、connection の途中で `TimeWindow` が閉じた capability が最後まで認可を通る。
 
+## 検証済みの frame を再 encode しない
+
+入口は 2 つある。`dispatch_frame` は bytes を受けて `decode_complete` で `ControlFrame` にし、`dispatch_control_frame` は transport が既に検証した `ControlFrame` をそのまま受ける。`dispatch_transport` と `RequestDispatcher::dispatch_request` は後者を使う。
+
+以前は後者も `frame.encode()` してから `dispatch_frame` に渡していた。1 request あたり最大 1 MiB の copy が 2 回増えるうえ、production 経路が `decode_complete` を通ることになる。この関数の doc は「buffered な test input 用であり、確保順序の代わりにはならない」と述べていて、transport が持つ「長さを検査してから payload を確保する」順序を再現しない。
+
 ## その他の既知の問題
 
 **HEAD が byte 予算を消費しない。** `BrokerEffect::response_bytes()` は public fetch で `response.body.len()` を返し、HEAD の応答は常に空。`start` で `max_response_bytes` を予約し、`complete` で 0 を計上する。HEAD は `max_requests` と並行 slot だけに縛られる。
 
 **GitHub の byte 数は adapter の自己申告。** `response.response_bytes` をそのまま使う。検証するのは `TypedGitHubAdapter` だけで、別の `GitHubAdapter` 実装は過少申告できる。trait の signature には、この field が accounting の入力であることを示すものが無い。
-
-**`dispatch_transport` が frame を 2 度触る。** `FramedTransport::read_frame` が検証した `ControlFrame` を `encode()` し直し、`decode_complete` で読み直す。1 request あたり最大 1 MiB の copy が 2 回増える。`server.rs` も同じことをする。
 
 ## 正確な保証範囲
 

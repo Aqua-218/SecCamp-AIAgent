@@ -300,6 +300,113 @@ fn root_issuance_assigns_metadata_and_is_atomic_on_rejection() {
     assert!(!state.is_held_by(&child_subject_id(), &root_id));
 }
 
+// Requirement: the trusted host may bind an exact non-empty identity, while
+// duplicate and invalid transitions remain fully atomic. Category:
+// state/identity-boundary. Risk: critical.
+#[test]
+fn trusted_root_issuance_rejects_invalid_and_reused_ids_atomically() {
+    let mut state = state_with_subjects();
+    let empty_id = CapId::new("");
+    assert_eq!(
+        state.issue_root_with_id(empty_id.clone(), root_grant(false)),
+        Err(CapabilityStateError::InvalidCapabilityId(empty_id))
+    );
+    assert_eq!(
+        state
+            .issue_root(root_grant(false))
+            .expect("an invalid ID must not consume the sequential cursor")
+            .as_str(),
+        "session-issuer:0"
+    );
+
+    let external_id = CapId::new("orchestrator-root");
+    let issued_id = state
+        .issue_root_with_id(external_id.clone(), root_grant(false))
+        .expect("a non-empty host ID must be issued exactly");
+    assert_eq!(issued_id, external_id);
+    assert_eq!(
+        state
+            .capability(&external_id)
+            .map(|capability| capability.metadata().id()),
+        Some(&external_id)
+    );
+
+    assert_eq!(
+        state.issue_root_with_id(external_id.clone(), root_grant(false)),
+        Err(CapabilityStateError::CapabilityIdAlreadyIssued(
+            external_id.clone()
+        ))
+    );
+    state
+        .revoke(&external_id)
+        .expect("the externally allocated capability must be revocable");
+    let epoch_after_revoke = state.authorization_epoch();
+    assert_eq!(
+        state.issue_root_with_id(external_id.clone(), root_grant(false)),
+        Err(CapabilityStateError::CapabilityIdAlreadyIssued(external_id))
+    );
+    assert_eq!(state.authorization_epoch(), epoch_after_revoke);
+}
+
+// Requirement: subject and envelope checks happen before an external identity
+// can reserve state. Category: state/error atomicity. Risk: critical.
+#[test]
+fn trusted_root_invalid_grant_does_not_reserve_id_or_advance_epoch() {
+    let mut state = state_with_subjects();
+    let external_id = CapId::new("orchestrator-invalid-grant");
+    let epoch_before = state.authorization_epoch();
+    let invalid_grant = CapabilityGrant::new(
+        root_subject_id(),
+        window(0, 101),
+        file_authority(
+            [FileEffect::ReadData],
+            PathPattern::Exact(path(&["src", "main.rs"])),
+        ),
+    );
+
+    assert_eq!(
+        state.issue_root_with_id(external_id.clone(), invalid_grant),
+        Err(CapabilityStateError::GrantExceedsEnvelope(root_subject_id()))
+    );
+    assert_eq!(state.authorization_epoch(), epoch_before);
+    assert_eq!(state.capability(&external_id), None);
+    assert_eq!(
+        state
+            .issue_root(root_grant(false))
+            .expect("a rejected grant must not consume the sequential cursor")
+            .as_str(),
+        "session-issuer:0"
+    );
+}
+
+// Requirement: sequential issuance must skip sequence-shaped external IDs
+// and remain injective. Category: state/identity-allocation. Risk: critical.
+#[test]
+fn sequential_root_issuance_skips_reserved_external_ids() {
+    let mut state = state_with_subjects();
+    state
+        .issue_root_with_id(CapId::new("session-issuer:0"), root_grant(false))
+        .expect("the host may reserve the first sequential identity");
+    assert_eq!(
+        state
+            .issue_root(root_grant(false))
+            .expect("sequential issuance must skip the reserved identity")
+            .as_str(),
+        "session-issuer:1"
+    );
+
+    state
+        .issue_root_with_id(CapId::new("session-issuer:2"), root_grant(false))
+        .expect("the host may reserve a later sequential identity");
+    assert_eq!(
+        state
+            .issue_root(root_grant(false))
+            .expect("sequential issuance must continue after a skipped identity")
+            .as_str(),
+        "session-issuer:3"
+    );
+}
+
 // Requirement: every successful Derive creates an exact parent link and each
 // edge narrows authority. Category: state/normal. Risk: critical.
 #[test]

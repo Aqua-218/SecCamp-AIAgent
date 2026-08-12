@@ -12,4 +12,5 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
 sha2 = "0.10.9"

@@ -767,8 +767,8 @@ inductive Step : CapabilityState → CapabilityState → Prop
       Step state (state.beginSubjectClose subject)
   | finishClose {state : CapabilityState} {subject : SubjectId} :
       state.subjectStatuses subject = some .closing →
-      (∀ handle, state.openHandles handle = none ∨
-        (state.openHandles handle).any (fun record => record.subject != subject)) →
+      (∀ handleId handle,
+        state.openHandles handleId = some handle → handle.subject ≠ subject) →
       Step state (state.finishSubjectClose subject)
   | registerHandle {state : CapabilityState} {handle : OpenHandle} :
       state.subjectStatuses handle.subject = some .running →

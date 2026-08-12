@@ -1287,9 +1287,9 @@ fn required_steps() -> [IsolationStep; 13] {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendError, ChildProcessError, ChildStartupStatus, IsolationError, IsolationStep,
-        NamespaceIdentity, REQUIRED_STEPS, STARTUP_MESSAGE_VERSION, decode_startup_status,
-        encode_startup_failure, encode_startup_ready,
+        BackendError, ChildProcessError, ChildStartupReady, ChildStartupStatus, IsolationError,
+        IsolationStep, NamespaceIdentity, REQUIRED_STEPS, STARTUP_MESSAGE_VERSION,
+        decode_startup_status, encode_startup_failure, encode_startup_ready,
     };
 
     #[test]

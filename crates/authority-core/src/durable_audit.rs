@@ -43,7 +43,7 @@ pub struct CommitReceipt {
 impl CommitReceipt {
     /// Creates a receipt for one attempt from an adapter-provided token.
     #[must_use]
-    pub fn new(attempt_id: crate::audit::AttemptId, token: impl Into<Vec<u8>>) -> Self {
+    pub(crate) fn new(attempt_id: crate::audit::AttemptId, token: impl Into<Vec<u8>>) -> Self {
         Self {
             attempt_id,
             token: token.into(),
@@ -279,10 +279,82 @@ struct DurableState {
 /// coordination is intentionally outside authority-core; callers must assign
 /// one journal owner. Reopening validates the complete prefix and rejects all
 /// malformed or ambiguous suffixes instead of silently truncating them.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DurableAuditLog {
     state: Arc<Mutex<DurableState>>,
     path: PathBuf,
+}
+
+/// An immutable snapshot of a validated durable audit journal.
+///
+/// Unlike [`DurableAuditLog`], this view is freely cloneable because it owns no
+/// journal writer and exposes no state transition operations. Use
+/// [`Self::open`] to inspect recovery state without acquiring a WAL writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableAuditView {
+    path: PathBuf,
+    next_attempt_sequence: Option<u64>,
+    attempts: Vec<DurableAttempt>,
+}
+
+impl DurableAuditView {
+    /// Opens, validates, and snapshots an existing journal without write
+    /// access.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableAuditError`] when the file cannot be read or contains
+    /// an invalid, truncated, replayed, or checksum-invalid frame.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, DurableAuditError> {
+        let path = path.as_ref().to_owned();
+        let mut file = File::open(&path).map_err(DurableAuditError::from)?;
+        let file_length = file.metadata().map_err(DurableAuditError::from)?.len();
+        if file_length > MAX_JOURNAL_BYTES {
+            return Err(DurableAuditError::RecordTooLarge(
+                usize::try_from(file_length).unwrap_or(usize::MAX),
+            ));
+        }
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(DurableAuditError::from)?;
+        let (_, attempts) = parse_journal(&bytes)?;
+        Ok(Self::from_attempts(path, &attempts))
+    }
+
+    /// Returns the path from which this snapshot was recovered.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the next session-local attempt sequence in this snapshot.
+    ///
+    /// `None` means no further attempt identity can be allocated.
+    #[must_use]
+    pub const fn next_attempt_sequence(&self) -> Option<u64> {
+        self.next_attempt_sequence
+    }
+
+    /// Returns the validated attempts in attempt identity order.
+    #[must_use]
+    pub fn attempts(&self) -> &[DurableAttempt] {
+        &self.attempts
+    }
+
+    fn from_attempts(
+        path: PathBuf,
+        attempts: &BTreeMap<crate::audit::AttemptId, DurableAttemptState>,
+    ) -> Self {
+        Self {
+            path,
+            next_attempt_sequence: next_attempt_sequence(attempts),
+            attempts: attempts
+                .values()
+                .map(DurableAttemptState::snapshot)
+                .collect(),
+        }
+    }
 }
 
 impl DurableAuditLog {
@@ -361,6 +433,25 @@ impl DurableAuditLog {
         self.path.clone()
     }
 
+    /// Returns an immutable snapshot that can be retained after this writer is
+    /// moved into a [`crate::kernel::CapabilityKernel`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableAuditError::LockPoisoned`] or
+    /// [`DurableAuditError::JournalUnavailable`] when the backend is not
+    /// trustworthy.
+    pub fn read_only_view(&self) -> Result<DurableAuditView, DurableAuditError> {
+        let state = self.lock_state()?;
+        if state.unusable {
+            return Err(DurableAuditError::JournalUnavailable);
+        }
+        Ok(DurableAuditView::from_attempts(
+            self.path.clone(),
+            &state.attempts,
+        ))
+    }
+
     /// Returns the next session-local attempt sequence for a reopened kernel.
     ///
     /// `None` means no further attempt identity can be allocated.
@@ -403,7 +494,7 @@ impl DurableAuditLog {
     ///
     /// Returns a durable journal error when the attempt is a replay, the
     /// payload is too large, or the frame cannot be synced.
-    pub fn begin_attempt(
+    pub(crate) fn begin_attempt(
         &self,
         attempt_id: crate::audit::AttemptId,
         caller: &SubjectId,
@@ -446,13 +537,13 @@ impl DurableAuditLog {
     /// Returns a durable journal error when the attempt is unknown or already
     /// terminal, the receipt does not match, or the terminal frame cannot be
     /// synced.
-    pub fn finish_attempt(
+    pub(crate) fn finish_attempt(
         &self,
         attempt_id: crate::audit::AttemptId,
         outcome: AttemptOutcome,
         receipt: Option<&CommitReceipt>,
     ) -> Result<(), DurableAuditError> {
-        validate_finish(outcome, receipt, attempt_id)?;
+        let payload = encode_finish_payload(attempt_id, outcome, receipt)?;
         let mut state = self.lock_state()?;
         if state.unusable {
             return Err(DurableAuditError::JournalUnavailable);
@@ -464,7 +555,6 @@ impl DurableAuditLog {
             return Err(DurableAuditError::ReplayDetected { attempt_id });
         }
         let sequence = next_sequence(&state)?;
-        let payload = encode_finish_payload(outcome, receipt)?;
         append_frame(&mut state, sequence, FINISH_KIND, attempt_id, &payload)?;
         let attempt = state.attempts.get_mut(&attempt_id).ok_or_else(|| {
             DurableAuditError::InvalidRecord("attempt disappeared during finish".to_owned())
@@ -664,20 +754,22 @@ fn validate_finish(
     receipt: Option<&CommitReceipt>,
     attempt_id: crate::audit::AttemptId,
 ) -> Result<(), DurableAuditError> {
+    if let Some(receipt) = receipt
+        && receipt.attempt_id() != attempt_id
+    {
+        return Err(DurableAuditError::InvalidRecord(
+            "commit receipt belongs to another attempt".to_owned(),
+        ));
+    }
     if outcome == AttemptOutcome::Started {
         return Err(DurableAuditError::InvalidRecord(
             "Started is not a terminal outcome".to_owned(),
         ));
     }
     if outcome == AttemptOutcome::Committed {
-        let Some(receipt) = receipt else {
+        if receipt.is_none() {
             return Err(DurableAuditError::InvalidRecord(
                 "Committed requires a commit receipt".to_owned(),
-            ));
-        };
-        if receipt.attempt_id() != attempt_id {
-            return Err(DurableAuditError::InvalidRecord(
-                "commit receipt belongs to another attempt".to_owned(),
             ));
         }
     } else if receipt.is_some() {
@@ -689,9 +781,11 @@ fn validate_finish(
 }
 
 fn encode_finish_payload(
+    attempt_id: crate::audit::AttemptId,
     outcome: AttemptOutcome,
     receipt: Option<&CommitReceipt>,
 ) -> Result<Vec<u8>, DurableAuditError> {
+    validate_finish(outcome, receipt, attempt_id)?;
     let mut payload = vec![outcome_code(outcome)];
     if let Some(receipt) = receipt {
         let token_length = u32::try_from(receipt.token().len())
@@ -938,11 +1032,12 @@ fn encode_authority_request(
 mod tests {
     use std::{
         fs::{self, OpenOptions},
+        sync::Arc,
         sync::atomic::{AtomicU64, Ordering},
         thread,
     };
 
-    use super::{CommitReceipt, DurableAuditError, DurableAuditLog};
+    use super::{CommitReceipt, DurableAuditError, DurableAuditLog, DurableAuditView};
     use crate::{
         audit::{AttemptId, AttemptOutcome},
         capability::{AuthorityRequest, CapId, CapabilityRequest, CapabilityRequestSet, SubjectId},
@@ -1031,6 +1126,24 @@ mod tests {
     }
 
     #[test]
+    fn read_only_view_recovers_without_a_writer() {
+        let journal = TestJournal::new();
+        let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
+        begin(&log, 0);
+        let live_view = log
+            .read_only_view()
+            .expect("a healthy writer must produce a read-only snapshot");
+        drop(log);
+
+        let recovered = DurableAuditView::open(&journal.path)
+            .expect("a complete start frame must be recoverable read-only");
+        assert_eq!(live_view, recovered);
+        assert_eq!(recovered.path(), journal.path);
+        assert_eq!(recovered.next_attempt_sequence(), Some(1));
+        assert_eq!(recovered.attempts()[0].outcome(), AttemptOutcome::Started);
+    }
+
+    #[test]
     fn truncated_tail_is_rejected_without_silent_repair() {
         let journal = TestJournal::new();
         let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
@@ -1080,12 +1193,11 @@ mod tests {
     fn poisoned_durable_lock_fails_closed() {
         let journal = TestJournal::new();
         let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
-        let poisoned = log.clone();
+        let poisoned = Arc::clone(&log.state);
         thread::scope(|scope| {
             scope
                 .spawn(|| {
                     let _guard = poisoned
-                        .state
                         .lock()
                         .expect("test lock must initially be healthy");
                     panic!("poison durable audit lock");
@@ -1111,6 +1223,55 @@ mod tests {
         assert_eq!(
             log.attempts()
                 .expect("the rejected finish must not poison the journal")[0]
+                .outcome(),
+            AttemptOutcome::Started
+        );
+    }
+
+    #[test]
+    fn mismatched_reconciliation_receipt_is_rejected_without_mutation() {
+        let journal = TestJournal::new();
+        let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
+        begin(&log, 0);
+        let mismatched = CommitReceipt::new(AttemptId::from_u64(1), b"provider-attempt-1");
+
+        assert!(matches!(
+            log.finish_attempt(
+                AttemptId::from_u64(0),
+                AttemptOutcome::Committed,
+                Some(&mismatched),
+            ),
+            Err(DurableAuditError::InvalidRecord(message))
+                if message == "commit receipt belongs to another attempt"
+        ));
+        assert_eq!(
+            log.attempts()
+                .expect("rejected evidence must leave the journal readable")[0]
+                .outcome(),
+            AttemptOutcome::Started
+        );
+    }
+
+    #[test]
+    fn reconciliation_cannot_create_an_arbitrary_terminal_attempt() {
+        let journal = TestJournal::new();
+        let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
+        begin(&log, 0);
+        let arbitrary = CommitReceipt::new(AttemptId::from_u64(7), b"invented-evidence");
+
+        assert_eq!(
+            log.finish_attempt(
+                AttemptId::from_u64(7),
+                AttemptOutcome::Committed,
+                Some(&arbitrary),
+            ),
+            Err(DurableAuditError::ReplayDetected {
+                attempt_id: AttemptId::from_u64(7),
+            })
+        );
+        assert_eq!(
+            log.attempts()
+                .expect("rejected evidence must leave the journal readable")[0]
                 .outcome(),
             AttemptOutcome::Started
         );

@@ -32,6 +32,13 @@ def HostPath.CleanAbsolute (path : HostPath) : Prop :=
 def HostPath.AtOrBelow (path parent : HostPath) : Prop :=
   parent.components <+: path.components
 
+/-- Exact safe-component grammar for a Linux cgroup leaf name. -/
+def CgroupNameValid (name : String) : Prop :=
+  name ≠ "" ∧ name.length ≤ 255 ∧ name ≠ "." ∧ name ≠ ".." ∧
+    ∀ character, character ∈ name.toList →
+      character.isAlphanum = true ∨ character = '.' ∨
+        character = '_' ∨ character = '-'
+
 /-- Exact immutable isolation policy relevant to pure preflight. -/
 structure Config where
   rootfsSource : HostPath
@@ -42,7 +49,7 @@ structure Config where
   tmpfsTarget : HostPath
   tmpfsBytes : Nat
   cgroupRoot : HostPath
-  cgroupNameSafe : Bool
+  cgroupName : String
   memoryMaxBytes : Nat
   pidsMax : Nat
   landlockRequiredAbi : Nat
@@ -70,7 +77,7 @@ structure Config.Valid (config : Config) : Prop where
   cgroupNotRoot : config.cgroupRoot ≠ HostPath.root
   tmpfsPositive : 0 < config.tmpfsBytes
   tmpfsBounded : config.tmpfsBytes ≤ maximumTmpfsBytes
-  cgroupNameValid : config.cgroupNameSafe = true
+  cgroupNameValid : CgroupNameValid config.cgroupName
   memoryPositive : 0 < config.memoryMaxBytes
   pidsPositive : 0 < config.pidsMax
   landlockAbiSupported : 3 ≤ config.landlockRequiredAbi
@@ -140,6 +147,13 @@ def requiredStages : List ApplyStage :=
     .limitedTmpfs, .maskProc, .maskDevices, .closeInheritedFileDescriptors,
     .landlock, .dropCapabilities, .noNewPrivs, .seccomp]
 
+/-- Linux stages whose process state cannot be restored in place. -/
+def ApplyStage.irreversible : ApplyStage → Bool
+  | .namespaces | .identityMap | .readOnlyRootfs |
+      .closeInheritedFileDescriptors | .landlock | .dropCapabilities |
+      .noNewPrivs | .seccomp => true
+  | .cgroupV2 | .workspace | .limitedTmpfs | .maskProc | .maskDevices => false
+
 /-- Receipt exists only after every coordinator stage returned success. -/
 structure Receipt where
   stages : List ApplyStage
@@ -164,6 +178,7 @@ structure State where
   rollbackTrace : List ApplyStage
   rollbackFailures : List ApplyStage
   receipt : Option Receipt
+  mustTerminate : Bool
 
 /-- State before side-effect-free validation and capability detection. -/
 def State.initial : State where
@@ -175,6 +190,7 @@ def State.initial : State where
   rollbackTrace := []
   rollbackFailures := []
   receipt := none
+  mustTerminate := false
 
 /-- Enter apply only after configuration and capability preflight succeed. -/
 def State.beginApply (state : State) : State := { state with phase := .applying }
@@ -192,7 +208,8 @@ def State.applyFailure (state : State) (stage : ApplyStage) : State :=
   { state with
     phase := if state.completed = [] then .failed else .rollingBack
     applyTrace := state.applyTrace ++ [stage]
-    rollbackPending := state.completed.reverse }
+    rollbackPending := state.completed.reverse
+    mustTerminate := state.mustTerminate || state.completed.any ApplyStage.irreversible }
 
 /-- Record one rollback attempt and whether that attempt failed. -/
 def State.recordRollback (state : State) (stage : ApplyStage)
@@ -223,7 +240,8 @@ def State.WellFormed (state : State) : Prop :=
         state.applyTrace = requiredStages ∧
         ∃ receipt, state.receipt = some receipt ∧ receipt.stages = requiredStages
   | .failed =>
-      state.rollbackPending = [] ∧ state.receipt = none
+      state.rollbackPending = [] ∧ state.receipt = none ∧
+        state.rollbackTrace = state.completed.reverse
 
 /-- Initial coordinator shape is valid. -/
 theorem State.initial_wellFormed : State.initial.WellFormed := by
@@ -281,7 +299,7 @@ theorem Step.preserves_wellFormed {before after : State}
       constructor
       · exact plan
       · by_cases noCompleted : before.completed = []
-        · simp [State.applyFailure, noCompleted, noReceipt]
+        · simp [State.applyFailure, noCompleted, noReceipt, rollbackTrace]
         · have reverseNonempty : before.completed.reverse ≠ [] := by
             simpa using noCompleted
           simp [State.applyFailure, noCompleted, rollbackTrace, reverseNonempty,
@@ -293,7 +311,10 @@ theorem Step.preserves_wellFormed {before after : State}
       · exact plan
       · rename_i stage remaining failed
         by_cases noRemaining : remaining = []
-        · simp [State.recordRollback, noRemaining, noReceipt]
+        · have partitionAfter : before.rollbackTrace ++ [stage] =
+              before.completed.reverse := by
+            rw [← rollbackPartition, pending, noRemaining]
+          simp [State.recordRollback, noRemaining, noReceipt, partitionAfter]
         · have partitionAfter :
               (before.rollbackTrace ++ [stage]) ++ remaining =
                 before.completed.reverse := by
@@ -336,7 +357,7 @@ theorem State.receipt_excludes_rollback {state : State}
   | succeeded => rfl
   | failed =>
       rw [State.WellFormed, phase] at wellFormed
-      rw [wellFormed.2.2] at receiptLookup
+      rw [wellFormed.2.2.1] at receiptLookup
       cases receiptLookup
 
 /-- Every successful state exposes the complete required stage list. -/
@@ -345,6 +366,53 @@ theorem State.success_receipt_exact {state : State} (wellFormed : state.WellForm
     ∃ receipt, state.receipt = some receipt ∧ receipt.stages = requiredStages := by
   rw [State.WellFormed, succeeded] at wellFormed
   exact wellFormed.2.2.2.2
+
+/-- A terminal failure retains the complete reverse-prefix rollback trace. -/
+theorem State.failed_rollback_complete {state : State} (wellFormed : state.WellFormed)
+    (failed : state.phase = .failed) :
+    state.rollbackTrace = state.completed.reverse := by
+  rw [State.WellFormed, failed] at wellFormed
+  exact wellFormed.2.2.2
+
+/-- Failure after any irreversible Linux stage requires terminating the child. -/
+theorem State.applyFailure_marks_mustTerminate {state : State}
+    (failedStage : ApplyStage)
+    (irreversibleCompleted : ∃ stage,
+      stage ∈ state.completed ∧ stage.irreversible = true) :
+    (state.applyFailure failedStage).mustTerminate = true := by
+  simp [State.applyFailure, List.any_eq_true, irreversibleCompleted]
+
+/-- Once required, child termination cannot be cleared by a coordinator step. -/
+theorem Step.mustTerminate_monotone {before after : State}
+    (transition : Step before after)
+    (required : before.mustTerminate = true) : after.mustTerminate = true := by
+  cases transition with
+  | beginApply | applySuccess | rollback | finish => exact required
+  | applyFailure => simp [State.applyFailure, required]
+
+/-- Arbitrary finite isolation execution. -/
+inductive Steps : State → State → Prop
+  | refl (state : State) : Steps state state
+  | tail {first middle last : State} :
+      Steps first middle → Step middle last → Steps first last
+
+/-- Child-termination obligation persists across arbitrary retries and finishes. -/
+theorem Steps.mustTerminate_monotone {before after : State}
+    (transitions : Steps before after)
+    (required : before.mustTerminate = true) : after.mustTerminate = true := by
+  induction transitions with
+  | refl => exact required
+  | tail _ transition inductionHypothesis =>
+      exact transition.mustTerminate_monotone inductionHypothesis
+
+/-- Exact coordinator shape is inductive across arbitrary finite execution. -/
+theorem Steps.preserves_wellFormed {before after : State}
+    (transitions : Steps before after) (wellFormed : before.WellFormed) :
+    after.WellFormed := by
+  induction transitions with
+  | refl => exact wellFormed
+  | tail _ transition inductionHypothesis =>
+      exact transition.preserves_wellFormed inductionHypothesis
 
 end Isolation
 

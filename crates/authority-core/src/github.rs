@@ -88,6 +88,12 @@ impl GitHubOperations {
         self.0 & operation.mask() != 0
     }
 
+    /// Returns whether this set contains no GitHub operations.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
     /// Returns whether every operation in this set is also in `parent`.
     #[must_use]
     pub const fn is_subset_of(self, parent: Self) -> bool {
@@ -562,6 +568,8 @@ mod tests {
             ".topic",
             "topic/.hidden",
             "topic.lock",
+            "topic.",
+            "topic..old",
         ] {
             assert!(
                 BranchName::new(value).is_err(),
@@ -572,6 +580,8 @@ mod tests {
             BranchName::new("@").unwrap_err(),
             InvalidBranchName::ReservedAt
         );
+        assert!(BranchName::new("topic/@").is_ok());
+        assert!(BranchName::new("topic/{literal}").is_ok());
     }
 
     #[test]
@@ -681,6 +691,34 @@ mod tests {
         assert!(!github_body_below(&operation_escalation, &parent));
         assert!(!github_body_below(&base_escalation, &parent));
         assert!(!github_body_below(&head_escalation, &parent));
+    }
+
+    #[test]
+    fn github_operation_sets_handle_empty_membership_without_bypassing_structure() {
+        let empty = GitHubOperations::empty();
+        let create_pull_request = GitHubOperations::only(GitHubOperation::CreatePullRequest);
+        assert!(empty.is_empty());
+        assert!(empty.is_subset_of(create_pull_request));
+        assert!(!create_pull_request.is_subset_of(empty));
+
+        let parent = authority(
+            create_pull_request,
+            BranchPattern::Exact(branch("main")),
+            BranchPattern::Prefix(branch("agents")),
+        );
+        let same_shape = authority(
+            empty,
+            BranchPattern::Exact(branch("main")),
+            BranchPattern::Prefix(branch("agents")),
+        );
+        let different_head = authority(
+            empty,
+            BranchPattern::Exact(branch("main")),
+            BranchPattern::Prefix(branch("other")),
+        );
+
+        assert!(github_body_below(&same_shape, &parent));
+        assert!(!github_body_below(&different_head, &parent));
     }
 
     #[test]

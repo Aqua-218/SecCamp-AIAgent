@@ -270,6 +270,151 @@ theorem StartupTrace.notification_failure_events_require_termination :
     StartupEvent.mustTerminate ∈ notificationFailureTrace.events := by
   simp [notificationFailureTrace, StartupTrace.events]
 
+/-!
+## Rust-shaped startup and ownership observations
+
+These observations mirror the fields that the Linux backend validates before
+writing a ready message and before releasing its owned direct child.
+-/
+
+/-- Parent-visible observations from the concrete Linux readiness boundary. -/
+structure RustReadyObservation where
+  completedStepCode : Nat
+  expectedFinalStepCode : Nat
+  namespaceMatchesPreparation : Bool
+  parentDeathSignal : Nat
+  killSignal : Nat
+  startupReaderAlive : Bool
+  sourcePinnedBeforePivot : Bool
+  mountedSourceMatchesPin : Bool
+  deriving Repr, BEq, DecidableEq
+
+/-- Executable checker for the exact Rust readiness contract. -/
+def RustReadyObservation.checks (observation : RustReadyObservation) : Bool :=
+  observation.completedStepCode == observation.expectedFinalStepCode &&
+    observation.namespaceMatchesPreparation &&
+    observation.parentDeathSignal == observation.killSignal &&
+    observation.startupReaderAlive && observation.sourcePinnedBeforePivot &&
+    observation.mountedSourceMatchesPin
+
+/-- Translation from checked Rust fields to the abstract lifecycle evidence. -/
+def RustReadyObservation.toEvidence
+    (observation : RustReadyObservation) : ChildReadyEvidence where
+  parentDeathSignalIsKill := observation.parentDeathSignal == observation.killSignal
+  startupReaderAlive := observation.startupReaderAlive
+  sourcePinnedBeforePivot := observation.sourcePinnedBeforePivot
+  mountedSourceMatchesPin := observation.mountedSourceMatchesPin
+
+/-- Rust readiness cannot be accepted without every kernel evidence bit. -/
+theorem RustReadyObservation.checked_evidence
+    {observation : RustReadyObservation}
+    (checked : observation.checks = true) :
+    observation.toEvidence.checks = true := by
+  simp [RustReadyObservation.checks] at checked
+  simp [RustReadyObservation.toEvidence, ChildReadyEvidence.checks,
+    checked.1.1.1.2, checked.1.1.2, checked.1.2, checked.2]
+
+/-- A checked Rust observation admits the concrete starting-to-ready transition. -/
+theorem RustReadyObservation.checked_refines_child_ready
+    {observation : RustReadyObservation}
+    (checked : observation.checks = true) :
+    ChildLifecycleStep .starting .ready :=
+  ChildLifecycleStep.ready observation.toEvidence
+    (RustReadyObservation.checked_evidence checked)
+
+/-- Rust parent-side observations after a shutdown or Drop attempt. -/
+structure RustOwnedChildObservation where
+  terminationRequested : Bool
+  childExited : Bool
+  waitObserved : Bool
+  deriving Repr, BEq, DecidableEq
+
+/-- Ownership may be released only after termination, exit, and wait evidence. -/
+def RustOwnedChildObservation.checksRelease
+    (observation : RustOwnedChildObservation) : Bool :=
+  observation.terminationRequested && observation.childExited && observation.waitObserved
+
+/-- Checked release evidence is non-vacuous and includes the observed reap. -/
+theorem RustOwnedChildObservation.checked_release_complete
+    {observation : RustOwnedChildObservation}
+    (checked : observation.checksRelease = true) :
+    observation.terminationRequested = true ∧
+      observation.childExited = true ∧ observation.waitObserved = true := by
+  simp [RustOwnedChildObservation.checksRelease] at checked
+  exact ⟨checked.1.1, checked.1.2, checked.2⟩
+
+/-- Checked Rust release evidence refines the kill-and-reap lifecycle trace. -/
+theorem RustOwnedChildObservation.checked_refines_drop_reap
+    {observation : RustOwnedChildObservation}
+    (checked : observation.checksRelease = true) :
+    ChildLifecycleSteps .ready .reaped := by
+  have evidence := RustOwnedChildObservation.checked_release_complete checked
+  exact ChildLifecycle.drop_kill_reap_trace
+    observation.terminationRequested observation.childExited observation.waitObserved
+    evidence.1 evidence.2.1 evidence.2.2
+
+/-- Checked parent-death cleanup uses the same concrete kill-and-wait evidence. -/
+theorem RustOwnedChildObservation.checked_refines_parent_death_reap
+    {observation : RustOwnedChildObservation}
+    (checked : observation.checksRelease = true) :
+    ChildLifecycleSteps .ready .reaped := by
+  have evidence := RustOwnedChildObservation.checked_release_complete checked
+  exact ChildLifecycle.parentDeath_kill_reap_trace
+    observation.terminationRequested observation.childExited observation.waitObserved
+    evidence.1 evidence.2.1 evidence.2.2
+
+/-- Startup failure cleanup starts before readiness and still requires kill and wait evidence. -/
+theorem RustOwnedChildObservation.checked_refines_startup_failure_reap
+    {observation : RustOwnedChildObservation}
+    (checked : observation.checksRelease = true) :
+    ChildLifecycleSteps .starting .reaped := by
+  have evidence := RustOwnedChildObservation.checked_release_complete checked
+  exact .tail
+    (.tail (.tail (.refl .starting) .startupFailure)
+      (.signalExit observation.terminationRequested observation.childExited
+        evidence.1 evidence.2.1))
+    (.reap observation.waitObserved evidence.2.2)
+
+/-- Concrete ready witness using Rust's final seccomp code and SIGKILL value. -/
+def validRustReadyObservation : RustReadyObservation where
+  completedStepCode := 12
+  expectedFinalStepCode := 12
+  namespaceMatchesPreparation := true
+  parentDeathSignal := 9
+  killSignal := 9
+  startupReaderAlive := true
+  sourcePinnedBeforePivot := true
+  mountedSourceMatchesPin := true
+
+theorem validRustReadyObservation_checks : validRustReadyObservation.checks = true := by
+  native_decide
+
+/-- A credential transition that cleared PDEATHSIG cannot produce readiness. -/
+def clearedParentDeathObservation : RustReadyObservation :=
+  { validRustReadyObservation with parentDeathSignal := 0 }
+
+theorem clearedParentDeathObservation_rejected :
+    clearedParentDeathObservation.checks = false := by
+  native_decide
+
+/-- Resolving the workspace to an unpinned post-pivot source cannot produce readiness. -/
+def postPivotWorkspaceMismatchObservation : RustReadyObservation :=
+  { validRustReadyObservation with mountedSourceMatchesPin := false }
+
+theorem postPivotWorkspaceMismatchObservation_rejected :
+    postPivotWorkspaceMismatchObservation.checks = false := by
+  native_decide
+
+/-- A termination signal without a wait observation cannot release ownership. -/
+def unreapedRustChildObservation : RustOwnedChildObservation where
+  terminationRequested := true
+  childExited := true
+  waitObserved := false
+
+theorem unreapedRustChildObservation_rejected :
+    unreapedRustChildObservation.checksRelease = false := by
+  native_decide
+
 /-- Child verification failure is recorded after namespace preparation. -/
 def childVerificationFailureState : State :=
   preparedNamespaceState.applyFailure .namespaces

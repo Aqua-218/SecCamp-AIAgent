@@ -3,6 +3,11 @@
 use std::{error::Error, fmt};
 
 #[cfg(loom)]
+use loom::sync::Arc;
+#[cfg(not(loom))]
+use std::sync::Arc;
+
+#[cfg(loom)]
 use loom::sync::RwLock;
 #[cfg(not(loom))]
 use std::sync::RwLock;
@@ -10,6 +15,7 @@ use std::sync::RwLock;
 use crate::{
     audit::{AttemptRecord, AuditError, AuditTrail, EffectRecord},
     capability::{CapId, Capability, CapabilityRequest, CapabilityRequestSet, SubjectId},
+    durable_audit::{CommitReceipt, DurableAuditLog},
     handle::{HandleId, ObjectId, OpenHandle},
     state::{
         AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
@@ -63,6 +69,10 @@ pub enum EffectCommitError<E> {
     Effect(E),
     /// The attempt could not be recorded before executor invocation.
     Audit(AuditError),
+    /// The executor returned success, but the terminal durable receipt could
+    /// not be persisted. The external effect may already exist; callers must
+    /// resolve this with the provider's idempotency or reconciliation path.
+    CommittedButAudit(AuditError),
 }
 
 impl<E: fmt::Display> fmt::Display for EffectCommitError<E> {
@@ -77,6 +87,10 @@ impl<E: fmt::Display> fmt::Display for EffectCommitError<E> {
                 )
             }
             Self::Audit(error) => error.fmt(formatter),
+            Self::CommittedButAudit(error) => write!(
+                formatter,
+                "effect may be committed but its audit receipt failed: {error}"
+            ),
         }
     }
 }
@@ -85,7 +99,7 @@ impl<E: Error + 'static> Error for EffectCommitError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Effect(error) => Some(error),
-            Self::Audit(error) => Some(error),
+            Self::Audit(error) | Self::CommittedButAudit(error) => Some(error),
             Self::LockPoisoned | Self::NotAuthorized => None,
         }
     }
@@ -147,6 +161,25 @@ impl CapabilityKernel {
         }
     }
 
+    /// Creates a kernel whose attempt journal is backed by the supplied WAL.
+    ///
+    /// The WAL's recovered attempt sequence is used, so reopening a session
+    /// cannot reuse a prior attempt identity. Callers should use this
+    /// constructor when terminal audit receipts must survive process restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditError`] if the backend cannot be inspected safely.
+    pub fn try_new_with_durable_audit(
+        state: CapabilityState,
+        backend: DurableAuditLog,
+    ) -> Result<Self, AuditError> {
+        Ok(Self {
+            state: RwLock::new(state),
+            audit: AuditTrail::new_with_backend(Arc::new(backend))?,
+        })
+    }
+
     /// Registers a subject while holding exclusive state access.
     ///
     /// # Errors
@@ -165,6 +198,24 @@ impl CapabilityKernel {
     /// panicked, or wraps the sequential issuance error.
     pub fn issue_root(&self, grant: CapabilityGrant) -> Result<CapId, CapabilityKernelError> {
         self.with_state_mut(|state| state.issue_root(grant))
+    }
+
+    /// Issues a root capability with a trusted host-allocated identity while
+    /// holding exclusive state access.
+    ///
+    /// The transition uses the same subject/envelope validation and permanent
+    /// identity reservation as [`CapabilityState::issue_root_with_id`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
+    /// panicked, or wraps the sequential issuance error.
+    pub fn issue_root_with_id(
+        &self,
+        capability_id: CapId,
+        grant: CapabilityGrant,
+    ) -> Result<CapId, CapabilityKernelError> {
+        self.with_state_mut(|state| state.issue_root_with_id(capability_id, grant))
     }
 
     /// Derives a capability while holding exclusive state access.
@@ -400,6 +451,28 @@ impl CapabilityKernel {
         )
     }
 
+    /// Reauthorizes one request and persists an adapter-provided commit
+    /// receipt with the terminal durable audit record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectCommitError::CommittedButAudit`] if the executor
+    /// succeeds but the terminal receipt cannot be persisted.
+    pub fn authorize_and_commit_with_receipt<T, E>(
+        &self,
+        caller: &SubjectId,
+        capability_id: &CapId,
+        request: &CapabilityRequest,
+        commit_to_linearization: impl FnOnce(&Capability) -> Result<(T, Vec<u8>), E>,
+    ) -> Result<T, EffectCommitError<E>> {
+        self.authorize_all_and_commit_with_receipt(
+            caller,
+            capability_id,
+            &CapabilityRequestSet::one(request.clone()),
+            commit_to_linearization,
+        )
+    }
+
     /// Reauthorizes every request in one non-empty external operation and
     /// executes it through its linearization point.
     ///
@@ -426,6 +499,43 @@ impl CapabilityKernel {
         requests: &CapabilityRequestSet,
         commit_to_linearization: impl FnOnce(&Capability) -> Result<T, E>,
     ) -> Result<T, EffectCommitError<E>> {
+        self.authorize_all_and_commit_inner(caller, capability_id, requests, |capability| {
+            commit_to_linearization(capability).map(|value| (value, None))
+        })
+    }
+
+    /// Reauthorizes every request and accepts an adapter-provided commit
+    /// receipt from the executor.
+    ///
+    /// The returned token is persisted with the terminal WAL record. This is
+    /// the preferred entry point for external providers with an idempotency
+    /// or acceptance identifier. A provider token is only meaningful if the
+    /// executor returns it after its documented linearization point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectCommitError::CommittedButAudit`] when the executor
+    /// succeeded but the receipt could not be durably recorded; that result
+    /// means the external effect may already exist and needs reconciliation.
+    pub fn authorize_all_and_commit_with_receipt<T, E>(
+        &self,
+        caller: &SubjectId,
+        capability_id: &CapId,
+        requests: &CapabilityRequestSet,
+        commit_to_linearization: impl FnOnce(&Capability) -> Result<(T, Vec<u8>), E>,
+    ) -> Result<T, EffectCommitError<E>> {
+        self.authorize_all_and_commit_inner(caller, capability_id, requests, |capability| {
+            commit_to_linearization(capability).map(|(value, token)| (value, Some(token)))
+        })
+    }
+
+    fn authorize_all_and_commit_inner<T, E>(
+        &self,
+        caller: &SubjectId,
+        capability_id: &CapId,
+        requests: &CapabilityRequestSet,
+        commit_to_linearization: impl FnOnce(&Capability) -> Result<(T, Option<Vec<u8>>), E>,
+    ) -> Result<T, EffectCommitError<E>> {
         let state = self
             .state
             .read()
@@ -445,9 +555,12 @@ impl CapabilityKernel {
             .iter()
             .all(|request| state.authorizes(caller, capability_id, request))
         {
-            attempt.deny();
+            let audit_result = attempt.deny();
             drop(state);
-            return Err(EffectCommitError::NotAuthorized);
+            return match audit_result {
+                Ok(()) => Err(EffectCommitError::NotAuthorized),
+                Err(error) => Err(EffectCommitError::Audit(error)),
+            };
         }
 
         // Passing a reference tied to the read guard keeps shared access alive
@@ -456,21 +569,35 @@ impl CapabilityKernel {
             // Public transitions keep authorization and capability lookup in
             // sync. Preserve a terminal audit outcome if internal state is
             // ever inconsistent instead of leaving the attempt as started.
-            attempt.deny();
+            let audit_result = attempt.deny();
             drop(state);
-            return Err(EffectCommitError::NotAuthorized);
+            return match audit_result {
+                Ok(()) => Err(EffectCommitError::NotAuthorized),
+                Err(error) => Err(EffectCommitError::Audit(error)),
+            };
         };
+        let attempt_id = attempt.id();
         let result = commit_to_linearization(capability);
         match result {
-            Ok(value) => {
-                attempt.commit();
+            Ok((value, receipt)) => {
+                let receipt = receipt.map_or_else(
+                    || CommitReceipt::kernel_success(attempt_id),
+                    |token| CommitReceipt::new(attempt_id, token),
+                );
+                let audit_result = attempt.commit_with_receipt(&receipt);
                 drop(state);
-                Ok(value)
+                match audit_result {
+                    Ok(()) => Ok(value),
+                    Err(error) => Err(EffectCommitError::CommittedButAudit(error)),
+                }
             }
             Err(error) => {
-                attempt.fail_before_commit();
+                let audit_result = attempt.fail_before_commit();
                 drop(state);
-                Err(EffectCommitError::Effect(error))
+                match audit_result {
+                    Ok(()) => Err(EffectCommitError::Effect(error)),
+                    Err(audit_error) => Err(EffectCommitError::Audit(audit_error)),
+                }
             }
         }
     }

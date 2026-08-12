@@ -32,6 +32,15 @@ pub enum CapabilityKernelError {
     LockPoisoned,
     /// The sequential state machine rejected the requested transition.
     StateTransition(CapabilityStateError),
+    /// The capability is revoked, but a registered observer could not confirm
+    /// that it discarded the decisions the revocation invalidates.
+    ///
+    /// Authorization inside this kernel already fails closed. This reports that
+    /// state *outside* the kernel — a kernel-side filesystem cache, a mount, a
+    /// remote decision cache — may still be able to satisfy a request the
+    /// revocation was meant to stop. The caller must treat the affected
+    /// component as compromised rather than retrying.
+    RevocationNotPropagated(RevocationObserverError),
 }
 
 impl fmt::Display for CapabilityKernelError {
@@ -39,6 +48,10 @@ impl fmt::Display for CapabilityKernelError {
         match self {
             Self::LockPoisoned => formatter.write_str("capability kernel state lock is poisoned"),
             Self::StateTransition(error) => error.fmt(formatter),
+            Self::RevocationNotPropagated(error) => write!(
+                formatter,
+                "capability was revoked but the revocation was not propagated: {error}"
+            ),
         }
     }
 }
@@ -48,8 +61,90 @@ impl Error for CapabilityKernelError {
         match self {
             Self::LockPoisoned => None,
             Self::StateTransition(error) => Some(error),
+            Self::RevocationNotPropagated(error) => Some(error),
         }
     }
+}
+
+/// A registered observer that could not discard its cached decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevocationObserverError {
+    observer: &'static str,
+    reason: String,
+}
+
+impl RevocationObserverError {
+    /// Records which observer failed and why.
+    #[must_use]
+    pub fn new(observer: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            observer,
+            reason: reason.into(),
+        }
+    }
+
+    /// Returns the failing observer's static name.
+    #[must_use]
+    pub const fn observer(&self) -> &'static str {
+        self.observer
+    }
+
+    /// Returns the observer's description of the failure.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl fmt::Display for RevocationObserverError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.observer, self.reason)
+    }
+}
+
+impl Error for RevocationObserverError {}
+
+/// Discards decisions cached outside the kernel when a revocation commits.
+///
+/// The kernel's own authorization fails closed the moment a revocation takes
+/// the state lock. Components that cache an authorization result somewhere the
+/// kernel cannot reach — most importantly a Linux kernel page or attribute
+/// cache populated through a FUSE mount — need to be told, or a revoked
+/// capability keeps being satisfied from that cache.
+///
+/// # Ordering
+///
+/// Observers run after the state transition has committed and after the state
+/// lock has been released, and before the revoking call returns. That is what
+/// makes the guarantee stated on [`CapabilityKernel::revoke`] — that later
+/// attempts recheck against the revoked state once the call returns — hold for
+/// cached decisions as well as for kernel state.
+///
+/// Releasing the lock first is required, not incidental. An observer that
+/// invalidates a FUSE cache blocks until the operating system has finished
+/// that invalidation, and the operating system may first need to drain an
+/// in-flight request from that same mount. That request needs shared state
+/// access to be denied. Holding exclusive access across the observer would
+/// therefore deadlock the revocation against the request it is trying to stop.
+///
+/// # Implementation requirements
+///
+/// An observer must not re-enter a transition on the kernel that is notifying
+/// it, must return only after its discard has taken effect, and must report an
+/// error rather than returning if it cannot confirm that.
+pub trait RevocationObserver: Send + Sync {
+    /// Discards every decision this observer has cached.
+    ///
+    /// The revoked capability is deliberately not supplied. Deciding which
+    /// cached entries a single revocation can still satisfy requires the
+    /// derivation graph, and an observer that guessed wrong would leave a
+    /// live cache entry behind. Discarding everything cannot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevocationObserverError`] when the discard cannot be
+    /// confirmed. The caller treats that as a compromised component.
+    fn discard_cached_decisions(&self) -> Result<(), RevocationObserverError>;
 }
 
 impl From<CapabilityStateError> for CapabilityKernelError {
@@ -186,10 +281,25 @@ impl<E: Error + 'static> Error for CapabilityInspectionError<E> {
 /// through the executor's linearization point. Revocation and every other
 /// state transition require exclusive access, so a completed revoke cannot be
 /// followed by an effect that relied only on the revoked capability.
-#[derive(Debug)]
 pub struct CapabilityKernel {
     state: RwLock<CapabilityState>,
     audit: AuditTrail,
+    revocation_observers: RwLock<Vec<Arc<dyn RevocationObserver>>>,
+}
+
+impl fmt::Debug for CapabilityKernel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let observers = self
+            .revocation_observers
+            .read()
+            .map_or(0, |observers| observers.len());
+        formatter
+            .debug_struct("CapabilityKernel")
+            .field("state", &self.state)
+            .field("audit", &self.audit)
+            .field("revocation_observers", &observers)
+            .finish()
+    }
 }
 
 impl CapabilityKernel {
@@ -199,6 +309,7 @@ impl CapabilityKernel {
         Self {
             state: RwLock::new(state),
             audit: AuditTrail::new(),
+            revocation_observers: RwLock::new(Vec::new()),
         }
     }
 
@@ -218,6 +329,55 @@ impl CapabilityKernel {
         Ok(Self {
             state: RwLock::new(state),
             audit: AuditTrail::new_with_backend(Arc::new(backend))?,
+            revocation_observers: RwLock::new(Vec::new()),
+        })
+    }
+
+    /// Registers an observer notified by every revoking transition.
+    ///
+    /// Register before issuing the capabilities whose decisions the observer
+    /// caches. A revocation that commits before registration cannot be
+    /// propagated to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
+    /// panicked while mutating the observer list.
+    pub fn register_revocation_observer(
+        &self,
+        observer: Arc<dyn RevocationObserver>,
+    ) -> Result<(), CapabilityKernelError> {
+        self.revocation_observers
+            .write()
+            .map_err(|_| CapabilityKernelError::LockPoisoned)?
+            .push(observer);
+        Ok(())
+    }
+
+    /// Runs every observer with no state lock held.
+    ///
+    /// The caller must have released exclusive state access first. See
+    /// [`RevocationObserver`] for why that ordering is required rather than
+    /// convenient. Every observer runs even after one fails, so a single
+    /// failing mount cannot leave the others holding stale caches; the first
+    /// failure is what the caller sees.
+    fn propagate_revocation(&self) -> Result<(), CapabilityKernelError> {
+        let observers = self
+            .revocation_observers
+            .read()
+            .map_err(|_| CapabilityKernelError::LockPoisoned)?
+            .clone();
+
+        let mut first_failure = None;
+        for observer in observers {
+            if let Err(error) = observer.discard_cached_decisions()
+                && first_failure.is_none()
+            {
+                first_failure = Some(error);
+            }
+        }
+        first_failure.map_or(Ok(()), |error| {
+            Err(CapabilityKernelError::RevocationNotPropagated(error))
         })
     }
 
@@ -286,7 +446,37 @@ impl CapabilityKernel {
     /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
     /// panicked, or wraps the sequential revocation error.
     pub fn revoke(&self, capability: &CapId) -> Result<RevocationStatus, CapabilityKernelError> {
-        self.with_state_mut(|state| state.revoke(capability))
+        let status = self.with_state_mut(|state| state.revoke(capability))?;
+        // The state lock is released here. Observers run before this returns,
+        // so a decision cached outside the kernel cannot outlive the call
+        // either. See `RevocationObserver` for why the lock must be released
+        // first.
+        if status == RevocationStatus::NewlyRevoked {
+            self.propagate_revocation()?;
+        }
+        Ok(status)
+    }
+
+    /// Revokes a capability only when `caller` currently holds it.
+    ///
+    /// The holder check and revocation are one exclusive state transition, so
+    /// a transport-authenticated subject cannot race an ownership change or
+    /// revoke another subject's predictable capability identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same propagation errors as [`Self::revoke`], or a typed
+    /// state error when the capability is unknown or not held by `caller`.
+    pub fn revoke_held_by(
+        &self,
+        caller: &SubjectId,
+        capability: &CapId,
+    ) -> Result<RevocationStatus, CapabilityKernelError> {
+        let status = self.with_state_mut(|state| state.revoke_held_by(caller, capability))?;
+        if status == RevocationStatus::NewlyRevoked {
+            self.propagate_revocation()?;
+        }
+        Ok(status)
     }
 
     /// Returns the current version for authorization-dependent caches.
@@ -330,7 +520,13 @@ impl CapabilityKernel {
         &self,
         subject: &SubjectId,
     ) -> Result<SubjectCloseStatus, CapabilityKernelError> {
-        self.with_state_mut(|state| state.begin_subject_close(subject))
+        let status = self.with_state_mut(|state| state.begin_subject_close(subject))?;
+        // Closing a subject revokes every capability it holds, so it carries
+        // the same propagation obligation as an explicit revoke.
+        if status == SubjectCloseStatus::Started {
+            self.propagate_revocation()?;
+        }
+        Ok(status)
     }
 
     /// Marks external teardown for a closing subject as complete.

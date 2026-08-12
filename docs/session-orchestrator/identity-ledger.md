@@ -74,8 +74,8 @@ poison 検査
   -> sync_data          ← record は durable、header はまだ古い commit 範囲
   -> header を先頭に write_all
   -> sync_data          ← 新しい件数を公開
-  -> seek(End)
   -> in-memory の issued と next_sequence を更新
+  -> seek(End)          ← 失敗しても Ok。poison するだけ
 ```
 
 ```mermaid
@@ -91,14 +91,14 @@ sequenceDiagram
     L->>F: 先頭に新 header を write_all
     L->>F: sync_data
     Note over F: 新件数を公開
-    L->>F: seek(End)
-    Note over L,F: ここで失敗すると<br/>commit 済みでも Err を返し poison する
     L->>M: issued と next_sequence を更新
+    L->>F: seek(End)
+    Note over L,F: ここで失敗しても Ok。<br/>poison するだけで、commit 済みの<br/>identity を free と誤報しない
 ```
 
 **record の sync が header の write より前にある。** 逆にすると、crash 時に「header は N 件と言っているが実際は N-1 件」という file ができる。再 open すると `Truncated` になり、その identity は `issued` から落ちて再利用可能になる。ledger の存在意義がそこで消える。
 
-in-memory の更新が最後なのは、途中で失敗しても `issued` が durable な内容と一致する（あるいはその部分集合になる）ようにするため。
+2 つ目の `sync_data` までは、途中で失敗しても `issued` が durable な内容と一致する（あるいはその部分集合になる）。sync が終わった時点で予約は commit しているので、そこで in-memory を更新する。
 
 ## poison
 
@@ -112,11 +112,9 @@ if self.poisoned {
 
 部分的に書けた batch の後、in-memory の `issued` と file が食い違う。続行すると、free だと思っている identity が既に disk 上にある（あるいは逆）状態で払い出す。
 
-**注意点が 2 つある。**
+`Err` は「その identity がまだ free である」ことを意味する。両方の `sync_data` が終わった時点で予約は commit しており、そこから先の失敗で `Err` を返すと、disk 上に永久に残った値を caller が free だと解釈する。同じ値を再 open 後に retry すれば `Duplicate` になるので、`IdentityLedger` trait の doc と食い違う。そのため in-memory の更新を先に済ませ、最後の `seek(End)` が失敗しても `Ok` を返して poison だけする。次の append が未知の offset に書くことは、poison が止める。
 
-第 1 に、`poisoned` は process-local で永続しない。restart すると fail-closed 状態が消える。復旧は `parse_ledger` が trailing suffix を見つけるかどうかだけに依存し、失敗した batch が disk に何も残さなかった場合、再起動した process はそれらの identity を free として扱う。
-
-第 2 に、`reserve_batch` は **record が durable に commit された後でも Err を返しうる。** 最後の `seek(End)` は sync の後に走り、失敗すると poison して Err になる。したがって `Err` は「identity が free である」ことの証明にならない。同じ値を再 open 後に retry すると `Duplicate` になる。`IdentityLedger` trait の doc（「部分予約の前に重複を拒否する」）を素直に読むと、この挙動と食い違う。
+**`poisoned` は process-local で永続しない。** restart すると fail-closed 状態が消える。復旧は `parse_ledger` が trailing suffix を見つけるかどうかだけに依存し、失敗した batch が disk に何も残さなかった場合、再起動した process はそれらの identity を free として扱う。
 
 ## 排他所有
 
@@ -164,8 +162,8 @@ on-disk format が固定長 record なので、破損した位置を offset で�
 
 ## 変更時の確認点
 
-- `allocate_session_identity` の `kinds` 配列と、その後の位置読み `identities[0..6]` は独立した 2 つのリストになっている。**`kinds` を並べ替えると compile は通り、全 record の `IdentityKind` が黙ってずれる。** しかも Capability 用に引いた値が `broker_session_id` に入る。監査記録が永久に誤った domain を指す。
-- 同じ箇所の配列は `7` を hard-code し、`iter_mut().zip(kinds)` で結んでいる。`kinds` に 8 個目を足すと `zip` が切り捨てて予約されない。配列だけ 8 に伸ばすと slot 7 が `(Session, [0u8; 16])` のまま commit され、次の session が `Duplicate` で永久に失敗する。
+- `allocate_session_identity` は `draw_identities` に kind の列を渡し、結果を名前で分配する。**リストを 2 本に分けない。** 以前は `kinds` 配列と位置読みが独立していて、並べ替えると compile が通ったまま全 record の `IdentityKind` がずれ、Capability 用に引いた値が `broker_session_id` に入った。`zip` による切り捨てで 8 個目が黙って予約されないこともあった。現在はどちらも compile error になる。
+- kind を増やすときは、`draw_identities` に渡す配列と分配側の `let [...]` を同時に直す。長さが合わなければ compile が通らない。
 - `ledger_header` は `header[9] = 32` と literal を書き、`parse_ledger` は `LEDGER_HEADER_BYTES` と比較する。定数を変えると、自分が書いた file を読めなくなる。`header[28..]`、`record[28..]`、`checksum(&..[..28])` も offset 28 を hard-code しているので、`LEDGER_RECORD_BYTES` を上げると compile は通って実行時に `copy_from_slice` が panic する。
 - `LEDGER_MAGIC` は末尾に format version の数字を持ち、`LEDGER_VERSION` と重複している。format を変えるときは両方上げる。片方だけだと、古い file が `Corrupt`（magic）と `UnsupportedVersion`（byte 8）に分かれて現れる。
 - identity newtype の `Display` は lib.rs の外で load-bearing である。`firecracker_workspace.rs` が clone directory を `clone_root.join(workspace_id.to_string())` で作り、`firecracker_backend.rs` が `config.workspace.clone_id` に入れ、`authority_backend.rs` が Authority Core の subject / capability id を `to_string()` から導く。**hex の書式を変えると、on-disk path と Authority Core の subject 名が黙って変わる。**

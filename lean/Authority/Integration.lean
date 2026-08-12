@@ -143,6 +143,26 @@ def closeHandle (state : IntegratedHandleState) (handleId : HandleId)
   accountedHandles := replace state.accountedHandles handle.object
     ((state.accountedHandles handle.object).erase handleId)
 
+/-- Publish a closed namespace object without changing Authority handle state. -/
+def createClosedObject (state : IntegratedHandleState)
+    (object : NamespaceObject) : IntegratedHandleState where
+  authority := state.authority
+  namespaceState := state.namespaceState.create object
+  accountedHandles := state.accountedHandles
+
+/-- Preconditions for atomic namespace create plus Authority handle registration. -/
+structure MayCreateOpen (state : IntegratedHandleState) (object : NamespaceObject)
+    (handle : OpenHandle) where
+  namespaceCreation : state.namespaceState.MayCreate object
+  handleTargetsObject : handle.object = object.id
+  subjectRunning : state.authority.subjectStatuses handle.subject = some .running
+  handleFresh : state.authority.issuedHandleOwners handle.id = none
+
+/-- Create one namespace child and its returned Authority handle atomically. -/
+def createOpenHandle (state : IntegratedHandleState) (object : NamespaceObject)
+    (handle : OpenHandle) : IntegratedHandleState :=
+  (state.createClosedObject object).openHandle handle object
+
 /-- Only typed atomic handle operations may change the integrated bridge. -/
 inductive Step : IntegratedHandleState → IntegratedHandleState → Prop
   | openAtomic {state : IntegratedHandleState} {handle : OpenHandle} :
@@ -152,6 +172,10 @@ inductive Step : IntegratedHandleState → IntegratedHandleState → Prop
       {handleId : HandleId} :
       (allowed : MayClose state caller handleId) →
       Step state (state.closeHandle handleId allowed.handle allowed.object)
+  | createOpenAtomic {state : IntegratedHandleState} {object : NamespaceObject}
+      {handle : OpenHandle} :
+      MayCreateOpen state object handle →
+      Step state (state.createOpenHandle object handle)
 
 /-- A globally fresh handle identity is absent from every bridge list. -/
 theorem WellFormed.fresh_handle_not_accounted {state : IntegratedHandleState}
@@ -410,6 +434,73 @@ theorem closeHandle_preserves_wellFormed {state : IntegratedHandleState}
   · exact NamespaceState.closeObject_preserves_treeWellFormed
       wellFormed.namespaceWellFormed allowed.objectLookup
 
+/-- Publishing a fresh closed object preserves the cross-component invariant. -/
+theorem createClosedObject_preserves_wellFormed {state : IntegratedHandleState}
+    {object : NamespaceObject} (wellFormed : state.WellFormed)
+    (allowed : state.namespaceState.MayCreate object) :
+    (state.createClosedObject object).WellFormed := by
+  have newAccountingEmpty : state.accountedHandles object.id = [] := by
+    apply List.eq_nil_iff_forall_not_mem.mpr
+    intro handleId accounted
+    rcases (wellFormed.authorityHandlesExact object.id handleId).1 accounted with
+      ⟨handle, handleLookup, objectMatches⟩
+    rcases wellFormed.everyHandleHasLiveObject handleId handle handleLookup with
+      ⟨oldObject, oldObjectLookup⟩
+    rw [objectMatches] at oldObjectLookup
+    rw [allowed.objectAbsent] at oldObjectLookup
+    cases oldObjectLookup
+  constructor
+  · exact wellFormed.accountedHandlesNodup
+  · exact wellFormed.authorityHandlesExact
+  · intro objectId queriedObject objectLookup
+    by_cases sameObject : objectId = object.id
+    · subst objectId
+      have exactObject : queriedObject = object := Option.some.inj
+        (objectLookup.symm.trans
+          (NamespaceState.create_stores_object state.namespaceState object))
+      subst queriedObject
+      change (state.accountedHandles object.id).length = object.openHandleCount
+      rw [newAccountingEmpty, allowed.startsClosed]
+      rfl
+    · have oldLookup : state.namespaceState.objects objectId = some queriedObject := by
+        simpa [IntegratedHandleState.createClosedObject, NamespaceState.create,
+          replace, sameObject] using objectLookup
+      exact wellFormed.namespaceCountsExact objectId queriedObject oldLookup
+  · intro handleId handle handleLookup
+    rcases wellFormed.everyHandleHasLiveObject handleId handle handleLookup with
+      ⟨oldObject, oldObjectLookup⟩
+    have differentObject : handle.object ≠ object.id := by
+      intro sameObject
+      rw [sameObject, allowed.objectAbsent] at oldObjectLookup
+      cases oldObjectLookup
+    exact ⟨oldObject, by simpa [IntegratedHandleState.createClosedObject,
+      NamespaceState.create, replace, differentObject] using oldObjectLookup⟩
+  · exact wellFormed.liveHandleOwnerExact
+  · exact NamespaceState.create_preserves_treeWellFormed
+      wellFormed.namespaceWellFormed allowed
+
+/-- Atomic create-open preserves Authority/namespace handle agreement. -/
+theorem createOpenHandle_preserves_wellFormed {state : IntegratedHandleState}
+    {object : NamespaceObject} {handle : OpenHandle}
+    (wellFormed : state.WellFormed) (allowed : state.MayCreateOpen object handle) :
+    (state.createOpenHandle object handle).WellFormed := by
+  have createdWellFormed := createClosedObject_preserves_wellFormed wellFormed
+    allowed.namespaceCreation
+  let created := state.createClosedObject object
+  let mayOpen : created.MayOpen handle := {
+    subjectRunning := allowed.subjectRunning
+    handleFresh := allowed.handleFresh
+    object := object
+    objectLookup := by
+      rw [allowed.handleTargetsObject]
+      exact NamespaceState.create_stores_object state.namespaceState object
+    countCanIncrement := by
+      rw [allowed.namespaceCreation.startsClosed]
+      simp [CanIncrementU64, u64Maximum]
+  }
+  have opened := openHandle_preserves_wellFormed createdWellFormed mayOpen
+  simpa [mayOpen, created, IntegratedHandleState.createOpenHandle] using opened
+
 /-- Every typed integrated handle transition preserves the bridge invariant. -/
 theorem Step.preserves_wellFormed {before after : IntegratedHandleState}
     (transition : Step before after) (wellFormed : before.WellFormed) :
@@ -417,6 +508,8 @@ theorem Step.preserves_wellFormed {before after : IntegratedHandleState}
   cases transition with
   | openAtomic allowed => exact openHandle_preserves_wellFormed wellFormed allowed
   | closeAtomic allowed => exact closeHandle_preserves_wellFormed wellFormed allowed
+  | createOpenAtomic allowed =>
+      exact createOpenHandle_preserves_wellFormed wellFormed allowed
 
 /-- Finite executions consist solely of atomic bridge-preserving operations. -/
 inductive Steps : IntegratedHandleState → IntegratedHandleState → Prop

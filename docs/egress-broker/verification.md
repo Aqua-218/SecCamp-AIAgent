@@ -20,6 +20,17 @@
 | GitHub 事前条件 | expected-old plan がなければ provider を呼ばずに拒否する | fake provider |
 | provider error | rate-limit metadata は型付きで保持し、生 body は outcome に出さない | fake provider |
 
+## dispatch と server で確認したこと
+
+| 境界 | test |
+|---|---|
+| 一時的な budget 拒否の後、決着した retry が cache から返り adapter を再実行しない | `dispatcher_retries_transient_budget_denial_without_double_charging` |
+| 線形化点を越えた効果が `CommittedButUnrecorded` として返り、予約 byte が計上されたままになる | `committed_but_unrecorded_is_distinct_and_keeps_the_reserved_bytes_charged` |
+| journal 不能と lock poisoning が認可拒否と別の rejection になる | `audit_failure_is_reported_separately_from_authorization_denial` |
+| clock を connection ごとではなく request ごとに読む | `each_request_on_one_connection_reads_the_clock_again` |
+| peer CID が一致しない stream を、guest を読まずに落とす | `serve_expected_peer` の CID 検査 test |
+| 1 connection が host の request 上限で止まる | `connection_stops_at_the_host_request_bound` |
+
 ## 実行コマンド
 
 repository root から次を実行する。

@@ -11,6 +11,12 @@ use std::{
     fmt,
     io::Read,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -32,6 +38,7 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 pub const HTTPS_PORT: u16 = 443;
 const MAX_REDIRECT_LOCATION_BYTES: usize = 8 * 1024;
 const MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+static SYSTEM_RESOLUTION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// A validated host/path pair supplied to a connector.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,13 +87,23 @@ impl fmt::Debug for ConnectorResponse {
 }
 
 /// A DNS resolver used by the egress policy.
-pub trait Resolver: Send + Sync {
+pub trait Resolver: Send + Sync + 'static {
     /// Resolves the exact canonical host for one connection attempt.
     ///
     /// # Errors
     ///
     /// Returns [`ResolveError`] when the host cannot be resolved.
     fn resolve(&self, host: &CanonicalHost) -> Result<Vec<IpAddr>, ResolveError>;
+
+    /// Returns whether blocking lookups must share the production process-wide worker limit.
+    ///
+    /// The default keeps deterministic extension resolvers independent. A resolver backed by a
+    /// platform API without cancellation must opt in so a stuck lookup cannot be multiplied by
+    /// constructing new [`PublicFetcher`] values or starting new sessions.
+    #[doc(hidden)]
+    fn requires_process_wide_worker_limit(&self) -> bool {
+        false
+    }
 }
 
 /// A connector that must connect only to the supplied validated address.
@@ -115,6 +132,10 @@ impl Resolver for SystemResolver {
             .to_socket_addrs()
             .map(|addresses| addresses.map(|address| address.ip()).collect())
             .map_err(|_| ResolveError::LookupFailed)
+    }
+
+    fn requires_process_wide_worker_limit(&self) -> bool {
+        true
     }
 }
 
@@ -277,11 +298,18 @@ impl PublicResponse {
 pub enum ResolveError {
     /// The resolver could not provide an answer.
     LookupFailed,
+    /// A previous timed-out lookup is still occupying the bounded resolver worker.
+    Unavailable,
 }
 
 impl fmt::Display for ResolveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("DNS resolution failed for the requested host")
+        match self {
+            Self::LookupFailed => {
+                formatter.write_str("DNS resolution failed for the requested host")
+            }
+            Self::Unavailable => formatter.write_str("DNS resolution is temporarily unavailable"),
+        }
     }
 }
 
@@ -375,7 +403,8 @@ impl Error for FetchError {}
 
 /// A public fetch adapter with deterministic resolver and connector seams.
 pub struct PublicFetcher<R, C> {
-    resolver: R,
+    resolver: Arc<R>,
+    resolution_in_flight: Arc<AtomicBool>,
     connector: C,
     ip_policy: IpPolicy,
     policy: FetchPolicy,
@@ -388,9 +417,10 @@ where
 {
     /// Creates a fetcher with explicit network-policy dependencies.
     #[must_use]
-    pub const fn new(resolver: R, connector: C, ip_policy: IpPolicy, policy: FetchPolicy) -> Self {
+    pub fn new(resolver: R, connector: C, ip_policy: IpPolicy, policy: FetchPolicy) -> Self {
         Self {
-            resolver,
+            resolver: Arc::new(resolver),
+            resolution_in_flight: Arc::new(AtomicBool::new(false)),
             connector,
             ip_policy,
             policy,
@@ -426,12 +456,7 @@ where
         let mut target = FetchTarget::new(request.host().clone(), request.path().clone());
         let mut redirects = 0;
         loop {
-            let remaining = deadline.map_or(Duration::ZERO, |deadline| {
-                deadline.saturating_duration_since(Instant::now())
-            });
-            if remaining.is_zero() {
-                return Err(FetchError::OverallTimeout);
-            }
+            let remaining = remaining_until(deadline)?;
             let hop_request = HttpFetchRequest::new(
                 request.method(),
                 target.host().clone(),
@@ -441,14 +466,12 @@ where
             if !http_fetch_matches(authority, &hop_request) {
                 return Err(FetchError::RedirectRejected);
             }
-            let addresses = self
-                .resolver
-                .resolve(target.host())
-                .map_err(FetchError::Resolve)?;
+            let addresses = self.resolve_before_deadline(target.host(), remaining)?;
             let address = self
                 .ip_policy
                 .validate_dns_answer(&addresses)
                 .map_err(FetchError::IpPolicy)?;
+            let remaining = remaining_until(deadline)?;
             let response = self
                 .connector
                 .send(
@@ -458,6 +481,7 @@ where
                     remaining,
                 )
                 .map_err(FetchError::Connect)?;
+            remaining_until(deadline)?;
             if is_redirect(response.status) {
                 if redirects >= max_redirects {
                     return Err(FetchError::RedirectLimitExceeded);
@@ -479,6 +503,90 @@ where
             };
             return PublicResponse::new(response.status, target.host, target.path, body);
         }
+    }
+
+    fn resolve_before_deadline(
+        &self,
+        host: &CanonicalHost,
+        timeout: Duration,
+    ) -> Result<Vec<IpAddr>, FetchError> {
+        let gate = if self.resolver.requires_process_wide_worker_limit() {
+            ResolutionGate::ProcessWide(&SYSTEM_RESOLUTION_IN_FLIGHT)
+        } else {
+            ResolutionGate::Fetcher(Arc::clone(&self.resolution_in_flight))
+        };
+        let permit = ResolutionPermit::acquire(gate)
+            .ok_or(FetchError::Resolve(ResolveError::Unavailable))?;
+        let resolver = Arc::clone(&self.resolver);
+        let host = host.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("egress-dns-resolver".to_owned())
+            .spawn(move || {
+                let result = resolver.resolve(&host);
+                // Release the single-worker gate before publishing the answer,
+                // so a completed lookup cannot transiently reject the next hop.
+                drop(permit);
+                let _ = sender.send(result);
+            })
+            .map_err(|_| FetchError::Resolve(ResolveError::LookupFailed))?;
+
+        // The platform resolver API has no portable cancellation primitive.
+        // Detaching keeps the capability guard and Broker worker bounded by the
+        // request deadline. The permit prevents a timed-out lookup from being
+        // multiplied into an unbounded set of abandoned resolver threads.
+        drop(worker);
+        match receiver.recv_timeout(timeout) {
+            Ok(result) => result.map_err(FetchError::Resolve),
+            Err(RecvTimeoutError::Timeout) => Err(FetchError::OverallTimeout),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(FetchError::Resolve(ResolveError::LookupFailed))
+            }
+        }
+    }
+}
+
+enum ResolutionGate {
+    Fetcher(Arc<AtomicBool>),
+    ProcessWide(&'static AtomicBool),
+}
+
+impl ResolutionGate {
+    fn in_flight(&self) -> &AtomicBool {
+        match self {
+            Self::Fetcher(in_flight) => in_flight,
+            Self::ProcessWide(in_flight) => in_flight,
+        }
+    }
+}
+
+struct ResolutionPermit {
+    gate: ResolutionGate,
+}
+
+impl ResolutionPermit {
+    fn acquire(gate: ResolutionGate) -> Option<Self> {
+        gate.in_flight()
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self { gate })
+    }
+}
+
+impl Drop for ResolutionPermit {
+    fn drop(&mut self) {
+        self.gate.in_flight().store(false, Ordering::Release);
+    }
+}
+
+fn remaining_until(deadline: Option<Instant>) -> Result<Duration, FetchError> {
+    let remaining = deadline.map_or(Duration::ZERO, |deadline| {
+        deadline.saturating_duration_since(Instant::now())
+    });
+    if remaining.is_zero() {
+        Err(FetchError::OverallTimeout)
+    } else {
+        Ok(remaining)
     }
 }
 
@@ -556,7 +664,11 @@ mod tests {
         collections::VecDeque,
         io::{Cursor, Read},
         net::{IpAddr, Ipv4Addr, SocketAddr},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
         time::{Duration, Instant},
     };
 
@@ -567,7 +679,7 @@ mod tests {
 
     use super::{
         ConnectorError, ConnectorResponse, FetchError, FetchPolicy, FetchTarget, HttpsConnector,
-        PublicFetcher, PublicResponse, Resolver, read_bounded,
+        PublicFetcher, PublicResponse, ResolveError, Resolver, read_bounded,
     };
     use crate::ip_policy::IpPolicy;
 
@@ -615,6 +727,43 @@ mod tests {
                 .expect("resolver mutex is not poisoned")
                 .pop_front()
                 .ok_or(super::ResolveError::LookupFailed)
+        }
+    }
+
+    struct FailingResolver;
+
+    impl Resolver for FailingResolver {
+        fn resolve(&self, _host: &CanonicalHost) -> Result<Vec<IpAddr>, ResolveError> {
+            Err(ResolveError::LookupFailed)
+        }
+    }
+
+    struct BlockingResolver {
+        calls: Arc<AtomicUsize>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        finished: mpsc::SyncSender<()>,
+    }
+
+    impl Resolver for BlockingResolver {
+        fn resolve(&self, _host: &CanonicalHost) -> Result<Vec<IpAddr>, ResolveError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (release_lock, release_signal) = &*self.release;
+            let mut released = release_lock
+                .lock()
+                .expect("release mutex must not be poisoned");
+            while !*released {
+                released = release_signal
+                    .wait(released)
+                    .expect("release mutex must not be poisoned while waiting");
+            }
+            self.finished
+                .send(())
+                .expect("test must retain the resolver completion receiver");
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))])
+        }
+
+        fn requires_process_wide_worker_limit(&self) -> bool {
+            true
         }
     }
 
@@ -702,6 +851,103 @@ mod tests {
                     .parse()
                     .expect("fixture address is valid")
             )]
+        );
+    }
+
+    // Requirement: DNS consumes the same total deadline as redirects, connection, and body I/O.
+    // Category: timeout/concurrency/resource. Risk: critical.
+    #[test]
+    fn dns_timeout_bounds_abandoned_resolution_work_across_fetchers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (finished_sender, finished_receiver) = mpsc::sync_channel(2);
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let fetcher = PublicFetcher::new(
+            BlockingResolver {
+                calls: Arc::clone(&calls),
+                release: Arc::clone(&release),
+                finished: finished_sender.clone(),
+            },
+            MockConnector {
+                responses: Mutex::new(VecDeque::new()),
+                targets: Arc::clone(&targets),
+            },
+            IpPolicy::default(),
+            FetchPolicy {
+                max_redirects: 1,
+                max_response_bytes: 32,
+                total_timeout: Duration::from_millis(20),
+            },
+        );
+
+        assert_eq!(
+            fetcher.fetch(&request("/guide", 32), &authority("/guide", 32)),
+            Err(FetchError::OverallTimeout)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let second_fetcher = PublicFetcher::new(
+            BlockingResolver {
+                calls: Arc::clone(&calls),
+                release: Arc::clone(&release),
+                finished: finished_sender,
+            },
+            MockConnector {
+                responses: Mutex::new(VecDeque::new()),
+                targets: Arc::clone(&targets),
+            },
+            IpPolicy::default(),
+            FetchPolicy {
+                max_redirects: 1,
+                max_response_bytes: 32,
+                total_timeout: Duration::from_millis(20),
+            },
+        );
+        assert_eq!(
+            second_fetcher.fetch(&request("/guide", 32), &authority("/guide", 32)),
+            Err(FetchError::Resolve(ResolveError::Unavailable))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            targets
+                .lock()
+                .expect("target mutex must not be poisoned")
+                .is_empty()
+        );
+
+        let (release_lock, release_signal) = &*release;
+        *release_lock
+            .lock()
+            .expect("release mutex must not be poisoned") = true;
+        release_signal.notify_all();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bounded test resolver must finish after release");
+    }
+
+    // Requirement: resolver errors fail closed before IP selection or connector invocation.
+    // Category: error/security. Risk: high.
+    #[test]
+    fn dns_error_fails_closed_before_connector_invocation() {
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let fetcher = PublicFetcher::new(
+            FailingResolver,
+            MockConnector {
+                responses: Mutex::new(VecDeque::new()),
+                targets: Arc::clone(&targets),
+            },
+            IpPolicy::default(),
+            FetchPolicy::default(),
+        );
+
+        assert_eq!(
+            fetcher.fetch(&request("/guide", 32), &authority("/guide", 32)),
+            Err(FetchError::Resolve(ResolveError::LookupFailed))
+        );
+        assert!(
+            targets
+                .lock()
+                .expect("target mutex must not be poisoned")
+                .is_empty()
         );
     }
 

@@ -9,19 +9,21 @@
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{CWD, RenameFlags, renameat_with};
+use rustix::fs::{CWD, Mode, OFlags, RenameFlags, open, openat, renameat_with, statfs};
 use sha2::{Digest, Sha256};
 
 const REQUIRED_BLOCKED_SYSCALLS: [&str; 8] = [
@@ -46,6 +48,8 @@ pub const MAX_WORKSPACE_DEPTH: usize = 64;
 /// Maximum aggregate regular-file bytes copied into one workspace.
 pub const MAX_WORKSPACE_BYTES: u64 = 1 << 30;
 const ID_LENGTH: usize = 16;
+const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
 
 /// A SHA-256 digest used to pin every executable and guest artifact.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -165,6 +169,8 @@ pub struct DmVerityConfig {
     pub mapper_name: String,
     /// Verified dm-verity root hash.
     pub root_hash: Sha256Digest,
+    /// Host path inside the jail root that exposes the opened mapper device.
+    pub jailed_device_path: PathBuf,
 }
 
 /// Host-vsock endpoint exposed to the guest through Firecracker's vsock device.
@@ -180,17 +186,17 @@ pub struct VsockConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)] // Each field maps to an independent jailer namespace switch.
 pub struct NamespaceConfig {
-    /// Create a private user namespace.
+    /// Request a private user namespace (unsupported by the native jailer adapter).
     pub user: bool,
     /// Create a private PID namespace.
     pub pid: bool,
     /// Create a private mount namespace.
     pub mount: bool,
-    /// Create a private network namespace.
+    /// Request creation of a private network namespace (unsupported by the native jailer adapter).
     pub network: bool,
-    /// Create a private IPC namespace.
+    /// Request a private IPC namespace (unsupported by the native jailer adapter).
     pub ipc: bool,
-    /// Create a private UTS namespace.
+    /// Request a private UTS namespace (unsupported by the native jailer adapter).
     pub uts: bool,
 }
 
@@ -203,6 +209,36 @@ pub struct CgroupConfig {
     pub memory_max_bytes: u64,
     /// Maximum CPU quota in microseconds per period.
     pub cpu_quota_micros: u64,
+    /// CPU scheduling period in microseconds.
+    pub cpu_period_micros: u64,
+}
+
+/// Cgroup hierarchy version understood by the Firecracker jailer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CgroupVersion {
+    /// Unified cgroup v2 hierarchy.
+    V2,
+}
+
+impl CgroupVersion {
+    const fn jailer_value(self) -> &'static str {
+        match self {
+            Self::V2 => "2",
+        }
+    }
+}
+
+/// Privilege-drop and chroot settings passed to the Firecracker jailer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JailerConfig {
+    /// Dedicated non-root POSIX user ID for Firecracker.
+    pub uid: u32,
+    /// Dedicated non-root POSIX group ID for Firecracker.
+    pub gid: u32,
+    /// Jailer chroot base directory.
+    pub chroot_base_dir: PathBuf,
+    /// Explicit cgroup hierarchy version.
+    pub cgroup_version: CgroupVersion,
 }
 
 /// Deny-list properties of the host seccomp profile.
@@ -242,6 +278,8 @@ pub struct RuntimeConfig {
     pub workspace: WorkspaceConfig,
     /// Jailer executable and API socket paths.
     pub jailer: PinnedArtifact,
+    /// Jailer privilege-drop, chroot, and cgroup settings.
+    pub jailer_config: JailerConfig,
     /// Firecracker Unix API socket path.
     pub api_socket: PathBuf,
     /// Host isolation policy.
@@ -267,6 +305,7 @@ impl RuntimeConfig {
     /// setting, namespace switch, resource limit, or lifecycle identifier violates
     /// the fail-closed runtime policy. Returns [`RuntimeError::NetworkDeviceForbidden`]
     /// when a network device is configured.
+    #[allow(clippy::too_many_lines)] // Each branch validates a distinct security boundary field.
     pub fn validate(&self) -> Result<(), RuntimeError> {
         validate_artifact("firecracker", &self.firecracker)?;
         validate_artifact("kernel", &self.kernel)?;
@@ -275,9 +314,14 @@ impl RuntimeConfig {
         validate_artifact("jailer", &self.jailer)?;
         validate_artifact("seccomp filter", &self.isolation.seccomp.filter)?;
         validate_absolute_path("API socket", &self.api_socket)?;
+        validate_absolute_path("jailer chroot base", &self.jailer_config.chroot_base_dir)?;
         validate_absolute_path("workspace source", &self.workspace.source)?;
         validate_absolute_path("workspace clone root", &self.workspace.clone_root)?;
         validate_absolute_path("dm-verity hash device", &self.dm_verity.hash_device)?;
+        validate_absolute_path(
+            "jailed dm-verity device",
+            &self.dm_verity.jailed_device_path,
+        )?;
         validate_absolute_path("cgroup path", &self.isolation.cgroup.path)?;
         validate_absolute_path("vsock UDS path", &self.vsock.uds_path)?;
         if self.dm_verity.data_device != self.rootfs.path {
@@ -326,20 +370,29 @@ impl RuntimeConfig {
         }
         if self.isolation.cgroup.memory_max_bytes == 0
             || self.isolation.cgroup.cpu_quota_micros == 0
+            || self.isolation.cgroup.cpu_period_micros == 0
         {
             return Err(RuntimeError::InvalidConfig(
-                "cgroup memory and CPU limits must be non-zero".to_owned(),
+                "cgroup memory, CPU quota, and CPU period limits must be non-zero".to_owned(),
             ));
         }
-        if !(self.isolation.namespaces.user
-            && self.isolation.namespaces.pid
-            && self.isolation.namespaces.mount
-            && self.isolation.namespaces.network
-            && self.isolation.namespaces.ipc
-            && self.isolation.namespaces.uts)
+        if self.jailer_config.uid == 0 || self.jailer_config.gid == 0 {
+            return Err(RuntimeError::InvalidConfig(
+                "jailer UID and GID must be dedicated non-root IDs".to_owned(),
+            ));
+        }
+        if !self.isolation.namespaces.pid || !self.isolation.namespaces.mount {
+            return Err(RuntimeError::InvalidConfig(
+                "jailer requires private PID and mount namespaces".to_owned(),
+            ));
+        }
+        if self.isolation.namespaces.user
+            || self.isolation.namespaces.network
+            || self.isolation.namespaces.ipc
+            || self.isolation.namespaces.uts
         {
             return Err(RuntimeError::InvalidConfig(
-                "jailer must create private user, PID, mount, network, IPC, and UTS namespaces"
+                "jailer does not support user, newly-created network, IPC, or UTS namespace switches; use a supported external namespace launcher"
                     .to_owned(),
             ));
         }
@@ -356,24 +409,312 @@ impl RuntimeConfig {
                 )));
             }
         }
+        self.cgroup_parent()?;
+        self.jail_path("API socket", &self.api_socket)?;
+        self.jail_path("kernel", &self.kernel.path)?;
+        self.jail_path(
+            "jailed dm-verity device",
+            &self.dm_verity.jailed_device_path,
+        )?;
+        self.jail_path("workspace clone", &self.workspace.clone_path())?;
+        self.jail_path("seccomp filter", &self.isolation.seccomp.filter.path)?;
+        self.jail_path("vsock UDS", &self.vsock.uds_path)?;
         Ok(())
     }
 
-    fn fingerprint(&self) -> Sha256Digest {
-        let mut bytes = Vec::new();
-        for artifact in [
-            &self.firecracker,
-            &self.kernel,
-            &self.rootfs,
-            &self.verity_hash,
-            &self.jailer,
-            &self.isolation.seccomp.filter,
-        ] {
-            bytes.extend_from_slice(&artifact.digest.as_bytes());
+    fn jail_root(&self) -> Result<PathBuf, RuntimeError> {
+        let executable_name = self
+            .firecracker
+            .path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                RuntimeError::InvalidConfig(
+                    "Firecracker executable path has no file name".to_owned(),
+                )
+            })?;
+        Ok(self
+            .jailer_config
+            .chroot_base_dir
+            .join(executable_name)
+            .join(&self.workspace.clone_id)
+            .join("root"))
+    }
+
+    fn jail_path(&self, label: &str, host_path: &Path) -> Result<PathBuf, RuntimeError> {
+        jail_relative_path(&self.jail_root()?, label, host_path)
+    }
+
+    fn cgroup_parent(&self) -> Result<PathBuf, RuntimeError> {
+        let relative = self
+            .isolation
+            .cgroup
+            .path
+            .strip_prefix("/sys/fs/cgroup")
+            .map_err(|_| {
+                RuntimeError::InvalidConfig(
+                    "cgroup v2 path must be beneath /sys/fs/cgroup".to_owned(),
+                )
+            })?;
+        if relative.file_name() != Some(OsStr::new(&self.workspace.clone_id)) {
+            return Err(RuntimeError::InvalidConfig(
+                "cgroup path must end with the workspace clone ID owned by the jailer".to_owned(),
+            ));
         }
-        bytes.extend_from_slice(&self.dm_verity.root_hash.as_bytes());
-        bytes.extend_from_slice(&self.vsock.guest_cid.to_be_bytes());
+        let parent = relative
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        if parent.as_os_str().is_empty() {
+            return Err(RuntimeError::InvalidConfig(
+                "cgroup path must include a non-empty parent beneath /sys/fs/cgroup".to_owned(),
+            ));
+        }
+        for component in parent.components() {
+            let Component::Normal(component) = component else {
+                return Err(RuntimeError::InvalidConfig(
+                    "cgroup parent must be a relative normal path".to_owned(),
+                ));
+            };
+            let component = component.to_str().ok_or_else(|| {
+                RuntimeError::InvalidConfig("cgroup parent must be valid UTF-8".to_owned())
+            })?;
+            validate_safe_name("cgroup parent component", component)?;
+        }
+        Ok(parent)
+    }
+
+    /// Returns the compatibility fingerprint that must be persisted with a snapshot.
+    ///
+    /// Explicitly session-scoped host paths are normalized to their jail-visible paths because
+    /// paused restore binds a fresh workspace and vsock while preserving the guest-visible
+    /// resource contract. The clone ID, cgroup leaf, mapper name, and corresponding host paths
+    /// are bound separately by [`Self::instance_fingerprint`]. Every non-overridable
+    /// restore-relevant field is encoded here.
+    #[must_use]
+    #[allow(clippy::too_many_lines)] // The encoding deliberately enumerates the full config.
+    pub fn snapshot_fingerprint(&self) -> Sha256Digest {
+        let mut bytes = Vec::new();
+        fingerprint_artifact(&mut bytes, "firecracker", &self.firecracker);
+        fingerprint_jail_artifact(&mut bytes, "kernel", self, &self.kernel);
+        fingerprint_artifact(&mut bytes, "rootfs", &self.rootfs);
+        fingerprint_artifact(&mut bytes, "verity_hash", &self.verity_hash);
+        fingerprint_path(
+            &mut bytes,
+            "dm_verity.data_device",
+            &self.dm_verity.data_device,
+        );
+        fingerprint_path(
+            &mut bytes,
+            "dm_verity.hash_device",
+            &self.dm_verity.hash_device,
+        );
+        fingerprint_bytes(
+            &mut bytes,
+            "dm_verity.root_hash",
+            &self.dm_verity.root_hash.as_bytes(),
+        );
+        fingerprint_jail_path(
+            &mut bytes,
+            "dm_verity.jailed_device_path",
+            self,
+            &self.dm_verity.jailed_device_path,
+        );
+        fingerprint_path(&mut bytes, "workspace.source", &self.workspace.source);
+        fingerprint_jail_path(
+            &mut bytes,
+            "workspace.clone_root",
+            self,
+            &self.workspace.clone_root,
+        );
+        fingerprint_artifact(&mut bytes, "jailer", &self.jailer);
+        fingerprint_bytes(
+            &mut bytes,
+            "jailer.uid",
+            &self.jailer_config.uid.to_be_bytes(),
+        );
+        fingerprint_bytes(
+            &mut bytes,
+            "jailer.gid",
+            &self.jailer_config.gid.to_be_bytes(),
+        );
+        fingerprint_path(
+            &mut bytes,
+            "jailer.chroot_base_dir",
+            &self.jailer_config.chroot_base_dir,
+        );
+        fingerprint_bytes(
+            &mut bytes,
+            "jailer.cgroup_version",
+            self.jailer_config.cgroup_version.jailer_value().as_bytes(),
+        );
+        fingerprint_jail_path(&mut bytes, "api_socket", self, &self.api_socket);
+        for (name, enabled) in [
+            ("namespace.user", self.isolation.namespaces.user),
+            ("namespace.pid", self.isolation.namespaces.pid),
+            ("namespace.mount", self.isolation.namespaces.mount),
+            ("namespace.network", self.isolation.namespaces.network),
+            ("namespace.ipc", self.isolation.namespaces.ipc),
+            ("namespace.uts", self.isolation.namespaces.uts),
+        ] {
+            fingerprint_bytes(&mut bytes, name, &[u8::from(enabled)]);
+        }
+        fingerprint_path(
+            &mut bytes,
+            "cgroup.parent",
+            &self
+                .cgroup_parent()
+                .unwrap_or_else(|_| self.isolation.cgroup.path.clone()),
+        );
+        fingerprint_bytes(
+            &mut bytes,
+            "cgroup.memory_max_bytes",
+            &self.isolation.cgroup.memory_max_bytes.to_be_bytes(),
+        );
+        fingerprint_bytes(
+            &mut bytes,
+            "cgroup.cpu_quota_micros",
+            &self.isolation.cgroup.cpu_quota_micros.to_be_bytes(),
+        );
+        fingerprint_bytes(
+            &mut bytes,
+            "cgroup.cpu_period_micros",
+            &self.isolation.cgroup.cpu_period_micros.to_be_bytes(),
+        );
+        fingerprint_jail_artifact(
+            &mut bytes,
+            "seccomp.filter",
+            self,
+            &self.isolation.seccomp.filter,
+        );
+        fingerprint_string_set(
+            &mut bytes,
+            "seccomp.blocked_syscalls",
+            &self.isolation.seccomp.blocked_syscalls,
+        );
+        fingerprint_bytes(
+            &mut bytes,
+            "vsock.guest_cid",
+            &self.vsock.guest_cid.to_be_bytes(),
+        );
+        fingerprint_string_set(&mut bytes, "network_devices", &self.network_devices);
+        fingerprint_bytes(&mut bytes, "vcpu_count", &self.vcpu_count.to_be_bytes());
+        fingerprint_bytes(&mut bytes, "memory_mib", &self.memory_mib.to_be_bytes());
+        fingerprint_bytes(&mut bytes, "boot_args", self.boot_args.as_bytes());
         sha256(&bytes)
+    }
+
+    fn instance_fingerprint(&self) -> Sha256Digest {
+        let mut bytes = Vec::new();
+        fingerprint_bytes(
+            &mut bytes,
+            "restore_fingerprint",
+            &self.snapshot_fingerprint().as_bytes(),
+        );
+        fingerprint_bytes(
+            &mut bytes,
+            "workspace.clone_id",
+            self.workspace.clone_id.as_bytes(),
+        );
+        fingerprint_path(&mut bytes, "vsock.uds_path", &self.vsock.uds_path);
+        fingerprint_path(
+            &mut bytes,
+            "workspace.clone_root",
+            &self.workspace.clone_root,
+        );
+        fingerprint_path(&mut bytes, "api_socket", &self.api_socket);
+        fingerprint_path(&mut bytes, "cgroup.path", &self.isolation.cgroup.path);
+        fingerprint_path(&mut bytes, "kernel.path", &self.kernel.path);
+        fingerprint_path(
+            &mut bytes,
+            "seccomp.filter.path",
+            &self.isolation.seccomp.filter.path,
+        );
+        fingerprint_path(
+            &mut bytes,
+            "dm_verity.jailed_device_path",
+            &self.dm_verity.jailed_device_path,
+        );
+        fingerprint_bytes(
+            &mut bytes,
+            "dm_verity.mapper_name",
+            self.dm_verity.mapper_name.as_bytes(),
+        );
+        sha256(&bytes)
+    }
+}
+
+fn jail_relative_path(
+    jail_root: &Path,
+    label: &str,
+    host_path: &Path,
+) -> Result<PathBuf, RuntimeError> {
+    let relative = host_path.strip_prefix(jail_root).map_err(|_| {
+        RuntimeError::InvalidConfig(format!(
+            "{label} must be provisioned beneath jail root {}: {}",
+            jail_root.display(),
+            host_path.display()
+        ))
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "{label} cannot name the jail root itself"
+        )));
+    }
+    Ok(Path::new("/").join(relative))
+}
+
+fn fingerprint_bytes(output: &mut Vec<u8>, name: &str, value: &[u8]) {
+    output.extend_from_slice(&(name.len() as u64).to_be_bytes());
+    output.extend_from_slice(name.as_bytes());
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value);
+}
+
+fn fingerprint_path(output: &mut Vec<u8>, name: &str, path: &Path) {
+    fingerprint_bytes(output, name, path.as_os_str().as_bytes());
+}
+
+fn fingerprint_artifact(output: &mut Vec<u8>, name: &str, artifact: &PinnedArtifact) {
+    fingerprint_path(output, &format!("{name}.path"), &artifact.path);
+    fingerprint_bytes(
+        output,
+        &format!("{name}.digest"),
+        &artifact.digest.as_bytes(),
+    );
+}
+
+fn fingerprint_jail_path(output: &mut Vec<u8>, name: &str, config: &RuntimeConfig, path: &Path) {
+    let normalized = config
+        .jail_path(name, path)
+        .unwrap_or_else(|_| path.to_path_buf());
+    fingerprint_path(output, name, &normalized);
+}
+
+fn fingerprint_jail_artifact(
+    output: &mut Vec<u8>,
+    name: &str,
+    config: &RuntimeConfig,
+    artifact: &PinnedArtifact,
+) {
+    fingerprint_jail_path(output, &format!("{name}.path"), config, &artifact.path);
+    fingerprint_bytes(
+        output,
+        &format!("{name}.digest"),
+        &artifact.digest.as_bytes(),
+    );
+}
+
+fn fingerprint_string_set(output: &mut Vec<u8>, name: &str, values: &[String]) {
+    let mut sorted = values.iter().map(String::as_bytes).collect::<Vec<_>>();
+    sorted.sort_unstable();
+    fingerprint_bytes(
+        output,
+        &format!("{name}.count"),
+        &(sorted.len() as u64).to_be_bytes(),
+    );
+    for (index, value) in sorted.into_iter().enumerate() {
+        fingerprint_bytes(output, &format!("{name}.{index}"), value);
     }
 }
 
@@ -454,6 +795,17 @@ pub struct ProcessHandle {
     pub pid: u32,
 }
 
+/// Host ownership boundary for one jailer-managed Firecracker process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessOwnership {
+    /// Dedicated cgroup v2 directory that must contain the live Firecracker task.
+    pub cgroup_path: PathBuf,
+    /// Pinned executable that the owned cgroup must be running.
+    pub firecracker_executable: PathBuf,
+    /// Pinned digest expected from the executable copied into the jail.
+    pub firecracker_digest: Sha256Digest,
+}
+
 /// Captured result of a short command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandOutput {
@@ -479,6 +831,35 @@ pub trait CommandRunner {
     ///
     /// Returns an adapter error when the process cannot be started.
     fn start(&mut self, command: &CommandSpec) -> Result<ProcessHandle, RuntimeError>;
+    /// Starts a jailer and binds the resulting Firecracker task to an observable ownership scope.
+    ///
+    /// A returned handle retains cleanup ownership even when startup has not produced a live
+    /// Firecracker task yet. Callers must use [`Self::verify_running`] before performing VM API
+    /// operations. Production adapters must ensure that verification and [`Self::stop`] cover
+    /// every task in `ownership`, not just a short-lived launcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the ownership boundary cannot be established.
+    fn start_owned(
+        &mut self,
+        _command: &CommandSpec,
+        _ownership: &ProcessOwnership,
+    ) -> Result<ProcessHandle, RuntimeError> {
+        Err(RuntimeError::Command(
+            "command runner does not implement owned Firecracker startup".to_owned(),
+        ))
+    }
+    /// Verifies that the handle still owns a live Firecracker task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when no owned Firecracker task can be observed.
+    fn verify_running(&mut self, _process: ProcessHandle) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Command(
+            "command runner cannot verify an owned Firecracker task".to_owned(),
+        ))
+    }
     /// Stops a process created by this runner.
     ///
     /// # Errors
@@ -495,6 +876,29 @@ pub trait FileSystem {
     ///
     /// Returns an adapter error when the artifact cannot be read.
     fn read(&mut self, path: &Path) -> Result<Vec<u8>, RuntimeError>;
+    /// Computes a file digest for snapshot provenance checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the file cannot be read completely.
+    fn digest(&mut self, path: &Path) -> Result<Sha256Digest, RuntimeError> {
+        self.read(path).map(|bytes| sha256(&bytes))
+    }
+    /// Verifies that a jail-visible block device is the opened host dm-verity device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the binding cannot be observed exactly. The default is
+    /// fail-closed so a test or production adapter cannot accidentally omit this gate.
+    fn verify_block_device_binding(
+        &mut self,
+        _source: &Path,
+        _jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Io(
+            "filesystem adapter cannot verify jailed block-device bindings".to_owned(),
+        ))
+    }
     /// Creates a clone at `destination` from `source`.
     ///
     /// # Errors
@@ -518,6 +922,8 @@ pub enum HttpMethod {
     Put,
     /// HTTP POST.
     Post,
+    /// HTTP PATCH.
+    Patch,
     /// HTTP DELETE.
     Delete,
 }
@@ -528,6 +934,7 @@ impl HttpMethod {
             Self::Get => "GET",
             Self::Put => "PUT",
             Self::Post => "POST",
+            Self::Patch => "PATCH",
             Self::Delete => "DELETE",
         }
     }
@@ -561,6 +968,32 @@ pub trait ApiClient {
     ///
     /// Returns an adapter error when the request cannot be sent or decoded.
     fn request(&mut self, request: &ApiRequest) -> Result<ApiResponse, RuntimeError>;
+    /// Observes Firecracker's exported VM configuration and verifies restore resource binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API or stale-snapshot error unless the exported workspace and vsock resources
+    /// exactly equal the requested jail-visible values.
+    fn verify_restore_resources(
+        &mut self,
+        workspace_path: &Path,
+        vsock_uds_path: &Path,
+        guest_cid: u32,
+    ) -> Result<(), RuntimeError> {
+        let response = self.request(&ApiRequest {
+            method: HttpMethod::Get,
+            path: "/vm/config".to_owned(),
+            body: String::new(),
+        })?;
+        if !(200..300).contains(&response.status) {
+            return Err(RuntimeError::ApiStatus {
+                path: "/vm/config".to_owned(),
+                status: response.status,
+                body: response.body,
+            });
+        }
+        verify_exported_restore_resources(&response.body, workspace_path, vsock_uds_path, guest_cid)
+    }
 }
 
 /// A production API client speaking HTTP/1.x over a Unix-domain socket.
@@ -803,7 +1236,27 @@ impl ApiClient for UnixApiClient {
 
 /// Production command runner backed by `std::process::Command`.
 pub struct RealCommandRunner {
-    children: HashMap<u32, Child>,
+    children: HashMap<u32, ManagedChild>,
+}
+
+#[derive(Debug)]
+enum ManagedChild {
+    Direct(Child),
+    PendingOwned {
+        launcher: Child,
+        ownership: ProcessOwnership,
+    },
+    Isolated {
+        launcher: Child,
+        ownership: OwnedCgroup,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct OwnedCgroup {
+    path: PathBuf,
+    identity: ObjectIdentity,
+    firecracker_digest: Sha256Digest,
 }
 
 impl RealCommandRunner {
@@ -813,6 +1266,27 @@ impl RealCommandRunner {
         Self {
             children: HashMap::new(),
         }
+    }
+
+    fn retain_unverified_owned_launch(
+        &mut self,
+        pid: u32,
+        launcher: Child,
+        requested: &ProcessOwnership,
+        observed: Option<OwnedCgroup>,
+    ) -> ProcessHandle {
+        let managed = match observed {
+            Some(ownership) => ManagedChild::Isolated {
+                launcher,
+                ownership,
+            },
+            None => ManagedChild::PendingOwned {
+                launcher,
+                ownership: requested.clone(),
+            },
+        };
+        self.children.insert(pid, managed);
+        ProcessHandle { pid }
     }
 }
 
@@ -952,6 +1426,234 @@ fn command_output_error(readers: &[BoundedReadResult; 2]) -> Option<String> {
     None
 }
 
+fn spawn_detached(command: &CommandSpec) -> Result<Child, RuntimeError> {
+    Command::new(&command.program)
+        .args(&command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(RuntimeError::from)
+}
+
+fn open_owned_cgroup_file(
+    ownership: &OwnedCgroup,
+    name: &str,
+    flags: OFlags,
+) -> Result<File, RuntimeError> {
+    let directory_fd = open(
+        &ownership.path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| RuntimeError::Io(error.to_string()))?;
+    let directory = File::from(directory_fd);
+    let metadata = directory.metadata().map_err(RuntimeError::from)?;
+    if !metadata.is_dir() || ObjectIdentity::from_metadata(&metadata) != ownership.identity {
+        return Err(RuntimeError::Command(format!(
+            "owned cgroup was replaced: {}",
+            ownership.path.display()
+        )));
+    }
+    let file_fd = openat(
+        &directory,
+        name,
+        flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| RuntimeError::Io(error.to_string()))?;
+    let file = File::from(file_fd);
+    if !file.metadata().map_err(RuntimeError::from)?.is_file() {
+        return Err(RuntimeError::Command(format!(
+            "owned cgroup control is not a regular file: {name}"
+        )));
+    }
+    Ok(file)
+}
+
+fn cgroup_tasks(ownership: &OwnedCgroup) -> Result<Vec<u32>, RuntimeError> {
+    let file = open_owned_cgroup_file(ownership, "cgroup.procs", OFlags::RDONLY)?;
+    let mut contents = Vec::new();
+    file.take((MAX_COMMAND_OUTPUT_BYTES + 1) as u64)
+        .read_to_end(&mut contents)
+        .map_err(RuntimeError::from)?;
+    if contents.len() > MAX_COMMAND_OUTPUT_BYTES {
+        return Err(RuntimeError::Command(format!(
+            "owned cgroup task list exceeds {MAX_COMMAND_OUTPUT_BYTES}-byte safety limit"
+        )));
+    }
+    let contents = std::str::from_utf8(&contents).map_err(|_| {
+        RuntimeError::Command("owned cgroup task list is not valid UTF-8".to_owned())
+    })?;
+    contents
+        .lines()
+        .map(|line| {
+            if line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(RuntimeError::Command(
+                    "owned cgroup contains a malformed task identifier".to_owned(),
+                ));
+            }
+            let pid = line.parse::<u32>().map_err(|_| {
+                RuntimeError::Command("owned cgroup task identifier is out of range".to_owned())
+            })?;
+            if pid == 0 {
+                return Err(RuntimeError::Command(
+                    "owned cgroup contains task identifier zero".to_owned(),
+                ));
+            }
+            Ok(pid)
+        })
+        .collect()
+}
+
+fn cgroup_has_firecracker(ownership: &OwnedCgroup, tasks: &[u32]) -> Result<bool, RuntimeError> {
+    for pid in tasks {
+        let path = PathBuf::from(format!("/proc/{pid}/exe"));
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(RuntimeError::from(error)),
+        };
+        if digest_reader(file)? == ownership.firecracker_digest {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn digest_file(path: &Path) -> Result<Sha256Digest, RuntimeError> {
+    digest_reader(File::open(path).map_err(RuntimeError::from)?)
+}
+
+fn digest_reader(mut reader: impl Read) -> Result<Sha256Digest, RuntimeError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).map_err(RuntimeError::from)?;
+        if count == 0 {
+            return Ok(Sha256Digest(hasher.finalize().into()));
+        }
+        hasher.update(&buffer[..count]);
+    }
+}
+
+fn reap_launcher(launcher: &mut Child, pid: u32) -> Result<(), RuntimeError> {
+    match launcher.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            if let Err(kill_error) = launcher.kill() {
+                return match launcher.try_wait() {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err(RuntimeError::Command(format!(
+                        "killing launcher {pid} failed: {kill_error}"
+                    ))),
+                    Err(wait_error) => Err(RuntimeError::Command(format!(
+                        "killing launcher {pid} failed: {kill_error}; checking exit state failed: {wait_error}"
+                    ))),
+                };
+            }
+            launcher.wait().map(|_| ()).map_err(|error| {
+                RuntimeError::Command(format!("waiting for launcher {pid} failed: {error}"))
+            })
+        }
+        Err(error) => Err(RuntimeError::Command(format!(
+            "checking launcher {pid} failed: {error}"
+        ))),
+    }
+}
+
+fn observe_owned_cgroup(ownership: &ProcessOwnership) -> Result<Option<OwnedCgroup>, RuntimeError> {
+    match fs::symlink_metadata(&ownership.cgroup_path) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {
+            Ok(Some(OwnedCgroup {
+                path: ownership.cgroup_path.clone(),
+                identity: ObjectIdentity::from_metadata(&metadata),
+                firecracker_digest: ownership.firecracker_digest,
+            }))
+        }
+        Ok(_) => Err(RuntimeError::Command(format!(
+            "owned cgroup is not a real directory: {}",
+            ownership.cgroup_path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(RuntimeError::from(error)),
+    }
+}
+
+fn stop_pending_owned(
+    launcher: &mut Child,
+    pid: u32,
+    ownership: &ProcessOwnership,
+) -> Result<(), RuntimeError> {
+    // Once the launcher is reaped it cannot create another cgroup. Observe the exact expected
+    // scope afterwards and kill every task if the jailer created it before exiting.
+    reap_launcher(launcher, pid)?;
+    if let Some(owned_cgroup) = observe_owned_cgroup(ownership)? {
+        stop_owned_cgroup(launcher, pid, &owned_cgroup)?;
+    }
+    Ok(())
+}
+
+fn stop_owned_cgroup(
+    launcher: &mut Child,
+    pid: u32,
+    ownership: &OwnedCgroup,
+) -> Result<(), RuntimeError> {
+    let tasks = cgroup_tasks(ownership)?;
+    if !tasks.is_empty() {
+        let mut kill = open_owned_cgroup_file(ownership, "cgroup.kill", OFlags::WRONLY)?;
+        kill.write_all(b"1").map_err(|error| {
+            RuntimeError::Command(format!(
+                "killing tasks in owned cgroup {} failed: {error}",
+                ownership.path.display()
+            ))
+        })?;
+        let deadline = Instant::now() + PROCESS_STOP_TIMEOUT;
+        loop {
+            if cgroup_tasks(ownership)?.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(RuntimeError::Command(format!(
+                    "owned cgroup {} still contains live tasks after kill",
+                    ownership.path.display()
+                )));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    reap_launcher(launcher, pid)?;
+    if !cgroup_tasks(ownership)?.is_empty() {
+        return Err(RuntimeError::Command(format!(
+            "owned cgroup {} gained a live task during cleanup",
+            ownership.path.display()
+        )));
+    }
+    let metadata = fs::symlink_metadata(&ownership.path).map_err(RuntimeError::from)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || ObjectIdentity::from_metadata(&metadata) != ownership.identity
+    {
+        return Err(RuntimeError::Command(format!(
+            "owned cgroup was replaced before removal: {}",
+            ownership.path.display()
+        )));
+    }
+    if statfs(&ownership.path)
+        .map_err(|error| RuntimeError::Io(error.to_string()))?
+        .f_type
+        == CGROUP2_SUPER_MAGIC
+    {
+        fs::remove_dir(&ownership.path).map_err(|error| {
+            RuntimeError::Command(format!(
+                "removing owned cgroup {} failed: {error}",
+                ownership.path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 impl CommandRunner for RealCommandRunner {
     fn run(&mut self, command: &CommandSpec) -> Result<CommandOutput, RuntimeError> {
         let mut child = Command::new(&command.program)
@@ -1009,68 +1711,208 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn start(&mut self, command: &CommandSpec) -> Result<ProcessHandle, RuntimeError> {
-        let child = Command::new(&command.program)
-            .args(&command.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(RuntimeError::from)?;
+        let child = spawn_detached(command)?;
         let pid = child.id();
-        self.children.insert(pid, child);
+        self.children.insert(pid, ManagedChild::Direct(child));
         Ok(ProcessHandle { pid })
     }
 
-    fn stop(&mut self, process: ProcessHandle) -> Result<(), RuntimeError> {
-        let child = self
+    #[allow(clippy::too_many_lines)] // Ownership setup and launch observation are one atomic gate.
+    fn start_owned(
+        &mut self,
+        command: &CommandSpec,
+        ownership: &ProcessOwnership,
+    ) -> Result<ProcessHandle, RuntimeError> {
+        validate_absolute_path("owned cgroup", &ownership.cgroup_path)?;
+        validate_absolute_path(
+            "owned Firecracker executable",
+            &ownership.firecracker_executable,
+        )?;
+        let cgroup_parent = ownership.cgroup_path.parent().ok_or_else(|| {
+            RuntimeError::Command("owned cgroup has no parent directory".to_owned())
+        })?;
+        ensure_directory_path(cgroup_parent, false)?;
+        if statfs(cgroup_parent)
+            .map_err(|error| RuntimeError::Io(error.to_string()))?
+            .f_type
+            != CGROUP2_SUPER_MAGIC
+        {
+            return Err(RuntimeError::Command(format!(
+                "owned process scope is not on cgroup v2: {}",
+                ownership.cgroup_path.display()
+            )));
+        }
+        let executable_metadata =
+            fs::metadata(&ownership.firecracker_executable).map_err(RuntimeError::from)?;
+        if !executable_metadata.is_file() {
+            return Err(RuntimeError::Command(format!(
+                "owned Firecracker executable is not a regular file: {}",
+                ownership.firecracker_executable.display()
+            )));
+        }
+        if digest_file(&ownership.firecracker_executable)? != ownership.firecracker_digest {
+            return Err(RuntimeError::Command(format!(
+                "owned Firecracker executable digest changed before launch: {}",
+                ownership.firecracker_executable.display()
+            )));
+        }
+        match fs::symlink_metadata(&ownership.cgroup_path) {
+            Ok(_) => {
+                return Err(RuntimeError::Command(format!(
+                    "owned cgroup already exists before launch: {}",
+                    ownership.cgroup_path.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(RuntimeError::from(error)),
+        }
+        let mut launcher = spawn_detached(command)?;
+        let pid = launcher.id();
+        let deadline = Instant::now() + PROCESS_STOP_TIMEOUT;
+        let mut observed = None;
+        loop {
+            match observe_owned_cgroup(ownership) {
+                Ok(Some(owned_cgroup)) => {
+                    if observed.as_ref().is_some_and(|previous: &OwnedCgroup| {
+                        previous.identity != owned_cgroup.identity
+                    }) {
+                        return Ok(
+                            self.retain_unverified_owned_launch(pid, launcher, ownership, observed)
+                        );
+                    }
+                    observed.get_or_insert_with(|| owned_cgroup.clone());
+                    let Ok(tasks) = cgroup_tasks(&owned_cgroup) else {
+                        return Ok(
+                            self.retain_unverified_owned_launch(pid, launcher, ownership, observed)
+                        );
+                    };
+                    match cgroup_has_firecracker(&owned_cgroup, &tasks) {
+                        Ok(true) => {
+                            self.children.insert(
+                                pid,
+                                ManagedChild::Isolated {
+                                    launcher,
+                                    ownership: owned_cgroup,
+                                },
+                            );
+                            return Ok(ProcessHandle { pid });
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            return Ok(self.retain_unverified_owned_launch(
+                                pid, launcher, ownership, observed,
+                            ));
+                        }
+                    }
+                }
+                Ok(None) if observed.is_some() => {
+                    return Ok(self.retain_unverified_owned_launch(pid, launcher, ownership, None));
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    return Ok(
+                        self.retain_unverified_owned_launch(pid, launcher, ownership, observed)
+                    );
+                }
+            }
+            match launcher.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    return Ok(
+                        self.retain_unverified_owned_launch(pid, launcher, ownership, observed)
+                    );
+                }
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                return Ok(self.retain_unverified_owned_launch(pid, launcher, ownership, observed));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn verify_running(&mut self, process: ProcessHandle) -> Result<(), RuntimeError> {
+        let managed = self
             .children
             .get_mut(&process.pid)
             .ok_or_else(|| RuntimeError::Command(format!("unknown process {}", process.pid)))?;
-
-        // Poll before signalling so a child that exited between start and stop is
-        // reaped as a successful stop. The table entry is retained until that
-        // reap succeeds, which makes a later retry safe after any wait error.
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                self.children.remove(&process.pid);
-                return Ok(());
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return Err(RuntimeError::Command(format!(
+        match managed {
+            ManagedChild::Direct(child) => match child.try_wait() {
+                Ok(None) => Ok(()),
+                Ok(Some(status)) => Err(RuntimeError::Command(format!(
+                    "process {} exited before its runtime lease was issued with status {status}",
+                    process.pid
+                ))),
+                Err(error) => Err(RuntimeError::Command(format!(
                     "checking process {} failed: {error}",
                     process.pid
-                )));
-            }
-        }
-
-        if let Err(kill_error) = child.kill() {
-            return match child.try_wait() {
-                Ok(Some(_)) => {
-                    self.children.remove(&process.pid);
-                    Ok(())
+                ))),
+            },
+            ManagedChild::PendingOwned {
+                launcher,
+                ownership,
+            } => {
+                let Some(owned_cgroup) = observe_owned_cgroup(ownership)? else {
+                    return Err(RuntimeError::Command(format!(
+                        "jailer {} has not created owned cgroup {}",
+                        process.pid,
+                        ownership.cgroup_path.display()
+                    )));
+                };
+                let tasks = cgroup_tasks(&owned_cgroup)?;
+                if cgroup_has_firecracker(&owned_cgroup, &tasks)? {
+                    return Ok(());
                 }
-                Ok(None) => Err(RuntimeError::Command(format!(
-                    "killing process {} failed: {kill_error}",
-                    process.pid
-                ))),
-                Err(wait_error) => Err(RuntimeError::Command(format!(
-                    "killing process {} failed: {kill_error}; checking exit state failed: {wait_error}",
-                    process.pid
-                ))),
-            };
-        }
-
-        match child.wait() {
-            Ok(_) => {
-                self.children.remove(&process.pid);
-                Ok(())
+                let launcher_state = match launcher.try_wait() {
+                    Ok(Some(status)) => format!("launcher exited with status {status}"),
+                    Ok(None) => "launcher is still running".to_owned(),
+                    Err(error) => format!("launcher state check failed: {error}"),
+                };
+                Err(RuntimeError::Command(format!(
+                    "owned cgroup {} contains no pinned Firecracker task ({launcher_state})",
+                    owned_cgroup.path.display()
+                )))
             }
-            Err(wait_error) => Err(RuntimeError::Command(format!(
-                "waiting for process {} failed: {wait_error}",
-                process.pid
-            ))),
+            ManagedChild::Isolated {
+                launcher,
+                ownership,
+            } => {
+                let tasks = cgroup_tasks(ownership)?;
+                if cgroup_has_firecracker(ownership, &tasks)? {
+                    return Ok(());
+                }
+                let launcher_state = match launcher.try_wait() {
+                    Ok(Some(status)) => format!("launcher exited with status {status}"),
+                    Ok(None) => "launcher is still running".to_owned(),
+                    Err(error) => format!("launcher state check failed: {error}"),
+                };
+                Err(RuntimeError::Command(format!(
+                    "owned cgroup {} contains no pinned Firecracker task ({launcher_state})",
+                    ownership.path.display()
+                )))
+            }
         }
+    }
+
+    fn stop(&mut self, process: ProcessHandle) -> Result<(), RuntimeError> {
+        let managed = self
+            .children
+            .get_mut(&process.pid)
+            .ok_or_else(|| RuntimeError::Command(format!("unknown process {}", process.pid)))?;
+        let result = match managed {
+            ManagedChild::Direct(child) => reap_launcher(child, process.pid),
+            ManagedChild::PendingOwned {
+                launcher,
+                ownership,
+            } => stop_pending_owned(launcher, process.pid, ownership),
+            ManagedChild::Isolated {
+                launcher,
+                ownership,
+            } => stop_owned_cgroup(launcher, process.pid, ownership),
+        };
+        if result.is_ok() {
+            self.children.remove(&process.pid);
+        }
+        result
     }
 }
 
@@ -1848,6 +2690,44 @@ impl FileSystem for RealFileSystem {
         fs::read(path).map_err(RuntimeError::from)
     }
 
+    fn digest(&mut self, path: &Path) -> Result<Sha256Digest, RuntimeError> {
+        digest_file(path)
+    }
+
+    fn verify_block_device_binding(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        validate_absolute_path("opened dm-verity device", source)?;
+        validate_absolute_path("jailed dm-verity device", jailed_device)?;
+        let jailed_parent = jailed_device.parent().ok_or_else(|| {
+            RuntimeError::InvalidConfig("jailed dm-verity device has no parent".to_owned())
+        })?;
+        ensure_directory_path(jailed_parent, false)?;
+        let jailed_link_metadata =
+            fs::symlink_metadata(jailed_device).map_err(RuntimeError::from)?;
+        if jailed_link_metadata.file_type().is_symlink() {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "jailed dm-verity device cannot be a symbolic link: {}",
+                jailed_device.display()
+            )));
+        }
+        let source_metadata = fs::metadata(source).map_err(RuntimeError::from)?;
+        let jailed_metadata = fs::metadata(jailed_device).map_err(RuntimeError::from)?;
+        if !source_metadata.file_type().is_block_device()
+            || !jailed_metadata.file_type().is_block_device()
+            || source_metadata.rdev() != jailed_metadata.rdev()
+        {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "jailed dm-verity device is not the opened mapper {}: {}",
+                source.display(),
+                jailed_device.display()
+            )));
+        }
+        Ok(())
+    }
+
     fn clone_workspace(&mut self, source: &Path, destination: &Path) -> Result<(), RuntimeError> {
         let prepared = self.prepare_clone(source, destination)?;
         let ownership = Self::build_clone(source, &prepared)?;
@@ -2105,15 +2985,22 @@ impl IdentitySource for SystemIdentitySource {
     }
 }
 
-/// Snapshot files and the artifact fingerprint from which they were created.
+/// Unverified persisted snapshot manifest.
+///
+/// This value is never accepted by restore directly. Call [`Runtime::verify_snapshot`] to bind
+/// the declared provenance to the current file bytes and obtain a [`VerifiedSnapshot`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
     /// Firecracker snapshot state path.
     pub snapshot_path: PathBuf,
     /// Firecracker memory file path.
     pub memory_path: PathBuf,
-    /// Artifact fingerprint required for restore.
+    /// Restore-compatibility fingerprint required for restore.
     pub artifact_fingerprint: Sha256Digest,
+    /// Expected digest of the Firecracker state file.
+    pub snapshot_digest: Sha256Digest,
+    /// Expected digest of the guest memory file.
+    pub memory_digest: Sha256Digest,
     forbidden_identities: Vec<IdentityId>,
 }
 
@@ -2124,14 +3011,45 @@ impl Snapshot {
         snapshot_path: impl Into<PathBuf>,
         memory_path: impl Into<PathBuf>,
         artifact_fingerprint: Sha256Digest,
+        snapshot_digest: Sha256Digest,
+        memory_digest: Sha256Digest,
         forbidden_identities: Vec<IdentityId>,
     ) -> Self {
         Self {
             snapshot_path: snapshot_path.into(),
             memory_path: memory_path.into(),
             artifact_fingerprint,
+            snapshot_digest,
+            memory_digest,
             forbidden_identities,
         }
+    }
+}
+
+/// Snapshot provenance whose declared paths, content digests, and runtime compatibility were
+/// verified through the runtime's filesystem boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedSnapshot {
+    manifest: Snapshot,
+}
+
+impl VerifiedSnapshot {
+    /// Returns the verified Firecracker state path.
+    #[must_use]
+    pub fn snapshot_path(&self) -> &Path {
+        &self.manifest.snapshot_path
+    }
+
+    /// Returns the verified guest memory path.
+    #[must_use]
+    pub fn memory_path(&self) -> &Path {
+        &self.manifest.memory_path
+    }
+
+    /// Returns the verified restore-compatibility fingerprint.
+    #[must_use]
+    pub const fn artifact_fingerprint(&self) -> Sha256Digest {
+        self.manifest.artifact_fingerprint
     }
 }
 
@@ -2148,6 +3066,8 @@ pub enum RuntimeState {
     RestoredStopped,
     /// Fresh identities were generated but not injected.
     IdentityRegenerated,
+    /// Fresh identities were acknowledged while the restored VM remains paused.
+    IdentityAcknowledgedPaused,
     /// Fresh identities were injected; workload is still stopped.
     IdentityInjected,
     /// Workload start was explicitly requested after identity injection.
@@ -2163,9 +3083,11 @@ pub struct RuntimeInstance {
     process: ProcessHandle,
     process_stopped: bool,
     workspace: PathBuf,
+    jail_root: PathBuf,
     workspace_removed: bool,
     mapper_name: String,
     verity_opened: bool,
+    restore_fingerprint: Sha256Digest,
     config_fingerprint: Sha256Digest,
     identities: Option<IdentityBundle>,
 }
@@ -2315,23 +3237,28 @@ where
         let result = (|| {
             self.open_verity(config)?;
             verity_opened = true;
+            self.verify_verity_binding(config)?;
             let handle = self.start_jailer(config)?;
             process = Some(handle);
+            self.command_runner.verify_running(handle)?;
             self.configure_vm(config)?;
             self.api_call(ApiRequest {
                 method: HttpMethod::Put,
                 path: "/actions".to_owned(),
                 body: r#"{"action_type":"InstanceStart"}"#.to_owned(),
             })?;
+            self.command_runner.verify_running(handle)?;
             Ok(RuntimeInstance {
                 state: RuntimeState::WorkloadStopped,
                 process: handle,
                 process_stopped: false,
                 workspace: workspace.clone(),
+                jail_root: config.jail_root()?,
                 workspace_removed: false,
                 mapper_name: config.dm_verity.mapper_name.clone(),
                 verity_opened: true,
-                config_fingerprint: config.fingerprint(),
+                restore_fingerprint: config.snapshot_fingerprint(),
+                config_fingerprint: config.instance_fingerprint(),
                 identities: None,
             })
         })();
@@ -2362,7 +3289,7 @@ where
         instance: &mut RuntimeInstance,
         snapshot_path: impl Into<PathBuf>,
         memory_path: impl Into<PathBuf>,
-    ) -> Result<Snapshot, RuntimeError> {
+    ) -> Result<VerifiedSnapshot, RuntimeError> {
         if instance.state != RuntimeState::WorkloadStopped {
             return Err(RuntimeError::InvalidState {
                 expected: "WorkloadStopped".to_owned(),
@@ -2373,25 +3300,54 @@ where
         let memory_path = memory_path.into();
         validate_absolute_path("snapshot path", &snapshot_path)?;
         validate_absolute_path("snapshot memory path", &memory_path)?;
+        let snapshot_jail_path =
+            jail_relative_path(&instance.jail_root, "snapshot path", &snapshot_path)?;
+        let memory_jail_path =
+            jail_relative_path(&instance.jail_root, "snapshot memory path", &memory_path)?;
         self.api_call(ApiRequest {
             method: HttpMethod::Put,
             path: "/snapshot/create".to_owned(),
             body: format!(
                 "{{\"snapshot_type\":\"Full\",\"snapshot_path\":{},\"mem_file_path\":{}}}",
-                json_string(&snapshot_path.to_string_lossy()),
-                json_string(&memory_path.to_string_lossy())
+                json_string(&snapshot_jail_path.to_string_lossy()),
+                json_string(&memory_jail_path.to_string_lossy())
             ),
         })?;
-        instance.state = RuntimeState::Snapshotted;
-        Ok(Snapshot::new(
+        let snapshot_digest = self.filesystem.digest(&snapshot_path)?;
+        let memory_digest = self.filesystem.digest(&memory_path)?;
+        let manifest = Snapshot::new(
             snapshot_path,
             memory_path,
-            instance.config_fingerprint,
+            instance.restore_fingerprint,
+            snapshot_digest,
+            memory_digest,
             instance
                 .identities
                 .as_ref()
                 .map_or_else(Vec::new, |ids| ids.ids().to_vec()),
-        ))
+        );
+        instance.state = RuntimeState::Snapshotted;
+        Ok(VerifiedSnapshot { manifest })
+    }
+
+    /// Verifies persisted snapshot provenance before it can enter the restore API.
+    ///
+    /// Verification binds both exact host paths, both file digests, the full runtime
+    /// compatibility fingerprint, and the forbidden identity set into a private
+    /// [`VerifiedSnapshot`]. Restore repeats the content checks immediately before any side
+    /// effect to narrow the filesystem abstraction's unavoidable path-to-open race.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, stale-snapshot, or digest mismatch error when the manifest does not
+    /// identify the exact files and runtime requested.
+    pub fn verify_snapshot(
+        &mut self,
+        config: &RuntimeConfig,
+        snapshot: Snapshot,
+    ) -> Result<VerifiedSnapshot, RuntimeError> {
+        self.verify_snapshot_manifest(config, &snapshot)?;
+        Ok(VerifiedSnapshot { manifest: snapshot })
     }
 
     /// Restores a snapshot, regenerates all identities, and keeps workload execution stopped.
@@ -2403,7 +3359,7 @@ where
     pub fn restore(
         &mut self,
         config: &RuntimeConfig,
-        snapshot: &Snapshot,
+        snapshot: &VerifiedSnapshot,
     ) -> Result<RuntimeInstance, RuntimeError> {
         self.restore_generated(config, snapshot)
     }
@@ -2411,17 +3367,16 @@ where
     fn restore_generated(
         &mut self,
         config: &RuntimeConfig,
-        snapshot: &Snapshot,
+        snapshot: &VerifiedSnapshot,
     ) -> Result<RuntimeInstance, RuntimeError> {
         self.ensure_no_pending_cleanup()?;
         config.validate()?;
-        if config.fingerprint() != snapshot.artifact_fingerprint {
-            return Err(RuntimeError::StaleSnapshot(
-                "snapshot artifact fingerprint does not match the requested runtime".to_owned(),
-            ));
-        }
+        self.verify_snapshot_manifest(config, &snapshot.manifest)?;
+        let snapshot = &snapshot.manifest;
         validate_absolute_path("snapshot path", &snapshot.snapshot_path)?;
         validate_absolute_path("snapshot memory path", &snapshot.memory_path)?;
+        let snapshot_jail_path = config.jail_path("snapshot path", &snapshot.snapshot_path)?;
+        let memory_jail_path = config.jail_path("snapshot memory path", &snapshot.memory_path)?;
         self.verify_artifacts(config)?;
         let workspace = config.workspace.clone_path();
         if let Err(error) = self
@@ -2438,17 +3393,23 @@ where
         let result = (|| {
             self.open_verity(config)?;
             verity_opened = true;
+            self.verify_verity_binding(config)?;
             let handle = self.start_jailer(config)?;
             process = Some(handle);
+            self.command_runner.verify_running(handle)?;
+            self.verify_snapshot_manifest(config, snapshot)?;
             self.api_call(ApiRequest {
                 method: HttpMethod::Put,
                 path: "/snapshot/load".to_owned(),
                 body: format!(
-                    "{{\"snapshot_path\":{},\"mem_file_path\":{},\"resume_vm\":true}}",
-                    json_string(&snapshot.snapshot_path.to_string_lossy()),
-                    json_string(&snapshot.memory_path.to_string_lossy())
+                    "{{\"snapshot_path\":{},\"mem_file_path\":{},\"resume_vm\":false,\"vsock_override\":{{\"uds_path\":{}}}}}",
+                    json_string(&snapshot_jail_path.to_string_lossy()),
+                    json_string(&memory_jail_path.to_string_lossy()),
+                    json_string(&config.jail_path("vsock UDS", &config.vsock.uds_path)?.to_string_lossy())
                 ),
             })?;
+            self.bind_restored_workspace(config)?;
+            self.command_runner.verify_running(handle)?;
             let identities = IdentityBundle::generate(&mut self.identity_source)?;
             identities.validate(Some(&snapshot.forbidden_identities))?;
             Ok(RuntimeInstance {
@@ -2456,10 +3417,12 @@ where
                 process: handle,
                 process_stopped: false,
                 workspace: workspace.clone(),
+                jail_root: config.jail_root()?,
                 workspace_removed: false,
                 mapper_name: config.dm_verity.mapper_name.clone(),
                 verity_opened: true,
-                config_fingerprint: config.fingerprint(),
+                restore_fingerprint: config.snapshot_fingerprint(),
+                config_fingerprint: config.instance_fingerprint(),
                 identities: Some(identities),
             })
         })();
@@ -2487,10 +3450,10 @@ where
     pub fn restore_with_identities(
         &mut self,
         config: &RuntimeConfig,
-        snapshot: &Snapshot,
+        snapshot: &VerifiedSnapshot,
         identities: IdentityBundle,
     ) -> Result<RuntimeInstance, RuntimeError> {
-        identities.validate(Some(&snapshot.forbidden_identities))?;
+        identities.validate(Some(&snapshot.manifest.forbidden_identities))?;
         self.restore_with_allocated_identities(config, snapshot, identities)
     }
 
@@ -2502,7 +3465,7 @@ where
     pub fn restore_with_identity_bundle(
         &mut self,
         config: &RuntimeConfig,
-        snapshot: &Snapshot,
+        snapshot: &VerifiedSnapshot,
         identities: IdentityBundle,
     ) -> Result<RuntimeInstance, RuntimeError> {
         self.restore_with_identities(config, snapshot, identities)
@@ -2511,18 +3474,17 @@ where
     fn restore_with_allocated_identities(
         &mut self,
         config: &RuntimeConfig,
-        snapshot: &Snapshot,
+        snapshot: &VerifiedSnapshot,
         identities: IdentityBundle,
     ) -> Result<RuntimeInstance, RuntimeError> {
         self.ensure_no_pending_cleanup()?;
         config.validate()?;
-        if config.fingerprint() != snapshot.artifact_fingerprint {
-            return Err(RuntimeError::StaleSnapshot(
-                "snapshot artifact fingerprint does not match the requested runtime".to_owned(),
-            ));
-        }
+        self.verify_snapshot_manifest(config, &snapshot.manifest)?;
+        let snapshot = &snapshot.manifest;
         validate_absolute_path("snapshot path", &snapshot.snapshot_path)?;
         validate_absolute_path("snapshot memory path", &snapshot.memory_path)?;
+        let snapshot_jail_path = config.jail_path("snapshot path", &snapshot.snapshot_path)?;
+        let memory_jail_path = config.jail_path("snapshot memory path", &snapshot.memory_path)?;
         self.verify_artifacts(config)?;
         let workspace = config.workspace.clone_path();
         if let Err(error) = self
@@ -2539,26 +3501,34 @@ where
         let result = (|| {
             self.open_verity(config)?;
             verity_opened = true;
+            self.verify_verity_binding(config)?;
             let handle = self.start_jailer(config)?;
             process = Some(handle);
+            self.command_runner.verify_running(handle)?;
+            self.verify_snapshot_manifest(config, snapshot)?;
             self.api_call(ApiRequest {
                 method: HttpMethod::Put,
                 path: "/snapshot/load".to_owned(),
                 body: format!(
-                    "{{\"snapshot_path\":{},\"mem_file_path\":{},\"resume_vm\":true}}",
-                    json_string(&snapshot.snapshot_path.to_string_lossy()),
-                    json_string(&snapshot.memory_path.to_string_lossy())
+                    "{{\"snapshot_path\":{},\"mem_file_path\":{},\"resume_vm\":false,\"vsock_override\":{{\"uds_path\":{}}}}}",
+                    json_string(&snapshot_jail_path.to_string_lossy()),
+                    json_string(&memory_jail_path.to_string_lossy()),
+                    json_string(&config.jail_path("vsock UDS", &config.vsock.uds_path)?.to_string_lossy())
                 ),
             })?;
+            self.bind_restored_workspace(config)?;
+            self.command_runner.verify_running(handle)?;
             Ok(RuntimeInstance {
                 state: RuntimeState::IdentityRegenerated,
                 process: handle,
                 process_stopped: false,
                 workspace: workspace.clone(),
+                jail_root: config.jail_root()?,
                 workspace_removed: false,
                 mapper_name: config.dm_verity.mapper_name.clone(),
                 verity_opened: true,
-                config_fingerprint: config.fingerprint(),
+                restore_fingerprint: config.snapshot_fingerprint(),
+                config_fingerprint: config.instance_fingerprint(),
                 identities: Some(identities),
             })
         })();
@@ -2584,29 +3554,41 @@ where
     /// Returns [`RuntimeError::InvalidState`] or [`RuntimeError::StaleIdentity`] when
     /// identities are not ready, or an API error when injection is rejected.
     pub fn inject_identity(&mut self, instance: &mut RuntimeInstance) -> Result<(), RuntimeError> {
-        if instance.state != RuntimeState::IdentityRegenerated {
+        if !matches!(
+            instance.state,
+            RuntimeState::IdentityRegenerated | RuntimeState::IdentityAcknowledgedPaused
+        ) {
             return Err(RuntimeError::InvalidState {
-                expected: "IdentityRegenerated".to_owned(),
+                expected: "IdentityRegenerated or IdentityAcknowledgedPaused".to_owned(),
                 actual: format!("{:?}", instance.state),
             });
         }
-        let identities = instance.identities.as_ref().ok_or_else(|| {
-            RuntimeError::StaleIdentity(
-                "identity regeneration state has no identity bundle".to_owned(),
-            )
+        if instance.state == RuntimeState::IdentityRegenerated {
+            let identities = instance.identities.as_ref().ok_or_else(|| {
+                RuntimeError::StaleIdentity(
+                    "identity regeneration state has no identity bundle".to_owned(),
+                )
+            })?;
+            self.control_call(ApiRequest {
+                method: HttpMethod::Put,
+                path: "/actions/inject-identity".to_owned(),
+                body: format!(
+                    "{{\"vm_id\":{},\"session_id\":{},\"request_id\":{},\"subject_id\":{},\"capability_id\":{}}}",
+                    json_string(&identities.vm_id.to_hex()),
+                    json_string(&identities.session_id.to_hex()),
+                    json_string(&identities.request_id.to_hex()),
+                    json_string(&identities.subject_id.to_hex()),
+                    json_string(&identities.capability_id.to_hex())
+                ),
+            })?;
+            instance.state = RuntimeState::IdentityAcknowledgedPaused;
+        }
+        self.api_call(ApiRequest {
+            method: HttpMethod::Patch,
+            path: "/vm".to_owned(),
+            body: r#"{"state":"Resumed"}"#.to_owned(),
         })?;
-        self.control_call(ApiRequest {
-            method: HttpMethod::Put,
-            path: "/actions/inject-identity".to_owned(),
-            body: format!(
-                "{{\"vm_id\":{},\"session_id\":{},\"request_id\":{},\"subject_id\":{},\"capability_id\":{}}}",
-                json_string(&identities.vm_id.to_hex()),
-                json_string(&identities.session_id.to_hex()),
-                json_string(&identities.request_id.to_hex()),
-                json_string(&identities.subject_id.to_hex()),
-                json_string(&identities.capability_id.to_hex())
-            ),
-        })?;
+        self.command_runner.verify_running(instance.process)?;
         instance.state = RuntimeState::IdentityInjected;
         Ok(())
     }
@@ -2648,7 +3630,7 @@ where
         if instance.state == RuntimeState::Stopped {
             return Ok(());
         }
-        if config.fingerprint() != instance.config_fingerprint
+        if config.instance_fingerprint() != instance.config_fingerprint
             || config.dm_verity.mapper_name != instance.mapper_name
             || config.workspace.clone_path() != instance.workspace
         {
@@ -2711,6 +3693,46 @@ where
         Ok(())
     }
 
+    fn verify_snapshot_manifest(
+        &mut self,
+        config: &RuntimeConfig,
+        snapshot: &Snapshot,
+    ) -> Result<(), RuntimeError> {
+        if config.snapshot_fingerprint() != snapshot.artifact_fingerprint {
+            return Err(RuntimeError::StaleSnapshot(
+                "snapshot compatibility fingerprint does not match the requested runtime"
+                    .to_owned(),
+            ));
+        }
+        validate_absolute_path("snapshot path", &snapshot.snapshot_path)?;
+        validate_absolute_path("snapshot memory path", &snapshot.memory_path)?;
+        config.jail_path("snapshot path", &snapshot.snapshot_path)?;
+        config.jail_path("snapshot memory path", &snapshot.memory_path)?;
+        for (label, path, expected) in [
+            (
+                "snapshot state",
+                &snapshot.snapshot_path,
+                snapshot.snapshot_digest,
+            ),
+            (
+                "snapshot memory",
+                &snapshot.memory_path,
+                snapshot.memory_digest,
+            ),
+        ] {
+            let actual = self.filesystem.digest(path)?;
+            if actual != expected {
+                return Err(RuntimeError::SnapshotDigestMismatch {
+                    label: label.to_owned(),
+                    path: path.clone(),
+                    expected,
+                    actual,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn open_verity(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
         let command = CommandSpec::new(
             "veritysetup",
@@ -2731,31 +3753,82 @@ where
         self.command_runner.run(&command).map(|_| ())
     }
 
+    fn verify_verity_binding(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
+        self.filesystem.verify_block_device_binding(
+            &Path::new("/dev/mapper").join(&config.dm_verity.mapper_name),
+            &config.dm_verity.jailed_device_path,
+        )
+    }
+
     fn start_jailer(&mut self, config: &RuntimeConfig) -> Result<ProcessHandle, RuntimeError> {
-        let mut args = vec![
+        let command = Self::jailer_command(config)?;
+        self.command_runner.start_owned(
+            &command,
+            &ProcessOwnership {
+                cgroup_path: config.isolation.cgroup.path.clone(),
+                firecracker_executable: config.firecracker.path.clone(),
+                firecracker_digest: config.firecracker.digest,
+            },
+        )
+    }
+
+    fn jailer_command(config: &RuntimeConfig) -> Result<CommandSpec, RuntimeError> {
+        let api_socket = config.jail_path("API socket", &config.api_socket)?;
+        let seccomp_filter =
+            config.jail_path("seccomp filter", &config.isolation.seccomp.filter.path)?;
+        let parent_cgroup = config.cgroup_parent()?;
+        let args = vec![
             "--id".to_owned(),
             config.workspace.clone_id.clone(),
             "--exec-file".to_owned(),
             config.firecracker.path.display().to_string(),
-            "--api-sock".to_owned(),
-            config.api_socket.display().to_string(),
+            "--uid".to_owned(),
+            config.jailer_config.uid.to_string(),
+            "--gid".to_owned(),
+            config.jailer_config.gid.to_string(),
+            "--cgroup-version".to_owned(),
+            config
+                .jailer_config
+                .cgroup_version
+                .jailer_value()
+                .to_owned(),
+            "--parent-cgroup".to_owned(),
+            parent_cgroup.display().to_string(),
             "--cgroup".to_owned(),
-            config.isolation.cgroup.path.display().to_string(),
+            format!("memory.max={}", config.isolation.cgroup.memory_max_bytes),
+            "--cgroup".to_owned(),
+            format!(
+                "cpu.max={} {}",
+                config.isolation.cgroup.cpu_quota_micros, config.isolation.cgroup.cpu_period_micros
+            ),
+            "--chroot-base-dir".to_owned(),
+            config.jailer_config.chroot_base_dir.display().to_string(),
+            "--new-pid-ns".to_owned(),
+            "--".to_owned(),
+            "--api-sock".to_owned(),
+            api_socket.display().to_string(),
             "--seccomp-filter".to_owned(),
-            config.isolation.seccomp.filter.path.display().to_string(),
+            seccomp_filter.display().to_string(),
         ];
-        for flag in [
-            "--new-user-ns",
-            "--new-pid-ns",
-            "--new-mount-ns",
-            "--new-net-ns",
-            "--new-ipc-ns",
-            "--new-uts-ns",
-        ] {
-            args.push(flag.to_owned());
-        }
-        self.command_runner
-            .start(&CommandSpec::new(&config.jailer.path, args))
+        Ok(CommandSpec::new(&config.jailer.path, args))
+    }
+
+    fn bind_restored_workspace(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
+        let workspace_path = config.jail_path("workspace clone", &config.workspace.clone_path())?;
+        let vsock_path = config.jail_path("vsock UDS", &config.vsock.uds_path)?;
+        self.api_call(ApiRequest {
+            method: HttpMethod::Patch,
+            path: "/drives/workspace".to_owned(),
+            body: format!(
+                "{{\"drive_id\":\"workspace\",\"path_on_host\":{}}}",
+                json_string(&workspace_path.to_string_lossy())
+            ),
+        })?;
+        self.api_client.verify_restore_resources(
+            &workspace_path,
+            &vsock_path,
+            config.vsock.guest_cid,
+        )
     }
 
     fn configure_vm(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
@@ -2772,7 +3845,11 @@ where
             path: "/boot-source".to_owned(),
             body: format!(
                 "{{\"kernel_image_path\":{},\"boot_args\":{}}}",
-                json_string(&config.kernel.path.to_string_lossy()),
+                json_string(
+                    &config
+                        .jail_path("kernel", &config.kernel.path)?
+                        .to_string_lossy()
+                ),
                 json_string(&config.boot_args)
             ),
         })?;
@@ -2781,7 +3858,14 @@ where
             path: "/drives/rootfs".to_owned(),
             body: format!(
                 "{{\"drive_id\":\"rootfs\",\"path_on_host\":{},\"is_root_device\":true,\"is_read_only\":true}}",
-                json_string(&format!("/dev/mapper/{}", config.dm_verity.mapper_name))
+                json_string(
+                    &config
+                        .jail_path(
+                            "jailed dm-verity device",
+                            &config.dm_verity.jailed_device_path,
+                        )?
+                        .to_string_lossy()
+                )
             ),
         })?;
         self.api_call(ApiRequest {
@@ -2789,7 +3873,11 @@ where
             path: "/drives/workspace".to_owned(),
             body: format!(
                 "{{\"drive_id\":\"workspace\",\"path_on_host\":{},\"is_root_device\":false,\"is_read_only\":false}}",
-                json_string(&config.workspace.clone_path().to_string_lossy())
+                json_string(
+                    &config
+                        .jail_path("workspace clone", &config.workspace.clone_path())?
+                        .to_string_lossy()
+                )
             ),
         })?;
         self.api_call(ApiRequest {
@@ -2798,7 +3886,11 @@ where
             body: format!(
                 "{{\"guest_cid\":{},\"uds_path\":{}}}",
                 config.vsock.guest_cid,
-                json_string(&config.vsock.uds_path.to_string_lossy())
+                json_string(
+                    &config
+                        .jail_path("vsock UDS", &config.vsock.uds_path)?
+                        .to_string_lossy()
+                )
             ),
         })
     }
@@ -2910,6 +4002,299 @@ fn json_string(value: &str) -> String {
     escaped
 }
 
+#[derive(Debug)]
+enum JsonValue {
+    Object(Vec<(String, JsonValue)>),
+    Array(Vec<JsonValue>),
+    String(String),
+    Number(String),
+    Simple,
+}
+
+impl JsonValue {
+    fn member(&self, name: &str) -> Option<&Self> {
+        let Self::Object(members) = self else {
+            return None;
+        };
+        members
+            .iter()
+            .find_map(|(key, value)| (key == name).then_some(value))
+    }
+
+    fn string(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+struct JsonParser<'a> {
+    input: &'a str,
+    index: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn parse(input: &'a str) -> Result<JsonValue, RuntimeError> {
+        let mut parser = Self { input, index: 0 };
+        let value = parser.value(0)?;
+        parser.whitespace();
+        if parser.index != input.len() {
+            return Err(RuntimeError::Api(
+                "exported VM configuration has trailing JSON data".to_owned(),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn value(&mut self, depth: usize) -> Result<JsonValue, RuntimeError> {
+        if depth > MAX_WORKSPACE_DEPTH {
+            return Err(RuntimeError::Api(
+                "exported VM configuration exceeds JSON nesting limit".to_owned(),
+            ));
+        }
+        self.whitespace();
+        match self.peek() {
+            Some(b'{') => self.object(depth + 1),
+            Some(b'[') => self.array(depth + 1),
+            Some(b'"') => self.string().map(JsonValue::String),
+            Some(b'-' | b'0'..=b'9') => self.number().map(JsonValue::Number),
+            Some(b't') => self.literal("true"),
+            Some(b'f') => self.literal("false"),
+            Some(b'n') => self.literal("null"),
+            _ => Err(RuntimeError::Api(
+                "exported VM configuration contains invalid JSON".to_owned(),
+            )),
+        }
+    }
+
+    fn object(&mut self, depth: usize) -> Result<JsonValue, RuntimeError> {
+        self.expect(b'{')?;
+        let mut members = Vec::new();
+        self.whitespace();
+        if self.take(b'}') {
+            return Ok(JsonValue::Object(members));
+        }
+        loop {
+            self.whitespace();
+            let key = self.string()?;
+            if members.iter().any(|(existing, _)| existing == &key) {
+                return Err(RuntimeError::Api(format!(
+                    "exported VM configuration contains duplicate JSON key '{key}'"
+                )));
+            }
+            self.whitespace();
+            self.expect(b':')?;
+            let value = self.value(depth)?;
+            members.push((key, value));
+            self.whitespace();
+            if self.take(b'}') {
+                return Ok(JsonValue::Object(members));
+            }
+            self.expect(b',')?;
+        }
+    }
+
+    fn array(&mut self, depth: usize) -> Result<JsonValue, RuntimeError> {
+        self.expect(b'[')?;
+        let mut values = Vec::new();
+        self.whitespace();
+        if self.take(b']') {
+            return Ok(JsonValue::Array(values));
+        }
+        loop {
+            values.push(self.value(depth)?);
+            self.whitespace();
+            if self.take(b']') {
+                return Ok(JsonValue::Array(values));
+            }
+            self.expect(b',')?;
+        }
+    }
+
+    fn string(&mut self) -> Result<String, RuntimeError> {
+        self.expect(b'"')?;
+        let mut output = String::new();
+        loop {
+            let remainder = self.input.get(self.index..).ok_or_else(|| {
+                RuntimeError::Api("exported VM configuration has an unterminated string".to_owned())
+            })?;
+            let character = remainder.chars().next().ok_or_else(|| {
+                RuntimeError::Api("exported VM configuration has an unterminated string".to_owned())
+            })?;
+            self.index += character.len_utf8();
+            match character {
+                '"' => return Ok(output),
+                '\\' => output.push(self.escape()?),
+                character if character.is_control() => {
+                    return Err(RuntimeError::Api(
+                        "exported VM configuration string contains a control character".to_owned(),
+                    ));
+                }
+                character => output.push(character),
+            }
+        }
+    }
+
+    fn escape(&mut self) -> Result<char, RuntimeError> {
+        let byte = self.next().ok_or_else(|| {
+            RuntimeError::Api("exported VM configuration has an incomplete escape".to_owned())
+        })?;
+        match byte {
+            b'"' => Ok('"'),
+            b'\\' => Ok('\\'),
+            b'/' => Ok('/'),
+            b'b' => Ok('\u{0008}'),
+            b'f' => Ok('\u{000c}'),
+            b'n' => Ok('\n'),
+            b'r' => Ok('\r'),
+            b't' => Ok('\t'),
+            b'u' => {
+                let value = self.hex_quad()?;
+                char::from_u32(u32::from(value)).ok_or_else(|| {
+                    RuntimeError::Api(
+                        "exported VM configuration contains an unsupported Unicode surrogate"
+                            .to_owned(),
+                    )
+                })
+            }
+            _ => Err(RuntimeError::Api(
+                "exported VM configuration contains an invalid escape".to_owned(),
+            )),
+        }
+    }
+
+    fn hex_quad(&mut self) -> Result<u16, RuntimeError> {
+        let mut value = 0_u16;
+        for _ in 0..4 {
+            let digit = self.next().and_then(|byte| match byte {
+                b'0'..=b'9' => Some(u16::from(byte - b'0')),
+                b'a'..=b'f' => Some(u16::from(byte - b'a') + 10),
+                b'A'..=b'F' => Some(u16::from(byte - b'A') + 10),
+                _ => None,
+            });
+            value = value
+                .checked_mul(16)
+                .and_then(|value| digit.map(|digit| value + digit))
+                .ok_or_else(|| {
+                    RuntimeError::Api(
+                        "exported VM configuration contains an invalid Unicode escape".to_owned(),
+                    )
+                })?;
+        }
+        Ok(value)
+    }
+
+    fn number(&mut self) -> Result<String, RuntimeError> {
+        let start = self.index;
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'))
+        {
+            self.index += 1;
+        }
+        let number = &self.input[start..self.index];
+        if number.parse::<f64>().is_err() {
+            return Err(RuntimeError::Api(
+                "exported VM configuration contains an invalid number".to_owned(),
+            ));
+        }
+        Ok(number.to_owned())
+    }
+
+    fn literal(&mut self, literal: &str) -> Result<JsonValue, RuntimeError> {
+        if self.input[self.index..].starts_with(literal) {
+            self.index += literal.len();
+            Ok(JsonValue::Simple)
+        } else {
+            Err(RuntimeError::Api(
+                "exported VM configuration contains an invalid literal".to_owned(),
+            ))
+        }
+    }
+
+    fn whitespace(&mut self) {
+        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            self.index += 1;
+        }
+    }
+
+    fn expect(&mut self, expected: u8) -> Result<(), RuntimeError> {
+        if self.take(expected) {
+            Ok(())
+        } else {
+            Err(RuntimeError::Api(
+                "exported VM configuration contains malformed JSON".to_owned(),
+            ))
+        }
+    }
+
+    fn take(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.input.as_bytes().get(self.index).copied()
+    }
+
+    fn next(&mut self) -> Option<u8> {
+        let byte = self.peek()?;
+        self.index += 1;
+        Some(byte)
+    }
+}
+
+fn verify_exported_restore_resources(
+    body: &str,
+    workspace_path: &Path,
+    vsock_uds_path: &Path,
+    guest_cid: u32,
+) -> Result<(), RuntimeError> {
+    let root = JsonParser::parse(body)?;
+    let JsonValue::Array(drives) = root.member("drives").ok_or_else(|| {
+        RuntimeError::StaleSnapshot("exported VM config omitted drives".to_owned())
+    })?
+    else {
+        return Err(RuntimeError::StaleSnapshot(
+            "exported VM config drives field is not an array".to_owned(),
+        ));
+    };
+    let workspace_matches = drives
+        .iter()
+        .filter(|drive| drive.member("drive_id").and_then(JsonValue::string) == Some("workspace"))
+        .filter(|drive| {
+            drive.member("path_on_host").and_then(JsonValue::string)
+                == Some(workspace_path.to_string_lossy().as_ref())
+        })
+        .count();
+    if workspace_matches != 1 {
+        return Err(RuntimeError::StaleSnapshot(
+            "exported VM config does not bind exactly one workspace drive to the requested path"
+                .to_owned(),
+        ));
+    }
+    let vsock = root.member("vsock").ok_or_else(|| {
+        RuntimeError::StaleSnapshot("exported VM config omitted vsock".to_owned())
+    })?;
+    let path_matches = vsock.member("uds_path").and_then(JsonValue::string)
+        == Some(vsock_uds_path.to_string_lossy().as_ref());
+    let cid_matches = vsock.member("guest_cid").and_then(|value| match value {
+        JsonValue::Number(number) => number.parse::<u32>().ok(),
+        _ => None,
+    }) == Some(guest_cid);
+    if !path_matches || !cid_matches {
+        return Err(RuntimeError::StaleSnapshot(
+            "exported VM config does not bind vsock to the requested path and guest CID".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 impl From<io::Error> for RuntimeError {
     fn from(error: io::Error) -> Self {
         Self::Io(error.to_string())
@@ -2937,6 +4322,17 @@ pub enum RuntimeError {
         /// Expected digest.
         expected: Sha256Digest,
         /// Observed digest.
+        actual: Sha256Digest,
+    },
+    /// Snapshot state or memory bytes did not match verified provenance.
+    SnapshotDigestMismatch {
+        /// Snapshot component label.
+        label: String,
+        /// Observed component path.
+        path: PathBuf,
+        /// Provenance digest.
+        expected: Sha256Digest,
+        /// Observed content digest.
         actual: Sha256Digest,
     },
     /// An artifact or socket could not be accessed.
@@ -2974,7 +4370,7 @@ pub enum RuntimeError {
     WorkspaceAlreadyExists(PathBuf),
     /// A restored identity is duplicated or present in snapshot state.
     StaleIdentity(String),
-    /// Snapshot metadata does not match the requested artifact set.
+    /// Snapshot metadata does not match the requested runtime configuration.
     StaleSnapshot(String),
     /// Identity encoding is invalid.
     InvalidIdentity(String),
@@ -3006,6 +4402,12 @@ impl Display for RuntimeError {
                 )
             }
             Self::ArtifactDigestMismatch {
+                label,
+                path,
+                expected,
+                actual,
+            }
+            | Self::SnapshotDigestMismatch {
                 label,
                 path,
                 expected,
@@ -3061,7 +4463,9 @@ impl Error for RuntimeError {}
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     use super::*;
 
@@ -3168,6 +4572,358 @@ mod tests {
         )
     }
 
+    fn test_artifact(path: &str) -> PinnedArtifact {
+        PinnedArtifact::new(path, sha256(b"artifact"))
+    }
+
+    fn test_config() -> RuntimeConfig {
+        let rootfs = test_artifact("/artifacts/rootfs");
+        let jail_root = Path::new("/srv/jailer/firecracker/session-a/root");
+        RuntimeConfig {
+            firecracker: test_artifact("/artifacts/firecracker"),
+            kernel: test_artifact(jail_root.join("artifacts/kernel").to_str().unwrap()),
+            rootfs: rootfs.clone(),
+            verity_hash: test_artifact("/artifacts/verity"),
+            dm_verity: DmVerityConfig {
+                data_device: rootfs.path,
+                hash_device: PathBuf::from("/artifacts/verity"),
+                mapper_name: "rootfs-verity".to_owned(),
+                root_hash: sha256(b"verity-root"),
+                jailed_device_path: jail_root.join("dev/rootfs"),
+            },
+            workspace: WorkspaceConfig {
+                source: PathBuf::from("/workspace/source"),
+                clone_root: jail_root.join("workspace"),
+                clone_id: "session-a".to_owned(),
+            },
+            jailer: test_artifact("/artifacts/jailer"),
+            jailer_config: JailerConfig {
+                uid: 1000,
+                gid: 1000,
+                chroot_base_dir: PathBuf::from("/srv/jailer"),
+                cgroup_version: CgroupVersion::V2,
+            },
+            api_socket: jail_root.join("run/firecracker.socket"),
+            isolation: HostIsolationConfig {
+                namespaces: NamespaceConfig {
+                    user: false,
+                    pid: true,
+                    mount: true,
+                    network: false,
+                    ipc: false,
+                    uts: false,
+                },
+                cgroup: CgroupConfig {
+                    path: PathBuf::from("/sys/fs/cgroup/firecracker/session-a"),
+                    memory_max_bytes: 256 * 1024 * 1024,
+                    cpu_quota_micros: 100_000,
+                    cpu_period_micros: 100_000,
+                },
+                seccomp: SeccompConfig {
+                    filter: test_artifact(jail_root.join("artifacts/seccomp").to_str().unwrap()),
+                    blocked_syscalls: REQUIRED_BLOCKED_SYSCALLS
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                },
+            },
+            vsock: VsockConfig {
+                guest_cid: 42,
+                uds_path: jail_root.join("run/session-a.vsock"),
+            },
+            network_devices: Vec::new(),
+            vcpu_count: 2,
+            memory_mib: 256,
+            boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_owned(),
+        }
+    }
+
+    #[derive(Default)]
+    struct LifecycleRunner {
+        events: Rc<RefCell<Vec<String>>>,
+        next_pid: u32,
+    }
+
+    impl CommandRunner for LifecycleRunner {
+        fn run(&mut self, command: &CommandSpec) -> Result<CommandOutput, RuntimeError> {
+            self.events.borrow_mut().push(format!(
+                "command:{} {}",
+                command.program.display(),
+                command.args.join(" ")
+            ));
+            Ok(CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+
+        fn start(&mut self, _command: &CommandSpec) -> Result<ProcessHandle, RuntimeError> {
+            self.next_pid += 1;
+            self.events
+                .borrow_mut()
+                .push(format!("start:{}", self.next_pid));
+            Ok(ProcessHandle { pid: self.next_pid })
+        }
+
+        fn start_owned(
+            &mut self,
+            command: &CommandSpec,
+            _ownership: &ProcessOwnership,
+        ) -> Result<ProcessHandle, RuntimeError> {
+            self.start(command)
+        }
+
+        fn verify_running(&mut self, process: ProcessHandle) -> Result<(), RuntimeError> {
+            self.events
+                .borrow_mut()
+                .push(format!("verify:{}", process.pid));
+            Ok(())
+        }
+
+        fn stop(&mut self, process: ProcessHandle) -> Result<(), RuntimeError> {
+            self.events
+                .borrow_mut()
+                .push(format!("stop:{}", process.pid));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct LifecycleFileSystem {
+        events: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl FileSystem for LifecycleFileSystem {
+        fn read(&mut self, _path: &Path) -> Result<Vec<u8>, RuntimeError> {
+            Ok(b"artifact".to_vec())
+        }
+
+        fn verify_block_device_binding(
+            &mut self,
+            source: &Path,
+            jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            self.events.borrow_mut().push(format!(
+                "verify-device:{}:{}",
+                source.display(),
+                jailed_device.display()
+            ));
+            Ok(())
+        }
+
+        fn clone_workspace(
+            &mut self,
+            _source: &Path,
+            destination: &Path,
+        ) -> Result<(), RuntimeError> {
+            self.events
+                .borrow_mut()
+                .push(format!("clone:{}", destination.display()));
+            Ok(())
+        }
+
+        fn remove_workspace(&mut self, path: &Path) -> Result<(), RuntimeError> {
+            self.events
+                .borrow_mut()
+                .push(format!("remove:{}", path.display()));
+            Ok(())
+        }
+    }
+
+    struct LifecycleApi {
+        label: &'static str,
+        events: Rc<RefCell<Vec<String>>>,
+        statuses: VecDeque<u16>,
+    }
+
+    impl ApiClient for LifecycleApi {
+        fn request(&mut self, request: &ApiRequest) -> Result<ApiResponse, RuntimeError> {
+            self.events.borrow_mut().push(format!(
+                "{}:{:?}:{}:{}",
+                self.label, request.method, request.path, request.body
+            ));
+            Ok(ApiResponse {
+                status: self.statuses.pop_front().unwrap_or(204),
+                body: String::new(),
+            })
+        }
+
+        fn verify_restore_resources(
+            &mut self,
+            workspace_path: &Path,
+            vsock_uds_path: &Path,
+            guest_cid: u32,
+        ) -> Result<(), RuntimeError> {
+            self.events.borrow_mut().push(format!(
+                "{}:verify-resources:{}:{}:{guest_cid}",
+                self.label,
+                workspace_path.display(),
+                vsock_uds_path.display()
+            ));
+            Ok(())
+        }
+    }
+
+    struct SequentialIdentitySource(u8);
+
+    impl IdentitySource for SequentialIdentitySource {
+        fn generate(&mut self) -> Result<IdentityId, RuntimeError> {
+            self.0 += 1;
+            let mut bytes = [0_u8; ID_LENGTH];
+            bytes[ID_LENGTH - 1] = self.0;
+            Ok(IdentityId(bytes))
+        }
+    }
+
+    struct SnapshotVerifierFileSystem {
+        files: Rc<RefCell<HashMap<PathBuf, Vec<u8>>>>,
+    }
+
+    impl FileSystem for SnapshotVerifierFileSystem {
+        fn read(&mut self, path: &Path) -> Result<Vec<u8>, RuntimeError> {
+            self.files
+                .borrow()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| RuntimeError::Io(format!("missing test file {}", path.display())))
+        }
+
+        fn clone_workspace(
+            &mut self,
+            _source: &Path,
+            _destination: &Path,
+        ) -> Result<(), RuntimeError> {
+            Err(RuntimeError::Io("unexpected clone".to_owned()))
+        }
+
+        fn remove_workspace(&mut self, _path: &Path) -> Result<(), RuntimeError> {
+            Err(RuntimeError::Io("unexpected remove".to_owned()))
+        }
+    }
+
+    struct LateMutationFileSystem {
+        events: Rc<RefCell<Vec<String>>>,
+        files: HashMap<PathBuf, Vec<u8>>,
+        state_path: PathBuf,
+    }
+
+    impl FileSystem for LateMutationFileSystem {
+        fn read(&mut self, path: &Path) -> Result<Vec<u8>, RuntimeError> {
+            Ok(self
+                .files
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| b"artifact".to_vec()))
+        }
+
+        fn verify_block_device_binding(
+            &mut self,
+            _source: &Path,
+            _jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn clone_workspace(
+            &mut self,
+            _source: &Path,
+            destination: &Path,
+        ) -> Result<(), RuntimeError> {
+            self.events
+                .borrow_mut()
+                .push(format!("clone:{}", destination.display()));
+            self.files
+                .insert(self.state_path.clone(), b"state-v2".to_vec());
+            Ok(())
+        }
+
+        fn remove_workspace(&mut self, path: &Path) -> Result<(), RuntimeError> {
+            self.events
+                .borrow_mut()
+                .push(format!("remove:{}", path.display()));
+            Ok(())
+        }
+    }
+
+    type LifecycleRuntime = Runtime<
+        LifecycleRunner,
+        LifecycleFileSystem,
+        LifecycleApi,
+        LifecycleApi,
+        SequentialIdentitySource,
+    >;
+
+    fn lifecycle_runtime(
+        api_statuses: impl IntoIterator<Item = u16>,
+        guest_statuses: impl IntoIterator<Item = u16>,
+    ) -> (LifecycleRuntime, Rc<RefCell<Vec<String>>>) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        (
+            Runtime::new(
+                LifecycleRunner {
+                    events: Rc::clone(&events),
+                    next_pid: 0,
+                },
+                LifecycleFileSystem {
+                    events: Rc::clone(&events),
+                },
+                LifecycleApi {
+                    label: "firecracker",
+                    events: Rc::clone(&events),
+                    statuses: api_statuses.into_iter().collect(),
+                },
+                LifecycleApi {
+                    label: "guest",
+                    events: Rc::clone(&events),
+                    statuses: guest_statuses.into_iter().collect(),
+                },
+                SequentialIdentitySource(0),
+            ),
+            events,
+        )
+    }
+
+    fn test_snapshot(config: &RuntimeConfig) -> Snapshot {
+        let jail_root = config.jail_root().expect("test jail root must resolve");
+        Snapshot::new(
+            jail_root.join("snapshots/state"),
+            jail_root.join("snapshots/memory"),
+            config.snapshot_fingerprint(),
+            sha256(b"artifact"),
+            sha256(b"artifact"),
+            Vec::new(),
+        )
+    }
+
+    fn fake_owned_process(
+        runner: &mut RealCommandRunner,
+        cgroup: &Path,
+        firecracker_executable: &Path,
+    ) -> ProcessHandle {
+        let launcher = spawn_detached(&CommandSpec::new(
+            "/bin/sh",
+            ["-c".to_owned(), "exit 0".to_owned()],
+        ))
+        .expect("fake launcher must start");
+        let process = ProcessHandle { pid: launcher.id() };
+        runner.children.insert(
+            process.pid,
+            ManagedChild::Isolated {
+                launcher,
+                ownership: OwnedCgroup {
+                    path: cgroup.to_owned(),
+                    identity: ObjectIdentity::from_metadata(
+                        &fs::metadata(cgroup).expect("fake cgroup metadata must resolve"),
+                    ),
+                    firecracker_digest: digest_file(firecracker_executable)
+                        .expect("fake Firecracker executable must be digestible"),
+                },
+            },
+        );
+        process
+    }
+
     #[test]
     fn sha256_matches_nist_empty_vector() {
         assert_eq!(
@@ -3195,6 +4951,596 @@ mod tests {
             digest.to_hex(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The mutation matrix intentionally names every config field.
+    fn snapshot_fingerprint_covers_every_non_overridable_runtime_field() {
+        let base = test_config();
+        let expected = base.snapshot_fingerprint();
+        macro_rules! assert_mutation_changes_fingerprint {
+            ($name:literal, $mutation:expr) => {{
+                let mut changed = base.clone();
+                $mutation(&mut changed);
+                assert_ne!(
+                    changed.snapshot_fingerprint(),
+                    expected,
+                    "{} is missing from the snapshot compatibility fingerprint",
+                    $name
+                );
+            }};
+        }
+
+        assert_mutation_changes_fingerprint!("firecracker.path", |config: &mut RuntimeConfig| {
+            config.firecracker.path.push("changed");
+        });
+        assert_mutation_changes_fingerprint!("firecracker.digest", |config: &mut RuntimeConfig| {
+            config.firecracker.digest = sha256(b"changed-firecracker");
+        });
+        assert_mutation_changes_fingerprint!("kernel.path", |config: &mut RuntimeConfig| {
+            config.kernel.path.push("changed");
+        });
+        assert_mutation_changes_fingerprint!("kernel.digest", |config: &mut RuntimeConfig| {
+            config.kernel.digest = sha256(b"changed-kernel");
+        });
+        assert_mutation_changes_fingerprint!("rootfs.path", |config: &mut RuntimeConfig| {
+            config.rootfs.path.push("changed");
+        });
+        assert_mutation_changes_fingerprint!("rootfs.digest", |config: &mut RuntimeConfig| {
+            config.rootfs.digest = sha256(b"changed-rootfs");
+        });
+        assert_mutation_changes_fingerprint!("verity_hash.path", |config: &mut RuntimeConfig| {
+            config.verity_hash.path.push("changed");
+        });
+        assert_mutation_changes_fingerprint!("verity_hash.digest", |config: &mut RuntimeConfig| {
+            config.verity_hash.digest = sha256(b"changed-verity");
+        });
+        assert_mutation_changes_fingerprint!(
+            "dm_verity.data_device",
+            |config: &mut RuntimeConfig| {
+                config.dm_verity.data_device.push("changed");
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "dm_verity.hash_device",
+            |config: &mut RuntimeConfig| {
+                config.dm_verity.hash_device.push("changed");
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "dm_verity.root_hash",
+            |config: &mut RuntimeConfig| {
+                config.dm_verity.root_hash = sha256(b"changed-root-hash");
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "dm_verity.jailed_device_path",
+            |config: &mut RuntimeConfig| {
+                config.dm_verity.jailed_device_path.push("changed");
+            }
+        );
+        assert_mutation_changes_fingerprint!("workspace.source", |config: &mut RuntimeConfig| {
+            config.workspace.source.push("changed");
+        });
+        assert_mutation_changes_fingerprint!(
+            "workspace.clone_root",
+            |config: &mut RuntimeConfig| {
+                config.workspace.clone_root.push("changed");
+            }
+        );
+        assert_mutation_changes_fingerprint!("jailer.path", |config: &mut RuntimeConfig| {
+            config.jailer.path.push("changed");
+        });
+        assert_mutation_changes_fingerprint!("jailer.digest", |config: &mut RuntimeConfig| {
+            config.jailer.digest = sha256(b"changed-jailer");
+        });
+        assert_mutation_changes_fingerprint!("jailer.uid", |config: &mut RuntimeConfig| {
+            config.jailer_config.uid += 1;
+        });
+        assert_mutation_changes_fingerprint!("jailer.gid", |config: &mut RuntimeConfig| {
+            config.jailer_config.gid += 1;
+        });
+        assert_mutation_changes_fingerprint!(
+            "jailer.chroot_base_dir",
+            |config: &mut RuntimeConfig| {
+                config.jailer_config.chroot_base_dir.push("changed");
+            }
+        );
+        assert_mutation_changes_fingerprint!("api_socket", |config: &mut RuntimeConfig| {
+            config.api_socket.push("changed");
+        });
+        assert_mutation_changes_fingerprint!("namespace.user", |config: &mut RuntimeConfig| {
+            config.isolation.namespaces.user = true;
+        });
+        assert_mutation_changes_fingerprint!("namespace.pid", |config: &mut RuntimeConfig| {
+            config.isolation.namespaces.pid = false;
+        });
+        assert_mutation_changes_fingerprint!("namespace.mount", |config: &mut RuntimeConfig| {
+            config.isolation.namespaces.mount = false;
+        });
+        assert_mutation_changes_fingerprint!("namespace.network", |config: &mut RuntimeConfig| {
+            config.isolation.namespaces.network = true;
+        });
+        assert_mutation_changes_fingerprint!("namespace.ipc", |config: &mut RuntimeConfig| {
+            config.isolation.namespaces.ipc = true;
+        });
+        assert_mutation_changes_fingerprint!("namespace.uts", |config: &mut RuntimeConfig| {
+            config.isolation.namespaces.uts = true;
+        });
+        assert_mutation_changes_fingerprint!("cgroup.path", |config: &mut RuntimeConfig| {
+            config.isolation.cgroup.path.push("changed");
+        });
+        assert_mutation_changes_fingerprint!(
+            "cgroup.memory_max_bytes",
+            |config: &mut RuntimeConfig| {
+                config.isolation.cgroup.memory_max_bytes += 1;
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "cgroup.cpu_quota_micros",
+            |config: &mut RuntimeConfig| {
+                config.isolation.cgroup.cpu_quota_micros += 1;
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "cgroup.cpu_period_micros",
+            |config: &mut RuntimeConfig| {
+                config.isolation.cgroup.cpu_period_micros += 1;
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "seccomp.filter.path",
+            |config: &mut RuntimeConfig| {
+                config.isolation.seccomp.filter.path.push("changed");
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "seccomp.filter.digest",
+            |config: &mut RuntimeConfig| {
+                config.isolation.seccomp.filter.digest = sha256(b"changed-seccomp");
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "seccomp.blocked_syscalls",
+            |config: &mut RuntimeConfig| {
+                config
+                    .isolation
+                    .seccomp
+                    .blocked_syscalls
+                    .push("clone3".to_owned());
+            }
+        );
+        assert_mutation_changes_fingerprint!("vsock.guest_cid", |config: &mut RuntimeConfig| {
+            config.vsock.guest_cid += 1;
+        });
+        assert_mutation_changes_fingerprint!("network_devices", |config: &mut RuntimeConfig| {
+            config.network_devices.push("eth0".to_owned());
+        });
+        assert_mutation_changes_fingerprint!("vcpu_count", |config: &mut RuntimeConfig| {
+            config.vcpu_count += 1;
+        });
+        assert_mutation_changes_fingerprint!("memory_mib", |config: &mut RuntimeConfig| {
+            config.memory_mib += 1;
+        });
+        assert_mutation_changes_fingerprint!("boot_args", |config: &mut RuntimeConfig| {
+            config.boot_args.push_str(" quiet");
+        });
+    }
+
+    #[test]
+    fn snapshot_fingerprint_allows_only_explicit_session_resource_overrides() {
+        let base = test_config();
+        let mut session = base.clone();
+        session.workspace.clone_id = "session-b".to_owned();
+        let jail_root = Path::new("/srv/jailer/firecracker/session-b/root");
+        session.kernel.path = jail_root.join("artifacts/kernel");
+        session.workspace.clone_root = jail_root.join("workspace");
+        session.api_socket = jail_root.join("run/firecracker.socket");
+        session.isolation.cgroup.path = PathBuf::from("/sys/fs/cgroup/firecracker/session-b");
+        session.isolation.seccomp.filter.path = jail_root.join("artifacts/seccomp");
+        session.vsock.uds_path = jail_root.join("run/session-b.vsock");
+        session.dm_verity.mapper_name = "rootfs-verity-session-b".to_owned();
+        session.dm_verity.jailed_device_path = jail_root.join("dev/rootfs");
+
+        assert_eq!(session.snapshot_fingerprint(), base.snapshot_fingerprint());
+        assert_ne!(session.instance_fingerprint(), base.instance_fingerprint());
+    }
+
+    #[test]
+    fn jailer_command_matches_supported_v2_chroot_contract_exactly() {
+        let config = test_config();
+
+        let command = LifecycleRuntime::jailer_command(&config)
+            .expect("valid jailer configuration must produce an argv");
+
+        assert_eq!(command.program, Path::new("/artifacts/jailer"));
+        assert_eq!(
+            command.args,
+            [
+                "--id",
+                "session-a",
+                "--exec-file",
+                "/artifacts/firecracker",
+                "--uid",
+                "1000",
+                "--gid",
+                "1000",
+                "--cgroup-version",
+                "2",
+                "--parent-cgroup",
+                "firecracker",
+                "--cgroup",
+                "memory.max=268435456",
+                "--cgroup",
+                "cpu.max=100000 100000",
+                "--chroot-base-dir",
+                "/srv/jailer",
+                "--new-pid-ns",
+                "--",
+                "--api-sock",
+                "/run/firecracker.socket",
+                "--seccomp-filter",
+                "/artifacts/seccomp",
+            ]
+            .map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn snapshot_verifier_rejects_byte_mismatch_and_rechecks_before_restore() {
+        let config = test_config();
+        let jail_root = config.jail_root().expect("test jail root must resolve");
+        let state_path = jail_root.join("snapshots/state");
+        let memory_path = jail_root.join("snapshots/memory");
+        let files = Rc::new(RefCell::new(HashMap::from([
+            (state_path.clone(), b"state-v1".to_vec()),
+            (memory_path.clone(), b"memory-v1".to_vec()),
+        ])));
+        let mut runtime = Runtime::new(
+            CleanupRunner::default(),
+            SnapshotVerifierFileSystem {
+                files: Rc::clone(&files),
+            },
+            UnusedApi,
+            UnusedApi,
+            UnusedIdentitySource,
+        );
+        let manifest = Snapshot::new(
+            &state_path,
+            &memory_path,
+            config.snapshot_fingerprint(),
+            sha256(b"state-v1"),
+            sha256(b"memory-v1"),
+            Vec::new(),
+        );
+        let verified = runtime
+            .verify_snapshot(&config, manifest)
+            .expect("matching snapshot bytes must verify");
+        files
+            .borrow_mut()
+            .insert(state_path.clone(), b"state-v2".to_vec());
+
+        assert!(matches!(
+            runtime.restore(&config, &verified),
+            Err(RuntimeError::SnapshotDigestMismatch { label, path, .. })
+                if label == "snapshot state" && path == state_path
+        ));
+        assert!(runtime.command_runner.events.is_empty());
+    }
+
+    #[test]
+    fn restore_rechecks_snapshot_after_workspace_preparation_before_api_use() {
+        let config = test_config();
+        let jail_root = config.jail_root().expect("test jail root must resolve");
+        let state_path = jail_root.join("snapshots/state");
+        let memory_path = jail_root.join("snapshots/memory");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let files = HashMap::from([
+            (state_path.clone(), b"state-v1".to_vec()),
+            (memory_path.clone(), b"memory-v1".to_vec()),
+        ]);
+        let mut runtime = Runtime::new(
+            LifecycleRunner {
+                events: Rc::clone(&events),
+                next_pid: 0,
+            },
+            LateMutationFileSystem {
+                events: Rc::clone(&events),
+                files,
+                state_path: state_path.clone(),
+            },
+            LifecycleApi {
+                label: "firecracker",
+                events: Rc::clone(&events),
+                statuses: VecDeque::new(),
+            },
+            LifecycleApi {
+                label: "guest",
+                events: Rc::clone(&events),
+                statuses: VecDeque::new(),
+            },
+            SequentialIdentitySource(0),
+        );
+        let manifest = Snapshot::new(
+            &state_path,
+            &memory_path,
+            config.snapshot_fingerprint(),
+            sha256(b"state-v1"),
+            sha256(b"memory-v1"),
+            Vec::new(),
+        );
+        let verified = runtime
+            .verify_snapshot(&config, manifest)
+            .expect("initial snapshot bytes must verify");
+
+        let error = runtime
+            .restore(&config, &verified)
+            .expect_err("late snapshot replacement must fail before Firecracker reads it");
+
+        assert!(matches!(
+            error,
+            RuntimeError::SnapshotDigestMismatch { label, path, .. }
+                if label == "snapshot state" && path == state_path
+        ));
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .all(|event| !event.contains("firecracker:Put:/snapshot/load:"))
+        );
+    }
+
+    #[test]
+    fn snapshot_verifier_rejects_path_mismatch_even_when_bytes_match() {
+        let config = test_config();
+        let jail_root = config.jail_root().expect("test jail root must resolve");
+        let state_path = jail_root.join("snapshots/state");
+        let memory_path = jail_root.join("snapshots/memory");
+        let files = Rc::new(RefCell::new(HashMap::from([
+            (state_path.clone(), b"state".to_vec()),
+            (memory_path.clone(), b"memory".to_vec()),
+            (PathBuf::from("/outside/state"), b"state".to_vec()),
+        ])));
+        let mut runtime = Runtime::new(
+            CleanupRunner::default(),
+            SnapshotVerifierFileSystem { files },
+            UnusedApi,
+            UnusedApi,
+            UnusedIdentitySource,
+        );
+        let manifest = Snapshot::new(
+            "/outside/state",
+            memory_path,
+            config.snapshot_fingerprint(),
+            sha256(b"state"),
+            sha256(b"memory"),
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            runtime.verify_snapshot(&config, manifest),
+            Err(RuntimeError::InvalidConfig(message))
+                if message.contains("snapshot path must be provisioned beneath jail root")
+        ));
+        assert!(runtime.command_runner.events.is_empty());
+    }
+
+    #[test]
+    fn restore_binds_workspace_and_vsock_while_paused_before_issuing_instance() {
+        let config = test_config();
+        let (mut runtime, events) = lifecycle_runtime([], []);
+        let snapshot = runtime
+            .verify_snapshot(&config, test_snapshot(&config))
+            .expect("test snapshot provenance must verify");
+
+        let instance = runtime
+            .restore(&config, &snapshot)
+            .expect("paused restore with explicit resource binding must succeed");
+        assert_eq!(instance.state(), RuntimeState::IdentityRegenerated);
+
+        let events = events.borrow();
+        let load = events
+            .iter()
+            .position(|event| event.contains("firecracker:Put:/snapshot/load:"))
+            .expect("restore must load the snapshot");
+        assert!(events[load].contains("\"resume_vm\":false"));
+        assert!(
+            events[load].contains("\"vsock_override\":{\"uds_path\":\"/run/session-a.vsock\"}")
+        );
+        let workspace = events
+            .iter()
+            .position(|event| event.contains("firecracker:Patch:/drives/workspace:"))
+            .expect("restore must bind the fresh workspace through Firecracker");
+        assert!(events[workspace].contains("\"path_on_host\":\"/workspace/session-a\""));
+        let verifies = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| (event == "verify:1").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            verifies.len(),
+            2,
+            "restore must verify process ownership before API use and before returning"
+        );
+        let resources = events
+            .iter()
+            .position(|event| {
+                event == "firecracker:verify-resources:/workspace/session-a:/run/session-a.vsock:42"
+            })
+            .expect("restore must observe the exact Firecracker device bindings");
+        assert!(
+            verifies[0] < load
+                && load < workspace
+                && workspace < resources
+                && resources < verifies[1]
+        );
+        assert!(events.iter().all(|event| !event.contains(":/vm:")));
+    }
+
+    #[test]
+    fn exported_vm_config_verifier_requires_exact_unique_resource_bindings() {
+        let valid = r#"{
+            "drives":[
+                {"drive_id":"rootfs","path_on_host":"/dev/rootfs"},
+                {"drive_id":"workspace","path_on_host":"/workspace/session-a"}
+            ],
+            "vsock":{"guest_cid":42,"uds_path":"/run/session-a.vsock"},
+            "machine-config":{"vcpu_count":2}
+        }"#;
+        verify_exported_restore_resources(
+            valid,
+            Path::new("/workspace/session-a"),
+            Path::new("/run/session-a.vsock"),
+            42,
+        )
+        .expect("exact exported resource bindings must verify");
+
+        let wrong_workspace = valid.replace("/workspace/session-a", "/workspace/stale");
+        assert!(matches!(
+            verify_exported_restore_resources(
+                &wrong_workspace,
+                Path::new("/workspace/session-a"),
+                Path::new("/run/session-a.vsock"),
+                42,
+            ),
+            Err(RuntimeError::StaleSnapshot(message)) if message.contains("workspace")
+        ));
+        let wrong_vsock = valid.replace("\"guest_cid\":42", "\"guest_cid\":43");
+        assert!(matches!(
+            verify_exported_restore_resources(
+                &wrong_vsock,
+                Path::new("/workspace/session-a"),
+                Path::new("/run/session-a.vsock"),
+                42,
+            ),
+            Err(RuntimeError::StaleSnapshot(message)) if message.contains("vsock")
+        ));
+        let duplicate_key = valid.replace("\"drives\":[", "\"drives\":[],\"drives\":[");
+        assert!(matches!(
+            verify_exported_restore_resources(
+                &duplicate_key,
+                Path::new("/workspace/session-a"),
+                Path::new("/run/session-a.vsock"),
+                42,
+            ),
+            Err(RuntimeError::Api(message)) if message.contains("duplicate JSON key")
+        ));
+    }
+
+    #[test]
+    fn identity_acknowledgement_precedes_explicit_resume_and_workload_start() {
+        let config = test_config();
+        let (mut runtime, events) = lifecycle_runtime([], []);
+        let snapshot = runtime
+            .verify_snapshot(&config, test_snapshot(&config))
+            .expect("test snapshot provenance must verify");
+        let mut instance = runtime
+            .restore(&config, &snapshot)
+            .expect("restore must remain paused");
+
+        runtime
+            .inject_identity(&mut instance)
+            .expect("identity acknowledgement and resume must succeed");
+        assert_eq!(instance.state(), RuntimeState::IdentityInjected);
+        runtime
+            .start_workload(&mut instance)
+            .expect("workload may start after the gate");
+        assert_eq!(instance.state(), RuntimeState::Running);
+
+        let events = events.borrow();
+        let inject = events
+            .iter()
+            .position(|event| event.contains("guest:Put:/actions/inject-identity:"))
+            .expect("identity injection must be acknowledged");
+        let resume = events
+            .iter()
+            .position(|event| event.contains("firecracker:Patch:/vm:"))
+            .expect("Firecracker must be explicitly resumed");
+        let start = events
+            .iter()
+            .position(|event| event.contains("guest:Put:/actions/start-workload:"))
+            .expect("workload start must be separately acknowledged");
+        assert!(inject < resume && resume < start);
+    }
+
+    #[test]
+    fn failed_resume_keeps_acknowledged_identity_gate_retryable_without_reinjection() {
+        let config = test_config();
+        let (mut runtime, events) = lifecycle_runtime([204, 204, 503, 204], []);
+        let snapshot = runtime
+            .verify_snapshot(&config, test_snapshot(&config))
+            .expect("test snapshot provenance must verify");
+        let mut instance = runtime
+            .restore(&config, &snapshot)
+            .expect("restore must remain paused");
+
+        assert!(matches!(
+            runtime.inject_identity(&mut instance),
+            Err(RuntimeError::ApiStatus {
+                path,
+                status: 503,
+                ..
+            }) if path == "/vm"
+        ));
+        assert_eq!(instance.state(), RuntimeState::IdentityAcknowledgedPaused);
+        assert!(matches!(
+            runtime.start_workload(&mut instance),
+            Err(RuntimeError::InvalidState { .. })
+        ));
+
+        runtime
+            .inject_identity(&mut instance)
+            .expect("resume may be retried without sending identity twice");
+        assert_eq!(instance.state(), RuntimeState::IdentityInjected);
+        let events = events.borrow();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.contains("/actions/inject-identity"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.contains("firecracker:Patch:/vm:"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn workspace_rebind_rejection_rolls_back_without_issuing_an_instance() {
+        let config = test_config();
+        let (mut runtime, events) = lifecycle_runtime([204, 409], []);
+        let snapshot = runtime
+            .verify_snapshot(&config, test_snapshot(&config))
+            .expect("test snapshot provenance must verify");
+
+        assert!(matches!(
+            runtime.restore(&config, &snapshot),
+            Err(RuntimeError::ApiStatus {
+                path,
+                status: 409,
+                ..
+            }) if path == "/drives/workspace"
+        ));
+        let events = events.borrow();
+        let stop = events
+            .iter()
+            .position(|event| event == "stop:1")
+            .expect("failed resource binding must stop the owned task");
+        let close = events
+            .iter()
+            .position(|event| event.contains("veritysetup close"))
+            .expect("failed resource binding must close dm-verity");
+        let remove = events
+            .iter()
+            .position(|event| {
+                event.contains("remove:/srv/jailer/firecracker/session-a/root/workspace/session-a")
+            })
+            .expect("failed resource binding must remove the fresh workspace");
+        assert!(stop < close && close < remove);
     }
 
     #[test]
@@ -3256,5 +5602,136 @@ mod tests {
         );
         assert_eq!(runtime.filesystem.events, ["remove:/workspace/session"]);
         assert!(!runtime.has_pending_cleanup());
+    }
+
+    #[test]
+    fn owned_process_verification_tracks_cgroup_task_after_launcher_exit() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock must be after the Unix epoch")
+            .as_nanos();
+        let cgroup = std::env::temp_dir().join(format!(
+            "firecracker-runtime-owned-cgroup-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&cgroup).expect("fake cgroup directory must be creatable");
+        fs::write(cgroup.join("cgroup.procs"), b"")
+            .expect("fake cgroup task file must be creatable");
+        let current_executable = std::env::current_exe().expect("test executable must resolve");
+        let mut runner = RealCommandRunner::new();
+        let process = fake_owned_process(&mut runner, &cgroup, &current_executable);
+        thread::sleep(Duration::from_millis(20));
+        fs::write(
+            cgroup.join("cgroup.procs"),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("fake cgroup must expose the owned Firecracker task");
+
+        runner
+            .verify_running(process)
+            .expect("an exited launcher must not hide the live owned cgroup task");
+
+        fs::write(cgroup.join("cgroup.procs"), b"").expect("fake cgroup task must be removable");
+        runner
+            .stop(process)
+            .expect("empty owned cgroup and exited launcher must clean up");
+        fs::remove_file(cgroup.join("cgroup.procs"))
+            .expect("fake cgroup task file must be removable");
+        fs::remove_dir(cgroup).expect("fake cgroup directory must be removable");
+    }
+
+    #[test]
+    fn owned_process_start_rejects_a_fake_cgroup_before_launch() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock must be after the Unix epoch")
+            .as_nanos();
+        let cgroup = std::env::temp_dir().join(format!(
+            "firecracker-runtime-non-cgroup-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&cgroup).expect("fake cgroup directory must be creatable");
+        let mut runner = RealCommandRunner::new();
+
+        assert!(matches!(
+            runner.start_owned(
+                &CommandSpec::new("/bin/sh", ["-c".to_owned(), "exit 0".to_owned()]),
+                &ProcessOwnership {
+                    cgroup_path: cgroup.clone(),
+                    firecracker_executable: PathBuf::from("/bin/sh"),
+                    firecracker_digest: digest_file(Path::new("/bin/sh"))
+                        .expect("test shell must be digestible"),
+                }
+            ),
+            Err(RuntimeError::Command(message)) if message.contains("not on cgroup v2")
+        ));
+        assert!(runner.children.is_empty());
+        fs::remove_dir(cgroup).expect("fake cgroup directory must be removable");
+    }
+
+    #[test]
+    fn owned_process_verification_rejects_exited_launcher_without_firecracker_task() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock must be after the Unix epoch")
+            .as_nanos();
+        let cgroup = std::env::temp_dir().join(format!(
+            "firecracker-runtime-empty-cgroup-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&cgroup).expect("fake cgroup directory must be creatable");
+        fs::write(cgroup.join("cgroup.procs"), b"")
+            .expect("fake cgroup task file must be creatable");
+        let mut runner = RealCommandRunner::new();
+        let process = fake_owned_process(&mut runner, &cgroup, Path::new("/bin/sh"));
+        thread::sleep(Duration::from_millis(20));
+
+        assert!(matches!(
+            runner.verify_running(process),
+            Err(RuntimeError::Command(message))
+                if message.contains("contains no pinned Firecracker task")
+        ));
+        runner
+            .stop(process)
+            .expect("empty owned cgroup and exited launcher must clean up");
+        fs::remove_file(cgroup.join("cgroup.procs"))
+            .expect("fake cgroup task file must be removable");
+        fs::remove_dir(cgroup).expect("fake cgroup directory must be removable");
+    }
+
+    #[test]
+    fn owned_process_stop_does_not_accept_exited_launcher_while_cgroup_task_remains() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock must be after the Unix epoch")
+            .as_nanos();
+        let cgroup = std::env::temp_dir().join(format!(
+            "firecracker-runtime-live-cgroup-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&cgroup).expect("fake cgroup directory must be creatable");
+        fs::write(
+            cgroup.join("cgroup.procs"),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("fake cgroup task file must be creatable");
+        let current_executable = std::env::current_exe().expect("test executable must resolve");
+        let mut runner = RealCommandRunner::new();
+        let process = fake_owned_process(&mut runner, &cgroup, &current_executable);
+        thread::sleep(Duration::from_millis(20));
+
+        assert!(runner.stop(process).is_err());
+        assert!(
+            runner.children.contains_key(&process.pid),
+            "failed cgroup termination must retain ownership for cleanup retry"
+        );
+
+        fs::write(cgroup.join("cgroup.procs"), b"").expect("fake cgroup task must be removable");
+        runner
+            .stop(process)
+            .expect("cleanup must finish only after no live task remains");
+        fs::remove_file(cgroup.join("cgroup.procs"))
+            .expect("fake cgroup task file must be removable");
+        fs::remove_dir(cgroup).expect("fake cgroup directory must be removable");
     }
 }

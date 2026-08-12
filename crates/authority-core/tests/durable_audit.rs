@@ -14,7 +14,7 @@ use authority_core::{
     capability::{AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId},
     durable_audit::{DurableAuditError, DurableAuditLog, DurableAuditView},
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
-    kernel::{CapabilityKernel, EffectCommitError},
+    kernel::{CapabilityKernel, EffectCommitError, EffectExecution},
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     state::{CapabilityGrant, CapabilityState, StaticAuthorityEnvelope, Subject},
@@ -198,6 +198,40 @@ fn durable_wal_preserves_unknown_completion_after_crash_window() {
     assert_eq!(attempts[0].outcome(), AttemptOutcome::Started);
     assert!(attempts[0].receipt().is_none());
     assert_eq!(reopened.next_attempt_sequence(), Some(1));
+
+    let writer = DurableAuditLog::open(&journal.path)
+        .expect("the unresolved journal must remain inspectable by its recovery owner");
+    assert!(matches!(
+        CapabilityKernel::try_new_with_durable_audit(initial_state(), writer),
+        Err(AuditError::UnresolvedRecovery { attempts: 1 })
+    ));
+}
+
+#[test]
+fn durable_kernel_rejects_recovered_commit_unknown() {
+    let journal = TestJournal::new();
+    let backend = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
+    let kernel = CapabilityKernel::try_new_with_durable_audit(initial_state(), backend)
+        .expect("a healthy backend must construct a kernel");
+    let capability_id = issue_root(&kernel);
+
+    let result = kernel.authorize_and_execute_classified(
+        &SubjectId::new("subject"),
+        &capability_id,
+        &request(),
+        |_| EffectExecution::<(), std::convert::Infallible>::CommitUnknown {
+            evidence: b"provider completion was not observable".to_vec(),
+        },
+    );
+    assert!(matches!(result, Err(EffectCommitError::CommitUnknown)));
+    drop(kernel);
+
+    let writer = DurableAuditLog::open(&journal.path)
+        .expect("the commit-unknown journal must remain inspectable by its recovery owner");
+    assert!(matches!(
+        CapabilityKernel::try_new_with_durable_audit(initial_state(), writer),
+        Err(AuditError::UnresolvedRecovery { attempts: 1 })
+    ));
 }
 
 #[test]

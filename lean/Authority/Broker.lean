@@ -27,8 +27,11 @@ inductive BrokerOperationKind where
   | githubMutation
   deriving Repr, DecidableEq
 
-/-- The public body limit shared with `egress_protocol`'s canonical wire. -/
-def maxPublicWireBodyBytes : Nat := 512 * 1024
+/-- The largest public body whose canonical response remains one control frame. -/
+def maxSingleFramePublicBodyBytes : Nat := 512 * 1024
+
+/-- The public body limit shared with `egress_protocol`'s chunked canonical wire. -/
+def maxPublicWireBodyBytes : Nat := 32 * 1024 * 1024
 
 /-- Only public responses have a control-wire body admission ceiling. -/
 def WireAdmissible : BrokerOperationKind → Nat → Prop
@@ -41,6 +44,13 @@ theorem public_wire_admission_boundary :
     WireAdmissible .publicFetch maxPublicWireBodyBytes ∧
       ¬ WireAdmissible .publicFetch (maxPublicWireBodyBytes + 1) := by
   simp [WireAdmissible]
+
+/-- Chunking strictly extends admission beyond the historical single-frame limit. -/
+theorem chunked_public_admission_is_nontrivial :
+    maxSingleFramePublicBodyBytes < maxPublicWireBodyBytes ∧
+      WireAdmissible .publicFetch (maxSingleFramePublicBodyBytes + 1) := by
+  change 524288 < 33554432 ∧ 524289 ≤ 33554432
+  decide
 
 /-- Effect evidence returned through the kernel commit callback. -/
 inductive BrokerLinearizedEffect where

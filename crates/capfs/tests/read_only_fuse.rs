@@ -200,9 +200,8 @@ fn mounted_read_only_view_denies_read_after_revoke() {
     drop(session);
 }
 
-// Requirement: direct I/O must route a write on an already-open descriptor
-// back through capability authorization after revoke. Category: FUSE/security.
-// Risk: critical.
+// Requirement: O_TRUNC, WRITE, and SETATTR(size) must all stay behind their
+// respective authorization checks. Category: FUSE/security. Risk: critical.
 #[test]
 fn mounted_view_denies_write_after_revoke() {
     if !Path::new("/dev/fuse").exists() {
@@ -234,7 +233,7 @@ fn mounted_view_denies_write_after_revoke() {
                 validity,
                 AuthorityBody::File(FileAuthority::new(
                     repository.clone(),
-                    FileEffects::only(FileEffect::WriteData),
+                    FileEffects::from_effects([FileEffect::WriteData, FileEffect::Truncate]),
                     PathPattern::Prefix(CanonicalPath::root()),
                 )),
             ),
@@ -246,7 +245,7 @@ fn mounted_view_denies_write_after_revoke() {
             validity,
             AuthorityBody::File(FileAuthority::new(
                 repository.clone(),
-                FileEffects::only(FileEffect::WriteData),
+                FileEffects::from_effects([FileEffect::WriteData, FileEffect::Truncate]),
                 PathPattern::Exact(
                     CanonicalPath::new(["allowed.txt"]).expect("test path must be canonical"),
                 ),
@@ -269,13 +268,18 @@ fn mounted_view_denies_write_after_revoke() {
 
     let mut file = OpenOptions::new()
         .write(true)
+        .truncate(true)
         .open(mountpoint.path().join("allowed.txt"))
-        .expect("authorized FUSE file must open for writing");
-    file.write_all(b"C")
+        .expect("WriteData and Truncate must authorize a FUSE O_TRUNC open");
+    assert_eq!(
+        fs::read(&backing_file).expect("truncated backing file must remain readable"),
+        b""
+    );
+    file.write_all(b"Capa")
         .expect("authorized FUSE write must succeed");
     assert_eq!(
         fs::read(&backing_file).expect("backing file must remain readable"),
-        b"Capability"
+        b"Capa"
     );
 
     kernel
@@ -286,6 +290,16 @@ fn mounted_view_denies_write_after_revoke() {
             .expect_err("an existing descriptor must reauthorize every write")
             .kind(),
         io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        file.set_len(0)
+            .expect_err("an existing descriptor must reauthorize every size change")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        fs::read(&backing_file).expect("revoked truncation must leave the backing file unchanged"),
+        b"Capa"
     );
 
     drop(file);

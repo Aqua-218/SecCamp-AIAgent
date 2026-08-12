@@ -80,34 +80,27 @@ structure RuntimeConfig where
   namespaces : NamespaceSwitches
   blockedSyscalls : List String
   bootArguments : String
+  deriving DecidableEq
 
 /-- Syscalls that every host seccomp profile must deny. -/
 def requiredBlockedSyscalls : List String :=
   ["bpf", "connect", "mount", "perf_event_open", "ptrace", "setns",
     "socket", "unshare"]
 
-/-- Reduced compatibility payload used by snapshot fingerprinting. -/
+/-- Snapshot compatibility preimage. Retaining the complete configuration makes
+field omission impossible when restore begins consuming another configuration field. -/
 structure FingerprintPayload where
-  firecrackerDigest : Digest
-  kernelDigest : Digest
-  rootfsDigest : Digest
-  verityHashDigest : Digest
-  jailerDigest : Digest
-  seccompDigest : Digest
-  verityRootHash : Digest
-  vsockCid : Nat
+  restoreConfig : RuntimeConfig
   deriving DecidableEq
 
-/-- Exact fields included by the Rust fingerprint implementation. -/
+/-- Exact restore configuration covered by snapshot compatibility. -/
 def RuntimeConfig.fingerprintPayload (config : RuntimeConfig) : FingerprintPayload where
-  firecrackerDigest := config.firecracker.digest
-  kernelDigest := config.kernel.digest
-  rootfsDigest := config.rootfs.digest
-  verityHashDigest := config.verityHash.digest
-  jailerDigest := config.jailer.digest
-  seccompDigest := config.seccompFilter.digest
-  verityRootHash := config.verityRootHash
-  vsockCid := config.vsockCid
+  restoreConfig := config
+
+/-- Fingerprint equality covers every field of the restore configuration. -/
+theorem fingerprintPayload_eq_iff {first second : RuntimeConfig} :
+    first.fingerprintPayload = second.fingerprintPayload ↔ first = second := by
+  simp [RuntimeConfig.fingerprintPayload]
 
 /-- Complete pure configuration validation contract. -/
 structure RuntimeConfig.Valid (config : RuntimeConfig) : Prop where
@@ -143,6 +136,42 @@ structure RuntimeConfig.Valid (config : RuntimeConfig) : Prop where
   requiredSyscallsBlocked : ∀ syscall,
     syscall ∈ requiredBlockedSyscalls → syscall ∈ config.blockedSyscalls
 
+/-- Concrete valid launch configuration used to prove model non-vacuity. -/
+def validRuntimeConfigWitness : RuntimeConfig where
+  firecracker := ⟨⟨true, ["safe"]⟩, ⟨1⟩⟩
+  kernel := ⟨⟨true, ["safe"]⟩, ⟨1⟩⟩
+  rootfs := ⟨⟨true, ["safe"]⟩, ⟨1⟩⟩
+  verityHash := ⟨⟨true, ["safe"]⟩, ⟨1⟩⟩
+  jailer := ⟨⟨true, ["safe"]⟩, ⟨1⟩⟩
+  seccompFilter := ⟨⟨true, ["safe"]⟩, ⟨1⟩⟩
+  apiSocket := ⟨true, ["safe"]⟩
+  workspaceSource := ⟨true, ["source"]⟩
+  workspaceRoot := ⟨true, ["root"]⟩
+  workspaceCloneId := "clone"
+  verityDataDevice := ⟨true, ["safe"]⟩
+  verityHashDevice := ⟨true, ["safe"]⟩
+  verityRootHash := ⟨1⟩
+  mapperName := "mapper"
+  vsockCid := 3
+  vsockSocket := ⟨true, ["safe"]⟩
+  networkDevices := []
+  vcpuCount := 1
+  memoryMib := 1
+  cgroupPath := ⟨true, ["safe"]⟩
+  cgroupMemoryMax := 1
+  cgroupCpuQuota := 1
+  namespaces := ⟨true, true, true, true, true, true⟩
+  blockedSyscalls := requiredBlockedSyscalls
+  bootArguments := ""
+
+/-- The launch-configuration validity predicate has a concrete inhabitant. -/
+theorem validRuntimeConfigWitness_valid : validRuntimeConfigWitness.Valid := by
+  constructor <;>
+    simp [validRuntimeConfigWitness, PinnedArtifact.Valid, RuntimePathValid,
+      SafeName, NamespaceSwitches.Complete, Isolation.HostPath.AtOrBelow,
+      Isolation.HostPath.root] <;>
+    native_decide
+
 /-- Valid launch configuration cannot expose a network device. -/
 theorem RuntimeConfig.Valid.network_disabled {config : RuntimeConfig}
     (valid : config.Valid) : config.networkDevices = [] :=
@@ -160,17 +189,25 @@ theorem RuntimeConfig.Valid.blocks_required_syscall {config : RuntimeConfig}
     syscall ∈ config.blockedSyscalls :=
   valid.requiredSyscallsBlocked syscall required
 
-/-- Fingerprints deliberately omit vCPU count. -/
-theorem fingerprint_unchanged_by_vcpu_count (config : RuntimeConfig) (count : Nat) :
-    ({ config with vcpuCount := count }).fingerprintPayload =
+/-- A changed vCPU count is incompatible with the snapshot. -/
+theorem fingerprint_changed_by_vcpu_count (config : RuntimeConfig) (count : Nat)
+    (different : count ≠ config.vcpuCount) :
+    ({ config with vcpuCount := count }).fingerprintPayload ≠
       config.fingerprintPayload := by
-  rfl
+  intro compatible
+  have configsEqual : { config with vcpuCount := count } = config :=
+    fingerprintPayload_eq_iff.mp compatible
+  exact different (congrArg RuntimeConfig.vcpuCount configsEqual)
 
-/-- Fingerprints also omit the dm-verity mapper selected during launch. -/
-theorem fingerprint_unchanged_by_mapper_name (config : RuntimeConfig) (mapperName : String) :
-    ({ config with mapperName := mapperName }).fingerprintPayload =
+/-- A changed dm-verity mapper is incompatible with the snapshot. -/
+theorem fingerprint_changed_by_mapper_name (config : RuntimeConfig)
+    (mapperName : String) (different : mapperName ≠ config.mapperName) :
+    ({ config with mapperName := mapperName }).fingerprintPayload ≠
       config.fingerprintPayload := by
-  rfl
+  intro compatible
+  have configsEqual : { config with mapperName := mapperName } = config :=
+    fingerprintPayload_eq_iff.mp compatible
+  exact different (congrArg RuntimeConfig.mapperName configsEqual)
 
 /-- Shutdown-relevant configuration retained by a live Rust runtime instance. -/
 structure InstanceBinding where
@@ -201,19 +238,25 @@ theorem InstanceBinding.shutdown_config_closes_owned_mapper
     config.mapperName = binding.mapperName :=
   bound.2
 
-/-- Fingerprint equality alone cannot bind shutdown to the instance-owned mapper. -/
-theorem fingerprint_match_does_not_bind_shutdown_mapper
+/-- Fingerprint equality now binds shutdown to the instance-owned mapper. -/
+theorem fingerprint_match_binds_shutdown_mapper
+    {created shutdown : RuntimeConfig}
+    (compatible : shutdown.fingerprintPayload =
+      (InstanceBinding.fromConfig created).fingerprint) :
+    shutdown.mapperName = (InstanceBinding.fromConfig created).mapperName := by
+  have configsEqual : shutdown = created := by
+    apply fingerprintPayload_eq_iff.mp
+    simpa [InstanceBinding.fromConfig] using compatible
+  simp [InstanceBinding.fromConfig, configsEqual]
+
+/-- The former mapper-substitution counterexample is excluded by compatibility. -/
+theorem changed_mapper_cannot_match_instance_fingerprint
     (config : RuntimeConfig) (otherMapper : String)
     (different : otherMapper ≠ config.mapperName) :
-    ({ config with mapperName := otherMapper }).fingerprintPayload =
-        (InstanceBinding.fromConfig config).fingerprint ∧
-      ¬ (InstanceBinding.fromConfig config).MatchesShutdownConfig
-        { config with mapperName := otherMapper } := by
-  constructor
-  · rfl
-  · intro bound
-    exact different (by simpa [InstanceBinding.MatchesShutdownConfig,
-      InstanceBinding.fromConfig] using bound.2)
+    ({ config with mapperName := otherMapper }).fingerprintPayload ≠
+      (InstanceBinding.fromConfig config).fingerprint := by
+  simpa [InstanceBinding.fromConfig] using
+    fingerprint_changed_by_mapper_name config otherMapper different
 
 /-- Five guest-visible identity domains regenerated after restore. -/
 inductive GuestIdentityKind where
@@ -262,20 +305,40 @@ theorem internal_snapshot_forbidden_empty (config : RuntimeConfig) :
     (createInternalSnapshot config).forbiddenIdentities = [] := by
   rfl
 
-/-- Internal snapshots therefore reduce freshness to intrinsic bundle validity. -/
-theorem internal_snapshot_freshness_check_is_vacuous
-    (config : RuntimeConfig) (bundle : IdentityBundle) :
-    bundle.Valid (createInternalSnapshot config).forbiddenIdentities ↔
-      ((∀ kind, bundle.forKind kind ≠ 0) ∧
-        ∀ first second, bundle.forKind first = bundle.forKind second → first = second) := by
-  simp [IdentityBundle.Valid, createInternalSnapshot]
+/-- Concrete fresh identities witnessing that the identity contract is inhabited. -/
+def freshIdentityWitness : IdentityBundle where
+  vm := 1
+  session := 2
+  request := 3
+  subject := 4
+  capability := 5
+
+/-- The concrete bundle is intrinsically valid for a pre-session snapshot. -/
+theorem freshIdentityWitness_valid (config : RuntimeConfig) :
+    freshIdentityWitness.Valid
+      (createInternalSnapshot config).forbiddenIdentities := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro kind
+    cases kind <;> decide
+  · intro first second equal
+    cases first <;> cases second <;>
+      simp [IdentityBundle.forKind, freshIdentityWitness] at equal ⊢
+  · intro kind
+    simp [createInternalSnapshot]
+
+/-- A copied snapshot identity is rejected, so freshness is not vacuous. -/
+theorem forbidden_identity_counterexample_excluded :
+    ¬ freshIdentityWitness.Valid [freshIdentityWitness.vm] := by
+  intro valid
+  exact valid.2.2 .vm (by simp [IdentityBundle.forKind])
 
 /-- Publicly reachable successful lifecycle phases. -/
 inductive Phase where
   | workloadStopped
   | snapshotted
-  | identityRegenerated
-  | identityInjected
+  | restoredPaused
+  | guestGate
+  | identityAcknowledged
   | running
   | stopped
   deriving Repr, BEq, DecidableEq
@@ -297,8 +360,8 @@ def State.launched (config : RuntimeConfig) : State where
 /-- Reachable phase/identity refinement. -/
 def State.WellFormed (state : State) : Prop :=
   match state.phase with
-  | .workloadStopped | .snapshotted => state.identities = none
-  | .identityRegenerated | .identityInjected | .running =>
+  | .workloadStopped | .snapshotted | .restoredPaused => state.identities = none
+  | .guestGate | .identityAcknowledged | .running =>
       ∃ bundle, state.identities = some bundle ∧
         bundle.Valid state.forbiddenIdentities
   | .stopped => True
@@ -312,18 +375,22 @@ theorem State.launched_wellFormed (config : RuntimeConfig) :
 def State.markSnapshotted (state : State) : State :=
   { state with phase := .snapshotted }
 
-/-- Restore directly into the identity-regenerated gate. -/
-def State.restore (snapshot : Snapshot) (bundle : IdentityBundle) : State where
-  phase := .identityRegenerated
+/-- Restore into a paused guest before any identity can reach the guest gate. -/
+def State.restore (snapshot : Snapshot) : State where
+  phase := .restoredPaused
   fingerprint := snapshot.fingerprint
-  identities := some bundle
+  identities := none
   forbiddenIdentities := snapshot.forbiddenIdentities
 
-/-- Record successful guest identity injection. -/
-def State.markIdentityInjected (state : State) : State :=
-  { state with phase := .identityInjected }
+/-- Install host-generated identities while guest authority remains gated. -/
+def State.markGuestGate (state : State) (bundle : IdentityBundle) : State :=
+  { state with phase := .guestGate, identities := some bundle }
 
-/-- Release workload execution only after identity injection. -/
+/-- Record the guest's acknowledgement of the complete fresh identity bundle. -/
+def State.markIdentityAcknowledged (state : State) : State :=
+  { state with phase := .identityAcknowledged }
+
+/-- Release workload execution only after fresh identity acknowledgement. -/
 def State.markRunning (state : State) : State :=
   { state with phase := .running }
 
@@ -331,15 +398,19 @@ def State.markRunning (state : State) : State :=
 inductive Step : State → State → Prop
   | snapshot {state : State} :
       state.phase = .workloadStopped → Step state state.markSnapshotted
-  | restore {current : State} {snapshot : Snapshot} {bundle : IdentityBundle} :
+  | restore {current : State} {snapshot : Snapshot} :
+      current.phase = .snapshotted →
       snapshot.fingerprint = current.fingerprint →
-      bundle.Valid snapshot.forbiddenIdentities →
-      Step current (State.restore snapshot bundle)
-  | inject {state : State} {bundle : IdentityBundle} :
-      state.phase = .identityRegenerated → state.identities = some bundle →
-      Step state state.markIdentityInjected
+      Step current (State.restore snapshot)
+  | regenerate {state : State} {bundle : IdentityBundle} :
+      state.phase = .restoredPaused →
+      bundle.Valid state.forbiddenIdentities →
+      Step state (state.markGuestGate bundle)
+  | acknowledge {state : State} {bundle : IdentityBundle} :
+      state.phase = .guestGate → state.identities = some bundle →
+      Step state state.markIdentityAcknowledged
   | start {state : State} :
-      state.phase = .identityInjected → Step state state.markRunning
+      state.phase = .identityAcknowledged → Step state state.markRunning
 
 /-- Every accepted lifecycle transition preserves identity refinement. -/
 theorem Step.preserves_wellFormed {before after : State}
@@ -347,9 +418,10 @@ theorem Step.preserves_wellFormed {before after : State}
     after.WellFormed := by
   cases transition with
   | snapshot phase => simpa [State.markSnapshotted, State.WellFormed, phase] using wellFormed
-  | restore fingerprint valid => exact ⟨_, rfl, valid⟩
-  | inject phase identityLookup =>
-      simpa [State.markIdentityInjected, State.WellFormed, phase] using wellFormed
+  | restore phase _ => simp [State.restore, State.WellFormed]
+  | regenerate phase valid => exact ⟨_, rfl, valid⟩
+  | acknowledge phase identityLookup =>
+      simpa [State.markIdentityAcknowledged, State.WellFormed, phase] using wellFormed
   | start phase => simpa [State.markRunning, State.WellFormed, phase] using wellFormed
 
 /-- Running is reachable only with a valid regenerated identity bundle. -/
@@ -358,6 +430,168 @@ theorem State.running_has_fresh_identity {state : State}
     ∃ bundle, state.identities = some bundle ∧
       bundle.Valid state.forbiddenIdentities := by
   simpa [State.WellFormed, running] using wellFormed
+
+/-- Authority is released exactly when the workload-running phase is published. -/
+def State.AuthorityReleased (state : State) : Prop :=
+  state.phase = .running
+
+/-- Fresh identity acknowledgement remains observable after workload release. -/
+def State.FreshIdentityAcknowledged (state : State) : Prop :=
+  (state.phase = .identityAcknowledged ∨ state.phase = .running) ∧
+    ∃ bundle, state.identities = some bundle ∧
+      bundle.Valid state.forbiddenIdentities
+
+/-- A transition that releases authority must start at the acknowledged identity gate. -/
+theorem Step.release_requires_fresh_identity_acknowledgement
+    {before after : State} (transition : Step before after)
+    (wellFormed : before.WellFormed) (released : after.AuthorityReleased) :
+    before.phase = .identityAcknowledged ∧
+      ∃ bundle, before.identities = some bundle ∧
+        bundle.Valid before.forbiddenIdentities := by
+  cases transition with
+  | snapshot phase => simp [State.AuthorityReleased, State.markSnapshotted] at released
+  | restore phase compatible => simp [State.AuthorityReleased, State.restore] at released
+  | regenerate phase valid => simp [State.AuthorityReleased, State.markGuestGate] at released
+  | acknowledge phase identityLookup =>
+      simp [State.AuthorityReleased, State.markIdentityAcknowledged] at released
+  | start phase =>
+      refine ⟨phase, ?_⟩
+      simpa [State.WellFormed, phase] using wellFormed
+
+/-- Finite successful runtime execution. -/
+inductive Steps : State → State → Prop
+  | refl (state : State) : Steps state state
+  | tail {first middle last : State} :
+      Steps first middle → Step middle last → Steps first last
+
+/-- Identity refinement survives every finite successful runtime execution. -/
+theorem Steps.preserves_wellFormed {before after : State}
+    (transitions : Steps before after) (wellFormed : before.WellFormed) :
+    after.WellFormed := by
+  induction transitions with
+  | refl => exact wellFormed
+  | tail _ transition inductionHypothesis =>
+      exact transition.preserves_wellFormed inductionHypothesis
+
+/-- Reachability starts from one concrete launched runtime configuration. -/
+def State.Reachable (config : RuntimeConfig) (state : State) : Prop :=
+  config.Valid ∧ Steps (State.launched config) state
+
+/-- Launch is an inhabited origin for runtime reachability. -/
+theorem State.launched_reachable (config : RuntimeConfig) (valid : config.Valid) :
+    (State.launched config).Reachable config :=
+  ⟨valid, Steps.refl (State.launched config)⟩
+
+/-- Valid launched-origin reachability is concretely nonempty. -/
+theorem State.reachable_nonempty :
+    ∃ state : State, state.Reachable validRuntimeConfigWitness :=
+  ⟨State.launched validRuntimeConfigWitness,
+    State.launched_reachable validRuntimeConfigWitness validRuntimeConfigWitness_valid⟩
+
+/-- Every launched-origin reachable state satisfies identity refinement. -/
+theorem State.Reachable.wellFormed {config : RuntimeConfig} {state : State}
+    (reachable : state.Reachable config) : state.WellFormed :=
+  reachable.2.preserves_wellFormed (State.launched_wellFormed config)
+
+/-- Workload release in a reachable state carries a fresh acknowledged bundle. -/
+theorem State.Reachable.release_has_fresh_acknowledgement
+    {config : RuntimeConfig} {state : State}
+    (reachable : state.Reachable config) (released : state.AuthorityReleased) :
+    state.FreshIdentityAcknowledged := by
+  refine ⟨Or.inr released, ?_⟩
+  exact State.running_has_fresh_identity reachable.wellFormed released
+
+/-- Reachable authority release has an acknowledged, fresh immediate predecessor. -/
+theorem State.Reachable.no_release_before_fresh_identity_acknowledgement
+    {config : RuntimeConfig} {state : State}
+    (reachable : state.Reachable config) (released : state.AuthorityReleased) :
+    ∃ acknowledged,
+      Steps (State.launched config) acknowledged ∧
+      acknowledged.phase = .identityAcknowledged ∧
+      (∃ bundle, acknowledged.identities = some bundle ∧
+        bundle.Valid acknowledged.forbiddenIdentities) ∧
+      Step acknowledged state := by
+  cases reachable.2 with
+  | refl => simp [State.AuthorityReleased, State.launched] at released
+  | tail preceding transition =>
+      have wellFormed := preceding.preserves_wellFormed
+        (State.launched_wellFormed config)
+      have gate := transition.release_requires_fresh_identity_acknowledgement
+        wellFormed released
+      exact ⟨_, preceding, gate.1, gate.2, transition⟩
+
+/-- A restore-shaped result can only follow the snapshot gate. -/
+theorem Step.restored_paused_requires_snapshot_gate
+    {before after : State} (transition : Step before after)
+    (restored : after.phase = .restoredPaused) :
+    before.phase = .snapshotted := by
+  cases transition with
+  | snapshot phase => simp [State.markSnapshotted] at restored
+  | restore phase compatible => exact phase
+  | regenerate phase valid => simp [State.markGuestGate] at restored
+  | acknowledge phase identityLookup =>
+      simp [State.markIdentityAcknowledged] at restored
+  | start phase => simp [State.markRunning] at restored
+
+/-- Restore cannot bypass the snapshot gate from a running workload. -/
+theorem restore_from_running_counterexample_excluded
+    {current : State} (snapshot : Snapshot)
+    (running : current.phase = .running) :
+    ¬ Step current (State.restore snapshot) := by
+  intro transition
+  have snapshotted := transition.restored_paused_requires_snapshot_gate (by rfl)
+  rw [running] at snapshotted
+  contradiction
+
+/-- The complete restore/acknowledge/release path is constructively reachable. -/
+theorem State.running_constructively_reachable
+    (config : RuntimeConfig) (valid : config.Valid) :
+    ∃ state : State, state.Reachable config ∧ state.AuthorityReleased ∧
+      state.FreshIdentityAcknowledged := by
+  let launched := State.launched config
+  let snapshotted := launched.markSnapshotted
+  let snapshot := createInternalSnapshot config
+  let restored := State.restore snapshot
+  let gated := restored.markGuestGate freshIdentityWitness
+  let acknowledged := gated.markIdentityAcknowledged
+  let running := acknowledged.markRunning
+  have snapshotStep : Step launched snapshotted := by
+    exact Step.snapshot rfl
+  have restoreStep : Step snapshotted restored := by
+    apply Step.restore
+    · rfl
+    · rfl
+  have regenerateStep : Step restored gated := by
+    apply Step.regenerate
+    · rfl
+    · simpa [restored, snapshot, State.restore] using
+        freshIdentityWitness_valid config
+  have acknowledgeStep : Step gated acknowledged := by
+    exact Step.acknowledge rfl rfl
+  have startStep : Step acknowledged running := by
+    exact Step.start rfl
+  have launchedSteps : Steps launched snapshotted :=
+    Steps.tail (Steps.refl launched) snapshotStep
+  have restoredSteps : Steps launched restored :=
+    Steps.tail launchedSteps restoreStep
+  have gatedSteps : Steps launched gated :=
+    Steps.tail restoredSteps regenerateStep
+  have acknowledgedSteps : Steps launched acknowledged :=
+    Steps.tail gatedSteps acknowledgeStep
+  have runningSteps : Steps launched running :=
+    Steps.tail acknowledgedSteps startStep
+  have reachable : running.Reachable config := by
+    exact ⟨valid, runningSteps⟩
+  exact ⟨running, reachable, rfl,
+    reachable.release_has_fresh_acknowledgement rfl⟩
+
+/-- The safety theorem applies to an actual reachable workload release. -/
+theorem State.running_reachable_nonempty :
+    ∃ state : State,
+      state.Reachable validRuntimeConfigWitness ∧
+      state.AuthorityReleased ∧ state.FreshIdentityAcknowledged :=
+  State.running_constructively_reachable validRuntimeConfigWitness
+    validRuntimeConfigWitness_valid
 
 /-- Retryable shutdown resource state. -/
 structure CleanupState where
@@ -476,41 +710,6 @@ theorem CleanupState.removed_implies_dependencies {state : CleanupState}
     state.processStopped = true ∧ state.verityOpened = false :=
   safe removed
 
-/-- Observable success/failure results of Rust's best-effort rollback calls. -/
-structure RollbackResults where
-  processStopSucceeded : Bool
-  verityCloseSucceeded : Bool
-  workspaceRemoveSucceeded : Bool
-  deriving DecidableEq
-
-/-- Rust rollback attempts all owned resources even after process-stop failure. -/
-def CleanupState.rollbackAttempt (state : CleanupState)
-    (results : RollbackResults) : CleanupState where
-  processStopped := state.processStopped || results.processStopSucceeded
-  verityOpened := state.verityOpened && !results.verityCloseSucceeded
-  workspaceRemoved := state.workspaceRemoved || results.workspaceRemoveSucceeded
-
-/-- Concrete failing-stop/successful-dependency rollback outcome. -/
-def unsafeRollbackResults : RollbackResults where
-  processStopSucceeded := false
-  verityCloseSucceeded := true
-  workspaceRemoveSucceeded := true
-
-/-- Current Rust rollback can remove backing resources while the process remains live. -/
-theorem rollback_stop_failure_can_violate_dependency_safety :
-    ¬ (CleanupState.live.rollbackAttempt unsafeRollbackResults).Safe := by
-  intro safe
-  have dependencies := safe (by rfl)
-  simp [CleanupState.live, CleanupState.rollbackAttempt, unsafeRollbackResults] at dependencies
-
-/-- Dependency-gated shutdown and best-effort rollback are distinct contracts. -/
-theorem unsafe_rollback_is_not_a_cleanup_step :
-    ¬ CleanupStep CleanupState.live
-      (CleanupState.live.rollbackAttempt unsafeRollbackResults) := by
-  intro transition
-  have violatesSafety := rollback_stop_failure_can_violate_dependency_safety
-  exact violatesSafety (transition.preserves_safety CleanupState.live_safe)
-
 /-- Runtime lifecycle composed with the retryable, dependency-gated cleanup state. -/
 structure ManagedState where
   core : State
@@ -544,7 +743,7 @@ theorem ManagedState.launched_wellFormed (config : RuntimeConfig) :
 theorem Step.after_ne_stopped {before after : State} (transition : Step before after) :
     after.phase ≠ .stopped := by
   cases transition <;> simp [State.markSnapshotted, State.restore,
-    State.markIdentityInjected, State.markRunning]
+    State.markGuestGate, State.markIdentityAcknowledged, State.markRunning]
 
 /-- Same-instance lifecycle steps, cleanup commits, and the terminal shutdown gate.
 Rust restore returns a new instance rather than reviving a stopped one. -/

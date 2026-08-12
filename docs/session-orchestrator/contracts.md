@@ -23,9 +23,9 @@
 
 Firecracker snapshot は session initialization より前に停止していなければならない。VM ID、Broker session ID、request ID、subject ID、capability ID、credential、user workspace を含めてはならない。restore adapter が session-scoped identity を見つけた場合は `SnapshotDescriptor::with_inherited_ids` で報告し、orchestrator は backend 呼び出し前に startup を拒否する。
 
-`OsEntropy` は host OS の random source を読む。別の `CryptographicRandom` を使う production host は CSPRNG でなければならない。orchestrator の process 内 ledger は、失敗した startup を含め、全 identity domain で同一 128-bit value の再利用を拒否する。これは snapshot からの identity 複製と accidental reuse を防ぐが、複数 supervisor process や process restart をまたぐ durable storage の代替ではない。
+`OsEntropy` は host OS の random source を読む。別の `CryptographicRandom` を使う production host は CSPRNG でなければならない。ledger は、失敗した startup を含め、全 identity domain で同一 128-bit value の再利用を拒否する。
 
-したがって supervisor は、process restart と snapshot restore をまたいで同じ no-reuse domain を永続化または調整しなければならない。process-local ledger が失われる場合は、外部 allocator が同じ不変条件を満たすことを確認してから新しい orchestrator を構築する。
+production supervisor は `SessionOrchestrator::new_durable` を使い、restart と snapshot restore をまたいで同じ ledger file を保持する。exclusive lock の取得、全 record の version/checksum 検証、identity batch の append と `sync_data` が成功するまで backend effect を始めてはならない。複数 host で一つの no-reuse domain を共有する場合だけ、この file ownership と同等以上の外部調整が別途必要になる。
 
 ## workspace adapter
 

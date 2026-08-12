@@ -1,56 +1,43 @@
+<!-- doc-type: index -->
+
 # Firecracker runtime
 
 [ドキュメント一覧](../README.md) / Firecracker runtime
 
 > **対象読者:** Firecracker 統合担当者、ホスト隔離のレビュー担当者、運用担当者
 
-`firecracker-runtime` は Phase 6 のホスト側 runtime 境界である。pinned artifact の検証、dm-verity の準備、clone ごとの workspace 準備、jailer 起動、Firecracker API の順序制御、snapshot lifecycle、restore 後の identity 注入と workload gate を担当する。
+`firecracker-runtime` はホスト側から 1 台の microVM を起動・snapshot・restore・停止するための crate である。artifact の digest 固定、dm-verity mapping、jailer 経由の起動、Firecracker API の呼び出し順序、restore 後の identity 再生成までを所有する。
 
-この crate は Firecracker、jailer、guest kernel、rootfs、dm-verity、guest supervisor の実装そのものではない。`CommandRunner`、`FileSystem`、`ApiClient`、`IdentitySource` の境界を持ち、production adapter と test double を差し替えられる構造である。
+VM の中で workload を閉じ込める部分は [runtime-isolation](../runtime-isolation/README.md)、複数 backend をまたぐ session の lifecycle は [session-orchestrator](../session-orchestrator/README.md) の担当。この crate は「VM が 1 台立ち上がって、正しい identity を持っている」ところまでを見る。
 
-## 実装済みの不変条件
+## この crate が絶対にやらないこと
 
-- Firecracker、jailer、kernel、rootfs、dm-verity hash image、seccomp profile は、workspace や process の副作用より前に読み取り、SHA-256 を検証する。
-- absolute path の `latest` component、parent traversal、all-zero digest を拒否する。mutable な artifact channel は入力にできない。
-- dm-verity の data device と hash device は pinned descriptor と一致しなければならない。launch は read-only mapping を開き、mapped device を read-only root drive として送る。
-- launch ごとに `clone_root` と `clone_id` から workspace path を導出し、既存 destination を拒否する。production `RealFileSystem` は copy 中に symlink と未対応の special file を拒否する。
-- standard profile は private user、PID、mount、network、IPC、UTS namespace、non-zero cgroup v2 memory/CPU limit、隔離設計で要求する seccomp deny set を必須にする。
-- `network_devices` は空でなければならない。host 通信に設定される Firecracker device は virtio-vsock だけである。
+- guest に network device を与えない。`RuntimeConfig::validate` は `network_devices` が空でなければ `NetworkDeviceForbidden` を返す。外部通信は vsock 越しの [Host Egress Broker](../egress-broker/README.md) 経由だけ。
+- digest が一致しない artifact で起動しない。検査は side effect の前。
+- fingerprint が違う snapshot を restore しない。
+- identity を再生成せずに workload を走らせない。restore 直後の状態は `IdentityRegenerated` であって `Running` ではない。
 
-## lifecycle
+## 実装範囲と検証境界
 
-`Runtime::launch` は artifact を検証し、workspace を clone し、dm-verity を開き、jailer を起動し、machine/boot/rootfs/workspace/vsock を設定して Firecracker の `InstanceStart` を要求する。この method の戻り値は `RuntimeState::WorkloadStopped` であり、workload start action は送らない。
+lifecycle、API 呼び出し順序、rollback、identity gate は fake command runner / filesystem / API client を使う test で検証済み。`UnixApiClient` は本物の HTTP/1.x を local Unix socket 上で話す test まで通っている。
 
-`Runtime::create_snapshot` は workload が停止した pre-session state だけを受け付ける。snapshot には artifact fingerprint と、source state に存在した identity が記録される。`Runtime::restore` は同じ fingerprint を要求し、snapshot load 後も workload を停止したままにする。restore は新しい VM、session、request、subject、capability の 128-bit identity を生成し、snapshot metadata にある identity の再生成や重複を拒否する。
+一方、実 Firecracker binary、実 jailer、実 dm-verity mapping、実 VM の起動は一度も実行していない。詳細は[検証対応表](verification.md)。
 
-`inject_identity` は guest control API を呼び、成功したときだけ `IdentityInjected` へ遷移する。`start_workload` は `IdentityInjected` からのみ呼べる。control API が失敗した場合、instance state は変わらない。
+## 文書一覧
 
-launch、restore、configuration failure には逆順の rollback がある。process 起動後の failure では process を止め、dm-verity mapping を閉じ、clone workspace を削除する。cleanup error は元の error とともに返し、捨てない。通常の `shutdown` も process 停止、verity close、workspace removal を試み、いずれかが失敗すれば `RuntimeError::Cleanup` を返して `Stopped` に遷移しない。
-
-## production adapter と契約境界
-
-`RealCommandRunner` は `std::process::Command` で `veritysetup` と jailer を実行する。`RealFileSystem` は symlink を追従せずに artifact を読み、workspace を copy する。`UnixApiClient` は Unix-domain socket 上で bounded HTTP/1.1 request を送り、malformed response と non-2xx status を runtime 境界で拒否する。`SystemIdentitySource` は restore 後に `/dev/urandom` から新しい 128-bit 値を読む。
-
-呼び出し側は Firecracker API socket 用と guest supervisor control socket 用に別々の `UnixApiClient` を構築し、両方を `Runtime::new` へ渡す。この crate は credential を作らず、guest に network interface も作らない。
-
-## 検証状態
-
-contract test は valid launch ordering、digest mismatch、`latest` 拒否、virtio-net 拒否、API error、reverse rollback、stale/duplicate identity、workload gate を検証する。`UnixApiClient` については local Unix socket の HTTP exchange も検証する。
-
-一方、これらは test double と local Unix socket による検証である。実 Firecracker process、実 jailer namespace/cgroup、実 dm-verity device、guest kernel、guest supervisor、snapshot/restore、VM escape 境界は実行していない。したがって、この crate の状態を VM 実起動済み、または full isolation 完成済みとは扱わない。
-
-repository root からの focused test は次のとおりである。
-
-```bash
-cargo fmt --manifest-path crates/firecracker-runtime/Cargo.toml -- --check
-cargo test --manifest-path crates/firecracker-runtime/Cargo.toml
-cargo clippy --manifest-path crates/firecracker-runtime/Cargo.toml --all-targets -- -D warnings
-```
+| 文書 | 対象ソース | 内容 |
+|---|---|---|
+| [artifact の固定と fingerprint](pinned-artifacts.md) | [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) | SHA-256 による artifact 固定、dm-verity との結び付け、config fingerprint |
+| [起動の順序と rollback](launch-sequence.md) | [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) | workspace clone から `InstanceStart` までの順序、失敗時の巻き戻し |
+| [snapshot と identity gate](snapshot-and-identity.md) | [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) | 8 状態の lifecycle、restore 後の identity 再生成、workload の解放条件 |
+| [workspace clone](workspace-clone.md) | [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) | symlink / hard link を許さない再帰 copy、上限、所有権 marker |
+| [ホスト隔離プロファイル](host-isolation.md) | [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) | jailer の namespace、cgroup、seccomp の必須 deny |
+| [検証対応表](verification.md) | — | fake で見た範囲と、実機で未確認の範囲 |
 
 ## 関連
 
 - [隔離基盤の設計](../design/runtime-isolation.md)
-- [session orchestrator](../session-orchestrator/README.md)
-- [supervisor adapter](../supervisor/README.md)
-- [実装順序](../design/implementation-plan.md)
-- [検証戦略](../design/verification.md)
+- [runtime-isolation](../runtime-isolation/README.md)
+- [Session orchestrator](../session-orchestrator/README.md)
+- [Host Egress Broker](../egress-broker/README.md)
+- [用語集](../glossary.md)

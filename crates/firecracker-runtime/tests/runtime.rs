@@ -6,12 +6,12 @@
 //! remain independent of the implementation's private data structures.
 
 use firecracker_runtime::{
-    ApiClient, ApiRequest, ApiResponse, CgroupConfig, CommandOutput, CommandRunner, CommandSpec,
-    DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, IdentityBundle, IdentityId,
-    IdentitySource, MAX_COMMAND_OUTPUT_BYTES, MAX_HTTP_BODY_BYTES, MAX_WORKSPACE_BYTES,
-    MAX_WORKSPACE_DEPTH, NamespaceConfig, PinnedArtifact, ProcessHandle, RealCommandRunner,
-    RealFileSystem, Runtime, RuntimeConfig, RuntimeError, RuntimeState, SeccompConfig, Snapshot,
-    VsockConfig, WorkspaceConfig, sha256,
+    ApiClient, ApiRequest, ApiResponse, CgroupConfig, CgroupVersion, CommandOutput, CommandRunner,
+    CommandSpec, DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, IdentityBundle,
+    IdentityId, IdentitySource, JailerConfig, MAX_COMMAND_OUTPUT_BYTES, MAX_HTTP_BODY_BYTES,
+    MAX_WORKSPACE_BYTES, MAX_WORKSPACE_DEPTH, NamespaceConfig, PinnedArtifact, ProcessHandle,
+    ProcessOwnership, RealCommandRunner, RealFileSystem, Runtime, RuntimeConfig, RuntimeError,
+    RuntimeState, SeccompConfig, Snapshot, VsockConfig, WorkspaceConfig, sha256,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -25,6 +25,12 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type Events = Rc<RefCell<Vec<String>>>;
+
+const JAIL_ROOT: &str = "/srv/jailer/firecracker/clone-a/root";
+const SNAPSHOT_STATE_PATH: &str = "/srv/jailer/firecracker/clone-a/root/snapshots/state";
+const SNAPSHOT_MEMORY_PATH: &str = "/srv/jailer/firecracker/clone-a/root/snapshots/memory";
+const SNAPSHOT_STATE_BYTES: &[u8] = b"snapshot-state";
+const SNAPSHOT_MEMORY_BYTES: &[u8] = b"snapshot-memory";
 
 static UNIX_API_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -86,6 +92,18 @@ impl CommandRunner for MockRunner {
         let process = ProcessHandle { pid: self.next_pid };
         self.next_pid += 1;
         Ok(process)
+    }
+
+    fn start_owned(
+        &mut self,
+        command: &CommandSpec,
+        _ownership: &ProcessOwnership,
+    ) -> Result<ProcessHandle, RuntimeError> {
+        self.start(command)
+    }
+
+    fn verify_running(&mut self, _process: ProcessHandle) -> Result<(), RuntimeError> {
+        Ok(())
     }
 
     fn stop(&mut self, process: ProcessHandle) -> Result<(), RuntimeError> {
@@ -164,6 +182,20 @@ impl ApiClient for MockApi {
             body: String::new(),
         })
     }
+
+    fn verify_restore_resources(
+        &mut self,
+        workspace_path: &Path,
+        vsock_uds_path: &Path,
+        guest_cid: u32,
+    ) -> Result<(), RuntimeError> {
+        self.events.borrow_mut().push(format!(
+            "api:/vm/config:verify:{}:{}:{guest_cid}",
+            workspace_path.display(),
+            vsock_uds_path.display()
+        ));
+        Ok(())
+    }
 }
 
 struct MockIdentitySource {
@@ -201,10 +233,17 @@ fn artifact(path: &str, label: &str) -> PinnedArtifact {
 }
 
 fn config() -> RuntimeConfig {
+    let jail_root = Path::new(JAIL_ROOT);
     let rootfs = artifact("/artifacts/rootfs.img", "rootfs");
     RuntimeConfig {
         firecracker: artifact("/artifacts/firecracker", "firecracker"),
-        kernel: artifact("/artifacts/vmlinux-6.1", "kernel"),
+        kernel: artifact(
+            jail_root
+                .join("artifacts/vmlinux-6.1")
+                .to_str()
+                .expect("fixture path is UTF-8"),
+            "kernel",
+        ),
         rootfs: rootfs.clone(),
         verity_hash: artifact("/artifacts/rootfs.verity", "verity-hash"),
         dm_verity: DmVerityConfig {
@@ -212,30 +251,44 @@ fn config() -> RuntimeConfig {
             hash_device: PathBuf::from("/artifacts/rootfs.verity"),
             mapper_name: "rootfs-verity".to_owned(),
             root_hash: sha256(b"verity-root-hash"),
+            jailed_device_path: jail_root.join("dev/rootfs"),
         },
         workspace: WorkspaceConfig {
             source: PathBuf::from("/workspace/source"),
-            clone_root: PathBuf::from("/workspace/clones"),
+            clone_root: jail_root.join("workspace"),
             clone_id: "clone-a".to_owned(),
         },
         jailer: artifact("/artifacts/jailer", "jailer"),
-        api_socket: PathBuf::from("/run/luna/firecracker.sock"),
+        jailer_config: JailerConfig {
+            uid: 1000,
+            gid: 1000,
+            chroot_base_dir: PathBuf::from("/srv/jailer"),
+            cgroup_version: CgroupVersion::V2,
+        },
+        api_socket: jail_root.join("run/firecracker.sock"),
         isolation: HostIsolationConfig {
             namespaces: NamespaceConfig {
-                user: true,
+                user: false,
                 pid: true,
                 mount: true,
-                network: true,
-                ipc: true,
-                uts: true,
+                network: false,
+                ipc: false,
+                uts: false,
             },
             cgroup: CgroupConfig {
                 path: PathBuf::from("/sys/fs/cgroup/luna/clone-a"),
                 memory_max_bytes: 256 * 1024 * 1024,
                 cpu_quota_micros: 100_000,
+                cpu_period_micros: 100_000,
             },
             seccomp: SeccompConfig {
-                filter: artifact("/artifacts/seccomp.json", "seccomp"),
+                filter: artifact(
+                    jail_root
+                        .join("artifacts/seccomp.json")
+                        .to_str()
+                        .expect("fixture path is UTF-8"),
+                    "seccomp",
+                ),
                 blocked_syscalls: [
                     "bpf",
                     "connect",
@@ -253,7 +306,7 @@ fn config() -> RuntimeConfig {
         },
         vsock: VsockConfig {
             guest_cid: 42,
-            uds_path: PathBuf::from("/run/luna/vsock.sock"),
+            uds_path: jail_root.join("run/vsock.sock"),
         },
         network_devices: Vec::new(),
         vcpu_count: 2,
@@ -271,6 +324,8 @@ fn filesystem_for(config: &RuntimeConfig, events: Events) -> MockFileSystem {
         (&config.verity_hash.path, b"verity-hash".as_slice()),
         (&config.jailer.path, b"jailer".as_slice()),
         (&config.isolation.seccomp.filter.path, b"seccomp".as_slice()),
+        (&PathBuf::from(SNAPSHOT_STATE_PATH), SNAPSHOT_STATE_BYTES),
+        (&PathBuf::from(SNAPSHOT_MEMORY_PATH), SNAPSHOT_MEMORY_BYTES),
     ] {
         artifacts.insert(path.clone(), bytes.to_vec());
     }
@@ -354,7 +409,12 @@ fn launch_valid_profile_configures_verity_vsock_and_jailer_without_network() {
     let events = events.borrow();
     assert!(events[0].starts_with("filesystem:clone:"));
     assert!(events[1].starts_with("command:run:veritysetup open --readonly"));
-    assert!(events[2].contains("--new-user-ns"));
+    assert!(events[2].contains("--new-pid-ns"));
+    assert!(events[2].contains("--uid 1000 --gid 1000 --cgroup-version 2"));
+    assert!(events[2].contains("--cgroup memory.max=268435456"));
+    assert!(events[2].contains("--cgroup cpu.max=100000 100000"));
+    assert!(events[2].contains("--chroot-base-dir /srv/jailer"));
+    assert!(!events[2].contains("--new-user-ns"));
     assert!(events.iter().any(|event| event.starts_with("api:/vsock:")));
     assert!(
         events
@@ -362,11 +422,7 @@ fn launch_valid_profile_configures_verity_vsock_and_jailer_without_network() {
             .all(|event| !event.contains("network-interface"))
     );
     assert!(events.iter().all(|event| !event.contains("eth0")));
-    assert!(
-        events
-            .iter()
-            .any(|event| event.contains("/dev/mapper/rootfs-verity"))
-    );
+    assert!(events.iter().any(|event| event.contains("/dev/rootfs")));
 }
 
 #[test]
@@ -482,7 +538,7 @@ fn restore_regenerates_all_identities_and_gates_workload_until_injection() {
     let (mut runtime, events) = runtime(&config, std::iter::empty());
     let mut first = runtime.launch(&config).expect("baseline VM must launch");
     let snapshot = runtime
-        .create_snapshot(&mut first, "/snapshots/state", "/snapshots/memory")
+        .create_snapshot(&mut first, SNAPSHOT_STATE_PATH, SNAPSHOT_MEMORY_PATH)
         .expect("pre-session snapshot must succeed");
     runtime
         .shutdown(&mut first, &config)
@@ -534,10 +590,12 @@ fn restore_regenerates_all_identities_and_gates_workload_until_injection() {
 #[test]
 fn restore_accepts_exact_host_allocated_identities() {
     let config = config();
-    let snapshot = Snapshot::new(
-        "/snapshots/state",
-        "/snapshots/memory",
+    let raw_snapshot = Snapshot::new(
+        SNAPSHOT_STATE_PATH,
+        SNAPSHOT_MEMORY_PATH,
         config.snapshot_fingerprint(),
+        sha256(SNAPSHOT_STATE_BYTES),
+        sha256(SNAPSHOT_MEMORY_BYTES),
         Vec::new(),
     );
     let bundle = IdentityBundle::new(
@@ -549,6 +607,9 @@ fn restore_accepts_exact_host_allocated_identities() {
     )
     .expect("host identity bundle must validate");
     let (mut runtime, events) = runtime(&config, std::iter::empty());
+    let snapshot = runtime
+        .verify_snapshot(&config, raw_snapshot)
+        .expect("fixture snapshot provenance must verify");
     let restored = runtime
         .restore_with_identities(&config, &snapshot, bundle.clone())
         .expect("host identities must be authoritative during restore");
@@ -565,10 +626,12 @@ fn restore_accepts_exact_host_allocated_identities() {
 fn restore_rejects_host_identity_reuse_before_side_effects() {
     let config = config();
     let reused = identity(201);
-    let snapshot = Snapshot::new(
-        "/snapshots/state",
-        "/snapshots/memory",
+    let raw_snapshot = Snapshot::new(
+        SNAPSHOT_STATE_PATH,
+        SNAPSHOT_MEMORY_PATH,
         config.snapshot_fingerprint(),
+        sha256(SNAPSHOT_STATE_BYTES),
+        sha256(SNAPSHOT_MEMORY_BYTES),
         vec![reused],
     );
     let bundle = IdentityBundle {
@@ -579,6 +642,9 @@ fn restore_rejects_host_identity_reuse_before_side_effects() {
         capability_id: identity(205),
     };
     let (mut runtime, events) = runtime(&config, std::iter::empty());
+    let snapshot = runtime
+        .verify_snapshot(&config, raw_snapshot)
+        .expect("fixture snapshot provenance must verify");
     assert!(matches!(
         runtime.restore_with_identities(&config, &snapshot, bundle),
         Err(RuntimeError::StaleIdentity(_))
@@ -592,13 +658,18 @@ fn stale_identity_is_rejected_and_restored_process_is_rolled_back() {
     let config = config();
     let stale = IdentityId::from_hex("00000000000000000000000000000001")
         .expect("test identity must be valid");
-    let snapshot = Snapshot::new(
-        "/snapshots/state",
-        "/snapshots/memory",
+    let raw_snapshot = Snapshot::new(
+        SNAPSHOT_STATE_PATH,
+        SNAPSHOT_MEMORY_PATH,
         config.snapshot_fingerprint(),
+        sha256(SNAPSHOT_STATE_BYTES),
+        sha256(SNAPSHOT_MEMORY_BYTES),
         vec![stale],
     );
     let (mut runtime, events) = runtime(&config, std::iter::empty());
+    let snapshot = runtime
+        .verify_snapshot(&config, raw_snapshot)
+        .expect("fixture snapshot provenance must verify");
     let error = runtime
         .restore(&config, &snapshot)
         .expect_err("stale identity must fail closed");
@@ -641,12 +712,17 @@ fn duplicate_identity_generation_is_rejected_as_stale() {
         MockApi::new(Rc::clone(&events), std::iter::empty()),
         MockIdentitySource::from_ids([duplicate; 5]),
     );
-    let snapshot = Snapshot::new(
-        "/snapshots/state",
-        "/snapshots/memory",
+    let raw_snapshot = Snapshot::new(
+        SNAPSHOT_STATE_PATH,
+        SNAPSHOT_MEMORY_PATH,
         config.snapshot_fingerprint(),
+        sha256(SNAPSHOT_STATE_BYTES),
+        sha256(SNAPSHOT_MEMORY_BYTES),
         Vec::new(),
     );
+    let snapshot = runtime
+        .verify_snapshot(&config, raw_snapshot)
+        .expect("fixture snapshot provenance must verify");
     let error = runtime
         .restore(&config, &snapshot)
         .expect_err("duplicate IDs must fail closed");

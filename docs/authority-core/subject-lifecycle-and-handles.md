@@ -92,6 +92,9 @@ Authority core の `finish_subject_close` は、その subject に live handle �
 
 現在実装済みなのは、lifecycle transition、held Capability の shutdown revoke、epoch 更新、typed handle identity、subject/object binding、live count、close の冪等性、ID 非再利用、Closed 前の live-handle 検査である。
 
+Authority core 内で残るのは adapter 側の接続である。kernel の Loom model は open-handle 登録と
+shutdown の順序、および child effect と direct / ancestor の複数 revoke を検査する。
+
 次は adapter 側に残る。
 
 - backing `open` の成功と `register_open_handle` を失敗処理込みで接続すること。登録が拒否された場合は、adapter が開いた fd を必ず閉じる。
@@ -100,7 +103,8 @@ Authority core の `finish_subject_close` は、その subject に live handle �
 - cgroup stop、fd close、unmount を実行してから `finish_subject_close` を呼ぶ supervisor orchestration。
 - open handle、rename、unlink、revoke を組み合わせた capfs の Loom・実 mount test。
 
-したがって、現在の model は stale handle ID の再束縛と Authority core 内の不正 transition を防ぐが、OS fd や FUSE lifecycle との接続まで完成したという意味ではない。
+したがって、現在の model は stale handle ID の再束縛、Authority core 内の不正 transition、登録と
+shutdown の競合を防ぐが、OS fd や FUSE lifecycle との接続まで完成したという意味ではない。
 
 ## どう検証しているか
 

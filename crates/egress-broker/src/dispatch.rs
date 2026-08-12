@@ -285,9 +285,14 @@ where
                     Some(CachedOutcome::RetryableBudget(operation)) => {
                         let (response, cached) =
                             self.dispatch_new(envelope.request(), &operation, context);
-                        if let Some(cached) = cached {
-                            self.outcomes.insert(envelope.request(), cached);
-                        }
+                        // The same write-back as the `New` arm below. Storing
+                        // only when `dispatch_new` returns `Some` would leave
+                        // the entry `RetryableBudget` forever, so every later
+                        // exact retry would re-enter the adapter.
+                        self.outcomes.insert(
+                            envelope.request(),
+                            cached.unwrap_or_else(|| CachedOutcome::Final(response.clone())),
+                        );
                         Ok(response)
                     }
                     None => Err(DispatchError::MissingCachedOutcome(envelope.request())),
@@ -900,5 +905,18 @@ mod tests {
             BrokerOutcome::Succeeded(BrokerEffect::Public(_))
         ));
         assert_eq!(dispatcher.budget_usage().started_requests(), 2);
+
+        // The retry that resolved the transient denial must replace the cached
+        // `RetryableBudget` entry. Otherwise every later exact retry re-enters
+        // the adapter, which for `CreatePullRequest` is one pull request each.
+        let third = dispatcher
+            .dispatch_frame(&encoded, &context)
+            .expect("a settled retry should be served from the cache");
+        assert_eq!(third.outcome, second.outcome);
+        assert_eq!(
+            dispatcher.budget_usage().started_requests(),
+            2,
+            "a settled outcome must not start another request"
+        );
     }
 }

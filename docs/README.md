@@ -22,6 +22,7 @@
 | 文書 | 内容 |
 |---|---|
 | [設計書](design/README.md) | 入口。何を守るのか、選んだ形、文書の読み方 |
+| [全体アーキテクチャ](design/architecture.md) | 8 crate の実行時配置、境界を越える 5 つの手段、まだ繋がっていない線 |
 | [脅威モデル](design/threat-model.md) | 想定する攻撃者と、防ぐ対象 |
 | [Capability モデル](design/capability-model.md) | 権限の表現と委譲 |
 | [状態機械と revoke](design/state-and-revocation.md) | 失効がいつから効くか |

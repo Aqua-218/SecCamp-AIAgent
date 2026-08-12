@@ -91,6 +91,7 @@ flowchart LR
     isolation --> plan["実装順序"]
     verify --> plan
 
+    click start "architecture.md" "全体アーキテクチャ"
     click threat "threat-model.md" "脅威モデル"
     click caps "capability-model.md" "Capability モデル"
     click state "state-and-revocation.md" "状態機械と revoke"
@@ -103,6 +104,7 @@ flowchart LR
 
 | 文書 | そこで決めること |
 |---|---|
+| [全体アーキテクチャ](architecture.md) | 8 crate がどこで動き、どの線がまだコードでないか |
 | [脅威モデル](threat-model.md) | 誰を信用し、どこまで守るか |
 | [Capability モデル](capability-model.md) | 権限をどう表し、どう狭めるか |
 | [状態機械と revoke](state-and-revocation.md) | 副作用と失効をどう競合させるか |
@@ -143,6 +145,7 @@ flowchart LR
 
 ## 関連
 
+- [全体アーキテクチャ](architecture.md)
 - [脅威モデル](threat-model.md)
 - [Capability モデル](capability-model.md)
 - [状態機械と revoke](state-and-revocation.md)

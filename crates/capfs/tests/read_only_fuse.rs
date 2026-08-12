@@ -33,6 +33,7 @@ type MountedDirectoryView = (
     tempfile::TempDir,
     tempfile::TempDir,
     Arc<CapabilityKernel>,
+    SubjectId,
     CapId,
     BackgroundSession,
 );
@@ -99,7 +100,7 @@ fn mount_directory_view() -> MountedDirectoryView {
         Arc::clone(&kernel),
         MountAuthority::new(
             MountInstanceId::new("fuse-directory-integration"),
-            subject,
+            subject.clone(),
             capability.clone(),
             repository,
         ),
@@ -108,7 +109,7 @@ fn mount_directory_view() -> MountedDirectoryView {
     .expect("read-only filesystem must initialize");
     let session = spawn_mount(filesystem, mountpoint.path()).expect("FUSE mount must succeed");
 
-    (backing, mountpoint, kernel, capability, session)
+    (backing, mountpoint, kernel, subject, capability, session)
 }
 
 // Requirement: direct I/O must route a read on an already-open descriptor back
@@ -170,7 +171,7 @@ fn mounted_read_only_view_denies_read_after_revoke() {
         Arc::clone(&kernel),
         MountAuthority::new(
             MountInstanceId::new("fuse-integration"),
-            subject,
+            subject.clone(),
             capability.clone(),
             repository,
         ),
@@ -193,7 +194,7 @@ fn mounted_read_only_view_denies_read_after_revoke() {
     assert_eq!(before_revoke, "capability");
 
     kernel
-        .revoke(&capability)
+        .revoke_held_by(&subject, &capability)
         .expect("test capability must be revocable");
     file.seek(SeekFrom::Start(0))
         .expect("direct-I/O file offset must remain seekable");
@@ -266,7 +267,7 @@ fn mounted_view_denies_write_after_revoke() {
         Arc::clone(&kernel),
         MountAuthority::new(
             MountInstanceId::new("fuse-write-integration"),
-            subject,
+            subject.clone(),
             capability.clone(),
             repository,
         ),
@@ -292,7 +293,7 @@ fn mounted_view_denies_write_after_revoke() {
     );
 
     kernel
-        .revoke(&capability)
+        .revoke_held_by(&subject, &capability)
         .expect("test capability must be revocable");
     assert_eq!(
         file.write_all(b"!")
@@ -379,7 +380,7 @@ fn mounted_view_creates_files_and_directories_with_capability_effects() {
         Arc::clone(&kernel),
         MountAuthority::new(
             MountInstanceId::new("fuse-create-integration"),
-            subject,
+            subject.clone(),
             capability.clone(),
             repository,
         ),
@@ -414,7 +415,7 @@ fn mounted_view_creates_files_and_directories_with_capability_effects() {
     .expect("ListDirectory must authorize opening the parent before revoke");
 
     kernel
-        .revoke(&capability)
+        .revoke_held_by(&subject, &capability)
         .expect("test capability must be revocable");
     assert_eq!(
         mkdirat(&scoped_directory, "revoked-dir", Mode::RWXU)
@@ -495,7 +496,7 @@ fn mounted_view_removes_and_renames_only_with_live_effects() {
         Arc::clone(&kernel),
         MountAuthority::new(
             MountInstanceId::new("fuse-mutation-integration"),
-            subject,
+            subject.clone(),
             capability.clone(),
             repository,
         ),
@@ -523,7 +524,7 @@ fn mounted_view_removes_and_renames_only_with_live_effects() {
     )
     .expect("ListDirectory must authorize opening the parent before revoke");
     kernel
-        .revoke(&capability)
+        .revoke_held_by(&subject, &capability)
         .expect("test capability must be revocable");
     assert_eq!(
         unlinkat(&scoped_directory, "revoked.txt", AtFlags::empty())
@@ -601,7 +602,7 @@ fn mounted_view_authorizes_metadata_changes_and_rechecks_after_revoke() {
         Arc::clone(&kernel),
         MountAuthority::new(
             MountInstanceId::new("fuse-metadata-integration"),
-            subject,
+            subject.clone(),
             capability.clone(),
             repository,
         ),
@@ -625,7 +626,7 @@ fn mounted_view_authorizes_metadata_changes_and_rechecks_after_revoke() {
     );
 
     kernel
-        .revoke(&capability)
+        .revoke_held_by(&subject, &capability)
         .expect("test capability must be revocable");
     assert_eq!(
         file.set_permissions(fs::Permissions::from_mode(0o600))
@@ -654,7 +655,7 @@ fn mounted_directory_view_lists_only_its_authorized_prefix() {
         eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
         return;
     }
-    let (_backing, mountpoint, _kernel, _capability, session) = mount_directory_view();
+    let (_backing, mountpoint, _kernel, _subject, _capability, session) = mount_directory_view();
 
     assert_eq!(
         fs::read_dir(mountpoint.path())
@@ -685,7 +686,7 @@ fn mounted_directory_stream_denies_readdir_after_revoke() {
         eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
         return;
     }
-    let (_backing, mountpoint, kernel, capability, session) = mount_directory_view();
+    let (_backing, mountpoint, kernel, subject, capability, session) = mount_directory_view();
     let directory = open(
         mountpoint.path().join("scoped"),
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -704,7 +705,7 @@ fn mounted_directory_stream_denies_readdir_after_revoke() {
         assert_eq!(first.file_name().to_bytes(), b".");
 
         kernel
-            .revoke(&capability)
+            .revoke_held_by(&subject, &capability)
             .expect("test capability must be revocable");
         assert_eq!(
             entries
@@ -727,7 +728,7 @@ fn mounted_directory_stream_requires_restart_after_namespace_mutation() {
         eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
         return;
     }
-    let (_backing, mountpoint, _kernel, _capability, session) = mount_directory_view();
+    let (_backing, mountpoint, _kernel, _subject, _capability, session) = mount_directory_view();
     let scoped_mount = mountpoint.path().join("scoped");
     let directory = open(
         &scoped_mount,
@@ -877,7 +878,8 @@ fn revoke_after_unmount_reports_no_propagation_failure() {
         return;
     }
 
-    let (_backing, _mountpoint, kernel, first_capability, session) = mount_directory_view();
+    let (_backing, _mountpoint, kernel, subject, first_capability, session) =
+        mount_directory_view();
 
     // A second capability on the same kernel outlives the mount.
     let second_capability = kernel
@@ -896,14 +898,14 @@ fn revoke_after_unmount_reports_no_propagation_failure() {
         .expect("second capability issuance must succeed");
 
     kernel
-        .revoke(&first_capability)
+        .revoke_held_by(&subject, &first_capability)
         .expect("revoking while the mount is live must propagate");
 
     drop(session);
 
     // The observer is still registered, but its mount is gone.
     kernel
-        .revoke(&second_capability)
+        .revoke_held_by(&subject, &second_capability)
         .expect("revoking after unmount must not report a propagation failure");
 }
 

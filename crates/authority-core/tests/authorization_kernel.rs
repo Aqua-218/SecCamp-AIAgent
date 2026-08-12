@@ -178,6 +178,53 @@ fn transition_errors_retain_their_typed_state_source() {
     );
 }
 
+// Requirement: concurrent trusted-host issuance serializes duplicate identity
+// checks under the kernel's exclusive state lock. Category:
+// concurrency/identity-boundary. Risk: critical.
+#[test]
+fn concurrent_external_root_issuance_accepts_one_duplicate_identity() {
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "session-issuer",
+    ))));
+    kernel
+        .register_subject(Subject::new(root_subject_id(), root_envelope()))
+        .expect("root subject registration must succeed");
+
+    let identity = CapId::new("orchestrator-root");
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|_| {
+            let kernel = Arc::clone(&kernel);
+            let barrier = Arc::clone(&barrier);
+            let identity = identity.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                kernel.issue_root_with_id(identity, root_grant())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("issuance worker must not panic"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(CapabilityKernelError::StateTransition(
+                        CapabilityStateError::CapabilityIdAlreadyIssued(_)
+                    ))
+                )
+            })
+            .count(),
+        7
+    );
+}
+
 // Requirement: registration, issuance, and Derive remain available through
 // the exclusive kernel boundary. Category: normal/state. Risk: critical.
 #[test]

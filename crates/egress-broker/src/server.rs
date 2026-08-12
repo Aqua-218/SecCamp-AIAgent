@@ -29,7 +29,18 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionReport {
     requests_served: usize,
-    accounting_invariant_closed: bool,
+    close_reason: ConnectionCloseReason,
+}
+
+/// Why a successfully served broker connection stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionCloseReason {
+    /// The host-configured per-connection request bound was reached.
+    RequestLimitReached,
+    /// Broken byte accounting made further requests unsafe.
+    AccountingInvariant,
+    /// An external effect committed without its required terminal audit record.
+    CommittedButUnrecorded,
 }
 
 impl ConnectionReport {
@@ -39,10 +50,24 @@ impl ConnectionReport {
         self.requests_served
     }
 
-    /// Returns whether an accounting invariant forced an early close.
+    /// Returns the typed reason this connection stopped.
+    #[must_use]
+    pub const fn close_reason(self) -> ConnectionCloseReason {
+        self.close_reason
+    }
+
+    /// Returns whether a terminal safety invariant forced an early close.
+    ///
+    /// This compatibility view includes both broken accounting and a committed
+    /// effect missing its audit record. Prefer [`Self::close_reason`] when
+    /// callers must distinguish those conditions.
     #[must_use]
     pub const fn accounting_invariant_closed(self) -> bool {
-        self.accounting_invariant_closed
+        matches!(
+            self.close_reason,
+            ConnectionCloseReason::AccountingInvariant
+                | ConnectionCloseReason::CommittedButUnrecorded
+        )
     }
 }
 
@@ -76,7 +101,7 @@ where
     }
 }
 
-/// Why a broker connection was closed before its configured request bound.
+/// Why a broker connection failed before a successful typed close report.
 #[derive(Debug)]
 pub enum ServerError {
     /// The listener failed to accept a peer.
@@ -134,7 +159,7 @@ pub fn serve_expected_peer<L, D, C>(
 ) -> Result<ConnectionReport, ServerError>
 where
     L: PeerBoundListener,
-    D: RequestDispatcher,
+    D: RequestDispatcher + ?Sized,
     C: FnMut() -> MonotonicTime,
 {
     let (peer_cid, stream) = listener.accept_peer().map_err(ServerError::Accept)?;
@@ -150,9 +175,9 @@ where
 /// Serves at most `max_requests` on one already-authenticated connection.
 ///
 /// Any framing, dispatch, encoding, or write error closes the connection by
-/// returning ownership of the stream to this function's stack. An accounting
-/// invariant response is written once and then forces an early successful
-/// close so the affected session cannot continue.
+/// returning ownership of the stream to this function's stack. Terminal safety
+/// responses are written once and then force an early successful close so the
+/// affected session cannot continue.
 ///
 /// # Errors
 ///
@@ -167,7 +192,7 @@ pub fn serve_connection<S, D, C>(
 ) -> Result<ConnectionReport, ServerError>
 where
     S: Read + Write,
-    D: RequestDispatcher,
+    D: RequestDispatcher + ?Sized,
     C: FnMut() -> MonotonicTime,
 {
     let mut transport = FramedTransport::new(stream);
@@ -186,24 +211,35 @@ where
         // Both cases leave host state the guest must not keep transacting
         // against: broken byte accounting, or an external effect whose terminal
         // audit record is missing and that an operator has to reconcile.
-        let close_after_response = matches!(
-            response.outcome,
-            BrokerOutcome::Rejected(
-                BrokerRejection::AccountingInvariant | BrokerRejection::CommittedButUnrecorded
-            )
-        );
+        let close_reason = match &response.outcome {
+            BrokerOutcome::Rejected(BrokerRejection::AccountingInvariant) => {
+                Some(ConnectionCloseReason::AccountingInvariant)
+            }
+            BrokerOutcome::Rejected(BrokerRejection::CommittedButUnrecorded) => {
+                Some(ConnectionCloseReason::CommittedButUnrecorded)
+            }
+            BrokerOutcome::Succeeded(_)
+            | BrokerOutcome::Rejected(
+                BrokerRejection::NotAuthorized
+                | BrokerRejection::Budget
+                | BrokerRejection::OperationMismatch
+                | BrokerRejection::PublicFetch(_)
+                | BrokerRejection::GitHub(_)
+                | BrokerRejection::AuditUnavailable,
+            ) => None,
+        };
         let wire = response_to_wire(response);
         write_wire_response(&mut transport, &wire)?;
-        if close_after_response {
+        if let Some(close_reason) = close_reason {
             return Ok(ConnectionReport {
                 requests_served: request_index + 1,
-                accounting_invariant_closed: true,
+                close_reason,
             });
         }
     }
     Ok(ConnectionReport {
         requests_served: max_requests.get(),
-        accounting_invariant_closed: false,
+        close_reason: ConnectionCloseReason::RequestLimitReached,
     })
 }
 
@@ -294,7 +330,10 @@ mod tests {
         transport::PeerBoundListener,
     };
 
-    use super::{RequestDispatcher, ServerError, serve_connection, serve_expected_peer};
+    use super::{
+        ConnectionCloseReason, RequestDispatcher, ServerError, serve_connection,
+        serve_expected_peer,
+    };
 
     #[derive(Clone)]
     struct DuplexBuffer {
@@ -440,6 +479,10 @@ mod tests {
 
         assert_eq!(report.requests_served(), 2);
         assert_eq!(
+            report.close_reason(),
+            ConnectionCloseReason::RequestLimitReached
+        );
+        assert_eq!(
             ticks, 2,
             "the clock must be read once per request, not once per connection"
         );
@@ -474,6 +517,10 @@ mod tests {
         .expect("bounded connection must succeed");
 
         assert_eq!(report.requests_served(), 2);
+        assert_eq!(
+            report.close_reason(),
+            ConnectionCloseReason::RequestLimitReached
+        );
         assert!(!report.accounting_invariant_closed());
         assert_eq!(dispatcher.calls, 2);
         assert_eq!(
@@ -518,9 +565,80 @@ mod tests {
         .expect("accounting response must be written before close");
 
         assert_eq!(report.requests_served(), 1);
+        assert_eq!(
+            report.close_reason(),
+            ConnectionCloseReason::AccountingInvariant
+        );
         assert!(report.accounting_invariant_closed());
         assert_eq!(dispatcher.calls, 1);
         assert_eq!(decode_frames(&output.lock().expect("output lock")).len(), 1);
+    }
+
+    // Requirement: post-effect audit loss has a distinct typed close reason.
+    // Category: unit/accounting. Risk: critical.
+    #[test]
+    fn committed_but_unrecorded_is_written_once_then_reported_distinctly() {
+        let mut input = request_frame(1);
+        input.extend(request_frame(2));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let stream = DuplexBuffer {
+            input: Cursor::new(input),
+            output: Arc::clone(&output),
+        };
+        let mut dispatcher = FakeDispatcher {
+            outcomes: VecDeque::from([
+                rejection(1, BrokerRejection::CommittedButUnrecorded),
+                rejection(2, BrokerRejection::Budget),
+            ]),
+            calls: 0,
+        };
+
+        let report = serve_connection(
+            stream,
+            &mut dispatcher,
+            &context(),
+            &mut || MonotonicTime::from_ticks(7),
+            NonZeroUsize::new(2).expect("bound must be non-zero"),
+        )
+        .expect("committed-but-unrecorded response must be written before close");
+
+        assert_eq!(report.requests_served(), 1);
+        assert_eq!(
+            report.close_reason(),
+            ConnectionCloseReason::CommittedButUnrecorded
+        );
+        assert!(report.accounting_invariant_closed());
+        assert_eq!(dispatcher.calls, 1);
+        assert_eq!(decode_frames(&output.lock().expect("output lock")).len(), 1);
+    }
+
+    // Requirement: production can erase the concrete dispatcher behind a Box.
+    // Category: unit/integration seam. Risk: high.
+    #[test]
+    fn connection_accepts_boxed_dynamic_dispatcher() {
+        let stream = DuplexBuffer {
+            input: Cursor::new(request_frame(1)),
+            output: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut dispatcher: Box<dyn RequestDispatcher> = Box::new(FakeDispatcher {
+            outcomes: VecDeque::from([rejection(1, BrokerRejection::Budget)]),
+            calls: 0,
+        });
+
+        let report = serve_connection(
+            stream,
+            dispatcher.as_mut(),
+            &context(),
+            &mut || MonotonicTime::from_ticks(7),
+            NonZeroUsize::new(1).expect("bound must be non-zero"),
+        )
+        .expect("boxed dispatcher must serve a connection");
+
+        assert_eq!(report.requests_served(), 1);
+        assert_eq!(
+            report.close_reason(),
+            ConnectionCloseReason::RequestLimitReached
+        );
     }
 
     #[test]
@@ -573,6 +691,10 @@ mod tests {
             matches!(reassembled.outcome(), BrokerWireOutcome::Public(public) if public.body().len() == MAX_CONTROL_FRAME_BYTES)
         );
         assert_eq!(report.requests_served(), 1);
+        assert_eq!(
+            report.close_reason(),
+            ConnectionCloseReason::RequestLimitReached
+        );
         assert_eq!(dispatcher.calls, 1);
     }
 

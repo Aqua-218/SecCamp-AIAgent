@@ -15,7 +15,7 @@ use rustix::{
         AtFlags, FileType, Mode, OFlags, ResolveFlags, Statx, StatxFlags, StatxTimestamp, openat2,
         statx,
     },
-    io::pread,
+    io::{pread, pwrite},
 };
 
 use crate::{
@@ -120,27 +120,60 @@ impl Error for RuntimeBackingError {
     }
 }
 
+/// A regular-file descriptor opened beneath one validated repository root.
+///
+/// The descriptor is never opened with create, append, or truncate semantics.
+/// Callers remain responsible for authorizing every read or write while they
+/// hold the corresponding capability-kernel guard.
 #[derive(Debug)]
 pub(crate) struct OpenedBackingFile {
     fd: OwnedFd,
+    path: CanonicalPath,
 }
 
 impl OpenedBackingFile {
+    /// Reads at an explicit offset without changing descriptor state.
     pub(crate) fn read_at(
         &self,
         offset: u64,
         requested_size: usize,
     ) -> Result<Vec<u8>, RuntimeBackingError> {
         let mut bytes = vec![0_u8; requested_size];
-        let count = pread(&self.fd, bytes.as_mut_slice(), offset).map_err(|error| {
-            RuntimeBackingError::Io {
-                operation: "read",
-                path: PathBuf::from("<opened-file>"),
-                source: io::Error::from_raw_os_error(error.raw_os_error()),
-            }
-        })?;
+        let count = pread(&self.fd, bytes.as_mut_slice(), offset)
+            .map_err(|error| runtime_io_error("read", &self.path, error))?;
         bytes.truncate(count);
         Ok(bytes)
+    }
+
+    /// Writes at an explicit offset without append or implicit truncation.
+    ///
+    /// A successful call may report a short write. The caller must return that
+    /// exact count and must not retry after dropping its authorization guard.
+    pub(crate) fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<usize, RuntimeBackingError> {
+        pwrite(&self.fd, bytes, offset)
+            .map_err(|error| runtime_io_error("write", &self.path, error))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeFileAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl RuntimeFileAccess {
+    const fn open_flags(self) -> OFlags {
+        match self {
+            Self::ReadOnly => OFlags::RDONLY,
+            Self::ReadWrite => OFlags::RDWR,
+        }
+    }
+
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "open for reading",
+            Self::ReadWrite => "open for reading and writing",
+        }
     }
 }
 
@@ -175,6 +208,27 @@ impl ValidatedRepository {
         &self,
         object: &NamespaceObject,
     ) -> Result<OpenedBackingFile, RuntimeBackingError> {
+        self.open_runtime_file_with_access(object, RuntimeFileAccess::ReadOnly)
+    }
+
+    /// Opens a regular file for positioned writes without mutating its length.
+    ///
+    /// `O_RDWR` lets the adapter serve an `O_RDWR` FUSE handle, but does not
+    /// grant logical read access: the adapter must enforce the requested access
+    /// mode and reauthorize each `ReadData` or `WriteData` effect separately.
+    /// The open never carries `O_APPEND`, `O_CREAT`, or `O_TRUNC`.
+    pub(crate) fn open_runtime_writable_file(
+        &self,
+        object: &NamespaceObject,
+    ) -> Result<OpenedBackingFile, RuntimeBackingError> {
+        self.open_runtime_file_with_access(object, RuntimeFileAccess::ReadWrite)
+    }
+
+    fn open_runtime_file_with_access(
+        &self,
+        object: &NamespaceObject,
+        access: RuntimeFileAccess,
+    ) -> Result<OpenedBackingFile, RuntimeBackingError> {
         if object.kind() != NamespaceObjectKind::RegularFile {
             return Err(RuntimeBackingError::ObjectKindChanged {
                 path: object.path().clone(),
@@ -185,14 +239,17 @@ impl ValidatedRepository {
         let fd = openat2(
             self.as_fd(),
             path_buf(object.path()),
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            access.open_flags() | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
             RESOLVE_WITHIN_ROOT,
         )
-        .map_err(|error| runtime_io_error("open for reading", object.path(), error))?;
+        .map_err(|error| runtime_io_error(access.operation(), object.path(), error))?;
         let metadata = metadata_for_fd(&fd, object.path())?;
         validate_runtime_metadata(self, object, metadata)?;
-        Ok(OpenedBackingFile { fd })
+        Ok(OpenedBackingFile {
+            fd,
+            path: object.path().clone(),
+        })
     }
 }
 
@@ -319,7 +376,7 @@ impl fmt::Display for DisplayCanonicalPath<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, num::NonZeroUsize, os::unix::fs::symlink};
+    use std::{fs, num::NonZeroUsize, os::unix::fs::symlink, path::PathBuf};
 
     use tempfile::tempdir;
 
@@ -366,6 +423,81 @@ mod tests {
     }
 
     #[test]
+    fn runtime_positioned_write_preserves_unwritten_file_content() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let file_path = directory.path().join("notes.txt");
+        fs::write(&file_path, b"capability").expect("test file must be writable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let path = CanonicalPath::new(["notes.txt"]).expect("test path must be canonical");
+        let object = namespace
+            .object_at_path_snapshot(&path)
+            .expect("namespace must remain readable")
+            .expect("manifest file must exist");
+
+        let file = backing
+            .open_runtime_writable_file(&object)
+            .expect("unchanged regular file must open for writing");
+        assert_eq!(
+            fs::metadata(&file_path)
+                .expect("opened file metadata must remain readable")
+                .len(),
+            10,
+            "opening for writes must not truncate the file"
+        );
+        assert_eq!(
+            file.write_at(3, b"SAFE")
+                .expect("bounded positioned write must work"),
+            4
+        );
+        drop(file);
+
+        assert_eq!(
+            fs::read(file_path).expect("written test file must remain readable"),
+            b"capSAFEity"
+        );
+    }
+
+    #[test]
+    fn runtime_read_only_file_rejects_positioned_write_with_path_context() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::write(directory.path().join("notes.txt"), b"safe").expect("test file must be writable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let path = CanonicalPath::new(["notes.txt"]).expect("test path must be canonical");
+        let object = namespace
+            .object_at_path_snapshot(&path)
+            .expect("namespace must remain readable")
+            .expect("manifest file must exist");
+        let file = backing
+            .open_runtime_file(&object)
+            .expect("unchanged regular file must open for reading");
+
+        let error = file
+            .write_at(0, b"blocked")
+            .expect_err("read-only backing descriptor must reject writes");
+        match error {
+            RuntimeBackingError::Io {
+                operation,
+                path,
+                source,
+            } => {
+                assert_eq!(operation, "write");
+                assert_eq!(path, PathBuf::from("notes.txt"));
+                assert_eq!(
+                    source.raw_os_error(),
+                    Some(rustix::io::Errno::BADF.raw_os_error())
+                );
+            }
+            other => panic!("expected positioned write I/O error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn runtime_open_rejects_a_symlink_substituted_after_preflight() {
         let directory = tempdir().expect("temporary repository must be creatable");
         let file_path = directory.path().join("notes.txt");
@@ -385,6 +517,30 @@ mod tests {
 
         assert!(matches!(
             backing.open_runtime_file(&object),
+            Err(RuntimeBackingError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_writable_open_rejects_a_symlink_substituted_after_preflight() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let file_path = directory.path().join("notes.txt");
+        fs::write(&file_path, b"safe").expect("test file must be writable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial regular file must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let path = CanonicalPath::new(["notes.txt"]).expect("test path must be canonical");
+        let object = namespace
+            .object_at_path_snapshot(&path)
+            .expect("namespace must remain readable")
+            .expect("manifest file must exist");
+
+        fs::remove_file(&file_path).expect("test file must be replaceable");
+        symlink("/etc/passwd", &file_path).expect("test symlink must be creatable");
+
+        assert!(matches!(
+            backing.open_runtime_writable_file(&object),
             Err(RuntimeBackingError::Io { .. })
         ));
     }
@@ -410,6 +566,52 @@ mod tests {
         assert!(matches!(
             backing.runtime_metadata(&object),
             Err(RuntimeBackingError::HardLinkAppeared { link_count: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_writable_open_rejects_a_hard_link_added_after_preflight() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let file_path = directory.path().join("notes.txt");
+        fs::write(&file_path, b"safe").expect("test file must be writable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial regular file must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let path = CanonicalPath::new(["notes.txt"]).expect("test path must be canonical");
+        let object = namespace
+            .object_at_path_snapshot(&path)
+            .expect("namespace must remain readable")
+            .expect("manifest file must exist");
+
+        fs::hard_link(&file_path, directory.path().join("alias.txt"))
+            .expect("test hard link must be creatable");
+
+        assert!(matches!(
+            backing.open_runtime_writable_file(&object),
+            Err(RuntimeBackingError::HardLinkAppeared { link_count: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_writable_open_rejects_a_directory_object() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("empty repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let object = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("manifest root must exist");
+
+        assert!(matches!(
+            backing.open_runtime_writable_file(&object),
+            Err(RuntimeBackingError::ObjectKindChanged {
+                expected: NamespaceObjectKind::RegularFile,
+                actual: Some(NamespaceObjectKind::Directory),
+                ..
+            })
         ));
     }
 }

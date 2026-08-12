@@ -1,6 +1,13 @@
 //! Backend-independent isolation orchestration and failure handling.
 
-use std::{error::Error, fmt, num::NonZeroU32};
+use std::{
+    error::Error,
+    fmt,
+    fs::File,
+    io::{self, Read, Write},
+    num::NonZeroU32,
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+};
 
 use crate::{IsolationConfig, Syscall};
 
@@ -33,6 +40,43 @@ pub enum IsolationStep {
     NoNewPrivs,
     /// Install the default-deny seccomp filter.
     Seccomp,
+}
+
+const REQUIRED_STEPS: [IsolationStep; 13] = [
+    IsolationStep::Namespaces,
+    IsolationStep::IdentityMap,
+    IsolationStep::CgroupV2,
+    IsolationStep::ReadOnlyRootfs,
+    IsolationStep::Workspace,
+    IsolationStep::LimitedTmpfs,
+    IsolationStep::MaskProc,
+    IsolationStep::MaskDevices,
+    IsolationStep::CloseInheritedFileDescriptors,
+    IsolationStep::Landlock,
+    IsolationStep::DropCapabilities,
+    IsolationStep::NoNewPrivs,
+    IsolationStep::Seccomp,
+];
+
+pub(crate) mod private {
+    /// Unforgeable permission to invoke process-global backend operations.
+    pub(crate) struct OperationPermit(());
+
+    impl OperationPermit {
+        pub(super) const fn new() -> Self {
+            Self(())
+        }
+    }
+
+    /// Prevents downstream crates from supplying authority-bearing backends.
+    pub(crate) trait Sealed {}
+
+    #[cfg(not(test))]
+    impl Sealed for crate::LinuxBackend {}
+
+    // Unit tests remain able to exercise the coordinator with in-crate models.
+    #[cfg(test)]
+    impl<T> Sealed for T {}
 }
 
 /// A privileged backend operation failure.
@@ -109,6 +153,43 @@ impl IsolationStep {
             | Self::LimitedTmpfs
             | Self::MaskProc
             | Self::MaskDevices => false,
+        }
+    }
+
+    const fn wire_code(self) -> u8 {
+        match self {
+            Self::Namespaces => 0,
+            Self::IdentityMap => 1,
+            Self::CgroupV2 => 2,
+            Self::ReadOnlyRootfs => 3,
+            Self::Workspace => 4,
+            Self::LimitedTmpfs => 5,
+            Self::MaskProc => 6,
+            Self::MaskDevices => 7,
+            Self::CloseInheritedFileDescriptors => 8,
+            Self::Landlock => 9,
+            Self::DropCapabilities => 10,
+            Self::NoNewPrivs => 11,
+            Self::Seccomp => 12,
+        }
+    }
+
+    const fn from_wire_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Namespaces),
+            1 => Some(Self::IdentityMap),
+            2 => Some(Self::CgroupV2),
+            3 => Some(Self::ReadOnlyRootfs),
+            4 => Some(Self::Workspace),
+            5 => Some(Self::LimitedTmpfs),
+            6 => Some(Self::MaskProc),
+            7 => Some(Self::MaskDevices),
+            8 => Some(Self::CloseInheritedFileDescriptors),
+            9 => Some(Self::Landlock),
+            10 => Some(Self::DropCapabilities),
+            11 => Some(Self::NoNewPrivs),
+            12 => Some(Self::Seccomp),
+            _ => None,
         }
     }
 }
@@ -284,7 +365,7 @@ impl NamespacePreparation {
     /// Backend implementations are trusted to call this only after preparing all
     /// required namespaces and observing a child PID namespace distinct from the
     /// current process PID namespace.
-    pub const fn attest(parent: NamespaceIdentity, child: NamespaceIdentity) -> Self {
+    pub(crate) const fn attest(parent: NamespaceIdentity, child: NamespaceIdentity) -> Self {
         Self { parent, child }
     }
 
@@ -310,7 +391,7 @@ impl PidNamespaceChild {
     ///
     /// Backend implementations are trusted to compare the current PID namespace
     /// to [`NamespacePreparation::child`] before constructing this value.
-    pub const fn attest(namespace: NamespaceIdentity) -> Self {
+    pub(crate) const fn attest(namespace: NamespaceIdentity) -> Self {
         Self { namespace }
     }
 
@@ -320,24 +401,439 @@ impl PidNamespaceChild {
     }
 }
 
+const STARTUP_MESSAGE_MAGIC: [u8; 4] = *b"LISO";
+const STARTUP_MESSAGE_VERSION: u8 = 1;
+const STARTUP_MESSAGE_LEN: usize = 32;
+const STARTUP_READY: u8 = 1;
+const STARTUP_FAILED: u8 = 2;
+const TERMINATION_REQUIRED: u8 = 1;
+const ERRNO_UNAVAILABLE: i32 = i32::MIN;
+
+/// A child's kernel-observed startup result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildStartupStatus {
+    /// Every required isolation step completed in the child.
+    Ready(ChildStartupReady),
+    /// Isolation failed before the workload entry point ran.
+    Failed(ChildStartupFailure),
+}
+
+/// Parent-observable proof that the child reached the final isolation boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChildStartupReady {
+    pid_namespace: NamespaceIdentity,
+}
+
+impl ChildStartupReady {
+    /// Returns the namespace the child observed after handoff.
+    pub const fn pid_namespace(self) -> NamespaceIdentity {
+        self.pid_namespace
+    }
+
+    /// Returns the exact ordered isolation contract completed by the child.
+    pub const fn completed_steps() -> &'static [IsolationStep; 13] {
+        &REQUIRED_STEPS
+    }
+}
+
+/// Parent-observable isolation failure reported before the child terminates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChildStartupFailure {
+    step: IsolationStep,
+    errno: Option<i32>,
+    rollback_failure_count: u32,
+    termination_required: bool,
+}
+
+impl ChildStartupFailure {
+    /// Returns the operation that stopped isolation.
+    pub const fn step(self) -> IsolationStep {
+        self.step
+    }
+
+    /// Returns the kernel errno, when the failed operation supplied one.
+    pub const fn errno(self) -> Option<i32> {
+        self.errno
+    }
+
+    /// Returns how many best-effort rollback operations also failed.
+    pub const fn rollback_failure_count(self) -> u32 {
+        self.rollback_failure_count
+    }
+
+    /// Returns whether the child must terminate rather than continue execution.
+    pub const fn termination_required(self) -> bool {
+        self.termination_required
+    }
+}
+
+/// Terminal state reaped from the direct isolation child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildExit {
+    /// The child called `_exit` or returned from its process entry point.
+    Exited(i32),
+    /// The child was terminated by a signal.
+    Signaled(i32),
+}
+
+/// Failure while observing or controlling an owned isolation child.
+#[derive(Debug)]
+pub enum ChildProcessError {
+    /// This handle was created by an in-crate test double and owns no process.
+    OwnershipUnavailable,
+    /// The one-shot startup channel was consumed without yielding a status.
+    StartupAlreadyObserved,
+    /// The child closed its status channel before sending a complete message.
+    StartupChannelClosed,
+    /// The child supplied a malformed or contradictory status message.
+    InvalidStartupStatus(&'static str),
+    /// The direct child has already been reaped through this handle.
+    AlreadyReaped,
+    /// The stored child PID cannot be represented by the host wait API.
+    InvalidChildPid,
+    /// `waitpid` returned a state that was not terminal.
+    InvalidWaitStatus,
+    /// A kernel operation on the owned child failed.
+    Io {
+        /// Operation that failed.
+        operation: &'static str,
+        /// Operating-system failure.
+        source: io::Error,
+    },
+}
+
+impl ChildProcessError {
+    fn io(operation: &'static str, source: io::Error) -> Self {
+        Self::Io { operation, source }
+    }
+
+    fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            Self::Io { source, .. } => source.raw_os_error(),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ChildProcessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OwnershipUnavailable => {
+                formatter.write_str("isolation child ownership is unavailable")
+            }
+            Self::StartupAlreadyObserved => {
+                formatter.write_str("child startup status was already consumed")
+            }
+            Self::StartupChannelClosed => {
+                formatter.write_str("child startup channel closed before a complete status")
+            }
+            Self::InvalidStartupStatus(reason) => {
+                write!(formatter, "invalid child startup status: {reason}")
+            }
+            Self::AlreadyReaped => formatter.write_str("isolation child was already reaped"),
+            Self::InvalidChildPid => formatter.write_str("isolation child PID is invalid"),
+            Self::InvalidWaitStatus => {
+                formatter.write_str("waitpid returned a non-terminal child status")
+            }
+            Self::Io { operation, source } => {
+                write!(formatter, "{operation} failed: {source}")
+            }
+        }
+    }
+}
+
+impl Error for ChildProcessError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OwnedChildControl {
+    pidfd: OwnedFd,
+    startup_reader: Option<OwnedFd>,
+    startup_status: Option<ChildStartupStatus>,
+    startup_read_attempted: bool,
+    reaped: bool,
+}
+
+/// The only child endpoint permitted to attest startup to its launcher.
+#[derive(Debug)]
+pub(crate) struct ChildStartupNotifier {
+    writer: OwnedFd,
+}
+
+impl ChildStartupNotifier {
+    /// Creates the child endpoint of a close-on-exec status pipe.
+    pub(crate) const fn from_fd(writer: OwnedFd) -> Self {
+        Self { writer }
+    }
+
+    fn report_ready(self, receipt: &IsolationReceipt) -> Result<(), ChildProcessError> {
+        self.write_message(encode_startup_ready(receipt.pid_namespace()))
+    }
+
+    fn report_failure(self, failure: &IsolationError) -> Result<(), ChildProcessError> {
+        self.write_message(encode_startup_failure(failure))
+    }
+
+    fn write_message(self, message: [u8; STARTUP_MESSAGE_LEN]) -> Result<(), ChildProcessError> {
+        let mut writer = File::from(self.writer);
+        writer
+            .write_all(&message)
+            .map_err(|error| ChildProcessError::io("write child startup status", error))
+    }
+}
+
+fn encode_startup_ready(namespace: NamespaceIdentity) -> [u8; STARTUP_MESSAGE_LEN] {
+    let mut message = [0_u8; STARTUP_MESSAGE_LEN];
+    message[..4].copy_from_slice(&STARTUP_MESSAGE_MAGIC);
+    message[4] = STARTUP_MESSAGE_VERSION;
+    message[5] = STARTUP_READY;
+    message[6] = IsolationStep::Seccomp.wire_code();
+    message[8..12].copy_from_slice(&ERRNO_UNAVAILABLE.to_le_bytes());
+    message[12..20].copy_from_slice(&namespace.device().to_le_bytes());
+    message[20..28].copy_from_slice(&namespace.inode().to_le_bytes());
+    message
+}
+
+fn encode_startup_failure(failure: &IsolationError) -> [u8; STARTUP_MESSAGE_LEN] {
+    let (original, failures, termination_required) = match failure {
+        IsolationError::Backend(original) => (original, 0, false),
+        IsolationError::Rollback { original, failures } => (original, failures.len(), false),
+        IsolationError::TerminationRequired { original, failures } => {
+            (original, failures.len(), true)
+        }
+        // The child protocol is emitted only after successful preflight and
+        // namespace preparation. Retain a fail-closed representation if that
+        // invariant is violated by a future coordinator change.
+        IsolationError::InvalidConfig(_)
+        | IsolationError::CapabilityUnavailable(_)
+        | IsolationError::ChildHandoffRequired
+        | IsolationError::ForbiddenSyscall(_)
+        | IsolationError::UnsupportedSyscall(_) => {
+            let mut message = [0_u8; STARTUP_MESSAGE_LEN];
+            message[..4].copy_from_slice(&STARTUP_MESSAGE_MAGIC);
+            message[4] = STARTUP_MESSAGE_VERSION;
+            message[5] = STARTUP_FAILED;
+            message[6] = IsolationStep::Namespaces.wire_code();
+            message[7] = TERMINATION_REQUIRED;
+            message[8..12].copy_from_slice(&ERRNO_UNAVAILABLE.to_le_bytes());
+            return message;
+        }
+    };
+
+    let mut message = [0_u8; STARTUP_MESSAGE_LEN];
+    message[..4].copy_from_slice(&STARTUP_MESSAGE_MAGIC);
+    message[4] = STARTUP_MESSAGE_VERSION;
+    message[5] = STARTUP_FAILED;
+    message[6] = original.step.wire_code();
+    message[7] = u8::from(termination_required) * TERMINATION_REQUIRED;
+    message[8..12].copy_from_slice(&original.errno.unwrap_or(ERRNO_UNAVAILABLE).to_le_bytes());
+    message[28..32].copy_from_slice(&u32::try_from(failures).unwrap_or(u32::MAX).to_le_bytes());
+    message
+}
+
+fn read_startup_status(reader: OwnedFd) -> Result<ChildStartupStatus, ChildProcessError> {
+    let mut reader = File::from(reader);
+    let mut message = [0_u8; STARTUP_MESSAGE_LEN];
+    reader.read_exact(&mut message).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            ChildProcessError::StartupChannelClosed
+        } else {
+            ChildProcessError::io("read child startup status", error)
+        }
+    })?;
+    decode_startup_status(message)
+}
+
+fn decode_startup_status(
+    message: [u8; STARTUP_MESSAGE_LEN],
+) -> Result<ChildStartupStatus, ChildProcessError> {
+    if message[..4] != STARTUP_MESSAGE_MAGIC {
+        return Err(ChildProcessError::InvalidStartupStatus(
+            "message magic did not match",
+        ));
+    }
+    if message[4] != STARTUP_MESSAGE_VERSION {
+        return Err(ChildProcessError::InvalidStartupStatus(
+            "message version is unsupported",
+        ));
+    }
+    let step = IsolationStep::from_wire_code(message[6]).ok_or(
+        ChildProcessError::InvalidStartupStatus("isolation step code is unknown"),
+    )?;
+    if message[7] & !TERMINATION_REQUIRED != 0 {
+        return Err(ChildProcessError::InvalidStartupStatus(
+            "message flags contain unknown bits",
+        ));
+    }
+    let errno = i32::from_le_bytes(
+        message[8..12]
+            .try_into()
+            .expect("fixed status errno field has the correct length"),
+    );
+    let device = u64::from_le_bytes(
+        message[12..20]
+            .try_into()
+            .expect("fixed status device field has the correct length"),
+    );
+    let inode = u64::from_le_bytes(
+        message[20..28]
+            .try_into()
+            .expect("fixed status inode field has the correct length"),
+    );
+    let rollback_failure_count = u32::from_le_bytes(
+        message[28..32]
+            .try_into()
+            .expect("fixed status rollback field has the correct length"),
+    );
+
+    match message[5] {
+        STARTUP_READY => {
+            if step != IsolationStep::Seccomp
+                || message[7] != 0
+                || errno != ERRNO_UNAVAILABLE
+                || rollback_failure_count != 0
+            {
+                return Err(ChildProcessError::InvalidStartupStatus(
+                    "ready message did not attest the final isolation step",
+                ));
+            }
+            Ok(ChildStartupStatus::Ready(ChildStartupReady {
+                pid_namespace: NamespaceIdentity::from_kernel(device, inode),
+            }))
+        }
+        STARTUP_FAILED => {
+            if device != 0 || inode != 0 {
+                return Err(ChildProcessError::InvalidStartupStatus(
+                    "failure message contained a namespace attestation",
+                ));
+            }
+            Ok(ChildStartupStatus::Failed(ChildStartupFailure {
+                step,
+                errno: (errno != ERRNO_UNAVAILABLE).then_some(errno),
+                rollback_failure_count,
+                termination_required: message[7] == TERMINATION_REQUIRED,
+            }))
+        }
+        _ => Err(ChildProcessError::InvalidStartupStatus(
+            "message kind is unknown",
+        )),
+    }
+}
+
+fn wait_for_child(
+    pid: NonZeroU32,
+    options: libc::c_int,
+    control: &mut OwnedChildControl,
+) -> Result<Option<ChildExit>, ChildProcessError> {
+    let pid = libc::pid_t::try_from(pid.get()).map_err(|_| ChildProcessError::InvalidChildPid)?;
+    loop {
+        let mut status = 0;
+        // SAFETY: `status` is a valid writable pointer, and the handle records
+        // ownership of the direct child identified by `pid` until it is reaped.
+        let result = unsafe { libc::waitpid(pid, &raw mut status, options) };
+        if result == 0 {
+            return Ok(None);
+        }
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                control.reaped = true;
+            }
+            return Err(ChildProcessError::io("wait for isolation child", error));
+        }
+        control.reaped = true;
+        if libc::WIFEXITED(status) {
+            return Ok(Some(ChildExit::Exited(libc::WEXITSTATUS(status))));
+        }
+        if libc::WIFSIGNALED(status) {
+            return Ok(Some(ChildExit::Signaled(libc::WTERMSIG(status))));
+        }
+        return Err(ChildProcessError::InvalidWaitStatus);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_child(control: &OwnedChildControl) -> Result<(), ChildProcessError> {
+    loop {
+        // SAFETY: the pidfd is owned by this handle, the signal has no payload,
+        // and pidfd addressing prevents PID-reuse races.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                control.pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0_u32,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(ChildProcessError::io(
+            "terminate isolation child through pidfd",
+            error,
+        ));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn terminate_child(_control: &OwnedChildControl) -> Result<(), ChildProcessError> {
+    Err(ChildProcessError::io(
+        "terminate isolation child through pidfd",
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "pidfds are available only on Linux",
+        ),
+    ))
+}
+
 /// Namespace-launcher ownership of a successfully spawned isolation child.
 ///
 /// This handle is returned in the process that prepared namespaces. That
 /// launcher may already have irreversible process-global namespace changes and
 /// must not resume trusted supervisor work.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct IsolatedChildProcess {
     pid: NonZeroU32,
     pid_namespace: NamespaceIdentity,
+    control: Option<OwnedChildControl>,
 }
 
 impl IsolatedChildProcess {
-    /// Creates a parent handle from a positive child PID and prepared namespace.
-    ///
-    /// Backend implementations are trusted to use the PID returned by the spawn
-    /// operation that consumed the corresponding [`NamespacePreparation`].
-    pub const fn attest(pid: NonZeroU32, pid_namespace: NamespaceIdentity) -> Self {
-        Self { pid, pid_namespace }
+    /// Creates an owned parent handle from kernel-created process descriptors.
+    pub(crate) fn from_spawn(
+        pid: NonZeroU32,
+        pid_namespace: NamespaceIdentity,
+        pidfd: OwnedFd,
+        startup_reader: OwnedFd,
+    ) -> Self {
+        Self {
+            pid,
+            pid_namespace,
+            control: Some(OwnedChildControl {
+                pidfd,
+                startup_reader: Some(startup_reader),
+                startup_status: None,
+                startup_read_attempted: false,
+                reaped: false,
+            }),
+        }
     }
 
     /// Returns the child PID as seen by the preparing parent.
@@ -349,10 +845,119 @@ impl IsolatedChildProcess {
     pub const fn pid_namespace(&self) -> NamespaceIdentity {
         self.pid_namespace
     }
+
+    /// Returns the stable process descriptor owned by this launcher.
+    pub fn pidfd(&self) -> Result<BorrowedFd<'_>, ChildProcessError> {
+        self.control
+            .as_ref()
+            .map(|control| control.pidfd.as_fd())
+            .ok_or(ChildProcessError::OwnershipUnavailable)
+    }
+
+    /// Blocks until the child reports complete isolation or a typed startup failure.
+    pub fn wait_for_startup(&mut self) -> Result<&ChildStartupStatus, ChildProcessError> {
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(ChildProcessError::OwnershipUnavailable)?;
+        if control.startup_status.is_none() {
+            if control.startup_read_attempted {
+                return Err(ChildProcessError::StartupAlreadyObserved);
+            }
+            control.startup_read_attempted = true;
+            let reader = control
+                .startup_reader
+                .take()
+                .ok_or(ChildProcessError::StartupAlreadyObserved)?;
+            let status = read_startup_status(reader)?;
+            if let ChildStartupStatus::Ready(ready) = &status
+                && ready.pid_namespace != self.pid_namespace
+            {
+                return Err(ChildProcessError::InvalidStartupStatus(
+                    "ready namespace did not match the namespace prepared for this child",
+                ));
+            }
+            control.startup_status = Some(status);
+        }
+        control
+            .startup_status
+            .as_ref()
+            .ok_or(ChildProcessError::StartupAlreadyObserved)
+    }
+
+    /// Returns the child's terminal state without blocking.
+    pub fn try_wait(&mut self) -> Result<Option<ChildExit>, ChildProcessError> {
+        let pid = self.pid;
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(ChildProcessError::OwnershipUnavailable)?;
+        if control.reaped {
+            return Err(ChildProcessError::AlreadyReaped);
+        }
+        wait_for_child(pid, libc::WNOHANG, control)
+    }
+
+    /// Blocks until the child exits and reaps it exactly once.
+    pub fn wait(&mut self) -> Result<ChildExit, ChildProcessError> {
+        let pid = self.pid;
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(ChildProcessError::OwnershipUnavailable)?;
+        if control.reaped {
+            return Err(ChildProcessError::AlreadyReaped);
+        }
+        wait_for_child(pid, 0, control)?.ok_or(ChildProcessError::InvalidWaitStatus)
+    }
+
+    /// Sends `SIGKILL` through the owned pidfd and reaps the direct child.
+    pub fn terminate(&mut self) -> Result<ChildExit, ChildProcessError> {
+        let pid = self.pid;
+        let control = self
+            .control
+            .as_mut()
+            .ok_or(ChildProcessError::OwnershipUnavailable)?;
+        if control.reaped {
+            return Err(ChildProcessError::AlreadyReaped);
+        }
+        terminate_child(control)?;
+        wait_for_child(pid, 0, control)?.ok_or(ChildProcessError::InvalidWaitStatus)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn unattested_for_test(
+        pid: NonZeroU32,
+        pid_namespace: NamespaceIdentity,
+    ) -> Self {
+        Self {
+            pid,
+            pid_namespace,
+            control: None,
+        }
+    }
+}
+
+impl Drop for IsolatedChildProcess {
+    fn drop(&mut self) {
+        let pid = self.pid;
+        let Some(control) = self.control.as_mut() else {
+            return;
+        };
+        if control.reaped {
+            return;
+        }
+        // Dropping the only process capability must not detach an untrusted child.
+        if terminate_child(control).is_ok() {
+            let _ = wait_for_child(pid, 0, control);
+        } else {
+            let _ = wait_for_child(pid, libc::WNOHANG, control);
+        }
+    }
 }
 
 /// Process role returned by an explicit isolation spawn.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum SpawnOutcome<T> {
     /// The preparing launcher owns the spawned child and never receives a receipt.
     Parent(IsolatedChildProcess),
@@ -379,8 +984,13 @@ impl IsolationReceipt {
     }
 }
 
-/// Interface for privileged isolation operations.
-pub trait IsolationBackend {
+/// Sealed interface for the crate's privileged isolation implementation.
+///
+/// Downstream crates can use [`LinuxBackend`](crate::LinuxBackend) through the
+/// safe coordinator APIs, but cannot implement this authority-bearing trait or
+/// invoke its process-global mutation methods directly.
+#[allow(private_bounds, private_interfaces)]
+pub trait IsolationBackend: private::Sealed {
     /// Detects host capabilities without mutating the process.
     fn detect_capabilities(&mut self, config: &IsolationConfig) -> CapabilityReport;
 
@@ -394,6 +1004,7 @@ pub trait IsolationBackend {
     /// [`Self::verify_pid_namespace_child`].
     fn prepare_namespaces(
         &mut self,
+        _permit: private::OperationPermit,
         _config: &IsolationConfig,
     ) -> Result<NamespacePreparation, BackendError> {
         Err(BackendError::new(
@@ -411,12 +1022,13 @@ pub trait IsolationBackend {
     /// child to execute in `preparation.child()`.
     fn spawn_isolated<T, F>(
         &mut self,
+        _permit: private::OperationPermit,
         _preparation: NamespacePreparation,
         _child_entry: F,
     ) -> Result<SpawnOutcome<T>, BackendError>
     where
         Self: Sized,
-        F: FnOnce(&mut Self, NamespacePreparation) -> T,
+        F: FnOnce(&mut Self, NamespacePreparation, ChildStartupNotifier) -> T,
     {
         Err(BackendError::new(
             IsolationStep::Namespaces,
@@ -428,6 +1040,7 @@ pub trait IsolationBackend {
     /// Verifies that the current process entered the prepared child PID namespace.
     fn verify_pid_namespace_child(
         &mut self,
+        _permit: private::OperationPermit,
         _preparation: NamespacePreparation,
     ) -> Result<PidNamespaceChild, BackendError> {
         Err(BackendError::new(
@@ -442,6 +1055,7 @@ pub trait IsolationBackend {
     /// Coordinators never pass [`IsolationStep::Namespaces`] through this method.
     fn apply_step(
         &mut self,
+        _permit: private::OperationPermit,
         step: IsolationStep,
         config: &IsolationConfig,
     ) -> Result<(), BackendError>;
@@ -449,6 +1063,7 @@ pub trait IsolationBackend {
     /// Rolls back one previously completed operation.
     fn rollback_step(
         &mut self,
+        _permit: private::OperationPermit,
         step: IsolationStep,
         config: &IsolationConfig,
     ) -> Result<(), BackendError>;
@@ -510,17 +1125,36 @@ impl RuntimeIsolation {
     {
         Self::preflight(backend, config)?;
 
-        let preparation = backend.prepare_namespaces(config).map_err(|original| {
-            IsolationError::TerminationRequired {
+        let preparation = backend
+            .prepare_namespaces(private::OperationPermit::new(), config)
+            .map_err(|original| IsolationError::TerminationRequired {
                 original,
                 failures: Vec::new(),
-            }
-        })?;
+            })?;
         let spawned = backend
-            .spawn_isolated(preparation, |child_backend, child_preparation| {
-                Self::enter_isolated_child(child_backend, config, child_preparation)
-                    .map(workload_entry)
-            })
+            .spawn_isolated(
+                private::OperationPermit::new(),
+                preparation,
+                |child_backend, child_preparation, startup_notifier| {
+                    match Self::enter_isolated_child(child_backend, config, child_preparation) {
+                        Ok(receipt) => match startup_notifier.report_ready(&receipt) {
+                            Ok(()) => Ok(workload_entry(receipt)),
+                            Err(error) => Err(IsolationError::TerminationRequired {
+                                original: BackendError::new(
+                                    IsolationStep::Seccomp,
+                                    format!("report isolated child readiness to launcher: {error}"),
+                                    error.raw_os_error(),
+                                ),
+                                failures: Vec::new(),
+                            }),
+                        },
+                        Err(error) => {
+                            let _ = startup_notifier.report_failure(&error);
+                            Err(error)
+                        }
+                    }
+                },
+            )
             .map_err(|original| IsolationError::TerminationRequired {
                 original,
                 failures: Vec::new(),
@@ -549,7 +1183,9 @@ impl RuntimeIsolation {
         config: &IsolationConfig,
         preparation: NamespacePreparation,
     ) -> Result<IsolationReceipt, IsolationError> {
-        let pid_namespace_child = match backend.verify_pid_namespace_child(preparation) {
+        let pid_namespace_child = match backend
+            .verify_pid_namespace_child(private::OperationPermit::new(), preparation)
+        {
             Ok(child) => child,
             Err(original) => {
                 return Err(Self::failure_after_steps(
@@ -570,7 +1206,7 @@ impl RuntimeIsolation {
     ) -> Result<IsolationReceipt, IsolationError> {
         let mut completed = vec![IsolationStep::Namespaces];
         for step in required_steps().into_iter().skip(1) {
-            match backend.apply_step(step, config) {
+            match backend.apply_step(private::OperationPermit::new(), step, config) {
                 Ok(()) => completed.push(step),
                 Err(original) => {
                     return Err(Self::failure_after_steps(
@@ -601,7 +1237,11 @@ impl RuntimeIsolation {
         let failures = completed
             .iter()
             .rev()
-            .filter_map(|completed_step| backend.rollback_step(*completed_step, config).err())
+            .filter_map(|completed_step| {
+                backend
+                    .rollback_step(private::OperationPermit::new(), *completed_step, config)
+                    .err()
+            })
             .collect::<Vec<_>>();
         if termination_required {
             IsolationError::TerminationRequired { original, failures }
@@ -641,26 +1281,16 @@ where
 }
 
 fn required_steps() -> [IsolationStep; 13] {
-    [
-        IsolationStep::Namespaces,
-        IsolationStep::IdentityMap,
-        IsolationStep::CgroupV2,
-        IsolationStep::ReadOnlyRootfs,
-        IsolationStep::Workspace,
-        IsolationStep::LimitedTmpfs,
-        IsolationStep::MaskProc,
-        IsolationStep::MaskDevices,
-        IsolationStep::CloseInheritedFileDescriptors,
-        IsolationStep::Landlock,
-        IsolationStep::DropCapabilities,
-        IsolationStep::NoNewPrivs,
-        IsolationStep::Seccomp,
-    ]
+    REQUIRED_STEPS
 }
 
 #[cfg(test)]
 mod tests {
-    use super::IsolationStep;
+    use super::{
+        BackendError, ChildProcessError, ChildStartupStatus, IsolationError, IsolationStep,
+        NamespaceIdentity, REQUIRED_STEPS, STARTUP_MESSAGE_VERSION, decode_startup_status,
+        encode_startup_failure, encode_startup_ready,
+    };
 
     #[test]
     fn irreversible_apply_attempt_requires_process_termination() {
@@ -670,5 +1300,48 @@ mod tests {
     #[test]
     fn reversible_apply_attempt_does_not_itself_require_process_termination() {
         assert!(!IsolationStep::Workspace.is_irreversible());
+    }
+
+    #[test]
+    fn ready_status_attests_the_exact_final_boundary() {
+        let namespace = NamespaceIdentity::from_kernel(4, 81);
+        let status = decode_startup_status(encode_startup_ready(namespace))
+            .expect("internally encoded status must decode");
+        let ChildStartupStatus::Ready(ready) = status else {
+            panic!("ready encoding must not decode as failure");
+        };
+        assert_eq!(ready.pid_namespace(), namespace);
+        assert_eq!(ChildStartupReady::completed_steps(), &REQUIRED_STEPS);
+    }
+
+    #[test]
+    fn failure_status_preserves_parent_actionable_fields() {
+        let error = IsolationError::TerminationRequired {
+            original: BackendError::new(IsolationStep::Landlock, "denied", Some(libc::EACCES)),
+            failures: vec![BackendError::new(
+                IsolationStep::Workspace,
+                "unmount failed",
+                Some(libc::EBUSY),
+            )],
+        };
+        let status = decode_startup_status(encode_startup_failure(&error))
+            .expect("internally encoded status must decode");
+        let ChildStartupStatus::Failed(failure) = status else {
+            panic!("failure encoding must not decode as ready");
+        };
+        assert_eq!(failure.step(), IsolationStep::Landlock);
+        assert_eq!(failure.errno(), Some(libc::EACCES));
+        assert_eq!(failure.rollback_failure_count(), 1);
+        assert!(failure.termination_required());
+    }
+
+    #[test]
+    fn malformed_ready_status_is_rejected() {
+        let mut message = encode_startup_ready(NamespaceIdentity::from_kernel(4, 81));
+        message[4] = STARTUP_MESSAGE_VERSION.wrapping_add(1);
+        assert!(matches!(
+            decode_startup_status(message),
+            Err(ChildProcessError::InvalidStartupStatus(_))
+        ));
     }
 }

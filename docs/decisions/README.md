@@ -10,6 +10,24 @@
 
 実装が現在どうなっているかは各 crate の文書、なぜその構造にしたかは決定記録が正である。両者が食い違って見える場合、実装が変わって ADR が `Superseded` にされていない可能性を先に疑う。
 
+## 記録の状態
+
+ADR は追記のみで、内容を書き換えない。覆すときは新しい記録を書いて元の `Status` を変える。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Proposed: 決定を検討中
+    Proposed --> Accepted: 採用した日付を入れる
+    Accepted --> Superseded: 後継 ADR がこの決定を置き換えた
+    Accepted --> Deprecated: 前提が消えて不要になった
+    Superseded --> [*]
+    Deprecated --> [*]
+    note right of Accepted
+        本文はこれ以降編集しない。
+        古くなったら新しい ADR を書く。
+    end note
+```
+
 ## 運用
 
 | 項目 | 規約 |
@@ -28,31 +46,28 @@
 | ADR | 決定 | Status |
 |---|---|---|
 | [0000](0000-record-architecture-decisions.md) | 設計判断を MADR 形式の決定記録として残す | Accepted |
+| [0001](0001-limit-path-patterns-to-exact-and-prefix.md) | `PathPattern` を `Exact` と `Prefix` の 2 種類に限定する | Accepted |
+| [0002](0002-split-file-permissions-into-ten-effects.md) | file の権限を 10 種の `FileEffect` に分割する | Accepted |
+| [0003](0003-require-repository-and-path-match-for-empty-effects.md) | 空 effect の子にも repository と path の一致を要求する | Accepted |
+| [0004](0004-implement-authorization-twice-and-compare-with-a-corpus.md) | 認可判定を Rust と Lean で二重に実装し、共通 corpus で突き合わせる | Accepted |
+| [0005](0005-separate-object-identity-from-path.md) | object の identity を path から分離し `ObjectId` で持つ | Accepted |
+| [0006](0006-never-reuse-object-node-and-capability-ids.md) | `ObjectId`、`nodeid`、capability ID を再利用しない | Accepted |
+| [0007](0007-use-direct-io-so-revocation-cannot-be-bypassed.md) | FUSE adapter を Direct-I/O にし、page cache に revoke を迂回させない | Accepted |
+| [0008](0008-expose-only-typed-closed-operations-from-the-broker.md) | Broker は型付きの閉じた操作だけを公開する | Accepted |
+| [0009](0009-reject-the-whole-dns-answer-on-any-non-public-address.md) | DNS 応答に非 public address が 1 つでもあれば応答全体を拒否する | Accepted |
+| [0010](0010-re-resolve-and-re-authorize-on-every-redirect.md) | redirect のたびに DNS を再解決し、同じ authority で再認可する | Accepted |
+| [0011](0011-require-an-expected-old-object-plan-for-publish-branch.md) | `PublishBranch` に expected-old object の plan を必須とする | Accepted |
+| [0012](0012-check-frame-length-before-allocating-the-payload.md) | frame 長を payload 確保の前に検査する | Accepted |
+| [0013](0013-resolve-caller-identity-from-the-connection.md) | caller identity を受理済み connection から解決する | Accepted |
+| [0014](0014-keep-the-workspace-when-vm-kill-fails.md) | VM kill が失敗した場合に workspace isolation を実行しない | Accepted |
+| [0015](0015-persist-the-identity-ledger-across-restarts.md) | identity ledger を永続化し、restart をまたいで非再利用にする | Accepted |
+| [0016](0016-terminate-the-child-after-an-unrollbackable-isolation-failure.md) | rollback 不可能な isolation step の失敗後は child を終了させる | Accepted |
 
-## 遡って記録する対象
+## 遡及分について
 
-[0000](0000-record-architecture-decisions.md) の決定に従い、既存の主要な設計判断を遡って ADR 化する。対象は次のとおりで、上から順に書く。当時の議論記録が無いため、実装・コメント・既存文書から再構成した内容になる。
+0001 から 0016 は、決定当時の議論記録が無いため、実装・コメント・既存文書から再構成したものである。**採用しなかった案は、当時実際に検討されたものとは限らない。** 実装の形が排除している設計を、その理由とともに書き起こしてある。
 
-| 予定番号 | 決定 | 主な出典 |
-|---|---|---|
-| 0001 | `PathPattern` を `Exact` と `Prefix` の 2 種類に限定する | [パスモデル](../authority-core/paths.md) |
-| 0002 | file の権限を単一の read/write ではなく 10 種の `FileEffect` に分割する | [File authority](../authority-core/file-authorities.md) |
-| 0003 | 空 effect の子に対しても構造判定で repository と path の一致を要求する | [File authority](../authority-core/file-authorities.md) |
-| 0004 | 認可判定を Rust と Lean で二重に実装し、共通 corpus で突き合わせる | [検証とテスト](../authority-core/verification.md) |
-| 0005 | object の identity を path から分離し `ObjectId` で持つ | [共有 namespace registry](../capfs/namespace-registry.md) |
-| 0006 | `ObjectId`、`nodeid`、capability ID を再利用しない | [mount ごとの node table](../capfs/node-tables.md) |
-| 0007 | FUSE adapter を Direct-I/O にし、page cache に revoke を迂回させない | [Direct-I/O FUSE adapter](../capfs/read-only-fuse.md) |
-| 0008 | Broker は型付きの閉じた操作だけを公開し、生 URL と任意 HTTP メソッドを持たない | [Host Egress Broker](../egress-broker/README.md) |
-| 0009 | DNS 応答に非 public address が 1 つでも含まれれば応答全体を拒否する | [公開 HTTPS policy](../egress-broker/network-policy.md) |
-| 0010 | redirect ごとに DNS を再解決し、同じ HTTP authority で再検査する | [公開 HTTPS policy](../egress-broker/network-policy.md) |
-| 0011 | `PublishBranch` に expected-old object の plan を必須とし `force: false` で更新する | [GitHub 型付き adapter](../egress-broker/github.md) |
-| 0012 | wire 境界を bounded frame とし、payload 確保前に長さを検査する | [transport 契約](../egress-broker/transport.md) |
-| 0013 | caller identity を受理済み connection から解決し、wire 上の claim を認可に使わない | [Supervisor adapter](../supervisor/README.md) |
-| 0014 | VM kill が失敗した場合に workspace isolation を実行しない | [Session orchestrator](../session-orchestrator/README.md) |
-| 0015 | production host の identity ledger を永続化し、restart をまたいで非再利用にする | [Session orchestrator](../session-orchestrator/README.md) |
-| 0016 | rollback 不可能な isolation step の失敗後は child を再利用せず終了させる | [13 step の固定順序と rollback](../runtime-isolation/apply-order.md) |
-
-この表は着手前の一覧であり、書き終えた ADR は上の決定一覧へ移す。実際に書く段階で、複数の項目が 1 つの決定にまとまる場合や、逆に分割が必要になる場合がある。
+これから新しく決める分は `Proposed` から始め、採用日を入れて `Accepted` にする。
 
 ## 関連
 

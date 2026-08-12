@@ -229,8 +229,9 @@ impl CapabilityExecutor for CapabilityKernel {
             EffectCommitError::LockPoisoned => ExecutorError::LockPoisoned,
             EffectCommitError::Effect(error) => ExecutorError::Adapter(error),
             EffectCommitError::Audit(_) => ExecutorError::AuditUnavailable,
-            EffectCommitError::CommittedButAudit(_) => ExecutorError::CommittedButUnrecorded,
-            EffectCommitError::CommitUnknown | EffectCommitError::CommitUnknownAndAudit(_) => {
+            EffectCommitError::CommittedButAudit { .. } => ExecutorError::CommittedButUnrecorded,
+            EffectCommitError::CommitUnknown { .. }
+            | EffectCommitError::CommitUnknownAndAudit { .. } => {
                 ExecutorError::CommittedButUnrecorded
             }
         })

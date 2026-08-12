@@ -88,6 +88,9 @@ def parseEffect (value label : String) : Except String FileEffect :=
   | "remove_directory" => .ok .removeDirectory
   | "rename" => .ok .rename
   | "set_metadata" => .ok .setMetadata
+  | "read_link" => .ok .readLink
+  | "create_symlink" => .ok .createSymlink
+  | "create_hard_link" => .ok .createHardLink
   | _ => .error s!"invalid {label} `{value}`; expected a file effect"
 
 def parseEffectList (values : List String) (label : String) : Except String (List FileEffect) :=

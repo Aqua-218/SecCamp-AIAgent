@@ -13,9 +13,11 @@ use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +25,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{CWD, Mode, OFlags, RenameFlags, open, openat, renameat_with, statfs};
+use rustix::fs::{
+    CWD, Mode, OFlags, RenameFlags, fcntl_getfl, fcntl_setfl, open, openat, renameat_with, statfs,
+};
 use sha2::{Digest, Sha256};
 
 const REQUIRED_BLOCKED_SYSCALLS: [&str; 8] = [
@@ -48,7 +52,9 @@ pub const MAX_WORKSPACE_DEPTH: usize = 64;
 /// Maximum aggregate regular-file bytes copied into one workspace.
 pub const MAX_WORKSPACE_BYTES: u64 = 1 << 30;
 const ID_LENGTH: usize = 16;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
 
 /// A SHA-256 digest used to pin every executable and guest artifact.
@@ -960,7 +966,10 @@ pub struct ApiResponse {
     pub body: String,
 }
 
-/// Boundary for Firecracker or guest-supervisor API calls.
+/// Raw transport boundary for Firecracker or guest-supervisor API calls.
+///
+/// Guest lifecycle authorization is not delegated to this trait: [`Runtime`] validates the
+/// challenge and all five identity fields in each guest acknowledgement before changing state.
 pub trait ApiClient {
     /// Sends one request and returns its status and body.
     ///
@@ -1016,6 +1025,12 @@ impl UnixApiClient {
             socket,
             timeout: Duration::from_secs(5),
         })
+    }
+
+    /// Returns the exact Unix socket used for Firecracker API requests.
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket
     }
 
     /// Sets the bounded read/write timeout used for each API call.
@@ -1197,22 +1212,7 @@ fn is_http_token(byte: u8) -> bool {
 
 impl ApiClient for UnixApiClient {
     fn request(&mut self, request: &ApiRequest) -> Result<ApiResponse, RuntimeError> {
-        if !request.path.starts_with('/')
-            || request
-                .path
-                .chars()
-                .any(|character| character.is_ascii_control() || character == ' ')
-        {
-            return Err(RuntimeError::Api(
-                "API path must be an absolute token".to_owned(),
-            ));
-        }
-        let body = request.body.as_bytes();
-        if body.len() > MAX_HTTP_BODY_BYTES {
-            return Err(RuntimeError::Api(format!(
-                "API request body exceeds {MAX_HTTP_BODY_BYTES}-byte safety limit"
-            )));
-        }
+        validate_api_request(request)?;
         let mut stream = UnixStream::connect(&self.socket).map_err(RuntimeError::from)?;
         stream
             .set_read_timeout(Some(self.timeout))
@@ -1220,23 +1220,183 @@ impl ApiClient for UnixApiClient {
         stream
             .set_write_timeout(Some(self.timeout))
             .map_err(RuntimeError::from)?;
-        let message = format!(
-            "{} {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-            request.method.as_str(),
-            request.path,
-            body.len()
-        );
-        stream
-            .write_all(message.as_bytes())
-            .map_err(RuntimeError::from)?;
-        stream.write_all(body).map_err(RuntimeError::from)?;
-        Self::read_response(&mut stream)
+        request_over_stream(&mut stream, request)
     }
+}
+
+/// Production guest-control client over Firecracker's host-initiated vsock UDS protocol.
+///
+/// The UDS path and guest CID are the exact values exported and verified from Firecracker's VM
+/// configuration. The explicit guest port selects the guest supervisor listener; no factory can
+/// substitute another in-process [`ApiClient`].
+pub struct FirecrackerVsockApiClient {
+    uds_path: PathBuf,
+    guest_cid: u32,
+    guest_port: u32,
+    timeout: Duration,
+}
+
+impl FirecrackerVsockApiClient {
+    /// Seals one exact Firecracker vsock device and guest supervisor port.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::InvalidConfig`] for a non-absolute UDS path, reserved guest CID,
+    /// zero guest port, or the wildcard port value.
+    pub fn new(
+        uds_path: impl Into<PathBuf>,
+        guest_cid: u32,
+        guest_port: u32,
+    ) -> Result<Self, RuntimeError> {
+        let uds_path = uds_path.into();
+        validate_absolute_path("guest-control vsock UDS", &uds_path)?;
+        if guest_cid < 3 {
+            return Err(RuntimeError::InvalidConfig(
+                "guest-control CID must be at least 3".to_owned(),
+            ));
+        }
+        if guest_port == 0 || guest_port == u32::MAX {
+            return Err(RuntimeError::InvalidConfig(
+                "guest-control vsock port must be explicit, non-zero, and non-wildcard".to_owned(),
+            ));
+        }
+        Ok(Self {
+            uds_path,
+            guest_cid,
+            guest_port,
+            timeout: Duration::from_secs(5),
+        })
+    }
+
+    /// Returns the exact Firecracker UDS path.
+    #[must_use]
+    pub fn uds_path(&self) -> &Path {
+        &self.uds_path
+    }
+
+    /// Returns the guest CID bound by Firecracker's exported VM configuration.
+    #[must_use]
+    pub const fn guest_cid(&self) -> u32 {
+        self.guest_cid
+    }
+
+    /// Returns the fixed guest supervisor port.
+    #[must_use]
+    pub const fn guest_port(&self) -> u32 {
+        self.guest_port
+    }
+
+    /// Sets the bounded handshake and HTTP timeout used for each control call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::InvalidConfig`] when `timeout` is zero.
+    pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, RuntimeError> {
+        if timeout.is_zero() {
+            return Err(RuntimeError::InvalidConfig(
+                "guest-control timeout must be non-zero".to_owned(),
+            ));
+        }
+        self.timeout = timeout;
+        Ok(self)
+    }
+
+    fn connect(&self) -> Result<UnixStream, RuntimeError> {
+        const HANDSHAKE_LIMIT: usize = 64;
+        let mut stream = UnixStream::connect(&self.uds_path).map_err(RuntimeError::from)?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .map_err(RuntimeError::from)?;
+        stream
+            .set_write_timeout(Some(self.timeout))
+            .map_err(RuntimeError::from)?;
+        writeln!(stream, "CONNECT {}", self.guest_port).map_err(RuntimeError::from)?;
+        stream.flush().map_err(RuntimeError::from)?;
+
+        let mut acknowledgement = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            stream.read_exact(&mut byte).map_err(RuntimeError::from)?;
+            acknowledgement.push(byte[0]);
+            if acknowledgement.len() > HANDSHAKE_LIMIT {
+                return Err(RuntimeError::Api(
+                    "Firecracker vsock acknowledgement exceeds safety limit".to_owned(),
+                ));
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        let acknowledgement = std::str::from_utf8(&acknowledgement).map_err(|_| {
+            RuntimeError::Api("Firecracker vsock acknowledgement is not UTF-8".to_owned())
+        })?;
+        let assigned_port = acknowledgement
+            .strip_prefix("OK ")
+            .and_then(|value| value.strip_suffix('\n'))
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|port| *port != 0 && *port != u32::MAX)
+            .ok_or_else(|| {
+                RuntimeError::Api(
+                    "Firecracker vsock returned an invalid connection acknowledgement".to_owned(),
+                )
+            })?;
+        let _ = assigned_port;
+        Ok(stream)
+    }
+}
+
+impl ApiClient for FirecrackerVsockApiClient {
+    fn request(&mut self, request: &ApiRequest) -> Result<ApiResponse, RuntimeError> {
+        validate_api_request(request)?;
+        let mut stream = self.connect()?;
+        request_over_stream(&mut stream, request)
+    }
+}
+
+fn validate_api_request(request: &ApiRequest) -> Result<(), RuntimeError> {
+    if !request.path.starts_with('/')
+        || request
+            .path
+            .chars()
+            .any(|character| character.is_ascii_control() || character == ' ')
+    {
+        return Err(RuntimeError::Api(
+            "API path must be an absolute token".to_owned(),
+        ));
+    }
+    let body = request.body.as_bytes();
+    if body.len() > MAX_HTTP_BODY_BYTES {
+        return Err(RuntimeError::Api(format!(
+            "API request body exceeds {MAX_HTTP_BODY_BYTES}-byte safety limit"
+        )));
+    }
+    Ok(())
+}
+
+fn request_over_stream(
+    stream: &mut UnixStream,
+    request: &ApiRequest,
+) -> Result<ApiResponse, RuntimeError> {
+    validate_api_request(request)?;
+    let body = request.body.as_bytes();
+    let message = format!(
+        "{} {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        request.method.as_str(),
+        request.path,
+        body.len()
+    );
+    stream
+        .write_all(message.as_bytes())
+        .map_err(RuntimeError::from)?;
+    stream.write_all(body).map_err(RuntimeError::from)?;
+    UnixApiClient::read_response(stream)
 }
 
 /// Production command runner backed by `std::process::Command`.
 pub struct RealCommandRunner {
     children: HashMap<u32, ManagedChild>,
+    command_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -1265,6 +1425,15 @@ impl RealCommandRunner {
     pub fn new() -> Self {
         Self {
             children: HashMap::new(),
+            command_timeout: COMMAND_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_command_timeout(command_timeout: Duration) -> Self {
+        Self {
+            children: HashMap::new(),
+            command_timeout,
         }
     }
 
@@ -1316,6 +1485,7 @@ impl CommandOutputStream {
 #[derive(Debug)]
 enum BoundedReadError {
     LimitExceeded,
+    DeadlineExceeded,
     Io(String),
 }
 
@@ -1325,13 +1495,23 @@ struct BoundedReadResult {
     error: Option<BoundedReadError>,
 }
 
-fn read_bounded<R: Read>(mut reader: R) -> BoundedReadResult {
+fn read_bounded<R: Read>(mut reader: R, deadline: Instant) -> BoundedReadResult {
     let mut bytes = Vec::with_capacity(MAX_COMMAND_OUTPUT_BYTES.min(COMMAND_READ_CHUNK_BYTES));
     let mut buffer = [0_u8; COMMAND_READ_CHUNK_BYTES];
     loop {
+        if Instant::now() >= deadline {
+            return BoundedReadResult {
+                bytes,
+                error: Some(BoundedReadError::DeadlineExceeded),
+            };
+        }
         let count = match reader.read(&mut buffer) {
             Ok(count) => count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(PROCESS_POLL_INTERVAL);
+                continue;
+            }
             Err(error) => {
                 return BoundedReadResult {
                     bytes,
@@ -1357,49 +1537,197 @@ fn read_bounded<R: Read>(mut reader: R) -> BoundedReadResult {
 fn spawn_command_reader<R: Read + Send + 'static>(
     stream: CommandOutputStream,
     reader: R,
+    deadline: Instant,
     sender: mpsc::Sender<(CommandOutputStream, bool)>,
-) -> thread::JoinHandle<BoundedReadResult> {
-    thread::spawn(move || {
-        let result = read_bounded(reader);
-        let _ = sender.send((stream, result.error.is_some()));
-        result
-    })
+) -> io::Result<thread::JoinHandle<BoundedReadResult>> {
+    thread::Builder::new()
+        .name(format!("command-{}-reader", stream.name()))
+        .spawn(move || {
+            let result = read_bounded(reader, deadline);
+            let _ = sender.send((stream, result.error.is_some()));
+            result
+        })
+}
+
+fn set_nonblocking(stream: impl AsFd) -> Result<(), RuntimeError> {
+    let flags = fcntl_getfl(&stream).map_err(|error| RuntimeError::Io(error.to_string()))?;
+    fcntl_setfl(&stream, flags | OFlags::NONBLOCK)
+        .map_err(|error| RuntimeError::Io(error.to_string()))
+}
+
+unsafe extern "C" {
+    #[link_name = "kill"]
+    fn kill_process(process: i32, signal: i32) -> i32;
+}
+
+fn signal_process_group(pid: u32) -> Result<(), RuntimeError> {
+    const SIGKILL: i32 = 9;
+    const ESRCH: i32 = 3;
+    let process_group = i32::try_from(pid).map_err(|_| {
+        RuntimeError::Command(format!("process identifier {pid} exceeds platform range"))
+    })?;
+    // SAFETY: `kill` takes two plain integers. The negative, validated child PID names the
+    // process group created for this child, and SIGKILL requires no borrowed memory.
+    if unsafe { kill_process(-process_group, SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ESRCH) {
+        Ok(())
+    } else {
+        Err(RuntimeError::Command(format!(
+            "killing process group {pid} failed: {error}"
+        )))
+    }
+}
+
+fn reap_child_until(
+    child: &mut Child,
+    pid: u32,
+    deadline: Instant,
+) -> Result<ExitStatus, RuntimeError> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(PROCESS_POLL_INTERVAL),
+            Ok(None) => {
+                return Err(RuntimeError::Command(format!(
+                    "process {pid} did not exit before the cleanup deadline"
+                )));
+            }
+            Err(error) => {
+                return Err(RuntimeError::Command(format!(
+                    "checking process {pid} during cleanup failed: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn stop_process_group_until(
+    child: &mut Child,
+    pid: u32,
+    deadline: Instant,
+) -> Result<ExitStatus, RuntimeError> {
+    let group_result = signal_process_group(pid);
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            group_result?;
+            return Ok(status);
+        }
+        Ok(None) => {
+            if let Err(kill_error) = child.kill()
+                && group_result.is_err()
+            {
+                return Err(RuntimeError::Command(format!(
+                    "stopping process {pid} failed: {kill_error}; {}",
+                    group_result.expect_err("checked as an error")
+                )));
+            }
+        }
+        Err(error) => {
+            return Err(RuntimeError::Command(format!(
+                "checking process {pid} before termination failed: {error}"
+            )));
+        }
+    }
+    let status = reap_child_until(child, pid, deadline)?;
+    group_result?;
+    Ok(status)
+}
+
+#[cold]
+fn abort_cleanup(_context: &str, _error: &RuntimeError) -> ! {
+    // Diagnostics must not turn fail-stop into an unbounded write to an inherited stderr pipe.
+    std::process::abort();
+}
+
+struct CommandChild {
+    child: Child,
+    cleanup_required: bool,
+}
+
+impl CommandChild {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            cleanup_required: true,
+        }
+    }
+}
+
+impl Drop for CommandChild {
+    fn drop(&mut self) {
+        if !self.cleanup_required {
+            return;
+        }
+        let pid = self.child.id();
+        if let Err(error) =
+            stop_process_group_until(&mut self.child, pid, Instant::now() + PROCESS_STOP_TIMEOUT)
+        {
+            abort_cleanup("dropping an active command", &error);
+        }
+    }
 }
 
 fn monitor_command(
     child: &mut Child,
     receiver: &mpsc::Receiver<(CommandOutputStream, bool)>,
+    deadline: Instant,
 ) -> Result<ExitStatus, String> {
-    let terminate = loop {
+    let pid = child.id();
+    loop {
         let mut reader_error = false;
         while let Ok((_stream, has_error)) = receiver.try_recv() {
             reader_error |= has_error;
         }
         if reader_error {
-            break true;
+            return stop_process_group_until(child, pid, Instant::now() + PROCESS_STOP_TIMEOUT)
+                .map_err(|error| {
+                    abort_cleanup("stopping a command after capture failure", &error)
+                });
+        }
+        if Instant::now() >= deadline {
+            stop_process_group_until(child, pid, Instant::now() + PROCESS_STOP_TIMEOUT)
+                .unwrap_or_else(|error| abort_cleanup("stopping a command after timeout", &error));
+            return Err("execution deadline exceeded".to_owned());
         }
         match child.try_wait() {
-            Ok(Some(_)) => break false,
-            Ok(None) => thread::sleep(Duration::from_millis(1)),
+            Ok(Some(status)) => {
+                signal_process_group(pid).unwrap_or_else(|error| {
+                    abort_cleanup("stopping descendants of a completed command", &error)
+                });
+                return Ok(status);
+            }
+            Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
             Err(error) => {
-                let _ = child.kill();
-                return match child.wait() {
-                    Ok(_) => Err(error.to_string()),
-                    Err(wait_error) => Err(format!("{error}; reaping child failed: {wait_error}")),
-                };
+                stop_process_group_until(child, pid, Instant::now() + PROCESS_STOP_TIMEOUT)
+                    .unwrap_or_else(|cleanup_error| {
+                        abort_cleanup("stopping a command after wait failure", &cleanup_error)
+                    });
+                return Err(error.to_string());
             }
         }
-    };
-    if terminate {
-        let _ = child.kill();
     }
-    child.wait().map_err(|error| error.to_string())
 }
 
 fn join_command_reader(
     reader: thread::JoinHandle<BoundedReadResult>,
     stream: CommandOutputStream,
+    deadline: Instant,
 ) -> Result<BoundedReadResult, RuntimeError> {
+    while !reader.is_finished() {
+        if Instant::now() >= deadline {
+            abort_cleanup(
+                "waiting for a command output reader",
+                &RuntimeError::Command(format!(
+                    "{} reader did not stop before the cleanup deadline",
+                    stream.name()
+                )),
+            );
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL);
+    }
     reader
         .join()
         .map_err(|_| RuntimeError::Command(format!("{} reader thread panicked", stream.name())))
@@ -1416,6 +1744,9 @@ fn command_output_error(readers: &[BoundedReadResult; 2]) -> Option<String> {
                     "{} exceeds {MAX_COMMAND_OUTPUT_BYTES}-byte safety limit",
                     stream.name()
                 ),
+                BoundedReadError::DeadlineExceeded => {
+                    format!("{} capture exceeded the command deadline", stream.name())
+                }
                 BoundedReadError::Io(message) => {
                     format!("{} capture failed: {message}", stream.name())
                 }
@@ -1427,13 +1758,14 @@ fn command_output_error(readers: &[BoundedReadResult; 2]) -> Option<String> {
 }
 
 fn spawn_detached(command: &CommandSpec) -> Result<Child, RuntimeError> {
-    Command::new(&command.program)
+    let mut process = Command::new(&command.program);
+    process
         .args(&command.args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map_err(RuntimeError::from)
+        .process_group(0);
+    process.spawn().map_err(RuntimeError::from)
 }
 
 fn open_owned_cgroup_file(
@@ -1537,25 +1869,14 @@ fn digest_reader(mut reader: impl Read) -> Result<Sha256Digest, RuntimeError> {
     }
 }
 
-fn reap_launcher(launcher: &mut Child, pid: u32) -> Result<(), RuntimeError> {
+fn reap_launcher_until(
+    launcher: &mut Child,
+    pid: u32,
+    deadline: Instant,
+) -> Result<(), RuntimeError> {
     match launcher.try_wait() {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => {
-            if let Err(kill_error) = launcher.kill() {
-                return match launcher.try_wait() {
-                    Ok(Some(_)) => Ok(()),
-                    Ok(None) => Err(RuntimeError::Command(format!(
-                        "killing launcher {pid} failed: {kill_error}"
-                    ))),
-                    Err(wait_error) => Err(RuntimeError::Command(format!(
-                        "killing launcher {pid} failed: {kill_error}; checking exit state failed: {wait_error}"
-                    ))),
-                };
-            }
-            launcher.wait().map(|_| ()).map_err(|error| {
-                RuntimeError::Command(format!("waiting for launcher {pid} failed: {error}"))
-            })
-        }
+        Ok(Some(_)) => signal_process_group(pid),
+        Ok(None) => stop_process_group_until(launcher, pid, deadline).map(|_| ()),
         Err(error) => Err(RuntimeError::Command(format!(
             "checking launcher {pid} failed: {error}"
         ))),
@@ -1584,12 +1905,13 @@ fn stop_pending_owned(
     launcher: &mut Child,
     pid: u32,
     ownership: &ProcessOwnership,
+    deadline: Instant,
 ) -> Result<(), RuntimeError> {
     // Once the launcher is reaped it cannot create another cgroup. Observe the exact expected
     // scope afterwards and kill every task if the jailer created it before exiting.
-    reap_launcher(launcher, pid)?;
+    reap_launcher_until(launcher, pid, deadline)?;
     if let Some(owned_cgroup) = observe_owned_cgroup(ownership)? {
-        stop_owned_cgroup(launcher, pid, &owned_cgroup)?;
+        stop_owned_cgroup(launcher, pid, &owned_cgroup, deadline)?;
     }
     Ok(())
 }
@@ -1598,6 +1920,7 @@ fn stop_owned_cgroup(
     launcher: &mut Child,
     pid: u32,
     ownership: &OwnedCgroup,
+    deadline: Instant,
 ) -> Result<(), RuntimeError> {
     let tasks = cgroup_tasks(ownership)?;
     if !tasks.is_empty() {
@@ -1608,7 +1931,6 @@ fn stop_owned_cgroup(
                 ownership.path.display()
             ))
         })?;
-        let deadline = Instant::now() + PROCESS_STOP_TIMEOUT;
         loop {
             if cgroup_tasks(ownership)?.is_empty() {
                 break;
@@ -1619,10 +1941,10 @@ fn stop_owned_cgroup(
                     ownership.path.display()
                 )));
             }
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(PROCESS_POLL_INTERVAL);
         }
     }
-    reap_launcher(launcher, pid)?;
+    reap_launcher_until(launcher, pid, deadline)?;
     if !cgroup_tasks(ownership)?.is_empty() {
         return Err(RuntimeError::Command(format!(
             "owned cgroup {} gained a live task during cleanup",
@@ -1654,32 +1976,90 @@ fn stop_owned_cgroup(
     Ok(())
 }
 
+fn stop_managed_child(
+    managed: &mut ManagedChild,
+    pid: u32,
+    deadline: Instant,
+) -> Result<(), RuntimeError> {
+    match managed {
+        ManagedChild::Direct(child) => reap_launcher_until(child, pid, deadline),
+        ManagedChild::PendingOwned {
+            launcher,
+            ownership,
+        } => stop_pending_owned(launcher, pid, ownership, deadline),
+        ManagedChild::Isolated {
+            launcher,
+            ownership,
+        } => stop_owned_cgroup(launcher, pid, ownership, deadline),
+    }
+}
+
 impl CommandRunner for RealCommandRunner {
     fn run(&mut self, command: &CommandSpec) -> Result<CommandOutput, RuntimeError> {
-        let mut child = Command::new(&command.program)
+        let deadline = Instant::now() + self.command_timeout;
+        let mut process = Command::new(&command.program);
+        process
             .args(&command.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
-            .map_err(RuntimeError::from)?;
+            .process_group(0);
+        let mut command_child = CommandChild::new(process.spawn().map_err(RuntimeError::from)?);
+        let child = &mut command_child.child;
+        let pid = child.id();
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| RuntimeError::Command("failed to capture command stdout".to_owned()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| RuntimeError::Command("failed to capture command stderr".to_owned()))?;
+        let Some(stdout) = child.stdout.take() else {
+            return Err(RuntimeError::Command(
+                "failed to capture command stdout".to_owned(),
+            ));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            return Err(RuntimeError::Command(
+                "failed to capture command stderr".to_owned(),
+            ));
+        };
+        set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr))?;
         let (sender, receiver) = mpsc::channel();
-        let stdout_reader =
-            spawn_command_reader(CommandOutputStream::Stdout, stdout, sender.clone());
-        let stderr_reader = spawn_command_reader(CommandOutputStream::Stderr, stderr, sender);
+        let stdout_reader = spawn_command_reader(
+            CommandOutputStream::Stdout,
+            stdout,
+            deadline,
+            sender.clone(),
+        )
+        .map_err(RuntimeError::from)?;
+        let stderr_reader =
+            match spawn_command_reader(CommandOutputStream::Stderr, stderr, deadline, sender) {
+                Ok(reader) => reader,
+                Err(error) => {
+                    stop_process_group_until(child, pid, Instant::now() + PROCESS_STOP_TIMEOUT)
+                        .unwrap_or_else(|cleanup_error| {
+                            abort_cleanup("recovering command reader setup", &cleanup_error)
+                        });
+                    command_child.cleanup_required = false;
+                    join_command_reader(
+                        stdout_reader,
+                        CommandOutputStream::Stdout,
+                        Instant::now() + PROCESS_STOP_TIMEOUT,
+                    )?;
+                    return Err(RuntimeError::from(error));
+                }
+            };
 
-        let wait_result = monitor_command(&mut child, &receiver);
-        let stdout_result = join_command_reader(stdout_reader, CommandOutputStream::Stdout)?;
-        let stderr_result = join_command_reader(stderr_reader, CommandOutputStream::Stderr)?;
+        let wait_result = monitor_command(child, &receiver, deadline);
+        command_child.cleanup_required = false;
+        let reader_cleanup_deadline = Instant::now() + PROCESS_STOP_TIMEOUT;
+        let stdout_result = join_command_reader(
+            stdout_reader,
+            CommandOutputStream::Stdout,
+            reader_cleanup_deadline,
+        );
+        let stderr_result = join_command_reader(
+            stderr_reader,
+            CommandOutputStream::Stderr,
+            reader_cleanup_deadline,
+        );
+        let stdout_result = stdout_result?;
+        let stderr_result = stderr_result?;
         let mut reader_results = [stdout_result, stderr_result];
         let output_error = command_output_error(&reader_results);
         if let Some(message) = output_error {
@@ -1898,21 +2278,29 @@ impl CommandRunner for RealCommandRunner {
             .children
             .get_mut(&process.pid)
             .ok_or_else(|| RuntimeError::Command(format!("unknown process {}", process.pid)))?;
-        let result = match managed {
-            ManagedChild::Direct(child) => reap_launcher(child, process.pid),
-            ManagedChild::PendingOwned {
-                launcher,
-                ownership,
-            } => stop_pending_owned(launcher, process.pid, ownership),
-            ManagedChild::Isolated {
-                launcher,
-                ownership,
-            } => stop_owned_cgroup(launcher, process.pid, ownership),
-        };
+        let result =
+            stop_managed_child(managed, process.pid, Instant::now() + PROCESS_STOP_TIMEOUT);
         if result.is_ok() {
             self.children.remove(&process.pid);
         }
         result
+    }
+}
+
+impl Drop for RealCommandRunner {
+    fn drop(&mut self) {
+        let mut first_failure = None;
+        for (&pid, managed) in &mut self.children {
+            if let Err(error) =
+                stop_managed_child(managed, pid, Instant::now() + PROCESS_STOP_TIMEOUT)
+            {
+                first_failure.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_failure {
+            abort_cleanup("dropping a command runner with owned processes", &error);
+        }
+        self.children.clear();
     }
 }
 
@@ -2964,6 +3352,23 @@ pub trait IdentitySource {
     /// Returns [`RuntimeError::InvalidIdentity`] when a fresh identity cannot be
     /// generated or is all zeroes.
     fn generate(&mut self) -> Result<IdentityId, RuntimeError>;
+
+    /// Returns a challenge bound to one fresh host-allocated identity bundle.
+    ///
+    /// The default is a domain-separated digest of all five already-fresh identities, so
+    /// callers that restore host-supplied identities do not silently allocate a sixth identity.
+    /// Production overrides this with independent kernel entropy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::StaleIdentity`] only if no distinct non-zero challenge can be
+    /// derived within the bounded counter space.
+    fn guest_control_challenge(
+        &mut self,
+        identities: &IdentityBundle,
+    ) -> Result<IdentityId, RuntimeError> {
+        derive_guest_control_challenge(identities)
+    }
 }
 
 /// Production identity source backed by the host kernel's entropy device.
@@ -2983,6 +3388,44 @@ impl IdentitySource for SystemIdentitySource {
         }
         Ok(IdentityId(bytes))
     }
+
+    fn guest_control_challenge(
+        &mut self,
+        identities: &IdentityBundle,
+    ) -> Result<IdentityId, RuntimeError> {
+        for _ in 0..16 {
+            let challenge = self.generate()?;
+            if !identities.ids().contains(&challenge) {
+                return Ok(challenge);
+            }
+        }
+        Err(RuntimeError::StaleIdentity(
+            "kernel entropy repeatedly reused a session identity for the guest-control challenge"
+                .to_owned(),
+        ))
+    }
+}
+
+fn derive_guest_control_challenge(identities: &IdentityBundle) -> Result<IdentityId, RuntimeError> {
+    let mut transcript = Vec::with_capacity(32 + ID_LENGTH * 5 + 1);
+    transcript.extend_from_slice(b"firecracker-guest-control-v1\0");
+    for identity in identities.ids() {
+        transcript.extend_from_slice(&identity.0);
+    }
+    for counter in 0_u8..=u8::MAX {
+        transcript.push(counter);
+        let digest = sha256(&transcript).as_bytes();
+        transcript.pop();
+        let mut bytes = [0_u8; ID_LENGTH];
+        bytes.copy_from_slice(&digest[..ID_LENGTH]);
+        let challenge = IdentityId(bytes);
+        if !challenge.is_zero() && !identities.ids().contains(&challenge) {
+            return Ok(challenge);
+        }
+    }
+    Err(RuntimeError::StaleIdentity(
+        "could not derive a distinct guest-control challenge".to_owned(),
+    ))
 }
 
 /// Unverified persisted snapshot manifest.
@@ -3066,8 +3509,8 @@ pub enum RuntimeState {
     RestoredStopped,
     /// Fresh identities were generated but not injected.
     IdentityRegenerated,
-    /// Fresh identities were acknowledged while the restored VM remains paused.
-    IdentityAcknowledgedPaused,
+    /// The VM resumed but the guest supervisor has not acknowledged the exact identity bundle.
+    IdentityResumedAwaitingAck,
     /// Fresh identities were injected; workload is still stopped.
     IdentityInjected,
     /// Workload start was explicitly requested after identity injection.
@@ -3090,6 +3533,7 @@ pub struct RuntimeInstance {
     restore_fingerprint: Sha256Digest,
     config_fingerprint: Sha256Digest,
     identities: Option<IdentityBundle>,
+    guest_control_challenge: Option<IdentityId>,
 }
 
 impl RuntimeInstance {
@@ -3126,6 +3570,15 @@ pub struct Runtime<C, F, A, G, I> {
     guest_client: G,
     identity_source: I,
     pending_cleanup: Option<PendingCleanup>,
+    // `Drop` cannot add adapter bounds that are absent from this public generic type. The only
+    // constructor seals the correctly monomorphized cleanup routine without changing its API.
+    drop_cleanup: fn(&mut Self),
+}
+
+impl<C, F, A, G, I> Drop for Runtime<C, F, A, G, I> {
+    fn drop(&mut self) {
+        (self.drop_cleanup)(self);
+    }
 }
 
 #[derive(Debug)]
@@ -3165,6 +3618,22 @@ where
             guest_client,
             identity_source,
             pending_cleanup: None,
+            drop_cleanup: Self::cleanup_before_drop,
+        }
+    }
+
+    fn cleanup_before_drop(&mut self) {
+        let Some(mut pending) = self.pending_cleanup.take() else {
+            return;
+        };
+        let failures = self.cleanup_pending(&mut pending);
+        if pending.process.is_some() {
+            let error = RuntimeError::Cleanup(if failures.is_empty() {
+                "owned process remained live after drop cleanup".to_owned()
+            } else {
+                failures.join("; ")
+            });
+            abort_cleanup("dropping a runtime with pending process cleanup", &error);
         }
     }
 
@@ -3260,6 +3729,7 @@ where
                 restore_fingerprint: config.snapshot_fingerprint(),
                 config_fingerprint: config.instance_fingerprint(),
                 identities: None,
+                guest_control_challenge: None,
             })
         })();
         match result {
@@ -3424,6 +3894,7 @@ where
                 restore_fingerprint: config.snapshot_fingerprint(),
                 config_fingerprint: config.instance_fingerprint(),
                 identities: Some(identities),
+                guest_control_challenge: None,
             })
         })();
         match result {
@@ -3530,6 +4001,7 @@ where
                 restore_fingerprint: config.snapshot_fingerprint(),
                 config_fingerprint: config.instance_fingerprint(),
                 identities: Some(identities),
+                guest_control_challenge: None,
             })
         })();
         match result {
@@ -3549,6 +4021,13 @@ where
 
     /// Injects regenerated identities and leaves the workload stopped.
     ///
+    /// The runtime explicitly resumes the guest supervisor while its workload remains gated, then
+    /// sends the bundle over the exact Firecracker vsock endpoint. The guest must return a
+    /// canonical acknowledgement containing `identity-injected`, the challenge, and the exact VM,
+    /// session, request, subject, and capability IDs, in this field order: `ack`, `challenge`,
+    /// `vm_id`, `session_id`, `request_id`, `subject_id`, `capability_id`. A successful HTTP status
+    /// without that complete acknowledgement leaves the workload gate closed.
+    ///
     /// # Errors
     ///
     /// Returns [`RuntimeError::InvalidState`] or [`RuntimeError::StaleIdentity`] when
@@ -3556,44 +4035,51 @@ where
     pub fn inject_identity(&mut self, instance: &mut RuntimeInstance) -> Result<(), RuntimeError> {
         if !matches!(
             instance.state,
-            RuntimeState::IdentityRegenerated | RuntimeState::IdentityAcknowledgedPaused
+            RuntimeState::IdentityRegenerated | RuntimeState::IdentityResumedAwaitingAck
         ) {
             return Err(RuntimeError::InvalidState {
-                expected: "IdentityRegenerated or IdentityAcknowledgedPaused".to_owned(),
+                expected: "IdentityRegenerated or IdentityResumedAwaitingAck".to_owned(),
                 actual: format!("{:?}", instance.state),
             });
         }
         if instance.state == RuntimeState::IdentityRegenerated {
-            let identities = instance.identities.as_ref().ok_or_else(|| {
+            let identities = instance.identities.clone().ok_or_else(|| {
                 RuntimeError::StaleIdentity(
                     "identity regeneration state has no identity bundle".to_owned(),
                 )
             })?;
-            self.control_call(ApiRequest {
+            self.guest_control_challenge(instance, &identities)?;
+            self.api_call(ApiRequest {
+                method: HttpMethod::Patch,
+                path: "/vm".to_owned(),
+                body: r#"{"state":"Resumed"}"#.to_owned(),
+            })?;
+            instance.state = RuntimeState::IdentityResumedAwaitingAck;
+        }
+        self.command_runner.verify_running(instance.process)?;
+        let identities = instance.identities.clone().ok_or_else(|| {
+            RuntimeError::StaleIdentity("resumed VM has no identity bundle".to_owned())
+        })?;
+        let challenge = instance.guest_control_challenge.ok_or_else(|| {
+            RuntimeError::StaleIdentity("resumed VM has no guest-control challenge".to_owned())
+        })?;
+        self.control_call_with_identity_ack(
+            ApiRequest {
                 method: HttpMethod::Put,
                 path: "/actions/inject-identity".to_owned(),
-                body: format!(
-                    "{{\"vm_id\":{},\"session_id\":{},\"request_id\":{},\"subject_id\":{},\"capability_id\":{}}}",
-                    json_string(&identities.vm_id.to_hex()),
-                    json_string(&identities.session_id.to_hex()),
-                    json_string(&identities.request_id.to_hex()),
-                    json_string(&identities.subject_id.to_hex()),
-                    json_string(&identities.capability_id.to_hex())
-                ),
-            })?;
-            instance.state = RuntimeState::IdentityAcknowledgedPaused;
-        }
-        self.api_call(ApiRequest {
-            method: HttpMethod::Patch,
-            path: "/vm".to_owned(),
-            body: r#"{"state":"Resumed"}"#.to_owned(),
-        })?;
-        self.command_runner.verify_running(instance.process)?;
+                body: guest_control_request_body(challenge, &identities),
+            },
+            &guest_control_ack_body("identity-injected", challenge, &identities),
+        )?;
         instance.state = RuntimeState::IdentityInjected;
         Ok(())
     }
 
     /// Starts workload execution only after identity injection has succeeded.
+    ///
+    /// The guest must return the same challenge and five identities with a canonical
+    /// `workload-started` acknowledgement. The runtime does not enter [`RuntimeState::Running`]
+    /// on an unbound or replayed response.
     ///
     /// # Errors
     ///
@@ -3606,11 +4092,22 @@ where
                 actual: format!("{:?}", instance.state),
             });
         }
-        self.control_call(ApiRequest {
-            method: HttpMethod::Put,
-            path: "/actions/start-workload".to_owned(),
-            body: "{}".to_owned(),
+        let identities = instance.identities.clone().ok_or_else(|| {
+            RuntimeError::StaleIdentity("identity-injected state has no identity bundle".to_owned())
         })?;
+        let challenge = instance.guest_control_challenge.ok_or_else(|| {
+            RuntimeError::StaleIdentity(
+                "identity-injected state has no guest-control challenge".to_owned(),
+            )
+        })?;
+        self.control_call_with_identity_ack(
+            ApiRequest {
+                method: HttpMethod::Put,
+                path: "/actions/start-workload".to_owned(),
+                body: guest_control_request_body(challenge, &identities),
+            },
+            &guest_control_ack_body("workload-started", challenge, &identities),
+        )?;
         instance.state = RuntimeState::Running;
         Ok(())
     }
@@ -3907,7 +4404,34 @@ where
         Ok(())
     }
 
-    fn control_call(&mut self, request: ApiRequest) -> Result<(), RuntimeError> {
+    fn guest_control_challenge(
+        &mut self,
+        instance: &mut RuntimeInstance,
+        identities: &IdentityBundle,
+    ) -> Result<IdentityId, RuntimeError> {
+        if let Some(challenge) = instance.guest_control_challenge {
+            return Ok(challenge);
+        }
+        let challenge = self.identity_source.guest_control_challenge(identities)?;
+        if challenge.is_zero() {
+            return Err(RuntimeError::InvalidIdentity(
+                "guest-control challenge cannot be all zeroes".to_owned(),
+            ));
+        }
+        if identities.ids().contains(&challenge) {
+            return Err(RuntimeError::StaleIdentity(
+                "guest-control challenge reused a session identity".to_owned(),
+            ));
+        }
+        instance.guest_control_challenge = Some(challenge);
+        Ok(challenge)
+    }
+
+    fn control_call_with_identity_ack(
+        &mut self,
+        request: ApiRequest,
+        expected_ack: &str,
+    ) -> Result<(), RuntimeError> {
         let response = self.guest_client.request(&request)?;
         if !(200..300).contains(&response.status) {
             return Err(RuntimeError::ApiStatus {
@@ -3915,6 +4439,12 @@ where
                 status: response.status,
                 body: response.body,
             });
+        }
+        if response.body.as_bytes() != expected_ack.as_bytes() {
+            return Err(RuntimeError::StaleIdentity(format!(
+                "guest control response for {} did not acknowledge the exact challenge and identity bundle",
+                request.path
+            )));
         }
         Ok(())
     }
@@ -4000,6 +4530,35 @@ fn json_string(value: &str) -> String {
     }
     escaped.push('"');
     escaped
+}
+
+fn guest_control_request_body(challenge: IdentityId, identities: &IdentityBundle) -> String {
+    format!(
+        "{{\"challenge\":{},\"vm_id\":{},\"session_id\":{},\"request_id\":{},\"subject_id\":{},\"capability_id\":{}}}",
+        json_string(&challenge.to_hex()),
+        json_string(&identities.vm_id.to_hex()),
+        json_string(&identities.session_id.to_hex()),
+        json_string(&identities.request_id.to_hex()),
+        json_string(&identities.subject_id.to_hex()),
+        json_string(&identities.capability_id.to_hex())
+    )
+}
+
+fn guest_control_ack_body(
+    acknowledgement: &str,
+    challenge: IdentityId,
+    identities: &IdentityBundle,
+) -> String {
+    format!(
+        "{{\"ack\":{},\"challenge\":{},\"vm_id\":{},\"session_id\":{},\"request_id\":{},\"subject_id\":{},\"capability_id\":{}}}",
+        json_string(acknowledgement),
+        json_string(&challenge.to_hex()),
+        json_string(&identities.vm_id.to_hex()),
+        json_string(&identities.session_id.to_hex()),
+        json_string(&identities.request_id.to_hex()),
+        json_string(&identities.subject_id.to_hex()),
+        json_string(&identities.capability_id.to_hex())
+    )
 }
 
 #[derive(Debug)]
@@ -4465,6 +5024,8 @@ impl Error for RuntimeError {}
 mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::os::unix::net::UnixListener;
+    use std::os::unix::process::ExitStatusExt;
     use std::rc::Rc;
 
     use super::*;
@@ -4735,6 +5296,7 @@ mod tests {
         label: &'static str,
         events: Rc<RefCell<Vec<String>>>,
         statuses: VecDeque<u16>,
+        response_bodies: VecDeque<String>,
     }
 
     impl ApiClient for LifecycleApi {
@@ -4743,9 +5305,23 @@ mod tests {
                 "{}:{:?}:{}:{}",
                 self.label, request.method, request.path, request.body
             ));
+            let body = self.response_bodies.pop_front().unwrap_or_else(|| {
+                let acknowledgement = match request.path.as_str() {
+                    "/actions/inject-identity" => Some("identity-injected"),
+                    "/actions/start-workload" => Some("workload-started"),
+                    _ => None,
+                };
+                acknowledgement.map_or_else(String::new, |acknowledgement| {
+                    format!(
+                        "{{\"ack\":{},{}",
+                        json_string(acknowledgement),
+                        &request.body[1..]
+                    )
+                })
+            });
             Ok(ApiResponse {
                 status: self.statuses.pop_front().unwrap_or(204),
-                body: String::new(),
+                body,
             })
         }
 
@@ -4872,11 +5448,13 @@ mod tests {
                     label: "firecracker",
                     events: Rc::clone(&events),
                     statuses: api_statuses.into_iter().collect(),
+                    response_bodies: VecDeque::new(),
                 },
                 LifecycleApi {
                     label: "guest",
                     events: Rc::clone(&events),
                     statuses: guest_statuses.into_iter().collect(),
+                    response_bodies: VecDeque::new(),
                 },
                 SequentialIdentitySource(0),
             ),
@@ -5253,11 +5831,13 @@ mod tests {
                 label: "firecracker",
                 events: Rc::clone(&events),
                 statuses: VecDeque::new(),
+                response_bodies: VecDeque::new(),
             },
             LifecycleApi {
                 label: "guest",
                 events: Rc::clone(&events),
                 statuses: VecDeque::new(),
+                response_bodies: VecDeque::new(),
             },
             SequentialIdentitySource(0),
         );
@@ -5428,7 +6008,104 @@ mod tests {
     }
 
     #[test]
-    fn identity_acknowledgement_precedes_explicit_resume_and_workload_start() {
+    fn firecracker_vsock_client_uses_exact_uds_port_and_bounded_handshake() {
+        let socket = std::env::temp_dir().join(format!(
+            "firecracker-vsock-api-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock must follow epoch")
+                .as_nanos()
+        ));
+        let listener = UnixListener::bind(&socket).expect("test UDS must bind");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client must connect");
+            let mut connect = [0_u8; 14];
+            stream
+                .read_exact(&mut connect)
+                .expect("CONNECT handshake must arrive");
+            assert_eq!(&connect, b"CONNECT 19002\n");
+            stream
+                .write_all(b"OK 1073741824\n")
+                .expect("ACK must write");
+
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream
+                    .read_exact(&mut byte)
+                    .expect("HTTP headers must arrive");
+                request.push(byte[0]);
+            }
+            let headers = String::from_utf8(request).expect("headers must be UTF-8");
+            assert!(headers.starts_with("PUT /actions/inject-identity HTTP/1.1\r\n"));
+            assert!(headers.contains("Content-Length: 2\r\n"));
+            let mut body = [0_u8; 2];
+            stream.read_exact(&mut body).expect("HTTP body must arrive");
+            assert_eq!(&body, b"{}");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .expect("HTTP response must write");
+        });
+        let mut client = FirecrackerVsockApiClient::new(&socket, 42, 19_002)
+            .expect("exact endpoint must construct");
+        let response = client
+            .request(&ApiRequest {
+                method: HttpMethod::Put,
+                path: "/actions/inject-identity".to_owned(),
+                body: "{}".to_owned(),
+            })
+            .expect("handshake and HTTP request must succeed");
+
+        assert_eq!(
+            response,
+            ApiResponse {
+                status: 200,
+                body: "{}".to_owned()
+            }
+        );
+        server.join().expect("server fixture must finish");
+        fs::remove_file(socket).expect("test UDS must be removable");
+    }
+
+    #[test]
+    fn firecracker_vsock_client_rejects_foreign_or_malformed_endpoint_ack() {
+        let socket = std::env::temp_dir().join(format!(
+            "firecracker-vsock-bad-ack-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock must follow epoch")
+                .as_nanos()
+        ));
+        let listener = UnixListener::bind(&socket).expect("test UDS must bind");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client must connect");
+            let mut connect = [0_u8; 14];
+            stream
+                .read_exact(&mut connect)
+                .expect("CONNECT handshake must arrive");
+            assert_eq!(&connect, b"CONNECT 19002\n");
+            stream.write_all(b"OK 0\n").expect("bad ACK must write");
+        });
+        let mut client = FirecrackerVsockApiClient::new(&socket, 42, 19_002)
+            .expect("exact endpoint must construct");
+
+        assert!(matches!(
+            client.request(&ApiRequest {
+                method: HttpMethod::Put,
+                path: "/actions/inject-identity".to_owned(),
+                body: "{}".to_owned(),
+            }),
+            Err(RuntimeError::Api(message))
+                if message.contains("invalid connection acknowledgement")
+        ));
+        server.join().expect("server fixture must finish");
+        fs::remove_file(socket).expect("test UDS must be removable");
+    }
+
+    #[test]
+    fn explicit_resume_precedes_identity_acknowledgement_and_workload_start() {
         let config = test_config();
         let (mut runtime, events) = lifecycle_runtime([], []);
         let snapshot = runtime
@@ -5440,7 +6117,7 @@ mod tests {
 
         runtime
             .inject_identity(&mut instance)
-            .expect("identity acknowledgement and resume must succeed");
+            .expect("resume and identity acknowledgement must succeed");
         assert_eq!(instance.state(), RuntimeState::IdentityInjected);
         runtime
             .start_workload(&mut instance)
@@ -5448,23 +6125,123 @@ mod tests {
         assert_eq!(instance.state(), RuntimeState::Running);
 
         let events = events.borrow();
-        let inject = events
-            .iter()
-            .position(|event| event.contains("guest:Put:/actions/inject-identity:"))
-            .expect("identity injection must be acknowledged");
         let resume = events
             .iter()
             .position(|event| event.contains("firecracker:Patch:/vm:"))
             .expect("Firecracker must be explicitly resumed");
+        let inject = events
+            .iter()
+            .position(|event| event.contains("guest:Put:/actions/inject-identity:"))
+            .expect("the resumed guest must acknowledge the exact identity bundle");
         let start = events
             .iter()
             .position(|event| event.contains("guest:Put:/actions/start-workload:"))
             .expect("workload start must be separately acknowledged");
-        assert!(inject < resume && resume < start);
+        assert!(resume < inject && inject < start);
     }
 
     #[test]
-    fn failed_resume_keeps_acknowledged_identity_gate_retryable_without_reinjection() {
+    fn opaque_success_cannot_release_a_restored_vm() {
+        let config = test_config();
+        let (mut runtime, events) = lifecycle_runtime([], []);
+        runtime
+            .guest_client
+            .response_bodies
+            .push_back(String::new());
+        let snapshot = runtime
+            .verify_snapshot(&config, test_snapshot(&config))
+            .expect("test snapshot provenance must verify");
+        let mut instance = runtime
+            .restore(&config, &snapshot)
+            .expect("restore must remain paused");
+
+        assert!(matches!(
+            runtime.inject_identity(&mut instance),
+            Err(RuntimeError::StaleIdentity(message))
+                if message.contains("exact challenge and identity bundle")
+        ));
+        assert_eq!(instance.state(), RuntimeState::IdentityResumedAwaitingAck);
+        let events = events.borrow();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("firecracker:Patch:/vm:"))
+        );
+    }
+
+    #[test]
+    fn guest_ack_with_a_wrong_nonce_or_identity_fails_closed() {
+        for mismatch in ["nonce", "session"] {
+            let config = test_config();
+            let (mut runtime, events) = lifecycle_runtime([], []);
+            let snapshot = runtime
+                .verify_snapshot(&config, test_snapshot(&config))
+                .expect("test snapshot provenance must verify");
+            let mut instance = runtime
+                .restore(&config, &snapshot)
+                .expect("restore must remain paused");
+            let identities = instance
+                .identities()
+                .expect("restore must allocate identities")
+                .clone();
+            let challenge =
+                derive_guest_control_challenge(&identities).expect("challenge fixture must derive");
+            let response = if mismatch == "nonce" {
+                let mut wrong_challenge = challenge;
+                wrong_challenge.0[0] ^= 1;
+                guest_control_ack_body("identity-injected", wrong_challenge, &identities)
+            } else {
+                let mut wrong_identities = identities.clone();
+                wrong_identities.session_id =
+                    IdentityId::from_hex("00000000000000000000000000000007")
+                        .expect("wrong identity fixture must be valid");
+                guest_control_ack_body("identity-injected", challenge, &wrong_identities)
+            };
+            runtime.guest_client.response_bodies.push_back(response);
+
+            assert!(matches!(
+                runtime.inject_identity(&mut instance),
+                Err(RuntimeError::StaleIdentity(message))
+                    if message.contains("exact challenge and identity bundle")
+            ));
+            assert_eq!(instance.state(), RuntimeState::IdentityResumedAwaitingAck);
+            let events = events.borrow();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.contains("firecracker:Patch:/vm:"))
+            );
+        }
+    }
+
+    #[test]
+    fn workload_is_not_marked_running_without_session_bound_ack() {
+        let config = test_config();
+        let (mut runtime, _) = lifecycle_runtime([], []);
+        let snapshot = runtime
+            .verify_snapshot(&config, test_snapshot(&config))
+            .expect("test snapshot provenance must verify");
+        let mut instance = runtime
+            .restore(&config, &snapshot)
+            .expect("restore must remain paused");
+        runtime
+            .inject_identity(&mut instance)
+            .expect("identity proof and explicit resume must succeed");
+        runtime
+            .guest_client
+            .response_bodies
+            .push_back(String::new());
+
+        assert!(matches!(
+            runtime.start_workload(&mut instance),
+            Err(RuntimeError::StaleIdentity(message))
+                if message.contains("exact challenge and identity bundle")
+        ));
+        assert_eq!(instance.state(), RuntimeState::IdentityInjected);
+    }
+
+    #[test]
+    fn failed_resume_keeps_identity_gate_retryable_without_injection() {
         let config = test_config();
         let (mut runtime, events) = lifecycle_runtime([204, 204, 503, 204], []);
         let snapshot = runtime
@@ -5482,7 +6259,7 @@ mod tests {
                 ..
             }) if path == "/vm"
         ));
-        assert_eq!(instance.state(), RuntimeState::IdentityAcknowledgedPaused);
+        assert_eq!(instance.state(), RuntimeState::IdentityRegenerated);
         assert!(matches!(
             runtime.start_workload(&mut instance),
             Err(RuntimeError::InvalidState { .. })
@@ -5490,7 +6267,7 @@ mod tests {
 
         runtime
             .inject_identity(&mut instance)
-            .expect("resume may be retried without sending identity twice");
+            .expect("resume may be retried before sending identity");
         assert_eq!(instance.state(), RuntimeState::IdentityInjected);
         let events = events.borrow();
         assert_eq!(
@@ -5733,5 +6510,139 @@ mod tests {
         fs::remove_file(cgroup.join("cgroup.procs"))
             .expect("fake cgroup task file must be removable");
         fs::remove_dir(cgroup).expect("fake cgroup directory must be removable");
+    }
+
+    fn unique_test_path(label: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock must be after the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "firecracker-runtime-{label}-{}-{suffix}",
+            std::process::id()
+        ))
+    }
+
+    fn assert_process_reaped(pid: u32) {
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "owned child {pid} must be killed and reaped before its runner is dropped"
+        );
+    }
+
+    fn assert_process_gone(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < deadline {
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        }
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "command descendant {pid} must be killed with its process group"
+        );
+    }
+
+    #[test]
+    fn command_deadline_kills_and_reaps_a_hung_process_group() {
+        let pid_file = unique_test_path("hung-command-pid");
+        let script = format!(
+            "/bin/sleep 30 & descendant=$!; printf '%s %s' \"$$\" \"$descendant\" > {}; wait",
+            pid_file.display()
+        );
+        let mut runner = RealCommandRunner::with_command_timeout(Duration::from_millis(50));
+        let started = Instant::now();
+
+        let error = runner
+            .run(&CommandSpec::new("/bin/sh", ["-c".to_owned(), script]))
+            .expect_err("a command exceeding its deadline must fail");
+
+        assert!(error.to_string().contains("deadline"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "command timeout and reader shutdown must remain bounded"
+        );
+        let pids = fs::read_to_string(&pid_file)
+            .expect("hung command must publish its PID before the deadline")
+            .split_ascii_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("published command PIDs must be valid");
+        assert_eq!(pids.len(), 2);
+        assert_process_reaped(pids[0]);
+        assert_process_gone(pids[1]);
+        fs::remove_file(pid_file).expect("hung command PID fixture must be removable");
+    }
+
+    #[test]
+    fn command_runner_drop_kills_and_reaps_direct_child() {
+        let mut runner = RealCommandRunner::new();
+        let process = runner
+            .start(&CommandSpec::new("/bin/sleep", ["30".to_owned()]))
+            .expect("direct child must start");
+        assert!(Path::new(&format!("/proc/{}", process.pid)).exists());
+
+        drop(runner);
+
+        assert_process_reaped(process.pid);
+    }
+
+    #[test]
+    fn command_runner_drop_kills_and_reaps_owned_child() {
+        let cgroup = unique_test_path("drop-owned-cgroup");
+        fs::create_dir(&cgroup).expect("fake cgroup directory must be creatable");
+        fs::write(cgroup.join("cgroup.procs"), b"")
+            .expect("fake cgroup task file must be creatable");
+        let mut runner = RealCommandRunner::new();
+        let launcher = spawn_detached(&CommandSpec::new("/bin/sleep", ["30".to_owned()]))
+            .expect("owned launcher must start");
+        let pid = launcher.id();
+        runner.children.insert(
+            pid,
+            ManagedChild::Isolated {
+                launcher,
+                ownership: OwnedCgroup {
+                    path: cgroup.clone(),
+                    identity: ObjectIdentity::from_metadata(
+                        &fs::metadata(&cgroup).expect("fake cgroup metadata must resolve"),
+                    ),
+                    firecracker_digest: digest_file(Path::new("/bin/sleep"))
+                        .expect("test executable must be digestible"),
+                },
+            },
+        );
+
+        drop(runner);
+
+        assert_process_reaped(pid);
+        fs::remove_file(cgroup.join("cgroup.procs"))
+            .expect("fake cgroup task file must be removable");
+        fs::remove_dir(cgroup).expect("fake cgroup directory must be removable");
+    }
+
+    #[test]
+    fn runtime_drop_aborts_if_owned_process_cleanup_fails() {
+        const CHILD_MARKER: &str = "FIRECRACKER_RUNTIME_DROP_ABORT_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let mut runtime = cleanup_runtime([true], std::iter::empty());
+            runtime.pending_cleanup = Some(PendingCleanup {
+                process: Some(ProcessHandle { pid: 42 }),
+                verity_opened: true,
+                workspace: Some(PathBuf::from("/workspace/session")),
+                mapper_name: "session-root".to_owned(),
+            });
+            drop(runtime);
+            panic!("runtime drop must fail-stop while an owned process may remain live");
+        }
+
+        let output = Command::new(std::env::current_exe().expect("test executable must resolve"))
+            .args([
+                "--exact",
+                "tests::runtime_drop_aborts_if_owned_process_cleanup_fails",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1")
+            .output()
+            .expect("drop failure subprocess must start");
+
+        assert_eq!(output.status.signal(), Some(6));
     }
 }

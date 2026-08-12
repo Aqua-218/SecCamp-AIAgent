@@ -6,12 +6,13 @@ mod implementation {
         ffi::CString,
         fs, io,
         num::NonZeroU32,
-        os::fd::RawFd,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         os::unix::ffi::OsStrExt,
         os::unix::fs::MetadataExt,
         path::{Path, PathBuf},
     };
 
+    use crate::backend::{ChildStartupNotifier, private::OperationPermit};
     use crate::{
         BackendError, BindMountConfig, CapabilityReport, CgroupConfig, IdentityMap,
         IsolatedChildProcess, IsolationBackend, IsolationConfig, IsolationStep, LandlockConfig,
@@ -79,11 +80,20 @@ mod implementation {
     const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
     const CURRENT_PID_NAMESPACE: &str = "/proc/self/ns/pid";
     const PID_NAMESPACE_FOR_CHILDREN: &str = "/proc/self/ns/pid_for_children";
+    const FIRST_NONSTANDARD_FD: RawFd = 3;
+    const NULL_DEVICE_MAJOR: libc::c_uint = 1;
+    const NULL_DEVICE_MINOR: libc::c_uint = 3;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct PidNamespaceObservation {
         current: NamespaceIdentity,
         for_children: NamespaceIdentity,
+    }
+
+    #[derive(Debug)]
+    struct StartupPipe {
+        reader: OwnedFd,
+        writer: OwnedFd,
     }
 
     #[repr(C)]
@@ -132,6 +142,8 @@ mod implementation {
         rootfs_pivoted: bool,
         max_capability_index: Option<libc::c_int>,
         prepared_pid_namespaces: Option<(NamespaceIdentity, NamespaceIdentity)>,
+        startup_notifier_fd: Option<RawFd>,
+        child_entry_failure: Option<BackendError>,
     }
 
     impl LinuxBackend {
@@ -143,6 +155,8 @@ mod implementation {
                 rootfs_pivoted: false,
                 max_capability_index: None,
                 prepared_pid_namespaces: None,
+                startup_notifier_fd: None,
+                child_entry_failure: None,
             }
         }
     }
@@ -153,6 +167,7 @@ mod implementation {
         }
     }
 
+    #[allow(private_bounds, private_interfaces)]
     impl IsolationBackend for LinuxBackend {
         fn detect_capabilities(&mut self, config: &IsolationConfig) -> CapabilityReport {
             let mut report = CapabilityReport {
@@ -173,6 +188,18 @@ mod implementation {
                 report
                     .reasons
                     .push("user namespaces are disabled by the host".to_owned());
+            }
+            if !close_range_is_available() {
+                report.reasons.push(
+                    "close_range is unavailable; inherited descriptors cannot be closed completely"
+                        .to_owned(),
+                );
+            }
+            if !pidfd_open_is_available() {
+                report.reasons.push(
+                    "pidfd_open is unavailable; isolation child ownership cannot be established"
+                        .to_owned(),
+                );
             }
             let controllers = config.cgroup.root.join("cgroup.controllers");
             let required_controllers = fs::read_to_string(&controllers)
@@ -222,6 +249,7 @@ mod implementation {
 
         fn prepare_namespaces(
             &mut self,
+            _permit: OperationPermit,
             _config: &IsolationConfig,
         ) -> Result<NamespacePreparation, BackendError> {
             if self.prepared_pid_namespaces.is_some() {
@@ -238,79 +266,30 @@ mod implementation {
 
         fn spawn_isolated<T, F>(
             &mut self,
+            _permit: OperationPermit,
             preparation: NamespacePreparation,
             child_entry: F,
         ) -> Result<SpawnOutcome<T>, BackendError>
         where
-            F: FnOnce(&mut Self, NamespacePreparation) -> T,
+            F: FnOnce(&mut Self, NamespacePreparation, ChildStartupNotifier) -> T,
         {
-            let expected_namespaces = self.prepared_pid_namespaces.take().ok_or_else(|| {
-                BackendError::new(
-                    IsolationStep::Namespaces,
-                    "PID namespace handoff has no matching backend preparation",
-                    None,
-                )
-            })?;
-            if expected_namespaces != (preparation.parent(), preparation.child()) {
-                return Err(BackendError::new(
-                    IsolationStep::Namespaces,
-                    "PID namespace handoff token does not match backend preparation",
-                    None,
-                ));
-            }
-            if !process_is_single_threaded(IsolationStep::Namespaces)? {
-                return Err(BackendError::new(
-                    IsolationStep::Namespaces,
-                    "PID namespace handoff requires a single-threaded launcher process",
-                    None,
-                ));
-            }
-            let child_namespace = preparation.child();
-            // SAFETY: Namespace preparation can succeed only for a single-threaded
-            // launcher. The parent returns immediately; the child invokes the
-            // caller-provided continuation in its independent address space.
-            let fork_result = unsafe { libc::fork() };
-            match fork_result {
-                -1 => Err(last_error(
-                    IsolationStep::Namespaces,
-                    "fork prepared PID namespace child",
-                )),
-                0 => {
-                    validate_pid_namespace_child_entry(
-                        IsolationStep::Namespaces,
-                        &preparation,
-                        observe_pid_namespaces(IsolationStep::Namespaces)?,
-                    )?;
-                    Ok(SpawnOutcome::Child(child_entry(self, preparation)))
-                }
-                child_pid => {
-                    let child_pid = u32::try_from(child_pid)
-                        .ok()
-                        .and_then(NonZeroU32::new)
-                        .ok_or_else(|| {
-                            BackendError::new(
-                                IsolationStep::Namespaces,
-                                "fork returned an invalid child PID",
-                                None,
-                            )
-                        })?;
-                    Ok(SpawnOutcome::Parent(IsolatedChildProcess::attest(
-                        child_pid,
-                        child_namespace,
-                    )))
-                }
-            }
+            self.spawn_isolated_impl(preparation, child_entry)
         }
 
         fn verify_pid_namespace_child(
             &mut self,
+            _permit: OperationPermit,
             preparation: NamespacePreparation,
         ) -> Result<PidNamespaceChild, BackendError> {
+            if let Some(error) = self.child_entry_failure.take() {
+                return Err(error);
+            }
             verify_pid_namespace_child_entry(IsolationStep::Namespaces, preparation)
         }
 
         fn apply_step(
             &mut self,
+            _permit: OperationPermit,
             step: IsolationStep,
             config: &IsolationConfig,
         ) -> Result<(), BackendError> {
@@ -329,7 +308,16 @@ mod implementation {
                 }
                 IsolationStep::MaskProc => mask_mount(step, Path::new("/proc")),
                 IsolationStep::MaskDevices => mask_mount(step, Path::new("/dev")),
-                IsolationStep::CloseInheritedFileDescriptors => close_inherited_fds(step),
+                IsolationStep::CloseInheritedFileDescriptors => {
+                    let notifier_fd = self.startup_notifier_fd.ok_or_else(|| {
+                        BackendError::new(
+                            step,
+                            "child startup notifier was not registered before descriptor closure",
+                            None,
+                        )
+                    })?;
+                    close_inherited_fds(step, notifier_fd)
+                }
                 IsolationStep::Landlock => install_landlock(step, &config.landlock),
                 IsolationStep::DropCapabilities => self.drop_capabilities(step),
                 IsolationStep::NoNewPrivs => set_no_new_privs(step),
@@ -339,6 +327,7 @@ mod implementation {
 
         fn rollback_step(
             &mut self,
+            _permit: OperationPermit,
             step: IsolationStep,
             config: &IsolationConfig,
         ) -> Result<(), BackendError> {
@@ -370,6 +359,135 @@ mod implementation {
     }
 
     impl LinuxBackend {
+        fn spawn_isolated_impl<T, F>(
+            &mut self,
+            preparation: NamespacePreparation,
+            child_entry: F,
+        ) -> Result<SpawnOutcome<T>, BackendError>
+        where
+            F: FnOnce(&mut Self, NamespacePreparation, ChildStartupNotifier) -> T,
+        {
+            self.consume_prepared_namespace_handoff(&preparation)?;
+            let previous_signal_mask = block_all_signals(IsolationStep::Namespaces)?;
+            let fork_resources = (|| {
+                if !process_is_single_threaded(IsolationStep::Namespaces)? {
+                    return Err(BackendError::new(
+                        IsolationStep::Namespaces,
+                        "PID namespace handoff requires a single-threaded launcher process",
+                        None,
+                    ));
+                }
+                Ok::<_, BackendError>((
+                    create_startup_pipe(IsolationStep::Namespaces)?,
+                    open_null_device(IsolationStep::Namespaces)?,
+                ))
+            })();
+            let (startup_pipe, null_device) = match fork_resources {
+                Ok(resources) => resources,
+                Err(error) => {
+                    if let Err(restore_error) =
+                        restore_signal_mask(IsolationStep::Namespaces, &previous_signal_mask)
+                    {
+                        return Err(combine_errors(&error, &restore_error));
+                    }
+                    return Err(error);
+                }
+            };
+            let child_namespace = preparation.child();
+            // SAFETY: Namespace preparation can succeed only for a single-threaded
+            // launcher. Signals are blocked across fork so inherited handlers
+            // cannot execute before the child replaces their process-global state.
+            let fork_result = unsafe { libc::fork() };
+            match fork_result {
+                -1 => {
+                    let fork_error = last_error(
+                        IsolationStep::Namespaces,
+                        "fork prepared PID namespace child",
+                    );
+                    if let Err(restore_error) =
+                        restore_signal_mask(IsolationStep::Namespaces, &previous_signal_mask)
+                    {
+                        return Err(combine_errors(&fork_error, &restore_error));
+                    }
+                    Err(fork_error)
+                }
+                0 => {
+                    drop(startup_pipe.reader);
+                    let lifecycle_result = configure_child_lifecycle(IsolationStep::Namespaces);
+                    let descriptor_result = install_sanitized_standard_descriptors(
+                        IsolationStep::Namespaces,
+                        &null_device,
+                    );
+                    drop(null_device);
+                    self.child_entry_failure = combine_results(lifecycle_result, descriptor_result);
+                    let notifier_fd = startup_pipe.writer.as_raw_fd();
+                    self.startup_notifier_fd = Some(notifier_fd);
+                    let notifier = ChildStartupNotifier::from_fd(startup_pipe.writer);
+                    // This process is PID 1 in the prepared namespace. The fixed
+                    // seccomp contract denies every process-creation syscall, so
+                    // it cannot acquire descendants that need a reaper. Its
+                    // ancestor launcher owns termination and reap through pidfd.
+                    Ok(SpawnOutcome::Child(child_entry(
+                        self,
+                        preparation,
+                        notifier,
+                    )))
+                }
+                child_pid => {
+                    let raw_child_pid = child_pid;
+                    drop(startup_pipe.writer);
+                    drop(null_device);
+                    if let Err(error) =
+                        restore_signal_mask(IsolationStep::Namespaces, &previous_signal_mask)
+                    {
+                        return Err(cleanup_failed_spawn(child_pid, error));
+                    }
+                    let child_pid = u32::try_from(child_pid)
+                        .ok()
+                        .and_then(NonZeroU32::new)
+                        .ok_or_else(|| {
+                            cleanup_failed_spawn(
+                                raw_child_pid,
+                                BackendError::new(
+                                    IsolationStep::Namespaces,
+                                    "fork returned an invalid child PID",
+                                    None,
+                                ),
+                            )
+                        })?;
+                    let pidfd = open_pidfd(IsolationStep::Namespaces, child_pid)
+                        .map_err(|error| cleanup_failed_spawn(raw_child_pid, error))?;
+                    Ok(SpawnOutcome::Parent(IsolatedChildProcess::from_spawn(
+                        child_pid,
+                        child_namespace,
+                        pidfd,
+                        startup_pipe.reader,
+                    )))
+                }
+            }
+        }
+
+        fn consume_prepared_namespace_handoff(
+            &mut self,
+            preparation: &NamespacePreparation,
+        ) -> Result<(), BackendError> {
+            let expected_namespaces = self.prepared_pid_namespaces.take().ok_or_else(|| {
+                BackendError::new(
+                    IsolationStep::Namespaces,
+                    "PID namespace handoff has no matching backend preparation",
+                    None,
+                )
+            })?;
+            if expected_namespaces != (preparation.parent(), preparation.child()) {
+                return Err(BackendError::new(
+                    IsolationStep::Namespaces,
+                    "PID namespace handoff token does not match backend preparation",
+                    None,
+                ));
+            }
+            Ok(())
+        }
+
         fn configure_cgroup(
             &mut self,
             step: IsolationStep,
@@ -709,33 +827,394 @@ mod implementation {
         )
     }
 
-    fn close_inherited_fds(step: IsolationStep) -> Result<(), BackendError> {
-        // SAFETY: The range excludes stdin/stdout/stderr and uses no user pointer.
-        let result = unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 0_u32) };
-        if result == 0 {
-            return Ok(());
+    fn create_startup_pipe(step: IsolationStep) -> Result<StartupPipe, BackendError> {
+        let mut descriptors = [-1; 2];
+        // SAFETY: `descriptors` contains storage for exactly two returned fds.
+        let result = unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) };
+        if result == -1 {
+            return Err(last_error(step, "create close-on-exec child startup pipe"));
         }
-        if errno() != libc::ENOSYS {
-            return Err(last_error(step, "close inherited file descriptors"));
-        }
-        let mut limits = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
+        // SAFETY: successful `pipe2` returns ownership of both descriptors.
+        let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        // SAFETY: successful `pipe2` returns ownership of both descriptors.
+        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        Ok(StartupPipe {
+            reader: ensure_nonstandard_fd(step, reader, "normalize startup pipe reader")?,
+            writer: ensure_nonstandard_fd(step, writer, "normalize startup pipe writer")?,
+        })
+    }
+
+    fn open_null_device(step: IsolationStep) -> Result<OwnedFd, BackendError> {
+        let path = c"/dev/null";
+        // SAFETY: the path is a static C string and the flags create an owned fd.
+        let descriptor = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOCTTY | libc::O_NOFOLLOW,
+            )
         };
-        // SAFETY: `limits` is a valid writable rlimit structure.
-        let limit_result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limits) };
-        if limit_result == -1 {
-            return Err(last_error(step, "query file descriptor limit"));
+        if descriptor == -1 {
+            return Err(last_error(
+                step,
+                "open trusted /dev/null for standard descriptors",
+            ));
         }
-        let upper = limits.rlim_cur.min(1_048_576) as RawFd;
-        for fd in 3..upper {
-            // SAFETY: Each descriptor is a scalar selected from the process table.
-            let close_result = unsafe { libc::close(fd) };
-            if close_result == -1 && errno() != libc::EBADF {
-                return Err(last_error(step, "close inherited file descriptor"));
+        // SAFETY: successful `open` returns one owned descriptor.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `metadata` is writable and the owned descriptor remains live.
+        let result = unsafe { libc::fstat(descriptor.as_raw_fd(), metadata.as_mut_ptr()) };
+        if result == -1 {
+            return Err(last_error(step, "inspect /dev/null device identity"));
+        }
+        // SAFETY: successful `fstat` initialized the complete structure.
+        let metadata = unsafe { metadata.assume_init() };
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFCHR
+            || libc::major(metadata.st_rdev) != NULL_DEVICE_MAJOR
+            || libc::minor(metadata.st_rdev) != NULL_DEVICE_MINOR
+        {
+            return Err(BackendError::new(
+                step,
+                "/dev/null was not the kernel null character device (major 1, minor 3)",
+                None,
+            ));
+        }
+        ensure_nonstandard_fd(step, descriptor, "normalize /dev/null descriptor")
+    }
+
+    fn ensure_nonstandard_fd(
+        step: IsolationStep,
+        descriptor: OwnedFd,
+        action: &'static str,
+    ) -> Result<OwnedFd, BackendError> {
+        if descriptor.as_raw_fd() >= FIRST_NONSTANDARD_FD {
+            return Ok(descriptor);
+        }
+        // SAFETY: `descriptor` is live and F_DUPFD_CLOEXEC returns a new owned fd.
+        let duplicated = unsafe {
+            libc::fcntl(
+                descriptor.as_raw_fd(),
+                libc::F_DUPFD_CLOEXEC,
+                FIRST_NONSTANDARD_FD,
+            )
+        };
+        if duplicated == -1 {
+            return Err(last_error(step, action));
+        }
+        // SAFETY: successful F_DUPFD_CLOEXEC transfers ownership of the new fd.
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+    }
+
+    fn install_sanitized_standard_descriptors(
+        step: IsolationStep,
+        null_device: &OwnedFd,
+    ) -> Result<(), BackendError> {
+        for target in 0..FIRST_NONSTANDARD_FD {
+            loop {
+                // CLOEXEC prevents even the harmless placeholder from becoming
+                // an implicit workload channel after its eventual exec.
+                // SAFETY: the source is live, differs from every target, and
+                // dup3 atomically replaces each inherited standard descriptor.
+                let result =
+                    unsafe { libc::dup3(null_device.as_raw_fd(), target, libc::O_CLOEXEC) };
+                if result == target {
+                    break;
+                }
+                if result == -1 && errno() == libc::EINTR {
+                    continue;
+                }
+                return Err(last_error(
+                    step,
+                    "replace inherited standard descriptor with /dev/null",
+                ));
             }
         }
         Ok(())
+    }
+
+    fn block_all_signals(step: IsolationStep) -> Result<libc::sigset_t, BackendError> {
+        // SAFETY: sigset_t is a plain C value initialized by sigfillset.
+        let mut all_signals = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        // SAFETY: `all_signals` points to writable sigset storage.
+        if unsafe { libc::sigfillset(&raw mut all_signals) } == -1 {
+            return Err(last_error(step, "construct the fork signal mask"));
+        }
+        // SAFETY: the previous mask points to writable storage and this process
+        // has already been proven single-threaded.
+        let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        let result = unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &raw const all_signals, &raw mut previous)
+        };
+        if result != 0 {
+            return Err(BackendError::new(
+                step,
+                "block signals across PID namespace fork",
+                Some(result),
+            ));
+        }
+        Ok(previous)
+    }
+
+    fn restore_signal_mask(
+        step: IsolationStep,
+        previous: &libc::sigset_t,
+    ) -> Result<(), BackendError> {
+        // SAFETY: `previous` was initialized by pthread_sigmask in this thread.
+        let result =
+            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, previous, std::ptr::null_mut()) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(BackendError::new(
+                step,
+                "restore launcher signal mask after PID namespace fork",
+                Some(result),
+            ))
+        }
+    }
+
+    fn configure_child_lifecycle(step: IsolationStep) -> Result<(), BackendError> {
+        // If the launcher disappears before readiness, either PDEATHSIG or the
+        // startup pipe's default SIGPIPE disposition terminates this child.
+        // SAFETY: PR_SET_PDEATHSIG accepts a scalar signal number.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } == -1 {
+            return Err(last_error(step, "arm child parent-death termination"));
+        }
+        reset_signal_dispositions(step)?;
+        // SAFETY: sigset_t is initialized before it is installed.
+        let mut empty_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        // SAFETY: `empty_mask` points to writable sigset storage.
+        if unsafe { libc::sigemptyset(&raw mut empty_mask) } == -1 {
+            return Err(last_error(step, "construct empty child signal mask"));
+        }
+        // SAFETY: the child is single-threaded and the mask is initialized.
+        let result = unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_SETMASK,
+                &raw const empty_mask,
+                std::ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(BackendError::new(
+                step,
+                "clear inherited child signal mask",
+                Some(result),
+            ))
+        }
+    }
+
+    fn reset_signal_dispositions(step: IsolationStep) -> Result<(), BackendError> {
+        let first_glibc_reserved_signal = libc::SIGRTMIN() - 2;
+        for signal in 1..=libc::SIGRTMAX() {
+            if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+                continue;
+            }
+            // SAFETY: zero is a valid base for sigaction before its mask is initialized.
+            let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            action.sa_sigaction = libc::SIG_DFL;
+            // SAFETY: the action mask points to writable sigset storage.
+            if unsafe { libc::sigemptyset(&raw mut action.sa_mask) } == -1 {
+                return Err(last_error(
+                    step,
+                    "construct default child signal disposition",
+                ));
+            }
+            // SAFETY: `action` is initialized and the signal range is kernel-defined.
+            let result =
+                unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) };
+            if result == 0 {
+                continue;
+            }
+            let error = errno();
+            if error == libc::EINVAL
+                && (signal == first_glibc_reserved_signal
+                    || signal == first_glibc_reserved_signal + 1)
+            {
+                continue;
+            }
+            return Err(BackendError::new(
+                step,
+                format!("reset inherited disposition for signal {signal}"),
+                Some(error),
+            ));
+        }
+        Ok(())
+    }
+
+    fn close_inherited_fds(
+        step: IsolationStep,
+        preserved_notifier_fd: RawFd,
+    ) -> Result<(), BackendError> {
+        if preserved_notifier_fd < FIRST_NONSTANDARD_FD {
+            return Err(BackendError::new(
+                step,
+                "child startup notifier overlapped a standard descriptor",
+                None,
+            ));
+        }
+        if !descriptor_has_cloexec(step, preserved_notifier_fd)? {
+            return Err(BackendError::new(
+                step,
+                "child startup notifier was not close-on-exec",
+                None,
+            ));
+        }
+        let preserved_notifier_fd = preserved_notifier_fd.cast_unsigned();
+        if preserved_notifier_fd > FIRST_NONSTANDARD_FD.cast_unsigned() {
+            close_fd_range(
+                step,
+                FIRST_NONSTANDARD_FD.cast_unsigned(),
+                preserved_notifier_fd - 1,
+            )?;
+        }
+        close_fd_range(step, preserved_notifier_fd + 1, u32::MAX)
+    }
+
+    fn close_fd_range(step: IsolationStep, first: u32, last: u32) -> Result<(), BackendError> {
+        // SAFETY: the range excludes the separately-owned notifier and uses no pointer.
+        let result = unsafe { libc::syscall(libc::SYS_close_range, first, last, 0_u32) };
+        if result == 0 {
+            return Ok(());
+        }
+        if errno() == libc::ENOSYS {
+            return Err(BackendError::new(
+                step,
+                "close_range is unavailable; refusing an incomplete descriptor sweep",
+                Some(libc::ENOSYS),
+            ));
+        }
+        Err(last_error(step, "close inherited file descriptor range"))
+    }
+
+    fn descriptor_has_cloexec(
+        step: IsolationStep,
+        descriptor: RawFd,
+    ) -> Result<bool, BackendError> {
+        loop {
+            // SAFETY: F_GETFD reads flags from a scalar descriptor.
+            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            if flags >= 0 {
+                return Ok(flags & libc::FD_CLOEXEC != 0);
+            }
+            if errno() == libc::EINTR {
+                continue;
+            }
+            return Err(last_error(step, "inspect descriptor close-on-exec flag"));
+        }
+    }
+
+    fn open_pidfd(step: IsolationStep, child_pid: NonZeroU32) -> Result<OwnedFd, BackendError> {
+        let child_pid = libc::pid_t::try_from(child_pid.get()).map_err(|_| {
+            BackendError::new(step, "child PID did not fit the pidfd_open ABI", None)
+        })?;
+        // SAFETY: pidfd_open accepts only the scalar child PID and zero flags.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0_u32) };
+        if descriptor == -1 {
+            return Err(last_error(step, "open isolation child pidfd"));
+        }
+        let descriptor = RawFd::try_from(descriptor).map_err(|_| {
+            BackendError::new(step, "pidfd_open returned an invalid descriptor", None)
+        })?;
+        // SAFETY: successful pidfd_open returns one owned descriptor.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let descriptor = ensure_nonstandard_fd(step, descriptor, "normalize isolation pidfd")?;
+        if !descriptor_has_cloexec(step, descriptor.as_raw_fd())? {
+            return Err(BackendError::new(
+                step,
+                "pidfd_open returned a descriptor without close-on-exec",
+                None,
+            ));
+        }
+        Ok(descriptor)
+    }
+
+    fn close_range_is_available() -> bool {
+        // Reversed bounds are side-effect free and return EINVAL on kernels that
+        // implement close_range, while older kernels return ENOSYS.
+        // SAFETY: no valid descriptor range is supplied.
+        let result = unsafe { libc::syscall(libc::SYS_close_range, 1_u32, 0_u32, 0_u32) };
+        result == 0 || (result == -1 && errno() == libc::EINVAL)
+    }
+
+    fn pidfd_open_is_available() -> bool {
+        // An invalid PID makes this a side-effect-free availability probe.
+        // SAFETY: the syscall receives an invalid scalar PID and zero flags.
+        let result = unsafe { libc::syscall(libc::SYS_pidfd_open, -1_i32, 0_u32) };
+        if result >= 0 {
+            if let Ok(descriptor) = RawFd::try_from(result) {
+                // SAFETY: an unexpectedly successful probe returned an owned fd.
+                drop(unsafe { OwnedFd::from_raw_fd(descriptor) });
+            }
+            true
+        } else {
+            matches!(errno(), libc::EINVAL | libc::ESRCH)
+        }
+    }
+
+    fn combine_results(
+        first: Result<(), BackendError>,
+        second: Result<(), BackendError>,
+    ) -> Option<BackendError> {
+        match (first, second) {
+            (Ok(()), Ok(())) => None,
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Some(error),
+            (Err(primary), Err(secondary)) => Some(combine_errors(&primary, &secondary)),
+        }
+    }
+
+    fn combine_errors(primary: &BackendError, secondary: &BackendError) -> BackendError {
+        BackendError::new(
+            primary.step,
+            format!(
+                "{}; additional failure during {}: {}",
+                primary.message, secondary.step, secondary.message
+            ),
+            primary.errno.or(secondary.errno),
+        )
+    }
+
+    fn cleanup_failed_spawn(child_pid: libc::pid_t, original: BackendError) -> BackendError {
+        match kill_and_reap_direct_child(child_pid) {
+            Ok(()) => original,
+            Err(cleanup_error) => combine_errors(&original, &cleanup_error),
+        }
+    }
+
+    fn kill_and_reap_direct_child(child_pid: libc::pid_t) -> Result<(), BackendError> {
+        loop {
+            // SAFETY: `child_pid` came directly from fork and cannot be reused
+            // until this launcher reaps it.
+            let result = unsafe { libc::kill(child_pid, libc::SIGKILL) };
+            if result == 0 || (result == -1 && errno() == libc::ESRCH) {
+                break;
+            }
+            if errno() == libc::EINTR {
+                continue;
+            }
+            return Err(last_error(
+                IsolationStep::Namespaces,
+                "kill child after isolation spawn ownership failure",
+            ));
+        }
+        loop {
+            let mut status = 0;
+            // SAFETY: the PID names this launcher's direct, unreaped child and
+            // `status` points to writable storage.
+            let result = unsafe { libc::waitpid(child_pid, &raw mut status, 0) };
+            if result == child_pid {
+                return Ok(());
+            }
+            if result == -1 && errno() == libc::EINTR {
+                continue;
+            }
+            return Err(last_error(
+                IsolationStep::Namespaces,
+                "reap child after isolation spawn ownership failure",
+            ));
+        }
     }
 
     fn install_landlock(step: IsolationStep, config: &LandlockConfig) -> Result<(), BackendError> {
@@ -1378,7 +1857,10 @@ mod implementation {
             );
 
             let error = backend
-                .spawn_isolated(preparation, |_child_backend, _child_preparation| ())
+                .spawn_isolated_impl(
+                    preparation,
+                    |_child_backend, _child_preparation, _notifier| (),
+                )
                 .expect_err("an unattested direct handoff must fail before fork");
 
             assert!(error.message.contains("no matching backend preparation"));
@@ -1405,10 +1887,10 @@ mod implementation {
             let preparation = NamespacePreparation::attest(parent_namespace, child_namespace);
             let mut backend = LinuxBackend::new();
             backend.prepared_pid_namespaces = Some((parent_namespace, child_namespace));
-            let result: Result<SpawnOutcome<()>, BackendError> = backend
-                .spawn_isolated(preparation, |_child_backend, _child_preparation| {
-                    unreachable!("fork must not occur")
-                });
+            let result: Result<SpawnOutcome<()>, BackendError> = backend.spawn_isolated_impl(
+                preparation,
+                |_child_backend, _child_preparation, _notifier| unreachable!("fork must not occur"),
+            );
 
             release_sender
                 .send(())
@@ -1419,7 +1901,50 @@ mod implementation {
         }
 
         #[test]
-        fn fork_parent_returns_handle_and_child_runs_continuation() {
+        fn control_descriptors_are_cloexec_and_do_not_overlap_standard_io() {
+            let pipe = create_startup_pipe(IsolationStep::Namespaces)
+                .expect("startup pipe creation must not require privilege");
+            let null_device = open_null_device(IsolationStep::Namespaces)
+                .expect("opening the kernel null device must not require privilege");
+
+            for descriptor in [
+                pipe.reader.as_raw_fd(),
+                pipe.writer.as_raw_fd(),
+                null_device.as_raw_fd(),
+            ] {
+                assert!(descriptor >= FIRST_NONSTANDARD_FD);
+                assert!(
+                    descriptor_has_cloexec(IsolationStep::Namespaces, descriptor)
+                        .expect("control descriptor flags must be observable")
+                );
+            }
+        }
+
+        #[test]
+        fn descriptor_sweep_rejects_a_standard_notifier() {
+            let error = close_inherited_fds(
+                IsolationStep::CloseInheritedFileDescriptors,
+                libc::STDERR_FILENO,
+            )
+            .expect_err("a notifier may never overlap inherited standard IO");
+
+            assert!(error.message.contains("overlapped a standard descriptor"));
+        }
+
+        #[test]
+        fn required_process_descriptor_syscalls_are_available() {
+            assert!(
+                close_range_is_available(),
+                "complete descriptor closure requires close_range"
+            );
+            assert!(
+                pidfd_open_is_available(),
+                "race-free child ownership requires pidfd_open"
+            );
+        }
+
+        #[test]
+        fn gated_fork_sanitizes_child_lifecycle_and_owns_it_by_pidfd() {
             if !process_is_single_threaded(IsolationStep::Namespaces)
                 .expect("the fork test must inspect its thread count")
             {
@@ -1428,11 +1953,9 @@ mod implementation {
                 // fork only when this test itself runs single-threaded.
                 return;
             }
-            let mut pipe_fds = [-1; 2];
-            // SAFETY: `pipe_fds` points to storage for exactly two descriptors.
-            let pipe_result = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
-            assert_eq!(pipe_result, 0, "pipe creation failed: {}", errno());
-            let [read_fd, write_fd] = pipe_fds;
+            let leaked_descriptor = open_null_device(IsolationStep::Namespaces)
+                .expect("the fork test must create an inherited descriptor");
+            let leaked_fd = leaked_descriptor.as_raw_fd();
             let observed = observe_pid_namespaces(IsolationStep::Namespaces)
                 .expect("the fork test must observe its current PID namespace");
             assert_eq!(observed.current, observed.for_children);
@@ -1445,73 +1968,119 @@ mod implementation {
             let mut backend = LinuxBackend::new();
             backend.prepared_pid_namespaces = Some((parent_namespace, child_namespace));
 
-            let outcome: Result<SpawnOutcome<()>, BackendError> =
-                backend.spawn_isolated(preparation, move |_child_backend, _child_preparation| {
-                    // After fork, restrict the test child to async-signal-safe syscalls so it
-                    // cannot acquire a lock held by another test-harness thread.
-                    // SAFETY: Both descriptors were returned by `pipe2` and are process-local.
+            let outcome: Result<SpawnOutcome<()>, BackendError> = backend.spawn_isolated_impl(
+                preparation,
+                move |child_backend, _child_preparation, _notifier| {
+                    let Some(notifier_fd) = child_backend.startup_notifier_fd else {
+                        // SAFETY: the fork child must never return into the test harness.
+                        unsafe { libc::_exit(1) }
+                    };
+                    let setup_is_safe = child_signal_state_is_reset()
+                        && standard_descriptors_are_sanitized()
+                        && descriptor_has_cloexec(IsolationStep::Namespaces, notifier_fd)
+                            .unwrap_or(false)
+                        && close_inherited_fds(
+                            IsolationStep::CloseInheritedFileDescriptors,
+                            notifier_fd,
+                        )
+                        .is_ok()
+                        && descriptor_is_closed(leaked_fd)
+                        && !descriptor_is_closed(notifier_fd);
+                    // The child must not return into the Rust test harness after fork.
                     unsafe {
-                        libc::close(read_fd);
-                        let marker = [0x5a_u8];
-                        let written = libc::write(write_fd, marker.as_ptr().cast(), marker.len());
-                        libc::close(write_fd);
-                        libc::_exit(i32::from(written != 1));
+                        libc::_exit(i32::from(!setup_is_safe));
                     }
-                });
+                },
+            );
 
-            // SAFETY: The parent owns both inherited descriptors after `fork` returns.
-            unsafe { libc::close(write_fd) };
             let outcome = match outcome {
                 Ok(outcome) => outcome,
-                Err(error) => {
-                    // SAFETY: The read descriptor remains owned by this parent on fork failure.
-                    unsafe { libc::close(read_fd) };
-                    panic!("fork must succeed for the isolated fork test: {error}");
-                }
+                Err(error) => panic!("fork must succeed for the isolated fork test: {error}"),
             };
-            let SpawnOutcome::Parent(child) = outcome else {
+            let SpawnOutcome::Parent(mut child) = outcome else {
                 // The child branch exits in the continuation and cannot reach this assertion.
                 panic!("only the fork parent may return to the test harness");
             };
 
-            let mut marker = [0_u8; 1];
-            let bytes_read = loop {
-                // SAFETY: `marker` is writable for one byte and `read_fd` remains open.
-                let result =
-                    unsafe { libc::read(read_fd, marker.as_mut_ptr().cast(), marker.len()) };
-                if result == -1 && errno() == libc::EINTR {
-                    continue;
-                }
-                break result;
-            };
-            // SAFETY: The parent no longer needs the read descriptor.
-            unsafe { libc::close(read_fd) };
-
-            let mut status = 0;
-            let waited_pid = loop {
-                // SAFETY: The PID came from `fork`; `status` is valid writable storage.
-                let result = unsafe {
-                    libc::waitpid(
-                        libc::pid_t::try_from(child.pid().get()).expect("child PID must fit pid_t"),
-                        &raw mut status,
-                        0,
-                    )
-                };
-                if result == -1 && errno() == libc::EINTR {
-                    continue;
-                }
-                break result;
-            };
-
-            assert_eq!(bytes_read, 1);
-            assert_eq!(marker, [0x5a]);
-            assert_eq!(
-                waited_pid,
-                libc::pid_t::try_from(child.pid().get()).expect("child PID must fit pid_t")
+            assert!(
+                descriptor_has_cloexec(
+                    IsolationStep::Namespaces,
+                    child
+                        .pidfd()
+                        .expect("the parent must own a pidfd")
+                        .as_raw_fd(),
+                )
+                .expect("pidfd flags must be observable")
             );
-            assert!(libc::WIFEXITED(status));
-            assert_eq!(libc::WEXITSTATUS(status), 0);
+            assert!(matches!(
+                child.wait_for_startup(),
+                Err(crate::backend::ChildProcessError::StartupChannelClosed)
+            ));
+            assert!(matches!(
+                child.wait(),
+                Ok(crate::backend::ChildExit::Exited(0))
+            ));
             assert_eq!(child.pid_namespace(), child_namespace);
+        }
+
+        fn descriptor_is_closed(descriptor: RawFd) -> bool {
+            // SAFETY: F_GETFD only inspects the scalar descriptor.
+            let result = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+            result == -1 && errno() == libc::EBADF
+        }
+
+        fn standard_descriptors_are_sanitized() -> bool {
+            (libc::STDIN_FILENO..=libc::STDERR_FILENO).all(|descriptor| {
+                descriptor_has_cloexec(IsolationStep::Namespaces, descriptor).unwrap_or(false)
+                    && descriptor_is_null_device(descriptor)
+            })
+        }
+
+        fn descriptor_is_null_device(descriptor: RawFd) -> bool {
+            let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `metadata` is writable and fstat does not consume the fd.
+            if unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) } == -1 {
+                return false;
+            }
+            // SAFETY: successful fstat initialized the complete structure.
+            let metadata = unsafe { metadata.assume_init() };
+            metadata.st_mode & libc::S_IFMT == libc::S_IFCHR
+                && libc::major(metadata.st_rdev) == NULL_DEVICE_MAJOR
+                && libc::minor(metadata.st_rdev) == NULL_DEVICE_MINOR
+        }
+
+        fn child_signal_state_is_reset() -> bool {
+            // SAFETY: the structures are writable outputs for signal-state queries.
+            let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            // SAFETY: a null new action queries the current disposition.
+            if unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &raw mut action) } == -1
+                || action.sa_sigaction != libc::SIG_DFL
+            {
+                return false;
+            }
+            // SAFETY: the mask is a writable query output; a null input leaves it unchanged.
+            let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            if unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut mask) }
+                != 0
+            {
+                return false;
+            }
+            // SAFETY: `mask` was initialized by pthread_sigmask.
+            if unsafe { libc::sigismember(&raw const mask, libc::SIGTERM) } != 0 {
+                return false;
+            }
+            let mut parent_death_signal = 0;
+            // SAFETY: PR_GET_PDEATHSIG writes one signal number to the supplied pointer.
+            unsafe {
+                libc::prctl(
+                    libc::PR_GET_PDEATHSIG,
+                    &raw mut parent_death_signal,
+                    0,
+                    0,
+                    0,
+                ) == 0
+                    && parent_death_signal == libc::SIGKILL
+            }
         }
     }
 }
@@ -1521,6 +2090,7 @@ pub use implementation::LinuxBackend;
 
 #[cfg(not(target_os = "linux"))]
 mod unsupported {
+    use crate::backend::private::OperationPermit;
     use crate::{BackendError, CapabilityReport, IsolationBackend, IsolationConfig, IsolationStep};
 
     /// Unsupported-platform backend that reports prerequisites without attempting mutation.
@@ -1539,6 +2109,7 @@ mod unsupported {
         }
     }
 
+    #[allow(private_bounds, private_interfaces)]
     impl IsolationBackend for LinuxBackend {
         fn detect_capabilities(&mut self, _config: &IsolationConfig) -> CapabilityReport {
             CapabilityReport::unavailable(["runtime isolation requires Linux"])
@@ -1546,6 +2117,7 @@ mod unsupported {
 
         fn apply_step(
             &mut self,
+            _permit: OperationPermit,
             step: IsolationStep,
             _config: &IsolationConfig,
         ) -> Result<(), BackendError> {
@@ -1558,6 +2130,7 @@ mod unsupported {
 
         fn rollback_step(
             &mut self,
+            _permit: OperationPermit,
             step: IsolationStep,
             _config: &IsolationConfig,
         ) -> Result<(), BackendError> {

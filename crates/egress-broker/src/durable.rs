@@ -16,6 +16,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 #[cfg(target_os = "linux")]
@@ -27,7 +28,8 @@ use egress_protocol::{
     budget::{SessionBudget, SessionBudgetError, SessionBudgetLimits},
     response::{
         CanonicalBrokerResponse, CanonicalResponseChunk, MAX_EXPANDED_CANONICAL_RESPONSE_BYTES,
-        MAX_RESPONSE_CHUNK_BYTES, ResponseCborError, ResponseChunkError,
+        MAX_PUBLIC_WIRE_BODY_BYTES, MAX_RESPONSE_CHUNK_BYTES, ResponseCborError,
+        ResponseChunkError,
     },
     session::{BrokerEnvelope, BrokerRequestId, BrokerSessionId},
 };
@@ -48,6 +50,9 @@ const FINAL_PREFIX_LEN: usize = 16 + 1 + 7 + 8 + 4;
 const MAX_RECORD_PAYLOAD_BYTES: usize = MAX_EXPANDED_CANONICAL_RESPONSE_BYTES + 64 * 1024;
 const MAX_FINAL_WIRE_PAYLOADS: usize =
     MAX_EXPANDED_CANONICAL_RESPONSE_BYTES.div_ceil(MAX_RESPONSE_CHUNK_BYTES);
+const MAX_TERMINAL_RECORD_OVERHEAD: usize = MAX_RECORD_PAYLOAD_BYTES - 32 * 1024 * 1024;
+#[cfg(test)]
+const MAX_FINAL_APPEND_TRANSIENT_DATA_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES * 2;
 #[cfg(target_os = "linux")]
 const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(unix)]
@@ -117,11 +122,28 @@ pub enum BudgetSettlement {
 }
 
 /// One exact canonical response retained in a terminal WAL record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct DurableCanonicalResponse {
     response: CanonicalBrokerResponse,
-    wire_payloads: Vec<Vec<u8>>,
+    wire_payloads: OnceLock<Vec<Vec<u8>>>,
 }
+
+impl Clone for DurableCanonicalResponse {
+    fn clone(&self) -> Self {
+        Self {
+            response: self.response.clone(),
+            wire_payloads: OnceLock::new(),
+        }
+    }
+}
+
+impl PartialEq for DurableCanonicalResponse {
+    fn eq(&self, other: &Self) -> bool {
+        self.response == other.response
+    }
+}
+
+impl Eq for DurableCanonicalResponse {}
 
 impl DurableCanonicalResponse {
     /// Returns the decoded, typed canonical response.
@@ -134,33 +156,26 @@ impl DurableCanonicalResponse {
     ///
     /// A response fitting one control frame has one direct response payload.
     /// An expanded response has its complete canonical chunk payload sequence.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internally validated canonical response can no longer
+    /// be encoded by the same protocol version that accepted it.
     #[must_use]
     pub fn wire_payloads(&self) -> &[Vec<u8>] {
-        &self.wire_payloads
-    }
-
-    fn from_response(
-        request: BrokerRequestId,
-        response: &CanonicalBrokerResponse,
-    ) -> Result<Self, DurableWalError> {
-        if response.request() != request {
-            return Err(DurableWalError::ResponseRequestMismatch {
-                expected: request,
-                received: response.request(),
-            });
-        }
-        let wire_payloads = canonical_wire_payloads(response)?;
-        Ok(Self {
-            response: response.clone(),
-            wire_payloads,
-        })
+        self.wire_payloads
+            .get_or_init(|| {
+                canonical_wire_payloads(&self.response)
+                    .expect("validated durable response must retain a canonical wire sequence")
+            })
+            .as_slice()
     }
 
     fn from_wire_payloads(
         request: BrokerRequestId,
-        wire_payloads: Vec<Vec<u8>>,
+        wire_payloads: &[Vec<u8>],
     ) -> Result<Self, DurableWalError> {
-        let response = decode_wire_payloads(&wire_payloads)?;
+        let response = decode_wire_payloads(wire_payloads)?;
         if response.request() != request {
             return Err(DurableWalError::ResponseRequestMismatch {
                 expected: request,
@@ -174,7 +189,7 @@ impl DurableCanonicalResponse {
         }
         Ok(Self {
             response,
-            wire_payloads,
+            wire_payloads: OnceLock::new(),
         })
     }
 }
@@ -995,7 +1010,7 @@ impl DurableBrokerView {
         let mut file = open_existing_file(&directory.wal_path(), false)?;
         acquire_shared_lock(&file)?;
         validate_open_file(&directory, &file)?;
-        let (state, _) = read_and_parse(&mut file)?;
+        let (state, _) = read_and_parse(&mut file, TailPolicy::Reject)?;
         validate_open_file(&directory, &file)?;
         validate_open_lock(&directory, &lock_file)?;
         Ok(Self { path, state })
@@ -1078,6 +1093,24 @@ pub struct DurableBrokerWal {
     sealed: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TerminalHeadroomChange {
+    Preserve,
+    Add(u64),
+    Release(BrokerRequestId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailPolicy {
+    Reject,
+    Repair,
+}
+
+struct ParsedWal {
+    state: RecoveredState,
+    verified_length: usize,
+}
+
 impl DurableBrokerWal {
     /// Creates and durably initializes a new exclusively owned WAL.
     ///
@@ -1136,9 +1169,10 @@ impl DurableBrokerWal {
         let mut file = open_existing_file(&directory.wal_path(), true)?;
         acquire_exclusive_lock(&file)?;
         validate_open_file(&directory, &file)?;
-        let (state, length) = read_and_parse(&mut file)?;
+        let (state, length) = read_and_parse(&mut file, TailPolicy::Repair)?;
         validate_open_file(&directory, &file)?;
         validate_open_lock(&directory, &lock_file)?;
+        validate_recovered_headroom(&state, length)?;
         if state.config != expected {
             return Err(DurableWalError::ConfigurationMismatch {
                 expected,
@@ -1219,7 +1253,7 @@ impl DurableBrokerWal {
             return Err(DurableWalError::RequestCapacityExhausted);
         }
         let payload = encode_accept(envelope, response_cap);
-        self.append(ACCEPT_KIND, &payload)?;
+        self.append(ACCEPT_KIND, &payload, TerminalHeadroomChange::Preserve)?;
         self.state.apply_accept(envelope, response_cap)?;
         Ok(DurableAcceptance::New)
     }
@@ -1248,7 +1282,11 @@ impl DurableBrokerWal {
             entry.response_cap,
             self.state.config.budget_limits(),
         )?;
-        self.append(RESERVE_KIND, request.as_bytes())?;
+        self.append(
+            RESERVE_KIND,
+            request.as_bytes(),
+            TerminalHeadroomChange::Add(entry.response_cap),
+        )?;
         self.state.apply_reserve(request)
     }
 
@@ -1268,7 +1306,11 @@ impl DurableBrokerWal {
         {
             return Err(DurableWalError::InvalidTransition { request });
         }
-        self.append(RETRYABLE_BUDGET_KIND, request.as_bytes())?;
+        self.append(
+            RETRYABLE_BUDGET_KIND,
+            request.as_bytes(),
+            TerminalHeadroomChange::Preserve,
+        )?;
         self.state.apply_retryable(request)
     }
 
@@ -1286,8 +1328,13 @@ impl DurableBrokerWal {
         settlement: BudgetSettlement,
     ) -> Result<(), DurableWalError> {
         self.ensure_writable()?;
-        let canonical = DurableCanonicalResponse::from_response(request, response)?;
-        {
+        if response.request() != request {
+            return Err(DurableWalError::ResponseRequestMismatch {
+                expected: request,
+                received: response.request(),
+            });
+        }
+        let releases_headroom = {
             let entry = self.state.request(request)?;
             if matches!(entry.phase, DurableRequestPhase::Final(_)) {
                 return Err(DurableWalError::InvalidTransition { request });
@@ -1303,10 +1350,23 @@ impl DurableBrokerWal {
                 }
                 _ => {}
             }
-        }
+            entry.reservation.is_some()
+        };
         self.state.budget.validate_settlement(request, settlement)?;
-        let payload = encode_final(request, settlement, canonical.wire_payloads())?;
-        self.append(FINAL_KIND, &payload)?;
+        let wire_payloads = canonical_wire_payloads(response)?;
+        let payload = encode_final(request, settlement, &wire_payloads)?;
+        let headroom = if releases_headroom {
+            TerminalHeadroomChange::Release(request)
+        } else {
+            TerminalHeadroomChange::Preserve
+        };
+        self.append(FINAL_KIND, &payload, headroom)?;
+        drop(payload);
+        drop(wire_payloads);
+        let canonical = DurableCanonicalResponse {
+            response: response.clone(),
+            wire_payloads: OnceLock::new(),
+        };
         self.state.apply_final(request, settlement, canonical)
     }
 
@@ -1318,7 +1378,12 @@ impl DurableBrokerWal {
         }
     }
 
-    fn append(&mut self, kind: u8, payload: &[u8]) -> Result<(), DurableWalError> {
+    fn append(
+        &mut self,
+        kind: u8,
+        payload: &[u8],
+        headroom_change: TerminalHeadroomChange,
+    ) -> Result<(), DurableWalError> {
         if let Err(error) = self.validate_append_target() {
             self.sealed = true;
             return Err(error);
@@ -1327,9 +1392,26 @@ impl DurableBrokerWal {
             .state
             .next_wal_sequence
             .ok_or(DurableWalError::SequenceExhausted)?;
-        let frame = encode_frame(sequence, kind, payload)?;
+        let header = encode_frame_header(sequence, kind, payload.len())?;
+        let frame_size = HEADER_LEN
+            .checked_add(payload.len())
+            .and_then(|length| length.checked_add(CHECKSUM_LEN))
+            .ok_or(DurableWalError::RecordTooLarge(payload.len()))?;
         let frame_length =
-            u64::try_from(frame.len()).map_err(|_| DurableWalError::RecordTooLarge(frame.len()))?;
+            u64::try_from(frame_size).map_err(|_| DurableWalError::RecordTooLarge(frame_size))?;
+        if let TerminalHeadroomChange::Release(request) = headroom_change {
+            let response_cap = self
+                .state
+                .budget
+                .active
+                .get(&request)
+                .copied()
+                .ok_or(DurableWalError::InvalidTransition { request })?;
+            if frame_length > maximum_terminal_frame_bytes(response_cap)? {
+                self.sealed = true;
+                return Err(DurableWalError::RecordTooLarge(frame_size));
+            }
+        }
         let next_length =
             self.length
                 .checked_add(frame_length)
@@ -1337,17 +1419,35 @@ impl DurableBrokerWal {
                     length: u64::MAX,
                     maximum: MAX_DURABLE_BROKER_WAL_BYTES,
                 })?;
-        if next_length > MAX_DURABLE_BROKER_WAL_BYTES {
+        let protected_headroom = match self.protected_terminal_headroom(headroom_change) {
+            Ok(headroom) => headroom,
+            Err(error) => {
+                self.sealed = true;
+                return Err(error);
+            }
+        };
+        let projected_length =
+            next_length
+                .checked_add(protected_headroom)
+                .ok_or(DurableWalError::WalTooLarge {
+                    length: u64::MAX,
+                    maximum: MAX_DURABLE_BROKER_WAL_BYTES,
+                })?;
+        if projected_length > MAX_DURABLE_BROKER_WAL_BYTES {
+            self.sealed = true;
             return Err(DurableWalError::WalTooLarge {
-                length: next_length,
+                length: projected_length,
                 maximum: MAX_DURABLE_BROKER_WAL_BYTES,
             });
         }
-        if let Err(error) = self
-            .file
-            .write_all(&frame)
-            .and_then(|()| self.file.sync_all())
-        {
+        let frame_checksum = checksum_parts(&header, payload).to_le_bytes();
+        let append_result = (|| {
+            self.file.write_all(&header)?;
+            self.file.write_all(payload)?;
+            self.file.write_all(&frame_checksum)?;
+            self.file.sync_all()
+        })();
+        if let Err(error) = append_result {
             self.sealed = true;
             return Err(DurableWalError::DurabilityUncertain(error));
         }
@@ -1358,6 +1458,42 @@ impl DurableBrokerWal {
         self.length = next_length;
         self.state.next_wal_sequence = sequence.checked_add(1);
         Ok(())
+    }
+
+    fn protected_terminal_headroom(
+        &self,
+        change: TerminalHeadroomChange,
+    ) -> Result<u64, DurableWalError> {
+        let released = match change {
+            TerminalHeadroomChange::Release(request) => Some(request),
+            TerminalHeadroomChange::Preserve | TerminalHeadroomChange::Add(_) => None,
+        };
+        let mut headroom =
+            self.state
+                .budget
+                .active
+                .iter()
+                .try_fold(0_u64, |total, (request, response_cap)| {
+                    if Some(*request) == released {
+                        Ok(total)
+                    } else {
+                        total
+                            .checked_add(maximum_terminal_frame_bytes(*response_cap)?)
+                            .ok_or(DurableWalError::WalTooLarge {
+                                length: u64::MAX,
+                                maximum: MAX_DURABLE_BROKER_WAL_BYTES,
+                            })
+                    }
+                })?;
+        if let TerminalHeadroomChange::Add(response_cap) = change {
+            headroom = headroom
+                .checked_add(maximum_terminal_frame_bytes(response_cap)?)
+                .ok_or(DurableWalError::WalTooLarge {
+                    length: u64::MAX,
+                    maximum: MAX_DURABLE_BROKER_WAL_BYTES,
+                })?;
+        }
+        Ok(headroom)
     }
 
     fn validate_append_target(&self) -> Result<(), DurableWalError> {
@@ -1533,7 +1669,7 @@ fn decode_final(
             "final response payload sequence has trailing bytes".to_owned(),
         ));
     }
-    let response = DurableCanonicalResponse::from_wire_payloads(request, wire_payloads)?;
+    let response = DurableCanonicalResponse::from_wire_payloads(request, &wire_payloads)?;
     Ok((request, settlement, response))
 }
 
@@ -1575,28 +1711,86 @@ fn decode_wire_payloads(
 }
 
 fn encode_frame(sequence: u64, kind: u8, payload: &[u8]) -> Result<Vec<u8>, DurableWalError> {
-    if payload.len() > MAX_RECORD_PAYLOAD_BYTES {
-        return Err(DurableWalError::RecordTooLarge(payload.len()));
-    }
-    let payload_length =
-        u32::try_from(payload.len()).map_err(|_| DurableWalError::RecordTooLarge(payload.len()))?;
+    let header = encode_frame_header(sequence, kind, payload.len())?;
     let capacity = HEADER_LEN
         .checked_add(payload.len())
         .and_then(|length| length.checked_add(CHECKSUM_LEN))
         .ok_or(DurableWalError::RecordTooLarge(payload.len()))?;
     let mut frame = Vec::with_capacity(capacity);
-    frame.extend_from_slice(MAGIC);
-    frame.extend_from_slice(&VERSION.to_le_bytes());
-    frame.push(kind);
-    frame.push(0);
-    frame.extend_from_slice(&sequence.to_le_bytes());
-    frame.extend_from_slice(&payload_length.to_le_bytes());
+    frame.extend_from_slice(&header);
     frame.extend_from_slice(payload);
-    frame.extend_from_slice(&checksum(&frame).to_le_bytes());
+    frame.extend_from_slice(&checksum_parts(&header, payload).to_le_bytes());
     Ok(frame)
 }
 
-fn read_and_parse(file: &mut File) -> Result<(RecoveredState, u64), DurableWalError> {
+fn encode_frame_header(
+    sequence: u64,
+    kind: u8,
+    payload_length: usize,
+) -> Result<[u8; HEADER_LEN], DurableWalError> {
+    if payload_length > MAX_RECORD_PAYLOAD_BYTES {
+        return Err(DurableWalError::RecordTooLarge(payload_length));
+    }
+    let payload_length = u32::try_from(payload_length)
+        .map_err(|_| DurableWalError::RecordTooLarge(payload_length))?;
+    let mut header = [0_u8; HEADER_LEN];
+    header[..8].copy_from_slice(MAGIC);
+    header[8..10].copy_from_slice(&VERSION.to_le_bytes());
+    header[10] = kind;
+    header[12..20].copy_from_slice(&sequence.to_le_bytes());
+    header[20..24].copy_from_slice(&payload_length.to_le_bytes());
+    Ok(header)
+}
+
+fn maximum_terminal_frame_bytes(response_cap: u64) -> Result<u64, DurableWalError> {
+    let bounded_body = response_cap.min(MAX_PUBLIC_WIRE_BODY_BYTES);
+    let bounded_body =
+        usize::try_from(bounded_body).map_err(|_| DurableWalError::RecordTooLarge(usize::MAX))?;
+    let payload_length = bounded_body
+        .checked_add(MAX_TERMINAL_RECORD_OVERHEAD)
+        .ok_or(DurableWalError::RecordTooLarge(usize::MAX))?;
+    let frame_length = HEADER_LEN
+        .checked_add(payload_length)
+        .and_then(|length| length.checked_add(CHECKSUM_LEN))
+        .ok_or(DurableWalError::RecordTooLarge(usize::MAX))?;
+    u64::try_from(frame_length).map_err(|_| DurableWalError::RecordTooLarge(frame_length))
+}
+
+fn validate_recovered_headroom(
+    state: &RecoveredState,
+    wal_length: u64,
+) -> Result<(), DurableWalError> {
+    let headroom = state
+        .budget
+        .active
+        .values()
+        .try_fold(0_u64, |total, response_cap| {
+            total
+                .checked_add(maximum_terminal_frame_bytes(*response_cap)?)
+                .ok_or(DurableWalError::WalTooLarge {
+                    length: u64::MAX,
+                    maximum: MAX_DURABLE_BROKER_WAL_BYTES,
+                })
+        })?;
+    let projected = wal_length
+        .checked_add(headroom)
+        .ok_or(DurableWalError::WalTooLarge {
+            length: u64::MAX,
+            maximum: MAX_DURABLE_BROKER_WAL_BYTES,
+        })?;
+    if projected > MAX_DURABLE_BROKER_WAL_BYTES {
+        return Err(DurableWalError::WalTooLarge {
+            length: projected,
+            maximum: MAX_DURABLE_BROKER_WAL_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn read_and_parse(
+    file: &mut File,
+    tail_policy: TailPolicy,
+) -> Result<(RecoveredState, u64), DurableWalError> {
     let length = file.metadata()?.len();
     if length > MAX_DURABLE_BROKER_WAL_BYTES {
         return Err(DurableWalError::WalTooLarge {
@@ -1623,11 +1817,20 @@ fn read_and_parse(file: &mut File) -> Result<(RecoveredState, u64), DurableWalEr
             "WAL length changed during recovery".to_owned(),
         ));
     }
-    let state = parse_wal(&bytes)?;
-    Ok((state, observed_length))
+    let parsed = parse_wal(&bytes, tail_policy)?;
+    let verified_length = u64::try_from(parsed.verified_length).unwrap_or(u64::MAX);
+    if verified_length < observed_length {
+        if tail_policy != TailPolicy::Repair {
+            return Err(DurableWalError::TruncatedRecord);
+        }
+        if let Err(error) = file.set_len(verified_length).and_then(|()| file.sync_all()) {
+            return Err(DurableWalError::DurabilityUncertain(error));
+        }
+    }
+    Ok((parsed.state, verified_length))
 }
 
-fn parse_wal(bytes: &[u8]) -> Result<RecoveredState, DurableWalError> {
+fn parse_wal(bytes: &[u8], tail_policy: TailPolicy) -> Result<ParsedWal, DurableWalError> {
     if bytes.len() > usize::try_from(MAX_DURABLE_BROKER_WAL_BYTES).unwrap_or(usize::MAX) {
         return Err(DurableWalError::WalTooLarge {
             length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
@@ -1638,10 +1841,12 @@ fn parse_wal(bytes: &[u8]) -> Result<RecoveredState, DurableWalError> {
     let mut expected_sequence = 0;
     let mut state = None;
     while offset < bytes.len() {
-        if bytes.len() - offset < HEADER_LEN + CHECKSUM_LEN {
-            return Err(DurableWalError::TruncatedRecord);
-        }
         let frame_start = offset;
+        let remaining = bytes.len() - frame_start;
+        if remaining < HEADER_LEN {
+            validate_partial_header(&bytes[frame_start..], expected_sequence)?;
+            return finish_torn_tail(state, expected_sequence, frame_start, tail_policy);
+        }
         if &bytes[offset..offset + MAGIC.len()] != MAGIC {
             return Err(DurableWalError::InvalidMagic);
         }
@@ -1668,12 +1873,20 @@ fn parse_wal(bytes: &[u8]) -> Result<RecoveredState, DurableWalError> {
         if payload_length > MAX_RECORD_PAYLOAD_BYTES {
             return Err(DurableWalError::RecordTooLarge(payload_length));
         }
+        validate_frame_shape(kind, expected_sequence, payload_length)?;
         let frame_length = HEADER_LEN
             .checked_add(payload_length)
             .and_then(|length| length.checked_add(CHECKSUM_LEN))
             .ok_or(DurableWalError::RecordTooLarge(payload_length))?;
         if bytes.len() - frame_start < frame_length {
-            return Err(DurableWalError::TruncatedRecord);
+            if has_complete_following_frame(
+                bytes,
+                frame_start + HEADER_LEN,
+                expected_sequence.saturating_add(1),
+            ) {
+                return Err(DurableWalError::TruncatedRecord);
+            }
+            return finish_torn_tail(state, expected_sequence, frame_start, tail_policy);
         }
         let payload_end = offset + payload_length;
         let payload = &bytes[offset..payload_end];
@@ -1682,51 +1895,218 @@ fn parse_wal(bytes: &[u8]) -> Result<RecoveredState, DurableWalError> {
         if stored_checksum != checksum(&bytes[frame_start..payload_end]) {
             return Err(DurableWalError::ChecksumMismatch);
         }
-        match kind {
-            INIT_KIND if expected_sequence == 0 => {
-                state = Some(RecoveredState::new(decode_init(payload)?));
-            }
-            INIT_KIND => {
-                return Err(DurableWalError::InvalidRecord(
-                    "session record is repeated".to_owned(),
-                ));
-            }
-            ACCEPT_KIND => {
-                let recovered = state.as_mut().ok_or_else(|| {
-                    DurableWalError::InvalidRecord(
-                        "request appears before the session record".to_owned(),
-                    )
-                })?;
-                let (sequence, request, payload_hash, response_cap) =
-                    decode_accept(payload, recovered.config.session())?;
-                recovered.apply_accept_parts(sequence, request, payload_hash, response_cap)?;
-            }
-            RESERVE_KIND => {
-                let request = decode_request(payload)?;
-                recovered_state(&mut state)?.apply_reserve(request)?;
-            }
-            RETRYABLE_BUDGET_KIND => {
-                let request = decode_request(payload)?;
-                recovered_state(&mut state)?.apply_retryable(request)?;
-            }
-            FINAL_KIND => {
-                let (request, settlement, response) = decode_final(payload)?;
-                recovered_state(&mut state)?.apply_final(request, settlement, response)?;
-            }
-            _ => {
-                return Err(DurableWalError::InvalidRecord(
-                    "frame kind is unknown".to_owned(),
-                ));
-            }
-        }
+        apply_recovered_frame(&mut state, kind, expected_sequence, payload)?;
         expected_sequence = expected_sequence
             .checked_add(1)
             .ok_or(DurableWalError::SequenceExhausted)?;
     }
+    finish_parsed_wal(state, expected_sequence, offset)
+}
+
+fn apply_recovered_frame(
+    state: &mut Option<RecoveredState>,
+    kind: u8,
+    expected_sequence: u64,
+    payload: &[u8],
+) -> Result<(), DurableWalError> {
+    match kind {
+        INIT_KIND if expected_sequence == 0 => {
+            *state = Some(RecoveredState::new(decode_init(payload)?));
+        }
+        INIT_KIND => {
+            return Err(DurableWalError::InvalidRecord(
+                "session record is repeated".to_owned(),
+            ));
+        }
+        ACCEPT_KIND => {
+            let recovered = state.as_mut().ok_or_else(|| {
+                DurableWalError::InvalidRecord(
+                    "request appears before the session record".to_owned(),
+                )
+            })?;
+            let (sequence, request, payload_hash, response_cap) =
+                decode_accept(payload, recovered.config.session())?;
+            recovered.apply_accept_parts(sequence, request, payload_hash, response_cap)?;
+        }
+        RESERVE_KIND => {
+            let request = decode_request(payload)?;
+            recovered_state(state)?.apply_reserve(request)?;
+        }
+        RETRYABLE_BUDGET_KIND => {
+            let request = decode_request(payload)?;
+            recovered_state(state)?.apply_retryable(request)?;
+        }
+        FINAL_KIND => {
+            let (request, settlement, response) = decode_final(payload)?;
+            recovered_state(state)?.apply_final(request, settlement, response)?;
+        }
+        _ => {
+            return Err(DurableWalError::InvalidRecord(
+                "frame kind is unknown".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn finish_torn_tail(
+    state: Option<RecoveredState>,
+    expected_sequence: u64,
+    verified_length: usize,
+    tail_policy: TailPolicy,
+) -> Result<ParsedWal, DurableWalError> {
+    if tail_policy == TailPolicy::Reject {
+        return Err(DurableWalError::TruncatedRecord);
+    }
+    finish_parsed_wal(state, expected_sequence, verified_length)
+}
+
+fn finish_parsed_wal(
+    state: Option<RecoveredState>,
+    expected_sequence: u64,
+    verified_length: usize,
+) -> Result<ParsedWal, DurableWalError> {
     let mut state = state
         .ok_or_else(|| DurableWalError::InvalidRecord("WAL has no session record".to_owned()))?;
     state.next_wal_sequence = Some(expected_sequence);
-    Ok(state)
+    Ok(ParsedWal {
+        state,
+        verified_length,
+    })
+}
+
+fn validate_partial_header(bytes: &[u8], expected_sequence: u64) -> Result<(), DurableWalError> {
+    let magic_length = bytes.len().min(MAGIC.len());
+    if bytes[..magic_length] != MAGIC[..magic_length] {
+        return Err(DurableWalError::InvalidMagic);
+    }
+    if bytes.len() >= MAGIC.len() + 2 {
+        let version = u16::from_le_bytes(
+            bytes[MAGIC.len()..MAGIC.len() + 2]
+                .try_into()
+                .map_err(|_| DurableWalError::TruncatedRecord)?,
+        );
+        if version != VERSION {
+            return Err(DurableWalError::UnsupportedVersion(version));
+        }
+    }
+    if bytes.len() > MAGIC.len() + 2 {
+        validate_frame_kind(bytes[MAGIC.len() + 2], expected_sequence)?;
+    }
+    if bytes.len() > MAGIC.len() + 3 && bytes[MAGIC.len() + 3] != 0 {
+        return Err(DurableWalError::InvalidRecord(
+            "frame reserved bits are non-zero".to_owned(),
+        ));
+    }
+    if bytes.len() >= MAGIC.len() + 2 + 1 + 1 + 8 {
+        let sequence_start = MAGIC.len() + 2 + 1 + 1;
+        let sequence = u64::from_le_bytes(
+            bytes[sequence_start..sequence_start + 8]
+                .try_into()
+                .map_err(|_| DurableWalError::TruncatedRecord)?,
+        );
+        if sequence != expected_sequence {
+            return Err(DurableWalError::SequenceMismatch {
+                expected: expected_sequence,
+                actual: sequence,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_frame_shape(
+    kind: u8,
+    expected_sequence: u64,
+    payload_length: usize,
+) -> Result<(), DurableWalError> {
+    validate_frame_kind(kind, expected_sequence)?;
+    let valid_length = match kind {
+        INIT_KIND => payload_length == INIT_PAYLOAD_LEN,
+        ACCEPT_KIND => payload_length == ACCEPT_PAYLOAD_LEN,
+        RESERVE_KIND | RETRYABLE_BUDGET_KIND => payload_length == REQUEST_PAYLOAD_LEN,
+        FINAL_KIND => (FINAL_PREFIX_LEN..=MAX_RECORD_PAYLOAD_BYTES).contains(&payload_length),
+        _ => false,
+    };
+    if !valid_length {
+        return Err(DurableWalError::InvalidRecord(
+            "frame kind and payload length are inconsistent".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_frame_kind(kind: u8, expected_sequence: u64) -> Result<(), DurableWalError> {
+    match kind {
+        INIT_KIND if expected_sequence == 0 => Ok(()),
+        INIT_KIND => Err(DurableWalError::InvalidRecord(
+            "session record is repeated".to_owned(),
+        )),
+        ACCEPT_KIND | RESERVE_KIND | RETRYABLE_BUDGET_KIND | FINAL_KIND
+            if expected_sequence > 0 =>
+        {
+            Ok(())
+        }
+        _ => Err(DurableWalError::InvalidRecord(
+            "frame kind is unknown".to_owned(),
+        )),
+    }
+}
+
+fn has_complete_following_frame(bytes: &[u8], start: usize, expected_sequence: u64) -> bool {
+    let Some(search) = bytes.get(start..) else {
+        return false;
+    };
+    for relative in 0..search.len().saturating_sub(MAGIC.len()).saturating_add(1) {
+        let frame_start = start + relative;
+        if bytes.get(frame_start..frame_start + MAGIC.len()) != Some(MAGIC.as_slice()) {
+            continue;
+        }
+        let Some(header) = bytes.get(frame_start..frame_start + HEADER_LEN) else {
+            continue;
+        };
+        if u16::from_le_bytes([header[8], header[9]]) != VERSION || header[11] != 0 {
+            continue;
+        }
+        let sequence = u64::from_le_bytes(
+            header[12..20]
+                .try_into()
+                .expect("fixed WAL sequence header slice"),
+        );
+        if sequence != expected_sequence {
+            continue;
+        }
+        let payload_length = usize::try_from(u32::from_le_bytes(
+            header[20..24]
+                .try_into()
+                .expect("fixed WAL length header slice"),
+        ))
+        .unwrap_or(usize::MAX);
+        if payload_length > MAX_RECORD_PAYLOAD_BYTES
+            || validate_frame_shape(header[10], sequence, payload_length).is_err()
+        {
+            continue;
+        }
+        let Some(frame_length) = HEADER_LEN
+            .checked_add(payload_length)
+            .and_then(|length| length.checked_add(CHECKSUM_LEN))
+        else {
+            continue;
+        };
+        let Some(frame) = bytes.get(frame_start..frame_start + frame_length) else {
+            continue;
+        };
+        let payload_end = HEADER_LEN + payload_length;
+        let stored_checksum = u64::from_le_bytes(
+            frame[payload_end..]
+                .try_into()
+                .expect("fixed WAL checksum trailer slice"),
+        );
+        if stored_checksum == checksum(&frame[..payload_end]) {
+            return true;
+        }
+    }
+    false
 }
 
 fn recovered_state(
@@ -1785,8 +2165,12 @@ fn read_fixed<const N: usize>(
 }
 
 fn checksum(bytes: &[u8]) -> u64 {
+    checksum_parts(bytes, &[])
+}
+
+fn checksum_parts(first: &[u8], second: &[u8]) -> u64 {
     let mut state = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
+    for byte in first.iter().chain(second) {
         state ^= u64::from(*byte);
         state = state.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -2103,16 +2487,22 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use authority_core::http::{CanonicalHost, CanonicalUrlPath};
     use egress_protocol::{
         budget::SessionBudgetLimits,
-        response::{BrokerWireOutcome, BrokerWireRejection, CanonicalBrokerResponse},
+        response::{
+            BrokerWireOutcome, BrokerWireRejection, CanonicalBrokerResponse,
+            MAX_PUBLIC_WIRE_BODY_BYTES, PublicWireResponse,
+        },
         session::{BrokerEnvelope, BrokerRequestId, BrokerSessionId, PayloadHash},
     };
 
     use super::{
         BudgetSettlement, DurableAcceptance, DurableBrokerView, DurableBrokerWal,
-        DurableRequestPhase, DurableSessionConfig, DurableWalError, FINAL_KIND, PRIVATE_FILE_MODE,
-        durable_lock_name, encode_frame, validate_owner_and_permissions,
+        DurableRequestPhase, DurableSessionConfig, DurableWalError, FINAL_KIND, HEADER_LEN,
+        MAX_DURABLE_BROKER_WAL_BYTES, MAX_FINAL_APPEND_TRANSIENT_DATA_BYTES, PRIVATE_FILE_MODE,
+        RETRYABLE_BUDGET_KIND, canonical_wire_payloads, durable_lock_name, encode_final,
+        encode_frame, validate_owner_and_permissions,
     };
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
@@ -2164,6 +2554,28 @@ mod tests {
             request,
             BrokerWireOutcome::Rejected(BrokerWireRejection::CommittedButUnrecorded),
         )
+    }
+
+    fn maximum_public_response(request: BrokerRequestId, byte: u8) -> CanonicalBrokerResponse {
+        let body_length = usize::try_from(MAX_PUBLIC_WIRE_BODY_BYTES)
+            .expect("public response cap fits this platform");
+        let public = PublicWireResponse::new(
+            200,
+            CanonicalHost::new("example.com").expect("fixture host is canonical"),
+            CanonicalUrlPath::root(),
+            vec![byte; body_length],
+        )
+        .expect("maximum public response is valid");
+        CanonicalBrokerResponse::new(request, BrokerWireOutcome::Public(public))
+    }
+
+    fn append_fixture(path: &PathBuf, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open WAL fixture");
+        file.write_all(bytes).expect("append WAL fixture");
+        file.sync_all().expect("sync WAL fixture");
     }
 
     #[test]
@@ -2358,10 +2770,118 @@ mod tests {
         file.seek(SeekFrom::End(-1)).expect("seek checksum");
         file.write_all(&[0xff]).expect("corrupt checksum");
         file.sync_all().expect("sync corruption");
+        let corrupt_length = file.metadata().expect("corrupt metadata").len();
+        drop(file);
         assert!(matches!(
             DurableBrokerView::open(&corrupt_path.0),
             Err(DurableWalError::ChecksumMismatch)
         ));
+        assert!(matches!(
+            DurableBrokerWal::open(&corrupt_path.0, config()),
+            Err(DurableWalError::ChecksumMismatch)
+        ));
+        assert_eq!(
+            fs::metadata(&corrupt_path.0)
+                .expect("corrupt WAL metadata")
+                .len(),
+            corrupt_length
+        );
+    }
+
+    #[test]
+    fn exclusive_open_repairs_only_a_torn_tail_and_preserves_pending_reservation() {
+        let path = TestPath::new("repair-tail");
+        let first = envelope(0, 1);
+        let verified_length = {
+            let mut wal = DurableBrokerWal::create(&path.0, config()).expect("create WAL");
+            wal.accept(first, 10).expect("accept request");
+            wal.reserve(first.request()).expect("reserve request");
+            fs::metadata(&path.0).expect("verified WAL metadata").len()
+        };
+        let response = rejection(first.request());
+        let wire_payloads = vec![response.encode().expect("encode response")];
+        let payload = encode_final(
+            first.request(),
+            BudgetSettlement::Complete { response_bytes: 10 },
+            &wire_payloads,
+        )
+        .expect("encode final payload");
+        let frame = encode_frame(3, FINAL_KIND, &payload).expect("encode final frame");
+        append_fixture(&path.0, &frame[..frame.len() - 3]);
+        let torn_length = fs::metadata(&path.0).expect("torn WAL metadata").len();
+
+        assert!(matches!(
+            DurableBrokerView::open(&path.0),
+            Err(DurableWalError::TruncatedRecord)
+        ));
+        assert_eq!(
+            fs::metadata(&path.0)
+                .expect("unrepaired WAL metadata")
+                .len(),
+            torn_length
+        );
+
+        let mut repaired = DurableBrokerWal::open(&path.0, config()).expect("repair torn tail");
+        assert_eq!(
+            fs::metadata(&path.0).expect("repaired WAL metadata").len(),
+            verified_length
+        );
+        let recovered = repaired
+            .read_only_view()
+            .expect("repaired view")
+            .request(first.request())
+            .expect("recovered request")
+            .clone();
+        assert!(matches!(
+            recovered.phase(),
+            DurableRequestPhase::AcceptedPending
+        ));
+        assert_eq!(recovered.active_reservation(), Some(10));
+        repaired
+            .finalize(
+                first.request(),
+                &response,
+                BudgetSettlement::Complete { response_bytes: 10 },
+            )
+            .expect("conservatively finalize recovered request");
+        drop(repaired);
+        DurableBrokerWal::open(&path.0, config()).expect("reopen repaired WAL");
+    }
+
+    #[test]
+    fn truncation_before_a_later_frame_is_corruption_and_is_not_repaired() {
+        let path = TestPath::new("middle-truncation");
+        let first = envelope(0, 1);
+        {
+            let mut wal = DurableBrokerWal::create(&path.0, config()).expect("create WAL");
+            wal.accept(first, 10).expect("accept request");
+        }
+        let response = rejection(first.request());
+        let wire_payloads = vec![response.encode().expect("encode response")];
+        let payload = encode_final(
+            first.request(),
+            BudgetSettlement::NotStarted,
+            &wire_payloads,
+        )
+        .expect("encode final payload");
+        let mut truncated = encode_frame(2, FINAL_KIND, &payload).expect("encode final frame");
+        truncated[20..24].copy_from_slice(&(1024_u32 * 1024).to_le_bytes());
+        let later = encode_frame(3, RETRYABLE_BUDGET_KIND, first.request().as_bytes())
+            .expect("encode later frame");
+        append_fixture(&path.0, &truncated[..HEADER_LEN + 8]);
+        append_fixture(&path.0, &later);
+        let corrupt_length = fs::metadata(&path.0).expect("corrupt WAL metadata").len();
+
+        assert!(matches!(
+            DurableBrokerWal::open(&path.0, config()),
+            Err(DurableWalError::TruncatedRecord)
+        ));
+        assert_eq!(
+            fs::metadata(&path.0)
+                .expect("still-corrupt WAL metadata")
+                .len(),
+            corrupt_length
+        );
     }
 
     #[test]
@@ -2491,6 +3011,125 @@ mod tests {
             DurableBrokerView::open(&path.0),
             Err(DurableWalError::RecordTooLarge(length)) if length == u32::MAX as usize
         ));
+    }
+
+    #[test]
+    fn active_terminal_headroom_cannot_be_consumed_by_retryable_markers() {
+        let path = TestPath::new("headroom-markers");
+        let active = envelope(0, 1);
+        let retryable = envelope(1, 2);
+        let mut wal = DurableBrokerWal::create(&path.0, config()).expect("create WAL");
+        wal.accept(active, 10).expect("accept active request");
+        wal.reserve(active.request())
+            .expect("reserve active request");
+        wal.accept(retryable, 10).expect("accept retryable request");
+        let marker_length = u64::try_from(
+            encode_frame(4, RETRYABLE_BUDGET_KIND, retryable.request().as_bytes())
+                .expect("encode retryable marker")
+                .len(),
+        )
+        .expect("marker length fits u64");
+        let headroom = super::maximum_terminal_frame_bytes(10).expect("terminal headroom");
+        wal.length = MAX_DURABLE_BROKER_WAL_BYTES - headroom - marker_length + 1;
+        let physical_length = fs::metadata(&path.0).expect("WAL metadata").len();
+
+        assert!(matches!(
+            wal.mark_retryable_budget(retryable.request()),
+            Err(DurableWalError::WalTooLarge { .. })
+        ));
+        assert!(wal.is_sealed());
+        assert_eq!(
+            fs::metadata(&path.0).expect("WAL metadata").len(),
+            physical_length
+        );
+    }
+
+    #[test]
+    fn fourth_maximum_effect_is_refused_before_reserve_and_first_three_reopen() {
+        let path = TestPath::new("four-maximum-effects");
+        let config = DurableSessionConfig::new(
+            config().session(),
+            NonZeroUsize::new(4).expect("test replay capacity is non-zero"),
+            SessionBudgetLimits::new(
+                NonZeroU64::new(4).expect("test request budget is non-zero"),
+                MAX_PUBLIC_WIRE_BODY_BYTES * 4,
+                NonZeroUsize::new(1).expect("test concurrency budget is non-zero"),
+            ),
+        );
+        let mut wal = DurableBrokerWal::create(&path.0, config).expect("create WAL");
+        for sequence in 0_u8..3 {
+            let request = envelope(u64::from(sequence), sequence + 1);
+            wal.accept(request, MAX_PUBLIC_WIRE_BODY_BYTES)
+                .expect("accept maximum request");
+            wal.reserve(request.request())
+                .expect("reserve maximum request");
+            let response = maximum_public_response(request.request(), sequence);
+            if sequence == 0 {
+                let wire_payloads =
+                    canonical_wire_payloads(&response).expect("encode maximum wire sequence");
+                let payload = encode_final(
+                    request.request(),
+                    BudgetSettlement::Complete {
+                        response_bytes: MAX_PUBLIC_WIRE_BODY_BYTES,
+                    },
+                    &wire_payloads,
+                )
+                .expect("encode maximum final payload");
+                let wire_bytes = wire_payloads.iter().map(Vec::len).sum::<usize>();
+                assert!(payload.len() <= super::MAX_RECORD_PAYLOAD_BYTES);
+                assert!(
+                    wire_bytes + payload.len() <= MAX_FINAL_APPEND_TRANSIENT_DATA_BYTES,
+                    "maximum final append data must stay within two bounded record buffers"
+                );
+            }
+            wal.finalize(
+                request.request(),
+                &response,
+                BudgetSettlement::Complete {
+                    response_bytes: MAX_PUBLIC_WIRE_BODY_BYTES,
+                },
+            )
+            .expect("finalize maximum request");
+            let DurableRequestPhase::Final(canonical) = wal
+                .state
+                .request(request.request())
+                .expect("terminal durable request")
+                .phase()
+            else {
+                panic!("maximum request must be terminal");
+            };
+            assert!(canonical.wire_payloads.get().is_none());
+        }
+        let fourth = envelope(3, 4);
+        wal.accept(fourth, MAX_PUBLIC_WIRE_BODY_BYTES)
+            .expect("accept fourth request before effect");
+        assert!(matches!(
+            wal.reserve(fourth.request()),
+            Err(DurableWalError::WalTooLarge { .. })
+        ));
+        assert!(wal.is_sealed());
+        drop(wal);
+
+        let reopened = DurableBrokerWal::open(&path.0, config).expect("reopen valid prefix");
+        let view = reopened.read_only_view().expect("reopened view");
+        for value in 1_u8..=3 {
+            let DurableRequestPhase::Final(canonical) = view
+                .request(BrokerRequestId::new([value; 16]))
+                .expect("terminal request")
+                .phase()
+            else {
+                panic!("reopened maximum request must be terminal");
+            };
+            assert!(canonical.wire_payloads.get().is_none());
+        }
+        let recovered_fourth = view
+            .request(fourth.request())
+            .expect("fourth request marker");
+        assert!(matches!(
+            recovered_fourth.phase(),
+            DurableRequestPhase::AcceptedPending
+        ));
+        assert_eq!(recovered_fourth.active_reservation(), None);
     }
 
     #[test]

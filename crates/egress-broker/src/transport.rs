@@ -28,6 +28,20 @@ pub trait VsockListener {
     fn accept(&self) -> io::Result<Self::Stream>;
 }
 
+/// A listener that reports the authenticated transport peer identity.
+pub trait PeerBoundListener {
+    /// Stream type returned for one accepted connection.
+    type Stream: Read + Write;
+
+    /// Accepts one connection and returns its kernel-reported peer CID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operating-system error when accept fails or the peer address
+    /// is not an `AF_VSOCK` address.
+    fn accept_peer(&self) -> io::Result<(u32, Self::Stream)>;
+}
+
 /// A safe wrapper around one accepted `AF_VSOCK` stream.
 #[derive(Debug)]
 pub struct VsockStream {
@@ -111,8 +125,22 @@ impl VsockListener for AfVsockListener {
     type Stream = VsockStream;
 
     fn accept(&self) -> io::Result<Self::Stream> {
-        let (socket, _peer) = self.socket.accept()?;
-        Ok(VsockStream { socket })
+        self.accept_peer().map(|(_, stream)| stream)
+    }
+}
+
+impl PeerBoundListener for AfVsockListener {
+    type Stream = VsockStream;
+
+    fn accept_peer(&self) -> io::Result<(u32, Self::Stream)> {
+        let (socket, peer) = self.socket.accept()?;
+        let (peer_cid, _peer_port) = peer.as_vsock_address().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "accepted peer did not provide an AF_VSOCK address",
+            )
+        })?;
+        Ok((peer_cid, VsockStream { socket }))
     }
 }
 

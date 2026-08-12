@@ -248,6 +248,25 @@ impl PublicResponse {
         self.wire.body()
     }
 
+    /// Checks that an extension response remains within the selected request and authority.
+    pub(crate) fn validate_dispatch(
+        &self,
+        request: &HttpFetchRequest,
+        authority: &HttpFetchAuthority,
+    ) -> bool {
+        let body_fits = u64::try_from(self.body().len())
+            .is_ok_and(|body_bytes| body_bytes <= request.max_response_bytes());
+        let method_body_matches =
+            request.method() != HttpFetchMethod::Head || self.body().is_empty();
+        let final_request = HttpFetchRequest::new(
+            request.method(),
+            self.host().clone(),
+            self.path().clone(),
+            request.max_response_bytes(),
+        );
+        body_fits && method_body_matches && http_fetch_matches(authority, &final_request)
+    }
+
     pub(crate) fn into_wire(self) -> PublicWireResponse {
         self.wire
     }
@@ -721,6 +740,55 @@ mod tests {
             PublicResponse::new(200, host, path, vec![0; oversized]),
             Err(FetchError::InvalidResponse)
         );
+    }
+
+    // Requirement: an extension response remains inside the admitted request and authority.
+    // Category: boundary/security/accounting. Risk: critical.
+    #[test]
+    fn public_response_dispatch_validation_rejects_oversize_and_unauthorized_output() {
+        let admitted_request = request("/guide", 4);
+        let admitted_authority = authority("/guide", 4);
+        let host = CanonicalHost::new("public.example").expect("fixture host is valid");
+        let path = CanonicalUrlPath::new("/guide").expect("fixture path is valid");
+        let valid = PublicResponse::new(200, host.clone(), path, b"okay".to_vec())
+            .expect("fixture response is wire valid");
+        assert!(valid.validate_dispatch(&admitted_request, &admitted_authority));
+
+        let oversized = PublicResponse::new(
+            200,
+            host.clone(),
+            CanonicalUrlPath::new("/guide").expect("fixture path is valid"),
+            b"large".to_vec(),
+        )
+        .expect("fixture response is wire valid");
+        assert!(!oversized.validate_dispatch(&admitted_request, &admitted_authority));
+
+        let outside = PublicResponse::new(
+            200,
+            host,
+            CanonicalUrlPath::new("/outside").expect("fixture path is valid"),
+            Vec::new(),
+        )
+        .expect("fixture response is wire valid");
+        assert!(!outside.validate_dispatch(&admitted_request, &admitted_authority));
+
+        let head_request = authority_core::http::HttpFetchRequest::new(
+            authority_core::http::HttpFetchMethod::Head,
+            CanonicalHost::new("public.example").expect("fixture host is valid"),
+            CanonicalUrlPath::new("/guide").expect("fixture path is valid"),
+            4,
+        );
+        let head_body = PublicResponse::new(
+            200,
+            CanonicalHost::new("public.example").expect("fixture host is valid"),
+            CanonicalUrlPath::new("/guide").expect("fixture path is valid"),
+            b"body".to_vec(),
+        )
+        .expect("fixture response is wire valid");
+        assert!(!head_body.validate_dispatch(
+            &head_request,
+            &authority_with_method(authority_core::http::HttpFetchMethod::Head, "/guide", 4,)
+        ));
     }
 
     // Requirement: every redirect re-resolves and re-checks the capability path.

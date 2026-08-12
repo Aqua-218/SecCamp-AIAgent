@@ -32,6 +32,12 @@ inductive FileEffect where
   | rename
   /-- Changes supported metadata such as mode or timestamps. -/
   | setMetadata
+  /-- Reads a symbolic link's target without following it. -/
+  | readLink
+  /-- Creates a symbolic link. -/
+  | createSymlink
+  /-- Creates an additional name for an existing inode. -/
+  | createHardLink
   deriving Repr, BEq, DecidableEq
 
 /-- A set of permitted file effects represented by its membership decision. -/
@@ -55,7 +61,8 @@ end FileEffects
 
 private def allFileEffects : List FileEffect :=
   [.readData, .listDirectory, .writeData, .truncate, .createFile,
-    .createDirectory, .removeFile, .removeDirectory, .rename, .setMetadata]
+    .createDirectory, .removeFile, .removeDirectory, .rename, .setMetadata,
+    .readLink, .createSymlink, .createHardLink]
 
 private theorem FileEffect.mem_allFileEffects (effect : FileEffect) :
     effect ∈ allFileEffects := by

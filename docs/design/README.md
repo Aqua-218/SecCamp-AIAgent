@@ -4,6 +4,8 @@ Agent にコードを書かせるだけなら、それほど難しくない。�
 
 この基盤では、Agent と Tool を最初から信用しない。何をしてよいかは Capability で明示し、実際の副作用が起きる場所で強制する。
 
+この文書は設計の入口であり、実装の完了判定ではない。Cycle 2 の各 crate については、コードが存在すること、mock/contract test が通ること、実機・外部サービス境界を実行したことを分けて記録する。
+
 ## 何を守るのか
 
 守りたい境界は3段ある。
@@ -104,6 +106,29 @@ flowchart LR
 | [検証戦略](verification.md) | 何を証明し、何をテストするか |
 | [実装順序](implementation-plan.md) | どこから作れば手戻りが少ないか |
 
+## Cycle 2 の実装状況
+
+| 境界 | 実装済み | mock/contract 検証済み | 実機・外部統合の状態 |
+|---|---|---|---|
+| Authority core と audit | typed authority、状態遷移、`auth_epoch`、in-memory audit、`DurableAuditLog` の WAL/receipt | Rust/Lean 共通 corpus、property test、loom、durable audit contract test | 複数 process の journal owner 調整、実 provider との receipt reconciliation は未検証 |
+| capfs | link-free preflight、namespace/node table、Direct-I/O FUSE adapter | module/contract test と環境依存の実 mount test | 全 interleaving の loom、敵対的 backing 差し替え、隔離層との end-to-end は未検証 |
+| `egress-broker` | bounded transport、typed dispatch、DNS/IP policy、公開 HTTPS、型付き GitHub adapter | fake resolver/connector/provider による module test | 実 `AF_VSOCK`、外部 DNS/HTTPS/GitHub API、guest-to-host は未検証 |
+| `runtime-isolation` | policy validation、`LinuxBackend`、13 段階の ordered apply/rollback | mock backend test、host capability detection | privileged isolation apply、workload 実行中の escape test は未検証 |
+| `firecracker-runtime` | artifact pin、dm-verity/jailer/API 順序、workspace、snapshot/restore、identity/workload gate | fake boundary test、local Unix socket HTTP exchange | 実 Firecracker/jailer/dm-verity/guest kernel/VM は未検証 |
+| `supervisor` | connection-to-subject binding、bounded wire protocol、subject/handle lifecycle | `CapabilityKernel` + `FakeResources` による test | Linux namespace/cgroup/mount、実 socket、guest supervisor は未検証 |
+| `session-orchestrator` | 128-bit identity ledger、lease binding、startup/rollback/stop state machine | mock backend による contract/state-machine test | production backend 接続、process 外 durable identity allocator、実 VM は未検証 |
+
+この表の「実装済み」は、該当 crate の API と実装が repository にあることを意味する。「mock/contract 検証済み」は、特権 kernel、外部 network、provider、実 VM を通っていない test の結果である。
+
+## Cycle 2 の実装文書
+
+| 文書 | 役割 |
+|---|---|
+| [Host Egress Broker](../egress-broker/README.md) | host egress の transport、公開 HTTPS、GitHub typed adapter、検証境界 |
+| [Firecracker runtime](../firecracker-runtime/README.md) | VM launch、artifact、dm-verity、snapshot、identity gate、未検証範囲 |
+| [Supervisor adapter](../supervisor/README.md) | connection identity、wire protocol、subject lifecycle、handle 境界 |
+| [Session orchestrator](../session-orchestrator/README.md) | session resource の順序、lease binding、rollback/stop 契約 |
+
 ## revoke の約束
 
 > revoke が返った後に commit される副作用は、失効した Capability やその子孫だけを根拠には実行されない。
@@ -115,3 +140,6 @@ flowchart LR
 - [脅威モデル](threat-model.md)
 - [Capability モデル](capability-model.md)
 - [状態機械と revoke](state-and-revocation.md)
+- [Cycle 2 実装状況](#cycle-2-の実装状況)
+- [Cycle 2 実装順序](implementation-plan.md)
+- [Cycle 2 検証戦略](verification.md)

@@ -13,9 +13,11 @@ use loom::sync::RwLock;
 use std::sync::RwLock;
 
 use crate::{
-    audit::{AttemptRecord, AuditError, AuditTrail, EffectRecord},
+    audit::{AttemptId, AttemptRecord, AuditError, AuditTrail, EffectRecord},
     capability::{CapId, Capability, CapabilityRequest, CapabilityRequestSet, SubjectId},
-    durable_audit::{CommitReceipt, DurableAuditLog},
+    durable_audit::{
+        CommitReceipt, DurableAuditError, DurableAuditLog, MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES,
+    },
     handle::{HandleId, ObjectId, OpenHandle},
     state::{
         AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
@@ -167,15 +169,34 @@ pub enum EffectCommitError<E> {
     /// The executor returned success, but the terminal durable receipt could
     /// not be persisted. The external effect may already exist; callers must
     /// resolve this with the provider's idempotency or reconciliation path.
-    CommittedButAudit(AuditError),
+    CommittedButAudit {
+        /// Identity durably allocated before executor invocation.
+        attempt_id: AttemptId,
+        /// Exact receipt returned by the executor for reconciliation.
+        receipt: CommitReceipt,
+        /// Terminal audit persistence failure.
+        source: AuditError,
+    },
     /// The executor crossed a boundary whose external result cannot be
     /// determined. The durable audit records this as `CommitUnknown`, never as
     /// a committed effect.
-    CommitUnknown,
+    CommitUnknown {
+        /// Identity durably allocated before executor invocation.
+        attempt_id: AttemptId,
+        /// Exact bounded evidence returned by the executor.
+        evidence: Vec<u8>,
+    },
     /// The external result is unknown and its terminal evidence could not be
     /// persisted. Recovery must treat the original started attempt as
     /// unresolved and must not infer either success or failure.
-    CommitUnknownAndAudit(AuditError),
+    CommitUnknownAndAudit {
+        /// Identity durably allocated before executor invocation.
+        attempt_id: AttemptId,
+        /// Exact evidence returned by the executor after its size check.
+        evidence: Vec<u8>,
+        /// Evidence validation or terminal audit persistence failure.
+        source: AuditError,
+    },
 }
 
 impl<E: fmt::Display> fmt::Display for EffectCommitError<E> {
@@ -190,16 +211,24 @@ impl<E: fmt::Display> fmt::Display for EffectCommitError<E> {
                 )
             }
             Self::Audit(error) => error.fmt(formatter),
-            Self::CommittedButAudit(error) => write!(
+            Self::CommittedButAudit {
+                attempt_id, source, ..
+            } => write!(
                 formatter,
-                "effect may be committed but its audit receipt failed: {error}"
+                "effect attempt {} may be committed but its audit receipt failed: {source}",
+                attempt_id.as_u64()
             ),
-            Self::CommitUnknown => {
-                formatter.write_str("effect completion is unknown and requires reconciliation")
-            }
-            Self::CommitUnknownAndAudit(error) => write!(
+            Self::CommitUnknown { attempt_id, .. } => write!(
                 formatter,
-                "effect completion is unknown and its evidence could not be persisted: {error}"
+                "effect attempt {} completion is unknown and requires reconciliation",
+                attempt_id.as_u64()
+            ),
+            Self::CommitUnknownAndAudit {
+                attempt_id, source, ..
+            } => write!(
+                formatter,
+                "effect attempt {} completion is unknown and its evidence could not be persisted: {source}",
+                attempt_id.as_u64()
             ),
         }
     }
@@ -209,10 +238,11 @@ impl<E: Error + 'static> Error for EffectCommitError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Effect(error) => Some(error),
-            Self::Audit(error)
-            | Self::CommittedButAudit(error)
-            | Self::CommitUnknownAndAudit(error) => Some(error),
-            Self::LockPoisoned | Self::NotAuthorized | Self::CommitUnknown => None,
+            Self::Audit(error) => Some(error),
+            Self::CommittedButAudit { source, .. } | Self::CommitUnknownAndAudit { source, .. } => {
+                Some(source)
+            }
+            Self::LockPoisoned | Self::NotAuthorized | Self::CommitUnknown { .. } => None,
         }
     }
 }
@@ -316,13 +346,15 @@ impl CapabilityKernel {
 
     /// Creates a kernel whose attempt journal is backed by the supplied WAL.
     ///
-    /// The WAL's recovered attempt sequence is used, so reopening a session
-    /// cannot reuse a prior attempt identity. Callers should use this
-    /// constructor when terminal audit receipts must survive process restart.
+    /// Only an empty, exclusively owned WAL can back a new operational kernel.
+    /// A WAL containing any prior attempt remains available through its
+    /// read-only recovery view, but cannot be attached to caller-supplied
+    /// capability state until full capability-state recovery exists.
     ///
     /// # Errors
     ///
-    /// Returns [`AuditError`] if the backend cannot be inspected safely.
+    /// Returns [`AuditError`] if the backend cannot be inspected safely or if
+    /// it contains attempts from a prior capability-state instance.
     pub fn try_new_with_durable_audit(
         state: CapabilityState,
         backend: DurableAuditLog,
@@ -797,7 +829,11 @@ impl CapabilityKernel {
                 drop(state);
                 match audit_result {
                     Ok(()) => Ok(value),
-                    Err(error) => Err(EffectCommitError::CommittedButAudit(error)),
+                    Err(source) => Err(EffectCommitError::CommittedButAudit {
+                        attempt_id,
+                        receipt,
+                        source,
+                    }),
                 }
             }
             EffectExecution::FailedBeforeCommit(error) => {
@@ -809,11 +845,28 @@ impl CapabilityKernel {
                 }
             }
             EffectExecution::CommitUnknown { evidence } => {
-                let audit_result = attempt.commit_unknown(evidence);
+                if let Err(source) = validate_commit_unknown_evidence(&evidence) {
+                    drop(state);
+                    return Err(EffectCommitError::CommitUnknownAndAudit {
+                        attempt_id,
+                        evidence,
+                        source,
+                    });
+                }
+                // The retained bytes are the exact bounded executor evidence;
+                // only the copy passed to the consuming audit guard is cloned.
+                let audit_result = attempt.commit_unknown(evidence.clone());
                 drop(state);
                 match audit_result {
-                    Ok(()) => Err(EffectCommitError::CommitUnknown),
-                    Err(audit_error) => Err(EffectCommitError::CommitUnknownAndAudit(audit_error)),
+                    Ok(()) => Err(EffectCommitError::CommitUnknown {
+                        attempt_id,
+                        evidence,
+                    }),
+                    Err(source) => Err(EffectCommitError::CommitUnknownAndAudit {
+                        attempt_id,
+                        evidence,
+                        source,
+                    }),
                 }
             }
         }
@@ -831,14 +884,36 @@ impl CapabilityKernel {
     }
 }
 
+fn validate_commit_unknown_evidence(evidence: &[u8]) -> Result<(), AuditError> {
+    if evidence.is_empty() {
+        return Err(AuditError::Durable(DurableAuditError::InvalidRecord(
+            "CommitUnknown evidence cannot be empty".to_owned(),
+        )));
+    }
+    if evidence.len() > MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES {
+        return Err(AuditError::Durable(DurableAuditError::RecordTooLarge(
+            evidence.len(),
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
-    use std::thread;
+    use std::{
+        convert::Infallible,
+        error::Error,
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+        thread,
+    };
 
     use super::{CapabilityKernel, CapabilityKernelError, EffectCommitError, EffectExecution};
     use crate::{
-        audit::AttemptOutcome,
+        audit::{AttemptId, AttemptOutcome, AuditError},
         capability::{AuthorityBody, AuthorityRequest, CapabilityRequest, IssuerId, SubjectId},
+        durable_audit::{DurableAuditError, DurableAuditLog, MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES},
         file::{FileAuthority, FileEffect, FileEffects, FileRequest},
         path::{CanonicalPath, PathPattern},
         repository::RepoId,
@@ -847,6 +922,29 @@ mod tests {
         },
         time::{MonotonicTime, TimeWindow},
     };
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let serial = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "authority-kernel-errors-{}-{serial}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir(&path).expect("create kernel test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn empty_envelope() -> StaticAuthorityEnvelope {
         StaticAuthorityEnvelope::new(
@@ -950,5 +1048,220 @@ mod tests {
                 .expect("trusted raw test revocation must succeed"),
             RevocationStatus::NewlyRevoked
         );
+    }
+
+    #[test]
+    fn classified_commit_unknown_retains_attempt_and_exact_evidence() {
+        let (kernel, subject, capability, request) = authorized_kernel();
+        let evidence = b"provider-timeout-after-request-write".to_vec();
+
+        let result =
+            kernel.authorize_and_execute_classified(&subject, &capability, &request, |_| {
+                EffectExecution::<(), Infallible>::CommitUnknown {
+                    evidence: evidence.clone(),
+                }
+            });
+
+        assert_eq!(
+            result,
+            Err(EffectCommitError::CommitUnknown {
+                attempt_id: AttemptId::from_u64(0),
+                evidence: evidence.clone(),
+            })
+        );
+        let error = result.expect_err("commit completion must remain unknown");
+        assert!(error.source().is_none());
+        assert!(error.to_string().contains("effect attempt 0 completion"));
+    }
+
+    #[test]
+    fn oversized_commit_unknown_retains_exact_evidence_and_started_attempt() {
+        let (kernel, subject, capability, request) = authorized_kernel();
+        let oversized = vec![0x5a; MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES + 1];
+
+        let result =
+            kernel.authorize_and_execute_classified(&subject, &capability, &request, |_| {
+                EffectExecution::<(), Infallible>::CommitUnknown {
+                    evidence: oversized.clone(),
+                }
+            });
+
+        assert!(matches!(
+            result,
+            Err(EffectCommitError::CommitUnknownAndAudit {
+                attempt_id,
+                evidence,
+                source: AuditError::Durable(DurableAuditError::RecordTooLarge(length)),
+            }) if attempt_id == AttemptId::from_u64(0)
+                && evidence == oversized
+                && length == MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES + 1
+        ));
+        assert_eq!(
+            kernel
+                .attempt_records()
+                .expect("invalid evidence must leave audit readable")[0]
+                .outcome(),
+            AttemptOutcome::Started
+        );
+    }
+
+    #[test]
+    fn committed_audit_failure_retains_attempt_and_exact_receipt() {
+        let directory = TestDirectory::new();
+        let journal = directory.0.join("audit.wal");
+        let moved = directory.0.join("moved.wal");
+        let (kernel, subject, capability, request) = durable_authorized_kernel(&journal);
+        let token = b"provider-accepted-request-7".to_vec();
+
+        let result =
+            kernel.authorize_and_execute_classified(&subject, &capability, &request, |_| {
+                replace_journal_path(&journal, &moved);
+                EffectExecution::<(), Infallible>::Committed {
+                    value: (),
+                    receipt: Some(token.clone()),
+                }
+            });
+
+        match result.expect_err("swapped WAL path must fail the terminal receipt") {
+            EffectCommitError::CommittedButAudit {
+                attempt_id,
+                receipt,
+                source,
+            } => {
+                assert_eq!(attempt_id, AttemptId::from_u64(0));
+                assert_eq!(receipt.attempt_id(), attempt_id);
+                assert_eq!(receipt.token(), token);
+                assert!(matches!(
+                    source,
+                    AuditError::Durable(DurableAuditError::PathIdentityChanged)
+                ));
+            }
+            other => panic!("unexpected committed audit error: {other:?}"),
+        }
+        assert_eq!(
+            kernel
+                .attempt_records()
+                .expect("failed terminal receipt must leave audit readable")[0]
+                .outcome(),
+            AttemptOutcome::Started
+        );
+    }
+
+    #[test]
+    fn commit_unknown_audit_failure_retains_attempt_and_exact_evidence() {
+        let directory = TestDirectory::new();
+        let journal = directory.0.join("audit.wal");
+        let moved = directory.0.join("moved.wal");
+        let (kernel, subject, capability, request) = durable_authorized_kernel(&journal);
+        let evidence = b"provider-timeout-after-request-write".to_vec();
+
+        let result =
+            kernel.authorize_and_execute_classified(&subject, &capability, &request, |_| {
+                replace_journal_path(&journal, &moved);
+                EffectExecution::<(), Infallible>::CommitUnknown {
+                    evidence: evidence.clone(),
+                }
+            });
+
+        match result.expect_err("swapped WAL path must fail terminal evidence") {
+            EffectCommitError::CommitUnknownAndAudit {
+                attempt_id,
+                evidence: retained,
+                source,
+            } => {
+                assert_eq!(attempt_id, AttemptId::from_u64(0));
+                assert_eq!(retained, evidence);
+                assert!(matches!(
+                    source,
+                    AuditError::Durable(DurableAuditError::PathIdentityChanged)
+                ));
+            }
+            other => panic!("unexpected unknown audit error: {other:?}"),
+        }
+        assert_eq!(
+            kernel
+                .attempt_records()
+                .expect("failed terminal evidence must leave audit readable")[0]
+                .outcome(),
+            AttemptOutcome::Started
+        );
+    }
+
+    fn authorized_kernel() -> (
+        CapabilityKernel,
+        SubjectId,
+        crate::capability::CapId,
+        CapabilityRequest,
+    ) {
+        let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("issuer")));
+        let subject = SubjectId::new("subject");
+        let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+            .expect("fixed test bounds must form a non-empty window");
+        kernel
+            .register_subject(Subject::new(
+                subject.clone(),
+                StaticAuthorityEnvelope::new(validity, read_authority()),
+            ))
+            .expect("subject registration must succeed");
+        let capability = kernel
+            .issue_root(CapabilityGrant::new(
+                subject.clone(),
+                validity,
+                read_authority(),
+            ))
+            .expect("root capability issuance must succeed");
+        let request = CapabilityRequest::new(
+            MonotonicTime::from_ticks(1),
+            AuthorityRequest::File(FileRequest::new(
+                RepoId::new("workspace"),
+                FileEffect::ReadData,
+                CanonicalPath::root(),
+            )),
+        );
+        (kernel, subject, capability, request)
+    }
+
+    fn durable_authorized_kernel(
+        journal: &Path,
+    ) -> (
+        CapabilityKernel,
+        SubjectId,
+        crate::capability::CapId,
+        CapabilityRequest,
+    ) {
+        let backend = DurableAuditLog::create(journal).expect("create durable kernel WAL");
+        let state = CapabilityState::new(IssuerId::new("issuer"));
+        let kernel = CapabilityKernel::try_new_with_durable_audit(state, backend)
+            .expect("construct durable kernel");
+        let subject = SubjectId::new("subject");
+        let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+            .expect("fixed test bounds must form a non-empty window");
+        kernel
+            .register_subject(Subject::new(
+                subject.clone(),
+                StaticAuthorityEnvelope::new(validity, read_authority()),
+            ))
+            .expect("subject registration must succeed");
+        let capability = kernel
+            .issue_root(CapabilityGrant::new(
+                subject.clone(),
+                validity,
+                read_authority(),
+            ))
+            .expect("root capability issuance must succeed");
+        let request = CapabilityRequest::new(
+            MonotonicTime::from_ticks(1),
+            AuthorityRequest::File(FileRequest::new(
+                RepoId::new("workspace"),
+                FileEffect::ReadData,
+                CanonicalPath::root(),
+            )),
+        );
+        (kernel, subject, capability, request)
+    }
+
+    fn replace_journal_path(journal: &Path, moved: &Path) {
+        fs::rename(journal, moved).expect("move locked journal inode");
+        fs::copy(moved, journal).expect("replace journal pathname");
     }
 }

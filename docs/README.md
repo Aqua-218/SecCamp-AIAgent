@@ -4,27 +4,45 @@
 
 > **対象読者:** この repository の設計・実装・検証を追う全員
 
-このディレクトリは、設計上の判断と現在の実装を分けて参照するための入口である。
+設計上の判断と現在の実装は別々に書いてある。「なぜこの構造か」を知りたいときは[設計書](design/README.md)、「なぜ別の案を採らなかったか」は[決定記録](decisions/README.md)、「今どこまで実装され、どこから未検証か」は各 crate の文書を読む。
 
-現在の Cycle 2 文書では、コード/API が存在すること、mock/contract test が通ること、特権操作や外部サービスを含む実機検証を行ったことを別々に記載する。mock test の成功だけで VM 実起動や full isolation 完成とは判断しない。
+**mock test の成功を、実機動作の根拠にしない。** コードと API が存在すること、mock / contract test が通ること、特権操作や外部サービスを含む実機検証を行ったことは、各 crate の検証対応表で区別して書く。VM 実起動と full isolation はまだ達成していない。
 
-| 文書群 | 対象読者 | 内容 |
-|---|---|---|
-| [CI/CD operations](ci-cd.md) | リポジトリ管理者、リリース担当者 | GitHub Actions / GitLab CI のゲート、保護設定、署名付きリリース、障害復旧 |
-| [設計書](design/README.md) | 設計者、実装者、セキュリティレビュー担当者 | 脅威モデル、Capability モデル、失効、隔離、検証戦略、実装順序 |
-| [Authority core 実装ガイド](authority-core/README.md) | Rust/Lean 実装者、証明のレビュー担当者 | 現在の Authority core 各ファイルの責務、Rust と Lean の対応、定理、テスト |
-| [capfs 実装ガイド](capfs/README.md) | filesystem adapter 実装者、並行境界のレビュー担当者 | backing root、startup import、ObjectId、namespace変更、mount-local node identity |
-| [Broker session envelope](egress-protocol/session-envelopes.md) | Broker / transport 実装者 | session、sequence、request ID、payload hash、retry と replay 防止 |
-| [Canonical Broker CBOR](egress-protocol/canonical-cbor.md) | Broker / transport 実装者 | bounded frame の中の唯一の request schema、payload hash と typed operation への復元 |
+## 横断文書
 
-## Cycle 2 の実装境界
+| 文書 | 内容 |
+|---|---|
+| [用語集](glossary.md) | 全体で使う語の定義。文脈で意味が変わる `envelope` / `session` / `subject` / `generation` の衝突を先に載せてある |
+| [決定記録](decisions/README.md) | 採用しなかった案とその理由。MADR 形式、1 決定 1 ファイル |
+| [文書規約](document-conventions.md) | ページ型ごとの骨格、粒度の目安、CI が検査する構造 |
+| [CI/CD operations](ci-cd.md) | GitHub Actions / GitLab CI のゲート、保護設定、署名付きリリース、障害復旧 |
 
-| 文書群 | 内容 | 検証の境界 |
-|---|---|---|
-| [Host Egress Broker](egress-broker/README.md) | AF_VSOCK frame、session/replay、budget、公開 HTTPS、型付き GitHub adapter | fake resolver/connector/provider と module test。実 AF_VSOCK、外部 DNS/HTTPS/GitHub は未検証 |
-| [Firecracker runtime](firecracker-runtime/README.md) | pinned artifact、dm-verity/jailer command、Firecracker API 順序、snapshot/restore、identity gate | fake command/filesystem/API と local Unix socket test。実 Firecracker/jailer/dm-verity/VM は未検証 |
-| [Supervisor adapter](supervisor/README.md) | authenticated connection binding、wire protocol、subject lifecycle、Authority Core/handle 境界 | `CapabilityKernel` と `FakeResources` による mock/contract test。Linux resource と実 socket は未検証 |
-| [Session orchestrator](session-orchestrator/README.md) | session identity、backend lease binding、startup/rollback/stop、Authority/Broker/Firecracker/workspace adapter | production adapter composition test。外部 command/filesystem/API/listener と実 VM は未検証 |
+## 設計
+
+| 文書 | 内容 |
+|---|---|
+| [設計書](design/README.md) | 入口。何を守るのか、選んだ形、文書の読み方 |
+| [脅威モデル](design/threat-model.md) | 想定する攻撃者と、防ぐ対象 |
+| [Capability モデル](design/capability-model.md) | 権限の表現と委譲 |
+| [状態機械と revoke](design/state-and-revocation.md) | 失効がいつから効くか |
+| [capfs](design/capfs.md) | filesystem 操作を Capability 判定へ接続する境界 |
+| [ネットワークと外部副作用](design/network-egress.md) | egress を閉じた型付き操作に限る理由 |
+| [隔離基盤](design/runtime-isolation.md) | VM と、その内側のプロセス隔離 |
+| [検証戦略](design/verification.md) | Rust test、Lean 証明、共通 corpus の役割分担 |
+| [実装順序](design/implementation-plan.md) | 着手順と現在位置 |
+
+## 実装 crate
+
+| crate | 文書群 | 実装している境界 | 検証の境界 |
+|---|---|---|---|
+| `authority-core` | [Authority core](authority-core/README.md) | 権限の表現、委譲判定、状態、revoke、監査。Rust と Lean の二重実装 | unit / property / loom / Lean 定理 / 共通 corpus |
+| `capfs` | [capfs](capfs/README.md) | backing root、namespace registry、node table、Direct-I/O FUSE adapter | 実 mount test を含む。実 VM 内での動作は未検証 |
+| `egress-protocol` | [Broker session envelope](egress-protocol/session-envelopes.md)、[Canonical CBOR](egress-protocol/canonical-cbor.md) | bounded frame、canonical CBOR、session と sequence、budget | module test |
+| `egress-broker` | [Host Egress Broker](egress-broker/README.md) | AF_VSOCK frame、replay、budget、公開 HTTPS、型付き GitHub adapter | fake resolver / connector / provider。実 vsock、外部 DNS / HTTPS / GitHub は未検証 |
+| `firecracker-runtime` | [Firecracker runtime](firecracker-runtime/README.md) | artifact 固定、dm-verity、jailer、API 順序、snapshot / restore、identity gate | fake command / filesystem / API。実 Firecracker、実 jailer、実 VM は未検証 |
+| `runtime-isolation` | [runtime-isolation](runtime-isolation/README.md) | exec 直前の 13 step。namespace、mount、cgroup、Landlock、capability、seccomp | mock backend と純粋関数。実 syscall は未検証 |
+| `supervisor` | [Supervisor adapter](supervisor/README.md) | 認証済み connection の subject binding、wire protocol、subject lifecycle | `CapabilityKernel` と `FakeResources`。Linux resource と実 socket は未検証 |
+| `session-orchestrator` | [Session orchestrator](session-orchestrator/README.md) | session identity、backend lease、startup / rollback / stop | production adapter composition test。実 VM は未検証 |
 
 ## Authority core 文書
 
@@ -50,21 +68,20 @@
 | 文書 | 内容 |
 |---|---|
 | [実装ガイド](capfs/README.md) | 現在の実装範囲と文書一覧 |
-| [Backing repository の事前検証](capfs/backing-preflight.md) | root fd、link-free tree、mount・inode identity、startup import |
-| [共有 namespace registry](capfs/namespace-registry.md) | `ObjectId`割り当て、現在path、generation、open handle、namespace lock契約 |
-| [mount ごとの node table](capfs/node-tables.md) | subject-local `nodeid -> ObjectId`、LOOKUP / FORGET、nodeid非再利用 |
-| [Direct-I/O FUSE adapter](capfs/read-only-fuse.md) | LOOKUP / GETATTR / OPEN / READ / WRITE / SETATTR / CREATE / MKDIR / UNLINK / RMDIR / RENAME / READDIR / RELEASE、runtime backing I/O、revoke後の再認可 |
+| [Backing repository の事前検証](capfs/backing-preflight.md) | root fd、link 検査、mount・inode identity、startup import |
+| [共有 namespace registry](capfs/namespace-registry.md) | `ObjectId` 割り当て、現在 path、generation、open handle、namespace lock 契約 |
+| [mount ごとの node table](capfs/node-tables.md) | subject-local `nodeid -> ObjectId`、LOOKUP / FORGET、nodeid 非再利用 |
+| [Direct-I/O FUSE adapter](capfs/read-only-fuse.md) | 各 FUSE operation、runtime backing I/O、revoke 後の再認可 |
 
 ## 文書の使い分け
 
-- 「なぜこの構造にするか」は[設計書](design/README.md)を読む。
-- 「どのファイルが何を実装・証明しているか」は[Authority core 実装ガイド](authority-core/README.md)を読む。
-- 「rename 中にも現在 path をどう固定するか」は[capfs 実装ガイド](capfs/README.md)を読む。
-- 「host 側の egress、VM、subject、session の lifecycle」は[Cycle 2 の実装境界](#cycle-2-の実装境界)から各 adapter 文書を読む。
-- 設計と実装が食い違って見える場合は、両方を照合し、実装済み範囲を Authority core 実装ガイドで確認する。
+- 設計と実装が食い違って見える場合は、まず[決定記録](decisions/README.md)を見る。実装が変わって ADR が `Superseded` にされていない可能性がある。
+- 「動くのか」を判断するときは、各 crate の検証対応表の**未検証の境界**を先に読む。
+- 新しく文書を書くときは[文書規約](document-conventions.md)と `docs/templates/` を使う。
 
 ## 関連
 
-- [Capability モデル](design/capability-model.md)
-- [検証戦略](design/verification.md)
-- [実装順序](design/implementation-plan.md)
+- [設計書](design/README.md)
+- [用語集](glossary.md)
+- [決定記録](decisions/README.md)
+- [文書規約](document-conventions.md)

@@ -1,9 +1,9 @@
 //! Loom models for the effect-commit and revoke synchronization boundary.
 //!
 //! Specification: `docs/design/verification.md`, revoke/commit row. Coverage:
-//! bounded interleavings for direct and ancestor revoke, two concurrent
-//! effects, and a negative control that releases shared access immediately
-//! after authorization.
+//! bounded interleavings for direct and ancestor revoke, compound requests,
+//! two concurrent effects, and a negative control that releases shared access
+//! immediately after authorization.
 //! Run with: `RUSTFLAGS='--cfg loom' cargo test --test authorization_kernel_loom`.
 
 #![cfg(loom)]
@@ -12,7 +12,10 @@ use std::convert::Infallible;
 
 use authority_core::{
     audit::AttemptOutcome,
-    capability::{AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId},
+    capability::{
+        AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, CapabilityRequestSet, IssuerId,
+        SubjectId,
+    },
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
     kernel::{CapabilityKernel, EffectCommitError},
     path::{CanonicalPath, PathPattern},
@@ -47,7 +50,7 @@ fn subject_id() -> SubjectId {
 fn authority() -> AuthorityBody {
     AuthorityBody::File(FileAuthority::new(
         RepoId::new("workspace"),
-        FileEffects::only(FileEffect::ReadData),
+        FileEffects::from_effects([FileEffect::ReadData, FileEffect::WriteData]),
         PathPattern::Prefix(CanonicalPath::root()),
     ))
 }
@@ -58,6 +61,17 @@ fn request() -> CapabilityRequest {
         AuthorityRequest::File(FileRequest::new(
             RepoId::new("workspace"),
             FileEffect::ReadData,
+            CanonicalPath::new(["src", "main.rs"]).expect("model path must contain valid segments"),
+        )),
+    )
+}
+
+fn write_request() -> CapabilityRequest {
+    CapabilityRequest::new(
+        time(50),
+        AuthorityRequest::File(FileRequest::new(
+            RepoId::new("workspace"),
+            FileEffect::WriteData,
             CanonicalPath::new(["src", "main.rs"]).expect("model path must contain valid segments"),
         )),
     )
@@ -270,6 +284,113 @@ fn guarded_descendant_commit_never_crosses_completed_ancestor_revoke() {
             usize::from(effect_result.is_ok())
         );
     });
+}
+
+fn check_compound_commit_against_revoke(revoke_ancestor: bool) {
+    loom::model(move || {
+        let (state, ancestor_id, capability_id) = initialized_delegated_state();
+        let revoke_id = if revoke_ancestor {
+            ancestor_id
+        } else {
+            capability_id.clone()
+        };
+        let kernel = Arc::new(CapabilityKernel::new(state));
+        let revoke_returned = Arc::new(AtomicBool::new(false));
+        let executor_entries = Arc::new(AtomicUsize::new(0));
+        let executor_steps = Arc::new(AtomicUsize::new(0));
+        let expected_requests = [request(), write_request()];
+        let requests =
+            CapabilityRequestSet::new(expected_requests[0].clone(), [expected_requests[1].clone()]);
+
+        let effect_kernel = Arc::clone(&kernel);
+        let effect_revoke_returned = Arc::clone(&revoke_returned);
+        let effect_executor_entries = Arc::clone(&executor_entries);
+        let effect_executor_steps = Arc::clone(&executor_steps);
+        let effect = thread::spawn(move || {
+            effect_kernel.authorize_all_and_commit(
+                &child_subject_id(),
+                &capability_id,
+                &requests,
+                |_| {
+                    effect_executor_entries.fetch_add(1, Ordering::AcqRel);
+                    assert!(
+                        !effect_revoke_returned.load(Ordering::Acquire),
+                        "compound executor entered after revoke returned"
+                    );
+
+                    effect_executor_steps.fetch_add(1, Ordering::AcqRel);
+                    thread::yield_now();
+                    assert!(
+                        !effect_revoke_returned.load(Ordering::Acquire),
+                        "revoke returned between compound executor steps"
+                    );
+                    effect_executor_steps.fetch_add(1, Ordering::AcqRel);
+                    Ok::<_, Infallible>(())
+                },
+            )
+        });
+
+        let revoke_kernel = Arc::clone(&kernel);
+        let revoke_finished = Arc::clone(&revoke_returned);
+        let revoke = thread::spawn(move || {
+            assert_eq!(
+                revoke_kernel.revoke(&revoke_id),
+                Ok(RevocationStatus::NewlyRevoked)
+            );
+            revoke_finished.store(true, Ordering::Release);
+        });
+
+        let effect_result = effect.join().expect("the effect thread must not panic");
+        revoke.join().expect("the revoke thread must not panic");
+
+        let attempts = kernel
+            .attempt_records()
+            .expect("the model audit trail must remain readable");
+        let effects = kernel
+            .effect_records()
+            .expect("the model effect trail must remain readable");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].requests().collect::<Vec<_>>(),
+            expected_requests.iter().collect::<Vec<_>>()
+        );
+
+        match effect_result {
+            Ok(()) => {
+                assert_eq!(executor_entries.load(Ordering::Acquire), 1);
+                assert_eq!(executor_steps.load(Ordering::Acquire), 2);
+                assert_eq!(attempts[0].outcome(), AttemptOutcome::Committed);
+                assert_eq!(effects.len(), 1);
+                assert_eq!(
+                    effects[0].requests().collect::<Vec<_>>(),
+                    expected_requests.iter().collect::<Vec<_>>()
+                );
+            }
+            Err(EffectCommitError::NotAuthorized) => {
+                assert_eq!(executor_entries.load(Ordering::Acquire), 0);
+                assert_eq!(executor_steps.load(Ordering::Acquire), 0);
+                assert_eq!(attempts[0].outcome(), AttemptOutcome::Denied);
+                assert!(effects.is_empty());
+            }
+            Err(error) => panic!("the model returned an unexpected effect error: {error}"),
+        }
+    });
+}
+
+// Requirement: a compound operation is either fully guarded before direct
+// revoke or denied without entering its executor. Category: bounded
+// concurrency/security. Risk: critical.
+#[test]
+fn compound_commit_never_partially_crosses_completed_direct_revoke() {
+    check_compound_commit_against_revoke(false);
+}
+
+// Requirement: ancestor revoke applies the same all-or-deny boundary to a
+// descendant's compound operation. Category: bounded concurrency/security.
+// Risk: critical.
+#[test]
+fn compound_commit_never_partially_crosses_completed_ancestor_revoke() {
+    check_compound_commit_against_revoke(true);
 }
 
 // Requirement: every effect already holding shared access may commit before

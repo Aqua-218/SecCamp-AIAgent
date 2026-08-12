@@ -55,7 +55,7 @@ flowchart LR
 
 逐次状態機械では、1〜63操作の Derive/revoke 列を1,000 case 生成し、production state と独立した参照モデルを各 transition 後に比較する。subject binding、ID 非再利用、親以下の authority、静的 envelope、祖先失効をまとめて検査するが、これは生成した有限の操作列に対する test であり、状態機械全体の数学的証明ではない。[Capability state の検証範囲](../authority-core/capability-state.md#どう検証しているか)
 
-revoke / commit については、production の `CapabilityKernel` と同じ synchronization wrapper を使い、direct revoke / 1 effect、ancestor revoke / descendant effect、2 effects / 1 revoke の bounded model を loom で検査している。effect が実行される場合は revoke return より前に線形化点と audit outcome の確定へ到達し、revoke が先なら executor を呼ばず認可拒否になる。詳しい実装と executor 契約は[Authorization guard](../authority-core/authorization-guard.md)を参照する。
+revoke / commit については、production の `CapabilityKernel` と同じ synchronization wrapper を使い、direct revoke / 単一・compound effect、ancestor revoke / 単一・compound descendant effect、2 effects / 1 revoke の bounded model を loom で検査している。effect が実行される場合は revoke return より前に線形化点と audit outcome の確定へ到達し、revoke が先なら executor を呼ばず認可拒否になる。compound modelは、executorが部分的に呼ばれないことと、request set全件が1件のattempt / effectとして監査されることも確認する。詳しい実装と executor 契約は[Authorization guard](../authority-core/authorization-guard.md)を参照する。
 
 loom は実システム全体の証明ではない。direct / ancestor の 2 thread model は全 interleaving を探索するが、3 thread model は CI での state explosion を避けるため preemption bound 2 である。open handle、rename、unlink、複数 revoke、実 syscall adapter は含まず、loom 自身にも完全な C11 memory model ではないという制限がある。したがって、ここで言えるのは選んだ bounded model の範囲内の結果である。
 

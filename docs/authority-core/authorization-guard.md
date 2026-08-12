@@ -150,12 +150,14 @@ revoke が `revoked` へ追加してreturnした後、effect は shared guard �
 
 通常buildでは `std::sync::RwLock` を使う。`RUSTFLAGS='--cfg loom'` を付けたmodel testでは、同じ `CapabilityKernel` のlockだけを `loom::sync::RwLock` へ差し替える。
 
-[`crates/authority-core/tests/authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) には4つの model がある。
+[`crates/authority-core/tests/authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) には6つの model がある。
 
 | Model | 期待する結果 | 確認すること |
 |---|---|---|
 | direct revoke / 1 effect | 全 interleaving で pass | executor が走るなら revoke return より前、revoke が先なら認可拒否になる |
 | ancestor revoke / descendant effect | 全 interleaving で pass | root revoke が child Capability の effect も同じ順序で止める |
+| direct revoke / compound effect | 全 interleaving で pass | request set全件のexecutor処理がguard内で完了するか、executorへ入らずset全体が拒否される |
+| ancestor revoke / descendant compound effect | 全 interleaving で pass | root revokeでもcompound effectが部分実行・部分監査されず、全requestが1件のattemptとして残る |
 | direct revoke / 2 effects | preemption bound 2 で pass | 両 effect が先、revoke が先、effect が1件ずつ両側になる順序で audit と commit 数が一致する |
 | unlocked negative control | 指定した assertion で panic | 認可直後に guard を解放すると、revoke return 後の commit 順序が実在する |
 
@@ -170,7 +172,7 @@ RUSTFLAGS='--cfg loom' cargo clippy --package authority-core --test authorizatio
 
 ## 正確な保証範囲
 
-現在は、1 effect / 1 direct revoke、1 descendant effect / 1 ancestor revoke、2 effects / 1 direct revoke を検査する。最初の2つは model 内の全 interleaving、3 thread の model は同値な schedule の爆発を避けるため preemption bound 2で探索する。各 model は attempt outcome、effect count、`auth_epoch` の対応も確認する。
+現在は、単一・compound effectと1 direct revoke、単一・compound descendant effectと1 ancestor revoke、2 effectsと1 direct revokeを検査する。2 threadのmodelは全interleaving、3 threadのmodelは同値なscheduleの爆発を避けるためpreemption bound 2で探索する。各modelはattempt outcomeとeffect countを確認し、単一requestでは`auth_epoch`、compound requestでは監査されたrequest set全件との対応も確認する。
 
 次はまだ含まれない。
 

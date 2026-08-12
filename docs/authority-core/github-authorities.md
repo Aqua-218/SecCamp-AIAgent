@@ -20,7 +20,7 @@ GitHubAuthority {
 
 pull request は「どの base branch に」「どの head branch から」作るかの組で意味が変わる。`main` への pull request は許しても、release branch への変更は許したくない場合がある。したがって base と head は1つの曖昧な branch scope にまとめず、それぞれ exact または segment-aware prefix で判定する。
 
-`Prefix(agents)` は `agents/fix` を許すが、`agents-evil` は許さない。slash 区切りの component 列で比較するためである。Rust の `BranchName::new` は `refs/`、`..`、reflog syntax、`.lock` suffix、control character など Git ref として曖昧または危険な shorthand を拒否する。
+`Prefix(agents)` は `agents/fix` を許すが、`agents-evil` は許さない。slash 区切りの component 列で比較するためである。Rust の `BranchName::new` と Lean の `BranchName.ofSegments` は、`refs/`、先頭 `-`、`..`、末尾 `.`、reflog syntax、`.lock` suffix、control character など Git ref として曖昧または危険な shorthand を同じ入口規則で拒否する。
 
 ```mermaid
 flowchart LR

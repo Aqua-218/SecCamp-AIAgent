@@ -96,6 +96,19 @@ mod implementation {
         writer: OwnedFd,
     }
 
+    #[derive(Debug)]
+    struct PinnedWorkspaceSource {
+        descriptor: OwnedFd,
+        device: u64,
+        inode: u64,
+    }
+
+    impl PinnedWorkspaceSource {
+        fn proc_path(&self) -> PathBuf {
+            PathBuf::from(format!("/proc/self/fd/{}", self.descriptor.as_raw_fd()))
+        }
+    }
+
     #[repr(C)]
     struct LandlockRulesetAttr {
         handled_access_fs: u64,
@@ -143,6 +156,8 @@ mod implementation {
         max_capability_index: Option<libc::c_int>,
         prepared_pid_namespaces: Option<(NamespaceIdentity, NamespaceIdentity)>,
         startup_notifier_fd: Option<RawFd>,
+        expected_parent_pid: Option<libc::pid_t>,
+        workspace_source: Option<PinnedWorkspaceSource>,
         child_entry_failure: Option<BackendError>,
     }
 
@@ -156,6 +171,8 @@ mod implementation {
                 max_capability_index: None,
                 prepared_pid_namespaces: None,
                 startup_notifier_fd: None,
+                expected_parent_pid: None,
+                workspace_source: None,
                 child_entry_failure: None,
             }
         }
@@ -299,10 +316,10 @@ mod implementation {
                     "namespace setup requires the explicit prepare and child handoff API",
                     None,
                 )),
-                IsolationStep::IdentityMap => install_identity_map(step, config.identity),
+                IsolationStep::IdentityMap => self.install_identity_map(step, config.identity),
                 IsolationStep::CgroupV2 => self.configure_cgroup(step, &config.cgroup),
                 IsolationStep::ReadOnlyRootfs => self.mount_rootfs(step, config),
-                IsolationStep::Workspace => mount_workspace(step, &config.workspace),
+                IsolationStep::Workspace => self.mount_workspace(step, &config.workspace),
                 IsolationStep::LimitedTmpfs => {
                     mount_tmpfs(step, &config.tmpfs.target, config.tmpfs.size_bytes)
                 }
@@ -321,7 +338,10 @@ mod implementation {
                 IsolationStep::Landlock => install_landlock(step, &config.landlock),
                 IsolationStep::DropCapabilities => self.drop_capabilities(step),
                 IsolationStep::NoNewPrivs => set_no_new_privs(step),
-                IsolationStep::Seccomp => install_seccomp(step, &config.seccomp),
+                IsolationStep::Seccomp => {
+                    self.verify_parent_lifecycle(step)?;
+                    install_seccomp(step, &config.seccomp)
+                }
             }
         }
 
@@ -394,6 +414,7 @@ mod implementation {
                 }
             };
             let child_namespace = preparation.child();
+            let launcher_pid = current_pid();
             // SAFETY: Namespace preparation can succeed only for a single-threaded
             // launcher. Signals are blocked across fork so inherited handlers
             // cannot execute before the child replaces their process-global state.
@@ -413,15 +434,20 @@ mod implementation {
                 }
                 0 => {
                     drop(startup_pipe.reader);
-                    let lifecycle_result = configure_child_lifecycle(IsolationStep::Namespaces);
+                    let notifier_fd = startup_pipe.writer.as_raw_fd();
+                    self.expected_parent_pid = Some(launcher_pid);
+                    self.startup_notifier_fd = Some(notifier_fd);
+                    let lifecycle_result = configure_child_lifecycle(
+                        IsolationStep::Namespaces,
+                        launcher_pid,
+                        notifier_fd,
+                    );
                     let descriptor_result = install_sanitized_standard_descriptors(
                         IsolationStep::Namespaces,
                         &null_device,
                     );
                     drop(null_device);
                     self.child_entry_failure = combine_results(lifecycle_result, descriptor_result);
-                    let notifier_fd = startup_pipe.writer.as_raw_fd();
-                    self.startup_notifier_fd = Some(notifier_fd);
                     let notifier = ChildStartupNotifier::from_fd(startup_pipe.writer);
                     // This process is PID 1 in the prepared namespace. The fixed
                     // seccomp contract denies every process-creation syscall, so
@@ -435,6 +461,8 @@ mod implementation {
                 }
                 child_pid => {
                     let raw_child_pid = child_pid;
+                    self.expected_parent_pid = None;
+                    self.startup_notifier_fd = None;
                     drop(startup_pipe.writer);
                     drop(null_device);
                     if let Err(error) =
@@ -486,6 +514,36 @@ mod implementation {
                 ));
             }
             Ok(())
+        }
+
+        fn install_identity_map(
+            &self,
+            step: IsolationStep,
+            identity: IdentityMap,
+        ) -> Result<(), BackendError> {
+            install_identity_map(step, identity)?;
+            // Linux clears PDEATHSIG when effective or filesystem credentials
+            // change. Re-arm only after both mapped credentials are final and
+            // reject a launcher that vanished during the cleared interval.
+            self.verify_parent_lifecycle(step)
+        }
+
+        fn verify_parent_lifecycle(&self, step: IsolationStep) -> Result<(), BackendError> {
+            let expected_parent_pid = self.expected_parent_pid.ok_or_else(|| {
+                BackendError::new(
+                    step,
+                    "expected launcher PID was not retained in the isolation child",
+                    None,
+                )
+            })?;
+            let notifier_fd = self.startup_notifier_fd.ok_or_else(|| {
+                BackendError::new(
+                    step,
+                    "startup notifier was not retained for parent-liveness verification",
+                    None,
+                )
+            })?;
+            arm_and_verify_parent_lifecycle(step, expected_parent_pid, notifier_fd)
         }
 
         fn configure_cgroup(
@@ -549,6 +607,7 @@ mod implementation {
         ) -> Result<(), BackendError> {
             let rootfs = &config.rootfs;
             make_mounts_private(step)?;
+            let workspace_source = pin_workspace_source(step, &config.workspace.source)?;
             let setup_result = (|| {
                 mount_call(
                     step,
@@ -560,18 +619,13 @@ mod implementation {
                 )?;
                 fs::create_dir_all(&rootfs.old_root)
                     .map_err(|error| io_error(step, "create old-root directory", &error))?;
-                for target in [
+                create_rootfs_mount_targets(step, config)?;
+                stage_workspace_mount(
+                    step,
+                    &rootfs.mount_target,
                     &config.workspace.target,
-                    &config.tmpfs.target,
-                    Path::new("/proc"),
-                    Path::new("/dev"),
-                ] {
-                    let target = rootfs_path(&rootfs.mount_target, target).ok_or_else(|| {
-                        BackendError::new(step, "mount target escaped the staged rootfs", None)
-                    })?;
-                    fs::create_dir_all(target)
-                        .map_err(|error| io_error(step, "create rootfs mount directory", &error))?;
-                }
+                    &workspace_source,
+                )?;
                 Ok::<(), BackendError>(())
             })();
             if let Err(error) = setup_result {
@@ -637,6 +691,52 @@ mod implementation {
                     ),
                     error.errno,
                 ));
+            }
+            if result.is_ok() {
+                self.workspace_source = Some(workspace_source);
+            }
+            result
+        }
+
+        fn mount_workspace(
+            &mut self,
+            step: IsolationStep,
+            config: &BindMountConfig,
+        ) -> Result<(), BackendError> {
+            let source = self.workspace_source.as_ref().ok_or_else(|| {
+                BackendError::new(
+                    step,
+                    "workspace source was not pinned before rootfs pivot",
+                    None,
+                )
+            })?;
+            verify_pinned_workspace_mount(step, source, &config.target)?;
+            let result = mount_call(
+                step,
+                None,
+                &config.target,
+                None,
+                libc::MS_BIND
+                    | libc::MS_REMOUNT
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV
+                    | libc::MS_NOEXEC,
+                None,
+            );
+            if result.is_err()
+                && let Err(cleanup_error) = unmount_path(step, &config.target)
+            {
+                return Err(BackendError::new(
+                    step,
+                    format!(
+                        "workspace remount failed; failed to unmount partial workspace mount: {}",
+                        cleanup_error.message
+                    ),
+                    cleanup_error.errno,
+                ));
+            }
+            if result.is_ok() {
+                self.workspace_source = None;
             }
             result
         }
@@ -765,36 +865,114 @@ mod implementation {
         Ok(())
     }
 
-    fn mount_workspace(step: IsolationStep, config: &BindMountConfig) -> Result<(), BackendError> {
+    fn pin_workspace_source(
+        step: IsolationStep,
+        source: &Path,
+    ) -> Result<PinnedWorkspaceSource, BackendError> {
+        let source = c_path(step, source)?;
+        // O_PATH pins the exact directory object without granting a data IO
+        // channel. O_NOFOLLOW prevents a final symlink from changing which host
+        // tree is exposed after validation.
+        // SAFETY: the path is NUL-terminated and successful open returns one fd.
+        let descriptor = unsafe {
+            libc::open(
+                source.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if descriptor == -1 {
+            return Err(last_error(step, "pin workspace source before rootfs pivot"));
+        }
+        // SAFETY: successful open returned one owned descriptor.
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let identity = descriptor_identity(step, &descriptor, "inspect pinned workspace source")?;
+        Ok(PinnedWorkspaceSource {
+            descriptor,
+            device: identity.0,
+            inode: identity.1,
+        })
+    }
+
+    fn stage_workspace_mount(
+        step: IsolationStep,
+        rootfs_target: &Path,
+        workspace_target: &Path,
+        source: &PinnedWorkspaceSource,
+    ) -> Result<(), BackendError> {
+        let workspace_target = rootfs_path(rootfs_target, workspace_target).ok_or_else(|| {
+            BackendError::new(step, "workspace target escaped the staged rootfs", None)
+        })?;
         mount_call(
             step,
-            Some(&config.source),
-            &config.target,
+            Some(&source.proc_path()),
+            &workspace_target,
             None,
             libc::MS_BIND,
             None,
-        )?;
-        let result = mount_call(
+        )
+    }
+
+    fn create_rootfs_mount_targets(
+        step: IsolationStep,
+        config: &IsolationConfig,
+    ) -> Result<(), BackendError> {
+        for target in [
+            &config.workspace.target,
+            &config.tmpfs.target,
+            Path::new("/proc"),
+            Path::new("/dev"),
+        ] {
+            let target = rootfs_path(&config.rootfs.mount_target, target).ok_or_else(|| {
+                BackendError::new(step, "mount target escaped the staged rootfs", None)
+            })?;
+            fs::create_dir_all(target)
+                .map_err(|error| io_error(step, "create rootfs mount directory", &error))?;
+        }
+        Ok(())
+    }
+
+    fn verify_pinned_workspace_mount(
+        step: IsolationStep,
+        source: &PinnedWorkspaceSource,
+        target: &Path,
+    ) -> Result<(), BackendError> {
+        let current_source = descriptor_identity(
             step,
-            None,
-            &config.target,
-            None,
-            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-            None,
-        );
-        if result.is_err()
-            && let Err(cleanup_error) = unmount_path(step, &config.target)
-        {
+            &source.descriptor,
+            "reinspect pinned workspace source",
+        )?;
+        if current_source != (source.device, source.inode) {
             return Err(BackendError::new(
                 step,
-                format!(
-                    "workspace remount failed; failed to unmount partial workspace mount: {}",
-                    cleanup_error.message
-                ),
-                cleanup_error.errno,
+                "pinned workspace descriptor identity changed before finalization",
+                None,
             ));
         }
-        result
+        let target_metadata = fs::metadata(target)
+            .map_err(|error| io_error(step, "inspect staged workspace mount", &error))?;
+        if (target_metadata.dev(), target_metadata.ino()) != current_source {
+            return Err(BackendError::new(
+                step,
+                "workspace mount did not resolve to the source pinned before rootfs pivot",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn descriptor_identity(
+        step: IsolationStep,
+        descriptor: &OwnedFd,
+        action: &'static str,
+    ) -> Result<(u64, u64), BackendError> {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: metadata is writable and the descriptor remains live.
+        if unsafe { libc::fstat(descriptor.as_raw_fd(), metadata.as_mut_ptr()) } == -1 {
+            return Err(last_error(step, action));
+        }
+        // SAFETY: successful fstat initialized the complete structure.
+        let metadata = unsafe { metadata.assume_init() };
+        Ok((metadata.st_dev, metadata.st_ino))
     }
 
     fn mount_tmpfs(
@@ -973,13 +1151,14 @@ mod implementation {
         }
     }
 
-    fn configure_child_lifecycle(step: IsolationStep) -> Result<(), BackendError> {
+    fn configure_child_lifecycle(
+        step: IsolationStep,
+        expected_parent_pid: libc::pid_t,
+        notifier_fd: RawFd,
+    ) -> Result<(), BackendError> {
         // If the launcher disappears before readiness, either PDEATHSIG or the
         // startup pipe's default SIGPIPE disposition terminates this child.
-        // SAFETY: PR_SET_PDEATHSIG accepts a scalar signal number.
-        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } == -1 {
-            return Err(last_error(step, "arm child parent-death termination"));
-        }
+        arm_parent_death_signal(step)?;
         reset_signal_dispositions(step)?;
         // SAFETY: sigset_t is initialized before it is installed.
         let mut empty_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
@@ -995,14 +1174,99 @@ mod implementation {
                 std::ptr::null_mut(),
             )
         };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(BackendError::new(
+        if result != 0 {
+            return Err(BackendError::new(
                 step,
                 "clear inherited child signal mask",
                 Some(result),
-            ))
+            ));
+        }
+        arm_and_verify_parent_lifecycle(step, expected_parent_pid, notifier_fd)
+    }
+
+    fn arm_and_verify_parent_lifecycle(
+        step: IsolationStep,
+        expected_parent_pid: libc::pid_t,
+        notifier_fd: RawFd,
+    ) -> Result<(), BackendError> {
+        arm_parent_death_signal(step)?;
+        let mut parent_death_signal = 0;
+        // SAFETY: PR_GET_PDEATHSIG writes one scalar signal number.
+        if unsafe {
+            libc::prctl(
+                libc::PR_GET_PDEATHSIG,
+                &raw mut parent_death_signal,
+                0,
+                0,
+                0,
+            )
+        } == -1
+        {
+            return Err(last_error(step, "verify child parent-death termination"));
+        }
+        if parent_death_signal != libc::SIGKILL {
+            return Err(BackendError::new(
+                step,
+                "parent-death signal was not SIGKILL after lifecycle re-arm",
+                None,
+            ));
+        }
+
+        // A PID-namespace init sees an out-of-namespace parent as PID zero. If
+        // the parent is visible, require its exact pre-fork PID; in both cases
+        // the one-owner startup pipe detects death in the PR_SET race window.
+        // SAFETY: getppid has no pointer arguments.
+        let observed_parent_pid = unsafe { libc::getppid() };
+        if observed_parent_pid != 0 && observed_parent_pid != expected_parent_pid {
+            return Err(BackendError::new(
+                step,
+                "isolation child was reparented before lifecycle verification",
+                None,
+            ));
+        }
+        verify_startup_reader_alive(step, notifier_fd)
+    }
+
+    fn arm_parent_death_signal(step: IsolationStep) -> Result<(), BackendError> {
+        // SAFETY: PR_SET_PDEATHSIG accepts a scalar signal number.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } == -1 {
+            Err(last_error(step, "arm child parent-death termination"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn verify_startup_reader_alive(
+        step: IsolationStep,
+        notifier_fd: RawFd,
+    ) -> Result<(), BackendError> {
+        let mut descriptor = libc::pollfd {
+            fd: notifier_fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: descriptor points to one initialized pollfd and timeout
+            // zero makes this a nonblocking liveness observation.
+            let result = unsafe { libc::poll(&raw mut descriptor, 1, 0) };
+            if result == -1 && errno() == libc::EINTR {
+                continue;
+            }
+            if result == -1 {
+                return Err(last_error(step, "poll child startup notifier"));
+            }
+            let terminal = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+            if result == 0
+                || descriptor.revents & terminal != 0
+                || descriptor.revents & libc::POLLOUT == 0
+            {
+                return Err(BackendError::new(
+                    step,
+                    "launcher closed the child startup channel before readiness",
+                    None,
+                ));
+            }
+            return Ok(());
         }
     }
 
@@ -1784,6 +2048,119 @@ mod implementation {
         }
 
         #[test]
+        fn workspace_source_pin_survives_path_rename() {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock must follow the Unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "runtime-isolation-workspace-pin-{}-{nonce}",
+                std::process::id()
+            ));
+            let original = root.join("original");
+            let renamed = root.join("renamed");
+            fs::create_dir_all(&original).expect("test workspace must be created");
+
+            let pinned = pin_workspace_source(IsolationStep::ReadOnlyRootfs, &original)
+                .expect("workspace source must be pinned");
+            fs::rename(&original, &renamed).expect("test workspace must be renamed");
+            let through_descriptor = fs::metadata(pinned.proc_path())
+                .expect("pinned workspace must remain reachable through its descriptor");
+
+            assert_eq!(
+                (through_descriptor.dev(), through_descriptor.ino()),
+                (pinned.device, pinned.inode)
+            );
+            drop(pinned);
+            fs::remove_dir(&renamed).expect("renamed test workspace must be removed");
+            fs::remove_dir(&root).expect("test workspace root must be removed");
+        }
+
+        #[test]
+        fn startup_reader_liveness_rejects_a_closed_parent_endpoint() {
+            let pipe = create_startup_pipe(IsolationStep::Namespaces)
+                .expect("test startup pipe must be created");
+            verify_startup_reader_alive(IsolationStep::Namespaces, pipe.writer.as_raw_fd())
+                .expect("a live reader must keep the startup writer usable");
+
+            drop(pipe.reader);
+            let error =
+                verify_startup_reader_alive(IsolationStep::Namespaces, pipe.writer.as_raw_fd())
+                    .expect_err("a closed parent endpoint must fail lifecycle verification");
+            assert!(error.message.contains("closed the child startup channel"));
+        }
+
+        #[test]
+        fn gated_credential_transition_rearms_parent_death_signal() {
+            // SAFETY: geteuid has no pointer arguments.
+            if unsafe { libc::geteuid() } != 0
+                || !process_is_single_threaded(IsolationStep::Namespaces)
+                    .expect("the credential test must inspect its thread count")
+            {
+                return;
+            }
+            let pipe = create_startup_pipe(IsolationStep::Namespaces)
+                .expect("credential test startup pipe must be created");
+            let parent_pid = current_pid();
+            // SAFETY: the child performs only isolated lifecycle operations and
+            // exits without returning into the Rust test harness.
+            let child_pid = unsafe { libc::fork() };
+            assert_ne!(child_pid, -1, "credential test fork must succeed");
+            if child_pid == 0 {
+                drop(pipe.reader);
+                let writer_fd = pipe.writer.as_raw_fd();
+                let result = (|| {
+                    configure_child_lifecycle(IsolationStep::Namespaces, parent_pid, writer_fd)?;
+                    // SAFETY: the expendable root child intentionally changes to
+                    // the conventional nobody credential for this regression test.
+                    if unsafe { libc::setresgid(65534, 65534, 65534) } == -1 {
+                        return Err(last_error(
+                            IsolationStep::IdentityMap,
+                            "change regression-test GID",
+                        ));
+                    }
+                    // SAFETY: the child still has UID zero until this final change.
+                    if unsafe { libc::setresuid(65534, 65534, 65534) } == -1 {
+                        return Err(last_error(
+                            IsolationStep::IdentityMap,
+                            "change regression-test UID",
+                        ));
+                    }
+                    let mut cleared_signal = libc::SIGKILL;
+                    // SAFETY: PR_GET_PDEATHSIG writes one scalar signal number.
+                    if unsafe {
+                        libc::prctl(libc::PR_GET_PDEATHSIG, &raw mut cleared_signal, 0, 0, 0)
+                    } == -1
+                        || cleared_signal != 0
+                    {
+                        return Err(BackendError::new(
+                            IsolationStep::IdentityMap,
+                            "credential transition did not clear the parent-death signal",
+                            None,
+                        ));
+                    }
+                    arm_and_verify_parent_lifecycle(
+                        IsolationStep::IdentityMap,
+                        parent_pid,
+                        writer_fd,
+                    )
+                })();
+                // SAFETY: the fork child must never return into the test harness.
+                unsafe { libc::_exit(i32::from(result.is_err())) }
+            }
+
+            drop(pipe.writer);
+            let mut status = 0;
+            // SAFETY: the PID is this process's direct, unreaped child.
+            assert_eq!(
+                unsafe { libc::waitpid(child_pid, &raw mut status, 0) },
+                child_pid
+            );
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+
+        #[test]
         fn pid_namespace_identity_is_observable_without_privilege() {
             let observation = observe_pid_namespaces(IsolationStep::Namespaces)
                 .expect("procfs namespace links must be observable");
@@ -2018,7 +2395,7 @@ mod implementation {
             ));
             assert!(matches!(
                 child.wait(),
-                Ok(crate::backend::ChildExit::Exited(0))
+                Err(crate::backend::ChildProcessError::AlreadyReaped)
             ));
             assert_eq!(child.pid_namespace(), child_namespace);
         }

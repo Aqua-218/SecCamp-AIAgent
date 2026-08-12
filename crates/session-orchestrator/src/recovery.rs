@@ -39,6 +39,7 @@ const JOURNAL_HEADER_LENGTH_FIELD: u8 = 32;
 const JOURNAL_RECORD_BYTES: usize = 192;
 const MAX_JOURNAL_BYTES: usize =
     JOURNAL_DATA_OFFSET + (MAX_SESSION_RECOVERY_RECORDS * JOURNAL_RECORD_BYTES);
+const COMPLETE_RECOVERY_RECORDS: u64 = 7;
 const CONFIG_FINGERPRINT_BYTES: usize = 32;
 const IDENTITY_COUNT: usize = 7;
 const ENCODED_IDENTITY_BYTES: usize = IDENTITY_COUNT * ID_BYTES;
@@ -117,10 +118,10 @@ pub enum SessionRecoveryStage {
     IdentityReserved,
     /// The session cgroup contains no processes.
     CgroupEmpty,
-    /// The session device mapper has been closed.
-    MapperClosed,
     /// Workspace provisioning state has been released.
     ProvisioningReleased,
+    /// The session device mapper has been closed.
+    MapperClosed,
     /// The jail and workspace paths have been removed.
     JailRemoved,
     /// Every recovery obligation is durably complete.
@@ -161,9 +162,9 @@ impl SessionRecoveryStage {
         match self {
             Self::Intent => Some(Self::IdentityReserved),
             Self::IdentityReserved => Some(Self::CgroupEmpty),
-            Self::CgroupEmpty => Some(Self::MapperClosed),
-            Self::MapperClosed => Some(Self::ProvisioningReleased),
-            Self::ProvisioningReleased => Some(Self::JailRemoved),
+            Self::CgroupEmpty => Some(Self::ProvisioningReleased),
+            Self::ProvisioningReleased => Some(Self::MapperClosed),
+            Self::MapperClosed => Some(Self::JailRemoved),
             Self::JailRemoved => Some(Self::Complete),
             Self::Complete | Self::Abandoned => None,
         }
@@ -296,6 +297,13 @@ pub enum SessionRecoveryError {
     NotRegularFile {
         /// Rejected path.
         path: PathBuf,
+    },
+    /// A journal or lock inode has another hard-link name.
+    AliasedFile {
+        /// Rejected path.
+        path: PathBuf,
+        /// Number of names linked to the inode.
+        links: u64,
     },
     /// A validated path no longer names the retained device/inode.
     PathIdentityChanged {
@@ -438,6 +446,11 @@ impl fmt::Display for SessionRecoveryError {
             Self::NotRegularFile { path } => write!(
                 formatter,
                 "session recovery path is not a regular file: {}",
+                path.display()
+            ),
+            Self::AliasedFile { path, links } => write!(
+                formatter,
+                "session recovery path has {links} hard links instead of exactly one: {}",
                 path.display()
             ),
             Self::PathIdentityChanged { path } => write!(
@@ -842,6 +855,19 @@ impl DurableSessionRecoveryJournal {
                 stage: pending.stage,
             });
         }
+        let required_records = self
+            .record_count
+            .checked_add(COMPLETE_RECOVERY_RECORDS)
+            .ok_or(SessionRecoveryError::CapacityExceeded {
+                records: u64::MAX,
+                max_records: MAX_SESSION_RECOVERY_RECORDS as u64,
+            })?;
+        if required_records > MAX_SESSION_RECOVERY_RECORDS as u64 {
+            return Err(SessionRecoveryError::CapacityExceeded {
+                records: required_records,
+                max_records: MAX_SESSION_RECOVERY_RECORDS as u64,
+            });
+        }
         let intent_checksum = intent_checksum(intent);
         let lease = SessionRecoveryLease {
             intent,
@@ -854,10 +880,12 @@ impl DurableSessionRecoveryJournal {
         Ok(lease)
     }
 
-    /// Durably advances cleanup for the exact active lease.
+    /// Durably advances non-terminal cleanup for the exact active lease.
     ///
     /// Repeating the currently committed stage is an idempotent no-op. Every
     /// other successful checkpoint must be the immediate dependency successor.
+    /// Terminal transitions are accepted only through [`Self::complete`] and
+    /// [`Self::abandon`].
     ///
     /// # Errors
     ///
@@ -867,6 +895,15 @@ impl DurableSessionRecoveryJournal {
         &mut self,
         lease: &SessionRecoveryLease,
         stage: SessionRecoveryStage,
+    ) -> Result<SessionRecoveryLease, SessionRecoveryError> {
+        self.commit_stage(lease, stage, false)
+    }
+
+    fn commit_stage(
+        &mut self,
+        lease: &SessionRecoveryLease,
+        stage: SessionRecoveryStage,
+        allow_terminal: bool,
     ) -> Result<SessionRecoveryLease, SessionRecoveryError> {
         self.ensure_available()?;
         let current = self
@@ -878,9 +915,19 @@ impl DurableSessionRecoveryJournal {
         if stage == current.stage {
             return Ok(current);
         }
-        let is_abandon = current.stage == SessionRecoveryStage::Intent
-            && stage == SessionRecoveryStage::Abandoned;
-        if current.stage.next() != Some(stage) && !is_abandon {
+        let valid_terminal = allow_terminal
+            && matches!(
+                (current.stage, stage),
+                (
+                    SessionRecoveryStage::JailRemoved,
+                    SessionRecoveryStage::Complete
+                ) | (
+                    SessionRecoveryStage::Intent,
+                    SessionRecoveryStage::Abandoned
+                )
+            );
+        let valid_nonterminal = !stage.is_terminal() && current.stage.next() == Some(stage);
+        if !valid_nonterminal && !valid_terminal {
             return Err(SessionRecoveryError::InvalidStageTransition {
                 current: current.stage,
                 requested: stage,
@@ -901,7 +948,7 @@ impl DurableSessionRecoveryJournal {
     /// Returns [`SessionRecoveryError`] unless `JailRemoved` is the last
     /// durable checkpoint for the exact active lease, or durable I/O fails.
     pub fn complete(&mut self, lease: &SessionRecoveryLease) -> Result<(), SessionRecoveryError> {
-        self.checkpoint(lease, SessionRecoveryStage::Complete)
+        self.commit_stage(lease, SessionRecoveryStage::Complete, true)
             .map(|_| ())
     }
 
@@ -912,7 +959,7 @@ impl DurableSessionRecoveryJournal {
     /// Returns [`SessionRecoveryError`] unless the exact lease is still at
     /// `Intent`, before any identity reservation was acknowledged.
     pub fn abandon(&mut self, lease: &SessionRecoveryLease) -> Result<(), SessionRecoveryError> {
-        self.checkpoint(lease, SessionRecoveryStage::Abandoned)
+        self.commit_stage(lease, SessionRecoveryStage::Abandoned, true)
             .map(|_| ())
     }
 
@@ -1277,6 +1324,18 @@ fn validate_parent_path(
         PathBuf::from(".")
     };
     let mut final_identity = None;
+    if !path.is_absolute() {
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            SessionRecoveryError::io(SessionRecoveryOperation::Metadata, &current, &error)
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(SessionRecoveryError::Symlink {
+                path: current.clone(),
+            });
+        }
+        validate_directory_metadata(&current, &metadata, effective_uid)?;
+        final_identity = Some(file_identity(&metadata));
+    }
     for component in path.components() {
         match component {
             std::path::Component::RootDir => current.push(Path::new("/")),
@@ -1346,15 +1405,24 @@ fn validate_directory_metadata(
     }
     #[cfg(unix)]
     {
-        let mode = metadata.mode();
-        let owner = metadata.uid();
-        if mode & WRITE_BY_GROUP_OR_OTHER != 0
-            && (mode & STICKY_DIRECTORY == 0 || (owner != 0 && owner != effective_uid))
-        {
-            return Err(SessionRecoveryError::UnsafeParentDirectory {
-                path: path.to_path_buf(),
-            });
-        }
+        validate_directory_security(path, metadata.mode(), metadata.uid(), effective_uid)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_directory_security(
+    path: &Path,
+    mode: u32,
+    owner: u32,
+    effective_uid: u32,
+) -> Result<(), SessionRecoveryError> {
+    let trusted_owner = owner == 0 || owner == effective_uid;
+    let unsafe_writable = mode & WRITE_BY_GROUP_OR_OTHER != 0 && mode & STICKY_DIRECTORY == 0;
+    if !trusted_owner || unsafe_writable {
+        return Err(SessionRecoveryError::UnsafeParentDirectory {
+            path: path.to_path_buf(),
+        });
     }
     Ok(())
 }
@@ -1371,6 +1439,12 @@ fn validate_file_metadata(
                 path: path.to_path_buf(),
                 expected: effective_uid,
                 actual: metadata.uid(),
+            });
+        }
+        if metadata.nlink() != 1 {
+            return Err(SessionRecoveryError::AliasedFile {
+                path: path.to_path_buf(),
+                links: metadata.nlink(),
             });
         }
         let mode = metadata.mode() & 0o777;
@@ -1609,13 +1683,6 @@ fn parse_header_slot(bytes: &[u8], slot: usize) -> Result<ParsedHeader, SessionR
             records: record_count,
             max_records: MAX_SESSION_RECOVERY_RECORDS as u64,
         })?;
-    if bytes.len() < committed_length {
-        return Err(SessionRecoveryError::truncated(
-            bytes.len(),
-            committed_length,
-            bytes.len(),
-        ));
-    }
     Ok(ParsedHeader {
         generation,
         record_count,
@@ -1627,7 +1694,7 @@ fn parse_header_slot(bytes: &[u8], slot: usize) -> Result<ParsedHeader, SessionR
 fn select_header(bytes: &[u8]) -> Result<ParsedHeader, SessionRecoveryError> {
     let first = parse_header_slot(bytes, 0);
     let second = parse_header_slot(bytes, 1);
-    match (first, second) {
+    let selected = match (first, second) {
         (Ok(first), Ok(second)) => {
             if first.generation == second.generation
                 && (first.record_count != second.record_count
@@ -1646,7 +1713,15 @@ fn select_header(bytes: &[u8]) -> Result<ParsedHeader, SessionRecoveryError> {
         }
         (Ok(header), Err(_)) | (Err(_), Ok(header)) => Ok(header),
         (Err(first), Err(_)) => Err(first),
+    }?;
+    if bytes.len() < selected.committed_length {
+        return Err(SessionRecoveryError::truncated(
+            bytes.len(),
+            selected.committed_length,
+            bytes.len(),
+        ));
     }
+    Ok(selected)
 }
 
 fn parse_committed_journal(
@@ -1963,8 +2038,8 @@ mod tests {
         for stage in [
             SessionRecoveryStage::IdentityReserved,
             SessionRecoveryStage::CgroupEmpty,
-            SessionRecoveryStage::MapperClosed,
             SessionRecoveryStage::ProvisioningReleased,
+            SessionRecoveryStage::MapperClosed,
             SessionRecoveryStage::JailRemoved,
         ] {
             lease = journal
@@ -2021,6 +2096,26 @@ mod tests {
         panic!("parent did not release recovery journal child");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn attacker_owned_ancestor_is_rejected_even_for_root() {
+        let path = Path::new("/attacker-owned");
+        assert!(matches!(
+            validate_directory_security(path, 0o700, 1_001, 0),
+            Err(SessionRecoveryError::UnsafeParentDirectory { .. })
+        ));
+        assert!(matches!(
+            validate_directory_security(path, 0o1_777, 1_001, 1_000),
+            Err(SessionRecoveryError::UnsafeParentDirectory { .. })
+        ));
+        assert!(matches!(
+            validate_directory_security(path, 0o777, 1_000, 1_000),
+            Err(SessionRecoveryError::UnsafeParentDirectory { .. })
+        ));
+        validate_directory_security(Path::new("/tmp"), 0o1_777, 0, 1_000)
+            .expect("root-owned sticky ancestor must remain trusted");
+    }
+
     #[test]
     fn stable_sidecar_serializes_same_process_writers() {
         let fixture = JournalFixture::new("same-process");
@@ -2037,6 +2132,57 @@ mod tests {
         assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
         DurableSessionRecoveryJournal::open(&fixture.path)
             .expect("released writer lock must be reusable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_hardlink_alias_is_rejected() {
+        let fixture = JournalFixture::new("journal-hardlink");
+        drop(DurableSessionRecoveryJournal::open(&fixture.path).expect("journal must open"));
+        fs::hard_link(&fixture.path, fixture.directory.join("journal.alias"))
+            .expect("journal alias must be created");
+
+        assert!(matches!(
+            DurableSessionRecoveryJournal::open(&fixture.path),
+            Err(SessionRecoveryError::AliasedFile { links: 2, .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_hardlink_alias_is_rejected() {
+        let fixture = JournalFixture::new("lock-hardlink");
+        drop(DurableSessionRecoveryJournal::open(&fixture.path).expect("journal must open"));
+        fs::hard_link(fixture.lock_path(), fixture.directory.join("lock.alias"))
+            .expect("lock alias must be created");
+
+        assert!(matches!(
+            DurableSessionRecoveryJournal::open(&fixture.path),
+            Err(SessionRecoveryError::AliasedFile { links: 2, .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_path_alias_cannot_create_a_second_writer() {
+        let fixture = JournalFixture::new("cross-path-hardlink");
+        let mut first =
+            DurableSessionRecoveryJournal::open(&fixture.path).expect("first writer must open");
+        let alias = fixture.directory.join("second.recovery");
+        fs::hard_link(&fixture.path, &alias).expect("cross-path alias must be created");
+
+        assert!(matches!(
+            DurableSessionRecoveryJournal::open(&alias),
+            Err(SessionRecoveryError::AliasedFile { links: 2, .. })
+        ));
+        assert!(matches!(
+            first.prepare(intent(0x20)),
+            Err(SessionRecoveryError::AliasedFile { links: 2, .. })
+        ));
+        assert!(matches!(
+            first.prepare(intent(0x21)),
+            Err(SessionRecoveryError::Unavailable { .. })
+        ));
     }
 
     #[test]
@@ -2119,9 +2265,9 @@ mod tests {
         assert_eq!(pending.intent(), expected);
         assert_eq!(pending.stage(), SessionRecoveryStage::CgroupEmpty);
         let pending = reopened
-            .checkpoint(&pending, SessionRecoveryStage::MapperClosed)
+            .checkpoint(&pending, SessionRecoveryStage::ProvisioningReleased)
             .expect("recovered exact lease must continue");
-        assert_eq!(pending.stage(), SessionRecoveryStage::MapperClosed);
+        assert_eq!(pending.stage(), SessionRecoveryStage::ProvisioningReleased);
     }
 
     #[test]
@@ -2154,6 +2300,10 @@ mod tests {
             DurableSessionRecoveryJournal::open(&fixture.path).expect("journal must open");
         let first = journal.prepare(intent(0x31)).expect("intent must commit");
         assert!(matches!(
+            journal.checkpoint(&first, SessionRecoveryStage::Abandoned),
+            Err(SessionRecoveryError::InvalidStageTransition { .. })
+        ));
+        assert!(matches!(
             journal.checkpoint(&first, SessionRecoveryStage::MapperClosed),
             Err(SessionRecoveryError::InvalidStageTransition { .. })
         ));
@@ -2175,11 +2325,42 @@ mod tests {
             Err(SessionRecoveryError::PendingRecovery { .. })
         ));
         let first = checkpoint_through_jail(&mut journal, first);
+        assert!(matches!(
+            journal.checkpoint(&first, SessionRecoveryStage::Complete),
+            Err(SessionRecoveryError::InvalidStageTransition { .. })
+        ));
         journal.complete(&first).expect("completion must commit");
         assert_eq!(journal.pending(), None);
         journal
             .prepare(intent(0x32))
             .expect("next generation must prepare after completion");
+    }
+
+    #[test]
+    fn prepare_requires_headroom_for_every_success_checkpoint() {
+        let fixture = JournalFixture::new("prepare-headroom");
+        let mut journal =
+            DurableSessionRecoveryJournal::open(&fixture.path).expect("journal must open");
+        journal.record_count = MAX_SESSION_RECOVERY_RECORDS as u64 - COMPLETE_RECOVERY_RECORDS + 1;
+        let before = fs::metadata(&fixture.path)
+            .expect("journal must exist")
+            .len();
+
+        assert!(matches!(
+            journal.prepare(intent(0x33)),
+            Err(SessionRecoveryError::CapacityExceeded {
+                records,
+                max_records,
+            }) if records == MAX_SESSION_RECOVERY_RECORDS as u64 + 1
+                && max_records == MAX_SESSION_RECOVERY_RECORDS as u64
+        ));
+        assert_eq!(journal.pending(), None);
+        assert_eq!(
+            fs::metadata(&fixture.path)
+                .expect("journal must remain")
+                .len(),
+            before
+        );
     }
 
     #[test]
@@ -2508,8 +2689,8 @@ mod tests {
         for (generation, slot, stage) in [
             (2, 0, SessionRecoveryStage::IdentityReserved),
             (3, 1, SessionRecoveryStage::CgroupEmpty),
-            (4, 0, SessionRecoveryStage::MapperClosed),
-            (5, 1, SessionRecoveryStage::ProvisioningReleased),
+            (4, 0, SessionRecoveryStage::ProvisioningReleased),
+            (5, 1, SessionRecoveryStage::MapperClosed),
             (6, 0, SessionRecoveryStage::JailRemoved),
         ] {
             lease = journal
@@ -2523,23 +2704,33 @@ mod tests {
     }
 
     #[test]
-    fn valid_newer_header_beyond_file_falls_back_to_older_slot() {
-        let fixture = JournalFixture::new("future-header");
-        drop(DurableSessionRecoveryJournal::open(&fixture.path).expect("journal must open"));
-        let future = journal_header(10, 1);
-        let mut file = OpenOptions::new()
+    fn committed_newer_header_with_missing_record_fails_closed() {
+        let fixture = JournalFixture::new("committed-record-loss");
+        {
+            let mut journal =
+                DurableSessionRecoveryJournal::open(&fixture.path).expect("journal must open");
+            journal
+                .prepare(intent(0x68))
+                .expect("intent and newer header must commit");
+        }
+        let file = OpenOptions::new()
             .write(true)
             .open(&fixture.path)
             .expect("journal must be writable by test");
-        file.seek(SeekFrom::Start(JOURNAL_HEADER_SLOT_BYTES as u64))
-            .and_then(|_| file.write_all(&future).and_then(|()| file.sync_all()))
-            .expect("test must publish impossible future header");
+        file.set_len(JOURNAL_DATA_OFFSET as u64)
+            .and_then(|()| file.sync_all())
+            .expect("test must remove the committed record");
         drop(file);
-        let reopened = DurableSessionRecoveryJournal::open(&fixture.path)
-            .expect("older file-consistent header must win");
-        assert_eq!(reopened.pending(), None);
-        assert_eq!(reopened.header_generation, 0);
-        assert_eq!(reopened.active_header_slot, 0);
+
+        assert!(matches!(
+            DurableSessionRecoveryJournal::open(&fixture.path),
+            Err(SessionRecoveryError::Truncated {
+                expected,
+                actual,
+                ..
+            }) if expected == JOURNAL_DATA_OFFSET + JOURNAL_RECORD_BYTES
+                && actual == JOURNAL_DATA_OFFSET
+        ));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::{
         mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use authority_core::time::MonotonicTime;
@@ -37,10 +37,14 @@ const VMADDR_CID_ANY: u32 = u32::MAX;
 const VMADDR_PORT_ANY: u32 = u32::MAX;
 const DEFAULT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+const DROP_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Interrupts both directions of one accepted Broker stream.
 pub trait BrokerStreamShutdown: Send + 'static {
     /// Shuts down the associated stream.
+    ///
+    /// Implementations must return promptly. The owner invokes shutdown
+    /// synchronously before applying its bounded worker-join deadline.
     ///
     /// # Errors
     ///
@@ -326,6 +330,26 @@ where
     exit_receiver: Receiver<BrokerWorkerExit>,
     worker: Option<JoinHandle<()>>,
     exit: Option<BrokerWorkerExit>,
+    drop_join_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropJoinAction {
+    Join,
+    Wait(Duration),
+    FailStop,
+}
+
+fn drop_join_action(worker_finished: bool, elapsed: Duration, timeout: Duration) -> DropJoinAction {
+    if worker_finished {
+        return DropJoinAction::Join;
+    }
+    let remaining = timeout.saturating_sub(elapsed);
+    if remaining.is_zero() {
+        DropJoinAction::FailStop
+    } else {
+        DropJoinAction::Wait(remaining.min(DROP_JOIN_POLL_INTERVAL))
+    }
 }
 
 impl<F> ActiveBroker<F>
@@ -395,6 +419,18 @@ where
             BrokerWorkerExit::ExitChannelLost
         }
     }
+
+    fn wait_for_drop_progress(&mut self, timeout: Duration) {
+        if self.exit.is_some() {
+            thread::park_timeout(timeout);
+            return;
+        }
+        match self.exit_receiver.recv_timeout(timeout) {
+            Ok(exit) => self.exit = Some(exit),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => thread::park_timeout(timeout),
+        }
+    }
 }
 
 impl<F> Drop for ActiveBroker<F>
@@ -402,10 +438,34 @@ where
     F: VsockListenerFactory,
 {
     fn drop(&mut self) {
-        if self.worker.is_some() {
-            let _ = self.request_cancel();
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
+        if self.worker.is_none() {
+            return;
+        }
+
+        // Destructors must not unwind, especially while an outer panic is
+        // already in flight. Cancellation is set before stream shutdown, so a
+        // panicking shutdown implementation can be contained while the owner
+        // still waits for the worker. Forgetting the panic payload also avoids
+        // running a hostile payload destructor from this destructor.
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(|| self.request_cancel())) {
+            std::mem::forget(payload);
+        }
+
+        let started = Instant::now();
+        loop {
+            let worker_finished = self.worker.as_ref().is_some_and(JoinHandle::is_finished);
+            match drop_join_action(worker_finished, started.elapsed(), self.drop_join_timeout) {
+                DropJoinAction::Join => {
+                    if let Some(worker) = self.worker.take() {
+                        let _ = worker.join();
+                    }
+                    return;
+                }
+                DropJoinAction::Wait(timeout) => self.wait_for_drop_progress(timeout),
+                // A live worker cannot be detached safely: it still owns a
+                // session-scoped listener/runtime. Abort is the explicit
+                // fail-stop boundary once bounded cancellation is exhausted.
+                DropJoinAction::FailStop => std::process::abort(),
             }
         }
     }
@@ -596,6 +656,7 @@ where
             exit_receiver,
             worker: Some(worker),
             exit: None,
+            drop_join_timeout: self.join_timeout,
         });
         Ok(lease)
     }
@@ -830,7 +891,8 @@ mod tests {
     use super::{
         BrokerBackend, BrokerCancellation, BrokerConnectionExit, BrokerRuntime,
         BrokerRuntimeFactory, BrokerServiceListener, BrokerStreamShutdown, BrokerWorkerExit,
-        BrokerWorkerStatus, VsockListenerFactory, successful_connection_exit,
+        BrokerWorkerStatus, DROP_JOIN_POLL_INTERVAL, DropJoinAction, VsockListenerFactory,
+        drop_join_action, successful_connection_exit,
     };
     use crate::{
         BackendError, BrokerBackend as OrchestratorBrokerBackend, BrokerLease, BrokerSessionId,
@@ -1121,6 +1183,42 @@ mod tests {
         assert_eq!(
             successful_connection_exit(ConnectionCloseReason::CommittedButUnrecorded, 2),
             BrokerConnectionExit::CommittedButUnrecorded { requests_served: 2 }
+        );
+    }
+
+    #[test]
+    fn drop_join_decision_joins_only_a_known_finished_worker() {
+        let timeout = Duration::from_millis(5);
+
+        assert_eq!(
+            drop_join_action(true, Duration::ZERO, timeout),
+            DropJoinAction::Join
+        );
+        assert_eq!(
+            drop_join_action(true, timeout, timeout),
+            DropJoinAction::Join
+        );
+    }
+
+    #[test]
+    fn drop_join_decision_waits_boundedly_then_requires_fail_stop() {
+        let timeout = Duration::from_millis(5);
+
+        assert_eq!(
+            drop_join_action(false, Duration::ZERO, timeout),
+            DropJoinAction::Wait(DROP_JOIN_POLL_INTERVAL)
+        );
+        assert_eq!(
+            drop_join_action(false, Duration::from_micros(4_500), timeout),
+            DropJoinAction::Wait(Duration::from_micros(500))
+        );
+        assert_eq!(
+            drop_join_action(false, timeout, timeout),
+            DropJoinAction::FailStop
+        );
+        assert_eq!(
+            drop_join_action(false, timeout + Duration::from_millis(1), timeout),
+            DropJoinAction::FailStop
         );
     }
 

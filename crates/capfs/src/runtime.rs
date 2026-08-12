@@ -14,7 +14,8 @@ use rustix::{
     fd::OwnedFd,
     fs::{
         AtFlags, FileType, Mode, OFlags, RenameFlags, ResolveFlags, Statx, StatxFlags,
-        StatxTimestamp, fchmod, ftruncate, mkdirat, openat2, renameat_with, statx, unlinkat,
+        StatxTimestamp, Timespec, Timestamps, UTIME_NOW, UTIME_OMIT, fchmod, ftruncate, futimens,
+        mkdirat, openat2, renameat_with, statx, unlinkat,
     },
     io::{fcntl_dupfd_cloexec, pread, pwrite},
 };
@@ -48,6 +49,69 @@ impl CreationPermissions {
 
     const fn mode(self) -> Mode {
         self.0
+    }
+}
+
+/// Ordinary owner/group/other permission bits for a metadata update.
+///
+/// set-ID and sticky bits are deliberately stripped. Those bits can change
+/// execution or deletion semantics and are outside the initial capfs metadata
+/// policy even when a caller holds `SetMetadata`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct MetadataPermissions(Mode);
+
+impl MetadataPermissions {
+    #[allow(dead_code)]
+    pub(crate) fn from_requested_mode(requested_mode: u32) -> Self {
+        Self(Mode::from_raw_mode(requested_mode & 0o777))
+    }
+
+    const fn mode(self) -> Mode {
+        self.0
+    }
+}
+
+/// One timestamp value accepted by the supported metadata policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum MetadataTime {
+    /// Ask the kernel to sample its current realtime clock.
+    Now,
+    /// Set one exact wall-clock value.
+    Exact(SystemTime),
+}
+
+/// A non-empty atime/mtime update executed by one `futimens` syscall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct MetadataTimes {
+    access: Option<MetadataTime>,
+    modification: Option<MetadataTime>,
+}
+
+impl MetadataTimes {
+    #[allow(dead_code)]
+    pub(crate) fn new(
+        access: Option<MetadataTime>,
+        modification: Option<MetadataTime>,
+    ) -> Option<Self> {
+        if access.is_none() && modification.is_none() {
+            None
+        } else {
+            Some(Self {
+                access,
+                modification,
+            })
+        }
+    }
+
+    #[allow(dead_code)]
+    fn to_rustix(self, path: &CanonicalPath) -> Result<Timestamps, RuntimeBackingError> {
+        Ok(Timestamps {
+            last_access: metadata_time_to_timespec(self.access, path)?,
+            last_modification: metadata_time_to_timespec(self.modification, path)?,
+        })
     }
 }
 
@@ -459,6 +523,41 @@ impl ValidatedRepository {
         })
     }
 
+    /// Replaces ordinary permission bits on one validated backing object.
+    ///
+    /// The object descriptor is opened and its kind, mount, and hard-link
+    /// invariants are checked before `fchmod`. The syscall is the final fallible
+    /// step: success means the metadata effect committed even if a later FUSE
+    /// attribute reply must independently fail.
+    #[allow(dead_code)]
+    pub(crate) fn set_runtime_permissions(
+        &self,
+        object: &NamespaceObject,
+        permissions: MetadataPermissions,
+    ) -> Result<(), RuntimeBackingError> {
+        let fd = self.open_runtime_metadata_object(object)?;
+        fchmod(&fd, permissions.mode())
+            .map_err(|error| runtime_io_error("set permissions", object.path(), error))
+    }
+
+    /// Replaces atime and/or mtime on one validated backing object.
+    ///
+    /// Missing fields become `UTIME_OMIT`; `Now` becomes `UTIME_NOW`, allowing
+    /// both supported timestamps to commit atomically in one `futimens` call.
+    /// Exact-time conversion and all backing validation happen before that
+    /// final syscall.
+    #[allow(dead_code)]
+    pub(crate) fn set_runtime_timestamps(
+        &self,
+        object: &NamespaceObject,
+        times: MetadataTimes,
+    ) -> Result<(), RuntimeBackingError> {
+        let timestamps = times.to_rustix(object.path())?;
+        let fd = self.open_runtime_metadata_object(object)?;
+        futimens(&fd, &timestamps)
+            .map_err(|error| runtime_io_error("set timestamps", object.path(), error))
+    }
+
     fn open_runtime_file_with_access(
         &self,
         object: &NamespaceObject,
@@ -485,6 +584,21 @@ impl ValidatedRepository {
             fd,
             path: object.path().clone(),
         })
+    }
+
+    #[allow(dead_code)]
+    fn open_runtime_metadata_object(
+        &self,
+        object: &NamespaceObject,
+    ) -> Result<OwnedFd, RuntimeBackingError> {
+        match object.kind() {
+            NamespaceObjectKind::Directory => self.open_runtime_directory(object),
+            NamespaceObjectKind::RegularFile => {
+                let file =
+                    self.open_runtime_file_with_access(object, RuntimeFileAccess::ReadOnly)?;
+                Ok(file.fd)
+            }
+        }
     }
 
     fn open_runtime_directory(
@@ -805,6 +919,59 @@ fn system_time(
     value.ok_or_else(|| RuntimeBackingError::TimestampOutOfRange(path.clone()))
 }
 
+#[allow(dead_code)]
+fn metadata_time_to_timespec(
+    update: Option<MetadataTime>,
+    path: &CanonicalPath,
+) -> Result<Timespec, RuntimeBackingError> {
+    match update {
+        None => Ok(Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        }),
+        Some(MetadataTime::Now) => Ok(Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_NOW,
+        }),
+        Some(MetadataTime::Exact(time)) => exact_time_to_timespec(time, path),
+    }
+}
+
+#[allow(dead_code)]
+fn exact_time_to_timespec(
+    time: SystemTime,
+    path: &CanonicalPath,
+) -> Result<Timespec, RuntimeBackingError> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => Ok(Timespec {
+            tv_sec: i64::try_from(duration.as_secs())
+                .map_err(|_| RuntimeBackingError::TimestampOutOfRange(path.clone()))?,
+            tv_nsec: i64::from(duration.subsec_nanos()),
+        }),
+        Err(error) => {
+            let duration = error.duration();
+            let seconds = i64::try_from(duration.as_secs())
+                .map_err(|_| RuntimeBackingError::TimestampOutOfRange(path.clone()))?;
+            let nanos = duration.subsec_nanos();
+            if nanos == 0 {
+                Ok(Timespec {
+                    tv_sec: -seconds,
+                    tv_nsec: 0,
+                })
+            } else {
+                let tv_sec = seconds
+                    .checked_add(1)
+                    .and_then(i64::checked_neg)
+                    .ok_or_else(|| RuntimeBackingError::TimestampOutOfRange(path.clone()))?;
+                Ok(Timespec {
+                    tv_sec,
+                    tv_nsec: 1_000_000_000_i64 - i64::from(nanos),
+                })
+            }
+        }
+    }
+}
+
 const fn namespace_kind(kind: FileType) -> Option<NamespaceObjectKind> {
     match kind {
         FileType::Directory => Some(NamespaceObjectKind::Directory),
@@ -860,12 +1027,16 @@ mod tests {
         num::NonZeroUsize,
         os::unix::fs::{PermissionsExt, symlink},
         path::PathBuf,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use rustix::fs::AtFlags;
+    use rustix::fs::{AtFlags, Timespec};
     use tempfile::tempdir;
 
-    use super::{CreationPermissions, RuntimeBackingError, rollback_created_entry_on_error};
+    use super::{
+        CreationPermissions, MetadataPermissions, MetadataTime, MetadataTimes, RuntimeBackingError,
+        exact_time_to_timespec, rollback_created_entry_on_error,
+    };
     use crate::{
         backing::{ImportedRepository, PreflightLimits},
         namespace::{NamespaceObjectKind, NamespaceOperationError},
@@ -1935,6 +2106,262 @@ mod tests {
                 )
                 .expect("namespace must remain readable")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn runtime_permissions_strip_privileged_bits_and_apply_exact_mode() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let file_path = directory.path().join("file.txt");
+        let child_directory_path = directory.path().join("child");
+        fs::write(&file_path, b"content").expect("test file must be creatable");
+        fs::create_dir(&child_directory_path).expect("test directory must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let file = namespace
+            .object_at_path_snapshot(
+                &CanonicalPath::new(["file.txt"]).expect("test path must be canonical"),
+            )
+            .expect("namespace must remain readable")
+            .expect("file must be imported");
+        let child_directory = namespace
+            .object_at_path_snapshot(
+                &CanonicalPath::new(["child"]).expect("test path must be canonical"),
+            )
+            .expect("namespace must remain readable")
+            .expect("directory must be imported");
+
+        backing
+            .set_runtime_permissions(&file, MetadataPermissions::from_requested_mode(0o7754))
+            .expect("file permissions must be mutable by descriptor");
+        backing
+            .set_runtime_permissions(
+                &child_directory,
+                MetadataPermissions::from_requested_mode(0o5710),
+            )
+            .expect("directory permissions must be mutable by descriptor");
+
+        assert_eq!(
+            fs::metadata(&file_path)
+                .expect("file metadata must remain readable")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o754,
+            "set-ID and sticky bits must not reach the backing file"
+        );
+        assert_eq!(
+            fs::metadata(&child_directory_path)
+                .expect("directory metadata must remain readable")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o710,
+            "set-ID and sticky bits must not reach the backing directory"
+        );
+    }
+
+    #[test]
+    fn runtime_permissions_reject_hard_link_before_metadata_change() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let file_path = directory.path().join("file.txt");
+        fs::write(&file_path, b"content").expect("test file must be creatable");
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o640))
+            .expect("initial permissions must be configurable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let file = namespace
+            .object_at_path_snapshot(
+                &CanonicalPath::new(["file.txt"]).expect("test path must be canonical"),
+            )
+            .expect("namespace must remain readable")
+            .expect("file must be imported");
+        fs::hard_link(&file_path, directory.path().join("alias.txt"))
+            .expect("out-of-band hard link must be creatable");
+
+        let error = backing
+            .set_runtime_permissions(&file, MetadataPermissions::from_requested_mode(0o600))
+            .expect_err("hard-linked file must reject metadata mutation");
+
+        assert!(matches!(
+            error,
+            RuntimeBackingError::HardLinkAppeared { link_count: 2, .. }
+        ));
+        assert_eq!(
+            fs::metadata(&file_path)
+                .expect("file metadata must remain readable")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o640,
+            "validation failure must occur before fchmod"
+        );
+    }
+
+    #[test]
+    fn runtime_timestamps_set_exact_values_and_omit_unspecified_fields() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let file_path = directory.path().join("file.txt");
+        fs::write(&file_path, b"content").expect("test file must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let file = namespace
+            .object_at_path_snapshot(
+                &CanonicalPath::new(["file.txt"]).expect("test path must be canonical"),
+            )
+            .expect("namespace must remain readable")
+            .expect("file must be imported");
+        let first_access = UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789);
+        let first_modification = UNIX_EPOCH + Duration::new(1_700_000_100, 987_654_321);
+        let second_modification = UNIX_EPOCH + Duration::new(1_700_000_200, 111_222_333);
+
+        backing
+            .set_runtime_timestamps(
+                &file,
+                MetadataTimes::new(
+                    Some(MetadataTime::Exact(first_access)),
+                    Some(MetadataTime::Exact(first_modification)),
+                )
+                .expect("at least one timestamp is present"),
+            )
+            .expect("both exact timestamps must commit in one syscall");
+        let first_metadata = backing
+            .runtime_metadata(&file)
+            .expect("updated metadata must remain valid");
+        assert_eq!(first_metadata.atime, first_access);
+        assert_eq!(first_metadata.mtime, first_modification);
+
+        backing
+            .set_runtime_timestamps(
+                &file,
+                MetadataTimes::new(None, Some(MetadataTime::Exact(second_modification)))
+                    .expect("mtime update is non-empty"),
+            )
+            .expect("mtime-only update must commit");
+        let second_metadata = backing
+            .runtime_metadata(&file)
+            .expect("updated metadata must remain valid");
+        assert_eq!(
+            second_metadata.atime, first_access,
+            "UTIME_OMIT must preserve the unspecified atime"
+        );
+        assert_eq!(second_metadata.mtime, second_modification);
+    }
+
+    #[test]
+    fn runtime_timestamps_support_kernel_now_without_changing_omitted_mtime() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::write(directory.path().join("file.txt"), b"content")
+            .expect("test file must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let file = namespace
+            .object_at_path_snapshot(
+                &CanonicalPath::new(["file.txt"]).expect("test path must be canonical"),
+            )
+            .expect("namespace must remain readable")
+            .expect("file must be imported");
+        let fixed_modification = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        backing
+            .set_runtime_timestamps(
+                &file,
+                MetadataTimes::new(None, Some(MetadataTime::Exact(fixed_modification)))
+                    .expect("mtime update is non-empty"),
+            )
+            .expect("initial mtime must be configurable");
+        let before = SystemTime::now();
+
+        backing
+            .set_runtime_timestamps(
+                &file,
+                MetadataTimes::new(Some(MetadataTime::Now), None)
+                    .expect("atime update is non-empty"),
+            )
+            .expect("kernel-now atime update must commit");
+        let after = SystemTime::now();
+        let metadata = backing
+            .runtime_metadata(&file)
+            .expect("updated metadata must remain valid");
+
+        let clock_tolerance = Duration::from_secs(1);
+        assert!(
+            metadata.atime
+                >= before
+                    .checked_sub(clock_tolerance)
+                    .expect("current time must exceed one second after the epoch")
+        );
+        assert!(
+            metadata.atime
+                <= after
+                    .checked_add(clock_tolerance)
+                    .expect("current time plus one second must be representable")
+        );
+        assert_eq!(metadata.mtime, fixed_modification);
+    }
+
+    #[test]
+    fn exact_timestamp_conversion_handles_values_before_unix_epoch() {
+        let path = CanonicalPath::new(["file.txt"]).expect("test path must be canonical");
+
+        assert_eq!(
+            exact_time_to_timespec(UNIX_EPOCH - Duration::from_nanos(1), &path)
+                .expect("one nanosecond before the epoch is representable"),
+            Timespec {
+                tv_sec: -1,
+                tv_nsec: 999_999_999,
+            }
+        );
+        assert!(MetadataTimes::new(None, None).is_none());
+    }
+
+    #[test]
+    fn runtime_timestamps_reject_a_symlink_before_metadata_change() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let outside = tempdir().expect("outside directory must be creatable");
+        let file_path = directory.path().join("file.txt");
+        let outside_path = outside.path().join("outside.txt");
+        fs::write(&file_path, b"inside").expect("test file must be creatable");
+        fs::write(&outside_path, b"outside").expect("outside file must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let file = namespace
+            .object_at_path_snapshot(
+                &CanonicalPath::new(["file.txt"]).expect("test path must be canonical"),
+            )
+            .expect("namespace must remain readable")
+            .expect("file must be imported");
+        let outside_before = fs::metadata(&outside_path)
+            .expect("outside metadata must be readable")
+            .modified()
+            .expect("outside mtime must be representable");
+        fs::remove_file(&file_path).expect("test file must be replaceable");
+        symlink(&outside_path, &file_path).expect("replacement symlink must be creatable");
+
+        let error = backing
+            .set_runtime_timestamps(
+                &file,
+                MetadataTimes::new(None, Some(MetadataTime::Now))
+                    .expect("mtime update is non-empty"),
+            )
+            .expect_err("replacement symlink must reject metadata mutation");
+
+        assert!(matches!(error, RuntimeBackingError::Io { .. }));
+        assert_eq!(
+            fs::metadata(&outside_path)
+                .expect("outside metadata must remain readable")
+                .modified()
+                .expect("outside mtime must remain representable"),
+            outside_before
         );
     }
 

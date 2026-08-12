@@ -46,3 +46,21 @@ isolation -> Closed` の順である。
 
 snapshot に session-scoped identity が含まれる場合は backend 呼び出し前に拒否し、
 restore 後の identity は必ず ledger から fresh に予約する。
+
+## production adapters
+
+この crate は次の production adapter を公開する。
+
+- `AuthorityCoreBackend`: host が割り当てた subject / capability identity を
+  `CapabilityKernel` の root issuance と revoke / subject close へ接続する。
+- `BrokerBackend`: session lease と一つの `AF_VSOCK` listener を同じ owner に保持し、
+  expected guest CID と exact close を強制する。
+- `FirecrackerBackendFactory`: snapshot identity、workspace、Broker lease、restore 後の
+  identity injection、workload gate、retry-safe shutdown を一つの runtime state に結ぶ。
+- `FirecrackerWorkspaceBackendFactory`: workspace の物理 clone / delete を orchestrator
+  だけに所有させ、Firecracker runtime には同じ prepared clone の claim を渡す。
+
+`tests/production_adapters.rs` はこれらを `start_session` から `stop_session` まで接続し、
+exact identity、snapshot、workspace、listener、Authority subject closure を検査する。
+外部境界は fake command runner / filesystem / API / listener なので、実 Firecracker、
+実 `AF_VSOCK`、特権 isolation、guest 内 capfs の end-to-end 実行を示すものではない。

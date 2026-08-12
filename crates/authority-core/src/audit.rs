@@ -200,14 +200,16 @@ pub enum AuditError {
     AttemptIdExhausted,
     /// The durable backend rejected or could not persist the journal update.
     Durable(DurableAuditError),
-    /// Recovery found attempts whose external completion cannot be determined.
+    /// Recovery found attempts from a prior capability-state instance.
     ///
-    /// A fresh operational kernel must not silently forget these records. The
-    /// session remains fail-closed until a typed reconciliation boundary has
-    /// resolved every ambiguous attempt.
-    UnresolvedRecovery {
-        /// Number of recovered `Started` or `CommitUnknown` attempts.
-        attempts: usize,
+    /// The audit WAL does not persist the [`crate::state::CapabilityState`]
+    /// transitions that authorized these attempts. Even terminal outcomes
+    /// therefore cannot be attached to a caller-supplied operational state
+    /// without risking capability identity reuse. A [`DurableAuditLog`] with
+    /// any prior attempt is inspection-only until full state recovery exists.
+    StateRecoveryRequired {
+        /// Exact prior attempt identities, sorted in ascending order.
+        attempts: Vec<AttemptId>,
     },
 }
 
@@ -219,10 +221,18 @@ impl fmt::Display for AuditError {
                 formatter.write_str("session-local attempt ID sequence is exhausted")
             }
             Self::Durable(error) => error.fmt(formatter),
-            Self::UnresolvedRecovery { attempts } => write!(
-                formatter,
-                "durable audit recovery contains {attempts} unresolved attempt(s)"
-            ),
+            Self::StateRecoveryRequired { attempts } => {
+                formatter.write_str(
+                    "durable audit contains prior attempts but operational capability-state recovery is unsupported (attempt IDs: [",
+                )?;
+                for (index, attempt) in attempts.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{}", attempt.as_u64())?;
+                }
+                formatter.write_str("])")
+            }
         }
     }
 }
@@ -231,7 +241,9 @@ impl Error for AuditError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Durable(error) => Some(error),
-            Self::LockPoisoned | Self::AttemptIdExhausted | Self::UnresolvedRecovery { .. } => None,
+            Self::LockPoisoned | Self::AttemptIdExhausted | Self::StateRecoveryRequired { .. } => {
+                None
+            }
         }
     }
 }
@@ -312,19 +324,15 @@ impl AuditTrail {
     }
 
     pub(crate) fn new_with_backend(backend: Arc<DurableAuditLog>) -> Result<Self, AuditError> {
-        let unresolved = backend
+        let mut recovered_attempts = backend
             .attempts()?
             .into_iter()
-            .filter(|attempt| {
-                matches!(
-                    attempt.outcome(),
-                    AttemptOutcome::Started | AttemptOutcome::CommitUnknown
-                )
-            })
-            .count();
-        if unresolved != 0 {
-            return Err(AuditError::UnresolvedRecovery {
-                attempts: unresolved,
+            .map(|attempt| attempt.attempt_id())
+            .collect::<Vec<_>>();
+        recovered_attempts.sort_unstable();
+        if !recovered_attempts.is_empty() {
+            return Err(AuditError::StateRecoveryRequired {
+                attempts: recovered_attempts,
             });
         }
         let next_attempt_sequence = backend.next_attempt_sequence()?;
@@ -464,15 +472,53 @@ impl AttemptGuard {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
+    use std::{
+        error::Error,
+        fs,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
     use super::{AttemptOutcome, AuditError, AuditTrail};
     use crate::{
-        capability::{AuthorityRequest, CapId, CapabilityRequest, SubjectId},
+        capability::{AuthorityRequest, CapId, CapabilityRequest, CapabilityRequestSet, SubjectId},
+        durable_audit::{CommitReceipt, CommitUnknownEvidence, DurableAuditLog},
         file::{FileEffect, FileRequest},
         path::CanonicalPath,
         repository::RepoId,
         state::AuthorizationEpoch,
         time::MonotonicTime,
     };
+
+    static NEXT_JOURNAL: AtomicU64 = AtomicU64::new(0);
+
+    struct TestJournal {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TestJournal {
+        fn new() -> Self {
+            let serial = NEXT_JOURNAL.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "authority-core-audit-recovery-{}-{serial}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&directory);
+            fs::create_dir(&directory).expect("test journal directory must be creatable");
+            let path = directory.join("audit.wal");
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for TestJournal {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
 
     fn request() -> CapabilityRequest {
         CapabilityRequest::new(
@@ -494,6 +540,17 @@ mod tests {
                 AuthorizationEpoch::default(),
             )
             .expect("the fixed audit sequence must remain available")
+    }
+
+    fn begin_durable(log: &DurableAuditLog, attempt: super::AttemptId) {
+        log.begin_attempt(
+            attempt,
+            &SubjectId::new(format!("subject-{}", attempt.as_u64())),
+            &CapId::new(format!("capability-{}", attempt.as_u64())),
+            &CapabilityRequestSet::one(request()),
+            AuthorizationEpoch::default(),
+        )
+        .expect("test attempt start must be durable");
     }
 
     #[test]
@@ -519,6 +576,81 @@ mod tests {
         let effects = trail.effects().expect("the audit lock must remain healthy");
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].attempt_id(), attempts[2].id());
+    }
+
+    #[test]
+    fn empty_durable_backend_is_the_only_operational_recovery() {
+        let journal = TestJournal::new();
+        let backend = Arc::new(
+            DurableAuditLog::create(&journal.path).expect("empty test WAL must be creatable"),
+        );
+
+        let trail = AuditTrail::new_with_backend(backend)
+            .expect("an empty WAL has no missing capability-state history");
+
+        assert!(
+            trail
+                .attempts()
+                .expect("fresh durable audit must remain readable")
+                .is_empty()
+        );
+        assert_eq!(start(&trail, 0).id(), super::AttemptId::from_u64(0));
+    }
+
+    #[test]
+    fn every_recovered_attempt_requires_state_recovery_with_exact_sorted_ids() {
+        let journal = TestJournal::new();
+        let backend =
+            Arc::new(DurableAuditLog::create(&journal.path).expect("test WAL must be creatable"));
+
+        let denied = super::AttemptId::from_u64(0);
+        begin_durable(&backend, denied);
+        backend
+            .finish_attempt(denied, AttemptOutcome::Denied, None, None)
+            .expect("denied outcome must be durable");
+
+        let failed = super::AttemptId::from_u64(1);
+        begin_durable(&backend, failed);
+        backend
+            .finish_attempt(failed, AttemptOutcome::FailedBeforeCommit, None, None)
+            .expect("pre-commit failure must be durable");
+
+        let committed = super::AttemptId::from_u64(2);
+        begin_durable(&backend, committed);
+        let receipt = CommitReceipt::kernel_success(committed);
+        backend
+            .finish_attempt(committed, AttemptOutcome::Committed, Some(&receipt), None)
+            .expect("committed outcome must be durable");
+
+        let unknown = super::AttemptId::from_u64(3);
+        begin_durable(&backend, unknown);
+        let evidence = CommitUnknownEvidence::new(unknown, b"provider-timeout")
+            .expect("fixed ambiguity evidence must be valid");
+        backend
+            .finish_attempt(
+                unknown,
+                AttemptOutcome::CommitUnknown,
+                None,
+                Some(&evidence),
+            )
+            .expect("commit-unknown outcome must be durable");
+
+        let started = super::AttemptId::from_u64(4);
+        begin_durable(&backend, started);
+
+        let error = AuditTrail::new_with_backend(backend)
+            .expect_err("every prior attempt must block operational state recovery");
+        assert_eq!(
+            error,
+            AuditError::StateRecoveryRequired {
+                attempts: vec![denied, failed, committed, unknown, started],
+            }
+        );
+        assert_eq!(
+            error.to_string(),
+            "durable audit contains prior attempts but operational capability-state recovery is unsupported (attempt IDs: [0, 1, 2, 3, 4])"
+        );
+        assert!(error.source().is_none());
     }
 
     #[test]

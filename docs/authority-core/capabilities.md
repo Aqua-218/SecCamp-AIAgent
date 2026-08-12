@@ -2,11 +2,11 @@
 
 [Authority core 実装ガイド](README.md) / Capability
 
-このページは [`crates/authority-core/src/capability.rs`](../../crates/authority-core/src/capability.rs) と [`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) が、file authority を有効期間や発行情報と結び付け、Capability 全体の包含をどう判定・証明しているかを説明する。
+このページは [`crates/authority-core/src/capability.rs`](../../crates/authority-core/src/capability.rs) と [`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) が、各 authority family を有効期間や発行情報と結び付け、Capability 全体の包含をどう判定・証明しているかを説明する。
 
 ## 権限本体を実際に使える札へまとめる
 
-`FileAuthority` だけでは「何ができるか」は表せても、「誰へ発行されたか」「いつ使えるか」「どの Capability から派生したか」は表せない。`Capability` はそれらを3つの部分へ分けて持つ。
+authority body だけでは「何ができるか」は表せても、「誰へ発行されたか」「いつ使えるか」「どの Capability から派生したか」は表せない。`Capability` はそれらを3つの部分へ分けて持つ。
 
 ```mermaid
 classDiagram
@@ -31,6 +31,8 @@ classDiagram
 
     class AuthorityBody {
         File FileAuthority
+        HttpFetch HttpFetchAuthority
+        GitHub GitHubAuthority
     }
 
     Capability --> CapabilityMetadata
@@ -48,14 +50,14 @@ classDiagram
 
 ## 型付き authority と request
 
-現在の `AuthorityBody` と `AuthorityRequest` は `File` variant だけを持つ。
+`AuthorityBody` と `AuthorityRequest` は resource family ごとに対応する variant を持つ。
 
 ```text
-AuthorityBody    = File(FileAuthority)
-AuthorityRequest = File(FileRequest)
+AuthorityBody    = File(FileAuthority) | HttpFetch(HttpFetchAuthority) | GitHub(GitHubAuthority)
+AuthorityRequest = File(FileRequest) | HttpFetch(HttpFetchRequest) | GitHub(GitHubRequest)
 ```
 
-任意の文字列や汎用 JSON を authority として通す fallback はない。将来 HTTP や provider API を加える場合は、body と request の variant、matching、containment、Lean の意味論を同時に追加する。
+任意の文字列や汎用 JSON を authority として通す fallback はない。異なる variant の body/request matching と body containment は常に `false` である。新しい provider API を加える場合も、body と request の variant、matching、containment、Lean の意味論を同時に追加する。
 
 `authority_matches` / `authorityMatches` は同じ種類の body と request を対応させる。Lean の `authorityMatches_iff_matches` は、実行可能な `Bool` と `AuthorityBody.Matches` という命題が一致することを証明する。
 
@@ -90,7 +92,7 @@ child.validity ⊆ parent.validity
 ∧ child.authority ⊆ parent.authority
 ```
 
-file-only の現在は、展開すると次の5条件になる。
+file authority では、展開すると次の5条件になる。
 
 ```text
 parent.not_before ≤ child.not_before
@@ -145,7 +147,7 @@ weakerThan child parent = true
 → ∀ request, child.Matches request → parent.Matches request
 ```
 
-これは特定の path や時刻だけの test ではない。Lean の `CapabilityRequest` として表せる任意の時刻・任意の file request について、child で許可されるなら parent でも許可される。
+これは特定の path や時刻だけの test ではない。Lean の `CapabilityRequest` として表せる任意の時刻・任意の同型 authority request について、child で許可されるなら parent でも許可される。
 
 ### 反射律と推移律: 多重委譲でも root を越えない
 
@@ -171,7 +173,7 @@ flowchart LR
     root -.->|"推移律"| leaf
 ```
 
-何十段の委譲でも各隣接 pair を確認すればよく、末端が root の時刻・repository・effect・path 境界を越えないことが推移律から従う。
+何十段の委譲でも各隣接 pair を確認すればよく、末端が root の時刻と authority family ごとの境界を越えないことが推移律から従う。
 
 ### 完全性: 本当の包含を誤って拒否しない
 
@@ -203,7 +205,7 @@ typed enum に variant を増やすと、matching と containment の `match` �
 
 ## 正確な保証範囲
 
-Lean で実装・証明済みなのは file variant の Capability envelope、時刻付き matching、純粋な `weakerThan` である。Rust ではこれに加え、逐次 `CapabilityState` が次を実装している。
+Lean で実装・証明済みなのは file / HTTP fetch / GitHub variant の Capability envelope、時刻付き matching、純粋な `weakerThan` である。Rust ではこれに加え、逐次 `CapabilityState` が次を実装している。
 
 - Capability ID の一意な採番と再利用防止。
 - caller と `SubjectId` の binding、held set、parent link の検証。
@@ -217,8 +219,8 @@ Rust state には、`auth_epoch`、subject lifecycle、open-handle registry、at
 次はまだ含まれない。
 
 - 使用回数、durable audit storage、global namespace registry。
-- HTTP fetch や GitHub authority など、File 以外の variant。
 - OS/FUSE operation を正しい `CapabilityRequest` へ変換する adapter。
+- HTTP redirect / DNS / response streaming や GitHub API call を実際に強制する Broker adapter。
 
 したがって `weakerThan_sound` は「Capability システム全体が完成した」という定理でも、Rust の状態遷移全体の証明でもない。現在の型付き file request と単調時刻の Lean モデル内で、受理した包含判定が authority を増幅しないという定理である。逐次状態遷移は契約 test と参照モデルを使った property test で別に検査する。
 
@@ -250,6 +252,8 @@ Rust state には、`auth_epoch`、subject lifecycle、open-handle registry、at
 
 - [有効期間と時刻窓の包含証明](validity-windows.md)
 - [File authority と包含証明](file-authorities.md)
+- [HTTP fetch authority](http-fetch-authorities.md)
+- [GitHub authority](github-authorities.md)
 - [Authority core で使う証明の考え方](proof-concepts.md)
 - [検証とテスト](verification.md)
 - [Capability モデル](../design/capability-model.md)

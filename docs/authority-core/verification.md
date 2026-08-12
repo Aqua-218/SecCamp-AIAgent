@@ -17,7 +17,7 @@ Authority core では、1つの手段ですべてを保証しようとせず、�
 | Lean theorem | Lean モデルのすべての型付き入力で、一般的な性質が成り立つか |
 | 共通 corpus の差分テスト | 同じ入力に対して Rust と Lean が同じ結果を返すか |
 
-unit test、Lean example・theorem、共通 corpus は現在の file-only slice に実装済みである。逐次 Capability state には Rust の transition test と stateful property test があり、effect commit と revoke の同期境界には loom model がある。ただし、具体例・生成列・bounded interleaving を実行する検査と、全入力を扱う Lean theorem では保証範囲が異なる。
+unit test、Lean example・theorem、共通 corpus は file / HTTP fetch / GitHub の authority family に実装済みである。逐次 Capability state には Rust の transition test と stateful property test があり、effect commit と revoke の同期境界には loom model がある。ただし、具体例・生成列・bounded interleaving を実行する検査と、全入力を扱う Lean theorem では保証範囲が異なる。
 
 ```mermaid
 flowchart LR
@@ -26,7 +26,7 @@ flowchart LR
     races["direct / ancestor revoke<br/>single / compound effects"] --> loom["loom model<br/>production + negative control"]
     examples --> leanExample["Lean example"]
     spec["全入力に対する仕様"] --> theorem["Lean theorem"]
-    corpus["共通 corpus<br/>101件 + 期待値"] --> rustRunner["Rust corpus runner"]
+    corpus["共通 corpus<br/>147件 + 期待値"] --> rustRunner["Rust corpus runner"]
     corpus --> leanRunner["Lean corpus runner"]
 
     rust --> confidence["Rust の具体的な挙動"]
@@ -72,11 +72,11 @@ test は、実際の関数を動かし、API の接続、error の内容、内�
 
 Lean theorem が `pathBelow` の性質を証明しても、Rust の `path_below` に同じ変更が入っているとは限らない。両言語で同じ入力を読み、結果を比較する差分テストがこの隙間を埋める。
 
-[`tests/fixtures/authority-core.tsv`](../../tests/fixtures/authority-core.tsv) は、判定種別、case 名、期待する `Bool`、判定に必要な入力を持つ versioned TSV である。現在は path、time、file、Capability の10種類の判定を101件で検査する。
+[`tests/fixtures/authority-core.tsv`](../../tests/fixtures/authority-core.tsv) は、判定種別、case 名、期待する `Bool`、判定に必要な入力を持つ versioned TSV である。現在は path、time、file、HTTP、GitHub、各 family の Capability を18種類の判定で147件検査する。
 
 Rust と Lean の runner は同じ fixture を別々に parse し、それぞれ production 判定を呼ぶ。各 runner は自分の結果が期待値と違えば失敗し、成功時だけ `case名<TAB>実結果` を出力する。[`scripts/check-authority-corpus.sh`](../../scripts/check-authority-corpus.sh) はその正規化出力も比較する。このため、両実装が同じ誤答を返した場合も、両出力が食い違った場合も検出できる。
 
-ただし差分テストは101件の具体例に対する回帰検査である。corpus にない任意の入力について Rust と Lean の一致を証明するものではない。
+ただし差分テストは147件の具体例に対する回帰検査である。corpus にない任意の入力について Rust と Lean の一致を証明するものではない。
 
 ## 「権限漏えいしない」と何を根拠に言えるのか
 
@@ -112,18 +112,20 @@ file body containment では、false allow を防ぐ `fileBodyBelow_sound` は�
 | [`path.rs`](../../crates/authority-core/src/path.rs) | 11 | valid/root path、child append、6種類の invalid segment、最初の error、tree relationship、rebase、Exact/Prefix matching、containment matrix、推移性 |
 | [`file.rs`](../../crates/authority-core/src/file.rs) | 5 | effect membership と duplicate、空/同値/拡大 subset、request matching の3軸、body containment の3軸、推移性 |
 | [`time.rs`](../../crates/authority-core/src/time.rs) | 4 | 正常/空/逆転区間、半開境界、時刻窓 subset、推移性 |
-| [`capability.rs`](../../crates/authority-core/src/capability.rs) | 5 | typed metadata、時刻付き matching、期間/file の縮小と拡大拒否、反射性、推移性 |
+| [`http.rs`](../../crates/authority-core/src/http.rs) | 7 | canonical host / URL path、method set、matching、containment の全軸 |
+| [`github.rs`](../../crates/authority-core/src/github.rs) | 7 | branch validation、operation set、matching、containment の全軸 |
+| [`capability.rs`](../../crates/authority-core/src/capability.rs) | 7 | typed metadata、時刻付き matching、同型 dispatch、cross-family deny、縮小と拡大拒否、推移性 |
 | [`state.rs`](../../crates/authority-core/src/state.rs) | 2 | `u64::MAX` の最後の Capability ID、authorization epoch の wraparound 拒否 |
 | [`handle.rs`](../../crates/authority-core/src/handle.rs) | 1 | typed handle / subject / object identity の保持 |
 | [`audit.rs`](../../crates/authority-core/src/audit.rs) | 2 | attempt outcome と effect filtering、Attempt ID exhaustion |
 | [`kernel.rs`](../../crates/authority-core/src/kernel.rs) | 1 | exclusive writer の panic 後に poisoned state を再利用せず fail closed にする |
 | [`authority-corpus.rs`](../../crates/authority-core/src/bin/authority-corpus.rs) | 7 | header/schema、未知の判定、必須 field、u64 上限、期待値不一致、case 名重複の拒否 |
-| [`capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 11 | 発行・Derive・revoke、atomicity、subject lifecycle、handle ID 非再利用 |
+| [`capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 12 | 発行・Derive・revoke、HTTP/GitHub lifecycle、atomicity、subject lifecycle、handle ID 非再利用 |
 | [`capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) | 1 | 1〜63操作の Derive/revoke 列を1,000 case 生成し、参照モデルと各 transition を比較 |
 | [`authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | 11 | synchronized API、active inspection、inspection中のrevoke待機、最終認可、lifecycle、handle、audit、祖先 revoke |
 | [`authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | 6 | direct / ancestor revokeの単一・compound effect、2 effects、audit consistency、negative control |
 
-Authority core packageではproduction moduleの32 test、corpus runnerの7 test、公開APIの状態遷移test 11件、authorization guardのcontract test 11件、property test 1件の合計62 testを実行する。capfs packageはmodule testとnamespace / node / preflight / 実mount integration testを合わせて107 testを実行する。現在のworkspace全体では合計169 testを`cargo test --workspace`で実行する。property testは内部で1,000本の操作列を生成する。これとは別に、runnerは共有fixtureの101件を実行時に評価する。
+Authority core packageではproduction moduleの48 test、corpus runnerの7 test、公開APIの状態遷移test 12件、authorization guardのcontract test 11件、property test 1件の合計79 testを実行する。capfs packageはmodule testとnamespace / node / preflight / 実mount integration testを合わせて107 testを実行する。現在のworkspace全体では合計186 testを`cargo test --workspace`で実行する。property testは内部で1,000本の操作列を生成する。これとは別に、runnerは共有fixtureの147件を実行時に評価する。
 
 loom の6件は `cfg(loom)` 専用なので、通常の `cargo test --workspace` では実行されない。専用コマンドでは production と同じ `CapabilityKernel` の同期 primitive を loom 版に差し替え、direct / ancestor revokeの単一・compound effectと、2 effects の bounded model を探索する。compound modelはexecutorの全段階実行または未実行、attempt / effectがrequest set全体を持つことまで確認する。negative control は意図どおり反例を発見して panic することを `#[should_panic]` で成功条件にしている。
 
@@ -134,7 +136,7 @@ loom の6件は `cfg(loom)` 専用なので、通常の `cargo test --workspace`
 - `u16` bitset が duplicate を無視し、期待どおり membership を返す。
 - Rust の enum variant と match 分岐が concrete boundary で正しく接続される。
 - `TimeWindow::new` が不正な端点を structured error として拒否する。
-- typed metadata の getter と file-only Capability envelope が実際の公開 API で接続される。
+- typed metadata の getter と全 tagged Capability envelope が実際の公開 API で接続される。
 - 失敗 transition が ID sequence や held/capability map を途中まで変更しない。
 - 別 subject にコピーした ID、revoke 済み祖先、静的 envelope 外の grant が拒否される。
 - subject shutdown、stale handle ID、audit outcome が実際の transition と一致する。
@@ -143,7 +145,7 @@ test helper の `path` は `CanonicalPath::new(...).expect(...)` を通し、fix
 
 ## `AuthorityTests.lean` は何を確認するか
 
-[`lean/AuthorityTests.lean`](../../lean/AuthorityTests.lean) は production theorem を置くファイルではない。Rust test と対応する値を作り、Lean の実行可能な `Bool` 判定を40個の `example` で評価する。
+[`lean/AuthorityTests.lean`](../../lean/AuthorityTests.lean) は production theorem を置くファイルではない。Rust test と対応する値を作り、Lean の実行可能な `Bool` 判定を48個の `example` で評価する。
 
 | 対象 | 具体的に確認する境界 |
 |---|---|
@@ -153,7 +155,9 @@ test helper の `path` は `CanonicalPath::new(...).expect(...)` を通し、fix
 | `fileMatches` | allow、effect 不一致、repository 不一致、path 不一致 |
 | `fileBodyBelow` | 反射、effect escalation、repository 不一致、path 拡大、具体的な推移 chain |
 | `TimeWindow` / `timeWindowBelow` | 正常/空/逆転区間、半開境界、期間拡大の拒否、具体的な推移 chain |
-| `capabilityMatches` / `weakerThan` | 時刻と body の積、反射、期間拡大の拒否、逆向き包含、具体的な多段委譲 |
+| `httpFetchMatches` / `httpFetchBodyBelow` | method / host / URL path / byte cap の matching と containment |
+| `gitHubMatches` / `gitHubBodyBelow` | installation / repository / operation / base/head branch の matching と containment |
+| `capabilityMatches` / `weakerThan` | 時刻と body の積、反射、期間拡大の拒否、逆向き包含、具体的な多段委譲、cross-family deny |
 
 多くの example は `by decide` で閉じる。Lean が命題を計算し、その結果が真である proof term を kernel が検査する。
 
@@ -167,11 +171,11 @@ Lean example が役立つ点は、定理だけでは見えにくい「この具�
 
 parser 自体についても6個の executable example があり、header 欠落、未知の判定種別、必須 field 欠落、`u64` を越える tick、期待値不一致、case 名重複を拒否する。Lean の `Nat` は `u64` より広いため、tick 上限を runner で明示的に揃えている。
 
-`lake test` は `AuthorityTests` を import したこの runner を test driver として構築し、標準の共有 fixture 101件を評価する。そのため、独立した40個の境界 example と、共通入力による両実装の比較を併用できる。
+`lake test` は `AuthorityTests` を import したこの runner を test driver として構築し、標準の共有 fixture 147件を評価する。そのため、独立した48個の境界 example と、共通入力による両実装の比較を併用できる。
 
 ## Production theorem は何を確認するか
 
-production theorem は [`lean/Authority/Path.lean`](../../lean/Authority/Path.lean)、[`lean/Authority/File.lean`](../../lean/Authority/File.lean)、[`lean/Authority/Time.lean`](../../lean/Authority/Time.lean)、[`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) に置く。
+production theorem は [`lean/Authority/Path.lean`](../../lean/Authority/Path.lean)、[`lean/Authority/File.lean`](../../lean/Authority/File.lean)、[`lean/Authority/Http.lean`](../../lean/Authority/Http.lean)、[`lean/Authority/GitHub.lean`](../../lean/Authority/GitHub.lean)、[`lean/Authority/Time.lean`](../../lean/Authority/Time.lean)、[`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) に置く。
 
 | 対象 | 証明する一般性質 | 実務上の意味 |
 |---|---|---|
@@ -181,9 +185,11 @@ production theorem は [`lean/Authority/Path.lean`](../../lean/Authority/Path.le
 | file matching | `fileMatches_iff_matches` | repository・effect・path の3条件と `Bool` が一致する |
 | file body containment | `refl`, `trans`, `sound` | 多段委譲でも child request は必ず root request の内側にある |
 | file body completeness | effect 非空条件付き `complete`, `iff` | 非空 child では本当の包含を誤拒否しない |
+| HTTP matching / containment | `httpFetchMatches_iff_matches`、`refl`、`trans`、`sound`、method 非空条件付き `complete` | method・host・path・response cap を拡大しない |
+| GitHub matching / containment | `gitHubMatches_iff_matches`、`refl`、`trans`、`sound`、operation 非空条件付き `complete` | installation・repository・operation・base/head を拡大しない |
 | time matching | `timeMatches_iff_contains` | 半開区間の membership と `Bool` が一致する |
 | time containment | `refl`, `trans`, `sound`, `complete`, `iff` | 多段でも期限を広げず、端点判定と時刻集合包含が一致する |
-| typed body matching / containment | matching `iff`、containment の `refl`, `trans`, `sound` | tagged body の分岐後も file semantics を保つ |
+| typed body matching / containment | matching `iff`、containment の `refl`, `trans`, `sound` | tagged body の同型分岐だけを許し、異型は拒否する |
 | Capability matching | `capabilityMatches_iff_matches` | 時刻と typed request の2条件が `Bool` と一致する |
 | Capability containment | `weakerThan_refl`, `trans`, `sound` | 多段でも root の全時刻付き request 集合を越えない |
 | Capability completeness | authority 非空条件付き `complete`, `iff` | 非空 child では本当の包含を誤拒否しない |
@@ -197,7 +203,7 @@ theorem を production 定義の隣に置くことで、判定を変更して証
 | Rust API の具体的挙動 | ✓ |  |  | ✓ | 確認済み |
 | Lean 判定の具体的挙動 |  | ✓ |  | ✓ | 確認済み |
 | Lean モデルの全入力での性質 |  |  | ✓ |  | 証明済み |
-| 共有した101入力で両言語が期待値どおりか |  |  |  | ✓ | 自動比較済み |
+| 共有した147入力で両言語が期待値どおりか |  |  |  | ✓ | 自動比較済み |
 | 生成した逐次操作列で state と参照モデルが一致するか | ✓ |  |  |  | 1,000 case 検査済み |
 | 全入力で Rust と Lean が同値か |  |  |  |  | 未証明 |
 | direct / ancestor revoke と 1 effect の全 bounded interleaving | ✓ |  |  |  | production model と negative control を loom で検査済み |
@@ -234,7 +240,7 @@ repository root から両実装の共通 corpus を比較する。
 scripts/check-authority-corpus.sh
 ```
 
-[`lean/lakefile.toml`](../../lean/lakefile.toml) は `authority_corpus` executable を `testDriver` に設定する。この executable は `AuthorityTests` を import するため、`lake check-test` では既存40個と parser 6個の executable example が一緒に型検査される。`lake test` はそれに加えて標準の共有 fixture 101件を実行する。
+[`lean/lakefile.toml`](../../lean/lakefile.toml) は `authority_corpus` executable を `testDriver` に設定する。この executable は `AuthorityTests` を import するため、`lake check-test` では48個と parser 6個の executable example が一緒に型検査される。`lake test` はそれに加えて標準の共有 fixture 147件を実行する。
 
 ## 現在の限界と次に埋めるもの
 
@@ -246,11 +252,12 @@ scripts/check-authority-corpus.sh
 - effect subset、file matching、file body containment の3軸。
 - 時刻窓の構築、半開 membership、端点 containment。
 - Capability matching と、期間・body を1軸ずつ壊した `weakerThan`。
+- HTTP の method / host / URL path / response cap と GitHub の installation / repository / operation / base/head branch。
 - positive case と、各条件を1つだけ壊した negative case。
 
 これにより、Lean theorem が証明するモデルと Rust 実装の間にある「同じ定義を実装しているはず」という確認の一部を、自動回帰 test にしている。
 
-残る限界は、corpus が有限であることと、schema v1 が現在の file-only authority だけを表すことである。File 以外の authority variant を追加するときは、両 runner と corpus を同じ変更で拡張する。互換性のない schema 変更では header の version も上げる。
+残る限界は、corpus が有限であることと、schema v1 が variant ごとの専用 row を追加する形で拡張されていることである。新しい authority variant を追加するときは、両 runner、typed dispatch、corpus、Lean theorem を同じ変更で拡張する。既存 row の field order を壊す変更では header の version を上げる。
 
 なお、共通corpus自体はrevokeを検証しない。逐次revokeと祖先失効はstateful test、単一・compound effectとdirect / ancestor revokeの同期境界はloomで検査している。現在のloom modelはopen handle、rename、unlink、複数revoke、4 thread以上を含まない。Direct-I/O filesystem adapterは実mountでread / write / truncate / metadata / readdir-after-revokeに加え、create / remove / renameとdirectory stream restartを検査する。変更系operationとrevokeを同時に競合させる統合・攻撃testは今後の境界である。
 

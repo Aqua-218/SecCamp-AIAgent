@@ -18,7 +18,9 @@
 | [Repository identity](authority-core/repository-identities.md) | `RepoId` の責務と exact equality 境界 |
 | [File authority](authority-core/file-authorities.md) | effect 集合、request、delegation 判定と証明 |
 | [有効期間](authority-core/validity-windows.md) | 単調時刻、半開区間、時刻窓の containment と証明 |
-| [Capability](authority-core/capabilities.md) | typed metadata、file-only envelope、時刻付き matching、`weakerThan` と証明 |
+| [Capability](authority-core/capabilities.md) | typed metadata、全 authority family の envelope、時刻付き matching、`weakerThan` と証明 |
+| [HTTP fetch authority](authority-core/http-fetch-authorities.md) | canonical host / URL path、GET / HEAD、応答上限、委譲と Broker の責務境界 |
+| [GitHub authority](authority-core/github-authorities.md) | installation / repository、閉じた操作、base/head branch、委譲と Broker の責務境界 |
 | [Capability state](authority-core/capability-state.md) | subject、静的 envelope、発行、保持、逐次 Derive、revoke と祖先失効 |
 | [Authorization guard](authority-core/authorization-guard.md) | effect commit と revoke の線形化、executor 契約、loom の positive / negative control |
 | [Subject lifecycle と open handle](authority-core/subject-lifecycle-and-handles.md) | shutdown、`auth_epoch`、handle の subject/object binding と ID 非再利用 |

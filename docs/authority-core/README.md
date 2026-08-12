@@ -8,7 +8,7 @@
 
 ## 現在証明している範囲
 
-現在の中心は、file Capability の子が親より強くならないことを確認する純粋な判定である。
+現在の中心は、file、公開 HTTP fetch、閉じた GitHub 操作の Capability が、委譲されても親より強くならないことを確認する純粋な判定である。
 
 ```text
 子の有効期間 ⊆ 親の有効期間
@@ -31,6 +31,8 @@ flowchart LR
         rustRepo["repository.rs<br/>repository identity"]
         rustPath["path.rs<br/>canonical path / path decision"]
         rustFile["file.rs<br/>file request / body decision"]
+        rustHttp["http.rs<br/>public fetch request / body decision"]
+        rustGitHub["github.rs<br/>GitHub request / body decision"]
         rustTime["time.rs<br/>validity window"]
         rustCap["capability.rs<br/>envelope / weaker_than"]
         rustHandle["handle.rs<br/>handle / object identity"]
@@ -40,6 +42,8 @@ flowchart LR
         rustRepo -->|"exact identity"| rustFile
         rustPath -->|"path decisions"| rustFile
         rustFile -->|"typed file body"| rustCap
+        rustHttp -->|"typed HTTP body"| rustCap
+        rustGitHub -->|"typed GitHub body"| rustCap
         rustTime -->|"validity"| rustCap
         rustCap -->|"checked grants"| rustState
         rustHandle -->|"live handles"| rustState
@@ -51,18 +55,22 @@ flowchart LR
         leanRepo["Repository.lean<br/>identity model"]
         leanPath["Path.lean<br/>path semantics / proofs"]
         leanFile["File.lean<br/>file semantics / proofs"]
+        leanHttp["Http.lean<br/>HTTP semantics / proofs"]
+        leanGitHub["GitHub.lean<br/>GitHub semantics / proofs"]
         leanTime["Time.lean<br/>interval semantics / proofs"]
         leanCap["Capability.lean<br/>envelope semantics / proofs"]
         leanTests["AuthorityTests.lean<br/>boundary examples"]
         leanRepo -->|"repository equality"| leanFile
         leanPath -->|"path containment"| leanFile
         leanFile -->|"typed file body"| leanCap
+        leanHttp -->|"typed HTTP body"| leanCap
+        leanGitHub -->|"typed GitHub body"| leanCap
         leanTime -->|"validity containment"| leanCap
         leanCap -->|"examples"| leanTests
     end
 
     subgraph differential["共有 fixture による差分テスト"]
-        corpus["authority-core.tsv<br/>101 oracle cases"]
+        corpus["authority-core.tsv<br/>147 oracle cases"]
         rustRunner["Rust corpus runner"]
         leanRunner["Lean corpus runner"]
         compare["normalized output diff"]
@@ -75,6 +83,8 @@ flowchart LR
     rustRepo -.->|"same concept"| leanRepo
     rustPath -.->|"same decisions"| leanPath
     rustFile -.->|"same decisions"| leanFile
+    rustHttp -.->|"same decisions"| leanHttp
+    rustGitHub -.->|"same decisions"| leanGitHub
     rustTime -.->|"same decisions"| leanTime
     rustCap -.->|"same decisions"| leanCap
     rustCap --> rustRunner
@@ -95,7 +105,11 @@ Rust は実際の認可経路から呼ぶ純粋な `bool` 判定を担当する�
 | [`lean/Authority/File.lean`](../../lean/Authority/File.lean) | file authority の意味論、実行可能判定、包含定理 | [File authority](file-authorities.md) |
 | [`crates/authority-core/src/time.rs`](../../crates/authority-core/src/time.rs) | session-local monotonic time、有効な半開区間、membership と containment | [有効期間](validity-windows.md) |
 | [`lean/Authority/Time.lean`](../../lean/Authority/Time.lean) | 時刻窓の集合意味論、端点判定の健全性・完全性・推移性 | [有効期間](validity-windows.md) |
-| [`crates/authority-core/src/capability.rs`](../../crates/authority-core/src/capability.rs) | typed ID、metadata、file-only tagged body、時刻付き matching、`weaker_than`、複合effect用の非空 request set | [Capability](capabilities.md) / [Authorization guard](authorization-guard.md) |
+| [`crates/authority-core/src/http.rs`](../../crates/authority-core/src/http.rs) | canonical host / URL path、GET / HEAD、response cap、matching と containment | [HTTP fetch authority](http-fetch-authorities.md) |
+| [`lean/Authority/Http.lean`](../../lean/Authority/Http.lean) | HTTP request 集合の意味論、matching / containment の健全性・完全性・推移性 | [HTTP fetch authority](http-fetch-authorities.md) |
+| [`crates/authority-core/src/github.rs`](../../crates/authority-core/src/github.rs) | installation / repository、閉じた GitHub 操作、branch pattern、matching と containment | [GitHub authority](github-authorities.md) |
+| [`lean/Authority/GitHub.lean`](../../lean/Authority/GitHub.lean) | GitHub request 集合の意味論、matching / containment の健全性・完全性・推移性 | [GitHub authority](github-authorities.md) |
+| [`crates/authority-core/src/capability.rs`](../../crates/authority-core/src/capability.rs) | typed ID、metadata、3種の tagged body、時刻付き matching、`weaker_than`、複合effect用の非空 request set | [Capability](capabilities.md) / [Authorization guard](authorization-guard.md) |
 | [`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) | Capability の集合意味論、matching 同値、`weakerThan` の健全性・完全性・推移性 | [Capability](capabilities.md) |
 | [`crates/authority-core/src/state.rs`](../../crates/authority-core/src/state.rs) | subject 登録、静的 envelope、root 発行、保持、逐次 Derive、revoke、epoch、lifecycle、handle registry | [Capability state](capability-state.md) / [Subject lifecycle と open handle](subject-lifecycle-and-handles.md) |
 | [`crates/authority-core/tests/capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 状態遷移の成功・拒否条件と失敗時の atomicity | [Capability state](capability-state.md) |
@@ -138,11 +152,11 @@ flowchart LR
 
 ## 現在の実装境界
 
-実装済みなのは repository identity、repository-relative path、file effect と request、file authority body、単調時刻の有効期間、typed metadata と file-only Capability、matching、`weakerThan` である。Rust 側にはさらに、subject と静的 envelope の登録、root 発行、保持、逐次 Derive、revoke、祖先失効、`auth_epoch`、subject lifecycle、open-handle registry、attempt/effect audit と、effect commit を revoke と線形化する `CapabilityKernel` がある。
+実装済みなのは repository identity、repository-relative path、file effect と request、public HTTP fetch、閉じた GitHub operation、単調時刻の有効期間、typed metadata と3種の Capability、matching、`weakerThan` である。Rust 側にはさらに、subject と静的 envelope の登録、root 発行、保持、逐次 Derive、revoke、祖先失効、`auth_epoch`、subject lifecycle、open-handle registry、attempt/effect audit と、effect commit を revoke と線形化する `CapabilityKernel` がある。
 
 未実装なのは、File以外のauthority variant、durable audit backend、supervisor / Broker adapterである。Direct-I/O [`capfs` adapter](../capfs/read-only-fuse.md)はglobal namespace registry、Authority handle registry、実backing syscallを接続し、全10 `FileEffect`をFUSEへ対応付けている。実mountではread / write / truncate / metadata / readdir-after-revoke、create / remove / rename transaction、directory stream mutation後のrestartを検査している。全thread scheduleのrename / write競合と、隔離基盤を含むend-to-end検証は別の境界である。
 
-現在の file-only slice には、101件の共通 corpus を両言語の production 判定へ流す自動差分テストがある。各runnerは全10 `FileEffect`のmatching / containmentを含む期待値を個別に検査し、その後に出力同士も比較する。ただしこれは選んだ具体例についての回帰検査であり、Rust と Lean が全入力で等しいという証明ではない。
+147件の共通 corpus を両言語の production 判定へ流す自動差分テストがある。全10 `FileEffect`に加え、HTTP のmethod / host / path / response cap、GitHub のinstallation / repository / operation / base / head を個別に壊す境界を検査し、その後に出力同士も比較する。ただしこれは選んだ具体例についての回帰検査であり、Rust と Lean が全入力で等しいという証明ではない。
 
 ## 関連
 

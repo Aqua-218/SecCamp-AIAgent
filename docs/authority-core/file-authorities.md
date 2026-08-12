@@ -288,7 +288,7 @@ repository equality と path containment を同じ body 判定に含めるため
 
 ## 正確な保証範囲
 
-このページの証明対象は file authority **body** の repository、effect、path と、1件の `FileRequest` である。これを有効期間や metadata と組み合わせた file-only Capability は[Capability envelope と委譲証明](capabilities.md)で別に扱う。
+このページの証明対象は file authority **body** の repository、effect、path と、1件の `FileRequest` である。これを有効期間や metadata と組み合わせた Capability は[Capability envelope と委譲証明](capabilities.md)で別に扱う。
 
 次はこの file body の定理には含まれない。Capability ID の採番、subject binding、親 ID と `delegable`、逐次 revoke は Rust の[Capability state](capability-state.md)で実装・テストするが、この Lean 定理の証明対象ではない。
 

@@ -32,7 +32,7 @@ Rust で typed Capability、正規化型、`Matches`、`PathBelow`、`WeakerThan
 
 **完了条件:** repository、host、path、time、response size の境界値まで Rust と Lean が一致する。
 
-現在は file-only slice として repository、path、file effect、time、typed Capability、`Matches`、`WeakerThan` の Rust/Lean 実装、Lean の包含証明、101件の共通 corpus による自動差分テストまで完了している。host/response size を持つ authority variant と、それらに対応する corpus case は未実装である。
+repository、path、file effect、time、typed Capability、`Matches`、`WeakerThan` の Rust/Lean 実装は完了している。さらに public HTTP fetch（canonical host、GET/HEAD、URL path、response size）と閉じた GitHub operation（installation、repository、operation、base/head branch）を tagged authority として追加し、Lean の matching / containment proof、147件の共通 corpus、state lifecycle test まで接続した。Host Egress Broker で URL parser・DNS・redirect・実 response streaming と GitHub API request を強制する部分は phase 5 の対象である。
 
 ## 2. 状態機械
 

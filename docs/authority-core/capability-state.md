@@ -175,7 +175,7 @@ leaf ≤ root
 - global namespace registry、実 fd、cgroup、mount を片付ける supervisor / capfs orchestration。
 - audit record の永続化と耐改ざん性。
 - supervisor の socket fd から caller identity を決める adapter。
-- File 以外の authority variant。
+- HTTP redirect / DNS / response streaming と GitHub API call を実際に強制する Broker adapter。
 
 `CapabilityKernel` は executor closure と revoke の順序を線形化する。ただし closure が実際の filesystem や外部 effect の正しい線形化点まで進んでから return する責任は adapter 側にあり、現在は実 mount や Broker との end-to-end 検証まではない。
 

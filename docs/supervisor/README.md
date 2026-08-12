@@ -8,6 +8,17 @@
 
 `supervisor` は、認証済み local connection、既存の `authority-core` kernel、OS runtime resource の間に置くホスト側 lifecycle adapter である。namespace、cgroup、mount、descriptor syscall 自体は実装せず、`RuntimeResources` が提供する token と操作へ委譲する。
 
+## 文書一覧
+
+| 節 | 対象ソース | 内容 |
+|---|---|---|
+| [identity 境界](#identity-境界) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | connection identity から subject を解決する。wire 上の claim を認可に使わない |
+| [wire protocol](#wire-protocol) | [`protocol.rs`](../../crates/supervisor/src/protocol.rs) | 4 KiB の bounded envelope、閉じた tag 集合 |
+| [lifecycle](#lifecycle) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | subject setup の transaction と単調な shutdown |
+| [Authority と handle の境界](#authority-と-handle-の境界) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | Authority Core への委譲、runtime handle の open と close |
+
+`supervisor.rs` は 1,323 行ある。上の 4 節はその要約で、独立した概念ページと契約ページに分ける予定。
+
 ## identity 境界
 
 transport は受理済み socket identity と peer credential を持つ `ConnectionIdentity` を渡す。`CallerResolver` はその identity を host が割り当てた `authority_core::capability::SubjectId` へ写像する。wire request に含まれる `claimed_subject` は診断用に保持できるが、`Supervisor::dispatch_wire` は認可に使わない。production caller resolver は、request bytes を decode する前に `SOCK_SEQPACKET` または同等の認証済み connection へ subject binding を確定させる必要がある。

@@ -2203,6 +2203,21 @@ pub struct Runtime<C, F, A, G, I> {
     api_client: A,
     guest_client: G,
     identity_source: I,
+    pending_cleanup: Option<PendingCleanup>,
+}
+
+#[derive(Debug)]
+struct PendingCleanup {
+    process: Option<ProcessHandle>,
+    verity_opened: bool,
+    workspace: Option<PathBuf>,
+    mapper_name: String,
+}
+
+impl PendingCleanup {
+    fn is_complete(&self) -> bool {
+        self.process.is_none() && !self.verity_opened && self.workspace.is_none()
+    }
 }
 
 impl<C, F, A, G, I> Runtime<C, F, A, G, I>
@@ -2227,6 +2242,49 @@ where
             api_client,
             guest_client,
             identity_source,
+            pending_cleanup: None,
+        }
+    }
+
+    /// Returns whether cleanup from a failed launch or restore remains pending.
+    #[must_use]
+    pub const fn has_pending_cleanup(&self) -> bool {
+        self.pending_cleanup.is_some()
+    }
+
+    /// Retries cleanup retained after a failed launch or restore.
+    ///
+    /// Cleanup is dependency ordered: a live process prevents dm-verity closure and
+    /// an open dm-verity mapping prevents workspace removal. Successfully completed
+    /// stages are not repeated on subsequent calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Cleanup`] when the first still-pending cleanup stage
+    /// fails. The remaining state is retained for another retry.
+    pub fn retry_pending_cleanup(&mut self) -> Result<(), RuntimeError> {
+        let Some(mut pending) = self.pending_cleanup.take() else {
+            return Ok(());
+        };
+        let failures = self.cleanup_pending(&mut pending);
+        if !pending.is_complete() {
+            self.pending_cleanup = Some(pending);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Cleanup(failures.join("; ")))
+        }
+    }
+
+    fn ensure_no_pending_cleanup(&self) -> Result<(), RuntimeError> {
+        if self.pending_cleanup.is_some() {
+            Err(RuntimeError::InvalidState {
+                expected: "failed launch cleanup to complete".to_owned(),
+                actual: "cleanup pending".to_owned(),
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -2235,8 +2293,10 @@ where
     /// # Errors
     ///
     /// Returns a validation, artifact, adapter, API, or rollback error when any
-    /// launch precondition or lifecycle step fails.
+    /// launch precondition or lifecycle step fails. When rollback also fails,
+    /// [`Self::retry_pending_cleanup`] can retry the retained cleanup state.
     pub fn launch(&mut self, config: &RuntimeConfig) -> Result<RuntimeInstance, RuntimeError> {
+        self.ensure_no_pending_cleanup()?;
         config.validate()?;
         self.verify_artifacts(config)?;
         let workspace = config.workspace.clone_path();
@@ -2244,11 +2304,8 @@ where
             .filesystem
             .clone_workspace(&config.workspace.source, &workspace)
         {
-            let cleanup = self
-                .filesystem
-                .remove_workspace(&workspace)
-                .err()
-                .map_or_else(Vec::new, |cleanup_error| vec![cleanup_error.to_string()]);
+            let cleanup =
+                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
             return Err(with_cleanup(error, &cleanup));
         }
         let workspace_cloned = true;
@@ -2281,8 +2338,13 @@ where
         match result {
             Ok(instance) => Ok(instance),
             Err(error) => {
-                let cleanup =
-                    self.rollback(process, verity_opened, workspace_cloned, &workspace, config);
+                let cleanup = self.rollback(
+                    process,
+                    verity_opened,
+                    workspace_cloned,
+                    &workspace,
+                    &config.dm_verity.mapper_name,
+                );
                 Err(with_cleanup(error, &cleanup))
             }
         }
@@ -2351,6 +2413,7 @@ where
         config: &RuntimeConfig,
         snapshot: &Snapshot,
     ) -> Result<RuntimeInstance, RuntimeError> {
+        self.ensure_no_pending_cleanup()?;
         config.validate()?;
         if config.fingerprint() != snapshot.artifact_fingerprint {
             return Err(RuntimeError::StaleSnapshot(
@@ -2365,11 +2428,8 @@ where
             .filesystem
             .clone_workspace(&config.workspace.source, &workspace)
         {
-            let cleanup = self
-                .filesystem
-                .remove_workspace(&workspace)
-                .err()
-                .map_or_else(Vec::new, |cleanup_error| vec![cleanup_error.to_string()]);
+            let cleanup =
+                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
             return Err(with_cleanup(error, &cleanup));
         }
         let workspace_cloned = true;
@@ -2406,8 +2466,13 @@ where
         match result {
             Ok(instance) => Ok(instance),
             Err(error) => {
-                let cleanup =
-                    self.rollback(process, verity_opened, workspace_cloned, &workspace, config);
+                let cleanup = self.rollback(
+                    process,
+                    verity_opened,
+                    workspace_cloned,
+                    &workspace,
+                    &config.dm_verity.mapper_name,
+                );
                 Err(with_cleanup(error, &cleanup))
             }
         }
@@ -2449,6 +2514,7 @@ where
         snapshot: &Snapshot,
         identities: IdentityBundle,
     ) -> Result<RuntimeInstance, RuntimeError> {
+        self.ensure_no_pending_cleanup()?;
         config.validate()?;
         if config.fingerprint() != snapshot.artifact_fingerprint {
             return Err(RuntimeError::StaleSnapshot(
@@ -2463,11 +2529,8 @@ where
             .filesystem
             .clone_workspace(&config.workspace.source, &workspace)
         {
-            let cleanup = self
-                .filesystem
-                .remove_workspace(&workspace)
-                .err()
-                .map_or_else(Vec::new, |cleanup_error| vec![cleanup_error.to_string()]);
+            let cleanup =
+                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
             return Err(with_cleanup(error, &cleanup));
         }
         let workspace_cloned = true;
@@ -2502,8 +2565,13 @@ where
         match result {
             Ok(instance) => Ok(instance),
             Err(error) => {
-                let cleanup =
-                    self.rollback(process, verity_opened, workspace_cloned, &workspace, config);
+                let cleanup = self.rollback(
+                    process,
+                    verity_opened,
+                    workspace_cloned,
+                    &workspace,
+                    &config.dm_verity.mapper_name,
+                );
                 Err(with_cleanup(error, &cleanup))
             }
         }
@@ -2569,7 +2637,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::InvalidState`] for an already stopped instance or
+    /// Returns [`RuntimeError::InvalidConfig`] when the cleanup-owning fields do not
+    /// match the instance, [`RuntimeError::InvalidState`] for a non-live instance, or
     /// [`RuntimeError::Cleanup`] when one or more shutdown actions fail.
     pub fn shutdown(
         &mut self,
@@ -2578,6 +2647,14 @@ where
     ) -> Result<(), RuntimeError> {
         if instance.state == RuntimeState::Stopped {
             return Ok(());
+        }
+        if config.fingerprint() != instance.config_fingerprint
+            || config.dm_verity.mapper_name != instance.mapper_name
+            || config.workspace.clone_path() != instance.workspace
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "shutdown config does not match the runtime instance".to_owned(),
+            ));
         }
         if instance.state == RuntimeState::New {
             return Err(RuntimeError::InvalidState {
@@ -2593,7 +2670,7 @@ where
             }
         }
         if instance.process_stopped && instance.verity_opened {
-            match self.close_verity(config) {
+            match self.close_verity_mapper(&instance.mapper_name) {
                 Ok(()) => instance.verity_opened = false,
                 Err(error) => failures.push(error.to_string()),
             }
@@ -2649,11 +2726,8 @@ where
         self.command_runner.run(&command).map(|_| ())
     }
 
-    fn close_verity(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
-        let command = CommandSpec::new(
-            "veritysetup",
-            ["close".to_owned(), config.dm_verity.mapper_name.clone()],
-        );
+    fn close_verity_mapper(&mut self, mapper_name: &str) -> Result<(), RuntimeError> {
+        let command = CommandSpec::new("veritysetup", ["close".to_owned(), mapper_name.to_owned()]);
         self.command_runner.run(&command).map(|_| ())
     }
 
@@ -2759,21 +2833,42 @@ where
         verity_opened: bool,
         workspace_cloned: bool,
         workspace: &Path,
-        config: &RuntimeConfig,
+        mapper_name: &str,
     ) -> Vec<String> {
-        let mut failures = Vec::new();
-        if let Some(process) = process
-            && let Err(error) = self.command_runner.stop(process)
-        {
-            failures.push(error.to_string());
-        }
-        if verity_opened && let Err(error) = self.close_verity(config) {
-            failures.push(error.to_string());
-        }
-        if workspace_cloned && let Err(error) = self.filesystem.remove_workspace(workspace) {
-            failures.push(error.to_string());
+        debug_assert!(self.pending_cleanup.is_none());
+        let mut pending = PendingCleanup {
+            process,
+            verity_opened,
+            workspace: workspace_cloned.then(|| workspace.to_path_buf()),
+            mapper_name: mapper_name.to_owned(),
+        };
+        let failures = self.cleanup_pending(&mut pending);
+        if !pending.is_complete() {
+            self.pending_cleanup = Some(pending);
         }
         failures
+    }
+
+    fn cleanup_pending(&mut self, pending: &mut PendingCleanup) -> Vec<String> {
+        if let Some(process) = pending.process {
+            match self.command_runner.stop(process) {
+                Ok(()) => pending.process = None,
+                Err(error) => return vec![error.to_string()],
+            }
+        }
+        if pending.verity_opened {
+            match self.close_verity_mapper(&pending.mapper_name) {
+                Ok(()) => pending.verity_opened = false,
+                Err(error) => return vec![error.to_string()],
+            }
+        }
+        if let Some(workspace) = pending.workspace.as_deref() {
+            match self.filesystem.remove_workspace(workspace) {
+                Ok(()) => pending.workspace = None,
+                Err(error) => return vec![error.to_string()],
+            }
+        }
+        Vec::new()
     }
 }
 
@@ -2966,7 +3061,112 @@ impl Error for RuntimeError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Sha256Digest, sha256};
+    use std::collections::VecDeque;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct CleanupRunner {
+        events: Vec<String>,
+        stop_failures: VecDeque<bool>,
+        close_failures: VecDeque<bool>,
+    }
+
+    impl CommandRunner for CleanupRunner {
+        fn run(&mut self, command: &CommandSpec) -> Result<CommandOutput, RuntimeError> {
+            self.events.push(format!(
+                "run:{} {}",
+                command.program.display(),
+                command.args.join(" ")
+            ));
+            if self.close_failures.pop_front().unwrap_or(false) {
+                Err(RuntimeError::Command("close failed".to_owned()))
+            } else {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+
+        fn start(&mut self, _command: &CommandSpec) -> Result<ProcessHandle, RuntimeError> {
+            Err(RuntimeError::Command("unexpected start".to_owned()))
+        }
+
+        fn stop(&mut self, process: ProcessHandle) -> Result<(), RuntimeError> {
+            self.events.push(format!("stop:{}", process.pid));
+            if self.stop_failures.pop_front().unwrap_or(false) {
+                Err(RuntimeError::Command("stop failed".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct CleanupFileSystem {
+        events: Vec<String>,
+        remove_failures: VecDeque<bool>,
+    }
+
+    impl FileSystem for CleanupFileSystem {
+        fn read(&mut self, _path: &Path) -> Result<Vec<u8>, RuntimeError> {
+            Err(RuntimeError::Io("unexpected read".to_owned()))
+        }
+
+        fn clone_workspace(
+            &mut self,
+            _source: &Path,
+            _destination: &Path,
+        ) -> Result<(), RuntimeError> {
+            Err(RuntimeError::Io("unexpected clone".to_owned()))
+        }
+
+        fn remove_workspace(&mut self, path: &Path) -> Result<(), RuntimeError> {
+            self.events.push(format!("remove:{}", path.display()));
+            if self.remove_failures.pop_front().unwrap_or(false) {
+                Err(RuntimeError::Io("remove failed".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct UnusedApi;
+
+    impl ApiClient for UnusedApi {
+        fn request(&mut self, _request: &ApiRequest) -> Result<ApiResponse, RuntimeError> {
+            Err(RuntimeError::Api("unexpected request".to_owned()))
+        }
+    }
+
+    struct UnusedIdentitySource;
+
+    impl IdentitySource for UnusedIdentitySource {
+        fn generate(&mut self) -> Result<IdentityId, RuntimeError> {
+            Err(RuntimeError::InvalidIdentity(
+                "unexpected generation".to_owned(),
+            ))
+        }
+    }
+
+    fn cleanup_runtime(
+        stop_failures: impl IntoIterator<Item = bool>,
+        close_failures: impl IntoIterator<Item = bool>,
+    ) -> Runtime<CleanupRunner, CleanupFileSystem, UnusedApi, UnusedApi, UnusedIdentitySource> {
+        Runtime::new(
+            CleanupRunner {
+                events: Vec::new(),
+                stop_failures: stop_failures.into_iter().collect(),
+                close_failures: close_failures.into_iter().collect(),
+            },
+            CleanupFileSystem::default(),
+            UnusedApi,
+            UnusedApi,
+            UnusedIdentitySource,
+        )
+    }
 
     #[test]
     fn sha256_matches_nist_empty_vector() {
@@ -2995,5 +3195,66 @@ mod tests {
             digest.to_hex(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn pending_cleanup_keeps_verity_and_workspace_when_process_stop_fails() {
+        let mut runtime = cleanup_runtime([true, false], std::iter::empty());
+
+        let failures = runtime.rollback(
+            Some(ProcessHandle { pid: 42 }),
+            true,
+            true,
+            Path::new("/workspace/session"),
+            "session-root",
+        );
+        assert!(failures[0].contains("stop failed"));
+        assert_eq!(runtime.command_runner.events, ["stop:42"]);
+        assert!(runtime.filesystem.events.is_empty());
+        assert!(runtime.has_pending_cleanup());
+
+        runtime
+            .retry_pending_cleanup()
+            .expect("retained cleanup must be retryable");
+        assert_eq!(
+            runtime.command_runner.events,
+            ["stop:42", "stop:42", "run:veritysetup close session-root"]
+        );
+        assert_eq!(runtime.filesystem.events, ["remove:/workspace/session"]);
+        assert!(!runtime.has_pending_cleanup());
+    }
+
+    #[test]
+    fn pending_cleanup_keeps_workspace_when_verity_close_fails() {
+        let mut runtime = cleanup_runtime(std::iter::empty(), [true, false]);
+
+        let failures = runtime.rollback(
+            Some(ProcessHandle { pid: 42 }),
+            true,
+            true,
+            Path::new("/workspace/session"),
+            "session-root",
+        );
+        assert!(failures[0].contains("close failed"));
+        assert_eq!(
+            runtime.command_runner.events,
+            ["stop:42", "run:veritysetup close session-root"]
+        );
+        assert!(runtime.filesystem.events.is_empty());
+        assert!(runtime.has_pending_cleanup());
+
+        runtime
+            .retry_pending_cleanup()
+            .expect("retained cleanup must be retryable");
+        assert_eq!(
+            runtime.command_runner.events,
+            [
+                "stop:42",
+                "run:veritysetup close session-root",
+                "run:veritysetup close session-root"
+            ]
+        );
+        assert_eq!(runtime.filesystem.events, ["remove:/workspace/session"]);
+        assert!(!runtime.has_pending_cleanup());
     }
 }

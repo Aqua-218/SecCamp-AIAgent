@@ -881,8 +881,9 @@ def MayCloseHandle (state : CapabilityState) (caller : SubjectId)
 
 /-- Successful idempotent calls that deliberately leave the state unchanged. -/
 inductive MaySucceedWithoutChange (state : CapabilityState) : Prop
-  | revokeAlready {capabilityId : CapId} :
-      state.WasIssued capabilityId → state.revoked capabilityId = true →
+  | revokeAlready {caller : SubjectId} {capabilityId : CapId} :
+      state.WasIssued capabilityId → state.HeldBy caller capabilityId →
+      state.revoked capabilityId = true →
       MaySucceedWithoutChange state
   | beginCloseAlreadyClosing {subject : SubjectId} :
       state.subjectStatuses subject = some .closing → MaySucceedWithoutChange state
@@ -920,8 +921,9 @@ inductive Step : CapabilityState → CapabilityState → Prop
         allowed.allocation.selectedSequence)
   | allocatorExhausted {state : CapabilityState} :
       MayExhaustAllocator state → Step state state.exhaustAllocator
-  | revoke {state : CapabilityState} {capabilityId : CapId} :
-      state.WasIssued capabilityId → state.revoked capabilityId = false →
+  | revoke {state : CapabilityState} {caller : SubjectId} {capabilityId : CapId} :
+      state.WasIssued capabilityId → state.HeldBy caller capabilityId →
+      state.revoked capabilityId = false →
       CanIncrementU64 state.authorizationEpoch →
       Step state (state.revoke capabilityId)
   | beginClose {state : CapabilityState} {subject : SubjectId} :
@@ -1610,7 +1612,7 @@ theorem Step.preserves_structuralWellFormed {before after : CapabilityState}
         graphWellFormed := wellFormed.graphWellFormed
         countersRepresentable := ⟨wellFormed.countersRepresentable.1,
           by simp [exhaustAllocator, FitsU64]⟩ }
-  | revoke issued _ canIncrement =>
+  | revoke issued _ _ canIncrement =>
       exact revoke_preserves_structuralWellFormed wellFormed issued canIncrement
   | beginClose running canIncrement =>
       exact beginSubjectClose_preserves_structuralWellFormed wellFormed running canIncrement
@@ -1629,7 +1631,7 @@ theorem Step.preserves_countersRepresentable {before after : CapabilityState}
     (representable : before.CountersRepresentable) :
     after.CountersRepresentable := by
   cases transition with
-  | revoke _ _ canIncrement => exact ⟨canIncrement.increment_fits, representable.2⟩
+  | revoke _ _ _ canIncrement => exact ⟨canIncrement.increment_fits, representable.2⟩
   | beginClose _ canIncrement => exact ⟨canIncrement.increment_fits, representable.2⟩
   | issueAllocatedRoot allowed =>
       exact ⟨representable.1,
@@ -1685,7 +1687,7 @@ theorem Step.capability_records_persist {before after : CapabilityState}
         contradiction
       simpa [allocateDerived, issue, replace, differentIds] using lookupBefore
   | allocatorExhausted _ => exact lookupBefore
-  | revoke _ _ => exact lookupBefore
+  | revoke _ _ _ => exact lookupBefore
   | beginClose _ => exact lookupBefore
   | finishClose _ _ => exact lookupBefore
   | registerHandle _ _ => exact lookupBefore
@@ -1736,7 +1738,7 @@ theorem Step.handle_identity_persists {before after : CapabilityState}
   | issueAllocatedRoot _ => exact ownerBefore
   | derive _ => exact ownerBefore
   | allocatorExhausted _ => exact ownerBefore
-  | revoke _ _ => exact ownerBefore
+  | revoke _ _ _ => exact ownerBefore
   | beginClose _ => exact ownerBefore
   | finishClose _ _ => exact ownerBefore
   | registerHandle _ fresh =>

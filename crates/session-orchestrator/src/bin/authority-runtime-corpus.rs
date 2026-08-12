@@ -2,6 +2,7 @@
 
 use std::{
     collections::VecDeque,
+    convert::Infallible,
     env, fs,
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
@@ -11,9 +12,11 @@ use std::{
 };
 
 use authority_core::{
-    capability::{AuthorityBody, CapId, IssuerId, SubjectId},
-    file::{FileAuthority, FileEffect, FileEffects},
-    kernel::{CapabilityKernel, CapabilityKernelError},
+    audit::{AttemptId, AttemptOutcome},
+    capability::{AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId},
+    durable_audit::{DurableAuditLog, DurableAuditView},
+    file::{FileAuthority, FileEffect, FileEffects, FileRequest},
+    kernel::{CapabilityKernel, CapabilityKernelError, EffectCommitError, EffectExecution},
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     state::{
@@ -47,6 +50,7 @@ use session_orchestrator::{
 
 const CORPUS_HEADER: &str = "# authority-runtime-corpus-v1";
 const RESPONSE_CAP: u64 = 1_100_000;
+const AUTHORITY_OBSERVATION_TIME: MonotonicTime = MonotonicTime::from_ticks(1);
 
 fn checked<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> Result<T, String> {
     result.map_err(|error| format!("{context}: {error}"))
@@ -61,7 +65,30 @@ fn hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn authority_rows() -> Result<Vec<String>, String> {
+fn active_flag(
+    kernel: &CapabilityKernel,
+    caller: &SubjectId,
+    capability: &CapId,
+) -> Result<u8, String> {
+    match kernel.with_active_capability(caller, capability, AUTHORITY_OBSERVATION_TIME, |_| {
+        Ok::<_, Infallible>(())
+    }) {
+        Ok(()) => Ok(1),
+        Err(authority_core::kernel::CapabilityInspectionError::NotActive) => Ok(0),
+        Err(error) => Err(format!("inspect authority snapshot: {error}")),
+    }
+}
+
+struct AuthorityFixture {
+    audit: TemporaryWal,
+    kernel: CapabilityKernel,
+    subject: SubjectId,
+    foreign: SubjectId,
+    capability: CapId,
+}
+
+fn authority_fixture() -> Result<AuthorityFixture, String> {
+    let audit = TemporaryWal::new("authority-audit")?;
     let subject = SubjectId::new("runtime-subject");
     let foreign = SubjectId::new("foreign-subject");
     let capability = CapId::new("runtime-capability");
@@ -74,7 +101,17 @@ fn authority_rows() -> Result<Vec<String>, String> {
         FileEffects::only(FileEffect::ReadData),
         PathPattern::Prefix(CanonicalPath::root()),
     ));
-    let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("runtime-corpus")));
+    let durable_audit = checked(
+        DurableAuditLog::create(&audit.path),
+        "create authority durable audit",
+    )?;
+    let kernel = checked(
+        CapabilityKernel::try_new_with_durable_audit(
+            CapabilityState::new(IssuerId::new("runtime-corpus")),
+            durable_audit,
+        ),
+        "attach authority durable audit",
+    )?;
     checked(
         kernel.register_subject(Subject::new(
             subject.clone(),
@@ -89,19 +126,164 @@ fn authority_rows() -> Result<Vec<String>, String> {
         ),
         "issue runtime corpus capability",
     )?;
+    Ok(AuthorityFixture {
+        audit,
+        kernel,
+        subject,
+        foreign,
+        capability,
+    })
+}
 
-    let before_foreign = checked(kernel.authorization_epoch(), "read pre-revoke epoch")?.as_u64();
-    let foreign_outcome = match kernel.revoke_held_by(&foreign, &capability) {
+struct AuthorityCheckpoint {
+    row: String,
+    epoch: u64,
+    active: u8,
+    next_attempt: u64,
+    effect_count: usize,
+}
+
+fn execute_commit_unknown(
+    fixture: &AuthorityFixture,
+    request: &CapabilityRequest,
+) -> Result<(AttemptId, Vec<u8>), String> {
+    let classified: Result<(), EffectCommitError<&'static str>> = fixture
+        .kernel
+        .authorize_and_execute_classified(&fixture.subject, &fixture.capability, request, |_| {
+            EffectExecution::CommitUnknown {
+                evidence: b"runtime-corpus-provider-timeout".to_vec(),
+            }
+        });
+    match classified {
+        Err(EffectCommitError::CommitUnknown {
+            attempt_id,
+            evidence,
+        }) if evidence.as_slice() == b"runtime-corpus-provider-timeout" => {
+            Ok((attempt_id, evidence))
+        }
+        other => Err(format!(
+            "classified ambiguous execution returned {other:?}, expected bound CommitUnknown"
+        )),
+    }
+}
+
+fn commit_unknown_row(fixture: &AuthorityFixture) -> Result<AuthorityCheckpoint, String> {
+    let request = CapabilityRequest::new(
+        AUTHORITY_OBSERVATION_TIME,
+        AuthorityRequest::File(FileRequest::new(
+            RepoId::new("runtime-repository"),
+            FileEffect::ReadData,
+            CanonicalPath::root(),
+        )),
+    );
+    let before_epoch = checked(
+        fixture.kernel.authorization_epoch(),
+        "read pre-attempt epoch",
+    )?
+    .as_u64();
+    let before_active = active_flag(&fixture.kernel, &fixture.subject, &fixture.capability)?;
+    let before_unknown_view = checked(
+        DurableAuditView::open(&fixture.audit.path),
+        "read pre-attempt durable audit",
+    )?;
+    let before_next_attempt = before_unknown_view
+        .next_attempt_sequence()
+        .ok_or_else(|| "authority attempt sequence was unexpectedly exhausted".to_owned())?;
+    let before_effect_count =
+        checked(fixture.kernel.effect_records(), "read pre-attempt effects")?.len();
+    let (returned_attempt_id, returned_evidence) = execute_commit_unknown(fixture, &request)?;
+    let after_epoch = checked(
+        fixture.kernel.authorization_epoch(),
+        "read post-attempt epoch",
+    )?
+    .as_u64();
+    let after_active = active_flag(&fixture.kernel, &fixture.subject, &fixture.capability)?;
+    let after_unknown_view = checked(
+        DurableAuditView::open(&fixture.audit.path),
+        "read post-attempt durable audit",
+    )?;
+    let after_next_attempt = after_unknown_view
+        .next_attempt_sequence()
+        .ok_or_else(|| "authority attempt sequence exhausted after one attempt".to_owned())?;
+    let durable_attempt = after_unknown_view
+        .attempts()
+        .last()
+        .ok_or_else(|| "classified execution produced no durable attempt".to_owned())?;
+    let unknown_evidence = durable_attempt
+        .commit_unknown_evidence()
+        .ok_or_else(|| "classified CommitUnknown attempt retained no evidence".to_owned())?;
+    if durable_attempt.outcome() != AttemptOutcome::CommitUnknown {
+        return Err(format!(
+            "classified ambiguous attempt retained {:?}, expected CommitUnknown",
+            durable_attempt.outcome()
+        ));
+    }
+    if returned_attempt_id != durable_attempt.attempt_id()
+        || returned_attempt_id != unknown_evidence.attempt_id()
+        || returned_evidence.as_slice() != unknown_evidence.token()
+    {
+        return Err("returned, durable, and evidence CommitUnknown identities disagree".to_owned());
+    }
+    let after_effect_count =
+        checked(fixture.kernel.effect_records(), "read post-attempt effects")?.len();
+    let in_memory_attempts = checked(fixture.kernel.attempt_records(), "read classified attempts")?;
+    let in_memory_attempt = in_memory_attempts
+        .last()
+        .ok_or_else(|| "classified execution produced no in-memory attempt".to_owned())?;
+    if in_memory_attempt.id() != durable_attempt.attempt_id()
+        || in_memory_attempt.outcome() != AttemptOutcome::CommitUnknown
+    {
+        return Err("in-memory and durable CommitUnknown attempts disagree".to_owned());
+    }
+    let row = format!(
+        "authority\tcommit-unknown\t1\t{}\t{}\t{}\tcommit-unknown\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tcommit-unknown\t{}\t{}",
+        fixture.subject.as_str(),
+        fixture.subject.as_str(),
+        fixture.capability.as_str(),
+        before_epoch,
+        after_epoch,
+        before_active,
+        after_active,
+        before_next_attempt,
+        after_next_attempt,
+        durable_attempt.attempt_id().as_u64(),
+        unknown_evidence.attempt_id().as_u64(),
+        unknown_evidence.token().len(),
+        before_effect_count,
+        after_effect_count,
+    );
+    Ok(AuthorityCheckpoint {
+        row,
+        epoch: after_epoch,
+        active: after_active,
+        next_attempt: after_next_attempt,
+        effect_count: after_effect_count,
+    })
+}
+
+fn authority_rows() -> Result<Vec<String>, String> {
+    let fixture = authority_fixture()?;
+    let checkpoint = commit_unknown_row(&fixture)?;
+    let foreign_outcome = match fixture
+        .kernel
+        .revoke_held_by(&fixture.foreign, &fixture.capability)
+    {
         Err(CapabilityKernelError::StateTransition(CapabilityStateError::CapabilityNotHeld {
             ..
         })) => "capability-not-held",
         Ok(status) => return Err(format!("foreign revoke unexpectedly succeeded: {status:?}")),
         Err(error) => return Err(format!("foreign revoke returned wrong error: {error}")),
     };
-    let after_foreign =
-        checked(kernel.authorization_epoch(), "read rejected-revoke epoch")?.as_u64();
+    let after_foreign = checked(
+        fixture.kernel.authorization_epoch(),
+        "read rejected-revoke epoch",
+    )?
+    .as_u64();
+    let after_foreign_active = active_flag(&fixture.kernel, &fixture.subject, &fixture.capability)?;
     let owned_outcome = checked(
-        kernel.revoke_held_by(&subject, &capability),
+        fixture
+            .kernel
+            .revoke_held_by(&fixture.subject, &fixture.capability),
         "revoke caller-held capability",
     )?;
     if owned_outcome != RevocationStatus::NewlyRevoked {
@@ -109,24 +291,43 @@ fn authority_rows() -> Result<Vec<String>, String> {
             "first caller-held revoke returned {owned_outcome:?}, expected NewlyRevoked"
         ));
     }
-    let after_owned =
-        checked(kernel.authorization_epoch(), "read committed-revoke epoch")?.as_u64();
+    let after_owned = checked(
+        fixture.kernel.authorization_epoch(),
+        "read committed-revoke epoch",
+    )?
+    .as_u64();
+    let after_owned_active = active_flag(&fixture.kernel, &fixture.subject, &fixture.capability)?;
 
     Ok(vec![
+        checkpoint.row,
         format!(
-            "authority\trevoke-foreign\t1\t{}\t{}\t{}\t{}\t{}",
-            foreign.as_str(),
-            capability.as_str(),
+            "authority\trevoke-foreign\t1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t-\t0\tnone\t{}\t{}",
+            fixture.foreign.as_str(),
+            fixture.subject.as_str(),
+            fixture.capability.as_str(),
             foreign_outcome,
-            before_foreign,
-            after_foreign
+            checkpoint.epoch,
+            after_foreign,
+            checkpoint.active,
+            after_foreign_active,
+            checkpoint.next_attempt,
+            checkpoint.next_attempt,
+            checkpoint.effect_count,
+            checkpoint.effect_count,
         ),
         format!(
-            "authority\trevoke-owned\t1\t{}\t{}\tnewly-revoked\t{}\t{}",
-            subject.as_str(),
-            capability.as_str(),
+            "authority\trevoke-owned\t1\t{}\t{}\t{}\tnewly-revoked\t{}\t{}\t{}\t{}\t{}\t{}\t-\t-\t0\tnone\t{}\t{}",
+            fixture.subject.as_str(),
+            fixture.subject.as_str(),
+            fixture.capability.as_str(),
             after_foreign,
-            after_owned
+            after_owned,
+            after_foreign_active,
+            after_owned_active,
+            checkpoint.next_attempt,
+            checkpoint.next_attempt,
+            checkpoint.effect_count,
+            checkpoint.effect_count,
         ),
     ])
 }
@@ -136,14 +337,14 @@ struct TemporaryWal {
 }
 
 impl TemporaryWal {
-    fn new() -> Result<Self, String> {
+    fn new(label: &str) -> Result<Self, String> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
             .as_nanos();
         Ok(Self {
             path: env::temp_dir().join(format!(
-                "authority-runtime-corpus-{}-{nonce}.wal",
+                "authority-runtime-corpus-{label}-{}-{nonce}.wal",
                 process::id()
             )),
         })
@@ -244,7 +445,7 @@ fn render_broker_rows(observation: &BrokerObservation) -> Result<Vec<String>, St
 }
 
 fn broker_rows() -> Result<Vec<String>, String> {
-    let temporary = TemporaryWal::new()?;
+    let temporary = TemporaryWal::new("broker")?;
     let session = BrokerSessionId::new([0x31; 16]);
     let request = BrokerRequestId::new([0x32; 16]);
     let envelope = BrokerEnvelope::new(

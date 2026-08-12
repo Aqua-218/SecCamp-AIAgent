@@ -168,12 +168,12 @@ leaf ≤ root
 
 ## 現在の境界
 
-このページの `CapabilityState` が実装するのは、1 thread 上で順番が確定した subject 登録、root 発行、Derive、保持確認、authorization、revoke と祖先失効、`auth_epoch`、subject lifecycle、open-handle registry である。並行利用では、この state を[Authorization guard](authorization-guard.md)の `CapabilityKernel` に入れる。
+このページの `CapabilityState` が実装するのは、1 thread 上で順番が確定した subject 登録、root 発行、Derive、保持確認、authorization、revoke と祖先失効、`auth_epoch`、subject lifecycle、open-handle registry である。並行利用では、この state を[Authorization guard](authorization-guard.md)の `CapabilityKernel` に入れる。attempt/effect の durable WAL は `authority-core` の durable audit module が state machine の外側で journalize する。
 
 まだ含まれないものは次のとおり。
 
 - global namespace registry、実 fd、cgroup、mount を片付ける supervisor / capfs orchestration。
-- audit record の永続化と耐改ざん性。
+- hash chain、署名、remote append-only storage による audit record の耐改ざん性。
 - supervisor の socket fd から caller identity を決める adapter。
 - HTTP redirect / DNS / response streaming と GitHub API call を実際に強制する Broker adapter。
 

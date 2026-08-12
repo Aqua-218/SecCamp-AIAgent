@@ -11,6 +11,23 @@ this module proves the security properties of the transition system itself.
 
 namespace Authority
 
+/-- Greatest natural number representable by Rust's `u64`. -/
+def u64Maximum : Nat := 18446744073709551615
+
+/-- A logical counter has a faithful Rust `u64` representation. -/
+def FitsU64 (value : Nat) : Prop := value ≤ u64Maximum
+
+/-- Incrementing this logical counter cannot overflow Rust's `u64`. -/
+def CanIncrementU64 (value : Nat) : Prop := value < u64Maximum
+
+/-- A checked increment remains representable as a Rust `u64`. -/
+theorem CanIncrementU64.increment_fits {value : Nat}
+    (canIncrement : CanIncrementU64 value) : FitsU64 (value + 1) := by
+  exact canIncrement
+
+/-- Externally supplied capability identities must not use the empty sentinel. -/
+def ValidCapabilityId (capabilityId : CapId) : Prop := capabilityId.value ≠ ""
+
 /-- Minimal finite-key update for total functional maps. -/
 def replace [DecidableEq keyType] (mapping : keyType → valueType)
     (selectedKey : keyType) (selectedValue : valueType) : keyType → valueType :=
@@ -415,6 +432,7 @@ theorem MayRegisterSubject.parent_exists_and_runs {state : CapabilityState}
 /-- Root issuance is allowed only inside a running subject's static ceiling. -/
 structure MayIssueRoot (state : CapabilityState) (capabilityId : CapId)
     (grant : CapabilityGrant) where
+  validCapabilityId : ValidCapabilityId capabilityId
   capabilityFresh : state.capabilities capabilityId = none
   targetSubject : Subject
   targetLookup : state.subjects grant.subject = some targetSubject
@@ -481,6 +499,7 @@ theorem issue_assigns_exact_metadata (state : CapabilityState)
 structure MayDerive (state : CapabilityState) (caller : SubjectId)
     (parentId childId : CapId) (grant : CapabilityGrant)
     (now : MonotonicTime) where
+  validChildId : ValidCapabilityId childId
   callerRunning : state.subjectStatuses caller = some .running
   childFresh : state.capabilities childId = none
   parentCapability : Capability
@@ -761,9 +780,11 @@ inductive Step : CapabilityState → CapabilityState → Prop
       Step state (state.issue childId (some parentId) grant)
   | revoke {state : CapabilityState} {capabilityId : CapId} :
       state.WasIssued capabilityId → state.revoked capabilityId = false →
+      CanIncrementU64 state.authorizationEpoch →
       Step state (state.revoke capabilityId)
   | beginClose {state : CapabilityState} {subject : SubjectId} :
       state.subjectStatuses subject = some .running →
+      CanIncrementU64 state.authorizationEpoch →
       Step state (state.beginSubjectClose subject)
   | finishClose {state : CapabilityState} {subject : SubjectId} :
       state.subjectStatuses subject = some .closing →
@@ -794,6 +815,26 @@ theorem Step.epoch_monotone {before after : CapabilityState}
   | registerHandle => exact Nat.le_refl _
   | closeHandle => exact Nat.le_refl _
   | successfulNoop => exact Nat.le_refl _
+
+/-- Every machine counter is representable by the corresponding Rust type. -/
+def CountersRepresentable (state : CapabilityState) : Prop :=
+  FitsU64 state.authorizationEpoch
+
+/-- The empty capability state has a representable authorization epoch. -/
+theorem empty_countersRepresentable (issuer : IssuerId) :
+    (empty issuer).CountersRepresentable := by
+  simp [CountersRepresentable, empty, FitsU64, u64Maximum]
+
+/-- Checked accepted transitions cannot overflow the authorization epoch. -/
+theorem Step.preserves_countersRepresentable {before after : CapabilityState}
+    (transition : Step before after)
+    (representable : before.CountersRepresentable) :
+    after.CountersRepresentable := by
+  cases transition with
+  | revoke _ _ canIncrement => exact canIncrement.increment_fits
+  | beginClose _ canIncrement => exact canIncrement.increment_fits
+  | registerSubject | issueRoot | derive | finishClose | registerHandle |
+      closeHandle | successfulNoop => exact representable
 
 /-- Accepted transitions never remove an issued capability record. -/
 theorem Step.capability_records_persist {before after : CapabilityState}
@@ -971,6 +1012,16 @@ theorem Steps.epoch_monotone {before after : CapabilityState}
   | refl => exact Nat.le_refl _
   | tail _ transition inductionHypothesis =>
       exact Nat.le_trans inductionHypothesis transition.epoch_monotone
+
+/-- Every finite accepted execution stays within the Rust `u64` epoch range. -/
+theorem Steps.preserve_countersRepresentable {before after : CapabilityState}
+    (transitions : Steps before after)
+    (representable : before.CountersRepresentable) :
+    after.CountersRepresentable := by
+  induction transitions with
+  | refl => exact representable
+  | tail _ transition inductionHypothesis =>
+      exact transition.preserves_countersRepresentable inductionHypothesis
 
 /-- Capability records remain immutable across a finite execution. -/
 theorem Steps.capability_records_persist {before after : CapabilityState}

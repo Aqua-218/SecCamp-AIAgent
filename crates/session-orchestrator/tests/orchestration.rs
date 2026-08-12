@@ -119,6 +119,7 @@ impl WorkspaceBackend for MockWorkspace {
 struct MockBroker {
     log: CallLog,
     fail_establish: bool,
+    fail_running_check: bool,
     fail_close: bool,
     foreign_session: Option<SessionId>,
 }
@@ -136,6 +137,17 @@ impl BrokerBackend for MockBroker {
             self.foreign_session.unwrap_or(identity.session_id()),
             identity.broker_session_id(),
         ))
+    }
+
+    fn ensure_broker_session_running(&mut self, _lease: &BrokerLease) -> Result<(), BackendError> {
+        self.log.push("broker.ensure-running");
+        if self.fail_running_check {
+            Err(BackendError::new(
+                "Broker service exited before workload release",
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn close_broker_session(&mut self, _lease: &BrokerLease) -> Result<(), BackendError> {
@@ -321,6 +333,7 @@ fn startup_and_stop_follow_the_linearized_lifecycle_order() {
             "broker.establish",
             "vm.start",
             "capability.inject",
+            "broker.ensure-running",
             "workload.release"
         ]
     );
@@ -341,6 +354,7 @@ fn startup_and_stop_follow_the_linearized_lifecycle_order() {
             "broker.establish",
             "vm.start",
             "capability.inject",
+            "broker.ensure-running",
             "workload.release",
             "capability.revoke",
             "vm.kill",
@@ -533,6 +547,61 @@ fn capability_failure_rolls_back_vm_broker_and_workspace() {
     );
 }
 
+// Requirement: a Broker worker that exits during paused-VM startup is detected
+// after capability injection and before workload code can run.
+// Category: integration/lifecycle. Risk: critical.
+#[test]
+fn broker_exit_before_workload_release_fails_closed() {
+    let log = CallLog::default();
+    let mut workspace = MockWorkspace {
+        log: log.clone(),
+        ..MockWorkspace::default()
+    };
+    let mut broker = MockBroker {
+        log: log.clone(),
+        fail_running_check: true,
+        ..MockBroker::default()
+    };
+    let mut vm = MockVm {
+        log: log.clone(),
+        ..MockVm::default()
+    };
+    let mut capability = MockCapability {
+        log: log.clone(),
+        ..MockCapability::default()
+    };
+    let mut workload = MockWorkload {
+        log: log.clone(),
+        ..MockWorkload::default()
+    };
+
+    let error = start_with(
+        SequenceRandom::new(identity_values(45, 7)),
+        &mut workspace,
+        &mut broker,
+        &mut vm,
+        &mut capability,
+        &mut workload,
+    )
+    .expect_err("an exited Broker must reject workload release");
+
+    assert!(matches!(error, StartFailure::Backend(_)));
+    assert_eq!(
+        log.values(),
+        vec![
+            "workspace.clone",
+            "broker.establish",
+            "vm.start",
+            "capability.inject",
+            "broker.ensure-running",
+            "capability.revoke",
+            "vm.kill",
+            "broker.close",
+            "workspace.isolate",
+        ]
+    );
+}
+
 // Requirement: workload failure revokes the root before killing its VM.
 // Category: error/rollback. Risk: critical.
 #[test]
@@ -577,6 +646,7 @@ fn workload_failure_revokes_then_kills_all_resources() {
             "broker.establish",
             "vm.start",
             "capability.inject",
+            "broker.ensure-running",
             "workload.release",
             "capability.revoke",
             "vm.kill",
@@ -824,6 +894,7 @@ fn rollback_keeps_workspace_bound_when_vm_kill_fails() {
             "broker.establish",
             "vm.start",
             "capability.inject",
+            "broker.ensure-running",
             "workload.release",
             "capability.revoke",
             "vm.kill",
@@ -1158,6 +1229,7 @@ fn stop_remains_stopping_and_retries_failed_revoke() {
             "broker.establish",
             "vm.start",
             "capability.inject",
+            "broker.ensure-running",
             "workload.release",
             "capability.revoke",
             "vm.kill",
@@ -1178,6 +1250,7 @@ fn stop_remains_stopping_and_retries_failed_revoke() {
             "broker.establish",
             "vm.start",
             "capability.inject",
+            "broker.ensure-running",
             "workload.release",
             "capability.revoke",
             "vm.kill",

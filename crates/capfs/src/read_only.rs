@@ -5,10 +5,10 @@ use std::{
     error::Error,
     ffi::OsStr,
     fmt, io,
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     path::Path,
     sync::{
-        Arc, Mutex,
+        Arc, OnceLock, RwLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -21,7 +21,10 @@ use authority_core::{
     },
     file::{FileEffect, FileRequest},
     handle::{HandleId, ObjectId, OpenHandle},
-    kernel::{CapabilityInspectionError, CapabilityKernel, EffectCommitError},
+    kernel::{
+        CapabilityInspectionError, CapabilityKernel, EffectCommitError, RevocationObserver,
+        RevocationObserverError,
+    },
     path::{CanonicalPath, path_matches},
     repository::RepoId,
     state::HandleCloseStatus,
@@ -29,17 +32,18 @@ use authority_core::{
 };
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
-    FopenFlags, Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags,
-    RenameFlags as FuseRenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow, WriteFlags,
+    FopenFlags, Generation, INodeNo, KernelConfig, LockOwner, MountOption, Notifier, OpenAccMode,
+    OpenFlags, RenameFlags as FuseRenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 use rustix::fs::OFlags;
 
 use crate::{
     backing::{ImportedRepository, ValidatedRepository},
     namespace::{
-        NamespaceError, NamespaceGeneration, NamespaceObject, NamespaceObjectKind,
-        NamespaceOperationError, NamespaceRegistry, RenamePlan,
+        NamespaceError, NamespaceExecutorOutcome, NamespaceGeneration, NamespaceObject,
+        NamespaceObjectKind, NamespaceObjectSpec, NamespaceOperationError, NamespaceRegistry,
+        RenamePlan, SymlinkTarget,
     },
     node::{ForgetOutcome, NodeId, NodeTable, NodeTableError},
     runtime::{
@@ -48,7 +52,15 @@ use crate::{
     },
 };
 
-const ATTRIBUTE_TTL: Duration = Duration::ZERO;
+/// How long the operating system may answer `LOOKUP` and `GETATTR` from its own
+/// caches instead of asking this adapter.
+///
+/// This is not an authorization window. A revocation invalidates these caches
+/// through [`MountCacheInvalidator`] before it returns, so no stale entry can
+/// survive one, whatever the value here. What the value bounds is how long a
+/// mount may show attributes that another mount on the same repository has
+/// since changed through a path this adapter did not observe.
+const ATTRIBUTE_TTL: Duration = Duration::from_secs(1);
 const NODE_GENERATION: Generation = Generation(0);
 const MAX_IO_SIZE: u32 = 1024 * 1024;
 
@@ -362,6 +374,7 @@ enum AdapterError {
     TryAgain,
     InvalidRequest,
     BadHandle,
+    CrossDevice,
     Internal,
 }
 
@@ -379,6 +392,7 @@ impl AdapterError {
             Self::TryAgain => Errno::EAGAIN,
             Self::InvalidRequest => Errno::EINVAL,
             Self::BadHandle => Errno::EBADF,
+            Self::CrossDevice => Errno::EXDEV,
             Self::Internal => Errno::EIO,
         }
     }
@@ -393,6 +407,13 @@ struct CreatedFile {
     node: NodeId,
     handle: u64,
     metadata: BackingMetadata,
+}
+
+/// Result produced after the truncate syscall crossed its linearization point.
+#[derive(Clone, Copy)]
+enum TruncateCommit {
+    Metadata(BackingMetadata),
+    MetadataUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,12 +433,23 @@ struct DirectoryEntry {
 pub struct CapabilityFilesystem {
     backing: Arc<ValidatedRepository>,
     namespace: Arc<NamespaceRegistry>,
-    nodes: NodeTable,
+    nodes: Arc<NodeTable>,
     kernel: Arc<CapabilityKernel>,
     authority: MountAuthority,
     clock: Arc<dyn AuthorizationClock>,
-    handles: Mutex<HandleState>,
-    fatal: AtomicBool,
+    /// Handle table shared by every session thread.
+    ///
+    /// `READ`, `WRITE`, `GETATTR`, `SETATTR(size)`, and `READDIR` only resolve
+    /// an existing entry, so they take the shared guard and no longer serialize
+    /// against each other. `OPEN`, `CREATE`, `OPENDIR`, `RELEASE`, and teardown
+    /// take the exclusive guard. Reader/writer exclusion against `RELEASE` is
+    /// what the previous mutex provided, and the read guard preserves it.
+    ///
+    /// This lock never orders an operation against revocation. That ordering
+    /// belongs to the capability kernel's own state guard, which every
+    /// authorization still passes through.
+    handles: RwLock<HandleState>,
+    fatal: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for CapabilityFilesystem {
@@ -458,7 +490,7 @@ impl CapabilityFilesystem {
         let root = namespace
             .object_at_path_snapshot(&CanonicalPath::root())?
             .ok_or(CapabilityFilesystemError::MissingNamespaceRoot)?;
-        let nodes = NodeTable::new(authority.subject.clone(), root.id().clone());
+        let nodes = Arc::new(NodeTable::new(authority.subject.clone(), root.id().clone()));
 
         Ok(Self {
             backing,
@@ -467,8 +499,8 @@ impl CapabilityFilesystem {
             kernel,
             authority,
             clock,
-            handles: Mutex::new(HandleState::new()),
-            fatal: AtomicBool::new(false),
+            handles: RwLock::new(HandleState::new()),
+            fatal: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -498,7 +530,7 @@ impl CapabilityFilesystem {
         self.ensure_healthy()?;
         let object = match handle {
             Some(handle) => {
-                let handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+                let handles = self.handles.read().map_err(|_| AdapterError::Internal)?;
                 let resource = handles
                     .resources
                     .get(&handle)
@@ -532,7 +564,7 @@ impl CapabilityFilesystem {
                 &self.authority.capability,
                 now,
                 |capability| {
-                    if !self.capability_may_observe(capability, object.path()) {
+                    if !self.capability_may_observe_object(capability, object) {
                         return Err(AdapterError::NotFound);
                     }
                     let metadata = self
@@ -543,6 +575,22 @@ impl CapabilityFilesystem {
                 },
             )
             .map_err(|error| map_metadata_inspection_error(&error))
+    }
+
+    /// Returns whether every name an object answers to is within reach.
+    ///
+    /// A hard-linked inode is one object with several names, and this adapter
+    /// authorizes it on all of them. Showing it through a name whose sibling
+    /// name is out of range would advertise something no operation could then
+    /// use, so visibility follows the same all-names rule as authorization.
+    fn capability_may_observe_object(
+        &self,
+        capability: &Capability,
+        object: &NamespaceObject,
+    ) -> bool {
+        object
+            .paths()
+            .all(|path| self.capability_may_observe(capability, path))
     }
 
     fn capability_may_observe(&self, capability: &Capability, path: &CanonicalPath) -> bool {
@@ -558,6 +606,99 @@ impl CapabilityFilesystem {
                 || authority.path().path().is_at_or_below(path))
     }
 
+    /// Builds the authorization every name of `object` must independently pass.
+    ///
+    /// # Why every name
+    ///
+    /// A hard link gives one inode several paths, and a capability is granted
+    /// over paths. If an operation were authorized on only the name the caller
+    /// happened to use, then linking a protected file into a directory the
+    /// caller controls would hand it the file's contents. Requiring the effect
+    /// on *all* current names makes the authority over an aliased inode the
+    /// intersection of the authority over its names, so adding a name can never
+    /// widen what anyone may do with it.
+    fn object_requests(
+        &self,
+        effects: &[FileEffect],
+        object: &NamespaceObject,
+    ) -> Result<CapabilityRequestSet, AdapterError> {
+        let mut requests = Vec::with_capacity(effects.len() * object.expected_link_count());
+        for path in object.paths() {
+            for effect in effects {
+                requests.push(self.file_request(*effect, path.clone()));
+            }
+        }
+        let mut requests = requests.into_iter();
+        let Some(first) = requests.next() else {
+            // Both an empty effect list and a path-less object are internal
+            // faults; neither may reach the kernel as "nothing to authorize".
+            self.mark_fatal();
+            return Err(AdapterError::Internal);
+        };
+        Ok(CapabilityRequestSet::new(first, requests))
+    }
+
+    /// Authorizes one effect on every name of an object, then commits.
+    fn with_authorized_object<T>(
+        &self,
+        object: &NamespaceObject,
+        effect: FileEffect,
+        commit: impl FnOnce() -> Result<T, AdapterError>,
+    ) -> Result<T, AdapterError> {
+        let requests = self.object_requests(&[effect], object)?;
+        self.kernel
+            .authorize_all_and_commit(
+                &self.authority.subject,
+                &self.authority.capability,
+                &requests,
+                |_| commit(),
+            )
+            .map_err(|error| self.map_effect_error(&error))
+    }
+
+    /// Authorizes a backing namespace mutation without erasing whether its
+    /// linearization point was crossed.
+    fn with_authorized_namespace_effect<T>(
+        &self,
+        object: &NamespaceObject,
+        effect: FileEffect,
+        commit: impl FnOnce() -> Result<T, AdapterError>,
+    ) -> NamespaceExecutorOutcome<T, AdapterError> {
+        let requests = match self.object_requests(&[effect], object) {
+            Ok(requests) => requests,
+            Err(error) => return NamespaceExecutorOutcome::FailedBeforeCommit(error),
+        };
+        self.namespace_effect_outcome(self.kernel.authorize_all_and_commit(
+            &self.authority.subject,
+            &self.authority.capability,
+            &requests,
+            |_| commit(),
+        ))
+    }
+
+    /// Preserves the kernel's external commit classification for a namespace
+    /// transaction. The registry performs shared quarantine only after it has
+    /// published the staged transition for `CommittedWithError`.
+    fn namespace_effect_outcome<T>(
+        &self,
+        result: Result<T, EffectCommitError<AdapterError>>,
+    ) -> NamespaceExecutorOutcome<T, AdapterError> {
+        match result {
+            Ok(value) => NamespaceExecutorOutcome::Committed(value),
+            Err(EffectCommitError::CommittedButAudit(_)) => {
+                NamespaceExecutorOutcome::CommittedWithError(AdapterError::Internal)
+            }
+            Err(EffectCommitError::CommitUnknown | EffectCommitError::CommitUnknownAndAudit(_)) => {
+                // The namespace cannot safely choose either staged state. Keep
+                // its prior snapshot, quarantine the repository, and require
+                // out-of-band reconciliation before any mount can use it.
+                self.namespace.mark_in_doubt();
+                NamespaceExecutorOutcome::FailedBeforeCommit(AdapterError::Internal)
+            }
+            Err(error) => NamespaceExecutorOutcome::FailedBeforeCommit(map_effect_error(&error)),
+        }
+    }
+
     fn open_file(&self, node: NodeId, flags: OpenFlags) -> Result<u64, AdapterError> {
         let intent = FileOpenIntent::from_open_flags(flags)?;
         self.open_resource(
@@ -565,7 +706,7 @@ impl CapabilityFilesystem {
             NamespaceObjectKind::RegularFile,
             AdapterError::IsDirectory,
             OpenResourceAccess::File(intent.access),
-            |path| self.file_open_requests(intent, path.clone()),
+            |object| self.file_open_requests(intent, object),
             |object| {
                 let open = if intent.needs_writable_backing() {
                     self.backing.open_runtime_writable_file(object)
@@ -595,11 +736,7 @@ impl CapabilityFilesystem {
             NamespaceObjectKind::Directory,
             AdapterError::NotDirectory,
             OpenResourceAccess::Directory,
-            |path| {
-                CapabilityRequestSet::one(
-                    self.file_request(FileEffect::ListDirectory, path.clone()),
-                )
-            },
+            |object| self.object_requests(&[FileEffect::ListDirectory], object),
             |_| Ok(OpenBacking::Directory(generation)),
         )
     }
@@ -610,7 +747,9 @@ impl CapabilityFilesystem {
         expected_kind: NamespaceObjectKind,
         kind_error: AdapterError,
         access: OpenResourceAccess,
-        authorization_requests: impl FnOnce(&CanonicalPath) -> CapabilityRequestSet,
+        authorization_requests: impl FnOnce(
+            &NamespaceObject,
+        ) -> Result<CapabilityRequestSet, AdapterError>,
         open_backing: impl FnOnce(&NamespaceObject) -> Result<OpenBacking, AdapterError>,
     ) -> Result<u64, AdapterError> {
         self.ensure_healthy()?;
@@ -618,36 +757,45 @@ impl CapabilityFilesystem {
             .nodes
             .resolve(node)
             .map_err(|error| map_node_lookup_error(&error))?;
-        let mut handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+        let mut handles = self.handles.write().map_err(|_| AdapterError::Internal)?;
         let sequence = handles.reserve()?;
         let authority_handle =
             HandleId::new(format!("{}:fuse-handle:{sequence}", self.authority.mount));
-        let opened = self.namespace.open_object(&object, |object| {
-            if object.kind() != expected_kind {
-                return Err(kind_error);
-            }
-            self.kernel
-                .register_open_handle(OpenHandle::new(
-                    authority_handle.clone(),
-                    self.authority.subject.clone(),
-                    object.id().clone(),
-                ))
-                .map_err(|_| AdapterError::Internal)?;
-
-            let requests = authorization_requests(object.path());
-            match self.kernel.authorize_all_and_commit(
-                &self.authority.subject,
-                &self.authority.capability,
-                &requests,
-                |_| open_backing(object),
-            ) {
-                Ok(backing) => Ok(backing),
-                Err(error) => {
-                    self.close_failed_authority_handle(&authority_handle)?;
-                    Err(self.map_effect_error(&error))
+        let opened = self
+            .namespace
+            .open_object_with_commit_outcome(&object, |object| {
+                if object.kind() != expected_kind {
+                    return NamespaceExecutorOutcome::FailedBeforeCommit(kind_error);
                 }
-            }
-        });
+                if self
+                    .kernel
+                    .register_open_handle(OpenHandle::new(
+                        authority_handle.clone(),
+                        self.authority.subject.clone(),
+                        object.id().clone(),
+                    ))
+                    .is_err()
+                {
+                    return NamespaceExecutorOutcome::FailedBeforeCommit(AdapterError::Internal);
+                }
+
+                let requests = match authorization_requests(object) {
+                    Ok(requests) => requests,
+                    Err(error) => {
+                        return self.close_unreturned_authority_handle(
+                            &authority_handle,
+                            NamespaceExecutorOutcome::FailedBeforeCommit(error),
+                        );
+                    }
+                };
+                let outcome = self.namespace_effect_outcome(self.kernel.authorize_all_and_commit(
+                    &self.authority.subject,
+                    &self.authority.capability,
+                    &requests,
+                    |_| open_backing(object),
+                ));
+                self.close_unreturned_authority_handle(&authority_handle, outcome)
+            });
         let backing = opened.map_err(|error| map_namespace_operation_error(&error))?;
         let replaced = handles.resources.insert(
             sequence,
@@ -685,29 +833,39 @@ impl CapabilityFilesystem {
         // Reserve the public handle before beginning the namespace transaction.
         // A successful CREATE therefore cannot publish an object for which the
         // adapter has no handle identity to return to FUSE.
-        let mut handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+        let mut handles = self.handles.write().map_err(|_| AdapterError::Internal)?;
         let sequence = handles.reserve()?;
         let authority_handle =
             HandleId::new(format!("{}:fuse-handle:{sequence}", self.authority.mount));
-        let created = self.namespace.create_open_child(
+        let created = self.namespace.create_open_child_with_commit_outcome(
             &parent,
             name,
-            NamespaceObjectKind::RegularFile,
+            NamespaceObjectSpec::RegularFile,
             |live_parent, child| {
-                self.kernel
+                if self
+                    .kernel
                     .register_open_handle(OpenHandle::new(
                         authority_handle.clone(),
                         self.authority.subject.clone(),
                         child.id().clone(),
                     ))
-                    .map_err(|_| AdapterError::Internal)?;
+                    .is_err()
+                {
+                    return NamespaceExecutorOutcome::FailedBeforeCommit(AdapterError::Internal);
+                }
 
-                let requests = self.file_creation_requests(
-                    FileEffect::CreateFile,
-                    intent,
-                    child.path().clone(),
-                );
-                match self.kernel.authorize_all_and_commit(
+                let requests =
+                    match self.file_creation_requests(FileEffect::CreateFile, intent, child) {
+                        Ok(requests) => requests,
+                        Err(error) => {
+                            return self.close_unreturned_authority_handle(
+                                &authority_handle,
+                                NamespaceExecutorOutcome::FailedBeforeCommit(error),
+                            );
+                        }
+                    };
+                let mut remembered_node = None;
+                let result = self.kernel.authorize_all_and_commit(
                     &self.authority.subject,
                     &self.authority.capability,
                     &requests,
@@ -721,6 +879,7 @@ impl CapabilityFilesystem {
                             .remember_lookup(child.id())
                             .map_err(|_| AdapterError::Internal)?;
                         let node = binding.node();
+                        remembered_node = Some(node);
                         if let Ok((backing, metadata)) =
                             self.backing
                                 .create_runtime_file(live_parent, child, permissions)
@@ -728,16 +887,18 @@ impl CapabilityFilesystem {
                             Ok((node, backing, metadata))
                         } else {
                             self.forget_created_lookup(node, child.id())?;
+                            remembered_node = None;
                             Err(AdapterError::Internal)
                         }
                     },
-                ) {
-                    Ok(created) => Ok(created),
-                    Err(error) => {
-                        self.close_failed_authority_handle(&authority_handle)?;
-                        Err(self.map_effect_error(&error))
-                    }
+                );
+                let mut outcome = self.namespace_effect_outcome(result);
+                if let Some(node) = remembered_node {
+                    outcome = Self::cleanup_unreturned_namespace_outcome(outcome, || {
+                        self.forget_created_lookup(node, child.id())
+                    });
                 }
+                self.close_unreturned_authority_handle(&authority_handle, outcome)
             },
         );
         let creation = created.map_err(|error| map_namespace_operation_error(&error))?;
@@ -776,40 +937,237 @@ impl CapabilityFilesystem {
             .resolve(parent)
             .map_err(|error| map_node_lookup_error(&error))?;
         let permissions = CreationPermissions::from_requested_mode(mode, umask);
-        let created = self.namespace.create_child(
+        let created = self.namespace.create_child_with_commit_outcome(
             &parent,
             name,
-            NamespaceObjectKind::Directory,
+            NamespaceObjectSpec::Directory,
             |live_parent, child| {
-                let request = self.file_request(FileEffect::CreateDirectory, child.path().clone());
-                self.kernel
-                    .authorize_and_commit(
-                        &self.authority.subject,
-                        &self.authority.capability,
-                        &request,
-                        |_| {
-                            let binding = self
-                                .nodes
-                                .remember_lookup(child.id())
-                                .map_err(|_| AdapterError::Internal)?;
-                            let node = binding.node();
-                            if let Ok(metadata) = self.backing.create_runtime_directory(
-                                live_parent,
-                                child,
-                                permissions,
-                            ) {
-                                Ok(Entry { node, metadata })
-                            } else {
-                                self.forget_created_lookup(node, child.id())?;
-                                Err(AdapterError::Internal)
-                            }
-                        },
-                    )
-                    .map_err(|error| self.map_effect_error(&error))
+                let requests = match self.object_requests(&[FileEffect::CreateDirectory], child) {
+                    Ok(requests) => requests,
+                    Err(error) => {
+                        return NamespaceExecutorOutcome::FailedBeforeCommit(error);
+                    }
+                };
+                let mut remembered_node = None;
+                let result = self.kernel.authorize_all_and_commit(
+                    &self.authority.subject,
+                    &self.authority.capability,
+                    &requests,
+                    |_| {
+                        let binding = self
+                            .nodes
+                            .remember_lookup(child.id())
+                            .map_err(|_| AdapterError::Internal)?;
+                        let node = binding.node();
+                        remembered_node = Some(node);
+                        if let Ok(metadata) =
+                            self.backing
+                                .create_runtime_directory(live_parent, child, permissions)
+                        {
+                            Ok(Entry { node, metadata })
+                        } else {
+                            self.forget_created_lookup(node, child.id())?;
+                            remembered_node = None;
+                            Err(AdapterError::Internal)
+                        }
+                    },
+                );
+                let mut outcome = self.namespace_effect_outcome(result);
+                if let Some(node) = remembered_node {
+                    outcome = Self::cleanup_unreturned_namespace_outcome(outcome, || {
+                        self.forget_created_lookup(node, child.id())
+                    });
+                }
+                outcome
             },
         );
         created
             .map(|creation| creation.into_parts().1)
+            .map_err(|error| map_namespace_operation_error(&error))
+    }
+
+    /// Replies with a link body that is proven to resolve inside this mount.
+    ///
+    /// The operating system resolves symbolic links itself: it asks for the
+    /// target and then continues its own path walk, without returning here for
+    /// the `..` components. The string handed back is therefore the entire
+    /// enforcement boundary, and it is rechecked here rather than trusted from
+    /// registration time, because a rename can move the link and change what the
+    /// same relative target denotes. A link that would now leave the repository
+    /// gets `EXDEV` instead of its body.
+    ///
+    /// The check runs for every name the link answers to: a hard-linked symlink
+    /// can be reached through any of them, and the same body resolves from each
+    /// name's own directory.
+    fn read_link(&self, node: NodeId) -> Result<String, AdapterError> {
+        self.ensure_healthy()?;
+        let object = self
+            .nodes
+            .resolve(node)
+            .map_err(|error| map_node_lookup_error(&error))?;
+        self.namespace
+            .with_object(&object, |object| {
+                if object.kind() != NamespaceObjectKind::Symlink {
+                    return Err(AdapterError::InvalidRequest);
+                }
+                let target = object.link_target().ok_or(AdapterError::Internal)?;
+                for path in object.paths() {
+                    target
+                        .resolve_from(path)
+                        .map_err(|_| AdapterError::CrossDevice)?;
+                }
+                self.with_authorized_object(object, FileEffect::ReadLink, || {
+                    self.backing
+                        .read_runtime_symlink(object)
+                        .map_err(|_| AdapterError::Internal)
+                })
+            })
+            .map_err(|error| map_namespace_operation_error(&error))
+    }
+
+    fn create_symlink(
+        &self,
+        parent: NodeId,
+        name: &str,
+        target: &str,
+    ) -> Result<Entry, AdapterError> {
+        self.ensure_healthy()?;
+        let target = SymlinkTarget::new(target).map_err(|_| AdapterError::Unsupported)?;
+        let parent = self
+            .nodes
+            .resolve(parent)
+            .map_err(|error| map_node_lookup_error(&error))?;
+        // The registry refuses to stage a link whose target leaves the
+        // repository, so an escaping target fails before anything is created.
+        let created = self.namespace.create_child_with_commit_outcome(
+            &parent,
+            name,
+            NamespaceObjectSpec::Symlink(target.clone()),
+            |live_parent, child| {
+                let requests = match self.object_requests(&[FileEffect::CreateSymlink], child) {
+                    Ok(requests) => requests,
+                    Err(error) => {
+                        return NamespaceExecutorOutcome::FailedBeforeCommit(error);
+                    }
+                };
+                let mut remembered_node = None;
+                let result = self.kernel.authorize_all_and_commit(
+                    &self.authority.subject,
+                    &self.authority.capability,
+                    &requests,
+                    |_| {
+                        let binding = self
+                            .nodes
+                            .remember_lookup(child.id())
+                            .map_err(|_| AdapterError::Internal)?;
+                        let node = binding.node();
+                        remembered_node = Some(node);
+                        if let Ok(metadata) =
+                            self.backing
+                                .create_runtime_symlink(live_parent, child, &target)
+                        {
+                            Ok(Entry { node, metadata })
+                        } else {
+                            self.forget_created_lookup(node, child.id())?;
+                            remembered_node = None;
+                            Err(AdapterError::Internal)
+                        }
+                    },
+                );
+                let mut outcome = self.namespace_effect_outcome(result);
+                if let Some(node) = remembered_node {
+                    outcome = Self::cleanup_unreturned_namespace_outcome(outcome, || {
+                        self.forget_created_lookup(node, child.id())
+                    });
+                }
+                outcome
+            },
+        );
+        created
+            .map(|creation| creation.into_parts().1)
+            .map_err(|error| map_namespace_operation_error(&error))
+    }
+
+    /// Gives one live inode a second name.
+    ///
+    /// `CreateHardLink` is required on the new name *and* on every name the
+    /// inode already has. Requiring the existing names is what stops a caller
+    /// from attaching a file it has no authority over to a directory it
+    /// controls; requiring the new one keeps the alias inside its own reach.
+    /// Because every later operation is authorized on all names, the link
+    /// cannot widen anyone's access to the inode.
+    fn create_hard_link(
+        &self,
+        node: NodeId,
+        new_parent: NodeId,
+        new_name: &str,
+    ) -> Result<Entry, AdapterError> {
+        self.ensure_healthy()?;
+        let source = self
+            .nodes
+            .resolve(node)
+            .map_err(|error| map_node_lookup_error(&error))?;
+        let parent = self
+            .nodes
+            .resolve(new_parent)
+            .map_err(|error| map_node_lookup_error(&error))?;
+        self.namespace
+            .link_child_with_commit_outcome(
+                &parent,
+                new_name,
+                &source,
+                |live_parent, linked, link_path| {
+                    let Some(source_path) = linked.paths().find(|path| *path != link_path).cloned()
+                    else {
+                        return NamespaceExecutorOutcome::FailedBeforeCommit(
+                            AdapterError::Internal,
+                        );
+                    };
+                    let requests = match self.object_requests(&[FileEffect::CreateHardLink], linked)
+                    {
+                        Ok(requests) => requests,
+                        Err(error) => {
+                            return NamespaceExecutorOutcome::FailedBeforeCommit(error);
+                        }
+                    };
+                    let mut remembered_node = None;
+                    let result = self.kernel.authorize_all_and_commit(
+                        &self.authority.subject,
+                        &self.authority.capability,
+                        &requests,
+                        |_| {
+                            // The inode already has a node identity; LINK adds
+                            // one kernel lookup reference to it rather than
+                            // introducing a second identity for one inode.
+                            let binding = self
+                                .nodes
+                                .remember_lookup(linked.id())
+                                .map_err(|_| AdapterError::Internal)?;
+                            let node = binding.node();
+                            remembered_node = Some(node);
+                            if let Ok(metadata) = self.backing.create_runtime_hard_link(
+                                linked,
+                                &source_path,
+                                live_parent,
+                                link_path,
+                            ) {
+                                Ok(Entry { node, metadata })
+                            } else {
+                                self.forget_lookup_reference(node)?;
+                                remembered_node = None;
+                                Err(AdapterError::Internal)
+                            }
+                        },
+                    );
+                    let mut outcome = self.namespace_effect_outcome(result);
+                    if let Some(node) = remembered_node {
+                        outcome = Self::cleanup_unreturned_namespace_outcome(outcome, || {
+                            self.forget_lookup_reference(node)
+                        });
+                    }
+                    outcome
+                },
+            )
             .map_err(|error| map_namespace_operation_error(&error))
     }
 
@@ -847,23 +1205,15 @@ impl CapabilityFilesystem {
             .resolve(parent)
             .map_err(|error| map_node_lookup_error(&error))?;
         self.namespace
-            .remove_child(&parent, name, |live_parent, child| {
+            .remove_child_with_commit_outcome(&parent, name, |live_parent, child, removed_path| {
                 if child.kind() != expected_kind {
-                    return Err(kind_error);
+                    return NamespaceExecutorOutcome::FailedBeforeCommit(kind_error);
                 }
-                let request = self.file_request(effect, child.path().clone());
-                self.kernel
-                    .authorize_and_commit(
-                        &self.authority.subject,
-                        &self.authority.capability,
-                        &request,
-                        |_| {
-                            self.backing
-                                .remove_runtime_object(live_parent, child)
-                                .map_err(|_| AdapterError::Internal)
-                        },
-                    )
-                    .map_err(|error| self.map_effect_error(&error))
+                self.with_authorized_namespace_effect(child, effect, || {
+                    self.backing
+                        .remove_runtime_object(live_parent, child, removed_path)
+                        .map_err(|_| AdapterError::Internal)
+                })
             })
             .map_err(|error| map_namespace_operation_error(&error))
     }
@@ -892,25 +1242,28 @@ impl CapabilityFilesystem {
             .resolve(destination_parent)
             .map_err(|error| map_node_lookup_error(&error))?;
         self.namespace
-            .rename_child(
+            .rename_child_with_commit_outcome(
                 &source_parent,
                 source_name,
                 &destination_parent,
                 destination_name,
                 |plan| {
-                    let requests = self.rename_requests(plan)?;
-                    self.kernel
-                        .authorize_all_and_commit(
-                            &self.authority.subject,
-                            &self.authority.capability,
-                            &requests,
-                            |_| {
-                                self.backing
-                                    .rename_runtime_subtree(plan)
-                                    .map_err(|_| AdapterError::Internal)
-                            },
-                        )
-                        .map_err(|error| self.map_effect_error(&error))
+                    let requests = match self.rename_requests(plan) {
+                        Ok(requests) => requests,
+                        Err(error) => {
+                            return NamespaceExecutorOutcome::FailedBeforeCommit(error);
+                        }
+                    };
+                    self.namespace_effect_outcome(self.kernel.authorize_all_and_commit(
+                        &self.authority.subject,
+                        &self.authority.capability,
+                        &requests,
+                        |_| {
+                            self.backing
+                                .rename_runtime_subtree(plan)
+                                .map_err(|_| AdapterError::Internal)
+                        },
+                    ))
                 },
             )
             .map_err(|error| map_namespace_operation_error(&error))
@@ -929,6 +1282,53 @@ impl CapabilityFilesystem {
         } else {
             self.mark_fatal();
             Err(AdapterError::Internal)
+        }
+    }
+
+    /// Closes an authority-side handle when no FUSE handle can be returned,
+    /// without changing the backing effect's commit classification.
+    fn close_unreturned_authority_handle<T>(
+        &self,
+        authority_handle: &HandleId,
+        outcome: NamespaceExecutorOutcome<T, AdapterError>,
+    ) -> NamespaceExecutorOutcome<T, AdapterError> {
+        Self::cleanup_unreturned_namespace_outcome(outcome, || {
+            self.close_failed_authority_handle(authority_handle)
+        })
+    }
+
+    /// Runs request-local cleanup only when a namespace operation cannot return
+    /// its successful value, preserving whether the backing effect committed.
+    fn cleanup_unreturned_namespace_outcome<T>(
+        outcome: NamespaceExecutorOutcome<T, AdapterError>,
+        cleanup: impl FnOnce() -> Result<(), AdapterError>,
+    ) -> NamespaceExecutorOutcome<T, AdapterError> {
+        match outcome {
+            NamespaceExecutorOutcome::Committed(value) => {
+                NamespaceExecutorOutcome::Committed(value)
+            }
+            NamespaceExecutorOutcome::FailedBeforeCommit(error) => {
+                let error = cleanup().err().unwrap_or(error);
+                NamespaceExecutorOutcome::FailedBeforeCommit(error)
+            }
+            NamespaceExecutorOutcome::CommittedWithError(error) => {
+                let error = cleanup().err().unwrap_or(error);
+                NamespaceExecutorOutcome::CommittedWithError(error)
+            }
+        }
+    }
+
+    /// Drops one lookup reference from a node that other references may hold.
+    ///
+    /// `LINK` adds a reference to an inode the kernel already knows, so undoing
+    /// it must not require the node to disappear.
+    fn forget_lookup_reference(&self, node: NodeId) -> Result<(), AdapterError> {
+        match self.nodes.forget(node, NonZeroU64::MIN) {
+            Ok(ForgetOutcome::Removed(_) | ForgetOutcome::Retained(_)) => Ok(()),
+            Err(_) => {
+                self.mark_fatal();
+                Err(AdapterError::Internal)
+            }
         }
     }
 
@@ -953,7 +1353,7 @@ impl CapabilityFilesystem {
         if size > MAX_IO_SIZE {
             return Err(AdapterError::InvalidRequest);
         }
-        let handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+        let handles = self.handles.read().map_err(|_| AdapterError::Internal)?;
         let resource = handles
             .resources
             .get(&handle)
@@ -973,19 +1373,11 @@ impl CapabilityFilesystem {
 
         self.namespace
             .with_object(&resource.object, |object| {
-                let request = self.file_request(FileEffect::ReadData, object.path().clone());
-                self.kernel
-                    .authorize_and_commit(
-                        &self.authority.subject,
-                        &self.authority.capability,
-                        &request,
-                        |_| {
-                            backing
-                                .read_at(offset, size as usize)
-                                .map_err(|_| AdapterError::Internal)
-                        },
-                    )
-                    .map_err(|error| self.map_effect_error(&error))
+                self.with_authorized_object(object, FileEffect::ReadData, || {
+                    backing
+                        .read_at(offset, size as usize)
+                        .map_err(|_| AdapterError::Internal)
+                })
             })
             .map_err(|error| map_namespace_operation_error(&error))
     }
@@ -1001,7 +1393,7 @@ impl CapabilityFilesystem {
         if bytes.len() > MAX_IO_SIZE as usize {
             return Err(AdapterError::InvalidRequest);
         }
-        let handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+        let handles = self.handles.read().map_err(|_| AdapterError::Internal)?;
         let resource = handles
             .resources
             .get(&handle)
@@ -1021,22 +1413,14 @@ impl CapabilityFilesystem {
 
         self.namespace
             .with_object(&resource.object, |object| {
-                let request = self.file_request(FileEffect::WriteData, object.path().clone());
-                self.kernel
-                    .authorize_and_commit(
-                        &self.authority.subject,
-                        &self.authority.capability,
-                        &request,
-                        |_| {
-                            backing
-                                .write_at(offset, bytes)
-                                .map_err(|_| AdapterError::Internal)
-                                .and_then(|written| {
-                                    u32::try_from(written).map_err(|_| AdapterError::Internal)
-                                })
-                        },
-                    )
-                    .map_err(|error| self.map_effect_error(&error))
+                self.with_authorized_object(object, FileEffect::WriteData, || {
+                    backing
+                        .write_at(offset, bytes)
+                        .map_err(|_| AdapterError::Internal)
+                        .and_then(|written| {
+                            u32::try_from(written).map_err(|_| AdapterError::Internal)
+                        })
+                })
             })
             .map_err(|error| map_namespace_operation_error(&error))
     }
@@ -1049,7 +1433,7 @@ impl CapabilityFilesystem {
     ) -> Result<BackingMetadata, AdapterError> {
         self.ensure_healthy()?;
         if let Some(handle) = handle {
-            let handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+            let handles = self.handles.read().map_err(|_| AdapterError::Internal)?;
             let resource = handles
                 .resources
                 .get(&handle)
@@ -1070,9 +1454,10 @@ impl CapabilityFilesystem {
                 backing
                     .truncate_to(length)
                     .map_err(|_| AdapterError::Internal)?;
-                self.backing
-                    .runtime_metadata(object)
-                    .map_err(|_| AdapterError::Internal)
+                Ok(match self.backing.runtime_metadata(object) {
+                    Ok(metadata) => TruncateCommit::Metadata(metadata),
+                    Err(_) => TruncateCommit::MetadataUnavailable,
+                })
             })
         } else {
             let object = self
@@ -1087,10 +1472,28 @@ impl CapabilityFilesystem {
                 backing
                     .truncate_to(length)
                     .map_err(|_| AdapterError::Internal)?;
-                self.backing
-                    .runtime_metadata(object)
-                    .map_err(|_| AdapterError::Internal)
+                Ok(match self.backing.runtime_metadata(object) {
+                    Ok(metadata) => TruncateCommit::Metadata(metadata),
+                    Err(_) => TruncateCommit::MetadataUnavailable,
+                })
             })
+        }
+        .and_then(|commit| self.finish_truncate(commit))
+    }
+
+    /// Converts a post-syscall metadata observation into the FUSE result.
+    fn finish_truncate(&self, commit: TruncateCommit) -> Result<BackingMetadata, AdapterError> {
+        match commit {
+            TruncateCommit::Metadata(metadata) => Ok(metadata),
+            TruncateCommit::MetadataUnavailable => {
+                // `ftruncate` was already durably audited as committed. The
+                // reply metadata is a later observation, so treating this as a
+                // pre-commit executor error would falsify the audit. Quarantine
+                // all mounts instead of letting the caller retry an operation
+                // that is known to have changed the file.
+                self.namespace.mark_in_doubt();
+                Err(AdapterError::Internal)
+            }
         }
     }
 
@@ -1108,24 +1511,16 @@ impl CapabilityFilesystem {
             .map_err(|error| map_node_lookup_error(&error))?;
         self.namespace
             .with_object(&object, |object| {
-                let request = self.file_request(FileEffect::SetMetadata, object.path().clone());
-                self.kernel
-                    .authorize_and_commit(
-                        &self.authority.subject,
-                        &self.authority.capability,
-                        &request,
-                        |_| match update {
-                            MetadataUpdate::Permissions(permissions) => self
-                                .backing
-                                .set_runtime_permissions(object, permissions)
-                                .map_err(|_| AdapterError::Internal),
-                            MetadataUpdate::Timestamps(timestamps) => self
-                                .backing
-                                .set_runtime_timestamps(object, timestamps)
-                                .map_err(|_| AdapterError::Internal),
-                        },
-                    )
-                    .map_err(|error| self.map_effect_error(&error))
+                self.with_authorized_object(object, FileEffect::SetMetadata, || match update {
+                    MetadataUpdate::Permissions(permissions) => self
+                        .backing
+                        .set_runtime_permissions(object, permissions)
+                        .map_err(|_| AdapterError::Internal),
+                    MetadataUpdate::Timestamps(timestamps) => self
+                        .backing
+                        .set_runtime_timestamps(object, timestamps)
+                        .map_err(|_| AdapterError::Internal),
+                })
             })
             .map_err(|error| map_namespace_operation_error(&error))
     }
@@ -1140,15 +1535,7 @@ impl CapabilityFilesystem {
                 if object.kind() != NamespaceObjectKind::RegularFile {
                     return Err(AdapterError::IsDirectory);
                 }
-                let request = self.file_request(FileEffect::Truncate, object.path().clone());
-                self.kernel
-                    .authorize_and_commit(
-                        &self.authority.subject,
-                        &self.authority.capability,
-                        &request,
-                        |_| operation(object),
-                    )
-                    .map_err(|error| self.map_effect_error(&error))
+                self.with_authorized_object(object, FileEffect::Truncate, || operation(object))
             })
             .map_err(|error| map_namespace_operation_error(&error))
     }
@@ -1161,7 +1548,7 @@ impl CapabilityFilesystem {
     ) -> Result<Vec<DirectoryEntry>, AdapterError> {
         self.ensure_healthy()?;
         let offset = usize::try_from(offset).map_err(|_| AdapterError::InvalidRequest)?;
-        let handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+        let handles = self.handles.read().map_err(|_| AdapterError::Internal)?;
         let resource = handles
             .resources
             .get(&handle)
@@ -1181,13 +1568,12 @@ impl CapabilityFilesystem {
                 &resource.object,
                 generation,
                 |directory, parent, children| {
-                    let request =
-                        self.file_request(FileEffect::ListDirectory, directory.path().clone());
+                    let requests = self.object_requests(&[FileEffect::ListDirectory], directory)?;
                     self.kernel
-                        .authorize_and_commit(
+                        .authorize_all_and_commit(
                             &self.authority.subject,
                             &self.authority.capability,
-                            &request,
+                            &requests,
                             |capability| {
                                 let mut entries = Vec::with_capacity(children.len() + 2);
                                 entries.push((
@@ -1203,20 +1589,18 @@ impl CapabilityFilesystem {
                                     "..".into(),
                                 ));
                                 for child in children {
-                                    if !self.capability_may_observe(capability, child.path()) {
+                                    if !self
+                                        .capability_may_observe_object(capability, child.object())
+                                    {
                                         continue;
                                     }
-                                    let name = child
-                                        .path()
-                                        .as_segments()
-                                        .last()
-                                        .cloned()
-                                        .ok_or(AdapterError::Internal)?;
+                                    let name =
+                                        child.name().ok_or(AdapterError::Internal)?.to_owned();
                                     entries.push((
                                         self.nodes
-                                            .node_for_object(child.id())
+                                            .node_for_object(child.object().id())
                                             .map_err(|_| AdapterError::Internal)?,
-                                        child.kind(),
+                                        child.object().kind(),
                                         name,
                                     ));
                                 }
@@ -1263,7 +1647,7 @@ impl CapabilityFilesystem {
         expected_kind: OpenResourceKind,
     ) -> Result<(), AdapterError> {
         self.ensure_healthy()?;
-        let mut handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+        let mut handles = self.handles.write().map_err(|_| AdapterError::Internal)?;
         let resource = handles
             .resources
             .get(&handle)
@@ -1309,43 +1693,40 @@ impl CapabilityFilesystem {
     fn file_open_requests(
         &self,
         intent: FileOpenIntent,
-        path: CanonicalPath,
-    ) -> CapabilityRequestSet {
-        let mut additional = Vec::with_capacity(2);
-        let first = match intent.access {
-            FileAccess::ReadOnly => self.file_request(FileEffect::ReadData, path.clone()),
-            FileAccess::WriteOnly => self.file_request(FileEffect::WriteData, path.clone()),
+        object: &NamespaceObject,
+    ) -> Result<CapabilityRequestSet, AdapterError> {
+        let mut effects = Vec::with_capacity(3);
+        match intent.access {
+            FileAccess::ReadOnly => effects.push(FileEffect::ReadData),
+            FileAccess::WriteOnly => effects.push(FileEffect::WriteData),
             FileAccess::ReadWrite => {
-                additional.push(self.file_request(FileEffect::WriteData, path.clone()));
-                self.file_request(FileEffect::ReadData, path.clone())
+                effects.push(FileEffect::ReadData);
+                effects.push(FileEffect::WriteData);
             }
-        };
-        if intent.truncate {
-            additional.push(self.file_request(FileEffect::Truncate, path));
         }
-        CapabilityRequestSet::new(first, additional)
+        if intent.truncate {
+            effects.push(FileEffect::Truncate);
+        }
+        self.object_requests(&effects, object)
     }
 
     fn file_creation_requests(
         &self,
         creation_effect: FileEffect,
         intent: FileOpenIntent,
-        path: CanonicalPath,
-    ) -> CapabilityRequestSet {
-        let mut additional = Vec::with_capacity(2);
+        object: &NamespaceObject,
+    ) -> Result<CapabilityRequestSet, AdapterError> {
+        let mut effects = Vec::with_capacity(3);
+        effects.push(creation_effect);
         match intent.access {
-            FileAccess::ReadOnly => {
-                additional.push(self.file_request(FileEffect::ReadData, path.clone()));
-            }
-            FileAccess::WriteOnly => {
-                additional.push(self.file_request(FileEffect::WriteData, path.clone()));
-            }
+            FileAccess::ReadOnly => effects.push(FileEffect::ReadData),
+            FileAccess::WriteOnly => effects.push(FileEffect::WriteData),
             FileAccess::ReadWrite => {
-                additional.push(self.file_request(FileEffect::ReadData, path.clone()));
-                additional.push(self.file_request(FileEffect::WriteData, path.clone()));
+                effects.push(FileEffect::ReadData);
+                effects.push(FileEffect::WriteData);
             }
         }
-        CapabilityRequestSet::new(self.file_request(creation_effect, path), additional)
+        self.object_requests(&effects, object)
     }
 
     fn rename_requests(&self, plan: &RenamePlan) -> Result<CapabilityRequestSet, AdapterError> {
@@ -1375,7 +1756,7 @@ impl CapabilityFilesystem {
     }
 
     fn cleanup_handles(&self) {
-        let Ok(mut handles) = self.handles.lock() else {
+        let Ok(mut handles) = self.handles.write() else {
             self.mark_fatal();
             return;
         };
@@ -1391,7 +1772,7 @@ impl CapabilityFilesystem {
             })
             .collect::<Vec<_>>();
         for (handle, object, authority_handle) in pending {
-            let closed = self.namespace.close_object(&object, |_| {
+            let closed = self.namespace.close_object_for_cleanup(&object, |_| {
                 match self
                     .kernel
                     .close_handle(&self.authority.subject, &authority_handle)
@@ -1410,10 +1791,11 @@ impl CapabilityFilesystem {
 
     fn ensure_healthy(&self) -> Result<(), AdapterError> {
         if self.fatal.load(Ordering::Acquire) {
-            Err(AdapterError::Internal)
-        } else {
-            Ok(())
+            return Err(AdapterError::Internal);
         }
+        self.namespace
+            .ensure_operational()
+            .map_err(|_| AdapterError::Internal)
     }
 
     fn mark_fatal(&self) {
@@ -1421,10 +1803,17 @@ impl CapabilityFilesystem {
     }
 
     fn map_effect_error(&self, error: &EffectCommitError<AdapterError>) -> AdapterError {
-        if matches!(error, EffectCommitError::CommittedButAudit(_)) {
+        if matches!(
+            error,
+            EffectCommitError::CommittedButAudit(_)
+                | EffectCommitError::CommitUnknown
+                | EffectCommitError::CommitUnknownAndAudit(_)
+        ) {
             // The backing operation may already exist even though its durable
-            // receipt failed. Stop this mount instead of allowing a retry to
-            // apply an operation whose namespace/audit outcome is unknown.
+            // receipt failed or its outcome could not be determined. Quarantine
+            // every mount sharing this repository instead of allowing a retry
+            // against unresolved backing state.
+            self.namespace.mark_in_doubt();
             self.mark_fatal();
         }
         map_effect_error(error)
@@ -1432,6 +1821,12 @@ impl CapabilityFilesystem {
 }
 
 impl Filesystem for CapabilityFilesystem {
+    /// Negotiates the FUSE session.
+    ///
+    /// `FUSE_CACHE_SYMLINKS` must never be added here. `READLINK` revalidates
+    /// that a link still resolves inside the repository from the link's current
+    /// path, and a cached link body would let the kernel keep following a target
+    /// that a rename has since turned into an escape without asking again.
     fn init(&mut self, _request: &Request, config: &mut KernelConfig) -> io::Result<()> {
         config
             .set_max_write(MAX_IO_SIZE)
@@ -1593,10 +1988,103 @@ impl Filesystem for CapabilityFilesystem {
                 &file_attr(created.node, created.metadata),
                 NODE_GENERATION,
                 FileHandle(created.handle),
-                FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_NOFLUSH,
+                // CREATE always hands back a writable handle.
+                WRITABLE_HANDLE_FLAGS,
             ),
             Err(error) => reply.error(error.errno()),
         }
+    }
+
+    fn readlink(&self, _request: &Request, node: INodeNo, reply: ReplyData) {
+        let Some(node) = NodeId::new(node.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        match self.read_link(node) {
+            Ok(target) => reply.data(target.as_bytes()),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    fn symlink(
+        &self,
+        _request: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let Some(parent) = NodeId::new(parent.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(link_name) = link_name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(target) = target.to_str() else {
+            // A target the canonical path model cannot represent is refused
+            // rather than stored as opaque bytes it could never resolve.
+            reply.error(Errno::EPERM);
+            return;
+        };
+        match self.create_symlink(parent, link_name, target) {
+            Ok(entry) => reply.entry(
+                &ATTRIBUTE_TTL,
+                &file_attr(entry.node, entry.metadata),
+                NODE_GENERATION,
+            ),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    fn link(
+        &self,
+        _request: &Request,
+        node: INodeNo,
+        new_parent: INodeNo,
+        new_name: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let Some(node) = NodeId::new(node.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(new_parent) = NodeId::new(new_parent.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(new_name) = new_name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match self.create_hard_link(node, new_parent, new_name) {
+            Ok(entry) => reply.entry(
+                &ATTRIBUTE_TTL,
+                &file_attr(entry.node, entry.metadata),
+                NODE_GENERATION,
+            ),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    /// Refuses device, FIFO, and socket creation explicitly.
+    ///
+    /// The default `Filesystem` implementation answers `ENOSYS`, which tells
+    /// the kernel the operation is merely unimplemented. capfs models a closed
+    /// object universe of directories, regular files, and symbolic links, so
+    /// this is a policy refusal and says so with `EPERM`.
+    fn mknod(
+        &self,
+        _request: &Request,
+        _parent: INodeNo,
+        _name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        reply.error(Errno::EPERM);
     }
 
     fn unlink(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -1667,10 +2155,7 @@ impl Filesystem for CapabilityFilesystem {
             return;
         };
         match self.open_file(node, flags) {
-            Ok(handle) => reply.opened(
-                FileHandle(handle),
-                FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_NOFLUSH,
-            ),
+            Ok(handle) => reply.opened(FileHandle(handle), handle_cache_mode(flags)),
             Err(error) => reply.error(error.errno()),
         }
     }
@@ -1805,7 +2290,192 @@ impl Filesystem for CapabilityFilesystem {
     }
 }
 
+/// Discards the operating system's caches for one mount when a capability is
+/// revoked.
+///
+/// The FUSE kernel is allowed to answer `READ`, `LOOKUP`, and `GETATTR` from
+/// its own page and attribute caches without consulting this adapter. Those
+/// answers were authorized when the cache was filled, so a revocation that only
+/// changed capability state would keep being satisfied from them. This observer
+/// is what stops that: it is registered with the capability kernel before the
+/// mount is spawned, and every revoking transition runs it before returning.
+///
+/// # Why this is sound
+///
+/// A FUSE notification is processed inline by the operating system while the
+/// write to the FUSE device is still in progress, so once
+/// [`Notifier::inval_inode`] returns the cached pages and attributes for that
+/// inode are already gone. Every inode this mount has handed out is
+/// invalidated, so after the observer returns there is no cached state left
+/// that could answer a request. Any read issued after that must come back to
+/// this adapter, which reauthorizes it and finds the capability revoked.
+///
+/// Reads already in flight when the revocation commits are not the concern:
+/// they were authorized before it, and the capability kernel's own state guard
+/// is what orders them.
+///
+/// # Failing closed
+///
+/// If the notifier is missing, the node table cannot be read, or the operating
+/// system refuses an invalidation, the mount is marked fatal so every later
+/// operation on it fails, and the error is reported to the revoking caller.
+/// A cache that cannot be proven empty is treated as populated.
+///
+/// # Outliving its mount
+///
+/// The kernel holds registered observers for its own lifetime, which is longer
+/// than any one mount's. The state this observer needs is therefore held
+/// weakly: once the session is dropped the filesystem goes with it, the weak
+/// references stop resolving, and the observer reports success because a mount
+/// that no longer exists has no cache left to serve anything from. Holding
+/// these strongly would keep the whole mount alive and turn every revoke after
+/// an unmount into a propagation failure.
+struct MountCacheInvalidator {
+    mount: MountInstanceId,
+    notifier: OnceLock<Notifier>,
+    nodes: Weak<NodeTable>,
+    fatal: Weak<AtomicBool>,
+}
+
+impl MountCacheInvalidator {
+    fn new(mount: MountInstanceId, nodes: &Arc<NodeTable>, fatal: &Arc<AtomicBool>) -> Self {
+        Self {
+            mount,
+            notifier: OnceLock::new(),
+            nodes: Arc::downgrade(nodes),
+            fatal: Arc::downgrade(fatal),
+        }
+    }
+
+    /// Supplies the notifier once the session exists.
+    ///
+    /// Registration happens before the mount is spawned so that no revocation
+    /// can commit without this observer running. Between registration and this
+    /// call the observer has no notifier and deliberately fails closed.
+    fn attach(&self, notifier: Notifier) {
+        let _ = self.notifier.set(notifier);
+    }
+
+    fn fail(&self, reason: impl Into<String>) -> RevocationObserverError {
+        if let Some(fatal) = self.fatal.upgrade() {
+            fatal.store(true, Ordering::Release);
+        }
+        RevocationObserverError::new("capfs mount cache", reason)
+    }
+}
+
+impl RevocationObserver for MountCacheInvalidator {
+    fn discard_cached_decisions(&self) -> Result<(), RevocationObserverError> {
+        let Some(nodes) = self.nodes.upgrade() else {
+            // The mount is gone, so its caches went with it.
+            return Ok(());
+        };
+        let Some(notifier) = self.notifier.get() else {
+            return Err(self.fail(format!(
+                "mount {} was revoked before its session could be notified",
+                self.mount
+            )));
+        };
+        // Snapshot first. Invalidation can block until the operating system
+        // drains an in-flight request from this mount, and that request needs
+        // the same table.
+        let nodes = nodes
+            .live_nodes()
+            .map_err(|error| self.fail(format!("mount {} node table: {error}", self.mount)))?;
+
+        for node in nodes {
+            // Offset zero with length zero invalidates the whole file and its
+            // cached attributes. ENOENT means the kernel already dropped this
+            // inode, which is the state being asked for.
+            match notifier.inval_inode(INodeNo(node.as_u64()), 0, 0) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(self.fail(format!(
+                        "mount {} could not invalidate inode {}: {error}",
+                        self.mount,
+                        node.as_u64()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Reply flags for a writable file handle.
+///
+/// Writable handles stay on direct I/O. A buffered write through FUSE is
+/// assembled page by page and has to read a partial page back before it can
+/// modify it, which costs more than the round trips it saves. Direct I/O also
+/// keeps every write reauthorized individually, which is strictly stronger than
+/// what the page cache would give.
+const WRITABLE_HANDLE_FLAGS: FopenFlags =
+    FopenFlags::FOPEN_DIRECT_IO.union(FopenFlags::FOPEN_NOFLUSH);
+
+/// Chooses whether one open handle uses the operating system's page cache.
+///
+/// A read-only handle is cached, which is what makes repeated reads cost
+/// nothing. A writable handle is not, because buffered FUSE writes are slower
+/// than direct ones and because mixing a cached and a direct handle on one
+/// inode would let the cached one keep serving content the direct one has
+/// already overwritten.
+///
+/// Neither choice is an authorization decision. A cached handle's reads are
+/// reachable again after a revoke because [`MountCacheInvalidator`] discards
+/// the cache before the revoke returns, and a direct handle's reads never left
+/// this adapter in the first place.
+///
+/// `FOPEN_KEEP_CACHE` is never set, so a cached handle's pages are dropped at
+/// the next `OPEN`. That bounds how long one mount can show content another
+/// mount has since rewritten to a single open.
+fn handle_cache_mode(flags: OpenFlags) -> FopenFlags {
+    let requested = u32::try_from(flags.0).map(OFlags::from_bits_retain);
+    match requested {
+        Ok(flags) if !flags.intersects(OFlags::WRONLY | OFlags::RDWR) => FopenFlags::empty(),
+        // Anything writable, and anything whose flags could not be read back,
+        // takes the conservative path.
+        _ => WRITABLE_HANDLE_FLAGS,
+    }
+}
+
+/// Upper bound on session threads per mount.
+///
+/// One, on measured evidence rather than caution.
+///
+/// A single thread used to saturate at about four concurrent readers, and
+/// raising this removed that plateau. Serving reads from the operating
+/// system's page cache removed it far more effectively: a cached read never
+/// reaches the session at all, so sixteen concurrent readers now cost the same
+/// per operation whether this is one or eight.
+///
+/// What remained was the cost. Dispatching a request to a thread pool instead
+/// of the same warm thread measured about 18% worse on single-client writes,
+/// which still round trip because writable handles stay on direct I/O.
+///
+/// Raising this is worthwhile only for a workload that issues concurrent
+/// *writes* or *opens*, which is the case the benchmark does not yet cover.
+/// Each thread also holds its own request buffer sized by [`MAX_IO_SIZE`], so
+/// threads cost roughly a megabyte of resident memory apiece, per mount, and a
+/// host runs one mount per subject.
+const MAX_SESSION_THREADS: usize = 1;
+
+/// Returns the session thread count for one mount.
+///
+/// See [`MAX_SESSION_THREADS`] for why this is currently pinned to one, and
+/// what evidence would justify raising it.
+fn session_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .min(MAX_SESSION_THREADS)
+}
+
 /// Returns the hardened direct-I/O mount configuration for [`CapabilityFilesystem`].
+///
+/// The session runs several threads. That is a throughput decision only: every
+/// operation still performs its own authorization against the capability
+/// kernel's state guard, and concurrent threads change neither the set of
+/// authorized operations nor the point at which a revoke excludes them.
 #[must_use]
 pub fn mount_config() -> Config {
     let mut config = Config::default();
@@ -1818,8 +2488,10 @@ pub fn mount_config() -> Config {
         MountOption::Subtype("capfs".to_owned()),
     ];
     config.acl = SessionACL::Owner;
-    config.n_threads = Some(1);
-    config.clone_fd = false;
+    config.n_threads = Some(session_threads());
+    // Each thread needs its own descriptor to read the FUSE device without
+    // contending on a shared one.
+    config.clone_fd = true;
     config
 }
 
@@ -1835,7 +2507,27 @@ pub fn spawn_mount(
     filesystem: CapabilityFilesystem,
     mountpoint: impl AsRef<Path>,
 ) -> io::Result<BackgroundSession> {
-    fuser::spawn_mount(filesystem, mountpoint, &mount_config())
+    // The observer is registered before the mount exists. A revocation can
+    // therefore never commit against a live mount that this kernel does not
+    // know to invalidate; the worst case is a revocation between registration
+    // and `attach`, which fails closed because the notifier is still unset.
+    let invalidator = Arc::new(MountCacheInvalidator::new(
+        filesystem.authority.mount.clone(),
+        &filesystem.nodes,
+        &filesystem.fatal,
+    ));
+    filesystem
+        .kernel
+        .register_revocation_observer(Arc::clone(&invalidator) as Arc<dyn RevocationObserver>)
+        .map_err(|error| {
+            io::Error::other(format!(
+                "capability kernel rejected the mount observer: {error}"
+            ))
+        })?;
+
+    let session = fuser::spawn_mount(filesystem, mountpoint, &mount_config())?;
+    invalidator.attach(session.notifier());
+    Ok(session)
 }
 
 fn file_attr(node: NodeId, metadata: BackingMetadata) -> FileAttr {
@@ -1892,6 +2584,7 @@ const fn namespace_file_type(kind: NamespaceObjectKind) -> FileType {
     match kind {
         NamespaceObjectKind::Directory => FileType::Directory,
         NamespaceObjectKind::RegularFile => FileType::RegularFile,
+        NamespaceObjectKind::Symlink => FileType::Symlink,
     }
 }
 
@@ -1940,6 +2633,14 @@ const fn map_namespace_operation_error(
         NamespaceOperationError::Namespace(NamespaceError::DestinationInsideSource) => {
             AdapterError::InvalidRequest
         }
+        // A target that would leave the repository is refused rather than
+        // handed to the kernel, which would resolve it outside this mount.
+        NamespaceOperationError::Namespace(
+            NamespaceError::SymlinkTargetEscapes(_) | NamespaceError::CannotAliasKind { .. },
+        ) => AdapterError::CrossDevice,
+        NamespaceOperationError::Namespace(NamespaceError::InvalidSymlinkTarget(_)) => {
+            AdapterError::Unsupported
+        }
         NamespaceOperationError::Namespace(_) => AdapterError::Internal,
         NamespaceOperationError::Executor(error) => *error,
     }
@@ -1959,9 +2660,16 @@ const fn map_effect_error(error: &EffectCommitError<AdapterError>) -> AdapterErr
     match error {
         EffectCommitError::NotAuthorized => AdapterError::AccessDenied,
         EffectCommitError::Effect(error) => *error,
+        // An unknown commit outcome is reported as a failure, which is the only
+        // answer that cannot mislead: claiming success would invent a result,
+        // and the caller must not retry an operation that may already have
+        // taken effect. `map_effect_error` on the filesystem marks the mount
+        // fatal for these.
         EffectCommitError::LockPoisoned
         | EffectCommitError::Audit(_)
-        | EffectCommitError::CommittedButAudit(_) => AdapterError::Internal,
+        | EffectCommitError::CommittedButAudit(_)
+        | EffectCommitError::CommitUnknown
+        | EffectCommitError::CommitUnknownAndAudit(_) => AdapterError::Internal,
     }
 }
 
@@ -1977,9 +2685,10 @@ mod tests {
     };
 
     use authority_core::{
+        audit::AuditError,
         capability::{AuthorityBody, AuthorityRequest, IssuerId, SubjectId},
         file::{FileAuthority, FileEffect, FileEffects},
-        kernel::CapabilityKernel,
+        kernel::{CapabilityKernel, EffectCommitError},
         path::{CanonicalPath, PathPattern},
         repository::RepoId,
         state::{CapabilityGrant, CapabilityState, StaticAuthorityEnvelope, Subject},
@@ -1991,11 +2700,12 @@ mod tests {
 
     use super::{
         AdapterError, CapabilityFilesystem, CapabilityFilesystemError, MetadataUpdate,
-        MountAuthority, MountInstanceId, NodeId, SetattrMutation, supported_setattr_mutation,
+        MountAuthority, MountInstanceId, NodeId, SetattrMutation, TruncateCommit,
+        supported_setattr_mutation,
     };
     use crate::{
         backing::{ImportedRepository, PreflightLimits},
-        namespace::NamespaceObjectKind,
+        namespace::{NamespaceExecutorOutcome, NamespaceObjectKind},
         runtime::{MetadataPermissions, MetadataTime, MetadataTimes},
     };
 
@@ -2772,6 +3482,52 @@ mod tests {
                 .expect("revoked truncation must leave the backing file unchanged"),
             b"capa"
         );
+    }
+
+    // Requirement: the adapter must not collapse a kernel post-commit audit
+    // failure into the pre-commit error consumed by namespace transactions.
+    #[test]
+    fn namespace_effect_classification_preserves_commit_status() {
+        let (_directory, filesystem, _kernel, _capability) = test_filesystem();
+        assert_eq!(
+            filesystem.namespace_effect_outcome::<()>(Ok(())),
+            NamespaceExecutorOutcome::Committed(())
+        );
+        assert_eq!(
+            filesystem
+                .namespace_effect_outcome::<()>(Err(EffectCommitError::Effect(AdapterError::Busy))),
+            NamespaceExecutorOutcome::FailedBeforeCommit(AdapterError::Busy)
+        );
+        assert_eq!(
+            filesystem.namespace_effect_outcome::<()>(Err(EffectCommitError::CommittedButAudit(
+                AuditError::LockPoisoned
+            ))),
+            NamespaceExecutorOutcome::CommittedWithError(AdapterError::Internal)
+        );
+        assert_eq!(
+            filesystem.namespace_effect_outcome::<()>(Err(EffectCommitError::CommitUnknown)),
+            NamespaceExecutorOutcome::FailedBeforeCommit(AdapterError::Internal)
+        );
+        assert!(filesystem.namespace.is_in_doubt());
+    }
+
+    // Requirement: failure to observe reply metadata after a successful
+    // ftruncate quarantines the shared repository instead of falsifying the
+    // effect as failed-before-commit.
+    #[test]
+    fn post_truncate_metadata_failure_quarantines_the_repository() {
+        let (_directory, filesystem, _kernel, _capability) = test_filesystem();
+
+        assert_eq!(
+            filesystem.finish_truncate(TruncateCommit::MetadataUnavailable),
+            Err(AdapterError::Internal)
+        );
+        assert!(filesystem.namespace.is_in_doubt());
+        assert_eq!(filesystem.ensure_healthy(), Err(AdapterError::Internal));
+        assert!(matches!(
+            filesystem.lookup_entry(NodeId::ROOT, "scoped"),
+            Err(AdapterError::Internal)
+        ));
     }
 
     // Requirement: mode and timestamp SETATTR requests require SetMetadata,

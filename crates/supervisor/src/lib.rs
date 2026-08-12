@@ -10,8 +10,17 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_errors_doc)]
 
+#[cfg(target_os = "linux")]
+mod capfs_resources;
 mod protocol;
 mod supervisor;
+
+#[cfg(target_os = "linux")]
+pub use capfs_resources::{
+    CapfsBuildError, CapfsHostResources, CapfsMountPlan, CapfsPlanError, CapfsResourceError,
+    CapfsRuntimeConfig, CapfsRuntimeManager, CapfsRuntimeResources, CapfsSupervisor,
+    CapfsSupervisorError, CapfsUnmountStrategy,
+};
 
 pub use protocol::{MAX_WIRE_REQUEST_BYTES, WireDecodeError, WireEncodeError, WireRequest};
 pub use supervisor::{

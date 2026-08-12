@@ -11,4 +11,5 @@ workspace = true
 [dependencies]
 authority-core = { path = "../authority-core" }
 egress-broker = { path = "../egress-broker" }
+egress-protocol = { path = "../egress-protocol" }
 firecracker-runtime = { path = "../firecracker-runtime" }

@@ -644,7 +644,7 @@ impl CapabilityFilesystem {
                 Ok(backing) => Ok(backing),
                 Err(error) => {
                     self.close_failed_authority_handle(&authority_handle)?;
-                    Err(map_effect_error(&error))
+                    Err(self.map_effect_error(&error))
                 }
             }
         });
@@ -735,7 +735,7 @@ impl CapabilityFilesystem {
                     Ok(created) => Ok(created),
                     Err(error) => {
                         self.close_failed_authority_handle(&authority_handle)?;
-                        Err(map_effect_error(&error))
+                        Err(self.map_effect_error(&error))
                     }
                 }
             },
@@ -805,7 +805,7 @@ impl CapabilityFilesystem {
                             }
                         },
                     )
-                    .map_err(|error| map_effect_error(&error))
+                    .map_err(|error| self.map_effect_error(&error))
             },
         );
         created
@@ -863,7 +863,7 @@ impl CapabilityFilesystem {
                                 .map_err(|_| AdapterError::Internal)
                         },
                     )
-                    .map_err(|error| map_effect_error(&error))
+                    .map_err(|error| self.map_effect_error(&error))
             })
             .map_err(|error| map_namespace_operation_error(&error))
     }
@@ -910,7 +910,7 @@ impl CapabilityFilesystem {
                                     .map_err(|_| AdapterError::Internal)
                             },
                         )
-                        .map_err(|error| map_effect_error(&error))
+                        .map_err(|error| self.map_effect_error(&error))
                 },
             )
             .map_err(|error| map_namespace_operation_error(&error))
@@ -985,7 +985,7 @@ impl CapabilityFilesystem {
                                 .map_err(|_| AdapterError::Internal)
                         },
                     )
-                    .map_err(|error| map_effect_error(&error))
+                    .map_err(|error| self.map_effect_error(&error))
             })
             .map_err(|error| map_namespace_operation_error(&error))
     }
@@ -1036,7 +1036,7 @@ impl CapabilityFilesystem {
                                 })
                         },
                     )
-                    .map_err(|error| map_effect_error(&error))
+                    .map_err(|error| self.map_effect_error(&error))
             })
             .map_err(|error| map_namespace_operation_error(&error))
     }
@@ -1125,7 +1125,7 @@ impl CapabilityFilesystem {
                                 .map_err(|_| AdapterError::Internal),
                         },
                     )
-                    .map_err(|error| map_effect_error(&error))
+                    .map_err(|error| self.map_effect_error(&error))
             })
             .map_err(|error| map_namespace_operation_error(&error))
     }
@@ -1148,7 +1148,7 @@ impl CapabilityFilesystem {
                         &request,
                         |_| operation(object),
                     )
-                    .map_err(|error| map_effect_error(&error))
+                    .map_err(|error| self.map_effect_error(&error))
             })
             .map_err(|error| map_namespace_operation_error(&error))
     }
@@ -1242,7 +1242,7 @@ impl CapabilityFilesystem {
                                     .collect()
                             },
                         )
-                        .map_err(|error| map_effect_error(&error))
+                        .map_err(|error| self.map_effect_error(&error))
                 },
             )
             .map_err(|error| map_namespace_operation_error(&error))
@@ -1418,6 +1418,16 @@ impl CapabilityFilesystem {
 
     fn mark_fatal(&self) {
         self.fatal.store(true, Ordering::Release);
+    }
+
+    fn map_effect_error(&self, error: &EffectCommitError<AdapterError>) -> AdapterError {
+        if matches!(error, EffectCommitError::CommittedButAudit(_)) {
+            // The backing operation may already exist even though its durable
+            // receipt failed. Stop this mount instead of allowing a retry to
+            // apply an operation whose namespace/audit outcome is unknown.
+            self.mark_fatal();
+        }
+        map_effect_error(error)
     }
 }
 
@@ -1949,7 +1959,9 @@ const fn map_effect_error(error: &EffectCommitError<AdapterError>) -> AdapterErr
     match error {
         EffectCommitError::NotAuthorized => AdapterError::AccessDenied,
         EffectCommitError::Effect(error) => *error,
-        EffectCommitError::LockPoisoned | EffectCommitError::Audit(_) => AdapterError::Internal,
+        EffectCommitError::LockPoisoned
+        | EffectCommitError::Audit(_)
+        | EffectCommitError::CommittedButAudit(_) => AdapterError::Internal,
     }
 }
 
@@ -1959,7 +1971,8 @@ mod tests {
         fs,
         num::NonZeroUsize,
         os::unix::fs::PermissionsExt,
-        sync::Arc,
+        sync::{Arc, Barrier},
+        thread,
         time::{Duration, UNIX_EPOCH},
     };
 
@@ -2524,6 +2537,81 @@ mod tests {
         filesystem
             .release_file(allowed.node, handle)
             .expect("revocation must not prevent writable handle release");
+    }
+
+    // Requirement: a live open handle excludes rename while a positioned write
+    // is in flight, and every competing operation has one namespace order.
+    // Category: bounded concurrency/security. Risk: critical.
+    #[test]
+    fn bounded_rename_write_race_keeps_open_handle_exclusive() {
+        const OPERATIONS: usize = 32;
+
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::from_effects([FileEffect::WriteData, FileEffect::Rename]),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("the authorized parent must resolve");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("the authorized file must resolve");
+        let handle = filesystem
+            .open_file(allowed.node, OpenFlags(1))
+            .expect("WriteData authority must open a writable handle");
+        let filesystem = Arc::new(filesystem);
+        let start = Arc::new(Barrier::new(2));
+
+        let writer_filesystem = Arc::clone(&filesystem);
+        let writer_start = Arc::clone(&start);
+        let writer = thread::spawn(move || {
+            writer_start.wait();
+            (0..OPERATIONS)
+                .map(|_| writer_filesystem.write_file(allowed.node, handle, 0, b"X"))
+                .collect::<Vec<_>>()
+        });
+
+        let rename_filesystem = Arc::clone(&filesystem);
+        let rename_start = Arc::clone(&start);
+        let renamer = thread::spawn(move || {
+            rename_start.wait();
+            (0..OPERATIONS)
+                .map(|_| {
+                    rename_filesystem.rename_entry(
+                        scoped.node,
+                        "allowed.txt",
+                        scoped.node,
+                        "moved.txt",
+                        RenameFlags::RENAME_NOREPLACE,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+
+        for result in writer.join().expect("writer thread must not panic") {
+            assert_eq!(
+                result,
+                Ok(1),
+                "every write must commit while the handle is live"
+            );
+        }
+        for result in renamer.join().expect("rename thread must not panic") {
+            assert_eq!(
+                result,
+                Err(AdapterError::Busy),
+                "rename must not reach authorization or backing while an open handle exists"
+            );
+        }
+
+        filesystem
+            .release_file(allowed.node, handle)
+            .expect("the live writable handle must close after the race");
+        assert_eq!(
+            fs::read(directory.path().join("scoped/allowed.txt"))
+                .expect("the original backing path must remain readable"),
+            b"Xapability"
+        );
+        assert!(!directory.path().join("scoped/moved.txt").exists());
     }
 
     // Requirement: O_RDWR requires both effects, not merely a writable

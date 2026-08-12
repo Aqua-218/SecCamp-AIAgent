@@ -442,9 +442,9 @@ example : Isolation.requiredStages.length = 13 := by
 example : Firecracker.IdentityBundle.Valid {
     vm := 1
     session := 2
-    subject := 3
-    capability := 4
-    brokerSession := 5
+    request := 3
+    subject := 4
+    capability := 5
   } [] := by
   constructor
   · intro kind

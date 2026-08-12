@@ -5,8 +5,10 @@
 //! for arbitrary URLs, headers, HTTP methods, request bodies, or credentials.
 
 use authority_core::{
+    capability::{AuthorityRequest, CapabilityRequest},
     github::GitHubRequest,
     http::{HttpFetchMethod, HttpFetchRequest},
+    time::MonotonicTime,
 };
 
 /// One external-effect family the Broker may dispatch.
@@ -70,6 +72,29 @@ impl BrokerOperation {
             Self::GitHub(_) => None,
         }
     }
+
+    /// Rebuilds this operation as the matching authority-core request variant.
+    ///
+    /// This is the only operation-to-authority conversion in this crate. A
+    /// Broker adapter can therefore hand the exact closed operation it decoded
+    /// to `CapabilityKernel` without independently choosing an authority tag.
+    #[must_use]
+    pub fn authority_request(&self) -> AuthorityRequest {
+        match self {
+            Self::PublicFetch(request) => AuthorityRequest::HttpFetch(request.clone()),
+            Self::GitHub(request) => AuthorityRequest::GitHub(request.clone()),
+        }
+    }
+
+    /// Rebuilds this operation as a capability request at `time`.
+    ///
+    /// The Broker adapter still owns caller and capability identity, final
+    /// authorization, replay handling, budget reservation, and the external
+    /// effect's linearization point.
+    #[must_use]
+    pub fn capability_request_at(&self, time: MonotonicTime) -> CapabilityRequest {
+        CapabilityRequest::new(time, self.authority_request())
+    }
 }
 
 /// Returns whether a public operation is one of the closed safe methods.
@@ -84,9 +109,11 @@ pub const fn is_safe_public_fetch_method(method: HttpFetchMethod) -> bool {
 #[cfg(test)]
 mod tests {
     use authority_core::{
+        capability::AuthorityRequest,
         github::{BranchName, GitHubOperation, GitHubRequest, InstallationId},
         http::{CanonicalHost, CanonicalUrlPath, HttpFetchMethod, HttpFetchRequest},
         repository::RepoId,
+        time::MonotonicTime,
     };
 
     use super::{BrokerOperation, BrokerOperationKind, is_safe_public_fetch_method};
@@ -134,5 +161,26 @@ mod tests {
     fn public_fetch_method_universe_contains_only_get_and_head() {
         assert!(is_safe_public_fetch_method(HttpFetchMethod::Get));
         assert!(is_safe_public_fetch_method(HttpFetchMethod::Head));
+    }
+
+    #[test]
+    fn authority_conversion_preserves_the_exact_closed_operation_variant() {
+        let fetch = BrokerOperation::PublicFetch(public_fetch());
+        let github = BrokerOperation::GitHub(github_request());
+        let time = MonotonicTime::from_ticks(42);
+
+        assert_eq!(
+            fetch.authority_request(),
+            AuthorityRequest::HttpFetch(public_fetch())
+        );
+        assert_eq!(
+            github.authority_request(),
+            AuthorityRequest::GitHub(github_request())
+        );
+        assert_eq!(fetch.capability_request_at(time).time(), time);
+        assert_eq!(
+            fetch.capability_request_at(time).authority(),
+            &fetch.authority_request()
+        );
     }
 }

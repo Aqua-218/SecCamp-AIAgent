@@ -185,8 +185,9 @@ pub enum IsolationError {
     },
     /// Applying an irreversible step may have partially changed process state.
     ///
-    /// The caller must terminate the process because this coordinator has no
-    /// process handle with which to enforce that obligation.
+    /// [`RuntimeIsolation::apply`] enforces this obligation by aborting the
+    /// current process. Code using the crate-internal non-enforcing transaction
+    /// path must not allow the process to continue.
     TerminationRequired {
         /// The operation that caused the transaction to stop.
         original: BackendError,
@@ -343,6 +344,9 @@ impl RuntimeIsolation {
 }
 
 /// Applies an isolation policy through the supplied backend.
+///
+/// Aborts the current process when an irreversible operation may have been
+/// partially applied.
 pub fn apply<B: IsolationBackend>(
     backend: &mut B,
     config: &IsolationConfig,

@@ -50,6 +50,21 @@ structure ReplayState where
 
 namespace ReplayState
 
+/-- Rust `checked_add(1)` for a logical `u64` sequence cursor. -/
+def checkedSuccessor (sequence : Nat) : Option Nat :=
+  if sequence < u64Maximum then some (sequence + 1) else none
+
+/-- A sequence at `u64::MAX` is accepted once and then exhausts the cursor. -/
+theorem checkedSuccessor_maximum : checkedSuccessor u64Maximum = none := by
+  simp [checkedSuccessor, CanIncrementU64]
+
+/-- A representable sequence is covered by the next cursor or exhaustion. -/
+def CursorCovers (nextSequence : Option Nat) (sequence : Nat) : Prop :=
+  FitsU64 sequence ∧
+    match nextSequence with
+    | some next => sequence < next
+    | none => True
+
 /-- Fresh replay state expects sequence zero. -/
 def empty (session : BrokerSessionId) (capacity : Nat) : ReplayState where
   session := session
@@ -71,12 +86,13 @@ structure MayAcceptNew (state : ReplayState) (envelope : BrokerEnvelope) where
   sessionMatches : envelope.session = state.session
   requestFresh : state.accepted envelope.request = none
   sequenceExpected : state.nextSequence = some envelope.sequence
+  sequenceRepresentable : FitsU64 envelope.sequence
   capacityAvailable : state.acceptedCount < state.capacity
 
 /-- Commit one validated new request binding. -/
 def acceptNew (state : ReplayState) (envelope : BrokerEnvelope) : ReplayState :=
   { state with
-    nextSequence := some (envelope.sequence + 1)
+    nextSequence := checkedSuccessor envelope.sequence
     acceptedCount := state.acceptedCount + 1
     accepted := replace state.accepted envelope.request (some {
       sequence := envelope.sequence
@@ -87,7 +103,7 @@ def acceptNew (state : ReplayState) (envelope : BrokerEnvelope) : ReplayState :=
 def WellFormed (state : ReplayState) : Prop :=
   state.acceptedCount ≤ state.capacity ∧
     ∀ request record, state.accepted request = some record →
-      ∃ next, state.nextSequence = some next ∧ record.sequence < next
+      CursorCovers state.nextSequence record.sequence
 
 /-- Empty replay state is well formed for every capacity. -/
 theorem empty_wellFormed (session : BrokerSessionId) (capacity : Nat) :
@@ -109,8 +125,14 @@ theorem acceptNew_stores_exact_binding (state : ReplayState)
 /-- A new acceptance advances the cursor by exactly one. -/
 theorem acceptNew_advances_sequence (state : ReplayState)
     (envelope : BrokerEnvelope) :
-    (state.acceptNew envelope).nextSequence = some (envelope.sequence + 1) := by
+    (state.acceptNew envelope).nextSequence = checkedSuccessor envelope.sequence := by
   rfl
+
+/-- Accepting `u64::MAX` records the binding and makes later fresh input impossible. -/
+theorem acceptMaximum_exhausts_sequence (state : ReplayState)
+    (envelope : BrokerEnvelope) (maximum : envelope.sequence = u64Maximum) :
+    (state.acceptNew envelope).nextSequence = none := by
+  rw [acceptNew_advances_sequence, maximum, checkedSuccessor_maximum]
 
 /-- Accepting a fresh identity preserves all earlier request bindings. -/
 theorem acceptNew_preserves_existing {state : ReplayState}
@@ -158,7 +180,6 @@ theorem acceptNew_preserves_wellFormed {state : ReplayState}
   · simp only [acceptNew]
     exact Nat.succ_le_of_lt allowed.capacityAvailable
   · intro request record lookup
-    refine ⟨envelope.sequence + 1, rfl, ?_⟩
     by_cases sameRequest : request = envelope.request
     · subst request
       have exactRecord : record = {
@@ -167,15 +188,21 @@ theorem acceptNew_preserves_wellFormed {state : ReplayState}
         } := Option.some.inj
           (lookup.symm.trans (acceptNew_stores_exact_binding state envelope))
       subst record
-      simp
+      refine ⟨allowed.sequenceRepresentable, ?_⟩
+      simp only [acceptNew]
+      by_cases canIncrement : envelope.sequence < u64Maximum
+      · simp [checkedSuccessor, canIncrement]
+      · simp [checkedSuccessor, canIncrement]
     · have oldLookup : state.accepted request = some record := by
         simpa [acceptNew, replace, sameRequest] using lookup
-      rcases wellFormed.2 request record oldLookup with
-        ⟨oldNext, oldCursor, recordBeforeCursor⟩
-      rw [allowed.sequenceExpected] at oldCursor
-      have cursorEquality := Option.some.inj oldCursor
-      subst oldNext
-      omega
+      have oldCovered := wellFormed.2 request record oldLookup
+      rw [allowed.sequenceExpected] at oldCovered
+      refine ⟨oldCovered.1, ?_⟩
+      simp only [acceptNew]
+      by_cases canIncrement : envelope.sequence < u64Maximum
+      · simp [checkedSuccessor, canIncrement]
+        exact Nat.lt.step oldCovered.2
+      · simp [checkedSuccessor, canIncrement]
 
 /-- Finite representation witnessing the exact domain of the replay map. -/
 structure Accounting (state : ReplayState) (acceptedIds : List BrokerRequestId) : Prop where
@@ -347,10 +374,30 @@ def WithinLimits (budget : SessionBudget) : Prop :=
       budget.limits.maxResponseBytes ∧
     budget.activeRequests ≤ budget.limits.maxConcurrentRequests
 
+/-- Immutable broker ceilings fit the Rust integer fields that store them. -/
+def LimitsRepresentable (limits : SessionBudgetLimits) : Prop :=
+  FitsU64 limits.maxRequests ∧
+    FitsU64 limits.maxResponseBytes ∧
+    FitsU64 limits.maxConcurrentRequests
+
+/-- Every logical budget counter has a faithful Rust integer representation. -/
+def CountersRepresentable (budget : SessionBudget) : Prop :=
+  LimitsRepresentable budget.limits ∧
+    FitsU64 budget.startedRequests ∧
+    FitsU64 budget.committedResponseBytes ∧
+    FitsU64 budget.reservedResponseBytes ∧
+    FitsU64 budget.activeRequests
+
 /-- Empty accounting is within every limit. -/
 theorem empty_withinLimits (limits : SessionBudgetLimits) :
     (empty limits).WithinLimits := by
   simp [empty, WithinLimits]
+
+/-- An empty budget inherits representability from its immutable ceilings. -/
+theorem empty_countersRepresentable {limits : SessionBudgetLimits}
+    (representable : LimitsRepresentable limits) :
+    (empty limits).CountersRepresentable := by
+  simp [CountersRepresentable, empty, FitsU64, u64Maximum, representable]
 
 /-- Empty accounting has an exact empty finite representation. -/
 theorem empty_accounting (limits : SessionBudgetLimits) :
@@ -722,6 +769,39 @@ theorem Step.preserves_limits {before after : SessionBudget}
   | complete allowed => exact complete_preserves_limits withinLimits allowed
   | abort allowed => exact abort_preserves_limits withinLimits allowed
 
+/-- Accepted budget transitions never replace the immutable session ceilings. -/
+theorem Step.limits_immutable {before after : SessionBudget}
+    (transition : Step before after) : after.limits = before.limits := by
+  cases transition <;> rfl
+
+/-- Checked budget arithmetic preserves all Rust integer representation bounds. -/
+theorem Step.preserves_countersRepresentable {before after : SessionBudget}
+    (transition : Step before after) (withinLimits : before.WithinLimits)
+    (representable : before.CountersRepresentable) :
+    after.CountersRepresentable := by
+  have afterWithinLimits := transition.preserves_limits withinLimits
+  have limitsSame := transition.limits_immutable
+  rcases representable with
+    ⟨⟨requestLimitFits, responseLimitFits, concurrentLimitFits⟩,
+      _startedFits, _committedFits, _reservedFits, _activeFits⟩
+  have afterRequestLimitFits : FitsU64 after.limits.maxRequests := by
+    rw [limitsSame]
+    exact requestLimitFits
+  have afterResponseLimitFits : FitsU64 after.limits.maxResponseBytes := by
+    rw [limitsSame]
+    exact responseLimitFits
+  have afterConcurrentLimitFits : FitsU64 after.limits.maxConcurrentRequests := by
+    rw [limitsSame]
+    exact concurrentLimitFits
+  refine ⟨⟨afterRequestLimitFits, afterResponseLimitFits,
+      afterConcurrentLimitFits⟩, ?_, ?_, ?_, ?_⟩
+  · exact Nat.le_trans afterWithinLimits.1 afterRequestLimitFits
+  · exact Nat.le_trans (Nat.le_add_right _ _) <|
+      Nat.le_trans afterWithinLimits.2.1 afterResponseLimitFits
+  · exact Nat.le_trans (Nat.le_add_left _ _) <|
+      Nat.le_trans afterWithinLimits.2.1 afterResponseLimitFits
+  · exact Nat.le_trans afterWithinLimits.2.2 afterConcurrentLimitFits
+
 /-- Exact reservation accounting is inductive across every accepted budget step. -/
 theorem Step.preserves_accounting {before after : SessionBudget}
     (transition : Step before after) (accounted : before.FullyAccounted) :
@@ -758,6 +838,17 @@ theorem Steps.preserves_limits {before after : SessionBudget}
   | refl => exact withinLimits
   | next firstStep remainingSteps inductionResult =>
       exact inductionResult (firstStep.preserves_limits withinLimits)
+
+/-- Arbitrary accepted budget executions keep every counter representable. -/
+theorem Steps.preserve_countersRepresentable {before after : SessionBudget}
+    (execution : Steps before after) (withinLimits : before.WithinLimits)
+    (representable : before.CountersRepresentable) :
+    after.CountersRepresentable := by
+  induction execution with
+  | refl => exact representable
+  | next firstStep remainingSteps inductionResult =>
+      exact inductionResult (firstStep.preserves_limits withinLimits)
+        (firstStep.preserves_countersRepresentable withinLimits representable)
 
 /-- Exact reservation accounting survives an arbitrary accepted execution. -/
 theorem Steps.preserves_accounting {before after : SessionBudget}

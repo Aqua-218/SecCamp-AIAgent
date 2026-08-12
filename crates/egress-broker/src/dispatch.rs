@@ -237,6 +237,7 @@ pub struct BrokerDispatcher<E, P, G> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CachedOutcome {
+    AcceptedPending { response_cap: u64 },
     Final(BrokerResponse),
     RetryableBudget(BrokerOperation),
 }
@@ -308,35 +309,58 @@ where
         let request =
             CanonicalBrokerRequest::decode(frame.payload()).map_err(DispatchError::Cbor)?;
         let envelope = request.envelope();
-        match self
-            .replay
-            .accept(envelope)
-            .map_err(DispatchError::Envelope)?
-        {
+        let request_id = envelope.request();
+        let response_cap = self.operation_response_cap(request.operation());
+        let had_retained_outcome = self.outcomes.contains_key(&request_id);
+        if !had_retained_outcome {
+            // Cache before mutating the replay guard. If execution is
+            // interrupted on either side of `accept`, the next call sees the
+            // marker and cannot mistake the request for safe new work.
+            self.outcomes
+                .insert(request_id, CachedOutcome::AcceptedPending { response_cap });
+        }
+        let acceptance = match self.replay.accept(envelope) {
+            Ok(acceptance) => acceptance,
+            Err(error) => {
+                if !had_retained_outcome {
+                    self.outcomes.remove(&request_id);
+                }
+                return Err(DispatchError::Envelope(error));
+            }
+        };
+        if acceptance == EnvelopeAcceptance::New && had_retained_outcome {
+            // A pending cache entry can predate replay admission when the
+            // original call was interrupted between the two transitions.
+            // Conservatively terminate it without running an external effect.
+            return Ok(self.recover_accepted_pending(request_id, response_cap));
+        }
+        match acceptance {
             EnvelopeAcceptance::Duplicate => {
-                match self.outcomes.get(&envelope.request()).cloned() {
+                match self.outcomes.get(&request_id).cloned() {
+                    Some(CachedOutcome::AcceptedPending { response_cap }) => {
+                        Ok(self.recover_accepted_pending(request_id, response_cap))
+                    }
                     Some(CachedOutcome::Final(response)) => Ok(response),
                     Some(CachedOutcome::RetryableBudget(operation)) => {
-                        let (response, cached) =
-                            self.dispatch_new(envelope.request(), &operation, context);
+                        let (response, cached) = self.dispatch_new(request_id, &operation, context);
                         // The same write-back as the `New` arm below. Storing
                         // only when `dispatch_new` returns `Some` would leave
                         // the entry `RetryableBudget` forever, so every later
                         // exact retry would re-enter the adapter.
                         self.outcomes.insert(
-                            envelope.request(),
+                            request_id,
                             cached.unwrap_or_else(|| CachedOutcome::Final(response.clone())),
                         );
                         Ok(response)
                     }
-                    None => Err(DispatchError::MissingCachedOutcome(envelope.request())),
+                    None => Err(DispatchError::MissingCachedOutcome(request_id)),
                 }
             }
             EnvelopeAcceptance::New => {
                 let (response, cached) =
-                    self.dispatch_new(envelope.request(), request.operation(), context);
+                    self.dispatch_new(request_id, request.operation(), context);
                 self.outcomes.insert(
-                    envelope.request(),
+                    request_id,
                     cached.unwrap_or_else(|| CachedOutcome::Final(response.clone())),
                 );
                 Ok(response)
@@ -393,9 +417,7 @@ where
                 None,
             );
         }
-        let response_cap = operation
-            .public_response_byte_limit()
-            .unwrap_or(self.github_response_cap);
+        let response_cap = self.operation_response_cap(operation);
         if let Err(error) = self.budget.start(request_id, response_cap) {
             let response = Self::rejected(request_id, BrokerRejection::Budget);
             let cached = if is_retryable_budget_error(error, self.budget.usage()) {
@@ -480,14 +502,34 @@ where
         }
     }
 
+    fn operation_response_cap(&self, operation: &BrokerOperation) -> u64 {
+        operation
+            .public_response_byte_limit()
+            .unwrap_or(self.github_response_cap)
+    }
+
+    fn recover_accepted_pending(
+        &mut self,
+        request_id: BrokerRequestId,
+        response_cap: u64,
+    ) -> BrokerResponse {
+        // Admission survived without a retained completion, so the external
+        // linearization point may have been crossed. Settle any live budget
+        // reservation at its full cap and never invoke the adapter again.
+        let (response, _) = self.settle_committed_but_unrecorded(request_id, response_cap);
+        self.outcomes
+            .insert(request_id, CachedOutcome::Final(response.clone()));
+        response
+    }
+
     fn settle_committed_but_unrecorded(
         &mut self,
         request_id: BrokerRequestId,
         response_cap: u64,
     ) -> (BrokerResponse, Option<CachedOutcome>) {
-        // The executor crossed its linearization point, so the external effect
-        // may exist at the provider. Charging the complete reservation keeps
-        // the session honest and prevents those bytes from being spent twice.
+        // The external effect may exist at the provider. Charging any live
+        // reservation at its complete cap keeps the session honest and
+        // prevents those bytes from being spent twice.
         if self.budget.complete(request_id, response_cap).is_err() {
             let _ = self.budget.abort(request_id);
         }
@@ -594,7 +636,10 @@ mod tests {
         io::Cursor,
         net::{IpAddr, Ipv4Addr},
         num::{NonZeroU64, NonZeroUsize},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU32, Ordering},
+        },
         time::Duration,
     };
 
@@ -624,8 +669,8 @@ mod tests {
 
     use super::{
         AdapterError, BrokerDispatcher, BrokerEffect, BrokerOutcome, BrokerRejection,
-        CapabilityExecutor, DispatchContext, DispatchError, ExecutorError,
-        default_github_response_cap,
+        CachedOutcome, CapabilityExecutor, DispatchContext, DispatchError, ExecutorError,
+        PublicDispatchAdapter, default_github_response_cap,
     };
     use crate::{
         github::{
@@ -636,7 +681,7 @@ mod tests {
         ip_policy::IpPolicy,
         public_fetch::{
             ConnectorError, ConnectorResponse, FetchError, FetchPolicy, FetchTarget,
-            HttpsConnector, PublicFetcher, Resolver,
+            HttpsConnector, PublicFetcher, PublicResponse, Resolver,
         },
         transport::FramedTransport,
     };
@@ -839,6 +884,37 @@ mod tests {
         }
     }
 
+    struct PanickingExecutor {
+        calls: Arc<AtomicU32>,
+    }
+
+    impl CapabilityExecutor for PanickingExecutor {
+        fn execute(
+            &self,
+            _context: &DispatchContext,
+            _request: &CapabilityRequest,
+            _effect: &mut dyn FnMut(&Capability) -> Result<BrokerEffect, AdapterError>,
+        ) -> Result<BrokerEffect, ExecutorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            panic!("injected executor panic");
+        }
+    }
+
+    struct PanickingPublicAdapter {
+        calls: Arc<AtomicU32>,
+    }
+
+    impl PublicDispatchAdapter for PanickingPublicAdapter {
+        fn fetch(
+            &self,
+            _request: &HttpFetchRequest,
+            _authority: &HttpFetchAuthority,
+        ) -> Result<PublicResponse, FetchError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            panic!("injected public adapter panic");
+        }
+    }
+
     fn dispatcher_with_executor(
         executor: FailingExecutor,
     ) -> BrokerDispatcher<
@@ -848,6 +924,36 @@ mod tests {
     > {
         BrokerDispatcher::new(
             executor,
+            PublicFetcher::new(
+                ResolverFixture,
+                ConnectorFixture,
+                IpPolicy::default(),
+                FetchPolicy::default(),
+            ),
+            MockGithub {
+                calls: Arc::new(Mutex::new(0)),
+                failure: false,
+            },
+            BrokerSessionId::new([1; 16]),
+            NonZeroUsize::new(8).expect("fixture capacity is non-zero"),
+            SessionBudgetLimits::new(
+                NonZeroU64::new(4).expect("fixture request limit is non-zero"),
+                128,
+                NonZeroUsize::new(2).expect("fixture concurrency limit is non-zero"),
+            ),
+            default_github_response_cap(),
+        )
+    }
+
+    fn dispatcher_with_panicking_executor(
+        calls: Arc<AtomicU32>,
+    ) -> BrokerDispatcher<
+        PanickingExecutor,
+        PublicFetcher<ResolverFixture, ConnectorFixture>,
+        MockGithub,
+    > {
+        BrokerDispatcher::new(
+            PanickingExecutor { calls },
             PublicFetcher::new(
                 ResolverFixture,
                 ConnectorFixture,
@@ -1012,6 +1118,137 @@ mod tests {
                 "no effect ran, so nothing is charged"
             );
         }
+    }
+
+    // Requirement: an executor panic after replay admission cannot reopen the external effect.
+    // Category: state transition/security/idempotency. Risk: critical.
+    #[test]
+    fn dispatcher_recovers_executor_panic_as_terminal_commit_unknown() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut dispatcher = dispatcher_with_panicking_executor(calls.clone());
+        let context = DispatchContext {
+            caller: SubjectId::new("subject"),
+            capability: CapId::new("capability"),
+            now: MonotonicTime::from_ticks(1),
+        };
+        let encoded = frame(BrokerSessionId::new([1; 16]), 0, 13, public_operation());
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = dispatcher.dispatch_frame(&encoded, &context);
+        }));
+        assert!(panic.is_err(), "the injected executor panic must propagate");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatcher.budget_usage().active_requests(), 1);
+
+        let recovered = dispatcher
+            .dispatch_frame(&encoded, &context)
+            .expect("an exact retry should recover the retained pending state");
+        assert_eq!(
+            recovered.outcome,
+            BrokerOutcome::Rejected(BrokerRejection::CommittedButUnrecorded)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatcher.budget_usage().active_requests(), 0);
+        assert_eq!(dispatcher.budget_usage().committed_response_bytes(), 32);
+
+        assert_eq!(
+            dispatcher
+                .dispatch_frame(&encoded, &context)
+                .expect("the recovered outcome should remain terminal"),
+            recovered
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Requirement: a panic inside an authorized adapter cannot duplicate its unknown effect.
+    // Category: integration/security/idempotency. Risk: critical.
+    #[test]
+    fn dispatcher_recovers_adapter_panic_without_reinvoking_adapter() {
+        let (kernel, subject, capability) = kernel_and_capability();
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut dispatcher = BrokerDispatcher::new(
+            kernel,
+            PanickingPublicAdapter {
+                calls: calls.clone(),
+            },
+            MockGithub {
+                calls: Arc::new(Mutex::new(0)),
+                failure: false,
+            },
+            BrokerSessionId::new([1; 16]),
+            NonZeroUsize::new(8).expect("fixture capacity is non-zero"),
+            SessionBudgetLimits::new(
+                NonZeroU64::new(4).expect("fixture request limit is non-zero"),
+                128,
+                NonZeroUsize::new(1).expect("fixture concurrency limit is non-zero"),
+            ),
+            default_github_response_cap(),
+        );
+        let context = DispatchContext {
+            caller: subject,
+            capability,
+            now: MonotonicTime::from_ticks(1),
+        };
+        let encoded = frame(BrokerSessionId::new([1; 16]), 0, 14, public_operation());
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = dispatcher.dispatch_frame(&encoded, &context);
+        }));
+        assert!(panic.is_err(), "the injected adapter panic must propagate");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let recovered = dispatcher
+            .dispatch_frame(&encoded, &context)
+            .expect("an exact retry should fail closed from the pending state");
+        assert_eq!(
+            recovered.outcome,
+            BrokerOutcome::Rejected(BrokerRejection::CommittedButUnrecorded)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatcher.budget_usage().active_requests(), 0);
+        assert_eq!(dispatcher.budget_usage().committed_response_bytes(), 32);
+    }
+
+    // Requirement: interruption before replay mutation still cannot turn retry into new work.
+    // Category: state transition/security/idempotency. Risk: critical.
+    #[test]
+    fn dispatcher_fails_closed_after_pre_admission_interruption() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut dispatcher = dispatcher_with_panicking_executor(calls.clone());
+        let context = DispatchContext {
+            caller: SubjectId::new("subject"),
+            capability: CapId::new("capability"),
+            now: MonotonicTime::from_ticks(1),
+        };
+        let encoded = frame(BrokerSessionId::new([1; 16]), 0, 15, public_operation());
+        let control = ControlFrame::decode_complete(&encoded).expect("fixture frame is valid");
+        let request = CanonicalBrokerRequest::decode(control.payload())
+            .expect("fixture request is canonical");
+        let request_id = request.envelope().request();
+        let response_cap = dispatcher.operation_response_cap(request.operation());
+
+        // This is the only state retained if the caller is interrupted after
+        // the pre-admission cache write but before `replay.accept`.
+        dispatcher
+            .outcomes
+            .insert(request_id, CachedOutcome::AcceptedPending { response_cap });
+
+        let recovered = dispatcher
+            .dispatch_frame(&encoded, &context)
+            .expect("the resumed request should terminate without execution");
+        assert_eq!(
+            recovered.outcome,
+            BrokerOutcome::Rejected(BrokerRejection::CommittedButUnrecorded)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(dispatcher.budget_usage().started_requests(), 0);
+        assert_eq!(
+            dispatcher
+                .dispatch_frame(&encoded, &context)
+                .expect("the exact retry should use the terminal cache"),
+            recovered
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     fn dispatcher_with_response_budget(

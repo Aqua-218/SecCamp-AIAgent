@@ -18,7 +18,7 @@ use authority_core::{
     },
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
     handle::{HandleId, ObjectId, OpenHandle},
-    kernel::{CapabilityKernel, CapabilityKernelError, EffectCommitError},
+    kernel::{CapabilityKernel, CapabilityKernelError, EffectCommitError, EffectExecution},
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     state::{
@@ -182,7 +182,7 @@ fn guarded_commit_never_crosses_a_completed_revoke() {
         let effect_capability_id = capability_id.clone();
         let effect_revoke_returned = Arc::clone(&revoke_returned);
         let effect = thread::spawn(move || {
-            effect_kernel.authorize_and_commit(
+            effect_kernel.authorize_and_execute_classified(
                 &subject_id(),
                 &effect_capability_id,
                 &request(),
@@ -192,7 +192,10 @@ fn guarded_commit_never_crosses_a_completed_revoke() {
                         !effect_revoke_returned.load(Ordering::Acquire),
                         "effect committed after revoke returned"
                     );
-                    Ok::<_, Infallible>(())
+                    EffectExecution::<_, Infallible>::Committed {
+                        value: (),
+                        receipt: None,
+                    }
                 },
             )
         });
@@ -202,7 +205,7 @@ fn guarded_commit_never_crosses_a_completed_revoke() {
         let revoke_finished = Arc::clone(&revoke_returned);
         let revoke = thread::spawn(move || {
             assert_eq!(
-                revoke_kernel.revoke(&revoke_capability_id),
+                revoke_kernel.revoke_held_by(&subject_id(), &revoke_capability_id),
                 Ok(RevocationStatus::NewlyRevoked)
             );
             revoke_finished.store(true, Ordering::Release);
@@ -252,21 +255,29 @@ fn guarded_descendant_commit_never_crosses_completed_ancestor_revoke() {
         let effect_kernel = Arc::clone(&kernel);
         let effect_revoke_returned = Arc::clone(&revoke_returned);
         let effect = thread::spawn(move || {
-            effect_kernel.authorize_and_commit(&child_subject_id(), &child_id, &request(), |_| {
-                thread::yield_now();
-                assert!(
-                    !effect_revoke_returned.load(Ordering::Acquire),
-                    "descendant effect committed after ancestor revoke returned"
-                );
-                Ok::<_, Infallible>(())
-            })
+            effect_kernel.authorize_and_execute_classified(
+                &child_subject_id(),
+                &child_id,
+                &request(),
+                |_| {
+                    thread::yield_now();
+                    assert!(
+                        !effect_revoke_returned.load(Ordering::Acquire),
+                        "descendant effect committed after ancestor revoke returned"
+                    );
+                    EffectExecution::<_, Infallible>::Committed {
+                        value: (),
+                        receipt: None,
+                    }
+                },
+            )
         });
 
         let revoke_kernel = Arc::clone(&kernel);
         let revoke_finished = Arc::clone(&revoke_returned);
         let revoke = thread::spawn(move || {
             assert_eq!(
-                revoke_kernel.revoke(&root_id),
+                revoke_kernel.revoke_held_by(&subject_id(), &root_id),
                 Ok(RevocationStatus::NewlyRevoked)
             );
             revoke_finished.store(true, Ordering::Release);
@@ -296,6 +307,11 @@ fn check_compound_commit_against_revoke(revoke_ancestor: bool) {
         } else {
             capability_id.clone()
         };
+        let revoke_subject = if revoke_ancestor {
+            subject_id()
+        } else {
+            child_subject_id()
+        };
         let kernel = Arc::new(CapabilityKernel::new(state));
         let revoke_returned = Arc::new(AtomicBool::new(false));
         let executor_entries = Arc::new(AtomicUsize::new(0));
@@ -309,7 +325,7 @@ fn check_compound_commit_against_revoke(revoke_ancestor: bool) {
         let effect_executor_entries = Arc::clone(&executor_entries);
         let effect_executor_steps = Arc::clone(&executor_steps);
         let effect = thread::spawn(move || {
-            effect_kernel.authorize_all_and_commit(
+            effect_kernel.authorize_all_and_execute_classified(
                 &child_subject_id(),
                 &capability_id,
                 &requests,
@@ -327,7 +343,10 @@ fn check_compound_commit_against_revoke(revoke_ancestor: bool) {
                         "revoke returned between compound executor steps"
                     );
                     effect_executor_steps.fetch_add(1, Ordering::AcqRel);
-                    Ok::<_, Infallible>(())
+                    EffectExecution::<_, Infallible>::Committed {
+                        value: (),
+                        receipt: None,
+                    }
                 },
             )
         });
@@ -336,7 +355,7 @@ fn check_compound_commit_against_revoke(revoke_ancestor: bool) {
         let revoke_finished = Arc::clone(&revoke_returned);
         let revoke = thread::spawn(move || {
             assert_eq!(
-                revoke_kernel.revoke(&revoke_id),
+                revoke_kernel.revoke_held_by(&revoke_subject, &revoke_id),
                 Ok(RevocationStatus::NewlyRevoked)
             );
             revoke_finished.store(true, Ordering::Release);
@@ -419,7 +438,7 @@ fn two_guarded_effects_remain_consistent_with_one_revoke_order() {
             let effect_calls = Arc::clone(executor_calls);
             let effect_capability_id = capability_id.clone();
             thread::spawn(move || {
-                effect_kernel.authorize_and_commit(
+                effect_kernel.authorize_and_execute_classified(
                     &subject_id(),
                     &effect_capability_id,
                     &request(),
@@ -429,7 +448,10 @@ fn two_guarded_effects_remain_consistent_with_one_revoke_order() {
                             "effect committed after revoke returned"
                         );
                         effect_calls.fetch_add(1, Ordering::AcqRel);
-                        Ok::<_, Infallible>(())
+                        EffectExecution::<_, Infallible>::Committed {
+                            value: (),
+                            receipt: None,
+                        }
                     },
                 )
             })
@@ -441,7 +463,7 @@ fn two_guarded_effects_remain_consistent_with_one_revoke_order() {
         let revoke_finished = Arc::clone(&revoke_returned);
         let revoke = thread::spawn(move || {
             assert_eq!(
-                revoke_kernel.revoke(&capability_id),
+                revoke_kernel.revoke_held_by(&subject_id(), &capability_id),
                 Ok(RevocationStatus::NewlyRevoked)
             );
             revoke_finished.store(true, Ordering::Release);
@@ -569,7 +591,7 @@ fn multiple_direct_and_ancestor_revokes_preserve_effect_order() {
         let effect_child_id = child_id.clone();
         let effect_completed_revokes = Arc::clone(&completed_revokes);
         let effect = thread::spawn(move || {
-            effect_kernel.authorize_and_commit(
+            effect_kernel.authorize_and_execute_classified(
                 &child_subject_id(),
                 &effect_child_id,
                 &request(),
@@ -579,7 +601,10 @@ fn multiple_direct_and_ancestor_revokes_preserve_effect_order() {
                         0,
                         "an effect cannot commit after either revoke returned"
                     );
-                    Ok::<_, Infallible>(())
+                    EffectExecution::<_, Infallible>::Committed {
+                        value: (),
+                        receipt: None,
+                    }
                 },
             )
         });
@@ -588,7 +613,7 @@ fn multiple_direct_and_ancestor_revokes_preserve_effect_order() {
         let child_revoke_completed = Arc::clone(&completed_revokes);
         let child_revoke_id = child_id.clone();
         let child_revoke = thread::spawn(move || {
-            let result = child_revoke_kernel.revoke(&child_revoke_id);
+            let result = child_revoke_kernel.revoke_held_by(&child_subject_id(), &child_revoke_id);
             assert_eq!(result, Ok(RevocationStatus::NewlyRevoked));
             child_revoke_completed.fetch_add(1, Ordering::AcqRel);
         });
@@ -596,7 +621,7 @@ fn multiple_direct_and_ancestor_revokes_preserve_effect_order() {
         let root_revoke_kernel = Arc::clone(&kernel);
         let root_revoke_completed = Arc::clone(&completed_revokes);
         let root_revoke = thread::spawn(move || {
-            let result = root_revoke_kernel.revoke(&root_id);
+            let result = root_revoke_kernel.revoke_held_by(&subject_id(), &root_id);
             assert_eq!(result, Ok(RevocationStatus::NewlyRevoked));
             root_revoke_completed.fetch_add(1, Ordering::AcqRel);
         });

@@ -173,6 +173,11 @@ pub enum BrokerConnectionExit {
 /// Runs the policy and protocol loop for one already CID-authenticated stream.
 pub trait BrokerRuntime<S>: Send + 'static {
     /// Owns and serves `stream` until a typed terminal condition is reached.
+    ///
+    /// Implementations must serve synchronously: they must not transfer the
+    /// stream to a detached task, and they must return after cancellation plus
+    /// stream shutdown. Those requirements let backend close and drop retain
+    /// exclusive ownership until the worker has actually terminated.
     fn serve(self, stream: S, cancellation: &BrokerCancellation) -> BrokerConnectionExit;
 }
 
@@ -215,23 +220,9 @@ where
             &mut self.clock,
             self.max_requests,
         ) {
-            Ok(report) => match report.close_reason() {
-                ConnectionCloseReason::RequestLimitReached => {
-                    BrokerConnectionExit::RequestLimitReached {
-                        requests_served: report.requests_served(),
-                    }
-                }
-                ConnectionCloseReason::AccountingInvariant => {
-                    BrokerConnectionExit::AccountingInvariant {
-                        requests_served: report.requests_served(),
-                    }
-                }
-                ConnectionCloseReason::CommittedButUnrecorded => {
-                    BrokerConnectionExit::CommittedButUnrecorded {
-                        requests_served: report.requests_served(),
-                    }
-                }
-            },
+            Ok(report) => {
+                successful_connection_exit(report.close_reason(), report.requests_served())
+            }
             Err(_) if cancellation.is_cancelled() => BrokerConnectionExit::Cancelled,
             Err(ServerError::Transport(TransportError::Io(error)))
                 if matches!(
@@ -246,6 +237,23 @@ where
             Err(error) => BrokerConnectionExit::Failed {
                 message: error.to_string(),
             },
+        }
+    }
+}
+
+fn successful_connection_exit(
+    close_reason: ConnectionCloseReason,
+    requests_served: usize,
+) -> BrokerConnectionExit {
+    match close_reason {
+        ConnectionCloseReason::RequestLimitReached => {
+            BrokerConnectionExit::RequestLimitReached { requests_served }
+        }
+        ConnectionCloseReason::AccountingInvariant => {
+            BrokerConnectionExit::AccountingInvariant { requests_served }
+        }
+        ConnectionCloseReason::CommittedButUnrecorded => {
+            BrokerConnectionExit::CommittedButUnrecorded { requests_served }
         }
     }
 }
@@ -817,10 +825,12 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use egress_broker::server::ConnectionCloseReason;
+
     use super::{
         BrokerBackend, BrokerCancellation, BrokerConnectionExit, BrokerRuntime,
         BrokerRuntimeFactory, BrokerServiceListener, BrokerStreamShutdown, BrokerWorkerExit,
-        BrokerWorkerStatus, VsockListenerFactory,
+        BrokerWorkerStatus, VsockListenerFactory, successful_connection_exit,
     };
     use crate::{
         BackendError, BrokerBackend as OrchestratorBrokerBackend, BrokerLease, BrokerSessionId,
@@ -979,6 +989,14 @@ mod tests {
         }
     }
 
+    type TestBackend = BrokerBackend<FakeListenerFactory, RuntimeFactory>;
+    type BackendFixture = (
+        TestBackend,
+        Arc<Mutex<Vec<BindCall>>>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    );
+
     fn identity(seed: u8) -> SessionIdentity {
         SessionIdentity {
             session_id: SessionId::new([seed; 16]),
@@ -991,15 +1009,7 @@ mod tests {
         }
     }
 
-    fn backend(
-        behavior: RuntimeBehavior,
-        join_timeout: Duration,
-    ) -> (
-        BrokerBackend<FakeListenerFactory, RuntimeFactory>,
-        Arc<Mutex<Vec<BindCall>>>,
-        Arc<AtomicUsize>,
-        Arc<AtomicUsize>,
-    ) {
+    fn backend(behavior: RuntimeBehavior, join_timeout: Duration) -> BackendFixture {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let shutdowns = Arc::new(AtomicUsize::new(0));
         let builds = Arc::new(AtomicUsize::new(0));
@@ -1027,10 +1037,7 @@ mod tests {
         (backend, calls, builds, shutdowns)
     }
 
-    fn wait_for_exit(
-        backend: &mut BrokerBackend<FakeListenerFactory, RuntimeFactory>,
-        lease: &BrokerLease,
-    ) -> BrokerWorkerExit {
+    fn wait_for_exit(backend: &mut TestBackend, lease: &BrokerLease) -> BrokerWorkerExit {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             match backend
@@ -1098,6 +1105,22 @@ mod tests {
             BrokerWorkerExit::Connection(BrokerConnectionExit::RequestLimitReached {
                 requests_served: 8,
             })
+        );
+    }
+
+    #[test]
+    fn production_report_mapping_preserves_max_accounting_and_cbu_reasons() {
+        assert_eq!(
+            successful_connection_exit(ConnectionCloseReason::RequestLimitReached, 9),
+            BrokerConnectionExit::RequestLimitReached { requests_served: 9 }
+        );
+        assert_eq!(
+            successful_connection_exit(ConnectionCloseReason::AccountingInvariant, 4),
+            BrokerConnectionExit::AccountingInvariant { requests_served: 4 }
+        );
+        assert_eq!(
+            successful_connection_exit(ConnectionCloseReason::CommittedButUnrecorded, 2),
+            BrokerConnectionExit::CommittedButUnrecorded { requests_served: 2 }
         );
     }
 

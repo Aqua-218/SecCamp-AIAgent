@@ -145,6 +145,79 @@ fn registry_enforces_unique_paths_parents_and_object_ids() {
     );
 }
 
+// Requirement: CREATE derives its target from the parent's current path while
+// holding the write transaction, and publishes its returned handle atomically.
+// Category: namespace/race. Risk: critical.
+#[test]
+fn child_creation_uses_the_current_parent_path_and_can_start_open() {
+    let registry = NamespaceRegistry::new();
+    let source = create_object(&registry, path(&["source"]), NamespaceObjectKind::Directory);
+    registry
+        .rename_subtree(&path(&["source"]), path(&["renamed"]), |_| {
+            Ok::<_, Infallible>(())
+        })
+        .expect("test parent rename must succeed");
+
+    let creation = registry
+        .create_open_child(
+            &source,
+            "created.txt",
+            NamespaceObjectKind::RegularFile,
+            |object| {
+                assert_eq!(object.path(), &path(&["renamed", "created.txt"]));
+                assert_eq!(object.open_handle_count(), 1);
+                Ok::<_, Infallible>("backing file created")
+            },
+        )
+        .expect("child creation beneath the renamed parent must succeed");
+    let created = creation.object().clone();
+    assert_eq!(creation.value(), &"backing file created");
+    assert_eq!(
+        registry
+            .object_snapshot(&created)
+            .map(|object| object.map(|object| object.open_handle_count())),
+        Ok(Some(1))
+    );
+    assert_eq!(
+        registry.remove_object(&created, |_| Ok::<_, Infallible>(())),
+        Err(NamespaceOperationError::Namespace(
+            NamespaceError::OpenHandleInSubtree(created.clone())
+        ))
+    );
+    registry
+        .close_object(&created, |_| Ok::<_, Infallible>(()))
+        .expect("the creation handle must close normally");
+    registry
+        .remove_object(&created, |_| Ok::<_, Infallible>(()))
+        .expect("a closed created object must be removable");
+}
+
+// Requirement: an executor failure during child creation publishes neither a
+// path nor an object identity. Category: namespace/atomicity. Risk: critical.
+#[test]
+fn failed_child_creation_has_no_visible_namespace_effect() {
+    let registry = NamespaceRegistry::new();
+    let parent = create_object(&registry, path(&["parent"]), NamespaceObjectKind::Directory);
+    let target = path(&["parent", "failed.txt"]);
+
+    assert_eq!(
+        registry.create_child(
+            &parent,
+            "failed.txt",
+            NamespaceObjectKind::RegularFile,
+            |_| Err::<(), _>(BackingFailure),
+        ),
+        Err(NamespaceOperationError::Executor(BackingFailure))
+    );
+    assert_eq!(registry.object_at_path_snapshot(&target), Ok(None));
+    assert_eq!(registry.object_count(), Ok(2));
+    assert_eq!(
+        registry.generation().map(NamespaceGeneration::as_u64),
+        Ok(1),
+        "failed child creation must not advance the generation"
+    );
+}
+
 // Requirement: child lookup validates the parent and name, then resolves the
 // child without releasing the namespace guard. Category: lookup/security. Risk: critical.
 #[test]

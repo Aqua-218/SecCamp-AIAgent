@@ -738,6 +738,49 @@ impl NamespaceRegistry {
         Ok(NamespaceObjectCreation::new(object_id, result))
     }
 
+    /// Creates one direct child of a current parent object.
+    ///
+    /// The parent identity is resolved and its child path is constructed while
+    /// the namespace write guard is held. This is required for filesystem
+    /// create operations: deriving a child path from a snapshot before taking
+    /// the guard could authorize an old parent path after a concurrent rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown or non-directory parent, invalid child
+    /// name, occupied child path, exhausted identity or generation, poisoned
+    /// registry, or backing operation failure.
+    pub fn create_child<T, E>(
+        &self,
+        parent: &ObjectId,
+        child_name: &str,
+        kind: NamespaceObjectKind,
+        operation: impl FnOnce(&NamespaceObject) -> Result<T, E>,
+    ) -> Result<NamespaceObjectCreation<T>, NamespaceOperationError<E>> {
+        self.create_child_with_open_count(parent, child_name, kind, 0, operation)
+    }
+
+    /// Creates and opens one direct child as one namespace transaction.
+    ///
+    /// The published record starts with exactly one open handle. Callers must
+    /// create the corresponding Authority handle and backing descriptor inside
+    /// `operation`; an executor error publishes neither the path nor that open
+    /// count. This prevents `CREATE` from exposing a moment in which a newly
+    /// created file can be removed before its returned FUSE handle is live.
+    ///
+    /// # Errors
+    ///
+    /// Uses the same rejection conditions as [`Self::create_child`].
+    pub fn create_open_child<T, E>(
+        &self,
+        parent: &ObjectId,
+        child_name: &str,
+        kind: NamespaceObjectKind,
+        operation: impl FnOnce(&NamespaceObject) -> Result<T, E>,
+    ) -> Result<NamespaceObjectCreation<T>, NamespaceOperationError<E>> {
+        self.create_child_with_open_count(parent, child_name, kind, 1, operation)
+    }
+
     /// Removes an empty, unopened object after the backing executor succeeds.
     ///
     /// # Errors
@@ -778,6 +821,50 @@ impl NamespaceRegistry {
         let result = operation(&object_record).map_err(NamespaceOperationError::Executor)?;
         *state = next_state;
         Ok(result)
+    }
+
+    fn create_child_with_open_count<T, E>(
+        &self,
+        parent: &ObjectId,
+        child_name: &str,
+        kind: NamespaceObjectKind,
+        open_handle_count: u64,
+        operation: impl FnOnce(&NamespaceObject) -> Result<T, E>,
+    ) -> Result<NamespaceObjectCreation<T>, NamespaceOperationError<E>> {
+        let mut state = self.write_state()?;
+        let parent_record = state
+            .objects
+            .get(parent)
+            .ok_or_else(|| NamespaceError::UnknownObject(parent.clone()))?;
+        if parent_record.kind != NamespaceObjectKind::Directory {
+            return Err(NamespaceError::ParentNotDirectory(parent_record.path.clone()).into());
+        }
+        let path = parent_record
+            .path
+            .child(child_name)
+            .map_err(NamespaceError::InvalidChildName)?;
+        state.validate_new_path(&path)?;
+        let next_generation = state.next_generation()?;
+        let mut next_state = state.clone();
+        let object_record = next_state.allocate_object(path, kind)?;
+        let object_id = object_record.id.clone();
+        if open_handle_count != 0 {
+            let object_record = next_state
+                .objects
+                .get_mut(&object_id)
+                .ok_or(NamespaceError::InvariantViolation)?;
+            object_record.open_handle_count = open_handle_count;
+        }
+        let object_record = next_state
+            .objects
+            .get(&object_id)
+            .cloned()
+            .ok_or(NamespaceError::InvariantViolation)?;
+        next_state.generation = next_generation;
+
+        let result = operation(&object_record).map_err(NamespaceOperationError::Executor)?;
+        *state = next_state;
+        Ok(NamespaceObjectCreation::new(object_id, result))
     }
 
     /// Renames a closed subtree without replacing an existing destination.

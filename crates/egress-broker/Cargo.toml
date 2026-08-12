@@ -1,0 +1,18 @@
+[package]
+name = "egress-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+authority-core = { path = "../authority-core" }
+egress-protocol = { path = "../egress-protocol" }
+percent-encoding = "2.3.1"
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
+serde_json = "1.0.145"
+socket2 = { version = "0.6.5", features = ["all"] }
+url = "2.5.7"

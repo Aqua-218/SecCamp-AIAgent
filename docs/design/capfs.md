@@ -87,6 +87,14 @@ flowchart LR
 
 詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。initial link-free file modelの全10 `FileEffect`はFUSE operationへ接続済みである。directory streamはopen時のgenerationを保持し、途中でnamespaceが変われば`EAGAIN`を返してcookieの再利用を止める。
 
+namespace writer lockとCapability kernelのshared / exclusive guardを組み合わせたbounded
+競合契約を[`crates/capfs/tests/concurrency.rs`](../../crates/capfs/tests/concurrency.rs)で
+実行する。write中のrevoke、open / close、rename、unlinkを32 round走らせ、writeのcommitが
+revoke returnを越えないこと、revoke後のmutationがbacking executorへ入らないこと、open
+count・authority handle・namespace pathのrollback / publishとcommitted effect数が一致することを確認する。
+これはinitial link-free modelのunit境界を閉じる検査であり、実FUSE kernelの複数thread
+requestや敵対的backing差し替えを仮定しない。
+
 ## 初期実装は workspace を木に限定する
 
 最初の `capfs` は、path-based authority と相性が悪い alias を扱わない。これは初期実装の安全境界であり、symlink を恒久的に非対応とする決定ではない。

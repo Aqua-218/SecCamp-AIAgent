@@ -31,7 +31,7 @@ mod tests {
     use super::{
         BackendError, BindMountConfig, CapabilityReport, CgroupConfig, IdentityMap,
         IsolationBackend, IsolationConfig, IsolationError, IsolationReceipt, IsolationStep,
-        LandlockConfig, RootfsConfig, SeccompPolicy, Syscall, TmpfsConfig, apply,
+        LandlockConfig, RootfsConfig, RuntimeIsolation, SeccompPolicy, Syscall, TmpfsConfig, apply,
     };
 
     struct MockBackend {
@@ -130,7 +130,8 @@ mod tests {
         let mut backend = MockBackend::new();
         backend.fail_at = Some(IsolationStep::Landlock);
 
-        let error = apply(&mut backend, &test_config()).expect_err("failure must propagate");
+        let error = RuntimeIsolation::apply_transaction(&mut backend, &test_config())
+            .expect_err("failure must propagate");
         assert!(matches!(
             error,
             IsolationError::TerminationRequired {

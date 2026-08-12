@@ -406,7 +406,7 @@ fn runtime_workspace_error(message: &str) -> RuntimeError {
 mod tests {
     use super::*;
     use crate::{
-        BrokerSessionId, CapabilityId, RequestId, SessionId, SubjectId, VmId, WorkspaceId, ID_BYTES,
+        BrokerSessionId, CapabilityId, ID_BYTES, RequestId, SessionId, SubjectId, VmId, WorkspaceId,
     };
     use std::{collections::VecDeque, sync::Mutex};
 
@@ -559,9 +559,11 @@ mod tests {
         let (mut backend, mut runtime_filesystem) = adapters(Arc::clone(&state));
         let session = identity(0x11, 0xab);
 
-        assert!(backend
-            .clone_workspace(&session, &WorkspaceTemplateId::new("template-b"))
-            .is_err());
+        assert!(
+            backend
+                .clone_workspace(&session, &WorkspaceTemplateId::new("template-b"))
+                .is_err()
+        );
         let lease = backend
             .clone_workspace(&session, &WorkspaceTemplateId::new("template-a"))
             .expect("orchestrator clone must succeed");
@@ -569,12 +571,14 @@ mod tests {
             WorkspaceLease::new(SessionId::new([0x99; ID_BYTES]), lease.workspace_id());
 
         assert!(backend.isolate_workspace(&foreign_lease).is_err());
-        assert!(runtime_filesystem
-            .clone_workspace(
-                Path::new("/workspace/source"),
-                Path::new("/workspace/other")
-            )
-            .is_err());
+        assert!(
+            runtime_filesystem
+                .clone_workspace(
+                    Path::new("/workspace/source"),
+                    Path::new("/workspace/other")
+                )
+                .is_err()
+        );
 
         let recorded = state.lock().expect("fake state must not be poisoned");
         assert_eq!(recorded.clones.len(), 1);
@@ -606,11 +610,13 @@ mod tests {
                     .is_err(),
                 "unsafe jail root must fail closed: {jail_root}"
             );
-            assert!(state
-                .lock()
-                .expect("fake state must not be poisoned")
-                .clones
-                .is_empty());
+            assert!(
+                state
+                    .lock()
+                    .expect("fake state must not be poisoned")
+                    .clones
+                    .is_empty()
+            );
         }
     }
 
@@ -639,15 +645,19 @@ mod tests {
             "/srv/jailer/firecracker/{foreign_id}/root/dev/rootfs"
         ));
 
-        assert!(runtime_filesystem
-            .verify_block_device_binding(&mapper, &foreign_device)
-            .is_err());
-        assert!(runtime_filesystem
-            .verify_block_device_binding(
-                Path::new("/dev/mapper/rootfs-verity-foreign"),
-                &jailed_device
-            )
-            .is_err());
+        assert!(
+            runtime_filesystem
+                .verify_block_device_binding(&mapper, &foreign_device)
+                .is_err()
+        );
+        assert!(
+            runtime_filesystem
+                .verify_block_device_binding(
+                    Path::new("/dev/mapper/rootfs-verity-foreign"),
+                    &jailed_device
+                )
+                .is_err()
+        );
         assert!(
             state
                 .lock()
@@ -694,11 +704,13 @@ mod tests {
                 "/srv/jailer/firecracker/abababababababababababababababab/root/workspace/abababababababababababababababab",
             ))
             .expect("runtime release must only mark the record");
-        assert!(state
-            .lock()
-            .expect("fake state must not be poisoned")
-            .removals
-            .is_empty());
+        assert!(
+            state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .removals
+                .is_empty()
+        );
 
         assert!(backend.isolate_workspace(&lease).is_err());
         assert!(backend.isolate_workspace(&lease).is_ok());

@@ -4,7 +4,7 @@
 
 > **対象読者:** host lifecycle 統合担当者、Firecracker/Broker/Authority adapter の設計者、レビュー担当者
 
-`session-orchestrator` は、隔離された一つの agent session のホスト側 lifecycle state machine である。resource の確保順序と identity binding を所有するが、socket を開く、Firecracker を起動する、FUSE を mount する、provider request を実行する、といった副作用は所有しない。副作用は backend trait を実装する production adapter が担当する。
+`session-orchestrator` は、隔離された一つの agent session のホスト側 lifecycle state machine である。resource の確保順序と identity binding を所有し、Authority Core、Broker listener、Firecracker runtime、workspace の production adapter を提供する。FUSE mount、provider request、特権 isolation の具体的な副作用は、それぞれの専用 adapter が所有する。
 
 ## lifecycle
 
@@ -41,7 +41,7 @@ process 内 ledger は process restart をまたいで永続化されない。�
 
 state machine は mock backend を使う test で検証済みである。正常 startup/stop、各 stage failure の rollback、rollback failure、VM kill failure 時の workspace 保持、inherited identity と reused identity、active session の二重起動、foreign lease、stop retry を対象にする。
 
-この crate は backend を実装しないため、実 Firecracker、実 Broker/vsock、実 capfs、実 Authority Core adapter、実 workload restrictions、process 外の durable identity allocator は未検証である。mock test が pass したことを VM 実起動済みや full isolation 完成の根拠にはしない。
+production adapter composition test は、実 `CapabilityKernel` と session adapter 群を使い、workspace clone、listener ownership、snapshot binding、Firecracker identity injection、Authority subject closure を一つの startup/stop 経路で検査する。command、filesystem、API、listener は test double であり、実 Firecracker、実 Broker/vsock、実 capfs、特権 workload restrictions は未検証である。mock test が pass したことを VM 実起動済みや full isolation 完成の根拠にはしない。
 
 adapter の義務と、既存 crate へ接続するときの型・順序は [production backend 契約](contracts.md) を参照する。
 

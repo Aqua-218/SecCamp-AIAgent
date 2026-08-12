@@ -69,11 +69,10 @@ response outcome の保持先と connection close は transport / Broker の責�
 
 `frame.rs` は 4 byte big-endian length prefix と 1 MiB 上限を実装済みである。streaming transport は prefix を読んだ直後に `ValidatedFrameLength` で検査し、その値を超える allocation をしない。buffered decoder も truncated prefix/payload、trailing bytes、oversized length を拒否する。
 
-canonical CBOR の schema 検証と vsock I/O はまだこの crate に入れていない。CBOR decoder を追加するときは、frame の payload が canonical であることを確認してからその同じ bytes を hash し、guard へ渡す。
+[canonical CBOR schema と decoder](canonical-cbor.md) はこの crate に実装済みである。outer envelope は transmitted payload hash と embedded canonical operation payload を持ち、decoder は payload を hash して値が一致することを確認する。vsock I/O はまだこの crate に入れていない。
 
 ## 何がまだ必要か
 
-- canonical CBOR schema と decoder。
 - vsock listener、session handshake、connection close と response cache。
 - closed operation union を実際の provider adapter へつなぐ dispatch。
 - redirect / DNS / public-IP / TLS / response streaming の強制。

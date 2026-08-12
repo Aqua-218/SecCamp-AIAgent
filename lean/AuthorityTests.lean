@@ -1,4 +1,4 @@
-import Authority.Capability
+import Authority
 
 /-!
 # Authority Decision Tests
@@ -435,5 +435,66 @@ example : authorityMatches (.file sourceReadWrite) (.httpFetch
 
 example : authorityBodyBelow (.httpFetch httpParent) (.gitHub gitHubParent) = false := by
   native_decide
+
+example : Isolation.requiredStages.length = 13 := by
+  native_decide
+
+example : Firecracker.IdentityBundle.Valid {
+    vm := 1
+    session := 2
+    subject := 3
+    capability := 4
+    brokerSession := 5
+  } [] := by
+  constructor
+  · intro kind
+    cases kind <;> decide
+  · constructor
+    · intro first second sameIdentity
+      cases first <;> cases second <;>
+        simp [Firecracker.IdentityBundle.forKind] at sameIdentity ⊢
+    · intro kind
+      cases kind <;> simp [Firecracker.IdentityBundle.forKind]
+
+private def orchestrationIdentity : Orchestrator.SessionIdentity where
+  session := { value := "session" }
+  request := { value := "request" }
+  vm := { value := "vm" }
+  subject := { value := "subject" }
+  workspace := { value := "workspace" }
+  capability := { value := "capability" }
+  brokerSession := { value := "broker-session" }
+
+example : Orchestrator.IdentityBatchFresh (fun _ => false) orchestrationIdentity := by
+  constructor
+  · intro kind
+    cases kind <;> rfl
+  · intro first second sameIdentity
+    cases first <;> cases second <;>
+      simp [Orchestrator.SessionIdentity.forKind, orchestrationIdentity] at sameIdentity ⊢
+
+example :
+    let unsafeCleanup : Firecracker.CleanupState := {
+      processStopped := false
+      verityOpened := true
+      workspaceRemoved := true
+    }
+    ¬ unsafeCleanup.Safe := by
+  dsimp only
+  intro safety
+  have dependencies := safety rfl
+  simp at dependencies
+
+example :
+    ReplayState.Accounting (ReplayState.empty { value := 7 } 16) [] :=
+  ReplayState.empty_accounting _ _
+
+example :
+    SessionBudget.Accounting (SessionBudget.empty {
+      maxRequests := 8
+      maxResponseBytes := 4096
+      maxConcurrentRequests := 2
+    }) [] :=
+  SessionBudget.empty_accounting _
 
 end AuthorityTests

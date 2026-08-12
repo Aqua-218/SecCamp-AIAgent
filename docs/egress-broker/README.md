@@ -52,7 +52,6 @@ dispatch、DNS/IP policy、redirect、応答上限、GitHub の publish 事前�
 | [GitHub 型付き adapter](github.md) | [`github.rs`](../../crates/egress-broker/src/github.rs) | 2 操作への限定、publish plan、credential handle |
 | [検証対応表](verification.md) | — | fake で見た範囲と、実機で未確認の範囲 |
 
-**[dispatch](dispatch.md) には未修正の欠陥が記録してある。** `RetryableBudget` として cache された outcome が置き換わらず、完全一致 retry が adapter を再実行する。`CreatePullRequest` なら retry 1 回につき pull request 1 つになる。
 
 ## 関連
 

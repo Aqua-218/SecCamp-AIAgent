@@ -516,6 +516,14 @@ structure MayAllocate (state : CapabilityState) (parent : Option CapId)
       state.WasIssued (state.sequentialCapabilityId sequence)
   fresh : state.capabilities (state.sequentialCapabilityId selectedSequence) = none
 
+/-- A failed sequential scan has proved every remaining representable identity reserved. -/
+structure MayExhaustAllocator (state : CapabilityState) where
+  allocatorAvailable : state.capabilityIdsExhausted = false
+  cursorRepresentable : FitsU64 state.nextCapabilitySequence
+  everyRemainingIssued : ∀ sequence,
+    state.nextCapabilitySequence ≤ sequence → FitsU64 sequence →
+      state.WasIssued (state.sequentialCapabilityId sequence)
+
 /-- Sequential allocator evidence specialized to validated root issuance. -/
 structure MayAllocateRoot (state : CapabilityState) (grant : CapabilityGrant) where
   allocation : MayAllocate state none grant
@@ -536,6 +544,27 @@ def allocateDerived (state : CapabilityState) (parentId : CapId)
       (some parentId) grant with
     nextCapabilitySequence := (advanceU64 selectedSequence).1
     capabilityIdsExhausted := (advanceU64 selectedSequence).2 }
+
+/-- Record the state change made by Rust when an unsuccessful scan reaches `u64::MAX`. -/
+def exhaustAllocator (state : CapabilityState) : CapabilityState :=
+  { state with
+    nextCapabilitySequence := u64Maximum
+    capabilityIdsExhausted := true }
+
+/-- A proved first exhaustion error changes the allocator state. -/
+theorem MayExhaustAllocator.exhaustAllocator_changes_state
+    {state : CapabilityState} (allowed : MayExhaustAllocator state) :
+    state.exhaustAllocator ≠ state := by
+  intro unchanged
+  have flagsEqual := congrArg CapabilityState.capabilityIdsExhausted unchanged
+  simp [exhaustAllocator, allowed.allocatorAvailable] at flagsEqual
+
+/-- Exhaustion records the terminal cursor and flag without changing the epoch. -/
+theorem exhaustAllocator_records_terminal_state (state : CapabilityState) :
+    state.exhaustAllocator.nextCapabilitySequence = u64Maximum ∧
+      state.exhaustAllocator.capabilityIdsExhausted = true ∧
+      state.exhaustAllocator.authorizationEpoch = state.authorizationEpoch := by
+  simp [exhaustAllocator]
 
 /-- `u64::MAX` can be issued exactly once before the allocator becomes exhausted. -/
 theorem allocateRoot_at_maximum_exhausts {state : CapabilityState}
@@ -889,6 +918,8 @@ inductive Step : CapabilityState → CapabilityState → Prop
       (allowed : MayAllocateDerived state caller parentId grant now) →
       Step state (state.allocateDerived parentId grant
         allowed.allocation.selectedSequence)
+  | allocatorExhausted {state : CapabilityState} :
+      MayExhaustAllocator state → Step state state.exhaustAllocator
   | revoke {state : CapabilityState} {capabilityId : CapId} :
       state.WasIssued capabilityId → state.revoked capabilityId = false →
       CanIncrementU64 state.authorizationEpoch →
@@ -921,6 +952,7 @@ theorem Step.epoch_monotone {before after : CapabilityState}
   | issueRoot => exact Nat.le_refl _
   | issueAllocatedRoot => exact Nat.le_refl _
   | derive => exact Nat.le_refl _
+  | allocatorExhausted => exact Nat.le_refl _
   | revoke => exact Nat.le_succ _
   | beginClose => exact Nat.le_succ _
   | finishClose => exact Nat.le_refl _
@@ -1564,6 +1596,20 @@ theorem Step.preserves_structuralWellFormed {before after : CapabilityState}
       exact allowed.preserves_structuralWellFormed wellFormed
   | derive allowed =>
       exact allowed.preserves_structuralWellFormed wellFormed
+  | allocatorExhausted allowed =>
+      exact {
+        subjectHasStatus := wellFormed.subjectHasStatus
+        statusHasSubject := wellFormed.statusHasSubject
+        subjectKeyMatches := wellFormed.subjectKeyMatches
+        subjectParentResolves := wellFormed.subjectParentResolves
+        holdingResolves := wellFormed.holdingResolves
+        revokedWasIssued := wellFormed.revokedWasIssued
+        liveHandleResolves := wellFormed.liveHandleResolves
+        handleOwnerResolves := wellFormed.handleOwnerResolves
+        capabilityResolves := wellFormed.capabilityResolves
+        graphWellFormed := wellFormed.graphWellFormed
+        countersRepresentable := ⟨wellFormed.countersRepresentable.1,
+          by simp [exhaustAllocator, FitsU64]⟩ }
   | revoke issued _ canIncrement =>
       exact revoke_preserves_structuralWellFormed wellFormed issued canIncrement
   | beginClose running canIncrement =>
@@ -1591,6 +1637,8 @@ theorem Step.preserves_countersRepresentable {before after : CapabilityState}
   | derive allowed =>
       exact ⟨representable.1,
         advanceU64_value_fits allowed.allocation.selectedRepresentable⟩
+  | allocatorExhausted =>
+      exact ⟨representable.1, by simp [exhaustAllocator, FitsU64]⟩
   | registerSubject | issueRoot | finishClose | registerHandle |
       closeHandle | successfulNoop => exact representable
 
@@ -1636,6 +1684,7 @@ theorem Step.capability_records_persist {before after : CapabilityState}
         rw [selectedLookup] at fresh
         contradiction
       simpa [allocateDerived, issue, replace, differentIds] using lookupBefore
+  | allocatorExhausted _ => exact lookupBefore
   | revoke _ _ => exact lookupBefore
   | beginClose _ => exact lookupBefore
   | finishClose _ _ => exact lookupBefore
@@ -1655,7 +1704,7 @@ theorem Step.graphWellFormed {before after : CapabilityState}
   | derive allowed =>
       simpa [allocateDerived] using
         allowed.deriveAllowed.preserves_graphWellFormed wellFormed
-  | revoke | beginClose | finishClose | registerHandle | closeHandle |
+  | allocatorExhausted | revoke | beginClose | finishClose | registerHandle | closeHandle |
       successfulNoop => exact wellFormed
 
 /-- Accepted transitions never undo a direct revocation. -/
@@ -1668,6 +1717,7 @@ theorem Step.revocation_monotone {before after : CapabilityState}
   | issueRoot _ => exact revokedBefore
   | issueAllocatedRoot _ => exact revokedBefore
   | derive _ => exact revokedBefore
+  | allocatorExhausted _ => exact revokedBefore
   | revoke => exact revoke_is_monotone _ _ _ revokedBefore
   | beginClose => exact beginSubjectClose_preserves_revocation _ _ _ revokedBefore
   | finishClose => exact revokedBefore
@@ -1685,6 +1735,7 @@ theorem Step.handle_identity_persists {before after : CapabilityState}
   | issueRoot _ => exact ownerBefore
   | issueAllocatedRoot _ => exact ownerBefore
   | derive _ => exact ownerBefore
+  | allocatorExhausted _ => exact ownerBefore
   | revoke _ _ => exact ownerBefore
   | beginClose _ => exact ownerBefore
   | finishClose _ _ => exact ownerBefore
@@ -1714,6 +1765,7 @@ theorem Step.holdings_persist {before after : CapabilityState}
       simpa [allocateDerived] using issue_preserves_holding before
         (before.sequentialCapabilityId allowed.allocation.selectedSequence)
         (some parentId) grant heldBefore
+  | allocatorExhausted => exact heldBefore
   | revoke => exact heldBefore
   | beginClose => exact heldBefore
   | finishClose => exact heldBefore
@@ -1732,6 +1784,7 @@ theorem Step.closed_subject_remains_closed {before after : CapabilityState}
   | issueRoot => exact closedBefore
   | issueAllocatedRoot => exact closedBefore
   | derive => exact closedBefore
+  | allocatorExhausted => exact closedBefore
   | revoke => exact closedBefore
   | beginClose runningBefore =>
       exact beginSubjectClose_preserves_closed runningBefore closedBefore
@@ -1768,7 +1821,8 @@ theorem Step.closed_handle_stays_closed {before after : CapabilityState}
     (closed : before.openHandles handleId = none) :
     after.openHandles handleId = none := by
   cases transition with
-  | registerSubject | issueRoot | issueAllocatedRoot | derive | revoke | beginClose | finishClose |
+  | registerSubject | issueRoot | issueAllocatedRoot | derive | allocatorExhausted |
+      revoke | beginClose | finishClose |
       successfulNoop => exact closed
   | registerHandle running fresh =>
       rename_i handle

@@ -30,8 +30,8 @@ use authority_core::{
 use fuser::{
     BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
     FopenFlags, Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags,
-    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
-    SessionACL, TimeOrNow, WriteFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyWrite, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 use rustix::fs::OFlags;
 
@@ -41,8 +41,8 @@ use crate::{
         NamespaceError, NamespaceObject, NamespaceObjectKind, NamespaceOperationError,
         NamespaceRegistry,
     },
-    node::{NodeId, NodeTable, NodeTableError},
-    runtime::{BackingMetadata, OpenedBackingFile},
+    node::{ForgetOutcome, NodeId, NodeTable, NodeTableError},
+    runtime::{BackingMetadata, CreationPermissions, OpenedBackingFile},
 };
 
 const ATTRIBUTE_TTL: Duration = Duration::ZERO;
@@ -246,6 +246,28 @@ impl FileOpenIntent {
     const fn needs_writable_backing(self) -> bool {
         self.access.permits_write() || self.truncate
     }
+
+    fn from_create_flags(raw_flags: i32) -> Result<Self, AdapterError> {
+        let access_flags = OpenFlags(raw_flags);
+        let access = match access_flags.acc_mode() {
+            OpenAccMode::O_RDONLY => FileAccess::ReadOnly,
+            OpenAccMode::O_WRONLY => FileAccess::WriteOnly,
+            OpenAccMode::O_RDWR => FileAccess::ReadWrite,
+        };
+        let raw_flags = u32::try_from(raw_flags).map_err(|_| AdapterError::InvalidRequest)?;
+        let flags = OFlags::from_bits_retain(raw_flags);
+        if flags.intersects(OFlags::APPEND) || flags.contains(OFlags::TMPFILE) {
+            return Err(AdapterError::Unsupported);
+        }
+
+        // FUSE `CREATE` is only reached after the namespace transaction has
+        // established that the target does not exist. O_TRUNC therefore has no
+        // existing length to change and does not request the Truncate effect.
+        Ok(Self {
+            access,
+            truncate: false,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -305,6 +327,7 @@ impl HandleState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterError {
     NotFound,
+    AlreadyExists,
     AccessDenied,
     Unsupported,
     IsDirectory,
@@ -318,6 +341,7 @@ impl AdapterError {
     const fn errno(self) -> Errno {
         match self {
             Self::NotFound => Errno::ENOENT,
+            Self::AlreadyExists => Errno::EEXIST,
             Self::AccessDenied => Errno::EACCES,
             Self::Unsupported => Errno::EPERM,
             Self::IsDirectory => Errno::EISDIR,
@@ -331,6 +355,12 @@ impl AdapterError {
 
 struct Entry {
     node: NodeId,
+    metadata: BackingMetadata,
+}
+
+struct CreatedFile {
+    node: NodeId,
+    handle: u64,
     metadata: BackingMetadata,
 }
 
@@ -573,14 +603,7 @@ impl CapabilityFilesystem {
             ) {
                 Ok(backing) => Ok(backing),
                 Err(error) => {
-                    if self
-                        .kernel
-                        .close_handle(&self.authority.subject, &authority_handle)
-                        != Ok(HandleCloseStatus::Closed)
-                    {
-                        self.mark_fatal();
-                        return Err(AdapterError::Internal);
-                    }
+                    self.close_failed_authority_handle(&authority_handle)?;
                     Err(map_effect_error(&error))
                 }
             }
@@ -601,6 +624,179 @@ impl CapabilityFilesystem {
             return Err(AdapterError::Internal);
         }
         Ok(sequence)
+    }
+
+    fn create_file(
+        &self,
+        parent: NodeId,
+        name: &str,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+    ) -> Result<CreatedFile, AdapterError> {
+        self.ensure_healthy()?;
+        let intent = FileOpenIntent::from_create_flags(flags)?;
+        let parent = self
+            .nodes
+            .resolve(parent)
+            .map_err(|error| map_node_lookup_error(&error))?;
+        let permissions = CreationPermissions::from_requested_mode(mode, umask);
+
+        // Reserve the public handle before beginning the namespace transaction.
+        // A successful CREATE therefore cannot publish an object for which the
+        // adapter has no handle identity to return to FUSE.
+        let mut handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+        let sequence = handles.reserve()?;
+        let authority_handle =
+            HandleId::new(format!("{}:fuse-handle:{sequence}", self.authority.mount));
+        let created = self.namespace.create_open_child(
+            &parent,
+            name,
+            NamespaceObjectKind::RegularFile,
+            |live_parent, child| {
+                self.kernel
+                    .register_open_handle(OpenHandle::new(
+                        authority_handle.clone(),
+                        self.authority.subject.clone(),
+                        child.id().clone(),
+                    ))
+                    .map_err(|_| AdapterError::Internal)?;
+
+                let requests = self.file_creation_requests(
+                    FileEffect::CreateFile,
+                    intent,
+                    child.path().clone(),
+                );
+                match self.kernel.authorize_all_and_commit(
+                    &self.authority.subject,
+                    &self.authority.capability,
+                    &requests,
+                    |_| {
+                        // Allocate the LOOKUP reference before touching the
+                        // backing file. If allocation fails, no file is created;
+                        // if backing creation fails, the reference is removed
+                        // before the namespace transaction rolls back.
+                        let binding = self
+                            .nodes
+                            .remember_lookup(child.id())
+                            .map_err(|_| AdapterError::Internal)?;
+                        let node = binding.node();
+                        if let Ok((backing, metadata)) =
+                            self.backing
+                                .create_runtime_file(live_parent, child, permissions)
+                        {
+                            Ok((node, backing, metadata))
+                        } else {
+                            self.forget_created_lookup(node, child.id())?;
+                            Err(AdapterError::Internal)
+                        }
+                    },
+                ) {
+                    Ok(created) => Ok(created),
+                    Err(error) => {
+                        self.close_failed_authority_handle(&authority_handle)?;
+                        Err(map_effect_error(&error))
+                    }
+                }
+            },
+        );
+        let creation = created.map_err(|error| map_namespace_operation_error(&error))?;
+        let (object, (node, backing, metadata)) = creation.into_parts();
+        let replaced = handles.resources.insert(
+            sequence,
+            OpenResource {
+                node,
+                object,
+                authority_handle,
+                access: OpenResourceAccess::File(intent.access),
+                backing: OpenBacking::File(backing),
+            },
+        );
+        if replaced.is_some() {
+            self.mark_fatal();
+            return Err(AdapterError::Internal);
+        }
+        Ok(CreatedFile {
+            node,
+            handle: sequence,
+            metadata,
+        })
+    }
+
+    fn create_directory(
+        &self,
+        parent: NodeId,
+        name: &str,
+        mode: u32,
+        umask: u32,
+    ) -> Result<Entry, AdapterError> {
+        self.ensure_healthy()?;
+        let parent = self
+            .nodes
+            .resolve(parent)
+            .map_err(|error| map_node_lookup_error(&error))?;
+        let permissions = CreationPermissions::from_requested_mode(mode, umask);
+        let created = self.namespace.create_child(
+            &parent,
+            name,
+            NamespaceObjectKind::Directory,
+            |live_parent, child| {
+                let request = self.file_request(FileEffect::CreateDirectory, child.path().clone());
+                self.kernel
+                    .authorize_and_commit(
+                        &self.authority.subject,
+                        &self.authority.capability,
+                        &request,
+                        |_| {
+                            let binding = self
+                                .nodes
+                                .remember_lookup(child.id())
+                                .map_err(|_| AdapterError::Internal)?;
+                            let node = binding.node();
+                            if let Ok(metadata) = self.backing.create_runtime_directory(
+                                live_parent,
+                                child,
+                                permissions,
+                            ) {
+                                Ok(Entry { node, metadata })
+                            } else {
+                                self.forget_created_lookup(node, child.id())?;
+                                Err(AdapterError::Internal)
+                            }
+                        },
+                    )
+                    .map_err(|error| map_effect_error(&error))
+            },
+        );
+        created
+            .map(|creation| creation.into_parts().1)
+            .map_err(|error| map_namespace_operation_error(&error))
+    }
+
+    fn close_failed_authority_handle(
+        &self,
+        authority_handle: &HandleId,
+    ) -> Result<(), AdapterError> {
+        if self
+            .kernel
+            .close_handle(&self.authority.subject, authority_handle)
+            == Ok(HandleCloseStatus::Closed)
+        {
+            Ok(())
+        } else {
+            self.mark_fatal();
+            Err(AdapterError::Internal)
+        }
+    }
+
+    fn forget_created_lookup(&self, node: NodeId, object: &ObjectId) -> Result<(), AdapterError> {
+        match self.nodes.forget(node, NonZeroU64::MIN) {
+            Ok(ForgetOutcome::Removed(removed)) if removed == *object => Ok(()),
+            Ok(ForgetOutcome::Removed(_) | ForgetOutcome::Retained(_)) | Err(_) => {
+                self.mark_fatal();
+                Err(AdapterError::Internal)
+            }
+        }
     }
 
     fn read_file(
@@ -940,6 +1136,28 @@ impl CapabilityFilesystem {
         CapabilityRequestSet::new(first, additional)
     }
 
+    fn file_creation_requests(
+        &self,
+        creation_effect: FileEffect,
+        intent: FileOpenIntent,
+        path: CanonicalPath,
+    ) -> CapabilityRequestSet {
+        let mut additional = Vec::with_capacity(2);
+        match intent.access {
+            FileAccess::ReadOnly => {
+                additional.push(self.file_request(FileEffect::ReadData, path.clone()));
+            }
+            FileAccess::WriteOnly => {
+                additional.push(self.file_request(FileEffect::WriteData, path.clone()));
+            }
+            FileAccess::ReadWrite => {
+                additional.push(self.file_request(FileEffect::ReadData, path.clone()));
+                additional.push(self.file_request(FileEffect::WriteData, path.clone()));
+            }
+        }
+        CapabilityRequestSet::new(self.file_request(creation_effect, path), additional)
+    }
+
     fn forget_node(&self, node: NodeId, count: u64) {
         let Some(count) = NonZeroU64::new(count) else {
             self.mark_fatal();
@@ -1103,6 +1321,63 @@ impl Filesystem for CapabilityFilesystem {
 
         match self.truncate_file(node, handle.map(|value| value.0), size) {
             Ok(metadata) => reply.attr(&ATTRIBUTE_TTL, &file_attr(node, metadata)),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    fn mkdir(
+        &self,
+        _request: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let Some(parent) = NodeId::new(parent.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match self.create_directory(parent, name, mode, umask) {
+            Ok(entry) => reply.entry(
+                &ATTRIBUTE_TTL,
+                &file_attr(entry.node, entry.metadata),
+                NODE_GENERATION,
+            ),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    fn create(
+        &self,
+        _request: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let Some(parent) = NodeId::new(parent.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match self.create_file(parent, name, mode, umask, flags) {
+            Ok(created) => reply.created(
+                &ATTRIBUTE_TTL,
+                &file_attr(created.node, created.metadata),
+                NODE_GENERATION,
+                FileHandle(created.handle),
+                FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_NOFLUSH,
+            ),
             Err(error) => reply.error(error.errno()),
         }
     }
@@ -1336,9 +1611,14 @@ const fn map_namespace_operation_error(
         NamespaceOperationError::Namespace(
             NamespaceError::UnknownObject(_)
             | NamespaceError::UnknownPath(_)
-            | NamespaceError::InvalidChildName(_)
-            | NamespaceError::ParentNotDirectory(_),
+            | NamespaceError::InvalidChildName(_),
         ) => AdapterError::NotFound,
+        NamespaceOperationError::Namespace(NamespaceError::PathOccupied(_)) => {
+            AdapterError::AlreadyExists
+        }
+        NamespaceOperationError::Namespace(NamespaceError::ParentNotDirectory(_)) => {
+            AdapterError::NotDirectory
+        }
         NamespaceOperationError::Namespace(_) => AdapterError::Internal,
         NamespaceOperationError::Executor(error) => *error,
     }
@@ -1394,6 +1674,10 @@ mod tests {
 
     fn open_flags(flags: OFlags) -> OpenFlags {
         OpenFlags(i32::try_from(flags.bits()).expect("test open flags must fit i32"))
+    }
+
+    fn create_flags(flags: OFlags) -> i32 {
+        i32::try_from(flags.bits()).expect("test create flags must fit i32")
     }
 
     fn test_filesystem() -> (
@@ -1552,6 +1836,152 @@ mod tests {
                 .map(|value| value.map(|record| record.open_handle_count())),
             Ok(Some(0))
         );
+    }
+
+    // Requirement: CREATE authorizes both installation of the namespace entry
+    // and the access mode of the returned FUSE handle. Category: FUSE/create.
+    // Risk: critical.
+    #[test]
+    fn create_file_requires_the_creation_and_handle_access_effects() {
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::only(FileEffect::CreateFile),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("create authority must expose its parent directory");
+
+        assert!(matches!(
+            filesystem.create_file(
+                scoped.node,
+                "created.txt",
+                0o666,
+                0,
+                create_flags(OFlags::WRONLY),
+            ),
+            Err(AdapterError::AccessDenied)
+        ));
+        assert!(
+            !directory.path().join("scoped/created.txt").exists(),
+            "a denied compound CREATE must publish neither a namespace object nor a backing file"
+        );
+    }
+
+    // Requirement: successful CREATE publishes one lookup reference and one
+    // open handle together. Category: FUSE/create. Risk: critical.
+    #[test]
+    fn create_file_returns_a_writable_handle_for_the_new_namespace_object() {
+        let (directory, filesystem, kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::from_effects([FileEffect::CreateFile, FileEffect::WriteData]),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("create authority must expose its parent directory");
+        let created = filesystem
+            .create_file(
+                scoped.node,
+                "created.txt",
+                0o666,
+                0o027,
+                create_flags(OFlags::WRONLY),
+            )
+            .expect("CreateFile and WriteData must authorize a writable CREATE");
+        let object = filesystem
+            .nodes
+            .resolve(created.node)
+            .expect("a successful CREATE must bind its returned node");
+
+        assert_eq!(created.metadata.permissions, 0o640);
+        assert_eq!(kernel.object_open_handle_count(&object), Ok(1));
+        assert_eq!(
+            filesystem
+                .namespace
+                .object_snapshot(&object)
+                .map(|value| value.map(|record| record.open_handle_count())),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            filesystem
+                .write_file(created.node, created.handle, 0, b"new content")
+                .expect("the returned O_WRONLY handle must remain usable"),
+            11
+        );
+        assert_eq!(
+            fs::read(directory.path().join("scoped/created.txt"))
+                .expect("the new backing file must be readable in the test"),
+            b"new content"
+        );
+        filesystem
+            .release_file(created.node, created.handle)
+            .expect("the CREATE handle must release both registries");
+        assert_eq!(kernel.object_open_handle_count(&object), Ok(0));
+    }
+
+    // Requirement: MKDIR is a separate effect from file creation and publishes
+    // only after the hardened backing operation succeeds. Category: FUSE/create.
+    // Risk: critical.
+    #[test]
+    fn create_directory_requires_its_own_effect_and_applies_request_umask() {
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::only(FileEffect::CreateDirectory),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("directory-create authority must expose its parent");
+        let created = filesystem
+            .create_directory(scoped.node, "created-dir", 0o777, 0o027)
+            .expect("CreateDirectory must authorize MKDIR without file-create authority");
+
+        assert_eq!(created.metadata.kind, NamespaceObjectKind::Directory);
+        assert_eq!(created.metadata.permissions, 0o750);
+        assert!(directory.path().join("scoped/created-dir").is_dir());
+        assert!(matches!(
+            filesystem.create_file(
+                scoped.node,
+                "not-a-file.txt",
+                0o600,
+                0,
+                create_flags(OFlags::WRONLY),
+            ),
+            Err(AdapterError::AccessDenied)
+        ));
+    }
+
+    #[test]
+    fn create_rejects_an_occupied_child_and_a_non_directory_parent() {
+        let (_directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::from_effects([FileEffect::CreateFile, FileEffect::WriteData]),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("authorized directory must resolve");
+        let existing = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("authorized file must resolve");
+
+        assert!(matches!(
+            filesystem.create_file(
+                scoped.node,
+                "allowed.txt",
+                0o600,
+                0,
+                create_flags(OFlags::WRONLY),
+            ),
+            Err(AdapterError::AlreadyExists)
+        ));
+        assert!(matches!(
+            filesystem.create_file(
+                existing.node,
+                "child.txt",
+                0o600,
+                0,
+                create_flags(OFlags::WRONLY),
+            ),
+            Err(AdapterError::NotDirectory)
+        ));
     }
 
     // Requirement: each positioned write checks WriteData at the object's

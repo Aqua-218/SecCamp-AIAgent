@@ -25,7 +25,7 @@ use capfs::{
     filesystem::{CapabilityFilesystem, MountAuthority, MountInstanceId, spawn_mount},
 };
 use fuser::BackgroundSession;
-use rustix::fs::{Mode, OFlags, RawDir, open};
+use rustix::fs::{Mode, OFlags, RawDir, mkdirat, open};
 use tempfile::tempdir;
 
 type MountedDirectoryView = (
@@ -303,6 +303,117 @@ fn mounted_view_denies_write_after_revoke() {
     );
 
     drop(file);
+    drop(session);
+}
+
+// Requirement: FUSE CREATE and MKDIR publish the shared namespace only after
+// their separate effects authorize the hardened backing operation. Category:
+// FUSE/create. Risk: critical.
+#[test]
+fn mounted_view_creates_files_and_directories_with_capability_effects() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let backing = tempdir().expect("temporary backing directory must be creatable");
+    let mountpoint = tempdir().expect("temporary mountpoint must be creatable");
+    fs::create_dir(backing.path().join("scoped"))
+        .expect("authorized backing directory must be creatable");
+    let repository = RepoId::new("workspace");
+    let imported = ImportedRepository::open(
+        repository.clone(),
+        backing.path(),
+        PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 2),
+    )
+    .expect("test backing must pass preflight");
+    let subject = SubjectId::new("fuse-create-subject");
+    let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+        .expect("test validity window must be non-empty");
+    let effects = FileEffects::from_effects([
+        FileEffect::ListDirectory,
+        FileEffect::CreateDirectory,
+        FileEffect::CreateFile,
+        FileEffect::WriteData,
+    ]);
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "fuse-create-session",
+    ))));
+    kernel
+        .register_subject(Subject::new(
+            subject.clone(),
+            StaticAuthorityEnvelope::new(
+                validity,
+                AuthorityBody::File(FileAuthority::new(
+                    repository.clone(),
+                    effects,
+                    PathPattern::Prefix(CanonicalPath::root()),
+                )),
+            ),
+        ))
+        .expect("test subject registration must succeed");
+    let capability = kernel
+        .issue_root(CapabilityGrant::new(
+            subject.clone(),
+            validity,
+            AuthorityBody::File(FileAuthority::new(
+                repository.clone(),
+                effects,
+                PathPattern::Prefix(
+                    CanonicalPath::new(["scoped"]).expect("test path must be canonical"),
+                ),
+            )),
+        ))
+        .expect("test capability issuance must succeed");
+    let filesystem = CapabilityFilesystem::new(
+        imported,
+        Arc::clone(&kernel),
+        MountAuthority::new(
+            MountInstanceId::new("fuse-create-integration"),
+            subject,
+            capability.clone(),
+            repository,
+        ),
+        Arc::new(MonotonicTime::from_ticks(5)),
+    )
+    .expect("filesystem must initialize");
+    let session = spawn_mount(filesystem, mountpoint.path()).expect("FUSE mount must succeed");
+    let scoped_mount = mountpoint.path().join("scoped");
+
+    fs::create_dir(scoped_mount.join("created-dir"))
+        .expect("CreateDirectory must authorize FUSE MKDIR");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(scoped_mount.join("created.txt"))
+        .expect("CreateFile and WriteData must authorize FUSE CREATE");
+    file.write_all(b"created through FUSE")
+        .expect("the returned CREATE handle must be writable");
+    drop(file);
+
+    assert!(backing.path().join("scoped/created-dir").is_dir());
+    assert_eq!(
+        fs::read(backing.path().join("scoped/created.txt"))
+            .expect("the newly created backing file must be readable"),
+        b"created through FUSE"
+    );
+    let scoped_directory = open(
+        &scoped_mount,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("ListDirectory must authorize opening the parent before revoke");
+
+    kernel
+        .revoke(&capability)
+        .expect("test capability must be revocable");
+    assert_eq!(
+        mkdirat(&scoped_directory, "revoked-dir", Mode::RWXU)
+            .expect_err("a later MKDIR must reauthorize its creation effect"),
+        rustix::io::Errno::ACCESS
+    );
+    assert!(!backing.path().join("scoped/revoked-dir").exists());
+
     drop(session);
 }
 

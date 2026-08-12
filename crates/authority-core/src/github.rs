@@ -152,7 +152,7 @@ impl BranchName {
                 if segment.ends_with('.') {
                     return Err(InvalidBranchName::SegmentTrailingDot { index });
                 }
-                if segment.ends_with(".lock") {
+                if segment.strip_suffix(".lock").is_some() {
                     return Err(InvalidBranchName::SegmentLockSuffix { index });
                 }
                 if segment
@@ -248,15 +248,30 @@ pub enum InvalidBranchName {
     /// The branch name contains reflog syntax.
     ReflogSyntax,
     /// One slash-delimited segment is empty.
-    EmptySegment { index: usize },
+    EmptySegment {
+        /// Zero-based position of the rejected slash-delimited component.
+        index: usize,
+    },
     /// One slash-delimited segment begins with `.`.
-    SegmentLeadingDot { index: usize },
+    SegmentLeadingDot {
+        /// Zero-based position of the rejected slash-delimited component.
+        index: usize,
+    },
     /// One slash-delimited segment ends with `.`.
-    SegmentTrailingDot { index: usize },
+    SegmentTrailingDot {
+        /// Zero-based position of the rejected slash-delimited component.
+        index: usize,
+    },
     /// One slash-delimited segment ends with Git's `.lock` suffix.
-    SegmentLockSuffix { index: usize },
+    SegmentLockSuffix {
+        /// Zero-based position of the rejected slash-delimited component.
+        index: usize,
+    },
     /// One slash-delimited segment contains a Git-forbidden character.
-    ForbiddenCharacter { index: usize },
+    ForbiddenCharacter {
+        /// Zero-based position of the rejected slash-delimited component.
+        index: usize,
+    },
 }
 
 impl fmt::Display for InvalidBranchName {

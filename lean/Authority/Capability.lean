@@ -1,11 +1,13 @@
 import Authority.File
+import Authority.GitHub
+import Authority.Http
 import Authority.Time
 
 /-!
 # Capability Envelopes
 
-Typed file capability envelopes, executable authorization decisions, and
-proofs that delegation preserves the complete time-and-authority request set.
+Typed capability envelopes, executable authorization decisions, and proofs
+that delegation preserves the complete time-and-authority request set.
 -/
 
 namespace Authority
@@ -45,11 +47,19 @@ structure CapabilityMetadata where
 inductive AuthorityBody where
   /-- Repository filesystem authority. -/
   | file (authority : FileAuthority)
+  /-- Public HTTP fetch authority. -/
+  | httpFetch (authority : HttpFetchAuthority)
+  /-- Closed GitHub API authority. -/
+  | gitHub (authority : GitHubAuthority)
 
 /-- A typed operation checked against an `AuthorityBody`. -/
 inductive AuthorityRequest where
   /-- Repository filesystem request. -/
   | file (request : FileRequest)
+  /-- Public HTTP fetch request. -/
+  | httpFetch (request : HttpFetchRequest)
+  /-- Closed GitHub API request. -/
+  | gitHub (request : GitHubRequest)
 
 namespace AuthorityBody
 
@@ -57,6 +67,9 @@ namespace AuthorityBody
 def Matches (authority : AuthorityBody) (request : AuthorityRequest) : Prop :=
   match authority, request with
   | .file authority, .file request => authority.Matches request
+  | .httpFetch authority, .httpFetch request => authority.Matches request
+  | .gitHub authority, .gitHub request => authority.Matches request
+  | _, _ => False
 
 /-- States that the authority body permits at least one typed request. -/
 def Nonempty (authority : AuthorityBody) : Prop :=
@@ -68,39 +81,53 @@ end AuthorityBody
 def authorityMatches (authority : AuthorityBody) (request : AuthorityRequest) : Bool :=
   match authority, request with
   | .file authority, .file request => fileMatches authority request
+  | .httpFetch authority, .httpFetch request => httpFetchMatches authority request
+  | .gitHub authority, .gitHub request => gitHubMatches authority request
+  | _, _ => false
 
 /-- The executable typed-authority check exactly represents `Matches`. -/
 theorem authorityMatches_iff_matches {authority : AuthorityBody}
     {request : AuthorityRequest} :
     authorityMatches authority request = true ↔ authority.Matches request := by
   cases authority <;> cases request <;>
-    simp [authorityMatches, AuthorityBody.Matches, fileMatches_iff_matches]
+    simp [authorityMatches, AuthorityBody.Matches, fileMatches_iff_matches,
+      httpFetchMatches_iff_matches, gitHubMatches_iff_matches]
 
 /-- Returns whether the child's typed request set is structurally below the parent's. -/
 def authorityBodyBelow (child parent : AuthorityBody) : Bool :=
   match child, parent with
   | .file child, .file parent => fileBodyBelow child parent
+  | .httpFetch child, .httpFetch parent => httpFetchBodyBelow child parent
+  | .gitHub child, .gitHub parent => gitHubBodyBelow child parent
+  | _, _ => false
 
 /-- Typed-authority containment is reflexive. -/
 theorem authorityBodyBelow_refl (authority : AuthorityBody) :
     authorityBodyBelow authority authority = true := by
-  cases authority <;> simp [authorityBodyBelow, fileBodyBelow_refl]
+  cases authority <;> simp [authorityBodyBelow, fileBodyBelow_refl,
+    httpFetchBodyBelow_refl, gitHubBodyBelow_refl]
 
 /-- Typed-authority containment is transitive. -/
 theorem authorityBodyBelow_trans {first second third : AuthorityBody}
     (firstBelowSecond : authorityBodyBelow first second = true)
     (secondBelowThird : authorityBodyBelow second third = true) :
     authorityBodyBelow first third = true := by
-  cases first <;> cases second <;> cases third
-  exact fileBodyBelow_trans firstBelowSecond secondBelowThird
+  cases first <;> cases second <;> cases third <;>
+    simp [authorityBodyBelow] at firstBelowSecond secondBelowThird ⊢
+  · exact fileBodyBelow_trans firstBelowSecond secondBelowThird
+  · exact httpFetchBodyBelow_trans firstBelowSecond secondBelowThird
+  · exact gitHubBodyBelow_trans firstBelowSecond secondBelowThird
 
 /-- A successful typed-authority decision implies semantic request-set inclusion. -/
 theorem authorityBodyBelow_sound {child parent : AuthorityBody}
     (isBelow : authorityBodyBelow child parent = true) :
     ∀ request, child.Matches request → parent.Matches request := by
   intro request childMatches
-  cases child <;> cases parent <;> cases request
-  exact fileBodyBelow_sound isBelow _ childMatches
+  cases child <;> cases parent <;> cases request <;>
+    simp [authorityBodyBelow, AuthorityBody.Matches] at isBelow childMatches ⊢
+  · exact fileBodyBelow_sound isBelow _ childMatches
+  · exact httpFetchBodyBelow_sound isBelow _ childMatches
+  · exact gitHubBodyBelow_sound isBelow _ childMatches
 
 /--
 Semantic request-set inclusion implies structural containment when the child
@@ -117,10 +144,87 @@ theorem authorityBodyBelow_complete_of_nonempty {child parent : AuthorityBody}
       apply fileBodyBelow_complete_of_effects_nonempty
       · rcases hasRequest with ⟨request, childMatches⟩
         cases request with
-        | file request =>
-          exact ⟨request.effect, childMatches.2.1⟩
+        | file request => exact ⟨request.effect, childMatches.2.1⟩
+        | httpFetch => simp [AuthorityBody.Matches] at childMatches
+        | gitHub => simp [AuthorityBody.Matches] at childMatches
       · intro request childMatches
         exact isSubset (.file request) childMatches
+    | httpFetch parent =>
+      exfalso
+      rcases hasRequest with ⟨request, childMatches⟩
+      cases request with
+      | file request =>
+        have parentMatches := isSubset (.file request) childMatches
+        simp [AuthorityBody.Matches] at parentMatches
+      | httpFetch => simp [AuthorityBody.Matches] at childMatches
+      | gitHub => simp [AuthorityBody.Matches] at childMatches
+    | gitHub parent =>
+      exfalso
+      rcases hasRequest with ⟨request, childMatches⟩
+      cases request with
+      | file request =>
+        have parentMatches := isSubset (.file request) childMatches
+        simp [AuthorityBody.Matches] at parentMatches
+      | httpFetch => simp [AuthorityBody.Matches] at childMatches
+      | gitHub => simp [AuthorityBody.Matches] at childMatches
+  | httpFetch child =>
+    cases parent with
+    | file parent =>
+      exfalso
+      rcases hasRequest with ⟨request, childMatches⟩
+      cases request with
+      | file => simp [AuthorityBody.Matches] at childMatches
+      | httpFetch request =>
+        have parentMatches := isSubset (.httpFetch request) childMatches
+        simp [AuthorityBody.Matches] at parentMatches
+      | gitHub => simp [AuthorityBody.Matches] at childMatches
+    | httpFetch parent =>
+      apply httpFetchBodyBelow_complete_of_methods_nonempty
+      · rcases hasRequest with ⟨request, childMatches⟩
+        cases request with
+        | file => simp [AuthorityBody.Matches] at childMatches
+        | httpFetch request => exact ⟨request.method, childMatches.2.1⟩
+        | gitHub => simp [AuthorityBody.Matches] at childMatches
+      · intro request childMatches
+        exact isSubset (.httpFetch request) childMatches
+    | gitHub parent =>
+      exfalso
+      rcases hasRequest with ⟨request, childMatches⟩
+      cases request with
+      | file => simp [AuthorityBody.Matches] at childMatches
+      | httpFetch request =>
+        have parentMatches := isSubset (.httpFetch request) childMatches
+        simp [AuthorityBody.Matches] at parentMatches
+      | gitHub => simp [AuthorityBody.Matches] at childMatches
+  | gitHub child =>
+    cases parent with
+    | file parent =>
+      exfalso
+      rcases hasRequest with ⟨request, childMatches⟩
+      cases request with
+      | file => simp [AuthorityBody.Matches] at childMatches
+      | httpFetch => simp [AuthorityBody.Matches] at childMatches
+      | gitHub request =>
+        have parentMatches := isSubset (.gitHub request) childMatches
+        simp [AuthorityBody.Matches] at parentMatches
+    | httpFetch parent =>
+      exfalso
+      rcases hasRequest with ⟨request, childMatches⟩
+      cases request with
+      | file => simp [AuthorityBody.Matches] at childMatches
+      | httpFetch => simp [AuthorityBody.Matches] at childMatches
+      | gitHub request =>
+        have parentMatches := isSubset (.gitHub request) childMatches
+        simp [AuthorityBody.Matches] at parentMatches
+    | gitHub parent =>
+      apply gitHubBodyBelow_complete_of_operations_nonempty
+      · rcases hasRequest with ⟨request, childMatches⟩
+        cases request with
+        | file => simp [AuthorityBody.Matches] at childMatches
+        | httpFetch => simp [AuthorityBody.Matches] at childMatches
+        | gitHub request => exact ⟨request.operation, childMatches.2.2.1⟩
+      · intro request childMatches
+        exact isSubset (.gitHub request) childMatches
 
 /-- An immutable capability envelope. -/
 structure Capability where

@@ -4,6 +4,8 @@ use std::fmt;
 
 use crate::{
     file::{FileAuthority, FileRequest, file_body_below, file_matches},
+    github::{GitHubAuthority, GitHubRequest, github_body_below, github_matches},
+    http::{HttpFetchAuthority, HttpFetchRequest, http_fetch_body_below, http_fetch_matches},
     time::{MonotonicTime, TimeWindow},
 };
 
@@ -156,6 +158,10 @@ impl CapabilityMetadata {
 pub enum AuthorityBody {
     /// Repository filesystem authority.
     File(FileAuthority),
+    /// Public HTTP fetch authority.
+    HttpFetch(HttpFetchAuthority),
+    /// Closed GitHub API authority.
+    GitHub(GitHubAuthority),
 }
 
 /// A typed operation checked against an [`AuthorityBody`].
@@ -163,6 +169,10 @@ pub enum AuthorityBody {
 pub enum AuthorityRequest {
     /// Repository filesystem request.
     File(FileRequest),
+    /// Public HTTP fetch request.
+    HttpFetch(HttpFetchRequest),
+    /// Closed GitHub API request.
+    GitHub(GitHubRequest),
 }
 
 /// An immutable capability envelope.
@@ -295,6 +305,13 @@ pub fn authority_matches(authority: &AuthorityBody, request: &AuthorityRequest) 
         (AuthorityBody::File(authority), AuthorityRequest::File(request)) => {
             file_matches(authority, request)
         }
+        (AuthorityBody::HttpFetch(authority), AuthorityRequest::HttpFetch(request)) => {
+            http_fetch_matches(authority, request)
+        }
+        (AuthorityBody::GitHub(authority), AuthorityRequest::GitHub(request)) => {
+            github_matches(authority, request)
+        }
+        _ => false,
     }
 }
 
@@ -303,6 +320,13 @@ pub fn authority_matches(authority: &AuthorityBody, request: &AuthorityRequest) 
 pub fn authority_body_below(child: &AuthorityBody, parent: &AuthorityBody) -> bool {
     match (child, parent) {
         (AuthorityBody::File(child), AuthorityBody::File(parent)) => file_body_below(child, parent),
+        (AuthorityBody::HttpFetch(child), AuthorityBody::HttpFetch(parent)) => {
+            http_fetch_body_below(child, parent)
+        }
+        (AuthorityBody::GitHub(child), AuthorityBody::GitHub(parent)) => {
+            github_body_below(child, parent)
+        }
+        _ => false,
     }
 }
 
@@ -332,6 +356,14 @@ mod tests {
     };
     use crate::{
         file::{FileAuthority, FileEffect, FileEffects, FileRequest},
+        github::{
+            BranchName, BranchPattern, GitHubAuthority, GitHubOperation, GitHubOperations,
+            GitHubRequest, InstallationId,
+        },
+        http::{
+            CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethod, HttpFetchMethods,
+            HttpFetchRequest, UrlPathPattern,
+        },
         path::{CanonicalPath, PathPattern},
         repository::RepoId,
         time::{MonotonicTime, TimeWindow},
@@ -375,6 +407,67 @@ mod tests {
         CapabilityRequest::new(
             MonotonicTime::from_ticks(time),
             AuthorityRequest::File(FileRequest::new(RepoId::new("workspace"), effect, path)),
+        )
+    }
+
+    fn http_capability(label: &str, validity: TimeWindow) -> Capability {
+        Capability::new(
+            metadata(label),
+            validity,
+            AuthorityBody::HttpFetch(HttpFetchAuthority::new(
+                HttpFetchMethods::from_methods([HttpFetchMethod::Get, HttpFetchMethod::Head]),
+                CanonicalHost::new("docs.example").expect("test host must be valid"),
+                UrlPathPattern::Prefix(
+                    CanonicalUrlPath::new("/guide").expect("test URL path must be valid"),
+                ),
+                4_096,
+            )),
+        )
+    }
+
+    fn http_request(time: u64, method: HttpFetchMethod, path: &str) -> CapabilityRequest {
+        CapabilityRequest::new(
+            MonotonicTime::from_ticks(time),
+            AuthorityRequest::HttpFetch(HttpFetchRequest::new(
+                method,
+                CanonicalHost::new("docs.example").expect("test host must be valid"),
+                CanonicalUrlPath::new(path).expect("test URL path must be valid"),
+                1_024,
+            )),
+        )
+    }
+
+    fn branch(value: &str) -> BranchName {
+        BranchName::new(value).expect("test branch must be valid")
+    }
+
+    fn github_capability(label: &str, validity: TimeWindow) -> Capability {
+        Capability::new(
+            metadata(label),
+            validity,
+            AuthorityBody::GitHub(GitHubAuthority::new(
+                InstallationId::new("installation-a"),
+                RepoId::new("github.example/acme/workspace"),
+                GitHubOperations::from_operations([
+                    GitHubOperation::PublishBranch,
+                    GitHubOperation::CreatePullRequest,
+                ]),
+                BranchPattern::Exact(branch("main")),
+                BranchPattern::Prefix(branch("agents")),
+            )),
+        )
+    }
+
+    fn github_request(time: u64, operation: GitHubOperation, head: &str) -> CapabilityRequest {
+        CapabilityRequest::new(
+            MonotonicTime::from_ticks(time),
+            AuthorityRequest::GitHub(GitHubRequest::new(
+                InstallationId::new("installation-a"),
+                RepoId::new("github.example/acme/workspace"),
+                operation,
+                branch("main"),
+                branch(head),
+            )),
         )
     }
 
@@ -500,5 +593,60 @@ mod tests {
         assert!(weaker_than(&leaf, &child));
         assert!(weaker_than(&child, &root));
         assert!(weaker_than(&leaf, &root));
+    }
+
+    #[test]
+    fn capability_matching_dispatches_only_to_the_same_authority_family() {
+        let file = file_capability(
+            "file",
+            window(10, 20),
+            FileEffects::only(FileEffect::ReadData),
+            PathPattern::Prefix(path(&["src"])),
+        );
+        let http = http_capability("http", window(10, 20));
+        let github = github_capability("github", window(10, 20));
+        let file_request = file_request(15, FileEffect::ReadData, path(&["src", "lib.rs"]));
+        let http_request = http_request(15, HttpFetchMethod::Get, "/guide/start");
+        let github_request = github_request(15, GitHubOperation::CreatePullRequest, "agents/fix");
+
+        assert!(capability_matches(&file, &file_request));
+        assert!(capability_matches(&http, &http_request));
+        assert!(capability_matches(&github, &github_request));
+
+        for (capability, request) in [
+            (&file, &http_request),
+            (&file, &github_request),
+            (&http, &file_request),
+            (&http, &github_request),
+            (&github, &file_request),
+            (&github, &http_request),
+        ] {
+            assert!(!capability_matches(capability, request));
+        }
+    }
+
+    #[test]
+    fn weaker_than_rejects_cross_family_delegation() {
+        let file = file_capability(
+            "file",
+            window(10, 20),
+            FileEffects::only(FileEffect::ReadData),
+            PathPattern::Prefix(path(&["src"])),
+        );
+        let http = http_capability("http", window(10, 20));
+        let github = github_capability("github", window(10, 20));
+
+        assert!(weaker_than(&http, &http));
+        assert!(weaker_than(&github, &github));
+        for (child, parent) in [
+            (&file, &http),
+            (&file, &github),
+            (&http, &file),
+            (&http, &github),
+            (&github, &file),
+            (&github, &http),
+        ] {
+            assert!(!weaker_than(child, parent));
+        }
     }
 }

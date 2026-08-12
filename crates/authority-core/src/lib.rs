@@ -5,7 +5,9 @@
 pub mod audit;
 pub mod capability;
 pub mod file;
+pub mod github;
 pub mod handle;
+pub mod http;
 pub mod kernel;
 pub mod path;
 pub mod repository;

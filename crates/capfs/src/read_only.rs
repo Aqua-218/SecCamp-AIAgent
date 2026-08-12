@@ -546,7 +546,12 @@ impl CapabilityFilesystem {
     }
 
     fn capability_may_observe(&self, capability: &Capability, path: &CanonicalPath) -> bool {
-        let AuthorityBody::File(authority) = capability.authority();
+        let AuthorityBody::File(authority) = capability.authority() else {
+            // capfs is deliberately a repository filesystem adapter. Future
+            // authority families must receive their own adapters rather than
+            // being treated as filesystem authority by accident.
+            return false;
+        };
         authority.repository() == &self.authority.repository
             && !authority.effects().is_empty()
             && (path_matches(authority.path(), path)
@@ -2421,6 +2426,7 @@ mod tests {
             .requests()
             .map(|request| match request.authority() {
                 AuthorityRequest::File(request) => (request.effect(), request.path().clone()),
+                _ => panic!("a capfs rename audit record must contain only file requests"),
             })
             .collect::<Vec<_>>();
         assert_eq!(requests.len(), 4);

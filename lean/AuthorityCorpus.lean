@@ -122,6 +122,146 @@ def parseFileRequest (fields : Fields) (role : String) :
   let path ← parsePath encodedPath s!"{role} path"
   .ok ({ repository := { value := repository }, effect, path }, fields)
 
+def parseHttpMethod (value label : String) : Except String HttpMethod :=
+  match value with
+  | "get" => .ok .get
+  | "head" => .ok .head
+  | _ => .error s!"invalid {label} `{value}`; expected `get` or `head`"
+
+def parseHttpMethodList (values : List String) (label : String) : Except String (List HttpMethod) :=
+  match values with
+  | [] => .ok []
+  | value :: remaining => do
+    let method ← parseHttpMethod value label
+    let methods ← parseHttpMethodList remaining label
+    .ok (method :: methods)
+
+def parseHttpMethods (encoded label : String) : Except String HttpMethods := do
+  if encoded == "-" then
+    .ok HttpMethods.empty
+  else
+    let methods ← parseHttpMethodList (encoded.splitOn "|") label
+    .ok (HttpMethods.ofList methods)
+
+def parseUrlPath (encoded label : String) : Except String CanonicalUrlPath :=
+  if encoded == "/" then
+    .ok CanonicalUrlPath.root
+  else if !encoded.startsWith "/" || encoded.endsWith "/" then
+    .error s!"invalid {label} `{encoded}`; expected a canonical origin path"
+  else
+    match CanonicalUrlPath.ofSegments ((encoded.drop 1).splitOn "/") with
+    | some path => .ok path
+    | none => .error s!"invalid {label} `{encoded}`; expected a canonical origin path"
+
+def parseUrlPattern (fields : Fields) (role : String) : Except String (UrlPathPattern × Fields) := do
+  let (kind, fields) ← fields.take s!"{role} URL path pattern kind"
+  let (encodedPath, fields) ← fields.take s!"{role} URL path pattern"
+  let path ← parseUrlPath encodedPath s!"{role} URL path pattern"
+  match kind with
+  | "exact" => .ok (.exact path, fields)
+  | "prefix" => .ok (.prefix path, fields)
+  | _ => .error s!"invalid {role} URL path pattern kind `{kind}`; expected `exact` or `prefix`"
+
+def parseUInt64 (encoded label : String) : Except String UInt64 :=
+  match encoded.toNat? with
+  | some value =>
+    if value ≤ maxUInt64Ticks then
+      .ok (UInt64.ofNat value)
+    else
+      .error s!"invalid {label} `{encoded}`; expected u64"
+  | none => .error s!"invalid {label} `{encoded}`; expected u64"
+
+def parseHttpAuthority (fields : Fields) (role : String) :
+    Except String (HttpFetchAuthority × Fields) := do
+  let (encodedMethods, fields) ← fields.take s!"{role} HTTP methods"
+  let methods ← parseHttpMethods encodedMethods s!"{role} HTTP methods"
+  let (host, fields) ← fields.take s!"{role} HTTP host"
+  let (path, fields) ← parseUrlPattern fields role
+  let (encodedMaxResponseBytes, fields) ← fields.take s!"{role} HTTP maximum response bytes"
+  let maxResponseBytes ← parseUInt64 encodedMaxResponseBytes s!"{role} HTTP maximum response bytes"
+  .ok ({ methods, host := { value := host }, path, maxResponseBytes }, fields)
+
+def parseHttpRequest (fields : Fields) (role : String) :
+    Except String (HttpFetchRequest × Fields) := do
+  let (encodedMethod, fields) ← fields.take s!"{role} HTTP method"
+  let method ← parseHttpMethod encodedMethod s!"{role} HTTP method"
+  let (host, fields) ← fields.take s!"{role} HTTP host"
+  let (encodedPath, fields) ← fields.take s!"{role} HTTP URL path"
+  let path ← parseUrlPath encodedPath s!"{role} HTTP URL path"
+  let (encodedMaxResponseBytes, fields) ← fields.take s!"{role} HTTP maximum response bytes"
+  let maxResponseBytes ← parseUInt64 encodedMaxResponseBytes s!"{role} HTTP maximum response bytes"
+  .ok ({ method, host := { value := host }, path, maxResponseBytes }, fields)
+
+def parseGitHubOperation (value label : String) : Except String GitHubOperation :=
+  match value with
+  | "publish_branch" => .ok .publishBranch
+  | "create_pull_request" => .ok .createPullRequest
+  | _ => .error s!"invalid {label} `{value}`; expected a GitHub operation"
+
+def parseGitHubOperationList (values : List String) (label : String) :
+    Except String (List GitHubOperation) :=
+  match values with
+  | [] => .ok []
+  | value :: remaining => do
+    let operation ← parseGitHubOperation value label
+    let operations ← parseGitHubOperationList remaining label
+    .ok (operation :: operations)
+
+def parseGitHubOperations (encoded label : String) : Except String GitHubOperations := do
+  if encoded == "-" then
+    .ok GitHubOperations.empty
+  else
+    let operations ← parseGitHubOperationList (encoded.splitOn "|") label
+    .ok (GitHubOperations.ofList operations)
+
+def parseBranch (encoded label : String) : Except String BranchName :=
+  match BranchName.ofSegments (encoded.splitOn "/") with
+  | some branch => .ok branch
+  | none => .error s!"invalid {label} `{encoded}`; expected a safe branch name"
+
+def parseBranchPattern (fields : Fields) (role : String) : Except String (BranchPattern × Fields) := do
+  let (kind, fields) ← fields.take s!"{role} branch pattern kind"
+  let (encodedBranch, fields) ← fields.take s!"{role} branch pattern"
+  let branch ← parseBranch encodedBranch s!"{role} branch pattern"
+  match kind with
+  | "exact" => .ok (.exact branch, fields)
+  | "prefix" => .ok (.prefix branch, fields)
+  | _ => .error s!"invalid {role} branch pattern kind `{kind}`; expected `exact` or `prefix`"
+
+def parseGitHubAuthority (fields : Fields) (role : String) :
+    Except String (GitHubAuthority × Fields) := do
+  let (installation, fields) ← fields.take s!"{role} GitHub installation"
+  let (repository, fields) ← fields.take s!"{role} GitHub repository"
+  let (encodedOperations, fields) ← fields.take s!"{role} GitHub operations"
+  let operations ← parseGitHubOperations encodedOperations s!"{role} GitHub operations"
+  let (base, fields) ← parseBranchPattern fields s!"{role} GitHub base"
+  let (head, fields) ← parseBranchPattern fields s!"{role} GitHub head"
+  let authority : GitHubAuthority :=
+    { installation := { value := installation }
+      repository := { value := repository }
+      operations
+      base
+      head }
+  .ok (authority, fields)
+
+def parseGitHubRequest (fields : Fields) (role : String) :
+    Except String (GitHubRequest × Fields) := do
+  let (installation, fields) ← fields.take s!"{role} GitHub installation"
+  let (repository, fields) ← fields.take s!"{role} GitHub repository"
+  let (encodedOperation, fields) ← fields.take s!"{role} GitHub operation"
+  let operation ← parseGitHubOperation encodedOperation s!"{role} GitHub operation"
+  let (encodedBase, fields) ← fields.take s!"{role} GitHub base branch"
+  let base ← parseBranch encodedBase s!"{role} GitHub base branch"
+  let (encodedHead, fields) ← fields.take s!"{role} GitHub head branch"
+  let head ← parseBranch encodedHead s!"{role} GitHub head branch"
+  let request : GitHubRequest :=
+    { installation := { value := installation }
+      repository := { value := repository }
+      operation
+      base
+      head }
+  .ok (request, fields)
+
 def parseTimeWindow (fields : Fields) (role : String) : Except String (TimeWindow × Fields) := do
   let (encodedStart, fields) ← fields.take s!"{role} not_before"
   let notBefore ← parseTicks encodedStart s!"{role} not_before"
@@ -149,6 +289,31 @@ def parseCapabilityRequest (fields : Fields) (role : String) :
   let time ← parseTicks encodedTime s!"{role} time"
   let (request, fields) ← parseFileRequest fields role
   .ok ({ time, authority := .file request }, fields)
+
+def parseHttpCapability (fields : Fields) (role : String) : Except String (Capability × Fields) := do
+  let (validity, fields) ← parseTimeWindow fields role
+  let (authority, fields) ← parseHttpAuthority fields role
+  .ok ({ metadata := corpusMetadata, validity, authority := .httpFetch authority }, fields)
+
+def parseHttpCapabilityRequest (fields : Fields) (role : String) :
+    Except String (CapabilityRequest × Fields) := do
+  let (encodedTime, fields) ← fields.take s!"{role} time"
+  let time ← parseTicks encodedTime s!"{role} time"
+  let (request, fields) ← parseHttpRequest fields role
+  .ok ({ time, authority := .httpFetch request }, fields)
+
+def parseGitHubCapability (fields : Fields) (role : String) :
+    Except String (Capability × Fields) := do
+  let (validity, fields) ← parseTimeWindow fields role
+  let (authority, fields) ← parseGitHubAuthority fields role
+  .ok ({ metadata := corpusMetadata, validity, authority := .gitHub authority }, fields)
+
+def parseGitHubCapabilityRequest (fields : Fields) (role : String) :
+    Except String (CapabilityRequest × Fields) := do
+  let (encodedTime, fields) ← fields.take s!"{role} time"
+  let time ← parseTicks encodedTime s!"{role} time"
+  let (request, fields) ← parseGitHubRequest fields role
+  .ok ({ time, authority := .gitHub request }, fields)
 
 def evaluateOperation (kind : String) (fields : Fields) : Except String (Bool × Fields) := do
   match kind with
@@ -187,6 +352,22 @@ def evaluateOperation (kind : String) (fields : Fields) : Except String (Bool ×
     let (child, fields) ← parseFileAuthority fields "child"
     let (parent, fields) ← parseFileAuthority fields "parent"
     .ok (fileBodyBelow child parent, fields)
+  | "http_matches" =>
+    let (authority, fields) ← parseHttpAuthority fields "authority"
+    let (request, fields) ← parseHttpRequest fields "request"
+    .ok (httpFetchMatches authority request, fields)
+  | "http_below" =>
+    let (child, fields) ← parseHttpAuthority fields "child"
+    let (parent, fields) ← parseHttpAuthority fields "parent"
+    .ok (httpFetchBodyBelow child parent, fields)
+  | "github_matches" =>
+    let (authority, fields) ← parseGitHubAuthority fields "authority"
+    let (request, fields) ← parseGitHubRequest fields "request"
+    .ok (gitHubMatches authority request, fields)
+  | "github_below" =>
+    let (child, fields) ← parseGitHubAuthority fields "child"
+    let (parent, fields) ← parseGitHubAuthority fields "parent"
+    .ok (gitHubBodyBelow child parent, fields)
   | "capability_matches" =>
     let (capability, fields) ← parseCapability fields "authority"
     let (request, fields) ← parseCapabilityRequest fields "request"
@@ -194,6 +375,22 @@ def evaluateOperation (kind : String) (fields : Fields) : Except String (Bool ×
   | "weaker_than" =>
     let (child, fields) ← parseCapability fields "child"
     let (parent, fields) ← parseCapability fields "parent"
+    .ok (weakerThan child parent, fields)
+  | "http_capability_matches" =>
+    let (capability, fields) ← parseHttpCapability fields "authority"
+    let (request, fields) ← parseHttpCapabilityRequest fields "request"
+    .ok (capabilityMatches capability request, fields)
+  | "http_weaker_than" =>
+    let (child, fields) ← parseHttpCapability fields "child"
+    let (parent, fields) ← parseHttpCapability fields "parent"
+    .ok (weakerThan child parent, fields)
+  | "github_capability_matches" =>
+    let (capability, fields) ← parseGitHubCapability fields "authority"
+    let (request, fields) ← parseGitHubCapabilityRequest fields "request"
+    .ok (capabilityMatches capability request, fields)
+  | "github_weaker_than" =>
+    let (child, fields) ← parseGitHubCapability fields "child"
+    let (parent, fields) ← parseGitHubCapability fields "parent"
     .ok (weakerThan child parent, fields)
   | _ => .error s!"unknown case kind `{kind}`; expected a supported authority decision"
 

@@ -22,6 +22,29 @@
 # weaker_than: child_start, child_end, child_repo, child_effects, child_kind,
 #              child_path, parent_start, parent_end, parent_repo,
 #              parent_effects, parent_kind, parent_path
+# http_matches: authority_methods, authority_host, authority_path_kind,
+#               authority_path, authority_max_response_bytes, request_method,
+#               request_host, request_path, request_max_response_bytes
+# http_below: child_methods, child_host, child_path_kind, child_path,
+#             child_max_response_bytes, parent_methods, parent_host,
+#             parent_path_kind, parent_path, parent_max_response_bytes
+# http_capability_matches: not_before, expires_at, [http authority fields],
+#                          request_time, [http request fields]
+# http_weaker_than: child_start, child_end, [http authority fields],
+#                   parent_start, parent_end, [http authority fields]
+# github_matches: authority_installation, authority_repository,
+#                 authority_operations, authority_base_kind, authority_base,
+#                 authority_head_kind, authority_head, request_installation,
+#                 request_repository, request_operation, request_base,
+#                 request_head
+# github_below: child_installation, child_repository, child_operations,
+#               child_base_kind, child_base, child_head_kind, child_head,
+#               parent_installation, parent_repository, parent_operations,
+#               parent_base_kind, parent_base, parent_head_kind, parent_head
+# github_capability_matches: not_before, expires_at, [github authority fields],
+#                            request_time, [github request fields]
+# github_weaker_than: child_start, child_end, [github authority fields],
+#                     parent_start, parent_end, [github authority fields]
 
 path_valid	path-root-is-valid	true	-
 path_valid	path-nested-is-valid	true	src|parser|lexer.rs
@@ -141,3 +164,61 @@ weaker_than	capability-repository-change-is-rejected	false	15	20	other	read_data
 weaker_than	capability-path-expansion-is-rejected	false	15	20	workspace	read_data	prefix	-	10	30	workspace	read_data|write_data	prefix	src
 weaker_than	transitive-leaf-capability-is-below-root	true	16	18	workspace	read_data	exact	src|parser|lexer.rs	10	30	workspace	read_data|write_data|rename	prefix	src
 weaker_than	empty-capability-does-not-bypass-structure	false	15	20	workspace	-	prefix	-	10	30	workspace	read_data	prefix	src
+
+# HTTP fetch authority is intentionally limited to a canonical host, the two
+# safe retrieval methods, a segment-aware URL path, and a response-byte cap.
+http_matches	http-get-descendant-is-allowed	true	get|head	docs.example	prefix	/guide	4096	get	docs.example	/guide/start	1024
+http_matches	http-head-descendant-is-allowed	true	get|head	docs.example	prefix	/guide	4096	head	docs.example	/guide/start	4096
+http_matches	http-method-escalation-is-rejected	false	get	docs.example	prefix	/guide	4096	head	docs.example	/guide/start	1024
+http_matches	http-host-change-is-rejected	false	get	docs.example	prefix	/guide	4096	get	api.example	/guide/start	1024
+http_matches	http-path-escape-is-rejected	false	get	docs.example	prefix	/guide	4096	get	docs.example	/release	1024
+http_matches	http-segment-boundary-is-respected	false	get	docs.example	prefix	/guide	4096	get	docs.example	/guide-old	1024
+http_matches	http-response-cap-escalation-is-rejected	false	get	docs.example	prefix	/guide	4096	get	docs.example	/guide/start	4097
+
+http_below	http-authority-below-itself	true	get|head	docs.example	prefix	/guide	4096	get|head	docs.example	prefix	/guide	4096
+http_below	http-authority-narrows-every-boundary	true	get	docs.example	exact	/guide/start	1024	get|head	docs.example	prefix	/guide	4096
+http_below	http-child-method-escalation-is-rejected	false	get|head	docs.example	exact	/guide/start	1024	get	docs.example	prefix	/guide	4096
+http_below	http-child-host-change-is-rejected	false	get	api.example	exact	/guide/start	1024	get	docs.example	prefix	/guide	4096
+http_below	http-child-path-expansion-is-rejected	false	get	docs.example	prefix	/	1024	get	docs.example	prefix	/guide	4096
+http_below	http-child-response-cap-escalation-is-rejected	false	get	docs.example	exact	/guide/start	8192	get	docs.example	prefix	/guide	4096
+http_below	http-empty-methods-do-not-bypass-structure	false	-	docs.example	prefix	/	1024	get	docs.example	prefix	/guide	4096
+
+http_capability_matches	http-capability-allows-lower-bound-request	true	10	20	get	docs.example	prefix	/guide	4096	10	get	docs.example	/guide/start	1024
+http_capability_matches	http-capability-rejects-expired-request	false	10	20	get	docs.example	prefix	/guide	4096	20	get	docs.example	/guide/start	1024
+http_capability_matches	http-capability-rejects-excess-response-cap	false	10	20	get	docs.example	prefix	/guide	4096	15	get	docs.example	/guide/start	4097
+http_capability_matches	http-capability-rejects-outside-url-path	false	10	20	get	docs.example	prefix	/guide	4096	15	get	docs.example	/release	1024
+
+http_weaker_than	http-capability-narrows-time-and-authority	true	15	20	get	docs.example	exact	/guide/start	1024	10	30	get|head	docs.example	prefix	/guide	4096
+http_weaker_than	http-capability-rejects-earlier-start	false	9	20	get	docs.example	exact	/guide/start	1024	10	30	get|head	docs.example	prefix	/guide	4096
+http_weaker_than	http-capability-rejects-method-expansion	false	15	20	get|head	docs.example	exact	/guide/start	1024	10	30	get	docs.example	prefix	/guide	4096
+http_weaker_than	http-capability-rejects-host-change	false	15	20	get	api.example	exact	/guide/start	1024	10	30	get	docs.example	prefix	/guide	4096
+http_weaker_than	http-capability-rejects-response-cap-expansion	false	15	20	get	docs.example	exact	/guide/start	8192	10	30	get	docs.example	prefix	/guide	4096
+
+# GitHub is not arbitrary authenticated HTTP: only named operations and both
+# branch boundaries are represented by the authority and request types.
+github_matches	github-create-pull-request-is-allowed	true	installation-a	github.example/acme/workspace	publish_branch|create_pull_request	exact	main	prefix	agents	installation-a	github.example/acme/workspace	create_pull_request	main	agents/fix
+github_matches	github-publish-branch-is-allowed	true	installation-a	github.example/acme/workspace	publish_branch|create_pull_request	exact	main	prefix	agents	installation-a	github.example/acme/workspace	publish_branch	main	agents/release
+github_matches	github-operation-escalation-is-rejected	false	installation-a	github.example/acme/workspace	create_pull_request	exact	main	prefix	agents	installation-a	github.example/acme/workspace	publish_branch	main	agents/fix
+github_matches	github-installation-change-is-rejected	false	installation-a	github.example/acme/workspace	create_pull_request	exact	main	prefix	agents	installation-b	github.example/acme/workspace	create_pull_request	main	agents/fix
+github_matches	github-repository-change-is-rejected	false	installation-a	github.example/acme/workspace	create_pull_request	exact	main	prefix	agents	installation-a	github.example/acme/other	create_pull_request	main	agents/fix
+github_matches	github-base-branch-escape-is-rejected	false	installation-a	github.example/acme/workspace	create_pull_request	exact	main	prefix	agents	installation-a	github.example/acme/workspace	create_pull_request	release	agents/fix
+github_matches	github-head-branch-boundary-is-respected	false	installation-a	github.example/acme/workspace	create_pull_request	exact	main	prefix	agents	installation-a	github.example/acme/workspace	create_pull_request	main	agents-evil
+
+github_below	github-authority-below-itself	true	installation-a	github.example/acme/workspace	publish_branch|create_pull_request	prefix	release	prefix	agents	installation-a	github.example/acme/workspace	publish_branch|create_pull_request	prefix	release	prefix	agents
+github_below	github-authority-narrows-every-boundary	true	installation-a	github.example/acme/workspace	create_pull_request	exact	release/current	exact	agents/fix	installation-a	github.example/acme/workspace	publish_branch|create_pull_request	prefix	release	prefix	agents
+github_below	github-child-operation-escalation-is-rejected	false	installation-a	github.example/acme/workspace	publish_branch|create_pull_request	exact	release/current	exact	agents/fix	installation-a	github.example/acme/workspace	create_pull_request	prefix	release	prefix	agents
+github_below	github-child-installation-change-is-rejected	false	installation-b	github.example/acme/workspace	create_pull_request	exact	release/current	exact	agents/fix	installation-a	github.example/acme/workspace	create_pull_request	prefix	release	prefix	agents
+github_below	github-child-repository-change-is-rejected	false	installation-a	github.example/acme/other	create_pull_request	exact	release/current	exact	agents/fix	installation-a	github.example/acme/workspace	create_pull_request	prefix	release	prefix	agents
+github_below	github-child-base-expansion-is-rejected	false	installation-a	github.example/acme/workspace	create_pull_request	prefix	release	exact	agents/fix	installation-a	github.example/acme/workspace	create_pull_request	exact	release/current	prefix	agents
+github_below	github-empty-operations-do-not-bypass-head-boundary	false	installation-a	github.example/acme/workspace	-	exact	main	prefix	other	installation-a	github.example/acme/workspace	create_pull_request	exact	main	prefix	agents
+
+github_capability_matches	github-capability-allows-lower-bound-request	true	10	20	installation-a	github.example/acme/workspace	create_pull_request	exact	main	prefix	agents	10	installation-a	github.example/acme/workspace	create_pull_request	main	agents/fix
+github_capability_matches	github-capability-rejects-expired-request	false	10	20	installation-a	github.example/acme/workspace	create_pull_request	exact	main	prefix	agents	20	installation-a	github.example/acme/workspace	create_pull_request	main	agents/fix
+github_capability_matches	github-capability-rejects-operation-escalation	false	10	20	installation-a	github.example/acme/workspace	create_pull_request	exact	main	prefix	agents	15	installation-a	github.example/acme/workspace	publish_branch	main	agents/fix
+github_capability_matches	github-capability-rejects-head-escape	false	10	20	installation-a	github.example/acme/workspace	create_pull_request	exact	main	prefix	agents	15	installation-a	github.example/acme/workspace	create_pull_request	main	other/fix
+
+github_weaker_than	github-capability-narrows-time-and-authority	true	15	20	installation-a	github.example/acme/workspace	create_pull_request	exact	main	exact	agents/fix	10	30	installation-a	github.example/acme/workspace	publish_branch|create_pull_request	prefix	main	prefix	agents
+github_weaker_than	github-capability-rejects-late-expiry	false	15	31	installation-a	github.example/acme/workspace	create_pull_request	exact	main	exact	agents/fix	10	30	installation-a	github.example/acme/workspace	publish_branch|create_pull_request	prefix	main	prefix	agents
+github_weaker_than	github-capability-rejects-installation-change	false	15	20	installation-b	github.example/acme/workspace	create_pull_request	exact	main	exact	agents/fix	10	30	installation-a	github.example/acme/workspace	publish_branch|create_pull_request	prefix	main	prefix	agents
+github_weaker_than	github-capability-rejects-base-expansion	false	15	20	installation-a	github.example/acme/workspace	create_pull_request	prefix	main	exact	agents/fix	10	30	installation-a	github.example/acme/workspace	publish_branch|create_pull_request	exact	main	prefix	agents
+github_weaker_than	github-capability-rejects-head-expansion	false	15	20	installation-a	github.example/acme/workspace	create_pull_request	exact	main	prefix	other	10	30	installation-a	github.example/acme/workspace	publish_branch|create_pull_request	exact	main	prefix	agents

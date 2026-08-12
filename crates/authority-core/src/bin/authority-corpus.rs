@@ -8,6 +8,14 @@ use authority_core::{
         IssuerId, SubjectId, capability_matches, weaker_than,
     },
     file::{FileAuthority, FileEffect, FileEffects, FileRequest, file_body_below, file_matches},
+    github::{
+        BranchName, BranchPattern, GitHubAuthority, GitHubOperation, GitHubOperations,
+        GitHubRequest, InstallationId, github_body_below, github_matches,
+    },
+    http::{
+        CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethod, HttpFetchMethods,
+        HttpFetchRequest, UrlPathPattern, http_fetch_body_below, http_fetch_matches,
+    },
     path::{CanonicalPath, PathPattern, path_below, path_matches},
     repository::RepoId,
     time::{MonotonicTime, TimeWindow},
@@ -148,6 +156,173 @@ fn parse_file_request(fields: &mut Fields<'_>, role: &str) -> Result<FileRequest
     Ok(FileRequest::new(repository, effect, path))
 }
 
+fn parse_http_method(value: &str, label: &str) -> Result<HttpFetchMethod, String> {
+    match value {
+        "get" => Ok(HttpFetchMethod::Get),
+        "head" => Ok(HttpFetchMethod::Head),
+        _ => Err(format!(
+            "invalid {label} `{value}`; expected `get` or `head`"
+        )),
+    }
+}
+
+fn parse_http_methods(encoded: &str, label: &str) -> Result<HttpFetchMethods, String> {
+    if encoded == "-" {
+        return Ok(HttpFetchMethods::empty());
+    }
+    encoded
+        .split('|')
+        .map(|value| parse_http_method(value, label))
+        .collect::<Result<Vec<_>, _>>()
+        .map(HttpFetchMethods::from_methods)
+}
+
+fn parse_url_path(encoded: &str, label: &str) -> Result<CanonicalUrlPath, String> {
+    CanonicalUrlPath::new(encoded).map_err(|error| format!("invalid {label} `{encoded}`: {error}"))
+}
+
+fn parse_url_pattern(fields: &mut Fields<'_>, role: &str) -> Result<UrlPathPattern, String> {
+    let kind = fields.take(&format!("{role} URL path pattern kind"))?;
+    let encoded_path = fields.take(&format!("{role} URL path pattern"))?;
+    let path = parse_url_path(encoded_path, &format!("{role} URL path pattern"))?;
+    match kind {
+        "exact" => Ok(UrlPathPattern::Exact(path)),
+        "prefix" => Ok(UrlPathPattern::Prefix(path)),
+        _ => Err(format!(
+            "invalid {role} URL path pattern kind `{kind}`; expected `exact` or `prefix`"
+        )),
+    }
+}
+
+fn parse_http_authority(fields: &mut Fields<'_>, role: &str) -> Result<HttpFetchAuthority, String> {
+    let methods = parse_http_methods(
+        fields.take(&format!("{role} HTTP methods"))?,
+        &format!("{role} HTTP methods"),
+    )?;
+    let encoded_host = fields.take(&format!("{role} HTTP host"))?;
+    let host = CanonicalHost::new(encoded_host)
+        .map_err(|error| format!("invalid {role} HTTP host `{encoded_host}`: {error}"))?;
+    let path = parse_url_pattern(fields, role)?;
+    let max_response_bytes = fields
+        .take(&format!("{role} HTTP maximum response bytes"))?
+        .parse::<u64>()
+        .map_err(|error| {
+            format!("invalid {role} HTTP maximum response bytes: expected u64: {error}")
+        })?;
+    Ok(HttpFetchAuthority::new(
+        methods,
+        host,
+        path,
+        max_response_bytes,
+    ))
+}
+
+fn parse_http_request(fields: &mut Fields<'_>, role: &str) -> Result<HttpFetchRequest, String> {
+    let method = parse_http_method(
+        fields.take(&format!("{role} HTTP method"))?,
+        &format!("{role} HTTP method"),
+    )?;
+    let encoded_host = fields.take(&format!("{role} HTTP host"))?;
+    let host = CanonicalHost::new(encoded_host)
+        .map_err(|error| format!("invalid {role} HTTP host `{encoded_host}`: {error}"))?;
+    let path = parse_url_path(
+        fields.take(&format!("{role} HTTP URL path"))?,
+        &format!("{role} HTTP URL path"),
+    )?;
+    let max_response_bytes = fields
+        .take(&format!("{role} HTTP maximum response bytes"))?
+        .parse::<u64>()
+        .map_err(|error| {
+            format!("invalid {role} HTTP maximum response bytes: expected u64: {error}")
+        })?;
+    Ok(HttpFetchRequest::new(
+        method,
+        host,
+        path,
+        max_response_bytes,
+    ))
+}
+
+fn parse_github_operation(value: &str, label: &str) -> Result<GitHubOperation, String> {
+    match value {
+        "publish_branch" => Ok(GitHubOperation::PublishBranch),
+        "create_pull_request" => Ok(GitHubOperation::CreatePullRequest),
+        _ => Err(format!(
+            "invalid {label} `{value}`; expected a GitHub operation"
+        )),
+    }
+}
+
+fn parse_github_operations(encoded: &str, label: &str) -> Result<GitHubOperations, String> {
+    if encoded == "-" {
+        return Ok(GitHubOperations::empty());
+    }
+    encoded
+        .split('|')
+        .map(|value| parse_github_operation(value, label))
+        .collect::<Result<Vec<_>, _>>()
+        .map(GitHubOperations::from_operations)
+}
+
+fn parse_branch(encoded: &str, label: &str) -> Result<BranchName, String> {
+    BranchName::new(encoded).map_err(|error| format!("invalid {label} `{encoded}`: {error}"))
+}
+
+fn parse_branch_pattern(fields: &mut Fields<'_>, role: &str) -> Result<BranchPattern, String> {
+    let kind = fields.take(&format!("{role} branch pattern kind"))?;
+    let encoded_branch = fields.take(&format!("{role} branch pattern"))?;
+    let branch = parse_branch(encoded_branch, &format!("{role} branch pattern"))?;
+    match kind {
+        "exact" => Ok(BranchPattern::Exact(branch)),
+        "prefix" => Ok(BranchPattern::Prefix(branch)),
+        _ => Err(format!(
+            "invalid {role} branch pattern kind `{kind}`; expected `exact` or `prefix`"
+        )),
+    }
+}
+
+fn parse_github_authority(fields: &mut Fields<'_>, role: &str) -> Result<GitHubAuthority, String> {
+    let installation = InstallationId::new(fields.take(&format!("{role} GitHub installation"))?);
+    let repository = RepoId::new(fields.take(&format!("{role} GitHub repository"))?);
+    let operations = parse_github_operations(
+        fields.take(&format!("{role} GitHub operations"))?,
+        &format!("{role} GitHub operations"),
+    )?;
+    let base = parse_branch_pattern(fields, &format!("{role} GitHub base"))?;
+    let head = parse_branch_pattern(fields, &format!("{role} GitHub head"))?;
+    Ok(GitHubAuthority::new(
+        installation,
+        repository,
+        operations,
+        base,
+        head,
+    ))
+}
+
+fn parse_github_request(fields: &mut Fields<'_>, role: &str) -> Result<GitHubRequest, String> {
+    let installation = InstallationId::new(fields.take(&format!("{role} GitHub installation"))?);
+    let repository = RepoId::new(fields.take(&format!("{role} GitHub repository"))?);
+    let operation = parse_github_operation(
+        fields.take(&format!("{role} GitHub operation"))?,
+        &format!("{role} GitHub operation"),
+    )?;
+    let base = parse_branch(
+        fields.take(&format!("{role} GitHub base branch"))?,
+        &format!("{role} GitHub base branch"),
+    )?;
+    let head = parse_branch(
+        fields.take(&format!("{role} GitHub head branch"))?,
+        &format!("{role} GitHub head branch"),
+    )?;
+    Ok(GitHubRequest::new(
+        installation,
+        repository,
+        operation,
+        base,
+        head,
+    ))
+}
+
 fn parse_time_window(fields: &mut Fields<'_>, role: &str) -> Result<TimeWindow, String> {
     let not_before = parse_ticks(
         fields.take(&format!("{role} not_before"))?,
@@ -194,6 +369,56 @@ fn parse_capability_request(
     ))
 }
 
+fn parse_http_capability(fields: &mut Fields<'_>, role: &str) -> Result<Capability, String> {
+    let validity = parse_time_window(fields, role)?;
+    let authority = parse_http_authority(fields, role)?;
+    Ok(Capability::new(
+        corpus_metadata(),
+        validity,
+        AuthorityBody::HttpFetch(authority),
+    ))
+}
+
+fn parse_http_capability_request(
+    fields: &mut Fields<'_>,
+    role: &str,
+) -> Result<CapabilityRequest, String> {
+    let time = parse_ticks(
+        fields.take(&format!("{role} time"))?,
+        &format!("{role} time"),
+    )?;
+    let request = parse_http_request(fields, role)?;
+    Ok(CapabilityRequest::new(
+        time,
+        AuthorityRequest::HttpFetch(request),
+    ))
+}
+
+fn parse_github_capability(fields: &mut Fields<'_>, role: &str) -> Result<Capability, String> {
+    let validity = parse_time_window(fields, role)?;
+    let authority = parse_github_authority(fields, role)?;
+    Ok(Capability::new(
+        corpus_metadata(),
+        validity,
+        AuthorityBody::GitHub(authority),
+    ))
+}
+
+fn parse_github_capability_request(
+    fields: &mut Fields<'_>,
+    role: &str,
+) -> Result<CapabilityRequest, String> {
+    let time = parse_ticks(
+        fields.take(&format!("{role} time"))?,
+        &format!("{role} time"),
+    )?;
+    let request = parse_github_request(fields, role)?;
+    Ok(CapabilityRequest::new(
+        time,
+        AuthorityRequest::GitHub(request),
+    ))
+}
+
 fn evaluate_operation(kind: &str, fields: &mut Fields<'_>) -> Result<bool, String> {
     match kind {
         "path_valid" => {
@@ -236,6 +461,26 @@ fn evaluate_operation(kind: &str, fields: &mut Fields<'_>) -> Result<bool, Strin
             let parent = parse_file_authority(fields, "parent")?;
             Ok(file_body_below(&child, &parent))
         }
+        "http_matches" => {
+            let authority = parse_http_authority(fields, "authority")?;
+            let request = parse_http_request(fields, "request")?;
+            Ok(http_fetch_matches(&authority, &request))
+        }
+        "http_below" => {
+            let child = parse_http_authority(fields, "child")?;
+            let parent = parse_http_authority(fields, "parent")?;
+            Ok(http_fetch_body_below(&child, &parent))
+        }
+        "github_matches" => {
+            let authority = parse_github_authority(fields, "authority")?;
+            let request = parse_github_request(fields, "request")?;
+            Ok(github_matches(&authority, &request))
+        }
+        "github_below" => {
+            let child = parse_github_authority(fields, "child")?;
+            let parent = parse_github_authority(fields, "parent")?;
+            Ok(github_body_below(&child, &parent))
+        }
         "capability_matches" => {
             let capability = parse_capability(fields, "authority")?;
             let request = parse_capability_request(fields, "request")?;
@@ -244,6 +489,26 @@ fn evaluate_operation(kind: &str, fields: &mut Fields<'_>) -> Result<bool, Strin
         "weaker_than" => {
             let child = parse_capability(fields, "child")?;
             let parent = parse_capability(fields, "parent")?;
+            Ok(weaker_than(&child, &parent))
+        }
+        "http_capability_matches" => {
+            let capability = parse_http_capability(fields, "authority")?;
+            let request = parse_http_capability_request(fields, "request")?;
+            Ok(capability_matches(&capability, &request))
+        }
+        "http_weaker_than" => {
+            let child = parse_http_capability(fields, "child")?;
+            let parent = parse_http_capability(fields, "parent")?;
+            Ok(weaker_than(&child, &parent))
+        }
+        "github_capability_matches" => {
+            let capability = parse_github_capability(fields, "authority")?;
+            let request = parse_github_capability_request(fields, "request")?;
+            Ok(capability_matches(&capability, &request))
+        }
+        "github_weaker_than" => {
+            let child = parse_github_capability(fields, "child")?;
+            let parent = parse_github_capability(fields, "parent")?;
             Ok(weaker_than(&child, &parent))
         }
         _ => Err(format!(
@@ -382,11 +647,11 @@ mod tests {
 
         let results = evaluate_corpus(&input).expect("all Rust decisions must match the corpus");
 
-        assert_eq!(results.len(), 101, "every version-one case must execute");
+        assert_eq!(results.len(), 147, "every version-one case must execute");
         assert_eq!(results[0].name, "path-root-is-valid");
         assert_eq!(
             results.last().map(|result| result.name.as_str()),
-            Some("empty-capability-does-not-bypass-structure")
+            Some("github-capability-rejects-head-expansion")
         );
     }
 

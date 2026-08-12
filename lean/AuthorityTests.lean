@@ -314,4 +314,98 @@ example : weakerThan earlyChildCapability rootCapability = false := by decide
 
 example : weakerThan rootCapability childCapability = false := by decide
 
+private def docsHost : CanonicalHost := { value := "docs.example" }
+
+private def guidePath : CanonicalUrlPath :=
+  { segments := ["guide"]
+    isValid := by decide }
+
+private def guideStartPath : CanonicalUrlPath :=
+  { segments := ["guide", "start"]
+    isValid := by decide }
+
+private def httpParent : HttpFetchAuthority :=
+  { methods := HttpMethods.ofList [.get, .head]
+    host := docsHost
+    path := .prefix guidePath
+    maxResponseBytes := UInt64.ofNat 4096 }
+
+private def httpChild : HttpFetchAuthority :=
+  { methods := HttpMethods.only .get
+    host := docsHost
+    path := .exact guideStartPath
+    maxResponseBytes := UInt64.ofNat 1024 }
+
+example : httpFetchMatches httpParent
+    { method := .get
+      host := docsHost
+      path := guideStartPath
+      maxResponseBytes := UInt64.ofNat 1024 } = true := by
+  native_decide
+
+example : httpFetchMatches httpParent
+    { method := .get
+      host := docsHost
+      path := { segments := ["guide-old"], isValid := by decide }
+      maxResponseBytes := UInt64.ofNat 1024 } = false := by
+  native_decide
+
+example : httpFetchBodyBelow httpChild httpParent = true := by
+  native_decide
+
+private def gitMain : BranchName :=
+  { segments := ["main"]
+    isValid := by decide }
+
+private def gitAgents : BranchName :=
+  { segments := ["agents"]
+    isValid := by decide }
+
+private def gitAgentFix : BranchName :=
+  { segments := ["agents", "fix"]
+    isValid := by decide }
+
+private def gitHubParent : GitHubAuthority :=
+  { installation := { value := "installation-a" }
+    repository := { value := "github.example/acme/workspace" }
+    operations := GitHubOperations.ofList [.publishBranch, .createPullRequest]
+    base := .exact gitMain
+    head := .prefix gitAgents }
+
+private def gitHubChild : GitHubAuthority :=
+  { installation := { value := "installation-a" }
+    repository := { value := "github.example/acme/workspace" }
+    operations := GitHubOperations.only .createPullRequest
+    base := .exact gitMain
+    head := .exact gitAgentFix }
+
+example : gitHubMatches gitHubParent
+    { installation := { value := "installation-a" }
+      repository := { value := "github.example/acme/workspace" }
+      operation := .createPullRequest
+      base := gitMain
+      head := gitAgentFix } = true := by
+  native_decide
+
+example : gitHubMatches gitHubParent
+    { installation := { value := "installation-a" }
+      repository := { value := "github.example/acme/workspace" }
+      operation := .createPullRequest
+      base := gitMain
+      head := { segments := ["agents-evil"], isValid := by decide } } = false := by
+  native_decide
+
+example : gitHubBodyBelow gitHubChild gitHubParent = true := by
+  native_decide
+
+example : authorityMatches (.file sourceReadWrite) (.httpFetch
+    { method := .get
+      host := docsHost
+      path := guideStartPath
+      maxResponseBytes := UInt64.ofNat 1024 }) = false := by
+  native_decide
+
+example : authorityBodyBelow (.httpFetch httpParent) (.gitHub gitHubParent) = false := by
+  native_decide
+
 end AuthorityTests

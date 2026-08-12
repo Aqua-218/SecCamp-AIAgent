@@ -2,6 +2,8 @@
 
 このディレクトリは、設計上の判断と現在の実装を分けて参照するための入口である。
 
+現在の Cycle 2 文書では、コード/API が存在すること、mock/contract test が通ること、特権操作や外部サービスを含む実機検証を行ったことを別々に記載する。mock test の成功だけで VM 実起動や full isolation 完成とは判断しない。
+
 | 文書群 | 対象読者 | 内容 |
 |---|---|---|
 | [設計書](design/README.md) | 設計者、実装者、セキュリティレビュー担当者 | 脅威モデル、Capability モデル、失効、隔離、検証戦略、実装順序 |
@@ -9,6 +11,15 @@
 | [capfs 実装ガイド](capfs/README.md) | filesystem adapter 実装者、並行境界のレビュー担当者 | backing root、startup import、ObjectId、namespace変更、mount-local node identity |
 | [Broker session envelope](egress-protocol/session-envelopes.md) | Broker / transport 実装者 | session、sequence、request ID、payload hash、retry と replay 防止 |
 | [Canonical Broker CBOR](egress-protocol/canonical-cbor.md) | Broker / transport 実装者 | bounded frame の中の唯一の request schema、payload hash と typed operation への復元 |
+
+## Cycle 2 の実装境界
+
+| 文書群 | 内容 | 検証の境界 |
+|---|---|---|
+| [Host Egress Broker](egress-broker/README.md) | AF_VSOCK frame、session/replay、budget、公開 HTTPS、型付き GitHub adapter | fake resolver/connector/provider と module test。実 AF_VSOCK、外部 DNS/HTTPS/GitHub は未検証 |
+| [Firecracker runtime](firecracker-runtime/README.md) | pinned artifact、dm-verity/jailer command、Firecracker API 順序、snapshot/restore、identity gate | fake command/filesystem/API と local Unix socket test。実 Firecracker/jailer/dm-verity/VM は未検証 |
+| [Supervisor adapter](supervisor/README.md) | authenticated connection binding、wire protocol、subject lifecycle、Authority Core/handle 境界 | `CapabilityKernel` と `FakeResources` による mock/contract test。Linux resource と実 socket は未検証 |
+| [Session orchestrator](session-orchestrator/README.md) | session identity、backend lease binding、startup/rollback/stop の順序 | mock backend による state-machine test。production backend 統合と実 VM は未検証 |
 
 ## Authority core 文書
 
@@ -44,6 +55,7 @@
 - 「なぜこの構造にするか」は[設計書](design/README.md)を読む。
 - 「どのファイルが何を実装・証明しているか」は[Authority core 実装ガイド](authority-core/README.md)を読む。
 - 「rename 中にも現在 path をどう固定するか」は[capfs 実装ガイド](capfs/README.md)を読む。
+- 「host 側の egress、VM、subject、session の lifecycle」は[Cycle 2 の実装境界](#cycle-2-の実装境界)から各 adapter 文書を読む。
 - 設計と実装が食い違って見える場合は、両方を照合し、実装済み範囲を Authority core 実装ガイドで確認する。
 
 ## 関連

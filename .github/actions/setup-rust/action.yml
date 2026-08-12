@@ -1,0 +1,49 @@
+name: Setup Rust CI environment
+description: Verify the pinned Rust toolchain and restore deterministic dependency caches.
+inputs:
+  tool-groups:
+    description: Space-delimited cargo tool groups to install.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Verify Rust toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustc --version | grep -F "rustc 1.93.1 "
+        cargo --version
+
+    - name: Restore Cargo registry cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: ${{ runner.os }}-${{ runner.arch }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-cargo-registry-
+
+    - name: Restore pinned CI tools
+      if: inputs.tool-groups != ''
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .ci-tools/cargo
+        key: ${{ runner.os }}-${{ runner.arch }}-cargo-tools-v5-${{ inputs.tool-groups }}
+
+    - name: Install pinned CI tools
+      if: inputs.tool-groups != ''
+      shell: bash
+      env:
+        TOOL_GROUPS: ${{ inputs.tool-groups }}
+      run: |
+        set -euo pipefail
+        read -r -a groups <<< "${TOOL_GROUPS}"
+        scripts/ci/install-cargo-tools.sh "${groups[@]}"
+        printf '%s/.ci-tools/cargo/bin\n' "${GITHUB_WORKSPACE}" >> "${GITHUB_PATH}"
+
+    - name: Fetch locked dependencies
+      shell: bash
+      run: cargo fetch --locked

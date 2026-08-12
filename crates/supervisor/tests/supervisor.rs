@@ -254,12 +254,14 @@ fn root_derive_and_revoke_use_typed_authority_kernel_transitions() {
         )
         .expect("narrow child derivation must succeed");
     assert_eq!(
-        supervisor.revoke(&root).expect("root revoke must succeed"),
+        supervisor
+            .revoke(&root_identity, &root)
+            .expect("root revoke must succeed"),
         authority_core::state::RevocationStatus::NewlyRevoked
     );
     assert_eq!(
         supervisor
-            .revoke(&root)
+            .revoke(&root_identity, &root)
             .expect("repeated revoke must succeed"),
         authority_core::state::RevocationStatus::AlreadyRevoked
     );
@@ -567,5 +569,38 @@ fn failed_handle_registration_retains_runtime_cleanup_and_reserves_id() {
             "unmount",
             "remove_cgroup"
         ]
+    );
+}
+
+// Requirement: revocation is gated on the connection like every other authority operation.
+// Category: unit/security. Risk: high.
+#[test]
+fn revoke_requires_a_bound_running_connection() {
+    let root_identity = ConnectionIdentity::new(1, 101, 1000, 1000);
+    let mut callers = StaticCallerResolver::new();
+    callers
+        .bind(root_identity, root_subject())
+        .expect("root caller binding must be unique");
+    let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("session")));
+    let mut supervisor = Supervisor::new(kernel, FakeResources::default(), callers);
+    supervisor
+        .create_subject(Subject::new(root_subject(), root_envelope()), root_identity)
+        .expect("root setup must succeed");
+    let root = supervisor
+        .issue_root(&root_subject(), root_grant())
+        .expect("root issuance must succeed");
+
+    let unbound = ConnectionIdentity::new(9, 109, 1000, 1000);
+    assert!(
+        supervisor.revoke(&unbound, &root).is_err(),
+        "an unbound connection must not revoke"
+    );
+
+    supervisor
+        .shutdown_subject(&root_subject())
+        .expect("clean shutdown must succeed");
+    assert!(
+        supervisor.revoke(&root_identity, &root).is_err(),
+        "a subject that is no longer running must not revoke"
     );
 }

@@ -813,11 +813,19 @@ where
             .map_err(SupervisorError::Kernel)
     }
 
-    /// Revokes a capability through the authority kernel.
+    /// Revokes a capability on behalf of an accepted connection.
+    ///
+    /// Takes the same connection identity and lifecycle gate as every other
+    /// authority operation. Without them, any holder of a `&Supervisor` could
+    /// revoke any `CapId` in the session, and adding a third wire tag would
+    /// hand that primitive to every connected subject.
     pub fn revoke(
         &self,
+        identity: &ConnectionIdentity,
         capability: &CapId,
     ) -> SupervisorResult<K::Error, R::Error, C::Error, RevocationStatus> {
+        let caller = self.resolve_caller(identity)?;
+        self.ensure_running(&caller)?;
         self.kernel
             .revoke(capability)
             .map_err(SupervisorError::Kernel)

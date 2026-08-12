@@ -1,0 +1,21 @@
+name: Setup Lean CI environment
+description: Install the checksum-verified elan client and the repository-pinned Lean toolchain.
+runs:
+  using: composite
+  steps:
+    - name: Restore Lean toolchain and build cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          .ci-tools/elan
+          lean/.lake
+        key: ${{ runner.os }}-${{ runner.arch }}-lean-${{ hashFiles('lean/lean-toolchain', 'lean/lake-manifest.json') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-lean-
+
+    - name: Install pinned Lean toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        scripts/ci/install-lean.sh
+        printf '%s/.ci-tools/elan/bin\n' "${GITHUB_WORKSPACE}" >> "${GITHUB_PATH}"

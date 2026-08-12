@@ -155,7 +155,16 @@ module内のtestはgeneration、open count、Object ID sequenceの上限、manif
 
 capfs package全体では、backing、runtime、node table、Direct-I/O FUSEを含めて、共有importのcontract testも実行する。
 
-ここで確認できるのはRust APIの具体的な境界と1つのthread競合である。実FUSE mountではread / readdir後のrevokeを検査しているが、rename、open、close、revokeを組み合わせた全bounded interleavingのLoom modelは次段階に残る。
+ここではRust APIの具体的な境界に加え、`crates/capfs/tests/concurrency.rs` のbounded
+concurrency contractで、write中のrevoke、open / close、rename、unlinkを同時に走らせる。
+writeが先に線形化した場合はrevokeのreturnより前に完了し、revokeが先に線形化した場合は
+open・rename・unlinkのbacking executorへ入らないことを確認する。open count、authority
+handle count、namespace path、committed effect数も各roundで突き合わせる。
+
+これは実FUSE kernelの全request lifecycleをモデル化するものではない。実FUSE mountでは
+read / readdir後のrevokeを検査し、実kernelが送る複数thread request、mount中の敵対的な
+backing差し替え、実syscallを含むrename / writeの物理的な競合は、実行環境依存の統合境界
+として別に扱う。
 
 ## 現在含まないもの
 

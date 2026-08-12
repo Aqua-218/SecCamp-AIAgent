@@ -68,6 +68,8 @@ structure RestorableSnapshot (state : IntegratedHandleState) where
   manifest : List NamespaceObject
   manifestExact : ManifestExact state.namespaceState manifest
   wellFormed : state.WellFormed
+  /-- Imported paths, aliases, object shapes, and every named parent are exact. -/
+  namespaceComplete : state.namespaceState.CompleteWellFormed
   /-- Restore may expose operations only after durable ambiguity is reconciled. -/
   repositoryReconciled : state.repositoryHealth = .operational
 
@@ -81,6 +83,12 @@ theorem Restorable.wellFormed {state : IntegratedHandleState}
   rcases restorable with ⟨snapshot⟩
   exact snapshot.wellFormed
 
+/-- A restorable import carries the full alias-aware namespace invariant. -/
+theorem Restorable.namespaceComplete {state : IntegratedHandleState}
+    (restorable : state.Restorable) : state.namespaceState.CompleteWellFormed := by
+  rcases restorable with ⟨snapshot⟩
+  exact snapshot.namespaceComplete
+
 /-- Restorable snapshots are operational only with explicit reconciliation evidence. -/
 theorem Restorable.repository_operational {state : IntegratedHandleState}
     (restorable : state.Restorable) :
@@ -93,9 +101,11 @@ theorem Restorable.ofWellFormedManifest {state : IntegratedHandleState}
     {manifest : List NamespaceObject}
     (manifestExact : ManifestExact state.namespaceState manifest)
     (wellFormed : state.WellFormed)
+    (namespaceComplete : state.namespaceState.CompleteWellFormed)
     (repositoryReconciled : state.repositoryHealth = .operational) :
     state.Restorable :=
-  ⟨{ manifest, manifestExact, wellFormed, repositoryReconciled }⟩
+  ⟨{ manifest, manifestExact, wellFormed, namespaceComplete,
+      repositoryReconciled }⟩
 
 /-- Build a startup snapshot whose imported manifest has no open handles. -/
 def initializeClosed (authority : CapabilityState)
@@ -243,6 +253,12 @@ theorem initial_wellFormed (issuer : IssuerId) : (initial issuer).WellFormed := 
   · exact CapabilityState.empty_countersRepresentable issuer
   · exact NamespaceState.withRoot_countersRepresentable
       (NamespaceState.allocatedObjectId 0)
+
+/-- Concrete initialization also satisfies exact aliases and every named parent. -/
+theorem initial_namespaceComplete (issuer : IssuerId) :
+    (initial issuer).namespaceState.CompleteWellFormed := by
+  exact NamespaceState.withRoot_completeWellFormed
+    (NamespaceState.allocatedObjectId 0)
 
 /-- The concrete runtime startup is admitted by the initial-state relation. -/
 theorem initial_isInitial (issuer : IssuerId) : (initial issuer).Initial :=
@@ -1063,8 +1079,8 @@ theorem addHardLink_preserves_wellFormed {state : IntegratedHandleState}
         (queriedLookup.symm.trans (NamespaceState.addHardLink_stores_object
           state.namespaceState objectId allowed.object alias))
       subst queriedObject
-      simpa [IntegratedHandleState.addHardLink,
-        NamespaceState.withAddedAlias] using
+      rw [NamespaceState.withAddedAlias_openHandleCount]
+      exact
         wellFormed.namespaceCountsExact objectId allowed.object allowed.objectLookup
     · exact wellFormed.namespaceCountsExact queriedId queriedObject
         (by simpa [IntegratedHandleState.addHardLink,
@@ -1405,11 +1421,127 @@ theorem Step.preserves_wellFormed {before after : IntegratedHandleState}
   | failedOpenAfterRegistration allowed =>
       exact failOpenAfterRegistration_preserves_wellFormed wellFormed allowed
 
+/-- The full Rust adapter invariant combines handle accounting with exact aliases. -/
+structure CompleteWellFormed (state : IntegratedHandleState) : Prop where
+  bridge : state.WellFormed
+  namespaceComplete : state.namespaceState.CompleteWellFormed
+
+/-- Concrete startup establishes the full integrated invariant. -/
+theorem initial_completeWellFormed (issuer : IssuerId) :
+    (initial issuer).CompleteWellFormed :=
+  ⟨initial_wellFormed issuer, initial_namespaceComplete issuer⟩
+
+/-- Exact integrated steps are the operations whose shape proof is carried or preserved. -/
+inductive CompleteStep : IntegratedHandleState → IntegratedHandleState → Prop
+  | openAtomic {state : IntegratedHandleState} {handle : OpenHandle} :
+      (complete : state.CompleteWellFormed) →
+      (allowed : MayOpen state handle) →
+      CompleteStep state (state.openHandle handle allowed.object)
+  | closeAtomic {state : IntegratedHandleState} {caller : SubjectId}
+      {handleId : HandleId} :
+      (complete : state.CompleteWellFormed) →
+      (allowed : MayClose state caller handleId) →
+      CompleteStep state (state.closeHandle handleId allowed.handle allowed.object)
+  | hardLinkAtomic {state : IntegratedHandleState} {objectId : ObjectId}
+      {alias : CanonicalPath} :
+      (complete : state.CompleteWellFormed) →
+      (allowed : state.namespaceState.MayAddHardLink objectId alias) →
+      CompleteStep state (state.addHardLink objectId allowed.object alias)
+  | unlinkNameAtomic {state : IntegratedHandleState} {objectId : ObjectId}
+      {alias : CanonicalPath} :
+      (complete : state.CompleteWellFormed) →
+      (allowed : state.namespaceState.MayUnlinkName objectId alias) →
+      CompleteStep state (state.unlinkName objectId allowed.object alias
+        allowed.newPrimary allowed.remaining)
+  | createSymlinkAtomic {state : IntegratedHandleState}
+      {object : NamespaceObject} :
+      (complete : state.CompleteWellFormed) →
+      (allowed : state.namespaceState.MayCreateSymlink object) →
+      CompleteStep state (state.createSymlink object)
+  | authorityOnly {state : IntegratedHandleState} {authority : CapabilityState} :
+      (complete : state.CompleteWellFormed) →
+      (transition : CapabilityState.Step state.authority authority) →
+      state.PreservesManagedOpenHandles authority →
+      CompleteStep state (state.withAuthority authority)
+  | failedOpenAfterRegistration {state : IntegratedHandleState}
+      {handle : OpenHandle} :
+      (complete : state.CompleteWellFormed) →
+      MayFailOpenAfterRegistration state handle →
+      CompleteStep state (state.failOpenAfterRegistration handle)
+
+/-- Every exact step is an existing integrated adapter step. -/
+theorem CompleteStep.toStep {before after : IntegratedHandleState}
+    (transition : CompleteStep before after) : Step before after := by
+  cases transition with
+  | openAtomic _ allowed => exact .openAtomic allowed
+  | closeAtomic _ allowed => exact .closeAtomic allowed
+  | hardLinkAtomic _ allowed => exact .hardLinkAtomic allowed
+  | unlinkNameAtomic _ allowed => exact .unlinkNameAtomic allowed
+  | createSymlinkAtomic _ allowed => exact .createSymlinkAtomic allowed
+  | authorityOnly _ authorityStep preservesManaged =>
+      exact .authorityOnly authorityStep preservesManaged
+  | failedOpenAfterRegistration _ allowed =>
+      exact .failedOpenAfterRegistration allowed
+
+/-- Every exact integrated step preserves handle accounting and namespace shape. -/
+theorem CompleteStep.preserves_completeWellFormed
+    {before after : IntegratedHandleState}
+    (transition : CompleteStep before after) : after.CompleteWellFormed := by
+  cases transition with
+  | openAtomic complete allowed =>
+      exact ⟨openHandle_preserves_wellFormed complete.bridge allowed,
+        NamespaceState.openObject_preserves_completeWellFormed complete.namespaceComplete
+          allowed.objectLookup⟩
+  | closeAtomic complete allowed =>
+      exact ⟨closeHandle_preserves_wellFormed complete.bridge allowed,
+        NamespaceState.closeObject_preserves_completeWellFormed complete.namespaceComplete
+          allowed.objectLookup⟩
+  | hardLinkAtomic complete allowed =>
+      exact ⟨addHardLink_preserves_wellFormed complete.bridge allowed,
+        NamespaceState.addHardLink_preserves_completeWellFormed allowed⟩
+  | unlinkNameAtomic complete allowed =>
+      exact ⟨unlinkName_preserves_wellFormed complete.bridge allowed,
+        NamespaceState.unlinkName_preserves_completeWellFormed allowed⟩
+  | createSymlinkAtomic complete allowed =>
+      exact ⟨createSymlink_preserves_wellFormed complete.bridge allowed,
+        NamespaceState.createSymlink_preserves_completeWellFormed allowed⟩
+  | authorityOnly complete authorityStep preservesManaged =>
+      exact ⟨authorityOnly_preserves_wellFormed complete.bridge authorityStep
+          preservesManaged,
+        complete.namespaceComplete⟩
+  | failedOpenAfterRegistration complete allowed =>
+      exact ⟨failOpenAfterRegistration_preserves_wellFormed complete.bridge allowed,
+        complete.namespaceComplete⟩
+
+/-- Arbitrary finite exact adapter executions, including non-reflexive traces. -/
+inductive CompleteSteps : IntegratedHandleState → IntegratedHandleState → Prop
+  | refl (state : IntegratedHandleState) : CompleteSteps state state
+  | tail {first middle last : IntegratedHandleState} :
+      CompleteSteps first middle → CompleteStep middle last →
+      CompleteSteps first last
+
+/-- Full integrated invariants survive every finite exact adapter execution. -/
+theorem CompleteSteps.preserves_completeWellFormed
+    {before after : IntegratedHandleState}
+    (transitions : CompleteSteps before after)
+    (complete : before.CompleteWellFormed) : after.CompleteWellFormed := by
+  induction transitions with
+  | refl => exact complete
+  | tail _ transition _ => exact transition.preserves_completeWellFormed
+
 /-- Finite executions consist solely of atomic bridge-preserving operations. -/
 inductive Steps : IntegratedHandleState → IntegratedHandleState → Prop
   | refl (state : IntegratedHandleState) : Steps state state
   | tail {first middle last : IntegratedHandleState} :
       Steps first middle → Step middle last → Steps first last
+
+/-- Exact executions embed in the legacy transition closure. -/
+theorem CompleteSteps.toSteps {before after : IntegratedHandleState}
+    (transitions : CompleteSteps before after) : Steps before after := by
+  induction transitions with
+  | refl => exact .refl _
+  | tail _ transition inductionHypothesis =>
+      exact .tail inductionHypothesis transition.toStep
 
 /-- Finite legacy executions preserve repository health exactly. -/
 theorem Steps.preserve_repositoryHealth {before after : IntegratedHandleState}
@@ -1484,6 +1616,29 @@ def initialRegisterSubjectStep (issuer : IssuerId) (subject : SubjectId) :
     (CapabilityState.Step.registerSubject (initialMayRegisterSubject issuer subject))
   · intro handleId managed
     simp [initial, initializeClosed] at managed
+
+/-- Subject registration is also an exact alias-preserving integrated step. -/
+def initialRegisterSubjectCompleteStep (issuer : IssuerId) (subject : SubjectId) :
+    CompleteStep (initial issuer) (readyInitial issuer subject) := by
+  apply CompleteStep.authorityOnly (initial_completeWellFormed issuer)
+    (CapabilityState.Step.registerSubject (initialMayRegisterSubject issuer subject))
+  intro handleId managed
+  simp [initial, initializeClosed] at managed
+
+/-- Exact finite executions have a concrete non-reflexive runtime witness. -/
+theorem initial_to_ready_complete_nonreflexive (issuer : IssuerId)
+    (subject : SubjectId) :
+    CompleteSteps (initial issuer) (readyInitial issuer subject) ∧
+      initial issuer ≠ readyInitial issuer subject := by
+  constructor
+  · exact .tail (.refl (initial issuer))
+      (initialRegisterSubjectCompleteStep issuer subject)
+  · intro equality
+    have statuses := congrArg
+      (fun state : IntegratedHandleState => state.authority.subjectStatuses subject)
+      equality
+    simp [initial, initializeClosed, readyInitial, startupSubject,
+      CapabilityState.empty, CapabilityState.registerSubject, replace] at statuses
 
 /-- Subject registration is part of ordinary reachability, not initialization. -/
 theorem readyInitial_reachable (issuer : IssuerId) (subject : SubjectId) :
@@ -1560,6 +1715,11 @@ theorem openedInitial_restorable (issuer : IssuerId) (subject : SubjectId)
   Restorable.ofWellFormedManifest
     (openedInitial_manifestExact issuer subject handleId)
     (openedInitial_reachable issuer subject handleId).wellFormed
+    (by
+      apply NamespaceState.openObject_preserves_completeWellFormed
+      · simpa [readyInitial, initial, initializeClosed] using
+          initial_namespaceComplete issuer
+      · exact (readyInitialMayOpen issuer subject handleId).objectLookup)
     rfl
 
 /-- The reachable open witness is exact in Authority, namespace, and accounting. -/

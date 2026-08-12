@@ -6,5 +6,6 @@
 
 #![forbid(unsafe_code)]
 
+pub mod budget;
 pub mod frame;
 pub mod session;

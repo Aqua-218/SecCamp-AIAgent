@@ -1,9 +1,9 @@
 //! Ordered Linux process isolation for untrusted workloads.
 //!
 //! The public API deliberately separates policy validation and orchestration
-//! from privileged operations. [`LinuxBackend`] is the production backend;
-//! [`IsolationBackend`] can be implemented by a test double without executing
-//! privileged syscalls.
+//! from privileged operations. [`LinuxBackend`] is the only production backend;
+//! [`IsolationBackend`] is sealed so downstream safe code cannot forge kernel
+//! isolation attestations or directly invoke process-global setup operations.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::module_name_repetitions)]
@@ -16,7 +16,8 @@ mod linux;
 mod syscall;
 
 pub use backend::{
-    BackendError, CapabilityReport, IsolatedChildProcess, IsolationBackend, IsolationError,
+    BackendError, CapabilityReport, ChildExit, ChildProcessError, ChildStartupFailure,
+    ChildStartupReady, ChildStartupStatus, IsolatedChildProcess, IsolationBackend, IsolationError,
     IsolationReceipt, IsolationStep, NamespaceIdentity, NamespacePreparation, PidNamespaceChild,
     RuntimeIsolation, SpawnOutcome, apply, spawn_isolated,
 };
@@ -29,6 +30,8 @@ pub use syscall::{SeccompPolicy, Syscall};
 
 #[cfg(test)]
 mod tests {
+    use crate::backend::{ChildStartupNotifier, private::OperationPermit};
+
     use super::{
         BackendError, BindMountConfig, CapabilityReport, CgroupConfig, IdentityMap,
         IsolatedChildProcess, IsolationBackend, IsolationConfig, IsolationError, IsolationReceipt,
@@ -37,7 +40,15 @@ mod tests {
         spawn_isolated,
     };
 
-    use std::{cell::Cell, num::NonZeroU32};
+    use std::{
+        cell::Cell,
+        fs::File,
+        io::Read,
+        num::NonZeroU32,
+        os::fd::{FromRawFd, OwnedFd},
+    };
+
+    const STARTUP_MESSAGE_LEN: usize = 32;
 
     #[derive(Clone, Copy)]
     enum MockSpawnRole {
@@ -66,6 +77,7 @@ mod tests {
         namespace_prepares: usize,
         child_verifications: usize,
         fail_child_verification: bool,
+        startup_messages: Vec<[u8; STARTUP_MESSAGE_LEN]>,
     }
 
     impl MockBackend {
@@ -80,10 +92,12 @@ mod tests {
                 namespace_prepares: 0,
                 child_verifications: 0,
                 fail_child_verification: false,
+                startup_messages: Vec::new(),
             }
         }
     }
 
+    #[allow(private_bounds, private_interfaces)]
     impl IsolationBackend for MockBackend {
         fn detect_capabilities(&mut self, _config: &IsolationConfig) -> CapabilityReport {
             self.report.clone()
@@ -91,6 +105,7 @@ mod tests {
 
         fn prepare_namespaces(
             &mut self,
+            _permit: OperationPermit,
             _config: &IsolationConfig,
         ) -> Result<NamespacePreparation, BackendError> {
             self.events.push(MockEvent::PrepareNamespaces);
@@ -103,23 +118,29 @@ mod tests {
 
         fn spawn_isolated<T, F>(
             &mut self,
+            _permit: OperationPermit,
             preparation: NamespacePreparation,
             child_entry: F,
         ) -> Result<SpawnOutcome<T>, BackendError>
         where
-            F: FnOnce(&mut Self, NamespacePreparation) -> T,
+            F: FnOnce(&mut Self, NamespacePreparation, ChildStartupNotifier) -> T,
         {
             match self.spawn_role {
                 MockSpawnRole::Parent => {
                     self.events.push(MockEvent::SpawnParent);
-                    Ok(SpawnOutcome::Parent(IsolatedChildProcess::attest(
-                        NonZeroU32::new(42).expect("mock child PID is positive"),
-                        preparation.child(),
-                    )))
+                    Ok(SpawnOutcome::Parent(
+                        IsolatedChildProcess::unattested_for_test(
+                            NonZeroU32::new(42).expect("mock child PID is positive"),
+                            preparation.child(),
+                        ),
+                    ))
                 }
                 MockSpawnRole::Child => {
                     self.events.push(MockEvent::SpawnChild);
-                    let child_result = child_entry(self, preparation);
+                    let (reader, writer) = startup_pipe();
+                    let child_result =
+                        child_entry(self, preparation, ChildStartupNotifier::from_fd(writer));
+                    self.startup_messages.push(read_startup_message(reader));
                     Ok(SpawnOutcome::Child(child_result))
                 }
                 MockSpawnRole::Reject => {
@@ -135,6 +156,7 @@ mod tests {
 
         fn verify_pid_namespace_child(
             &mut self,
+            _permit: OperationPermit,
             preparation: NamespacePreparation,
         ) -> Result<PidNamespaceChild, BackendError> {
             self.events.push(MockEvent::VerifyChild);
@@ -151,6 +173,7 @@ mod tests {
 
         fn apply_step(
             &mut self,
+            _permit: OperationPermit,
             step: IsolationStep,
             _config: &IsolationConfig,
         ) -> Result<(), BackendError> {
@@ -171,12 +194,92 @@ mod tests {
 
         fn rollback_step(
             &mut self,
+            _permit: OperationPermit,
             step: IsolationStep,
             _config: &IsolationConfig,
         ) -> Result<(), BackendError> {
             self.rollbacks.push(step);
             Ok(())
         }
+    }
+
+    fn startup_pipe() -> (OwnedFd, OwnedFd) {
+        let mut descriptors = [-1; 2];
+        // SAFETY: the array contains storage for exactly two returned descriptors.
+        let result = unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(result, 0, "mock startup pipe creation must succeed");
+        // SAFETY: successful pipe2 returns ownership of both descriptors.
+        let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        // SAFETY: successful pipe2 returns ownership of both descriptors.
+        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        (reader, writer)
+    }
+
+    fn read_startup_message(reader: OwnedFd) -> [u8; STARTUP_MESSAGE_LEN] {
+        let mut reader = File::from(reader);
+        let mut message = [0_u8; STARTUP_MESSAGE_LEN];
+        reader
+            .read_exact(&mut message)
+            .expect("mock child must emit one complete startup message");
+        message
+    }
+
+    fn assert_ready_message(message: &[u8; STARTUP_MESSAGE_LEN], namespace: NamespaceIdentity) {
+        assert_common_startup_header(message, 1, 12, 0);
+        assert_eq!(read_i32(message, 8), i32::MIN);
+        assert_eq!(read_u64(message, 12), namespace.device());
+        assert_eq!(read_u64(message, 20), namespace.inode());
+        assert_eq!(read_u32(message, 28), 0);
+    }
+
+    fn assert_failure_message(
+        message: &[u8; STARTUP_MESSAGE_LEN],
+        step_code: u8,
+        errno: Option<i32>,
+        rollback_failure_count: u32,
+    ) {
+        assert_common_startup_header(message, 2, step_code, 1);
+        assert_eq!(read_i32(message, 8), errno.unwrap_or(i32::MIN));
+        assert_eq!(read_u64(message, 12), 0);
+        assert_eq!(read_u64(message, 20), 0);
+        assert_eq!(read_u32(message, 28), rollback_failure_count);
+    }
+
+    fn assert_common_startup_header(
+        message: &[u8; STARTUP_MESSAGE_LEN],
+        kind: u8,
+        step_code: u8,
+        flags: u8,
+    ) {
+        assert_eq!(&message[..4], b"LISO");
+        assert_eq!(message[4], 1);
+        assert_eq!(message[5], kind);
+        assert_eq!(message[6], step_code);
+        assert_eq!(message[7], flags);
+    }
+
+    fn read_i32(message: &[u8; STARTUP_MESSAGE_LEN], offset: usize) -> i32 {
+        i32::from_le_bytes(
+            message[offset..offset + 4]
+                .try_into()
+                .expect("fixed-width i32 startup field"),
+        )
+    }
+
+    fn read_u32(message: &[u8; STARTUP_MESSAGE_LEN], offset: usize) -> u32 {
+        u32::from_le_bytes(
+            message[offset..offset + 4]
+                .try_into()
+                .expect("fixed-width u32 startup field"),
+        )
+    }
+
+    fn read_u64(message: &[u8; STARTUP_MESSAGE_LEN], offset: usize) -> u64 {
+        u64::from_le_bytes(
+            message[offset..offset + 8]
+                .try_into()
+                .expect("fixed-width u64 startup field"),
+        )
     }
 
     fn test_config() -> IsolationConfig {
@@ -240,6 +343,11 @@ mod tests {
         ];
         expected_events.extend(expected[1..].iter().copied().map(MockEvent::Apply));
         assert_eq!(backend.events, expected_events);
+        assert_eq!(backend.startup_messages.len(), 1);
+        assert_ready_message(
+            &backend.startup_messages[0],
+            NamespaceIdentity::from_kernel(4, 11),
+        );
     }
 
     #[test]
@@ -262,6 +370,7 @@ mod tests {
         assert_eq!(backend.namespace_prepares, 1);
         assert_eq!(backend.child_verifications, 0);
         assert!(backend.calls.is_empty());
+        assert!(backend.startup_messages.is_empty());
         assert_eq!(
             backend.events,
             vec![MockEvent::PrepareNamespaces, MockEvent::SpawnParent]
@@ -279,6 +388,7 @@ mod tests {
         assert_eq!(backend.namespace_prepares, 0);
         assert_eq!(backend.child_verifications, 0);
         assert!(backend.calls.is_empty());
+        assert!(backend.startup_messages.is_empty());
         assert!(backend.events.is_empty());
     }
 
@@ -325,6 +435,8 @@ mod tests {
         assert_eq!(backend.child_verifications, 1);
         assert!(backend.calls.is_empty());
         assert_eq!(backend.rollbacks, vec![IsolationStep::Namespaces]);
+        assert_eq!(backend.startup_messages.len(), 1);
+        assert_failure_message(&backend.startup_messages[0], 0, None, 0);
         assert_eq!(
             backend.events,
             vec![
@@ -364,6 +476,8 @@ mod tests {
                 IsolationStep::Namespaces,
             ]
         );
+        assert_eq!(backend.startup_messages.len(), 1);
+        assert_failure_message(&backend.startup_messages[0], 9, None, 0);
     }
 
     #[test]

@@ -77,6 +77,7 @@ case "${command_name}" in
     export ELAN_HOME="${CI_TOOLS_DIR:-${repository_root}/.ci-tools}/elan"
     export PATH="${ELAN_HOME}/bin:${PATH}"
     scripts/check-authority-corpus.sh
+    scripts/check-runtime-corpus.sh
     ;;
   coverage)
     mkdir -p -- coverage

@@ -1,4 +1,4 @@
-//! Contract tests for link-free repository preflight validation.
+//! Contract tests for repository preflight validation.
 
 #![cfg(target_os = "linux")]
 
@@ -8,16 +8,20 @@ use std::{
     fs::{self, File, hard_link},
     io::Write,
     num::NonZeroUsize,
-    os::unix::{ffi::OsStringExt, fs::symlink, net::UnixListener},
+    os::unix::{
+        ffi::OsStringExt,
+        fs::{MetadataExt, PermissionsExt, symlink},
+        net::UnixListener,
+    },
 };
 
 use authority_core::{path::CanonicalPath, repository::RepoId};
 use capfs::{
     backing::{
-        ImportedRepository, PreflightLimits, RejectedObjectKind, RepositoryPreflightError,
-        RepositoryStartupError, ValidatedRepository,
+        ImportedRepository, PreflightLimits, RejectedObjectKind, RepositoryEntry,
+        RepositoryPreflightError, RepositoryStartupError, ValidatedRepository,
     },
-    namespace::{NamespaceGeneration, NamespaceObjectKind},
+    namespace::{NamespaceGeneration, NamespaceObjectKind, SymlinkTarget},
 };
 use rustix::fs::{Dir, FileType, fstat};
 use tempfile::TempDir;
@@ -64,7 +68,7 @@ fn preflight_accepts_a_link_free_tree_and_keeps_the_root_fd() {
     write_file(repository.path().join("src/lib.rs"), b"pub fn run() {}");
 
     let validated = ValidatedRepository::open(repository.path(), limits(8, 3))
-        .expect("link-free tree should pass preflight");
+        .expect("a plain tree should pass preflight");
     let manifest = validated
         .entries()
         .iter()
@@ -111,7 +115,7 @@ fn startup_imports_the_complete_manifest_with_registry_assigned_ids() {
 
     let repository_id = RepoId::new("workspace");
     let imported = ImportedRepository::open(repository_id.clone(), repository.path(), limits(8, 3))
-        .expect("link-free tree should import atomically");
+        .expect("a plain tree should import atomically");
     let expected = [
         (CanonicalPath::root(), NamespaceObjectKind::Directory),
         (path(&["README.md"]), NamespaceObjectKind::RegularFile),
@@ -157,7 +161,7 @@ fn cloned_imports_share_the_workspace_state_for_multiple_mounts() {
     write_file(repository.path().join("existing.txt"), b"existing");
     let first_mount =
         ImportedRepository::open(RepoId::new("workspace"), repository.path(), limits(8, 1))
-            .expect("link-free tree should import atomically");
+            .expect("a plain tree should import atomically");
     let second_mount = first_mount.clone();
 
     let existing_path = path(&["existing.txt"]);
@@ -195,24 +199,21 @@ fn cloned_imports_share_the_workspace_state_for_multiple_mounts() {
 #[test]
 fn startup_propagates_preflight_failure_before_namespace_publication() {
     let repository = TempDir::new().expect("test repository should be creatable");
-    symlink("outside", repository.path().join("entry-link"))
+    symlink("../outside", repository.path().join("entry-link"))
         .expect("entry symlink should be creatable");
 
     assert!(matches!(
         ImportedRepository::open(RepoId::new("workspace"), repository.path(), limits(4, 1)),
         Err(RepositoryStartupError::Preflight(
-            RepositoryPreflightError::UnsupportedObject {
-                kind: RejectedObjectKind::Symlink,
-                ..
-            }
+            RepositoryPreflightError::EscapingSymlinkTarget { .. }
         ))
     ));
 }
 
-// Requirement: neither the configured root nor any entry may be a symlink.
-// Category: backing/security. Risk: critical.
+// Requirement: the configured root itself must be a real directory, never a
+// symlink standing in for one. Category: backing/security. Risk: critical.
 #[test]
-fn preflight_rejects_root_and_entry_symlinks() {
+fn preflight_rejects_a_symlinked_root() {
     let parent = TempDir::new().expect("test parent should be creatable");
     let real_root = parent.path().join("real");
     fs::create_dir(&real_root).expect("real root should be creatable");
@@ -221,36 +222,228 @@ fn preflight_rejects_root_and_entry_symlinks() {
 
     assert!(matches!(
         ValidatedRepository::open(&linked_root, limits(4, 2)),
-        Err(RepositoryPreflightError::UnsupportedObject {
-            kind: RejectedObjectKind::Symlink,
-            ..
-        })
-    ));
-
-    symlink("outside", real_root.join("entry-link")).expect("entry symlink should be creatable");
-    assert!(matches!(
-        ValidatedRepository::open(&real_root, limits(4, 2)),
-        Err(RepositoryPreflightError::UnsupportedObject {
-            kind: RejectedObjectKind::Symlink,
-            ..
-        })
+        Err(RepositoryPreflightError::RootNotDirectory(_))
     ));
 }
 
-// Requirement: a regular inode must have exactly one path in the initial tree.
+// Requirement: a symlink whose target stays inside the repository is imported
+// with that target; one that leaves is refused for the whole repository.
 // Category: backing/security. Risk: critical.
 #[test]
-fn preflight_rejects_hard_link_aliases() {
+fn preflight_imports_contained_symlinks_and_rejects_escaping_ones() {
+    let repository = TempDir::new().expect("test repository should be creatable");
+    fs::create_dir(repository.path().join("src")).expect("directory should be creatable");
+    write_file(repository.path().join("src/main.rs"), b"fn main() {}");
+    symlink("src/main.rs", repository.path().join("entry.rs"))
+        .expect("relative symlink should be creatable");
+    symlink("../main.rs", repository.path().join("src/self.rs"))
+        .expect("parent-relative symlink should be creatable");
+
+    let validated = ValidatedRepository::open(repository.path(), limits(8, 2))
+        .expect("contained symlinks must import");
+    let link = validated
+        .entries()
+        .iter()
+        .find(|entry| entry.path() == &path(&["entry.rs"]))
+        .expect("the symlink must appear in the manifest");
+    assert_eq!(link.kind(), NamespaceObjectKind::Symlink);
+    assert_eq!(
+        link.spec().target().map(SymlinkTarget::as_str),
+        Some("src/main.rs")
+    );
+
+    let absolute = TempDir::new().expect("test repository should be creatable");
+    symlink("/etc/passwd", absolute.path().join("absolute"))
+        .expect("absolute symlink should be creatable");
+    assert!(matches!(
+        ValidatedRepository::open(absolute.path(), limits(4, 1)),
+        Err(RepositoryPreflightError::UnsupportedSymlinkTarget { .. })
+    ));
+
+    let escaping = TempDir::new().expect("test repository should be creatable");
+    symlink("../../etc/passwd", escaping.path().join("escape"))
+        .expect("escaping symlink should be creatable");
+    assert!(matches!(
+        ValidatedRepository::open(escaping.path(), limits(4, 1)),
+        Err(RepositoryPreflightError::EscapingSymlinkTarget { .. })
+    ));
+}
+
+// Requirement: an inode may keep several names only when the repository holds
+// all of them. Category: backing/security. Risk: critical.
+#[test]
+fn preflight_imports_complete_hard_link_sets_and_rejects_external_aliases() {
     let repository = TempDir::new().expect("test repository should be creatable");
     let original = repository.path().join("original.rs");
     write_file(&original, b"fn original() {}");
     hard_link(&original, repository.path().join("alias.rs"))
         .expect("hard-link alias should be creatable");
 
-    assert!(matches!(
-        ValidatedRepository::open(repository.path(), limits(4, 1)),
-        Err(RepositoryPreflightError::HardLink { link_count: 2, .. })
-    ));
+    let validated = ValidatedRepository::open(repository.path(), limits(4, 1))
+        .expect("a fully contained alias set must import");
+    let inodes = validated
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind() == NamespaceObjectKind::RegularFile)
+        .map(RepositoryEntry::inode)
+        .collect::<Vec<_>>();
+    assert_eq!(inodes.len(), 2);
+    assert_eq!(
+        inodes.first(),
+        inodes.last(),
+        "both names must report the same inode so the import groups them"
+    );
+
+    let parent = TempDir::new().expect("test parent should be creatable");
+    let contained = parent.path().join("repository");
+    fs::create_dir(&contained).expect("repository should be creatable");
+    let inside = contained.join("inside.rs");
+    write_file(&inside, b"fn inside() {}");
+    let outside = parent.path().join("outside-alias.rs");
+    hard_link(&inside, &outside).expect("out-of-repository alias should be creatable");
+
+    let rejected = ValidatedRepository::open(&contained, limits(4, 1).rejecting_external_aliases())
+        .expect_err("the strict policy must refuse an inode named outside the repository");
+    match rejected {
+        RepositoryPreflightError::ExternalHardLink {
+            link_count,
+            names_in_repository,
+            ..
+        } => {
+            assert_eq!(link_count, 2);
+            assert_eq!(names_in_repository, vec![path(&["inside.rs"])]);
+        }
+        other => panic!("expected an external hard link rejection, got {other:?}"),
+    }
+}
+
+// Requirement: the default policy repairs an inode named outside the repository
+// by giving the repository its own copy, instead of refusing the whole
+// workspace. The outside name keeps the original inode.
+// Category: backing/security. Risk: critical.
+#[test]
+fn preflight_materializes_an_externally_aliased_inode_into_the_repository() {
+    let parent = TempDir::new().expect("test parent should be creatable");
+    let contained = parent.path().join("repository");
+    fs::create_dir(&contained).expect("repository should be creatable");
+    let inside = contained.join("inside.rs");
+    write_file(&inside, b"fn inside() {}");
+    fs::set_permissions(&inside, fs::Permissions::from_mode(0o640))
+        .expect("test permissions should be settable");
+    // A second repository name for the same inode must survive as an alias of
+    // the copy: only the boundary-crossing relationship is broken.
+    hard_link(&inside, contained.join("also-inside.rs"))
+        .expect("in-repository alias should be creatable");
+    let outside = parent.path().join("outside-alias.rs");
+    hard_link(&inside, &outside).expect("out-of-repository alias should be creatable");
+    let original_inode = fs::metadata(&outside)
+        .expect("the outside name should be readable")
+        .ino();
+
+    let validated = ValidatedRepository::open(&contained, limits(8, 1))
+        .expect("the default policy must repair the repository instead of refusing it");
+
+    let reported = validated.materialized_aliases();
+    assert_eq!(reported.len(), 1, "one inode was repaired: {reported:?}");
+    assert_eq!(reported[0].path(), &path(&["also-inside.rs"]));
+    assert_eq!(reported[0].bytes(), 14, "the copied byte count is reported");
+    assert_eq!(reported[0].additional_names(), 1);
+
+    let repaired = fs::metadata(&inside).expect("the repository name should still exist");
+    let sibling = fs::metadata(contained.join("also-inside.rs"))
+        .expect("the second repository name should still exist");
+    assert_eq!(
+        repaired.ino(),
+        sibling.ino(),
+        "names that aliased each other inside the repository must stay aliases"
+    );
+    assert_eq!(
+        repaired.nlink(),
+        2,
+        "the copy must have exactly its two repository names"
+    );
+    assert_ne!(
+        repaired.ino(),
+        original_inode,
+        "the repository must no longer share the inode named outside it"
+    );
+    assert_eq!(
+        fs::read(&inside).expect("the copy should be readable"),
+        b"fn inside() {}"
+    );
+    assert_eq!(repaired.permissions().mode() & 0o7777, 0o640);
+
+    let untouched = fs::metadata(&outside).expect("the outside name should still exist");
+    assert_eq!(
+        untouched.ino(),
+        original_inode,
+        "the outside name keeps its inode"
+    );
+    assert_eq!(
+        untouched.nlink(),
+        1,
+        "the outside name is now the inode's only name"
+    );
+    assert_eq!(
+        fs::read(&outside).expect("the outside file should be readable"),
+        b"fn inside() {}"
+    );
+
+    // The manifest describes the repaired tree, so both repository names group
+    // onto one object and the registry accepts them.
+    let inodes = validated
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind() == NamespaceObjectKind::RegularFile)
+        .map(RepositoryEntry::inode)
+        .collect::<Vec<_>>();
+    assert_eq!(inodes, vec![repaired.ino(), repaired.ino()]);
+    ImportedRepository::from_validated(RepoId::new("workspace"), validated)
+        .expect("the repaired manifest must import");
+}
+
+// Requirement: repairing an external hard link is bounded, and a refusal
+// leaves the tree as it was. Category: backing/resource. Risk: high.
+#[test]
+fn preflight_refuses_to_copy_more_than_its_budget_allows() {
+    let parent = TempDir::new().expect("test parent should be creatable");
+    let contained = parent.path().join("repository");
+    fs::create_dir(&contained).expect("repository should be creatable");
+    let inside = contained.join("large.bin");
+    write_file(&inside, &vec![0_u8; 4096]);
+    let outside = parent.path().join("outside-alias.bin");
+    hard_link(&inside, &outside).expect("out-of-repository alias should be creatable");
+    let original_inode = fs::metadata(&inside)
+        .expect("the repository name should be readable")
+        .ino();
+
+    let error = ValidatedRepository::open(&contained, limits(4, 1).with_external_alias_bytes(1024))
+        .expect_err("a copy larger than the budget must be refused");
+    assert!(
+        matches!(
+            error,
+            RepositoryPreflightError::MaterializationBudgetExceeded {
+                required: 4096,
+                remaining: 1024,
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        fs::metadata(&inside)
+            .expect("the repository name should be unchanged")
+            .ino(),
+        original_inode,
+        "a refused repair must not replace the inode"
+    );
+    assert_eq!(
+        fs::read_dir(&contained)
+            .expect("the repository should be readable")
+            .count(),
+        1,
+        "a refused repair must not leave a replacement behind"
+    );
 }
 
 // Requirement: sockets and every other non-file/non-directory object fail

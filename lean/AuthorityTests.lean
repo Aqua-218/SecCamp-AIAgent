@@ -532,4 +532,34 @@ example :
 example : ¬ ValidCapabilityId { value := "" } := by
   simp [ValidCapabilityId]
 
+example : NamespaceState.runtimeInitial.nextObjectSequence = some 1 := by
+  rfl
+
+example : NamespaceState.advanceObjectCursor u64Maximum = none :=
+  NamespaceState.advanceObjectCursor_maximum
+
+example : Isolation.ApplyStage.readOnlyRootfs.irreversible = true := by
+  rfl
+
+example : Isolation.ApplyStage.workspace.irreversible = false := by
+  rfl
+
+example :
+    ¬ (Firecracker.CleanupState.live.rollbackAttempt
+      Firecracker.unsafeRollbackResults).Safe :=
+  Firecracker.rollback_stop_failure_can_violate_dependency_safety
+
+example {budget : SessionBudget} {request : BrokerRequestId} {maximum : Nat}
+    (denial : BrokerState.RetryableStartDenial budget request maximum) :
+    budget.MayStart request maximum → False :=
+  denial.excludes_start
+
+example {state : Orchestrator.ManagedState} (wellFormed : state.WellFormed)
+    (closed : state.core.phase = .closed) : state.cleanup.Complete :=
+  wellFormed.closedRequiresCleanup closed
+
+example {state : Firecracker.ManagedState} (wellFormed : state.WellFormed)
+    (stopped : state.core.phase = .stopped) : state.cleanup.Complete :=
+  wellFormed.stoppedRequiresCleanup stopped
+
 end AuthorityTests

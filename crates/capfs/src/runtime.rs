@@ -15,17 +15,25 @@ use rustix::{
     fs::{
         AtFlags, FileType, Mode, OFlags, RenameFlags, ResolveFlags, Statx, StatxFlags,
         StatxTimestamp, Timespec, Timestamps, UTIME_NOW, UTIME_OMIT, fchmod, ftruncate, futimens,
-        mkdirat, openat2, renameat_with, statx, unlinkat,
+        linkat, mkdirat, openat2, readlinkat, renameat_with, statx, symlinkat, unlinkat,
     },
     io::{fcntl_dupfd_cloexec, pread, pwrite},
 };
 
 use crate::{
     backing::ValidatedRepository,
-    namespace::{NamespaceObject, NamespaceObjectKind, RenamePlan},
+    namespace::{NamespaceObject, NamespaceObjectKind, RenamePlan, SymlinkTarget},
 };
 
 const REQUIRED_METADATA: StatxFlags = StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID);
+
+/// The link count passed for a directory, whose value carries no alias meaning.
+///
+/// Linux derives a directory's link count from its `.` and `..` entries, so it
+/// can never indicate an alias. Directories are excluded from the link-count
+/// comparison, and this constant documents the value's irrelevance at each
+/// call site instead of leaving a bare number.
+const DIRECTORY_LINK_COUNT_UNCHECKED: usize = 0;
 const RESOLVE_WITHIN_ROOT: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_MAGICLINKS)
     .union(ResolveFlags::NO_SYMLINKS)
@@ -144,9 +152,16 @@ pub(crate) enum RuntimeBackingError {
         expected: NamespaceObjectKind,
         actual: Option<NamespaceObjectKind>,
     },
-    HardLinkAppeared {
+    UnexpectedLinkCount {
         path: CanonicalPath,
-        link_count: u32,
+        expected: usize,
+        actual: u32,
+    },
+    SymlinkTargetChanged {
+        path: CanonicalPath,
+    },
+    NonUtf8SymlinkTarget {
+        path: CanonicalPath,
     },
     NestedMount(CanonicalPath),
     TimestampOutOfRange(CanonicalPath),
@@ -154,6 +169,10 @@ pub(crate) enum RuntimeBackingError {
     PathNotDirectChild {
         parent: CanonicalPath,
         child: CanonicalPath,
+    },
+    InvalidLinkPlan,
+    LinkedDifferentInode {
+        path: CanonicalPath,
     },
     #[allow(dead_code)]
     InvalidRenamePlan {
@@ -195,9 +214,23 @@ impl fmt::Display for RuntimeBackingError {
                 "backing object `{}` changed kind from {expected:?} to {actual:?}",
                 DisplayCanonicalPath(path)
             ),
-            Self::HardLinkAppeared { path, link_count } => write!(
+            Self::UnexpectedLinkCount {
+                path,
+                expected,
+                actual,
+            } => write!(
                 formatter,
-                "backing file `{}` now has {link_count} hard links",
+                "backing object `{}` has {actual} names but the namespace records {expected}",
+                DisplayCanonicalPath(path)
+            ),
+            Self::SymlinkTargetChanged { path } => write!(
+                formatter,
+                "backing symbolic link `{}` no longer has the target the namespace recorded",
+                DisplayCanonicalPath(path)
+            ),
+            Self::NonUtf8SymlinkTarget { path } => write!(
+                formatter,
+                "backing symbolic link `{}` has a non-UTF-8 target",
                 DisplayCanonicalPath(path)
             ),
             Self::NestedMount(path) => write!(
@@ -215,6 +248,14 @@ impl fmt::Display for RuntimeBackingError {
                 "backing path `{}` is not a direct child of `{}`",
                 DisplayCanonicalPath(child),
                 DisplayCanonicalPath(parent)
+            ),
+            Self::InvalidLinkPlan => {
+                formatter.write_str("a hard link plan named an object with no existing name")
+            }
+            Self::LinkedDifferentInode { path } => write!(
+                formatter,
+                "backing hard link `{}` named a different inode than the validated source",
+                DisplayCanonicalPath(path)
             ),
             Self::InvalidRenamePlan {
                 source,
@@ -321,7 +362,7 @@ impl ValidatedRepository {
         &self,
         object: &NamespaceObject,
     ) -> Result<BackingMetadata, RuntimeBackingError> {
-        let path = object.path();
+        let path = object.primary_path();
         let fd = if path.is_root() {
             None
         } else {
@@ -386,18 +427,21 @@ impl ValidatedRepository {
             Mode::RUSR | Mode::WUSR,
             RESOLVE_WITHIN_ROOT,
         )
-        .map_err(|error| runtime_io_error("create regular file", child.path(), error))?;
+        .map_err(|error| runtime_io_error("create regular file", child.primary_path(), error))?;
 
         let result = (|| {
             fchmod(&fd, permissions.mode()).map_err(|error| {
-                runtime_io_error("set creation permissions", child.path(), error)
+                runtime_io_error("set creation permissions", child.primary_path(), error)
             })?;
-            let metadata =
-                validate_runtime_metadata(self, child, metadata_for_fd(&fd, child.path())?)?;
+            let metadata = validate_runtime_metadata(
+                self,
+                child,
+                metadata_for_fd(&fd, child.primary_path())?,
+            )?;
             Ok((
                 OpenedBackingFile {
                     fd,
-                    path: child.path().clone(),
+                    path: child.primary_path().clone(),
                 },
                 metadata,
             ))
@@ -421,7 +465,7 @@ impl ValidatedRepository {
         let child_name = validate_creation_objects(parent, child, NamespaceObjectKind::Directory)?;
         let parent_fd = self.open_runtime_directory(parent)?;
         mkdirat(&parent_fd, child_name, Mode::RWXU)
-            .map_err(|error| runtime_io_error("create directory", child.path(), error))?;
+            .map_err(|error| runtime_io_error("create directory", child.primary_path(), error))?;
 
         let result = (|| {
             let child_fd = openat2(
@@ -431,11 +475,17 @@ impl ValidatedRepository {
                 Mode::empty(),
                 RESOLVE_WITHIN_ROOT,
             )
-            .map_err(|error| runtime_io_error("open created directory", child.path(), error))?;
-            fchmod(&child_fd, permissions.mode()).map_err(|error| {
-                runtime_io_error("set creation permissions", child.path(), error)
+            .map_err(|error| {
+                runtime_io_error("open created directory", child.primary_path(), error)
             })?;
-            validate_runtime_metadata(self, child, metadata_for_fd(&child_fd, child.path())?)
+            fchmod(&child_fd, permissions.mode()).map_err(|error| {
+                runtime_io_error("set creation permissions", child.primary_path(), error)
+            })?;
+            validate_runtime_metadata(
+                self,
+                child,
+                metadata_for_fd(&child_fd, child.primary_path())?,
+            )
         })();
 
         rollback_created_entry_on_error(&parent_fd, child, child_name, AtFlags::REMOVEDIR, result)
@@ -451,21 +501,24 @@ impl ValidatedRepository {
         &self,
         parent: &NamespaceObject,
         object: &NamespaceObject,
+        removed_path: &CanonicalPath,
     ) -> Result<(), RuntimeBackingError> {
-        let child_name = direct_child_name(parent, object)?;
+        let child_name = direct_child_path_name(parent, removed_path)?;
         let parent_fd = self.open_runtime_directory(parent)?;
         let _validated_object = self.open_and_validate_runtime_child(
             &parent_fd,
             child_name,
-            object.path(),
+            removed_path,
             object.kind(),
+            object.expected_link_count(),
         )?;
         let (flags, operation) = match object.kind() {
             NamespaceObjectKind::Directory => (AtFlags::REMOVEDIR, "remove directory"),
             NamespaceObjectKind::RegularFile => (AtFlags::empty(), "remove regular file"),
+            NamespaceObjectKind::Symlink => (AtFlags::empty(), "remove symbolic link"),
         };
         unlinkat(&parent_fd, child_name, flags)
-            .map_err(|error| runtime_io_error(operation, object.path(), error))
+            .map_err(|error| runtime_io_error(operation, removed_path, error))
     }
 
     /// Executes one validated no-replace subtree rename.
@@ -502,9 +555,14 @@ impl ValidatedRepository {
                     source_name,
                     movement.source(),
                     movement.kind(),
+                    movement.expected_link_count(),
                 )?
             } else {
-                self.open_and_validate_runtime_path(movement.source(), movement.kind())?
+                self.open_and_validate_runtime_path(
+                    movement.source(),
+                    movement.kind(),
+                    movement.expected_link_count(),
+                )?
             };
             drop(fd);
         }
@@ -537,7 +595,7 @@ impl ValidatedRepository {
     ) -> Result<(), RuntimeBackingError> {
         let fd = self.open_runtime_metadata_object(object)?;
         fchmod(&fd, permissions.mode())
-            .map_err(|error| runtime_io_error("set permissions", object.path(), error))
+            .map_err(|error| runtime_io_error("set permissions", object.primary_path(), error))
     }
 
     /// Replaces atime and/or mtime on one validated backing object.
@@ -552,10 +610,10 @@ impl ValidatedRepository {
         object: &NamespaceObject,
         times: MetadataTimes,
     ) -> Result<(), RuntimeBackingError> {
-        let timestamps = times.to_rustix(object.path())?;
+        let timestamps = times.to_rustix(object.primary_path())?;
         let fd = self.open_runtime_metadata_object(object)?;
         futimens(&fd, &timestamps)
-            .map_err(|error| runtime_io_error("set timestamps", object.path(), error))
+            .map_err(|error| runtime_io_error("set timestamps", object.primary_path(), error))
     }
 
     fn open_runtime_file_with_access(
@@ -565,24 +623,24 @@ impl ValidatedRepository {
     ) -> Result<OpenedBackingFile, RuntimeBackingError> {
         if object.kind() != NamespaceObjectKind::RegularFile {
             return Err(RuntimeBackingError::ObjectKindChanged {
-                path: object.path().clone(),
+                path: object.primary_path().clone(),
                 expected: NamespaceObjectKind::RegularFile,
                 actual: Some(object.kind()),
             });
         }
         let fd = openat2(
             self.as_fd(),
-            path_buf(object.path()),
+            path_buf(object.primary_path()),
             access.open_flags() | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
             RESOLVE_WITHIN_ROOT,
         )
-        .map_err(|error| runtime_io_error(access.operation(), object.path(), error))?;
-        let metadata = metadata_for_fd(&fd, object.path())?;
+        .map_err(|error| runtime_io_error(access.operation(), object.primary_path(), error))?;
+        let metadata = metadata_for_fd(&fd, object.primary_path())?;
         validate_runtime_metadata(self, object, metadata)?;
         Ok(OpenedBackingFile {
             fd,
-            path: object.path().clone(),
+            path: object.primary_path().clone(),
         })
     }
 
@@ -598,7 +656,208 @@ impl ValidatedRepository {
                     self.open_runtime_file_with_access(object, RuntimeFileAccess::ReadOnly)?;
                 Ok(file.fd)
             }
+            // A symbolic link's own metadata is reachable only through an
+            // `O_PATH` descriptor: opening it any other way would resolve the
+            // target instead of the link.
+            NamespaceObjectKind::Symlink => self.open_runtime_symlink(object),
         }
+    }
+
+    /// Opens one symbolic link itself, never its target.
+    fn open_runtime_symlink(
+        &self,
+        object: &NamespaceObject,
+    ) -> Result<OwnedFd, RuntimeBackingError> {
+        if object.kind() != NamespaceObjectKind::Symlink {
+            return Err(RuntimeBackingError::ObjectKindChanged {
+                path: object.primary_path().clone(),
+                expected: NamespaceObjectKind::Symlink,
+                actual: Some(object.kind()),
+            });
+        }
+        let fd = openat2(
+            self.as_fd(),
+            path_buf(object.primary_path()),
+            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            RESOLVE_WITHIN_ROOT,
+        )
+        .map_err(|error| runtime_io_error("open symbolic link", object.primary_path(), error))?;
+        validate_runtime_metadata(self, object, metadata_for_fd(&fd, object.primary_path())?)?;
+        Ok(fd)
+    }
+
+    /// Reads one symbolic link and confirms the backing agrees with the registry.
+    ///
+    /// The registry, not the backing tree, owns what a link means: the target it
+    /// recorded was validated to stay inside the repository, and it is the value
+    /// that gets replied to `READLINK`. Reading the backing link and comparing is
+    /// what detects a target rewritten out of band; a mismatch fails closed
+    /// rather than serving either value.
+    pub(crate) fn read_runtime_symlink(
+        &self,
+        object: &NamespaceObject,
+    ) -> Result<String, RuntimeBackingError> {
+        let recorded =
+            object
+                .link_target()
+                .ok_or_else(|| RuntimeBackingError::ObjectKindChanged {
+                    path: object.primary_path().clone(),
+                    expected: NamespaceObjectKind::Symlink,
+                    actual: Some(object.kind()),
+                })?;
+        let fd = self.open_runtime_symlink(object)?;
+        let observed = read_link_body(&fd, object.primary_path())?;
+        if observed != recorded.as_str() {
+            return Err(RuntimeBackingError::SymlinkTargetChanged {
+                path: object.primary_path().clone(),
+            });
+        }
+        Ok(observed)
+    }
+
+    /// Exclusively creates one symbolic link below a validated live parent.
+    ///
+    /// `symlinkat` fails with `EEXIST` rather than replacing anything, and the
+    /// created link is reopened without following it and compared against the
+    /// target the namespace staged. A failure after creation removes the link
+    /// before returning.
+    pub(crate) fn create_runtime_symlink(
+        &self,
+        parent: &NamespaceObject,
+        child: &NamespaceObject,
+        target: &SymlinkTarget,
+    ) -> Result<BackingMetadata, RuntimeBackingError> {
+        let child_name = validate_creation_objects(parent, child, NamespaceObjectKind::Symlink)?;
+        let parent_fd = self.open_runtime_directory(parent)?;
+        symlinkat(target.as_str(), &parent_fd, child_name).map_err(|error| {
+            runtime_io_error("create symbolic link", child.primary_path(), error)
+        })?;
+
+        let result = (|| {
+            let child_fd = openat2(
+                &parent_fd,
+                child_name,
+                OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+                RESOLVE_WITHIN_ROOT,
+            )
+            .map_err(|error| {
+                runtime_io_error("open created symbolic link", child.primary_path(), error)
+            })?;
+            if read_link_body(&child_fd, child.primary_path())? != target.as_str() {
+                return Err(RuntimeBackingError::SymlinkTargetChanged {
+                    path: child.primary_path().clone(),
+                });
+            }
+            validate_runtime_metadata(
+                self,
+                child,
+                metadata_for_fd(&child_fd, child.primary_path())?,
+            )
+        })();
+
+        rollback_created_entry_on_error(&parent_fd, child, child_name, AtFlags::empty(), result)
+    }
+
+    /// Gives one existing inode an additional name below a validated parent.
+    ///
+    /// Both names are resolved from descriptors this method opened and
+    /// validated, so no intermediate component can be substituted. `linkat`
+    /// resolves only the two final components, and it never follows a symbolic
+    /// link source: linking a link produces a second name for the link itself.
+    ///
+    /// The created name is then reopened and required to be the *same inode*
+    /// that was validated. That comparison is what closes the window between
+    /// validating the source name and using it: if the source was swapped in
+    /// between, the new name points at a different inode and is removed again.
+    pub(crate) fn create_runtime_hard_link(
+        &self,
+        source: &NamespaceObject,
+        source_path: &CanonicalPath,
+        parent: &NamespaceObject,
+        link_path: &CanonicalPath,
+    ) -> Result<BackingMetadata, RuntimeBackingError> {
+        if source.kind() == NamespaceObjectKind::Directory {
+            return Err(RuntimeBackingError::ObjectKindChanged {
+                path: source_path.clone(),
+                expected: NamespaceObjectKind::RegularFile,
+                actual: Some(source.kind()),
+            });
+        }
+        let link_name = direct_child_path_name(parent, link_path)?;
+        let source_parent_path =
+            source_path
+                .parent()
+                .ok_or_else(|| RuntimeBackingError::PathNotDirectChild {
+                    parent: CanonicalPath::root(),
+                    child: source_path.clone(),
+                })?;
+        let source_name =
+            final_name(source_path).ok_or_else(|| RuntimeBackingError::PathNotDirectChild {
+                parent: source_parent_path.clone(),
+                child: source_path.clone(),
+            })?;
+        let source_parent_fd = self.open_runtime_directory_path(&source_parent_path)?;
+        let parent_fd = self.open_runtime_directory(parent)?;
+
+        // The source must still have exactly the names the registry recorded
+        // *before* this one is added.
+        let existing_names = source
+            .expected_link_count()
+            .checked_sub(1)
+            .ok_or(RuntimeBackingError::InvalidLinkPlan)?;
+        let source_fd = openat2(
+            &source_parent_fd,
+            source_name,
+            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            RESOLVE_WITHIN_ROOT,
+        )
+        .map_err(|error| runtime_io_error("open hard link source", source_path, error))?;
+        let source_metadata = metadata_for_fd(&source_fd, source_path)?;
+        validate_runtime_metadata_for(
+            self,
+            source_path,
+            source.kind(),
+            existing_names,
+            source_metadata,
+        )?;
+
+        linkat(
+            &source_parent_fd,
+            source_name,
+            &parent_fd,
+            link_name,
+            AtFlags::empty(),
+        )
+        .map_err(|error| runtime_io_error("create hard link", link_path, error))?;
+
+        let result = (|| {
+            let link_fd = openat2(
+                &parent_fd,
+                link_name,
+                OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+                RESOLVE_WITHIN_ROOT,
+            )
+            .map_err(|error| runtime_io_error("open created hard link", link_path, error))?;
+            let metadata = metadata_for_fd(&link_fd, link_path)?;
+            if metadata.stx_ino != source_metadata.stx_ino {
+                return Err(RuntimeBackingError::LinkedDifferentInode {
+                    path: link_path.clone(),
+                });
+            }
+            validate_runtime_metadata_for(
+                self,
+                link_path,
+                source.kind(),
+                source.expected_link_count(),
+                metadata,
+            )
+        })();
+
+        rollback_created_path_on_error(&parent_fd, link_path, link_name, AtFlags::empty(), result)
     }
 
     fn open_runtime_directory(
@@ -607,13 +866,13 @@ impl ValidatedRepository {
     ) -> Result<OwnedFd, RuntimeBackingError> {
         if object.kind() != NamespaceObjectKind::Directory {
             return Err(RuntimeBackingError::ObjectKindChanged {
-                path: object.path().clone(),
+                path: object.primary_path().clone(),
                 expected: NamespaceObjectKind::Directory,
                 actual: Some(object.kind()),
             });
         }
-        let fd = self.open_runtime_directory_path(object.path())?;
-        validate_runtime_metadata(self, object, metadata_for_fd(&fd, object.path())?)?;
+        let fd = self.open_runtime_directory_path(object.primary_path())?;
+        validate_runtime_metadata(self, object, metadata_for_fd(&fd, object.primary_path())?)?;
         Ok(fd)
     }
 
@@ -638,6 +897,7 @@ impl ValidatedRepository {
             self,
             path,
             NamespaceObjectKind::Directory,
+            DIRECTORY_LINK_COUNT_UNCHECKED,
             metadata_for_fd(&fd, path)?,
         )?;
         Ok(fd)
@@ -650,6 +910,7 @@ impl ValidatedRepository {
         child_name: &str,
         child_path: &CanonicalPath,
         expected_kind: NamespaceObjectKind,
+        expected_link_count: usize,
     ) -> Result<OwnedFd, RuntimeBackingError> {
         let fd = openat2(
             parent_fd,
@@ -663,6 +924,7 @@ impl ValidatedRepository {
             self,
             child_path,
             expected_kind,
+            expected_link_count,
             metadata_for_fd(&fd, child_path)?,
         )?;
         Ok(fd)
@@ -673,6 +935,7 @@ impl ValidatedRepository {
         &self,
         path: &CanonicalPath,
         expected_kind: NamespaceObjectKind,
+        expected_link_count: usize,
     ) -> Result<OwnedFd, RuntimeBackingError> {
         let fd = openat2(
             self.as_fd(),
@@ -682,7 +945,13 @@ impl ValidatedRepository {
             RESOLVE_WITHIN_ROOT,
         )
         .map_err(|error| runtime_io_error("open rename source", path, error))?;
-        validate_runtime_metadata_for(self, path, expected_kind, metadata_for_fd(&fd, path)?)?;
+        validate_runtime_metadata_for(
+            self,
+            path,
+            expected_kind,
+            expected_link_count,
+            metadata_for_fd(&fd, path)?,
+        )?;
         Ok(fd)
     }
 }
@@ -691,18 +960,38 @@ fn direct_child_name<'a>(
     parent: &NamespaceObject,
     child: &'a NamespaceObject,
 ) -> Result<&'a str, RuntimeBackingError> {
+    direct_child_path_name(parent, child.primary_path())
+}
+
+/// Returns the final segment of a path that must be a direct child of `parent`.
+///
+/// Taking the path rather than the object matters once an inode can have more
+/// than one name: a removal or a link names one of them, and using the object's
+/// primary path instead would operate on a different name than the request did.
+fn direct_child_path_name<'a>(
+    parent: &NamespaceObject,
+    child: &'a CanonicalPath,
+) -> Result<&'a str, RuntimeBackingError> {
     if parent.kind() != NamespaceObjectKind::Directory
-        || child.path().parent().as_ref() != Some(parent.path())
+        || child.parent().as_ref() != Some(parent.primary_path())
     {
         return Err(RuntimeBackingError::PathNotDirectChild {
-            parent: parent.path().clone(),
-            child: child.path().clone(),
+            parent: parent.primary_path().clone(),
+            child: child.clone(),
         });
     }
-    final_name(child.path()).ok_or_else(|| RuntimeBackingError::PathNotDirectChild {
-        parent: parent.path().clone(),
-        child: child.path().clone(),
+    final_name(child).ok_or_else(|| RuntimeBackingError::PathNotDirectChild {
+        parent: parent.primary_path().clone(),
+        child: child.clone(),
     })
+}
+
+/// Reads a link body from an `O_PATH` descriptor of the link itself.
+fn read_link_body(fd: &OwnedFd, path: &CanonicalPath) -> Result<String, RuntimeBackingError> {
+    let body = readlinkat(fd, "", Vec::new())
+        .map_err(|error| runtime_io_error("read symbolic link", path, error))?;
+    String::from_utf8(body.into_bytes())
+        .map_err(|_| RuntimeBackingError::NonUtf8SymlinkTarget { path: path.clone() })
 }
 
 fn final_name(path: &CanonicalPath) -> Option<&str> {
@@ -806,7 +1095,7 @@ fn validate_creation_objects<'a>(
 ) -> Result<&'a str, RuntimeBackingError> {
     if child.kind() != expected_kind {
         return Err(RuntimeBackingError::ObjectKindChanged {
-            path: child.path().clone(),
+            path: child.primary_path().clone(),
             expected: expected_kind,
             actual: Some(child.kind()),
         });
@@ -822,6 +1111,16 @@ fn rollback_created_entry_on_error<T>(
     flags: AtFlags,
     result: Result<T, RuntimeBackingError>,
 ) -> Result<T, RuntimeBackingError> {
+    rollback_created_path_on_error(parent_fd, child.primary_path(), child_name, flags, result)
+}
+
+fn rollback_created_path_on_error<T>(
+    parent_fd: &OwnedFd,
+    child_path: &CanonicalPath,
+    child_name: &str,
+    flags: AtFlags,
+    result: Result<T, RuntimeBackingError>,
+) -> Result<T, RuntimeBackingError> {
     let Err(error) = result else {
         return result;
     };
@@ -831,7 +1130,7 @@ fn rollback_created_entry_on_error<T>(
         // registry so the inconsistent repository fails closed.
         panic!(
             "failed to roll back backing creation `{}` after `{error}`: {}",
-            DisplayCanonicalPath(child.path()),
+            DisplayCanonicalPath(child_path),
             io::Error::from_raw_os_error(cleanup_error.raw_os_error())
         );
     }
@@ -860,13 +1159,26 @@ fn validate_runtime_metadata(
     object: &NamespaceObject,
     metadata: Statx,
 ) -> Result<BackingMetadata, RuntimeBackingError> {
-    validate_runtime_metadata_for(repository, object.path(), object.kind(), metadata)
+    validate_runtime_metadata_for(
+        repository,
+        object.primary_path(),
+        object.kind(),
+        object.expected_link_count(),
+        metadata,
+    )
 }
 
+/// Rechecks that the inode behind a path is still the one the namespace records.
+///
+/// The link-count comparison is what detects a name created outside capfs. It
+/// is no longer "exactly one": a hard link made *through* capfs is recorded in
+/// the namespace, so the invariant is that the inode has exactly as many names
+/// as the registry knows about. A name capfs cannot see would still be caught.
 fn validate_runtime_metadata_for(
     repository: &ValidatedRepository,
     path: &CanonicalPath,
     expected_kind: NamespaceObjectKind,
+    expected_link_count: usize,
     metadata: Statx,
 ) -> Result<BackingMetadata, RuntimeBackingError> {
     let actual_kind = namespace_kind(FileType::from_raw_mode(metadata.stx_mode.into()));
@@ -880,10 +1192,13 @@ fn validate_runtime_metadata_for(
     if metadata.stx_mnt_id != repository.root_mount_id() {
         return Err(RuntimeBackingError::NestedMount(path.clone()));
     }
-    if expected_kind == NamespaceObjectKind::RegularFile && metadata.stx_nlink != 1 {
-        return Err(RuntimeBackingError::HardLinkAppeared {
+    if expected_kind != NamespaceObjectKind::Directory
+        && u64::from(metadata.stx_nlink) != expected_link_count as u64
+    {
+        return Err(RuntimeBackingError::UnexpectedLinkCount {
             path: path.clone(),
-            link_count: metadata.stx_nlink,
+            expected: expected_link_count,
+            actual: metadata.stx_nlink,
         });
     }
 
@@ -976,6 +1291,7 @@ const fn namespace_kind(kind: FileType) -> Option<NamespaceObjectKind> {
     match kind {
         FileType::Directory => Some(NamespaceObjectKind::Directory),
         FileType::RegularFile => Some(NamespaceObjectKind::RegularFile),
+        FileType::Symlink => Some(NamespaceObjectKind::Symlink),
         _ => None,
     }
 }
@@ -1023,6 +1339,7 @@ impl fmt::Display for DisplayCanonicalPath<'_> {
 #[cfg(test)]
 mod tests {
     use std::{
+        convert::Infallible,
         fs,
         num::NonZeroUsize,
         os::unix::fs::{PermissionsExt, symlink},
@@ -1039,7 +1356,10 @@ mod tests {
     };
     use crate::{
         backing::{ImportedRepository, PreflightLimits},
-        namespace::{NamespaceObjectKind, NamespaceOperationError},
+        namespace::{
+            NamespaceError, NamespaceObjectKind, NamespaceObjectSpec, NamespaceOperationError,
+            SymlinkTarget,
+        },
     };
     use authority_core::path::CanonicalPath;
     use authority_core::repository::RepoId;
@@ -1237,7 +1557,7 @@ mod tests {
             .create_child(
                 parent.id(),
                 "new.txt",
-                NamespaceObjectKind::RegularFile,
+                NamespaceObjectSpec::RegularFile,
                 |live_parent, child| backing.create_runtime_file(live_parent, child, permissions),
             )
             .expect("vacant child must be created");
@@ -1284,7 +1604,7 @@ mod tests {
             .create_child(
                 parent.id(),
                 "private",
-                NamespaceObjectKind::Directory,
+                NamespaceObjectSpec::Directory,
                 |live_parent, child| {
                     backing.create_runtime_directory(
                         live_parent,
@@ -1328,7 +1648,7 @@ mod tests {
             .create_child(
                 parent.id(),
                 "occupied",
-                NamespaceObjectKind::RegularFile,
+                NamespaceObjectSpec::RegularFile,
                 |live_parent, child| {
                     backing.create_runtime_file(
                         live_parent,
@@ -1380,7 +1700,7 @@ mod tests {
             .create_child(
                 parent.id(),
                 "occupied",
-                NamespaceObjectKind::Directory,
+                NamespaceObjectSpec::Directory,
                 |live_parent, child| {
                     backing.create_runtime_directory(
                         live_parent,
@@ -1432,7 +1752,7 @@ mod tests {
             .create_child(
                 parent.id(),
                 "new.txt",
-                NamespaceObjectKind::RegularFile,
+                NamespaceObjectSpec::RegularFile,
                 |live_parent, child| {
                     backing.create_runtime_file(
                         live_parent,
@@ -1485,7 +1805,7 @@ mod tests {
             .create_child(
                 parent.id(),
                 "rolled-back.txt",
-                NamespaceObjectKind::RegularFile,
+                NamespaceObjectSpec::RegularFile,
                 |live_parent, child| {
                     let parent_fd = backing.open_runtime_directory(live_parent)?;
                     fs::write(directory.path().join("rolled-back.txt"), b"uncommitted")
@@ -1497,7 +1817,7 @@ mod tests {
                         AtFlags::empty(),
                         Err::<(), _>(RuntimeBackingError::PathNotDirectChild {
                             parent: CanonicalPath::root(),
-                            child: child.path().clone(),
+                            child: child.primary_path().clone(),
                         }),
                     )
                 },
@@ -1537,7 +1857,7 @@ mod tests {
         let error = namespace
             .create_object(
                 child_path.clone(),
-                NamespaceObjectKind::RegularFile,
+                NamespaceObjectSpec::RegularFile,
                 |child| {
                     backing.create_runtime_file(
                         &wrong_parent,
@@ -1580,7 +1900,7 @@ mod tests {
             .create_child(
                 parent.id(),
                 "escape.txt",
-                NamespaceObjectKind::RegularFile,
+                NamespaceObjectSpec::RegularFile,
                 |live_parent, child| {
                     backing.create_runtime_file(
                         live_parent,
@@ -1623,8 +1943,8 @@ mod tests {
             CanonicalPath::new(["obsolete.txt"]).expect("test path must be canonical");
 
         namespace
-            .remove_child(root.id(), "obsolete.txt", |parent, object| {
-                backing.remove_runtime_object(parent, object)
+            .remove_child(root.id(), "obsolete.txt", |parent, object, removed| {
+                backing.remove_runtime_object(parent, object, removed)
             })
             .expect("validated regular file must be removed");
 
@@ -1652,8 +1972,8 @@ mod tests {
         let removed_path = CanonicalPath::new(["empty"]).expect("test path must be canonical");
 
         namespace
-            .remove_child(root.id(), "empty", |parent, object| {
-                backing.remove_runtime_object(parent, object)
+            .remove_child(root.id(), "empty", |parent, object, removed| {
+                backing.remove_runtime_object(parent, object, removed)
             })
             .expect("validated empty directory must be removed");
 
@@ -1685,8 +2005,8 @@ mod tests {
             .expect("out-of-band child must be creatable");
 
         let error = namespace
-            .remove_child(root.id(), "initially-empty", |parent, object| {
-                backing.remove_runtime_object(parent, object)
+            .remove_child(root.id(), "initially-empty", |parent, object, removed| {
+                backing.remove_runtime_object(parent, object, removed)
             })
             .expect_err("non-empty backing directory must reject removal");
         assert!(matches!(
@@ -1724,14 +2044,15 @@ mod tests {
             .expect("out-of-band hard link must be creatable");
 
         let error = namespace
-            .remove_child(root.id(), "kept.txt", |parent, object| {
-                backing.remove_runtime_object(parent, object)
+            .remove_child(root.id(), "kept.txt", |parent, object, removed| {
+                backing.remove_runtime_object(parent, object, removed)
             })
             .expect_err("hard-linked file must reject removal");
         assert!(matches!(
             error,
-            NamespaceOperationError::Executor(RuntimeBackingError::HardLinkAppeared {
-                link_count: 2,
+            NamespaceOperationError::Executor(RuntimeBackingError::UnexpectedLinkCount {
+                expected: 1,
+                actual: 2,
                 ..
             })
         ));
@@ -2018,11 +2339,18 @@ mod tests {
                 |plan| backing.rename_runtime_subtree(plan),
             )
             .expect_err("source symlink must reject rename");
+        // The substitution is detected as a kind change: the namespace recorded
+        // a regular file and the backing now holds a symbolic link. Symlinks are
+        // representable objects now, so the mismatch names what was found.
         assert!(matches!(
             error,
             NamespaceOperationError::Executor(
                 RuntimeBackingError::Io { .. }
-                    | RuntimeBackingError::ObjectKindChanged { actual: None, .. }
+                    | RuntimeBackingError::ObjectKindChanged {
+                        expected: NamespaceObjectKind::RegularFile,
+                        actual: None | Some(NamespaceObjectKind::Symlink),
+                        ..
+                    }
             )
         ));
         assert_eq!(
@@ -2189,7 +2517,11 @@ mod tests {
 
         assert!(matches!(
             error,
-            RuntimeBackingError::HardLinkAppeared { link_count: 2, .. }
+            RuntimeBackingError::UnexpectedLinkCount {
+                expected: 1,
+                actual: 2,
+                ..
+            }
         ));
         assert_eq!(
             fs::metadata(&file_path)
@@ -2433,7 +2765,11 @@ mod tests {
 
         assert!(matches!(
             backing.runtime_metadata(&object),
-            Err(RuntimeBackingError::HardLinkAppeared { link_count: 2, .. })
+            Err(RuntimeBackingError::UnexpectedLinkCount {
+                expected: 1,
+                actual: 2,
+                ..
+            })
         ));
     }
 
@@ -2457,7 +2793,11 @@ mod tests {
 
         assert!(matches!(
             backing.open_runtime_writable_file(&object),
-            Err(RuntimeBackingError::HardLinkAppeared { link_count: 2, .. })
+            Err(RuntimeBackingError::UnexpectedLinkCount {
+                expected: 1,
+                actual: 2,
+                ..
+            })
         ));
     }
 
@@ -2481,5 +2821,165 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // Requirement: a link created through capfs round-trips, and the registry's
+    // record of the target is what a later read is checked against.
+    #[test]
+    fn runtime_symlink_creation_and_read_agree_with_the_namespace_record() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::create_dir(directory.path().join("src")).expect("parent directory must be creatable");
+        fs::write(directory.path().join("src/main.rs"), b"fn main() {}")
+            .expect("target file must be writable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let root = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+        let target = SymlinkTarget::new("src/main.rs").expect("target must be representable");
+
+        let creation = namespace
+            .create_child(
+                root.id(),
+                "entry.rs",
+                NamespaceObjectSpec::Symlink(target.clone()),
+                |live_parent, child| backing.create_runtime_symlink(live_parent, child, &target),
+            )
+            .expect("a contained symlink must be creatable");
+        let (object, metadata) = creation.into_parts();
+        assert_eq!(metadata.kind, NamespaceObjectKind::Symlink);
+        assert_eq!(metadata.link_count, 1);
+        assert!(
+            fs::symlink_metadata(directory.path().join("entry.rs"))
+                .expect("the link must exist")
+                .file_type()
+                .is_symlink()
+        );
+
+        let record = namespace
+            .object_snapshot(&object)
+            .expect("namespace must remain readable")
+            .expect("the link must be live");
+        assert_eq!(
+            backing
+                .read_runtime_symlink(&record)
+                .expect("an unchanged link must read back"),
+            "src/main.rs"
+        );
+
+        // A target rewritten outside capfs makes the registry and the backing
+        // disagree, and neither value is served.
+        fs::remove_file(directory.path().join("entry.rs")).expect("the link must be replaceable");
+        symlink("/etc/passwd", directory.path().join("entry.rs"))
+            .expect("a replacement link must be creatable");
+        assert!(matches!(
+            backing.read_runtime_symlink(&record),
+            Err(RuntimeBackingError::SymlinkTargetChanged { .. })
+        ));
+    }
+
+    // Requirement: a second name reaches the same inode, and the namespace's
+    // name count is what the runtime validates the inode against afterwards.
+    #[test]
+    fn runtime_hard_link_creates_a_second_name_for_the_same_inode() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::write(directory.path().join("original.txt"), b"shared")
+            .expect("test file must be writable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let root = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+        let source = namespace
+            .object_at_path_snapshot(
+                &CanonicalPath::new(["original.txt"]).expect("test path must be canonical"),
+            )
+            .expect("namespace must remain readable")
+            .expect("the file must be imported");
+
+        let metadata = namespace
+            .link_child(
+                root.id(),
+                "alias.txt",
+                source.id(),
+                |live_parent, linked, link_path| {
+                    backing.create_runtime_hard_link(
+                        linked,
+                        &CanonicalPath::new(["original.txt"]).expect("test path must be canonical"),
+                        live_parent,
+                        link_path,
+                    )
+                },
+            )
+            .expect("a second name must be creatable");
+        assert_eq!(metadata.link_count, 2);
+        assert_eq!(
+            fs::read(directory.path().join("alias.txt")).expect("the alias must be readable"),
+            b"shared"
+        );
+
+        // Both names now belong to one object, and the runtime accepts the
+        // inode only because the registry expects exactly two of them.
+        let linked = namespace
+            .object_snapshot(source.id())
+            .expect("namespace must remain readable")
+            .expect("the file must be live");
+        assert_eq!(linked.expected_link_count(), 2);
+        backing
+            .runtime_metadata(&linked)
+            .expect("a two-name inode must validate against a two-name record");
+
+        // A third name added outside capfs is still rejected.
+        fs::hard_link(
+            directory.path().join("original.txt"),
+            directory.path().join("smuggled.txt"),
+        )
+        .expect("out-of-band hard link must be creatable");
+        assert!(matches!(
+            backing.runtime_metadata(&linked),
+            Err(RuntimeBackingError::UnexpectedLinkCount {
+                expected: 2,
+                actual: 3,
+                ..
+            })
+        ));
+    }
+
+    // Requirement: a directory can never gain a second name through capfs.
+    #[test]
+    fn runtime_hard_link_refuses_a_directory_source() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::create_dir(directory.path().join("src")).expect("directory must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("repository must validate");
+        let (_repository, _backing, namespace) = imported.into_parts();
+        let root = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+        let source = namespace
+            .object_at_path_snapshot(
+                &CanonicalPath::new(["src"]).expect("test path must be canonical"),
+            )
+            .expect("namespace must remain readable")
+            .expect("the directory must be imported");
+
+        assert!(matches!(
+            namespace.link_child(root.id(), "alias", source.id(), |_, _, _| Ok::<
+                (),
+                Infallible,
+            >(())),
+            Err(NamespaceOperationError::Namespace(
+                NamespaceError::CannotAliasKind { .. }
+            ))
+        ));
+        assert!(!directory.path().join("alias").exists());
     }
 }

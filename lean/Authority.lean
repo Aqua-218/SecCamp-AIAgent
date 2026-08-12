@@ -5,6 +5,7 @@ import Authority.Kernel
 import Authority.Orchestrator
 import Authority.Refinement.Observation
 import Authority.Refinement.CapabilityState
+import Authority.Refinement.Broker
 import Authority.SupervisorRefinement
 
 /-!

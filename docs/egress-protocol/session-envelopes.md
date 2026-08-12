@@ -84,6 +84,26 @@ response outcome の保持先と connection close は transport / Broker の責�
 
 この順に分けることで、任意の raw frame や retry が credential を使う操作を二重に dispatch する抜け道を作らない。
 
+## 正確な保証範囲
+
+envelope が保証するのは、1 つの session 内で要求の順序と同一性が判定できることだけ。
+
+- session そのものの認証はしていない。`BrokerSessionId` を持っていることが、その session の正当な所有者である証明にはならない。connection の identity は [transport 契約](../egress-broker/transport.md)の層が持つ。
+- replay 防止は bounded capacity の範囲でしか効かない。capacity を超えて古くなった `(session, sequence)` は cache から落ちる。sequence の単調性がその後の防波堤になる。
+- payload hash は同一性の判定に使うだけで、完全性の証明ではない。改竄を検出する経路は TLS ではなく vsock の信頼に依存している。
+- budget は要求の受理前に予約するが、実際の消費量が予約と一致することは adapter 側の実装に依存する。
+- 時刻は扱わない。session の有効期間は Capability の[有効期間](../authority-core/validity-windows.md)が持つ。
+- session をまたぐ順序は定義しない。2 つの session の要求の前後関係は判定できない。
+
+## 変更時の確認点
+
+- sequence の開始値 `0` と「直前の次だけ」の規則を緩めない。飛ばしを許すと、失われた要求と再送の区別が付かなくなる。
+- 完全一致 retry の判定から field を減らさない。`(session, sequence, request ID, payload hash)` の 4 つ揃いが条件で、payload hash を外すと別内容の要求が retry として通る。
+- 拒否 outcome の cache をやめない。再計算すると budget や時刻の変化で結果が変わる。
+- replay capacity を変えるときは、その値が session あたりの in-flight 要求数を上回っていることを確認する。下回ると正当な retry が cache から落ちる。
+- budget の予約と解放を非対称にしない。拒否された要求の予約が解放されないと、session が徐々に枯れる。
+- restore 後に新しい `BrokerSessionId` を確立する手順を省かない。[snapshot と identity gate](../firecracker-runtime/snapshot-and-identity.md)がこの前提に依存している。
+
 ## 関連
 
 - [ネットワークと外部副作用](../design/network-egress.md)

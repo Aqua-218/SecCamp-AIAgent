@@ -638,6 +638,17 @@ impl IdentityLedger for DurableIdentityLedger {
                 message: error.to_string(),
             });
         }
+        // Persist records while the old header still defines the committed
+        // prefix. Only after this barrier may the header publish the new
+        // record count. A crash can therefore leave an invalid trailing suffix,
+        // but can never publish records that were not durably written first.
+        if let Err(error) = self.file.sync_data() {
+            self.poisoned = true;
+            return Err(LedgerError::SyncFailed {
+                path: self.path.clone(),
+                message: error.to_string(),
+            });
+        }
         if let Err(error) = self.file.seek(SeekFrom::Start(0)) {
             self.poisoned = true;
             return Err(LedgerError::io(

@@ -10,6 +10,7 @@ use std::{
         unix::ffi::OsStringExt,
     },
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use authority_core::{
@@ -316,11 +317,11 @@ pub struct ValidatedRepository {
 /// Keeping all three values under one owner prevents an adapter from pairing a
 /// capability for one repository with another backing fd or manifest-derived
 /// registry.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ImportedRepository {
     repository: RepoId,
-    backing: ValidatedRepository,
-    namespace: NamespaceRegistry,
+    backing: Arc<ValidatedRepository>,
+    namespace: Arc<NamespaceRegistry>,
 }
 
 impl ImportedRepository {
@@ -360,8 +361,8 @@ impl ImportedRepository {
         )?;
         Ok(Self {
             repository,
-            backing,
-            namespace,
+            backing: Arc::new(backing),
+            namespace: Arc::new(namespace),
         })
     }
 
@@ -373,19 +374,19 @@ impl ImportedRepository {
 
     /// Returns the validated backing root and its owned directory fd.
     #[must_use]
-    pub const fn backing(&self) -> &ValidatedRepository {
-        &self.backing
+    pub fn backing(&self) -> &ValidatedRepository {
+        self.backing.as_ref()
     }
 
     /// Returns the registry initialized from this backing root's manifest.
     #[must_use]
-    pub const fn namespace(&self) -> &NamespaceRegistry {
-        &self.namespace
+    pub fn namespace(&self) -> &NamespaceRegistry {
+        self.namespace.as_ref()
     }
 
     /// Separates the identity, backing root, and namespace for an adapter.
     #[must_use]
-    pub fn into_parts(self) -> (RepoId, ValidatedRepository, NamespaceRegistry) {
+    pub fn into_parts(self) -> (RepoId, Arc<ValidatedRepository>, Arc<NamespaceRegistry>) {
         (self.repository, self.backing, self.namespace)
     }
 }

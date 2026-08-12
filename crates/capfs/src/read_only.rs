@@ -289,8 +289,8 @@ struct DirectoryEntry {
 /// the namespace path remains stable. Successful opens use direct I/O so the
 /// kernel page cache cannot bypass a later revocation check.
 pub struct ReadOnlyFilesystem {
-    backing: ValidatedRepository,
-    namespace: NamespaceRegistry,
+    backing: Arc<ValidatedRepository>,
+    namespace: Arc<NamespaceRegistry>,
     nodes: NodeTable,
     kernel: Arc<CapabilityKernel>,
     authority: MountAuthority,

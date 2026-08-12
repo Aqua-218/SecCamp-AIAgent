@@ -3,6 +3,7 @@
 #![cfg(target_os = "linux")]
 
 use std::{
+    convert::Infallible,
     ffi::OsString,
     fs::{self, File, hard_link},
     io::Write,
@@ -144,6 +145,48 @@ fn startup_imports_the_complete_manifest_with_registry_assigned_ids() {
                 .st_mode
         ),
         FileType::Directory
+    );
+}
+
+// Requirement: independently constructed subject mounts for one workspace
+// observe one namespace and retain the same anchored backing root. Category:
+// mount/identity. Risk: critical.
+#[test]
+fn cloned_imports_share_the_workspace_state_for_multiple_mounts() {
+    let repository = TempDir::new().expect("test repository should be creatable");
+    write_file(repository.path().join("existing.txt"), b"existing");
+    let first_mount =
+        ImportedRepository::open(RepoId::new("workspace"), repository.path(), limits(8, 1))
+            .expect("link-free tree should import atomically");
+    let second_mount = first_mount.clone();
+
+    let existing_path = path(&["existing.txt"]);
+    let existing = first_mount
+        .namespace()
+        .object_at_path_snapshot(&existing_path)
+        .expect("first mount registry must remain readable")
+        .expect("manifest file must exist");
+    first_mount
+        .namespace()
+        .open_object(existing.id(), |_| Ok::<_, Infallible>(()))
+        .expect("first mount must register its open in the shared registry");
+
+    let observed = second_mount
+        .namespace()
+        .object_at_path_snapshot(&existing_path)
+        .expect("second mount registry must remain readable")
+        .expect("second mount must observe the shared object");
+    assert_eq!(observed.id(), existing.id());
+    assert_eq!(observed.open_handle_count(), 1);
+    second_mount
+        .namespace()
+        .close_object(existing.id(), |_| Ok::<_, Infallible>(()))
+        .expect("a second mount must close the shared open count");
+    drop(first_mount);
+    assert_eq!(
+        second_mount.backing().canonical_root(),
+        repository.path(),
+        "a remaining mount must retain the shared backing root fd"
     );
 }
 

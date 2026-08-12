@@ -413,6 +413,25 @@ impl CapabilityState {
         self.authorization_epoch
     }
 
+    /// Returns whether this state still has exactly its constructor contents.
+    ///
+    /// Session adapters use this check before attaching an empty local manifest
+    /// to a kernel. Accepting a state that already issued an identity would let
+    /// the adapter forget permanent tombstones and later attempt to reuse them.
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.next_capability_sequence == Some(0)
+            && self.subjects.is_empty()
+            && self.subject_statuses.is_empty()
+            && self.capabilities.is_empty()
+            && self.held.is_empty()
+            && self.revoked.is_empty()
+            && self.issued_ids.is_empty()
+            && self.authorization_epoch == AuthorizationEpoch(0)
+            && self.open_handles.is_empty()
+            && self.issued_handle_owners.is_empty()
+    }
+
     /// Registers a subject before capabilities may be issued to it.
     ///
     /// # Errors
@@ -935,6 +954,19 @@ mod tests {
             state.allocate_capability_id(),
             Err(CapabilityStateError::CapabilityIdExhausted)
         );
+    }
+
+    #[test]
+    fn pristine_state_rejects_every_permanent_identity_transition() {
+        let issuer = IssuerId::new("session-issuer");
+        let mut state = CapabilityState::new(issuer);
+        assert!(state.is_pristine());
+
+        state
+            .allocate_capability_id()
+            .expect("first capability identity allocation must succeed");
+
+        assert!(!state.is_pristine());
     }
 
     // Requirement: an authorization epoch must never wrap to a stale value.

@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # mount ごとの node table
 
 [ドキュメント一覧](../README.md) / [capfs 実装ガイド](README.md) / mount ごとの node table
+
+> **対象読者:** FUSE adapter 実装者、nodeid 境界のレビュー担当者
 
 対象ファイルは [`crates/capfs/src/node.rs`](../../crates/capfs/src/node.rs) である。
 

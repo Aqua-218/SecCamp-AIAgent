@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # Broker session envelope
 
 [ドキュメント一覧](../README.md) / Broker session envelope
+
+> **対象読者:** Broker / transport 実装者、replay 防止のレビュー担当者
 
 このページは [`crates/egress-protocol/src/session.rs`](../../crates/egress-protocol/src/session.rs) が担当する、Host Egress Broker の replay 防止と request identity の境界を説明する。
 

@@ -1,6 +1,10 @@
+<!-- doc-type: verification -->
+
 # Authority core の検証とテスト
 
 [Authority core 実装ガイド](README.md) / 検証とテスト
+
+> **対象読者:** Authority core の実装者、レビュー担当者、共通 corpus を更新する人
 
 このページは、Rust の unit・状態遷移・property test、loom model、Lean executable example、Lean theorem、共通 corpus の差分テストがそれぞれ何を確認し、組み合わせると何が分かるかを説明する。プロジェクト全体の検証方針は[検証戦略](../design/verification.md)を参照する。
 

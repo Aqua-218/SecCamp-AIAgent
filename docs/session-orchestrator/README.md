@@ -1,3 +1,5 @@
+<!-- doc-type: index -->
+
 # Session orchestrator
 
 [ドキュメント一覧](../README.md) / Session orchestrator

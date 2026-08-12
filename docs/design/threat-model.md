@@ -1,6 +1,10 @@
+<!-- doc-type: design -->
+
 # 脅威モデル
 
 [設計書一覧](README.md) / 脅威モデル
+
+> **対象読者:** 設計者、セキュリティレビュー担当者
 
 ## 一番大事な前提
 
@@ -89,7 +93,7 @@ supervisor は TCB なので、侵害後も細粒度 Capability が守られる�
 
 symlink は、link 解決後の canonical target path で認可する後続機能として追加する。hard link は複数 path が同じ inode を共有するため、別の alias-aware な認可モデルまたは import 時の分離を必要とする。詳細は[capfs](capfs.md#symlink-は後続機能として追加する)を参照する。
 
-## 関連文書
+## 関連
 
 - [Capability モデル](capability-model.md)
 - [capfs](capfs.md)

@@ -1,3 +1,5 @@
+<!-- doc-type: contract -->
+
 # production backend 契約
 
 [Session orchestrator](README.md) / production backend 契約

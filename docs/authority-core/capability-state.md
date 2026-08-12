@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # Capability の発行と逐次状態機械
 
 [Authority core 実装ガイド](README.md) / Capability state
+
+> **対象読者:** Capability の発行・保持・revoke を実装する人
 
 このページは [`crates/authority-core/src/state.rs`](../../crates/authority-core/src/state.rs) が、Capability の発行、保持、委譲、失効をどの順序で検査するかを説明する。権限本体の包含と Lean の定理は [Capability envelope と委譲証明](capabilities.md)を参照する。
 

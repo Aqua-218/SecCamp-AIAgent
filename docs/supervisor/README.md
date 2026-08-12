@@ -1,3 +1,5 @@
+<!-- doc-type: index -->
+
 # Supervisor adapter
 
 [ドキュメント一覧](../README.md) / Supervisor adapter

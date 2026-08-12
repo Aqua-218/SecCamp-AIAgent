@@ -1,3 +1,5 @@
+<!-- doc-type: contract -->
+
 # transport 契約
 
 [Host Egress Broker](README.md) / transport 契約

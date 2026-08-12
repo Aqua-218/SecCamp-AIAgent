@@ -1,3 +1,5 @@
+<!-- doc-type: index -->
+
 # Host Egress Broker
 
 [ドキュメント一覧](../README.md) / Host Egress Broker

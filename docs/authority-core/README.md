@@ -1,3 +1,5 @@
+<!-- doc-type: index -->
+
 # Authority core 実装ガイド
 
 [ドキュメント一覧](../README.md) / Authority core 実装ガイド

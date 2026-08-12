@@ -1,6 +1,10 @@
+<!-- doc-type: design -->
+
 # 状態機械と revoke
 
 [設計書一覧](README.md) / 状態機械と revoke
+
+> **対象読者:** 設計者、revoke 経路を実装する人、並行境界のレビュー担当者
 
 revoke で難しいのは、「止めると決めた瞬間」と「副作用が実際に起きた瞬間」が別々に存在することだ。この設計では、両者を同じ lock の上に置いて順番を一意に決める。
 
@@ -156,7 +160,7 @@ Authority core の `begin_subject_close` は subject を `Closing` にして新�
 
 どちらもこの実装の正しさを自動的に証明するものではない。ここでは、派生 link を保存する理由と、権限変更を単調な縮小に限定する設計上の先例として参照している。
 
-## 関連文書
+## 関連
 
 - [Capability モデル](capability-model.md)
 - [Capability の発行と逐次状態機械](../authority-core/capability-state.md)

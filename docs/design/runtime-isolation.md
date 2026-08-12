@@ -1,6 +1,10 @@
+<!-- doc-type: design -->
+
 # 隔離基盤
 
 [設計書一覧](README.md) / 隔離基盤
+
+> **対象読者:** 隔離境界の設計者、runtime-isolation と Firecracker の実装者
 
 ここでは「同じ安全機構を何枚も重ねる」のではなく、各レイヤに違う仕事を持たせる。上のレイヤほど細かく判断し、下のレイヤほど大きな被害を止める。
 
@@ -100,7 +104,7 @@ sequenceDiagram
 
 同じ snapshot から複数 VM を起動すると、乱数や ID まで複製され得る。そこで snapshot にセッション固有状態を入れず、restore 後に VM / session / subject / Capability / request ID を作り直す。workspace block image も clone ごとに分ける。[Firecracker snapshot security](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md?plain=1)
 
-## 関連文書
+## 関連
 
 - [脅威モデル](threat-model.md)
 - [capfs](capfs.md)

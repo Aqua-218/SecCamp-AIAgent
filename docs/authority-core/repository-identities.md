@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # Repository identity
 
 [Authority core 実装ガイド](README.md) / Repository identity
+
+> **対象読者:** `RepoId` を扱う実装者、repository 境界のレビュー担当者
 
 このページは [`crates/authority-core/src/repository.rs`](../../crates/authority-core/src/repository.rs) と [`lean/Authority/Repository.lean`](../../lean/Authority/Repository.lean) が、repository の境界をどう表しているかを説明する。
 

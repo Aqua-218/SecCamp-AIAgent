@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # 有効期間と時刻窓の包含証明
 
 [Authority core 実装ガイド](README.md) / 有効期間
+
+> **対象読者:** 有効期間を扱う実装者、時刻境界のレビュー担当者
 
 このページは [`crates/authority-core/src/time.rs`](../../crates/authority-core/src/time.rs) と [`lean/Authority/Time.lean`](../../lean/Authority/Time.lean) が、Capability の有効期間をどう表し、子の期間が親からはみ出さないことをどう証明しているかを説明する。
 

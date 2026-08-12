@@ -1,6 +1,10 @@
+<!-- doc-type: design -->
+
 # Capability モデル
 
 [設計書一覧](README.md) / Capability モデル
+
+> **対象読者:** 設計者、Authority core 実装者、権限境界のレビュー担当者
 
 Capability は「この subject が、何に、どんな操作をしてよいか」を表す札である。札の中身は発行後に書き換えない。権限を狭めたいときは、親より弱い子を新しく発行する。
 
@@ -134,7 +138,7 @@ Authority には repository、host、操作、時刻を含める。`delegable` �
 - Capability は VM 再起動を跨いで持ち越さない。
 - 使用回数や累積 byte 数は別の消費予算にする。子を複数作って回数を水増しできるため、Authority の集合包含には混ぜない。
 
-## 関連文書
+## 関連
 
 - [状態機械と revoke](state-and-revocation.md)
 - [capfs](capfs.md)

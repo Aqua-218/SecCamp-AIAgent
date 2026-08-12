@@ -1,6 +1,10 @@
+<!-- doc-type: index -->
+
 # capfs 実装ガイド
 
 [ドキュメント一覧](../README.md) / capfs 実装ガイド
+
+> **対象読者:** capfs を触る実装者、並行境界のレビュー担当者
 
 この文書群は、`capfs` が filesystem operation を Capability 判定へ接続するための実装を説明する。設計上の判断は[capfs 設計](../design/capfs.md)を正とする。
 

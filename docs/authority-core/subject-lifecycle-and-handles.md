@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # Subject lifecycle と open handle
 
 [Authority core 実装ガイド](README.md) / Subject lifecycle と open handle
+
+> **対象読者:** subject の shutdown と open handle を触る実装者
 
 このページは [`crates/authority-core/src/state.rs`](../../crates/authority-core/src/state.rs) の subject lifecycle と、[`crates/authority-core/src/handle.rs`](../../crates/authority-core/src/handle.rs) の open-handle model を説明する。Capability の発行規則は[逐次状態機械](capability-state.md)、effect と shutdown の同期は[Authorization guard](authorization-guard.md)を参照する。
 

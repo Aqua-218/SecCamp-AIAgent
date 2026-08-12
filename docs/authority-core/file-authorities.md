@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # File authority と包含証明
 
 [Authority core 実装ガイド](README.md) / File authority
+
+> **対象読者:** file 権限の委譲判定を触る Rust/Lean 実装者、証明のレビュー担当者
 
 このページは [`crates/authority-core/src/file.rs`](../../crates/authority-core/src/file.rs) と [`lean/Authority/File.lean`](../../lean/Authority/File.lean) が、file request の認可と子権限への委譲をどう判定し、何を証明しているかを説明する。
 

@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # Direct-I/O FUSE adapter
 
 [ドキュメント一覧](../README.md) / [capfs 実装ガイド](README.md) / Direct-I/O FUSE adapter
+
+> **対象読者:** FUSE adapter 実装者、毎操作の再認可境界のレビュー担当者
 
 このページは、[`crates/capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs) と [`crates/capfs/src/runtime.rs`](../../crates/capfs/src/runtime.rs) が、Linuxから届くfilesystem requestをどのようにCapability判定と安全なbacking I/Oへ接続しているかを説明する。公開APIは[`capfs::filesystem`](../../crates/capfs/src/lib.rs)であり、実装file名の`read_only.rs`は初期sliceからの移行互換として残している。
 

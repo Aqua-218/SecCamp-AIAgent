@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # Backing repository の事前検証
 
 [capfs 実装ガイド](README.md) / Backing repository の事前検証
+
+> **対象読者:** startup 検査を触る実装者、mount / inode identity のレビュー担当者
 
 このページは [`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) が起動時に何を拒否し、それが path-based authority を実 filesystem へ接続するうえでどう役立つかを説明する。
 

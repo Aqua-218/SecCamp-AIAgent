@@ -1,6 +1,10 @@
+<!-- doc-type: design -->
+
 # 検証戦略
 
 [設計書一覧](README.md) / 検証戦略
+
+> **対象読者:** 設計者、test を書く実装者、検証範囲のレビュー担当者
 
 全部を1つの形式手法で証明しようとはしない。純粋関数、状態遷移、並行処理、Linux kernel との接続では、効く道具が違うからである。
 
@@ -155,7 +159,7 @@ mindmap
 
 TLA+ は使わない。分散 revoke、複数ホスト間の Capability 移送、複製された Broker state を導入した時点で、対象が変わったものとして再検討する。
 
-## 関連文書
+## 関連
 
 - [Capability モデル](capability-model.md)
 - [状態機械と revoke](state-and-revocation.md)

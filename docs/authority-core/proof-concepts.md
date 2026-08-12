@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # Authority core で使う証明の考え方
 
 [Authority core 実装ガイド](README.md) / 証明の考え方
+
+> **対象読者:** Lean の証明を初めて読む実装者、証明のレビュー担当者
 
 このページは Lean の構文解説ではなく、`Path.lean` と `File.lean` が何を根拠に安全性を示しているかを、実装の言葉に置き換えて説明する。
 

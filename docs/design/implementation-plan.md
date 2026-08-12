@@ -1,6 +1,10 @@
+<!-- doc-type: exempt -->
+
 # 実装順序
 
 [設計書一覧](README.md) / 実装順序
+
+> **対象読者:** 実装順序を決める人、進捗と未着手範囲を確認する人
 
 最初から microVM を起動しても、設計の難しい部分はほとんど検証できない。まず Authority、状態機械、`capfs` をホスト上で確定し、その後に runtime isolation、Broker、Firecracker、統合 adapter を接続する。
 
@@ -123,7 +127,7 @@ cargo test --manifest-path crates/session-orchestrator/Cargo.toml
 cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-targets -- -D warnings
 ```
 
-## 関連文書
+## 関連
 
 - [検証戦略](verification.md)
 - [capfs](capfs.md)

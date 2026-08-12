@@ -1,4 +1,8 @@
+<!-- doc-type: exempt -->
+
 # CI/CD Operations
+
+> **対象読者:** リポジトリ管理者、リリース担当者、pipeline を変更する人
 
 This repository ships equivalent, fail-closed delivery pipelines for GitHub Actions and GitLab CI. Both platforms execute the same repository-owned scripts so that a platform migration does not change the quality, security, or release contract.
 

@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # GitHub authority
 
 [Authority core 実装ガイド](README.md) / GitHub authority
+
+> **対象読者:** GitHub 操作の認可を触る実装者、Broker との責務境界のレビュー担当者
 
 このページは [`crates/authority-core/src/github.rs`](../../crates/authority-core/src/github.rs) と [`lean/Authority/GitHub.lean`](../../lean/Authority/GitHub.lean) が、認証付き GitHub 操作を任意 HTTP から切り離して表す方法を説明する。
 

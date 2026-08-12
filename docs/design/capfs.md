@@ -1,6 +1,10 @@
+<!-- doc-type: design -->
+
 # capfs
 
 [設計書一覧](README.md) / capfs
+
+> **対象読者:** filesystem 境界の設計者、capfs 実装者
 
 `capfs` を挟む理由は、Agent に専用のファイル API を覚えさせるためではない。Agent には普通に `open`、`read`、`write` させつつ、最後の実行地点で Capability を強制するためである。
 
@@ -202,7 +206,7 @@ backing ext4 は supervisor の mount namespace にしか置かない。操作�
 
 `capfs` が停止したら要求は `EIO` になる。Agent / Tool に backing への別経路はない。supervisor が停止した場合は VM セッションごと捨て、Capability を workspace から復元しない。
 
-## 関連文書
+## 関連
 
 - [状態機械と revoke](state-and-revocation.md)
 - [隔離基盤](runtime-isolation.md)

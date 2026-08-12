@@ -1,3 +1,5 @@
+<!-- doc-type: concept -->
+
 # GitHub 型付き adapter
 
 [Host Egress Broker](README.md) / GitHub 型付き adapter

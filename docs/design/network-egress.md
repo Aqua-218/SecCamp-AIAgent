@@ -1,6 +1,10 @@
+<!-- doc-type: design -->
+
 # ネットワークと外部副作用
 
 [設計書一覧](README.md) / ネットワークと外部副作用
+
+> **対象読者:** egress 境界の設計者、Broker 実装者
 
 「GitHub だけに通信できれば安全」という設計にはしない。Agent が調査や依存取得で公開 Web を読む場面は普通にある。一方で、生のネットワークを渡すと Capability Kernel を通らない副作用経路ができる。
 
@@ -109,7 +113,7 @@ request 回数、累積 byte、同時 fetch 数は Capability ではなく sessi
 
 `egress-protocol` の `SessionBudget` はこの3つを実装済みである。request を start した時点で count token と最大 response byte reservation を取り、complete では実 byte だけを累積値へ確定して未使用 reservation を返す。abort は byte reservation と concurrency slot だけを返し、既に始めた request の count token は戻さない。
 
-## 関連文書
+## 関連
 
 - [Capability モデル](capability-model.md)
 - [状態機械と revoke](state-and-revocation.md)

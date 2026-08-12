@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # Capability envelope と委譲証明
 
 [Authority core 実装ガイド](README.md) / Capability
+
+> **対象読者:** Capability envelope を扱う Rust/Lean 実装者、委譲判定のレビュー担当者
 
 このページは [`crates/authority-core/src/capability.rs`](../../crates/authority-core/src/capability.rs) と [`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) が、各 authority family を有効期間や発行情報と結び付け、Capability 全体の包含をどう判定・証明しているかを説明する。
 

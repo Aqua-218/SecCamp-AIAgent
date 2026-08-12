@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # Canonical Broker CBOR
 
 [ドキュメント一覧](../README.md) / Canonical Broker CBOR
+
+> **対象読者:** Broker / transport 実装者、wire 境界のレビュー担当者
 
 このページは [`crates/egress-protocol/src/cbor.rs`](../../crates/egress-protocol/src/cbor.rs) が担当する、Host Egress Broker の control payload schema を説明する。ここでいう canonical は「意味が同じなら同じ bytes」という都合のよい約束ではない。decoder 自身が、v1 schema の唯一の表現以外を拒否するという意味である。
 

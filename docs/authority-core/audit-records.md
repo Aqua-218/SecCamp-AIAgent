@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # Attempt / effect audit
 
 [Authority core 実装ガイド](README.md) / Attempt / effect audit
+
+> **対象読者:** 認可試行と effect の記録を実装する人、fail closed 境界のレビュー担当者
 
 このページは [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs)、[`crates/authority-core/src/durable_audit.rs`](../../crates/authority-core/src/durable_audit.rs)、および [`CapabilityKernel::authorize_and_commit`](../../crates/authority-core/src/kernel.rs) が、認可の試行と実際に commit した effect をどう区別して記録するか説明する。
 

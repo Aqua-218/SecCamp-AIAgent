@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # HTTP fetch authority
 
 [Authority core 実装ガイド](README.md) / HTTP fetch authority
+
+> **対象読者:** 公開 HTTPS 取得の認可を触る実装者、Broker との責務境界のレビュー担当者
 
 このページは [`crates/authority-core/src/http.rs`](../../crates/authority-core/src/http.rs) と [`lean/Authority/Http.lean`](../../lean/Authority/Http.lean) が、公開 HTTP 取得を file 権限とは別の authority としてどう表すかを説明する。
 

@@ -1,3 +1,5 @@
+<!-- doc-type: verification -->
+
 # 検証対応表
 
 [Host Egress Broker](README.md) / 検証対応表

@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # パスモデルと包含証明
 
 [Authority core 実装ガイド](README.md) / パスモデル
+
+> **対象読者:** path 判定を触る Rust/Lean 実装者、証明のレビュー担当者
 
 このページは [`crates/authority-core/src/path.rs`](../../crates/authority-core/src/path.rs) と [`lean/Authority/Path.lean`](../../lean/Authority/Path.lean) が、パスによる権限漏えいをどう防ぎ、その判定が仕様どおりであることをどう証明しているかを説明する。
 

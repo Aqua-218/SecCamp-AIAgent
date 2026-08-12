@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # 共有 namespace registry
 
 [capfs 実装ガイド](README.md) / 共有 namespace registry
+
+> **対象読者:** namespace registry を触る実装者、rename 競合のレビュー担当者
 
 このページは [`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) が何を守り、それが rename、revoke、open handle の競合を閉じるうえでどう役立つかを説明する。
 

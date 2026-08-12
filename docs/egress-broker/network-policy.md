@@ -1,3 +1,5 @@
+<!-- doc-type: concept -->
+
 # 公開 HTTPS policy
 
 [Host Egress Broker](README.md) / 公開 HTTPS policy

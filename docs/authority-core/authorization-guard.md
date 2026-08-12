@@ -1,6 +1,10 @@
+<!-- doc-type: concept -->
+
 # Effect commit と revoke の authorization guard
 
 [Authority core 実装ガイド](README.md) / Authorization guard
+
+> **対象読者:** 認可と effect commit の並行境界を触る実装者、loom test のレビュー担当者
 
 このページは [`crates/authority-core/src/kernel.rs`](../../crates/authority-core/src/kernel.rs) が、Capability の最終認可から外部 effect の線形化点までを revoke とどう競合させるか説明する。Capability の発行・保持・祖先失効は[逐次状態機械](capability-state.md)を参照する。
 

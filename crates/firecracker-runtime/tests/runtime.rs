@@ -133,6 +133,28 @@ impl FileSystem for MockFileSystem {
             .ok_or_else(|| RuntimeError::Io(format!("missing mock artifact {}", path.display())))
     }
 
+    fn verify_block_device_binding(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        let expected_source = Path::new("/dev/mapper/rootfs-verity");
+        let expected_jailed_device = Path::new(JAIL_ROOT).join("dev/rootfs");
+        if source != expected_source || jailed_device != expected_jailed_device {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "unexpected mock block-device binding: {} -> {}",
+                source.display(),
+                jailed_device.display()
+            )));
+        }
+        self.events.borrow_mut().push(format!(
+            "filesystem:verify-device:{}:{}",
+            source.display(),
+            jailed_device.display()
+        ));
+        Ok(())
+    }
+
     fn clone_workspace(&mut self, source: &Path, destination: &Path) -> Result<(), RuntimeError> {
         self.events.borrow_mut().push(format!(
             "filesystem:clone:{}:{}",
@@ -409,12 +431,13 @@ fn launch_valid_profile_configures_verity_vsock_and_jailer_without_network() {
     let events = events.borrow();
     assert!(events[0].starts_with("filesystem:clone:"));
     assert!(events[1].starts_with("command:run:veritysetup open --readonly"));
-    assert!(events[2].contains("--new-pid-ns"));
-    assert!(events[2].contains("--uid 1000 --gid 1000 --cgroup-version 2"));
-    assert!(events[2].contains("--cgroup memory.max=268435456"));
-    assert!(events[2].contains("--cgroup cpu.max=100000 100000"));
-    assert!(events[2].contains("--chroot-base-dir /srv/jailer"));
-    assert!(!events[2].contains("--new-user-ns"));
+    assert!(events[2].starts_with("filesystem:verify-device:"));
+    assert!(events[3].contains("--new-pid-ns"));
+    assert!(events[3].contains("--uid 1000 --gid 1000 --cgroup-version 2"));
+    assert!(events[3].contains("--cgroup memory.max=268435456"));
+    assert!(events[3].contains("--cgroup cpu.max=100000 100000"));
+    assert!(events[3].contains("--chroot-base-dir /srv/jailer"));
+    assert!(!events[3].contains("--new-user-ns"));
     assert!(events.iter().any(|event| event.starts_with("api:/vsock:")));
     assert!(
         events
@@ -463,15 +486,16 @@ fn api_error_rolls_back_process_verity_and_workspace_in_reverse_order() {
         .expect_err("non-success API response must reject launch");
     assert!(matches!(error, RuntimeError::ApiStatus { status: 503, .. }));
     let events = events.borrow();
-    assert_eq!(events.len(), 8);
+    assert_eq!(events.len(), 9);
     assert!(events[0].starts_with("filesystem:clone:"));
     assert!(events[1].starts_with("command:run:veritysetup open"));
-    assert!(events[2].starts_with("command:start:"));
-    assert!(events[3].starts_with("api:/machine-config:"));
-    assert!(events[4].starts_with("api:/boot-source:"));
-    assert!(events[5].starts_with("command:stop:"));
-    assert!(events[6].starts_with("command:run:veritysetup close"));
-    assert!(events[7].starts_with("filesystem:remove:"));
+    assert!(events[2].starts_with("filesystem:verify-device:"));
+    assert!(events[3].starts_with("command:start:"));
+    assert!(events[4].starts_with("api:/machine-config:"));
+    assert!(events[5].starts_with("api:/boot-source:"));
+    assert!(events[6].starts_with("command:stop:"));
+    assert!(events[7].starts_with("command:run:veritysetup close"));
+    assert!(events[8].starts_with("filesystem:remove:"));
 }
 
 #[test]

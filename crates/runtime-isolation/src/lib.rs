@@ -131,7 +131,13 @@ mod tests {
         backend.fail_at = Some(IsolationStep::Landlock);
 
         let error = apply(&mut backend, &test_config()).expect_err("failure must propagate");
-        assert!(matches!(error, IsolationError::Backend(_)));
+        assert!(matches!(
+            error,
+            IsolationError::TerminationRequired {
+                failures,
+                ..
+            } if failures.is_empty()
+        ));
         assert_eq!(
             backend.rollbacks,
             vec![

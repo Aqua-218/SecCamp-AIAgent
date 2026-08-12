@@ -9,7 +9,15 @@ use authority_core::{
         AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId, weaker_than,
     },
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
+    github::{
+        BranchName, BranchPattern, GitHubAuthority, GitHubOperation, GitHubOperations,
+        GitHubRequest, InstallationId,
+    },
     handle::{HandleId, ObjectId, OpenHandle},
+    http::{
+        CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethod, HttpFetchMethods,
+        HttpFetchRequest, UrlPathPattern,
+    },
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     state::{
@@ -150,6 +158,58 @@ fn read_request(ticks: u64, segments: &[&str]) -> CapabilityRequest {
             RepoId::new("workspace"),
             FileEffect::ReadData,
             path(segments),
+        )),
+    )
+}
+
+fn http_authority(
+    methods: HttpFetchMethods,
+    path: UrlPathPattern,
+    max_bytes: u64,
+) -> AuthorityBody {
+    AuthorityBody::HttpFetch(HttpFetchAuthority::new(
+        methods,
+        CanonicalHost::new("docs.example").expect("test host must be valid"),
+        path,
+        max_bytes,
+    ))
+}
+
+fn http_request(ticks: u64, path: &str) -> CapabilityRequest {
+    CapabilityRequest::new(
+        time(ticks),
+        AuthorityRequest::HttpFetch(HttpFetchRequest::new(
+            HttpFetchMethod::Get,
+            CanonicalHost::new("docs.example").expect("test host must be valid"),
+            CanonicalUrlPath::new(path).expect("test URL path must be valid"),
+            1_024,
+        )),
+    )
+}
+
+fn branch(value: &str) -> BranchName {
+    BranchName::new(value).expect("test branch must be valid")
+}
+
+fn github_authority(operations: GitHubOperations, head: BranchPattern) -> AuthorityBody {
+    AuthorityBody::GitHub(GitHubAuthority::new(
+        InstallationId::new("installation-a"),
+        RepoId::new("github.example/acme/workspace"),
+        operations,
+        BranchPattern::Exact(branch("main")),
+        head,
+    ))
+}
+
+fn github_request(ticks: u64, operation: GitHubOperation, head: &str) -> CapabilityRequest {
+    CapabilityRequest::new(
+        time(ticks),
+        AuthorityRequest::GitHub(GitHubRequest::new(
+            InstallationId::new("installation-a"),
+            RepoId::new("github.example/acme/workspace"),
+            operation,
+            branch("main"),
+            branch(head),
         )),
     )
 }
@@ -665,4 +725,112 @@ fn open_handle_registry_rejects_reuse_and_blocks_early_subject_close() {
         state.close_handle(&root_subject_id(), &unknown),
         Err(CapabilityStateError::UnknownHandle(unknown))
     );
+}
+
+// Requirement: each tagged authority family must retain the same issuance,
+// derivation, authorization, and revoke guarantees as file authority.
+// Category: state/security. Risk: critical.
+#[test]
+fn service_authorities_follow_the_same_lifecycle_rules() {
+    let http_parent = http_authority(
+        HttpFetchMethods::from_methods([HttpFetchMethod::Get, HttpFetchMethod::Head]),
+        UrlPathPattern::Prefix(
+            CanonicalUrlPath::new("/guide").expect("test URL path must be valid"),
+        ),
+        4_096,
+    );
+    let http_child = http_authority(
+        HttpFetchMethods::only(HttpFetchMethod::Get),
+        UrlPathPattern::Exact(
+            CanonicalUrlPath::new("/guide/start").expect("test URL path must be valid"),
+        ),
+        1_024,
+    );
+    let mut http_state = CapabilityState::new(IssuerId::new("http-issuer"));
+    http_state
+        .register_subject(Subject::new(
+            root_subject_id(),
+            StaticAuthorityEnvelope::new(window(0, 100), http_parent.clone()),
+        ))
+        .expect("HTTP subject registration must succeed");
+    let http_root = http_state
+        .issue_root(
+            CapabilityGrant::new(root_subject_id(), window(10, 90), http_parent)
+                .with_delegable(true),
+        )
+        .expect("HTTP root issuance must succeed");
+    let http_child_id = http_state
+        .derive(
+            &root_subject_id(),
+            &http_root,
+            CapabilityGrant::new(root_subject_id(), window(20, 80), http_child),
+            time(25),
+        )
+        .expect("narrow HTTP child derivation must succeed");
+    assert!(http_state.authorizes(
+        &root_subject_id(),
+        &http_child_id,
+        &http_request(30, "/guide/start"),
+    ));
+    assert_eq!(
+        http_state.revoke(&http_root),
+        Ok(RevocationStatus::NewlyRevoked)
+    );
+    assert!(!http_state.authorizes(
+        &root_subject_id(),
+        &http_child_id,
+        &http_request(30, "/guide/start"),
+    ));
+
+    let github_parent = github_authority(
+        GitHubOperations::from_operations([
+            GitHubOperation::PublishBranch,
+            GitHubOperation::CreatePullRequest,
+        ]),
+        BranchPattern::Prefix(branch("agents")),
+    );
+    let github_child = github_authority(
+        GitHubOperations::only(GitHubOperation::CreatePullRequest),
+        BranchPattern::Exact(branch("agents/fix")),
+    );
+    let mut github_state = CapabilityState::new(IssuerId::new("github-issuer"));
+    github_state
+        .register_subject(Subject::new(
+            root_subject_id(),
+            StaticAuthorityEnvelope::new(window(0, 100), github_parent.clone()),
+        ))
+        .expect("GitHub subject registration must succeed");
+    let github_root = github_state
+        .issue_root(
+            CapabilityGrant::new(root_subject_id(), window(10, 90), github_parent)
+                .with_delegable(true),
+        )
+        .expect("GitHub root issuance must succeed");
+    let github_child_id = github_state
+        .derive(
+            &root_subject_id(),
+            &github_root,
+            CapabilityGrant::new(root_subject_id(), window(20, 80), github_child),
+            time(25),
+        )
+        .expect("narrow GitHub child derivation must succeed");
+    assert!(github_state.authorizes(
+        &root_subject_id(),
+        &github_child_id,
+        &github_request(30, GitHubOperation::CreatePullRequest, "agents/fix"),
+    ));
+    assert!(!github_state.authorizes(
+        &root_subject_id(),
+        &github_child_id,
+        &github_request(30, GitHubOperation::PublishBranch, "agents/fix"),
+    ));
+    assert_eq!(
+        github_state.revoke(&github_child_id),
+        Ok(RevocationStatus::NewlyRevoked)
+    );
+    assert!(!github_state.authorizes(
+        &root_subject_id(),
+        &github_child_id,
+        &github_request(30, GitHubOperation::CreatePullRequest, "agents/fix"),
+    ));
 }

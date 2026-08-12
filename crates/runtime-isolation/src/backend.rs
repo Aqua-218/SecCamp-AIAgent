@@ -93,6 +93,26 @@ impl fmt::Display for IsolationStep {
     }
 }
 
+impl IsolationStep {
+    const fn is_irreversible(self) -> bool {
+        match self {
+            Self::Namespaces
+            | Self::IdentityMap
+            | Self::ReadOnlyRootfs
+            | Self::CloseInheritedFileDescriptors
+            | Self::Landlock
+            | Self::DropCapabilities
+            | Self::NoNewPrivs
+            | Self::Seccomp => true,
+            Self::CgroupV2
+            | Self::Workspace
+            | Self::LimitedTmpfs
+            | Self::MaskProc
+            | Self::MaskDevices => false,
+        }
+    }
+}
+
 /// Non-mutating host capability detection output.
 #[derive(Clone, Debug)]
 pub struct CapabilityReport {
@@ -163,6 +183,16 @@ pub enum IsolationError {
         /// Rollback failures, in reverse completion order.
         failures: Vec<BackendError>,
     },
+    /// Applying an irreversible step may have partially changed process state.
+    ///
+    /// The caller must terminate the process because this coordinator has no
+    /// process handle with which to enforce that obligation.
+    TerminationRequired {
+        /// The operation that caused the transaction to stop.
+        original: BackendError,
+        /// Rollback failures, in reverse completion order.
+        failures: Vec<BackendError>,
+    },
     /// A network, namespace, or other forbidden syscall was requested.
     ForbiddenSyscall(Syscall),
     /// A syscall has no verified number on this target architecture.
@@ -184,6 +214,12 @@ impl fmt::Display for IsolationError {
             Self::Rollback { original, failures } => write!(
                 formatter,
                 "{}; rollback failed for {} completed step(s)",
+                original,
+                failures.len()
+            ),
+            Self::TerminationRequired { original, failures } => write!(
+                formatter,
+                "{}; process termination is required after irreversible isolation setup ({} rollback failure(s))",
                 original,
                 failures.len()
             ),
@@ -258,6 +294,14 @@ impl RuntimeIsolation {
             match backend.apply_step(step, config) {
                 Ok(()) => completed.push(step),
                 Err(original) => {
+                    // A failed backend call may have applied only part of its
+                    // operation, so attempting an irreversible step is enough
+                    // to make reuse of this process unsafe.
+                    let termination_required = step.is_irreversible()
+                        || completed
+                            .iter()
+                            .copied()
+                            .any(IsolationStep::is_irreversible);
                     let failures = completed
                         .iter()
                         .rev()
@@ -265,7 +309,9 @@ impl RuntimeIsolation {
                             backend.rollback_step(*completed_step, config).err()
                         })
                         .collect::<Vec<_>>();
-                    return if failures.is_empty() {
+                    return if termination_required {
+                        Err(IsolationError::TerminationRequired { original, failures })
+                    } else if failures.is_empty() {
                         Err(IsolationError::Backend(original))
                     } else {
                         Err(IsolationError::Rollback { original, failures })
@@ -301,4 +347,19 @@ fn required_steps() -> [IsolationStep; 13] {
         IsolationStep::NoNewPrivs,
         IsolationStep::Seccomp,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IsolationStep;
+
+    #[test]
+    fn irreversible_apply_attempt_requires_process_termination() {
+        assert!(IsolationStep::Landlock.is_irreversible());
+    }
+
+    #[test]
+    fn reversible_apply_attempt_does_not_itself_require_process_termination() {
+        assert!(!IsolationStep::Workspace.is_irreversible());
+    }
 }

@@ -25,6 +25,28 @@ theorem CanIncrementU64.increment_fits {value : Nat}
     (canIncrement : CanIncrementU64 value) : FitsU64 (value + 1) := by
   exact canIncrement
 
+/-- Use the current `u64` value once, then either advance or become exhausted. -/
+def advanceU64 (value : Nat) : Nat × Bool :=
+  if value < u64Maximum then (value + 1, false) else (value, true)
+
+/-- A representable counter remains representable after its final usable value. -/
+theorem advanceU64_value_fits {value : Nat} (fits : FitsU64 value) :
+    FitsU64 (advanceU64 value).1 := by
+  simp only [advanceU64]
+  split
+  · exact CanIncrementU64.increment_fits (by assumption)
+  · exact fits
+
+/-- Checked advancement never moves a logical counter backwards. -/
+theorem advanceU64_value_monotone (value : Nat) :
+    value ≤ (advanceU64 value).1 := by
+  simp [advanceU64]
+  split <;> omega
+
+/-- `u64::MAX` remains the last value and marks its allocator exhausted. -/
+theorem advanceU64_maximum : advanceU64 u64Maximum = (u64Maximum, true) := by
+  simp [advanceU64]
+
 /-- Externally supplied capability identities must not use the empty sentinel. -/
 def ValidCapabilityId (capabilityId : CapId) : Prop := capabilityId.value ≠ ""
 
@@ -168,6 +190,8 @@ structure CapabilityGrant where
 /-- The abstract sequential state protected by the Rust kernel lock. -/
 structure CapabilityState where
   issuer : IssuerId
+  nextCapabilitySequence : Nat
+  capabilityIdsExhausted : Bool
   subjects : SubjectId → Option Subject
   subjectStatuses : SubjectId → Option SubjectStatus
   capabilities : CapId → Option Capability
@@ -182,6 +206,8 @@ namespace CapabilityState
 /-- Empty state for one session-local issuer. -/
 def empty (issuer : IssuerId) : CapabilityState where
   issuer := issuer
+  nextCapabilitySequence := 0
+  capabilityIdsExhausted := false
   subjects := fun _ => none
   subjectStatuses := fun _ => none
   capabilities := fun _ => none
@@ -440,6 +466,10 @@ structure MayIssueRoot (state : CapabilityState) (capabilityId : CapId)
   grantInsideEnvelope :
     targetSubject.envelope.contains grant.validity grant.authority = true
 
+/-- Capability identity produced by Rust's issuer-scoped sequential allocator. -/
+def sequentialCapabilityId (state : CapabilityState) (sequence : Nat) : CapId :=
+  { value := s!"{state.issuer.value}:{sequence}" }
+
 /-- Every accepted root grant is semantically inside its immutable ceiling. -/
 theorem MayIssueRoot.grant_semantically_inside_envelope {state : CapabilityState}
     {capabilityId : CapId} {grant : CapabilityGrant}
@@ -455,6 +485,59 @@ def issue (state : CapabilityState) (capabilityId : CapId)
       (some (state.capabilityFromGrant capabilityId parent grant))
     held := replace state.held grant.subject
       (replace (state.held grant.subject) capabilityId true) }
+
+/-- Successful search result of the Rust sequential capability-ID allocator. -/
+structure MayAllocate (state : CapabilityState) (parent : Option CapId)
+    (grant : CapabilityGrant) where
+  selectedSequence : Nat
+  allocatorAvailable : state.capabilityIdsExhausted = false
+  cursorRepresentable : FitsU64 state.nextCapabilitySequence
+  selectedRepresentable : FitsU64 selectedSequence
+  cursorNotAfterSelected : state.nextCapabilitySequence ≤ selectedSequence
+  skippedAlreadyIssued : ∀ sequence,
+    state.nextCapabilitySequence ≤ sequence → sequence < selectedSequence →
+      state.WasIssued (state.sequentialCapabilityId sequence)
+  fresh : state.capabilities (state.sequentialCapabilityId selectedSequence) = none
+
+/-- Sequential allocator evidence specialized to validated root issuance. -/
+structure MayAllocateRoot (state : CapabilityState) (grant : CapabilityGrant) where
+  allocation : MayAllocate state none grant
+  issueAllowed : MayIssueRoot state
+    (state.sequentialCapabilityId allocation.selectedSequence) grant
+
+/-- Issue the first fresh sequential identity and advance or exhaust the cursor. -/
+def allocateRoot (state : CapabilityState) (grant : CapabilityGrant)
+    (selectedSequence : Nat) : CapabilityState :=
+  { state.issue (state.sequentialCapabilityId selectedSequence) none grant with
+    nextCapabilitySequence := (advanceU64 selectedSequence).1
+    capabilityIdsExhausted := (advanceU64 selectedSequence).2 }
+
+/-- Issue a derived capability using the same sequential allocator. -/
+def allocateDerived (state : CapabilityState) (parentId : CapId)
+    (grant : CapabilityGrant) (selectedSequence : Nat) : CapabilityState :=
+  { state.issue (state.sequentialCapabilityId selectedSequence)
+      (some parentId) grant with
+    nextCapabilitySequence := (advanceU64 selectedSequence).1
+    capabilityIdsExhausted := (advanceU64 selectedSequence).2 }
+
+/-- `u64::MAX` can be issued exactly once before the allocator becomes exhausted. -/
+theorem allocateRoot_at_maximum_exhausts {state : CapabilityState}
+    {grant : CapabilityGrant} (allowed : MayAllocateRoot state grant)
+    (atMaximum : allowed.allocation.selectedSequence = u64Maximum) :
+    (state.allocateRoot grant allowed.allocation.selectedSequence).nextCapabilitySequence =
+        u64Maximum ∧
+      (state.allocateRoot grant allowed.allocation.selectedSequence).capabilityIdsExhausted = true := by
+  simp [allocateRoot, atMaximum, advanceU64_maximum]
+
+/-- An exhausted sequential allocator accepts no later allocation result. -/
+theorem exhausted_rejects_allocation {state : CapabilityState}
+    {parent : Option CapId} {grant : CapabilityGrant}
+    (exhausted : state.capabilityIdsExhausted = true) :
+    ∀ _allowed : MayAllocate state parent grant, False := by
+  intro allowed
+  have available := allowed.allocatorAvailable
+  rw [exhausted] at available
+  contradiction
 
 /-- The newly issued identity resolves to its exact record. -/
 theorem issue_stores_exact_capability (state : CapabilityState)
@@ -516,6 +599,13 @@ structure MayDerive (state : CapabilityState) (caller : SubjectId)
   targetRunning : state.subjectStatuses grant.subject = some .running
   grantInsideEnvelope :
     targetSubject.envelope.contains grant.validity grant.authority = true
+
+/-- Sequential allocator evidence specialized to one validated derivation. -/
+structure MayAllocateDerived (state : CapabilityState) (caller : SubjectId)
+    (parentId : CapId) (grant : CapabilityGrant) (now : MonotonicTime) where
+  allocation : MayAllocate state (some parentId) grant
+  deriveAllowed : MayDerive state caller parentId
+    (state.sequentialCapabilityId allocation.selectedSequence) grant now
 
 /-- A validated derived record is structurally no stronger than its parent. -/
 theorem MayDerive.child_weakerThan_parent {state : CapabilityState}
@@ -774,10 +864,14 @@ inductive Step : CapabilityState → CapabilityState → Prop
       {grant : CapabilityGrant} :
       MayIssueRoot state capabilityId grant →
       Step state (state.issue capabilityId none grant)
+  | issueAllocatedRoot {state : CapabilityState} {grant : CapabilityGrant} :
+      (allowed : MayAllocateRoot state grant) →
+      Step state (state.allocateRoot grant allowed.allocation.selectedSequence)
   | derive {state : CapabilityState} {caller : SubjectId}
-      {parentId childId : CapId} {grant : CapabilityGrant} {now : MonotonicTime} :
-      MayDerive state caller parentId childId grant now →
-      Step state (state.issue childId (some parentId) grant)
+      {parentId : CapId} {grant : CapabilityGrant} {now : MonotonicTime} :
+      (allowed : MayAllocateDerived state caller parentId grant now) →
+      Step state (state.allocateDerived parentId grant
+        allowed.allocation.selectedSequence)
   | revoke {state : CapabilityState} {capabilityId : CapId} :
       state.WasIssued capabilityId → state.revoked capabilityId = false →
       CanIncrementU64 state.authorizationEpoch →
@@ -808,6 +902,7 @@ theorem Step.epoch_monotone {before after : CapabilityState}
   cases transition with
   | registerSubject => exact Nat.le_refl _
   | issueRoot => exact Nat.le_refl _
+  | issueAllocatedRoot => exact Nat.le_refl _
   | derive => exact Nat.le_refl _
   | revoke => exact Nat.le_succ _
   | beginClose => exact Nat.le_succ _
@@ -818,7 +913,7 @@ theorem Step.epoch_monotone {before after : CapabilityState}
 
 /-- Every machine counter is representable by the corresponding Rust type. -/
 def CountersRepresentable (state : CapabilityState) : Prop :=
-  FitsU64 state.authorizationEpoch
+  FitsU64 state.authorizationEpoch ∧ FitsU64 state.nextCapabilitySequence
 
 /-- The empty capability state has a representable authorization epoch. -/
 theorem empty_countersRepresentable (issuer : IssuerId) :
@@ -831,9 +926,15 @@ theorem Step.preserves_countersRepresentable {before after : CapabilityState}
     (representable : before.CountersRepresentable) :
     after.CountersRepresentable := by
   cases transition with
-  | revoke _ _ canIncrement => exact canIncrement.increment_fits
-  | beginClose _ canIncrement => exact canIncrement.increment_fits
-  | registerSubject | issueRoot | derive | finishClose | registerHandle |
+  | revoke _ _ canIncrement => exact ⟨canIncrement.increment_fits, representable.2⟩
+  | beginClose _ canIncrement => exact ⟨canIncrement.increment_fits, representable.2⟩
+  | issueAllocatedRoot allowed =>
+      exact ⟨representable.1,
+        advanceU64_value_fits allowed.allocation.selectedRepresentable⟩
+  | derive allowed =>
+      exact ⟨representable.1,
+        advanceU64_value_fits allowed.allocation.selectedRepresentable⟩
+  | registerSubject | issueRoot | finishClose | registerHandle |
       closeHandle | successfulNoop => exact representable
 
 /-- Accepted transitions never remove an issued capability record. -/
@@ -853,16 +954,31 @@ theorem Step.capability_records_persist {before after : CapabilityState}
         cases freshness
       simp [issue, replace, differentIds]
       exact lookupBefore
-  | derive allowed =>
-      rename_i caller parentId issuedId grant now
-      have differentIds : capabilityId ≠ issuedId := by
+  | issueAllocatedRoot allowed =>
+      have differentIds : capabilityId ≠
+          before.sequentialCapabilityId allowed.allocation.selectedSequence := by
         intro sameIdentity
-        subst capabilityId
-        have freshness := allowed.childFresh
-        rw [lookupBefore] at freshness
-        cases freshness
-      simp [issue, replace, differentIds]
-      exact lookupBefore
+        have selectedLookup : before.capabilities
+            (before.sequentialCapabilityId allowed.allocation.selectedSequence) = some record := by
+          rw [← sameIdentity]
+          exact lookupBefore
+        have fresh := allowed.issueAllowed.capabilityFresh
+        rw [selectedLookup] at fresh
+        contradiction
+      simpa [allocateRoot, issue, replace, differentIds] using lookupBefore
+  | derive allowed =>
+      rename_i caller parentId grant now
+      have differentIds : capabilityId ≠
+          before.sequentialCapabilityId allowed.allocation.selectedSequence := by
+        intro sameIdentity
+        have selectedLookup : before.capabilities
+            (before.sequentialCapabilityId allowed.allocation.selectedSequence) = some record := by
+          rw [← sameIdentity]
+          exact lookupBefore
+        have fresh := allowed.allocation.fresh
+        rw [selectedLookup] at fresh
+        contradiction
+      simpa [allocateDerived, issue, replace, differentIds] using lookupBefore
   | revoke _ _ => exact lookupBefore
   | beginClose _ => exact lookupBefore
   | finishClose _ _ => exact lookupBefore
@@ -877,7 +993,11 @@ theorem Step.graphWellFormed {before after : CapabilityState}
   cases transition with
   | registerSubject => exact wellFormed
   | issueRoot allowed => exact allowed.preserves_graphWellFormed wellFormed
-  | derive allowed => exact allowed.preserves_graphWellFormed wellFormed
+  | issueAllocatedRoot allowed =>
+      exact allowed.issueAllowed.preserves_graphWellFormed wellFormed
+  | derive allowed =>
+      simpa [allocateDerived] using
+        allowed.deriveAllowed.preserves_graphWellFormed wellFormed
   | revoke | beginClose | finishClose | registerHandle | closeHandle |
       successfulNoop => exact wellFormed
 
@@ -889,6 +1009,7 @@ theorem Step.revocation_monotone {before after : CapabilityState}
   cases transition with
   | registerSubject _ => exact revokedBefore
   | issueRoot _ => exact revokedBefore
+  | issueAllocatedRoot _ => exact revokedBefore
   | derive _ => exact revokedBefore
   | revoke => exact revoke_is_monotone _ _ _ revokedBefore
   | beginClose => exact beginSubjectClose_preserves_revocation _ _ _ revokedBefore
@@ -905,6 +1026,7 @@ theorem Step.handle_identity_persists {before after : CapabilityState}
   cases transition with
   | registerSubject _ => exact ownerBefore
   | issueRoot _ => exact ownerBefore
+  | issueAllocatedRoot _ => exact ownerBefore
   | derive _ => exact ownerBefore
   | revoke _ _ => exact ownerBefore
   | beginClose _ => exact ownerBefore
@@ -927,7 +1049,14 @@ theorem Step.holdings_persist {before after : CapabilityState}
   | registerSubject allowed =>
       exact registerSubject_preserves_holding allowed heldBefore
   | issueRoot => exact issue_preserves_holding _ _ _ _ heldBefore
-  | derive => exact issue_preserves_holding _ _ _ _ heldBefore
+  | issueAllocatedRoot allowed =>
+      simpa [allocateRoot] using issue_preserves_holding before
+        (before.sequentialCapabilityId allowed.allocation.selectedSequence) none _ heldBefore
+  | derive allowed =>
+      rename_i caller parentId grant now
+      simpa [allocateDerived] using issue_preserves_holding before
+        (before.sequentialCapabilityId allowed.allocation.selectedSequence)
+        (some parentId) grant heldBefore
   | revoke => exact heldBefore
   | beginClose => exact heldBefore
   | finishClose => exact heldBefore
@@ -944,6 +1073,7 @@ theorem Step.closed_subject_remains_closed {before after : CapabilityState}
   | registerSubject allowed =>
       exact registerSubject_preserves_closed allowed closedBefore
   | issueRoot => exact closedBefore
+  | issueAllocatedRoot => exact closedBefore
   | derive => exact closedBefore
   | revoke => exact closedBefore
   | beginClose runningBefore =>
@@ -981,7 +1111,7 @@ theorem Step.closed_handle_stays_closed {before after : CapabilityState}
     (closed : before.openHandles handleId = none) :
     after.openHandles handleId = none := by
   cases transition with
-  | registerSubject | issueRoot | derive | revoke | beginClose | finishClose |
+  | registerSubject | issueRoot | issueAllocatedRoot | derive | revoke | beginClose | finishClose |
       successfulNoop => exact closed
   | registerHandle running fresh =>
       rename_i handle

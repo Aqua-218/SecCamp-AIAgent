@@ -1,0 +1,51 @@
+workflow:
+  name: "$CI_COMMIT_REF_NAME / $CI_PIPELINE_SOURCE"
+  auto_cancel:
+    on_new_commit: interruptible
+    on_job_failure: none
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "api"
+
+include:
+  - local: .gitlab/ci/common.yml
+  - local: .gitlab/ci/validate.yml
+  - local: .gitlab/ci/test.yml
+  - local: .gitlab/ci/security.yml
+  - local: .gitlab/ci/release.yml
+
+stages:
+  - validate
+  - test
+  - analyze
+  - security
+  - package
+  - verify
+  - publish
+  - release
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+  GIT_DEPTH: "50"
+  RUST_BACKTRACE: "1"
+  FF_USE_FASTZIP: "true"
+  ARTIFACT_COMPRESSION_LEVEL: fast
+  CACHE_COMPRESSION_LEVEL: fast
+
+default:
+  image: docker.io/library/rust:1.93.1-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31
+  timeout: 30m
+  interruptible: true
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - scheduler_failure

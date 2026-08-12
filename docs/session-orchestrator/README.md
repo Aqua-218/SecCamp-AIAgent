@@ -8,6 +8,64 @@
 
 `session-orchestrator` は、隔離された一つの agent session のホスト側 lifecycle state machine である。resource の確保順序と identity binding を所有し、Authority Core、Broker listener、Firecracker runtime、workspace の production adapter を提供する。FUSE mount、provider request、特権 isolation の具体的な副作用は、それぞれの専用 adapter が所有する。
 
+## crate の構造
+
+```mermaid
+flowchart TB
+    host["host の運用"]
+
+    subgraph so["session-orchestrator（host 側）"]
+        direction TB
+        sm["SessionOrchestrator<br/>5 stage の取得と逆順解放<br/>Ready / Running / Stopping / Closed"]
+        ident["allocate_session_identity<br/>128-bit × 7"]
+        ledger["IdentityLedger<br/>no-reuse ledger"]
+        val["validate_*<br/>lease の identity 照合"]
+    end
+
+    wsb{{"WorkspaceBackend"}}
+    brb{{"BrokerBackend"}}
+    vmb{{"VmBackend / WorkloadBackend"}}
+    capb{{"CapabilityBackend"}}
+    rnd{{"CryptographicRandom"}}
+
+    fr["firecracker-runtime"]
+    eb["egress-broker"]
+    ac["authority-core"]
+    file[("durable ledger file<br/>+ .lock")]
+    urandom[("/dev/urandom")]
+
+    host ==> sm
+    sm --> ident
+    ident --> rnd
+    ident --> ledger
+    ledger ==> file
+    rnd ==> urandom
+    sm --> wsb
+    sm --> brb
+    sm --> vmb
+    sm --> capb
+    wsb --> fr
+    vmb --> fr
+    brb --> eb
+    capb --> ac
+    wsb -.-> val
+    brb -.-> val
+    vmb -.-> val
+    capb -.-> val
+    val -.->|"不一致なら次の stage へ進まない"| sm
+
+    classDef host fill:#1565c0,color:#fff,stroke:#0d47a1;
+    classDef seam fill:#6a1b9a,color:#fff,stroke:#4a148c;
+    classDef data fill:#ef6c00,color:#fff,stroke:#e65100;
+    classDef external fill:#616161,color:#fff,stroke:#424242;
+    class so,sm,ident,ledger,val host;
+    class wsb,brb,vmb,capb,rnd seam;
+    class fr,eb,ac,host external;
+    class file,urandom data;
+```
+
+この crate が直接触る I/O は ledger file と `/dev/urandom` だけ。残りは全部 trait 越しで、紫の継ぎ目に test の fake が入る。
+
 ## 文書一覧
 
 | 文書 | 対象ソース | 内容 |

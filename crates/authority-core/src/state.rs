@@ -260,6 +260,13 @@ pub enum CapabilityStateError {
     },
     /// A transition refers to a capability that was never issued.
     UnknownCapability(CapId),
+    /// A subject tried to revoke a capability it does not hold.
+    CapabilityNotHeld {
+        /// The authenticated caller.
+        caller: SubjectId,
+        /// The capability the caller tried to revoke.
+        capability: CapId,
+    },
     /// A trusted host supplied an empty capability identity.
     InvalidCapabilityId(CapId),
     /// A capability identity was already issued earlier in this session.
@@ -324,6 +331,10 @@ impl fmt::Display for CapabilityStateError {
                     "capability `{capability}` was not issued by this state"
                 )
             }
+            Self::CapabilityNotHeld { caller, capability } => write!(
+                formatter,
+                "subject `{caller}` does not hold capability `{capability}`"
+            ),
             Self::InvalidCapabilityId(capability) => {
                 write!(formatter, "capability ID `{capability}` is invalid")
             }
@@ -673,17 +684,38 @@ impl CapabilityState {
             return Err(CapabilityStateError::UnknownCapability(capability.clone()));
         }
 
-        if self.revoked.contains(capability) {
-            return Ok(RevocationStatus::AlreadyRevoked);
+        self.revoke_existing(capability)
+    }
+
+    /// Revokes a capability only when the authenticated caller holds it.
+    ///
+    /// The possession check and revocation are one sequential transition so a
+    /// caller-aware synchronization boundary can perform both under one
+    /// exclusive state guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityStateError::UnknownCapability`] when the ID was
+    /// never issued, [`CapabilityStateError::CapabilityNotHeld`] when the
+    /// caller does not hold it, or
+    /// [`CapabilityStateError::AuthorizationEpochExhausted`] when a new
+    /// revocation cannot advance the authorization epoch without wrapping.
+    pub fn revoke_held_by(
+        &mut self,
+        caller: &SubjectId,
+        capability: &CapId,
+    ) -> Result<RevocationStatus, CapabilityStateError> {
+        if !self.capabilities.contains_key(capability) {
+            return Err(CapabilityStateError::UnknownCapability(capability.clone()));
+        }
+        if !self.is_held_by(caller, capability) {
+            return Err(CapabilityStateError::CapabilityNotHeld {
+                caller: caller.clone(),
+                capability: capability.clone(),
+            });
         }
 
-        let next_epoch = self
-            .authorization_epoch
-            .checked_next()
-            .ok_or(CapabilityStateError::AuthorizationEpochExhausted)?;
-        self.revoked.insert(capability.clone());
-        self.authorization_epoch = next_epoch;
-        Ok(RevocationStatus::NewlyRevoked)
+        self.revoke_existing(capability)
     }
 
     /// Begins monotone shutdown and revokes every capability held by a subject.
@@ -845,6 +877,20 @@ impl CapabilityState {
             .ok_or(CapabilityStateError::AuthorizationEpochExhausted)
     }
 
+    fn revoke_existing(
+        &mut self,
+        capability: &CapId,
+    ) -> Result<RevocationStatus, CapabilityStateError> {
+        if self.revoked.contains(capability) {
+            return Ok(RevocationStatus::AlreadyRevoked);
+        }
+
+        let next_epoch = self.next_authorization_epoch()?;
+        self.revoked.insert(capability.clone());
+        self.authorization_epoch = next_epoch;
+        Ok(RevocationStatus::NewlyRevoked)
+    }
+
     fn issue(
         &mut self,
         grant: CapabilityGrant,
@@ -921,8 +967,42 @@ impl CapabilityState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthorizationEpoch, CapabilityState, CapabilityStateError};
-    use crate::capability::{CapId, IssuerId};
+    use super::{
+        AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
+        RevocationStatus, StaticAuthorityEnvelope, Subject,
+    };
+    use crate::{
+        capability::{AuthorityBody, CapId, IssuerId, SubjectId},
+        file::{FileAuthority, FileEffect, FileEffects},
+        path::{CanonicalPath, PathPattern},
+        repository::RepoId,
+        time::{MonotonicTime, TimeWindow},
+    };
+
+    fn state_with_capability_holder() -> (CapabilityState, SubjectId, SubjectId, CapId) {
+        let holder = SubjectId::new("holder");
+        let other = SubjectId::new("other");
+        let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+            .expect("test bounds must form a non-empty time window");
+        let authority = AuthorityBody::File(FileAuthority::new(
+            RepoId::new("workspace"),
+            FileEffects::from_effects([FileEffect::ReadData]),
+            PathPattern::Prefix(CanonicalPath::root()),
+        ));
+        let envelope = StaticAuthorityEnvelope::new(validity, authority.clone());
+        let mut state = CapabilityState::new(IssuerId::new("session-issuer"));
+        state
+            .register_subject(Subject::new(holder.clone(), envelope.clone()))
+            .expect("holder registration must succeed");
+        state
+            .register_subject(Subject::new(other.clone(), envelope))
+            .expect("other subject registration must succeed");
+        let capability = state
+            .issue_root(CapabilityGrant::new(holder.clone(), validity, authority))
+            .expect("root issuance must succeed");
+
+        (state, holder, other, capability)
+    }
 
     // Requirement: the final u64 sequence value is usable exactly once and no
     // wrapped ID can be issued. Category: numeric boundary. Risk: critical.
@@ -984,6 +1064,50 @@ mod tests {
         assert_eq!(
             CapabilityStateError::AuthorizationEpochExhausted.to_string(),
             "session-local authorization epoch is exhausted"
+        );
+    }
+
+    #[test]
+    fn revoke_held_by_rejects_non_holder_without_mutation() {
+        let (mut state, holder, other, capability) = state_with_capability_holder();
+        let epoch_before = state.authorization_epoch();
+
+        assert_eq!(
+            state.revoke_held_by(&other, &capability),
+            Err(CapabilityStateError::CapabilityNotHeld {
+                caller: other,
+                capability: capability.clone(),
+            })
+        );
+        assert_eq!(state.authorization_epoch(), epoch_before);
+        assert!(!state.is_revoked(&capability));
+        assert!(state.is_held_by(&holder, &capability));
+    }
+
+    #[test]
+    fn revoke_held_by_preserves_holder_idempotence() {
+        let (mut state, holder, _other, capability) = state_with_capability_holder();
+
+        assert_eq!(
+            state.revoke_held_by(&holder, &capability),
+            Ok(RevocationStatus::NewlyRevoked)
+        );
+        assert_eq!(state.authorization_epoch(), AuthorizationEpoch(1));
+        assert_eq!(
+            state.revoke_held_by(&holder, &capability),
+            Ok(RevocationStatus::AlreadyRevoked)
+        );
+        assert_eq!(state.authorization_epoch(), AuthorizationEpoch(1));
+    }
+
+    #[test]
+    fn revoke_held_by_preserves_unknown_capability_error() {
+        let (mut state, holder, _other, _capability) = state_with_capability_holder();
+        let unknown = CapId::new("unknown");
+
+        assert_eq!(
+            state.revoke_held_by(&holder, &unknown),
+            Err(CapabilityStateError::UnknownCapability(unknown))
         );
     }
 }

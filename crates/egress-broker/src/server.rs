@@ -14,6 +14,8 @@ use egress_protocol::{
     },
 };
 
+use authority_core::time::MonotonicTime;
+
 use crate::{
     dispatch::{
         BrokerDispatcher, BrokerEffect, BrokerOutcome, BrokerRejection, BrokerResponse,
@@ -119,16 +121,18 @@ impl Error for ServerError {}
 ///
 /// Returns [`ServerError`] for accept, peer identity, framing, dispatch, or
 /// canonical response failures.
-pub fn serve_expected_peer<L, D>(
+pub fn serve_expected_peer<L, D, C>(
     listener: &L,
     expected_peer_cid: u32,
     dispatcher: &mut D,
-    context: &DispatchContext,
+    identity: &DispatchContext,
+    clock: &mut C,
     max_requests: NonZeroUsize,
 ) -> Result<ConnectionReport, ServerError>
 where
     L: PeerBoundListener,
     D: RequestDispatcher,
+    C: FnMut() -> MonotonicTime,
 {
     let (peer_cid, stream) = listener.accept_peer().map_err(ServerError::Accept)?;
     if peer_cid != expected_peer_cid {
@@ -137,7 +141,7 @@ where
             received: peer_cid,
         });
     }
-    serve_connection(stream, dispatcher, context, max_requests)
+    serve_connection(stream, dispatcher, identity, clock, max_requests)
 }
 
 /// Serves at most `max_requests` on one already-authenticated connection.
@@ -151,21 +155,30 @@ where
 ///
 /// Returns [`ServerError`] on the first failure and never attempts to recover
 /// the byte stream after an ambiguous framing or write state.
-pub fn serve_connection<S, D>(
+pub fn serve_connection<S, D, C>(
     stream: S,
     dispatcher: &mut D,
-    context: &DispatchContext,
+    identity: &DispatchContext,
+    clock: &mut C,
     max_requests: NonZeroUsize,
 ) -> Result<ConnectionReport, ServerError>
 where
     S: Read + Write,
     D: RequestDispatcher,
+    C: FnMut() -> MonotonicTime,
 {
     let mut transport = FramedTransport::new(stream);
     for request_index in 0..max_requests.get() {
         let frame = transport.read_frame().map_err(ServerError::Transport)?;
+        // Re-read the clock per request. Reusing one instant for the whole
+        // connection lets a capability whose validity window closes mid-stream
+        // keep authorizing until the connection ends.
+        let context = DispatchContext {
+            now: clock(),
+            ..identity.clone()
+        };
         let response = dispatcher
-            .dispatch_request(&frame, context)
+            .dispatch_request(&frame, &context)
             .map_err(ServerError::Dispatch)?;
         // Both cases leave host state the guest must not keep transacting
         // against: broken byte accounting, or an external effect whose terminal
@@ -352,6 +365,45 @@ mod tests {
         responses
     }
 
+    // Requirement: a capability whose validity window closes mid-connection stops authorizing there.
+    // Category: unit/security. Risk: high.
+    #[test]
+    fn each_request_on_one_connection_reads_the_clock_again() {
+        let mut input = request_frame(1);
+        input.extend(request_frame(2));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let stream = DuplexBuffer {
+            input: Cursor::new(input),
+            output,
+        };
+        let mut dispatcher = FakeDispatcher {
+            outcomes: VecDeque::from([
+                rejection(1, BrokerRejection::Budget),
+                rejection(2, BrokerRejection::Budget),
+            ]),
+            calls: 0,
+        };
+        let mut ticks = 0_u64;
+
+        let report = serve_connection(
+            stream,
+            &mut dispatcher,
+            &context(),
+            &mut || {
+                ticks += 1;
+                MonotonicTime::from_ticks(ticks)
+            },
+            NonZeroUsize::new(2).expect("bound must be non-zero"),
+        )
+        .expect("both requests must be served");
+
+        assert_eq!(report.requests_served(), 2);
+        assert_eq!(
+            ticks, 2,
+            "the clock must be read once per request, not once per connection"
+        );
+    }
+
     #[test]
     fn connection_stops_at_the_host_request_bound() {
         let mut input = request_frame(1);
@@ -375,6 +427,7 @@ mod tests {
             stream,
             &mut dispatcher,
             &context(),
+            &mut || MonotonicTime::from_ticks(7),
             NonZeroUsize::new(2).expect("bound must be non-zero"),
         )
         .expect("bounded connection must succeed");
@@ -418,6 +471,7 @@ mod tests {
             stream,
             &mut dispatcher,
             &context(),
+            &mut || MonotonicTime::from_ticks(7),
             NonZeroUsize::new(2).expect("bound must be non-zero"),
         )
         .expect("accounting response must be written before close");
@@ -448,6 +502,7 @@ mod tests {
             42,
             &mut dispatcher,
             &context(),
+            &mut || MonotonicTime::from_ticks(7),
             NonZeroUsize::new(1).expect("bound must be non-zero"),
         )
         .expect_err("unexpected CID must fail closed");

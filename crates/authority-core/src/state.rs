@@ -260,6 +260,10 @@ pub enum CapabilityStateError {
     },
     /// A transition refers to a capability that was never issued.
     UnknownCapability(CapId),
+    /// A trusted host supplied an empty capability identity.
+    InvalidCapabilityId(CapId),
+    /// A capability identity was already issued earlier in this session.
+    CapabilityIdAlreadyIssued(CapId),
     /// The caller does not hold the requested parent capability.
     ParentNotHeld {
         /// The authenticated caller.
@@ -319,6 +323,12 @@ impl fmt::Display for CapabilityStateError {
                     formatter,
                     "capability `{capability}` was not issued by this state"
                 )
+            }
+            Self::InvalidCapabilityId(capability) => {
+                write!(formatter, "capability ID `{capability}` is invalid")
+            }
+            Self::CapabilityIdAlreadyIssued(capability) => {
+                write!(formatter, "capability ID `{capability}` was already issued")
             }
             Self::ParentNotHeld { caller, parent } => write!(
                 formatter,
@@ -549,6 +559,39 @@ impl CapabilityState {
     pub fn issue_root(&mut self, grant: CapabilityGrant) -> Result<CapId, CapabilityStateError> {
         self.validate_envelope(&grant)?;
         self.issue(grant, None)
+    }
+
+    /// Issues a root capability using an identity allocated by the trusted
+    /// host.
+    ///
+    /// The grant is checked by the same subject and static-envelope policy as
+    /// [`Self::issue_root`]. The supplied identity is opaque to this state
+    /// machine, but it must be non-empty and must never have been issued by
+    /// this state, including after direct revocation. A successful external
+    /// identity is permanently reserved so later sequential issuance skips it.
+    ///
+    /// Rejected grants and identities do not change capability state, the
+    /// authorization epoch, or the sequential ID cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the target subject is unknown, the grant exceeds
+    /// its envelope, the identity is empty, or the identity was already
+    /// issued.
+    pub fn issue_root_with_id(
+        &mut self,
+        capability_id: CapId,
+        grant: CapabilityGrant,
+    ) -> Result<CapId, CapabilityStateError> {
+        self.validate_envelope(&grant)?;
+        Self::validate_capability_id(&capability_id)?;
+        if self.issued_ids.contains(&capability_id) {
+            return Err(CapabilityStateError::CapabilityIdAlreadyIssued(
+                capability_id,
+            ));
+        }
+
+        Ok(self.issue_with_id(grant, None, capability_id))
     }
 
     /// Derives a capability from a held, active, delegable parent.
@@ -789,6 +832,15 @@ impl CapabilityState {
         parent: Option<CapId>,
     ) -> Result<CapId, CapabilityStateError> {
         let capability_id = self.allocate_capability_id()?;
+        Ok(self.issue_with_id(grant, parent, capability_id))
+    }
+
+    fn issue_with_id(
+        &mut self,
+        grant: CapabilityGrant,
+        parent: Option<CapId>,
+        capability_id: CapId,
+    ) -> CapId {
         let mut metadata = CapabilityMetadata::new(
             capability_id.clone(),
             grant.subject.clone(),
@@ -809,32 +861,49 @@ impl CapabilityState {
             .insert(capability_id.clone());
         self.capabilities.insert(capability_id.clone(), capability);
 
-        Ok(capability_id)
+        capability_id
+    }
+
+    fn validate_capability_id(capability_id: &CapId) -> Result<(), CapabilityStateError> {
+        if capability_id.as_str().is_empty() {
+            Err(CapabilityStateError::InvalidCapabilityId(
+                capability_id.clone(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn allocate_capability_id(&mut self) -> Result<CapId, CapabilityStateError> {
-        let sequence = self
+        let mut sequence = self
             .next_capability_sequence
-            .take()
             .ok_or(CapabilityStateError::CapabilityIdExhausted)?;
-        self.next_capability_sequence = sequence.checked_add(1);
 
-        let capability_id = CapId::new(format!("{}:{sequence}", self.issuer));
-        if self.issued_ids.contains(&capability_id) {
-            // The issuer and sequence form a session-local injective key. This
-            // branch protects fail-closed behavior if that invariant changes.
-            self.next_capability_sequence = None;
-            return Err(CapabilityStateError::CapabilityIdExhausted);
+        loop {
+            let next_sequence = sequence.checked_add(1);
+            let capability_id = CapId::new(format!("{}:{sequence}", self.issuer));
+            if !self.issued_ids.contains(&capability_id) {
+                self.next_capability_sequence = next_sequence;
+                return Ok(capability_id);
+            }
+
+            // An externally allocated ID may intentionally have the same
+            // shape as a sequential ID. Probe forward until an unused value
+            // is found, and fail closed when the numeric space is exhausted.
+            if let Some(next) = next_sequence {
+                sequence = next;
+            } else {
+                self.next_capability_sequence = None;
+                return Err(CapabilityStateError::CapabilityIdExhausted);
+            }
         }
-
-        Ok(capability_id)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AuthorizationEpoch, CapabilityState, CapabilityStateError};
-    use crate::capability::IssuerId;
+    use crate::capability::{CapId, IssuerId};
 
     // Requirement: the final u64 sequence value is usable exactly once and no
     // wrapped ID can be issued. Category: numeric boundary. Risk: critical.
@@ -848,6 +917,20 @@ mod tests {
             .expect("the maximum sequence value must remain available");
 
         assert_eq!(final_id.as_str(), "session-issuer:18446744073709551615");
+        assert_eq!(
+            state.allocate_capability_id(),
+            Err(CapabilityStateError::CapabilityIdExhausted)
+        );
+    }
+
+    #[test]
+    fn capability_id_allocation_exhausts_when_the_final_value_is_reserved() {
+        let mut state = CapabilityState::new(IssuerId::new("session-issuer"));
+        state.next_capability_sequence = Some(u64::MAX);
+        state
+            .issued_ids
+            .insert(CapId::new(format!("session-issuer:{}", u64::MAX)));
+
         assert_eq!(
             state.allocate_capability_id(),
             Err(CapabilityStateError::CapabilityIdExhausted)

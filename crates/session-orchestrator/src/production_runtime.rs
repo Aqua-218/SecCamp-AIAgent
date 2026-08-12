@@ -1341,10 +1341,14 @@ fn rebind_cgroup_path(
 #[cfg(test)]
 mod tests {
     use std::{
+        fs::OpenOptions,
+        io::Write,
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use egress_broker::dispatch::{BrokerResponse, DispatchError};
+    use egress_protocol::frame::ControlFrame;
     use firecracker_runtime::{
         ApiResponse, CgroupConfig, CgroupVersion, DmVerityConfig, HostIsolationConfig, HttpMethod,
         JailerConfig, NamespaceConfig, PinnedArtifact, SeccompConfig, Sha256Digest, VsockConfig,
@@ -1390,6 +1394,64 @@ mod tests {
             _request: &SessionEgressRequest,
         ) -> Result<PreparedEgressSession, BackendError> {
             Err(BackendError::new("test factory must not run during build"))
+        }
+    }
+
+    struct TestDispatcher;
+
+    impl RequestDispatcher for TestDispatcher {
+        fn dispatch_request(
+            &mut self,
+            _frame: &ControlFrame,
+            _context: &DispatchContext,
+        ) -> Result<BrokerResponse, DispatchError> {
+            unreachable!("identity-binding test never serves a connection")
+        }
+    }
+
+    struct ObservedEgressRequest {
+        identity: SessionIdentity,
+        caller: String,
+        capability: String,
+        wal_path: PathBuf,
+        exact_kernel: bool,
+    }
+
+    struct CapturingEgressFactory {
+        expected_kernel: Arc<CapabilityKernel>,
+        observed: Arc<Mutex<Option<ObservedEgressRequest>>>,
+    }
+
+    impl PerSessionEgressFactory for CapturingEgressFactory {
+        fn prepare(
+            &self,
+            request: &SessionEgressRequest,
+        ) -> Result<PreparedEgressSession, BackendError> {
+            let mut wal = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(request.wal_path())
+                .map_err(|error| {
+                    BackendError::new(format!("test Broker WAL creation failed: {error}"))
+                })?;
+            wal.write_all(b"durable-test-header")
+                .and_then(|()| wal.sync_data())
+                .map_err(|error| {
+                    BackendError::new(format!("test Broker WAL sync failed: {error}"))
+                })?;
+            *self
+                .observed
+                .lock()
+                .map_err(|_| BackendError::new("test observation mutex is poisoned"))? =
+                Some(ObservedEgressRequest {
+                    identity: request.identity(),
+                    caller: request.authority().caller.as_str().to_owned(),
+                    capability: request.authority().capability.as_str().to_owned(),
+                    wal_path: request.wal_path().to_owned(),
+                    exact_kernel: Arc::ptr_eq(request.executor(), &self.expected_kernel),
+                });
+            PreparedEgressSession::verify(request, TestDispatcher, || MonotonicTime::from_ticks(1))
+                .map_err(|error| BackendError::new(error.to_string()))
         }
     }
 
@@ -1719,6 +1781,45 @@ mod tests {
 
         fs::write(&wal, b"durable-header").expect("test WAL must be writable");
         verify_created_wal(&wal).expect("nonempty regular WAL must satisfy the filesystem proof");
+    }
+
+    #[test]
+    fn broker_runtime_factory_forwards_one_exact_identity_kernel_and_wal_path() {
+        let root = TestDirectory::new();
+        let wal_root = root.0.join("broker-wal");
+        fs::create_dir(&wal_root).expect("Broker WAL root must be creatable");
+        let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+            "production-test",
+        ))));
+        let observed = Arc::new(Mutex::new(None));
+        let factory = ProductionBrokerRuntimeFactory {
+            authority: AuthorityCoreBackend::new(Arc::clone(&kernel)),
+            egress_factory: Arc::new(CapturingEgressFactory {
+                expected_kernel: Arc::clone(&kernel),
+                observed: Arc::clone(&observed),
+            }),
+            wal_root: wal_root.clone(),
+            limits: broker_limits(),
+        };
+        let exact_identity = identity(0x31);
+
+        let _runtime = factory
+            .build(&exact_identity)
+            .expect("an exact prepared dispatcher must build");
+        let observed = observed
+            .lock()
+            .expect("test observation mutex must be healthy")
+            .take()
+            .expect("the per-session factory must be invoked");
+
+        assert_eq!(observed.identity, exact_identity);
+        assert_eq!(observed.caller, "34".repeat(crate::ID_BYTES));
+        assert_eq!(observed.capability, "37".repeat(crate::ID_BYTES));
+        assert_eq!(
+            observed.wal_path,
+            wal_root.join(format!("{}.wal", exact_identity.broker_session_id()))
+        );
+        assert!(observed.exact_kernel);
     }
 
     #[test]

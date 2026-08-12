@@ -7,7 +7,7 @@
 
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -30,6 +30,7 @@ struct PreparedWorkspace {
     session_id: crate::SessionId,
     workspace_id: crate::WorkspaceId,
     source: PathBuf,
+    session_jail_root: PathBuf,
     destination: PathBuf,
     runtime_claimed: bool,
     runtime_released: bool,
@@ -41,7 +42,7 @@ pub struct FirecrackerWorkspaceBackend<F> {
     state: Arc<Mutex<SharedWorkspaceState<F>>>,
     configured_template: WorkspaceTemplateId,
     source: PathBuf,
-    clone_root: PathBuf,
+    jail_root: PathBuf,
 }
 
 /// A [`FileSystem`] view for Firecracker that claims prepared workspaces without copying them.
@@ -57,20 +58,24 @@ pub struct FirecrackerWorkspaceBackendFactory<F> {
     state: Arc<Mutex<SharedWorkspaceState<F>>>,
     configured_template: WorkspaceTemplateId,
     source: PathBuf,
-    clone_root: PathBuf,
+    jail_root: PathBuf,
 }
 
 /// Short name for [`FirecrackerWorkspaceBackendFactory`].
 pub type FirecrackerWorkspaceFactory<F> = FirecrackerWorkspaceBackendFactory<F>;
 
 impl<F> FirecrackerWorkspaceBackendFactory<F> {
-    /// Creates a factory around one filesystem, source path, clone root, and template identity.
+    /// Creates a factory around one filesystem, source path, Firecracker jail root, and template
+    /// identity.
+    ///
+    /// For workspace identity `id`, the session jail is `<jail_root>/<id>/root` and the exact
+    /// runtime clone is `<jail_root>/<id>/root/workspace/<id>`.
     #[must_use]
     pub fn new(
         filesystem: F,
         configured_template: WorkspaceTemplateId,
         source: impl Into<PathBuf>,
-        clone_root: impl Into<PathBuf>,
+        jail_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(SharedWorkspaceState {
@@ -79,7 +84,7 @@ impl<F> FirecrackerWorkspaceBackendFactory<F> {
             })),
             configured_template,
             source: source.into(),
-            clone_root: clone_root.into(),
+            jail_root: jail_root.into(),
         }
     }
 
@@ -92,7 +97,7 @@ impl<F> FirecrackerWorkspaceBackendFactory<F> {
                 state: Arc::clone(&state),
                 configured_template: self.configured_template,
                 source: self.source,
-                clone_root: self.clone_root,
+                jail_root: self.jail_root,
             },
             FirecrackerFileSystem { state },
         )
@@ -103,16 +108,17 @@ impl<F> FirecrackerWorkspaceBackendFactory<F> {
 ///
 /// The configured template is the only template accepted by the returned
 /// [`WorkspaceBackend`]. `source` is the exact source path passed to the
-/// underlying filesystem, and every destination is `clone_root` followed by
-/// the lowercase 32-hexadecimal workspace identity.
+/// underlying filesystem. `jail_root` is the Firecracker executable-specific directory beneath
+/// the jailer's chroot base. Every destination is derived as
+/// `<jail_root>/<workspace_id>/root/workspace/<workspace_id>`.
 #[must_use]
 pub fn new_firecracker_workspace_adapters<F>(
     filesystem: F,
     configured_template: WorkspaceTemplateId,
     source: impl Into<PathBuf>,
-    clone_root: impl Into<PathBuf>,
+    jail_root: impl Into<PathBuf>,
 ) -> FirecrackerWorkspaceAdapters<F> {
-    FirecrackerWorkspaceBackendFactory::new(filesystem, configured_template, source, clone_root)
+    FirecrackerWorkspaceBackendFactory::new(filesystem, configured_template, source, jail_root)
         .into_handles()
 }
 
@@ -122,9 +128,9 @@ pub fn new_firecracker_workspace_backends<F>(
     filesystem: F,
     configured_template: WorkspaceTemplateId,
     source: impl Into<PathBuf>,
-    clone_root: impl Into<PathBuf>,
+    jail_root: impl Into<PathBuf>,
 ) -> FirecrackerWorkspaceAdapters<F> {
-    new_firecracker_workspace_adapters(filesystem, configured_template, source, clone_root)
+    new_firecracker_workspace_adapters(filesystem, configured_template, source, jail_root)
 }
 
 impl<F> WorkspaceBackend for FirecrackerWorkspaceBackend<F>
@@ -144,8 +150,14 @@ where
             )));
         }
 
+        validate_jail_root(&self.jail_root).map_err(|error| {
+            BackendError::new(format!("invalid Firecracker workspace jail root: {error}"))
+        })?;
         let workspace_id = identity.workspace_id();
-        let destination = self.clone_root.join(workspace_id.to_string());
+        let session_jail_root = self.jail_root.join(workspace_id.to_string()).join("root");
+        let destination = session_jail_root
+            .join("workspace")
+            .join(workspace_id.to_string());
         let mut state = self.state.lock().map_err(|_| {
             BackendError::new("workspace state mutex is poisoned; refusing workspace operation")
         })?;
@@ -173,6 +185,7 @@ where
                 session_id: identity.session_id(),
                 workspace_id,
                 source: self.source.clone(),
+                session_jail_root,
                 destination,
                 runtime_claimed: false,
                 runtime_released: false,
@@ -249,6 +262,42 @@ where
         state.filesystem.read(path)
     }
 
+    fn verify_block_device_binding(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
+        let record = state
+            .prepared
+            .values()
+            .find(|record| {
+                record.runtime_claimed
+                    && !record.runtime_released
+                    && !record.orchestrator_released
+                    && record.session_jail_root.join("dev/rootfs") == jailed_device
+            })
+            .ok_or_else(|| {
+                runtime_workspace_error(
+                    "block-device verification is not bound to the active session jail",
+                )
+            })?;
+        let expected_mapper_suffix = format!("-{}", record.workspace_id);
+        let mapper_is_session_bound = source.parent() == Some(Path::new("/dev/mapper"))
+            && source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(&expected_mapper_suffix));
+        if !mapper_is_session_bound {
+            return Err(runtime_workspace_error(
+                "block-device mapper is not bound to the active workspace identity",
+            ));
+        }
+        state
+            .filesystem
+            .verify_block_device_binding(source, jailed_device)
+    }
+
     fn clone_workspace(&mut self, source: &Path, destination: &Path) -> Result<(), RuntimeError> {
         let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
         let workspace_id = state
@@ -317,6 +366,24 @@ where
     }
 }
 
+fn validate_jail_root(path: &Path) -> Result<(), &'static str> {
+    if !path.is_absolute() {
+        return Err("jail root must be absolute");
+    }
+    if path == Path::new("/") {
+        return Err("jail root cannot be the host root");
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::CurDir | Component::Prefix(_)
+        )
+    }) {
+        return Err("jail root must contain only an absolute root and normal path components");
+    }
+    Ok(())
+}
+
 fn poisoned_runtime_error() -> RuntimeError {
     RuntimeError::InvalidState {
         expected: "healthy shared workspace state".to_owned(),
@@ -343,6 +410,7 @@ mod tests {
     struct FakeState {
         clones: Vec<(PathBuf, PathBuf)>,
         reads: Vec<PathBuf>,
+        block_bindings: Vec<(PathBuf, PathBuf)>,
         removals: Vec<PathBuf>,
         remove_failures: VecDeque<bool>,
     }
@@ -381,6 +449,19 @@ mod tests {
             Ok(())
         }
 
+        fn verify_block_device_binding(
+            &mut self,
+            source: &Path,
+            jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            self.state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .block_bindings
+                .push((source.to_owned(), jailed_device.to_owned()));
+            Ok(())
+        }
+
         fn remove_workspace(&mut self, path: &Path) -> Result<(), RuntimeError> {
             let mut state = self.state.lock().expect("fake state must not be poisoned");
             state.removals.push(path.to_owned());
@@ -408,7 +489,7 @@ mod tests {
             FakeFileSystem::new(state),
             WorkspaceTemplateId::new("template-a"),
             "/workspace/source",
-            "/workspace/clones",
+            "/srv/jailer/firecracker",
         )
     }
 
@@ -425,7 +506,9 @@ mod tests {
         runtime_filesystem
             .clone_workspace(
                 Path::new("/workspace/source"),
-                Path::new("/workspace/clones/abababababababababababababababab"),
+                Path::new(
+                    "/srv/jailer/firecracker/abababababababababababababababab/root/workspace/abababababababababababababababab",
+                ),
             )
             .expect("runtime must claim the prepared clone");
 
@@ -435,7 +518,9 @@ mod tests {
             recorded.clones[0],
             (
                 PathBuf::from("/workspace/source"),
-                PathBuf::from("/workspace/clones/abababababababababababababababab")
+                PathBuf::from(
+                    "/srv/jailer/firecracker/abababababababababababababababab/root/workspace/abababababababababababababababab"
+                )
             )
         );
         drop(recorded);
@@ -444,7 +529,9 @@ mod tests {
             runtime_filesystem
                 .clone_workspace(
                     Path::new("/workspace/source"),
-                    Path::new("/workspace/clones/abababababababababababababababab"),
+                    Path::new(
+                        "/srv/jailer/firecracker/abababababababababababababababab/root/workspace/abababababababababababababababab",
+                    ),
                 )
                 .is_err()
         );
@@ -495,6 +582,95 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsafe_jail_roots_before_clone_side_effects() {
+        for jail_root in ["relative/jailer/firecracker", "/", "/srv/jailer/../escape"] {
+            let state = Arc::new(Mutex::new(FakeState::default()));
+            let (mut backend, _) = new_firecracker_workspace_adapters(
+                FakeFileSystem::new(Arc::clone(&state)),
+                WorkspaceTemplateId::new("template-a"),
+                "/workspace/source",
+                jail_root,
+            );
+
+            assert!(
+                backend
+                    .clone_workspace(
+                        &identity(0x11, 0xab),
+                        &WorkspaceTemplateId::new("template-a"),
+                    )
+                    .is_err(),
+                "unsafe jail root must fail closed: {jail_root}"
+            );
+            assert!(
+                state
+                    .lock()
+                    .expect("fake state must not be poisoned")
+                    .clones
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn block_device_verification_is_session_bound_and_forwarded_exactly() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let (mut backend, mut runtime_filesystem) = adapters(Arc::clone(&state));
+        let session = identity(0x11, 0xab);
+        let workspace_id = session.workspace_id().to_string();
+        let destination = PathBuf::from(format!(
+            "/srv/jailer/firecracker/{workspace_id}/root/workspace/{workspace_id}"
+        ));
+        backend
+            .clone_workspace(&session, &WorkspaceTemplateId::new("template-a"))
+            .expect("orchestrator clone must succeed");
+        runtime_filesystem
+            .clone_workspace(Path::new("/workspace/source"), &destination)
+            .expect("runtime must claim the exact prepared clone");
+
+        let mapper = PathBuf::from(format!("/dev/mapper/rootfs-verity-{workspace_id}"));
+        let jailed_device = PathBuf::from(format!(
+            "/srv/jailer/firecracker/{workspace_id}/root/dev/rootfs"
+        ));
+        let foreign_id = identity(0x22, 0xcd).workspace_id().to_string();
+        let foreign_device = PathBuf::from(format!(
+            "/srv/jailer/firecracker/{foreign_id}/root/dev/rootfs"
+        ));
+
+        assert!(
+            runtime_filesystem
+                .verify_block_device_binding(&mapper, &foreign_device)
+                .is_err()
+        );
+        assert!(
+            runtime_filesystem
+                .verify_block_device_binding(
+                    Path::new("/dev/mapper/rootfs-verity-foreign"),
+                    &jailed_device
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .block_bindings
+                .is_empty(),
+            "cross-session bindings must not reach the production filesystem boundary"
+        );
+
+        runtime_filesystem
+            .verify_block_device_binding(&mapper, &jailed_device)
+            .expect("the exact session block binding must be delegated");
+        assert_eq!(
+            state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .block_bindings,
+            [(mapper, jailed_device)]
+        );
+    }
+
+    #[test]
     fn runtime_removal_is_non_destructive_and_orchestrator_removal_is_retry_safe() {
         let state = Arc::new(Mutex::new(FakeState {
             remove_failures: VecDeque::from([true, false]),
@@ -508,13 +684,15 @@ mod tests {
         runtime_filesystem
             .clone_workspace(
                 Path::new("/workspace/source"),
-                Path::new("/workspace/clones/abababababababababababababababab"),
+                Path::new(
+                    "/srv/jailer/firecracker/abababababababababababababababab/root/workspace/abababababababababababababababab",
+                ),
             )
             .expect("runtime must claim the prepared clone");
 
         runtime_filesystem
             .remove_workspace(Path::new(
-                "/workspace/clones/abababababababababababababababab",
+                "/srv/jailer/firecracker/abababababababababababababababab/root/workspace/abababababababababababababababab",
             ))
             .expect("runtime release must only mark the record");
         assert!(

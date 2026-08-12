@@ -11,6 +11,12 @@ linearization point.
 
 namespace Authority
 
+/-- Repository-wide admission state shared by every mount of one backing tree. -/
+inductive RepositoryHealth where
+  | operational
+  | inDoubt
+  deriving Repr, BEq, DecidableEq
+
 /-- Combined logical view shared by Authority Core and the namespace registry. -/
 structure IntegratedHandleState where
   authority : CapabilityState
@@ -18,6 +24,8 @@ structure IntegratedHandleState where
   accountedHandles : ObjectId → List HandleId
   /-- Handle identities owned by this namespace adapter, including tombstones. -/
   managedHandles : HandleId → Bool
+  /-- Shared quarantine is part of the logical state, not mount-local metadata. -/
+  repositoryHealth : RepositoryHealth
 
 namespace IntegratedHandleState
 
@@ -60,6 +68,8 @@ structure RestorableSnapshot (state : IntegratedHandleState) where
   manifest : List NamespaceObject
   manifestExact : ManifestExact state.namespaceState manifest
   wellFormed : state.WellFormed
+  /-- Restore may expose operations only after durable ambiguity is reconciled. -/
+  repositoryReconciled : state.repositoryHealth = .operational
 
 /-- A state may be restored only when a trusted importer supplies snapshot evidence. -/
 def Restorable (state : IntegratedHandleState) : Prop :=
@@ -71,12 +81,21 @@ theorem Restorable.wellFormed {state : IntegratedHandleState}
   rcases restorable with ⟨snapshot⟩
   exact snapshot.wellFormed
 
+/-- Restorable snapshots are operational only with explicit reconciliation evidence. -/
+theorem Restorable.repository_operational {state : IntegratedHandleState}
+    (restorable : state.Restorable) :
+    state.repositoryHealth = .operational := by
+  rcases restorable with ⟨snapshot⟩
+  exact snapshot.repositoryReconciled
+
 /-- Package an already validated finite snapshot at the explicit restore boundary. -/
 theorem Restorable.ofWellFormedManifest {state : IntegratedHandleState}
     {manifest : List NamespaceObject}
     (manifestExact : ManifestExact state.namespaceState manifest)
-    (wellFormed : state.WellFormed) : state.Restorable :=
-  ⟨{ manifest, manifestExact, wellFormed }⟩
+    (wellFormed : state.WellFormed)
+    (repositoryReconciled : state.repositoryHealth = .operational) :
+    state.Restorable :=
+  ⟨{ manifest, manifestExact, wellFormed, repositoryReconciled }⟩
 
 /-- Build a startup snapshot whose imported manifest has no open handles. -/
 def initializeClosed (authority : CapabilityState)
@@ -85,6 +104,7 @@ def initializeClosed (authority : CapabilityState)
   namespaceState := namespaceState
   accountedHandles := fun _ => []
   managedHandles := fun _ => false
+  repositoryHealth := .operational
 
 /-- A closed exact manifest and an empty handle registry establish the bridge. -/
 theorem initializeClosed_wellFormed {authority : CapabilityState}
@@ -227,6 +247,10 @@ theorem initial_wellFormed (issuer : IssuerId) : (initial issuer).WellFormed := 
 /-- The concrete runtime startup is admitted by the initial-state relation. -/
 theorem initial_isInitial (issuer : IssuerId) : (initial issuer).Initial :=
   ⟨issuer, rfl⟩
+
+/-- Concrete initialization begins outside quarantine. -/
+theorem initial_repository_operational (issuer : IssuerId) :
+    (initial issuer).repositoryHealth = .operational := rfl
 
 /-- Every ordinary initial state is exactly one concrete empty runtime state. -/
 theorem Initial.wellFormed {state : IntegratedHandleState}
@@ -376,6 +400,7 @@ def openHandle (state : IntegratedHandleState) (handle : OpenHandle)
   accountedHandles := replace state.accountedHandles handle.object
     (handle.id :: state.accountedHandles handle.object)
   managedHandles := replace state.managedHandles handle.id true
+  repositoryHealth := state.repositoryHealth
 
 /-- Opening the runtime root from a ready startup is an admitted atomic step. -/
 def readyInitialMayOpen (issuer : IssuerId) (subject : SubjectId)
@@ -431,6 +456,7 @@ def closeHandle (state : IntegratedHandleState) (handleId : HandleId)
   accountedHandles := replace state.accountedHandles handle.object
     ((state.accountedHandles handle.object).erase handleId)
   managedHandles := state.managedHandles
+  repositoryHealth := state.repositoryHealth
 
 /-- Publish a closed namespace object without changing Authority handle state. -/
 def createClosedObject (state : IntegratedHandleState)
@@ -439,6 +465,7 @@ def createClosedObject (state : IntegratedHandleState)
   namespaceState := state.namespaceState.create object
   accountedHandles := state.accountedHandles
   managedHandles := state.managedHandles
+  repositoryHealth := state.repositoryHealth
 
 /-- Integrated preconditions for publishing a namespace child closed. -/
 structure MayCreateClosed (state : IntegratedHandleState)
@@ -465,6 +492,7 @@ def removeObject (state : IntegratedHandleState) (objectId : ObjectId)
   namespaceState := state.namespaceState.remove objectId object
   accountedHandles := state.accountedHandles
   managedHandles := state.managedHandles
+  repositoryHealth := state.repositoryHealth
 
 /-- Rename a closed subtree without changing Authority or handle ownership. -/
 def renamePaths (state : IntegratedHandleState)
@@ -473,6 +501,36 @@ def renamePaths (state : IntegratedHandleState)
   namespaceState := state.namespaceState.renamePaths pathMapping
   accountedHandles := state.accountedHandles
   managedHandles := state.managedHandles
+  repositoryHealth := state.repositoryHealth
+
+/-- Publish one hard-link name without changing Authority handle ownership. -/
+def addHardLink (state : IntegratedHandleState) (objectId : ObjectId)
+    (object : NamespaceObject) (alias : CanonicalPath) : IntegratedHandleState where
+  authority := state.authority
+  namespaceState := state.namespaceState.addHardLink objectId object alias
+  accountedHandles := state.accountedHandles
+  managedHandles := state.managedHandles
+  repositoryHealth := state.repositoryHealth
+
+/-- Unlink one name and publish the first surviving alias as representative. -/
+def unlinkName (state : IntegratedHandleState) (objectId : ObjectId)
+    (object : NamespaceObject) (alias newPrimary : CanonicalPath)
+    (remaining : List CanonicalPath) : IntegratedHandleState where
+  authority := state.authority
+  namespaceState := state.namespaceState.unlinkName objectId object alias
+    newPrimary remaining
+  accountedHandles := state.accountedHandles
+  managedHandles := state.managedHandles
+  repositoryHealth := state.repositoryHealth
+
+/-- Publish one closed symlink without changing Authority handle ownership. -/
+def createSymlink (state : IntegratedHandleState)
+    (object : NamespaceObject) : IntegratedHandleState where
+  authority := state.authority
+  namespaceState := state.namespaceState.createSymlink object
+  accountedHandles := state.accountedHandles
+  managedHandles := state.managedHandles
+  repositoryHealth := state.repositoryHealth
 
 /-- Replace only the Authority component. -/
 def withAuthority (state : IntegratedHandleState)
@@ -481,6 +539,7 @@ def withAuthority (state : IntegratedHandleState)
   namespaceState := state.namespaceState
   accountedHandles := state.accountedHandles
   managedHandles := state.managedHandles
+  repositoryHealth := state.repositoryHealth
 
 /-- Register then close a managed handle after the namespace-side open fails. -/
 def failOpenAfterRegistration (state : IntegratedHandleState)
@@ -525,6 +584,19 @@ inductive Step : IntegratedHandleState → IntegratedHandleState → Prop
       {pathMapping : NamespaceState.PathRenaming} :
       (allowed : state.namespaceState.MayRename pathMapping) →
       Step state (state.renamePaths pathMapping)
+  | hardLinkAtomic {state : IntegratedHandleState} {objectId : ObjectId}
+      {alias : CanonicalPath} :
+      (allowed : state.namespaceState.MayAddHardLink objectId alias) →
+      Step state (state.addHardLink objectId allowed.object alias)
+  | unlinkNameAtomic {state : IntegratedHandleState} {objectId : ObjectId}
+      {alias : CanonicalPath} :
+      (allowed : state.namespaceState.MayUnlinkName objectId alias) →
+      Step state (state.unlinkName objectId allowed.object alias
+        allowed.newPrimary allowed.remaining)
+  | createSymlinkAtomic {state : IntegratedHandleState}
+      {object : NamespaceObject} :
+      (allowed : state.namespaceState.MayCreateSymlink object) →
+      Step state (state.createSymlink object)
   | authorityOnly {state : IntegratedHandleState} {authority : CapabilityState} :
       (transition : CapabilityState.Step state.authority authority) →
       state.PreservesManagedOpenHandles authority →
@@ -533,6 +605,24 @@ inductive Step : IntegratedHandleState → IntegratedHandleState → Prop
       {handle : OpenHandle} :
       MayFailOpenAfterRegistration state handle →
       Step state (state.failOpenAfterRegistration handle)
+
+/-- Legacy successful transitions preserve the repository admission state exactly. -/
+theorem Step.preserves_repositoryHealth {before after : IntegratedHandleState}
+    (transition : Step before after) :
+    after.repositoryHealth = before.repositoryHealth := by
+  cases transition <;> rfl
+
+/-- An ordinary adapter step is a legacy successful step admitted while healthy. -/
+structure OrdinaryStep (before after : IntegratedHandleState) : Prop where
+  operational : before.repositoryHealth = .operational
+  transition : Step before after
+
+/-- Every admitted ordinary step remains operational. -/
+theorem OrdinaryStep.after_operational {before after : IntegratedHandleState}
+    (transition : OrdinaryStep before after) :
+    after.repositoryHealth = .operational := by
+  rw [transition.transition.preserves_repositoryHealth]
+  exact transition.operational
 
 /-- A globally fresh handle identity is absent from every bridge list. -/
 theorem WellFormed.fresh_handle_not_accounted {state : IntegratedHandleState}
@@ -957,6 +1047,102 @@ theorem renamePaths_preserves_wellFormed {state : IntegratedHandleState}
   · exact (NamespaceState.Step.renamePaths allowed).preserves_countersRepresentable
       wellFormed.namespaceCountersRepresentable
 
+/-- Publishing one hard-link name preserves Authority/namespace handle agreement. -/
+theorem addHardLink_preserves_wellFormed {state : IntegratedHandleState}
+    {objectId : ObjectId} {alias : CanonicalPath} (wellFormed : state.WellFormed)
+    (allowed : state.namespaceState.MayAddHardLink objectId alias) :
+    (state.addHardLink objectId allowed.object alias).WellFormed := by
+  constructor
+  · exact wellFormed.accountedHandlesNodup
+  · exact wellFormed.authorityHandlesExact
+  · intro queriedId queriedObject queriedLookup
+    by_cases target : queriedId = objectId
+    · subst queriedId
+      have exactObject : queriedObject =
+          NamespaceState.withAddedAlias allowed.object alias := Option.some.inj
+        (queriedLookup.symm.trans (NamespaceState.addHardLink_stores_object
+          state.namespaceState objectId allowed.object alias))
+      subst queriedObject
+      simpa [IntegratedHandleState.addHardLink,
+        NamespaceState.withAddedAlias] using
+        wellFormed.namespaceCountsExact objectId allowed.object allowed.objectLookup
+    · exact wellFormed.namespaceCountsExact queriedId queriedObject
+        (by simpa [IntegratedHandleState.addHardLink,
+          NamespaceState.addHardLink, replace, target] using queriedLookup)
+  · intro handleId handle managed handleLookup
+    rcases wellFormed.everyManagedHandleHasLiveObject handleId handle managed
+      handleLookup with ⟨object, objectLookup⟩
+    by_cases target : handle.object = objectId
+    · subst objectId
+      have exactObject : object = allowed.object := Option.some.inj
+        (objectLookup.symm.trans allowed.objectLookup)
+      subst object
+      exact ⟨NamespaceState.withAddedAlias allowed.object alias,
+        NamespaceState.addHardLink_stores_object state.namespaceState handle.object
+          allowed.object alias⟩
+    · exact ⟨object, by simpa [IntegratedHandleState.addHardLink,
+        NamespaceState.addHardLink, replace, target] using objectLookup⟩
+  · exact wellFormed.liveHandleOwnerExact
+  · exact wellFormed.managedHandleReserved
+  · exact (NamespaceState.addHardLink_preserves_completeWellFormed allowed).tree
+  · exact wellFormed.authorityCountersRepresentable
+  · exact (NamespaceState.Step.addHardLink allowed).preserves_countersRepresentable
+      wellFormed.namespaceCountersRepresentable
+
+/-- Unlinking one of several names preserves Authority/namespace handle agreement. -/
+theorem unlinkName_preserves_wellFormed {state : IntegratedHandleState}
+    {objectId : ObjectId} {alias : CanonicalPath} (wellFormed : state.WellFormed)
+    (allowed : state.namespaceState.MayUnlinkName objectId alias) :
+    (state.unlinkName objectId allowed.object alias allowed.newPrimary
+      allowed.remaining).WellFormed := by
+  constructor
+  · exact wellFormed.accountedHandlesNodup
+  · exact wellFormed.authorityHandlesExact
+  · intro queriedId queriedObject queriedLookup
+    by_cases target : queriedId = objectId
+    · subst queriedId
+      have exactObject : queriedObject = NamespaceState.withRemainingAliases
+          allowed.object allowed.newPrimary allowed.remaining := Option.some.inj
+        (queriedLookup.symm.trans (NamespaceState.unlinkName_stores_object
+          state.namespaceState objectId allowed.object alias allowed.newPrimary
+          allowed.remaining))
+      subst queriedObject
+      simpa [IntegratedHandleState.unlinkName,
+        NamespaceState.withRemainingAliases] using
+        wellFormed.namespaceCountsExact objectId allowed.object allowed.objectLookup
+    · exact wellFormed.namespaceCountsExact queriedId queriedObject
+        (by simpa [IntegratedHandleState.unlinkName, NamespaceState.unlinkName,
+          replace, target] using queriedLookup)
+  · intro handleId handle managed handleLookup
+    rcases wellFormed.everyManagedHandleHasLiveObject handleId handle managed
+      handleLookup with ⟨object, objectLookup⟩
+    by_cases target : handle.object = objectId
+    · subst objectId
+      have exactObject : object = allowed.object := Option.some.inj
+        (objectLookup.symm.trans allowed.objectLookup)
+      subst object
+      exact ⟨NamespaceState.withRemainingAliases allowed.object allowed.newPrimary
+          allowed.remaining,
+        NamespaceState.unlinkName_stores_object state.namespaceState handle.object
+          allowed.object alias allowed.newPrimary allowed.remaining⟩
+    · exact ⟨object, by simpa [IntegratedHandleState.unlinkName,
+        NamespaceState.unlinkName, replace, target] using objectLookup⟩
+  · exact wellFormed.liveHandleOwnerExact
+  · exact wellFormed.managedHandleReserved
+  · exact (NamespaceState.unlinkName_preserves_completeWellFormed allowed).tree
+  · exact wellFormed.authorityCountersRepresentable
+  · exact (NamespaceState.Step.unlinkName allowed).preserves_countersRepresentable
+      wellFormed.namespaceCountersRepresentable
+
+/-- Publishing a checked closed symlink preserves the integrated invariant. -/
+theorem createSymlink_preserves_wellFormed {state : IntegratedHandleState}
+    {object : NamespaceObject} (wellFormed : state.WellFormed)
+    (allowed : state.namespaceState.MayCreateSymlink object) :
+    (state.createSymlink object).WellFormed := by
+  simpa [IntegratedHandleState.createSymlink,
+    IntegratedHandleState.createClosedObject, NamespaceState.createSymlink] using
+    createClosedObject_preserves_wellFormed wellFormed allowed.creation
+
 /-- Authority transitions preserve exact ownership for every handle left live. -/
 theorem capabilityStep_preserves_liveHandleOwnerExact
     {before after : CapabilityState} (transition : CapabilityState.Step before after)
@@ -1207,6 +1393,12 @@ theorem Step.preserves_wellFormed {before after : IntegratedHandleState}
       exact removeObject_preserves_wellFormed wellFormed allowed
   | renameAtomic allowed =>
       exact renamePaths_preserves_wellFormed wellFormed allowed
+  | hardLinkAtomic allowed =>
+      exact addHardLink_preserves_wellFormed wellFormed allowed
+  | unlinkNameAtomic allowed =>
+      exact unlinkName_preserves_wellFormed wellFormed allowed
+  | createSymlinkAtomic allowed =>
+      exact createSymlink_preserves_wellFormed wellFormed allowed
   | authorityOnly authorityStep preservesManaged =>
       exact authorityOnly_preserves_wellFormed wellFormed authorityStep
         preservesManaged
@@ -1218,6 +1410,15 @@ inductive Steps : IntegratedHandleState → IntegratedHandleState → Prop
   | refl (state : IntegratedHandleState) : Steps state state
   | tail {first middle last : IntegratedHandleState} :
       Steps first middle → Step middle last → Steps first last
+
+/-- Finite legacy executions preserve repository health exactly. -/
+theorem Steps.preserve_repositoryHealth {before after : IntegratedHandleState}
+    (transitions : Steps before after) :
+    after.repositoryHealth = before.repositoryHealth := by
+  induction transitions with
+  | refl => rfl
+  | tail _ transition inductionHypothesis =>
+      exact transition.preserves_repositoryHealth.trans inductionHypothesis
 
 /-- Exact bridge agreement survives every finite integrated execution. -/
 theorem Steps.preserves_wellFormed {before after : IntegratedHandleState}
@@ -1359,6 +1560,7 @@ theorem openedInitial_restorable (issuer : IssuerId) (subject : SubjectId)
   Restorable.ofWellFormedManifest
     (openedInitial_manifestExact issuer subject handleId)
     (openedInitial_reachable issuer subject handleId).wellFormed
+    rfl
 
 /-- The reachable open witness is exact in Authority, namespace, and accounting. -/
 theorem openedInitial_has_exact_handle (issuer : IssuerId) (subject : SubjectId)

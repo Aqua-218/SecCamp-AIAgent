@@ -154,10 +154,14 @@ def ApplyStage.irreversible : ApplyStage → Bool
       .noNewPrivs | .seccomp => true
   | .cgroupV2 | .workspace | .limitedTmpfs | .maskProc | .maskDevices => false
 
-/-- Receipt exists only after every coordinator stage returned success. -/
+/-- Receipt exists only after every stage and PID child handoff completed. -/
 structure Receipt where
   stages : List ApplyStage
+  namespaceCreated : Bool
+  pidChildEntered : Bool
   complete : stages = requiredStages
+  namespaceComplete : namespaceCreated = true
+  pidChildComplete : pidChildEntered = true
 
 /-- Observable coordinator phases. -/
 inductive Phase where
@@ -171,6 +175,8 @@ inductive Phase where
 /-- Coordinator state including complete apply and rollback call traces. -/
 structure State where
   phase : Phase
+  namespaceCreated : Bool
+  pidChildEntered : Bool
   completed : List ApplyStage
   remaining : List ApplyStage
   applyTrace : List ApplyStage
@@ -183,6 +189,8 @@ structure State where
 /-- State before side-effect-free validation and capability detection. -/
 def State.initial : State where
   phase := .preflight
+  namespaceCreated := false
+  pidChildEntered := false
   completed := []
   remaining := requiredStages
   applyTrace := []
@@ -194,6 +202,14 @@ def State.initial : State where
 
 /-- Enter apply only after configuration and capability preflight succeed. -/
 def State.beginApply (state : State) : State := { state with phase := .applying }
+
+/-- Record successful namespace creation before any PID child can enter it. -/
+def State.recordNamespaceCreated (state : State) : State :=
+  { state with namespaceCreated := true }
+
+/-- Record kernel-verified entry of the workload child into the PID namespace. -/
+def State.recordPidChildEntered (state : State) : State :=
+  { state with pidChildEntered := true }
 
 /-- Record one successful backend stage. -/
 def State.applySuccess (state : State) (stage : ApplyStage)
@@ -230,13 +246,19 @@ def State.FailureContext (state : State) : Prop :=
     state.mustTerminate =
       (failedStage.irreversible || state.completed.any ApplyStage.irreversible)
 
+/-- PID child entry can only follow successful namespace creation. -/
+def State.NamespaceStatusValid (state : State) : Prop :=
+  state.pidChildEntered = true → state.namespaceCreated = true
+
 /-- Exact coordinator-shape invariant. -/
 def State.WellFormed (state : State) : Prop :=
+  state.NamespaceStatusValid ∧
   state.completed ++ state.remaining = requiredStages ∧
   match state.phase with
   | .preflight =>
-      state.completed = [] ∧ state.remaining = requiredStages ∧
-      state.applyTrace = [] ∧ state.rollbackTrace = [] ∧
+      state.namespaceCreated = false ∧ state.pidChildEntered = false ∧
+        state.completed = [] ∧ state.remaining = requiredStages ∧
+        state.applyTrace = [] ∧ state.rollbackTrace = [] ∧
         state.rollbackPending = [] ∧ state.receipt = none ∧
         state.mustTerminate = false
   | .applying =>
@@ -249,8 +271,10 @@ def State.WellFormed (state : State) : Prop :=
         state.FailureContext
   | .succeeded =>
       state.completed = requiredStages ∧ state.remaining = [] ∧
-        state.applyTrace = requiredStages ∧
-        (∃ receipt, state.receipt = some receipt ∧ receipt.stages = requiredStages) ∧
+        state.applyTrace = requiredStages ∧ state.namespaceCreated = true ∧
+        state.pidChildEntered = true ∧
+        (∃ receipt, state.receipt = some receipt ∧
+          receipt.stages = requiredStages ∧ receipt.pidChildEntered = true) ∧
         state.mustTerminate = false
   | .failed =>
       state.rollbackPending = [] ∧ state.receipt = none ∧
@@ -258,7 +282,7 @@ def State.WellFormed (state : State) : Prop :=
 
 /-- Initial coordinator shape is valid. -/
 theorem State.initial_wellFormed : State.initial.WellFormed := by
-  simp [State.initial, State.WellFormed]
+  simp [State.initial, State.WellFormed, State.NamespaceStatusValid]
 
 /-- Concrete state where the first namespace operation failed after a partial effect. -/
 def State.firstNamespaceFailure : State :=
@@ -273,6 +297,23 @@ theorem State.firstNamespaceFailure_witness :
     State.firstNamespaceFailure.mustTerminate = true := by
   simp [State.firstNamespaceFailure, State.initial, State.beginApply,
     State.applyFailure, State.WellFormed, State.FailureContext, requiredStages,
+    ApplyStage.irreversible, State.NamespaceStatusValid]
+
+/-- Concrete fail-closed state where namespace creation had no PID child handoff. -/
+def State.missingPidChildHandoffFailure : State :=
+  State.initial.beginApply.recordNamespaceCreated.applyFailure .namespaces
+
+/-- Missing PID child handoff is incomplete and requires process termination. -/
+theorem State.missingPidChildHandoffFailure_witness :
+    State.missingPidChildHandoffFailure.WellFormed ∧
+    State.missingPidChildHandoffFailure.phase = .failed ∧
+    State.missingPidChildHandoffFailure.namespaceCreated = true ∧
+    State.missingPidChildHandoffFailure.pidChildEntered = false ∧
+    State.missingPidChildHandoffFailure.receipt = none ∧
+    State.missingPidChildHandoffFailure.mustTerminate = true := by
+  simp [State.missingPidChildHandoffFailure, State.initial, State.beginApply,
+    State.recordNamespaceCreated, State.applyFailure, State.WellFormed,
+    State.FailureContext, State.NamespaceStatusValid, requiredStages,
     ApplyStage.irreversible]
 
 /-- Accepted coordinator transitions. Failed preflight makes no transition. -/
@@ -280,9 +321,20 @@ inductive Step : State → State → Prop
   | beginApply {state : State} {config : Config} {report : CapabilityReport} :
       state.phase = .preflight → config.Valid → report.Sufficient config →
       Step state state.beginApply
+  | namespaceCreated {state : State} {remaining : List ApplyStage} :
+      state.phase = .applying →
+      state.remaining = .namespaces :: remaining →
+      state.namespaceCreated = false →
+      Step state state.recordNamespaceCreated
+  | pidChildEntered {state : State} {remaining : List ApplyStage} :
+      state.phase = .applying →
+      state.remaining = .namespaces :: remaining →
+      state.namespaceCreated = true → state.pidChildEntered = false →
+      Step state state.recordPidChildEntered
   | applySuccess {state : State} {stage : ApplyStage}
       {remaining : List ApplyStage} :
       state.phase = .applying → state.remaining = stage :: remaining →
+      state.pidChildEntered = true →
       Step state (state.applySuccess stage remaining)
   | applyFailure {state : State} {stage : ApplyStage}
       {remaining : List ApplyStage} :
@@ -295,10 +347,18 @@ inductive Step : State → State → Prop
   | finish {state : State} :
       state.phase = .applying → state.remaining = [] →
       (complete : state.completed = requiredStages) →
+      (namespaceComplete : state.namespaceCreated = true) →
+      (pidChildComplete : state.pidChildEntered = true) →
       Step state {
         state with
         phase := .succeeded
-        receipt := some { stages := state.completed, complete := complete } }
+        receipt := some {
+          stages := state.completed
+          namespaceCreated := state.namespaceCreated
+          pidChildEntered := state.pidChildEntered
+          complete := complete
+          namespaceComplete := namespaceComplete
+          pidChildComplete := pidChildComplete } }
 
 /-- Every accepted coordinator transition preserves exact plan and trace shape. -/
 theorem Step.preserves_wellFormed {before after : State}
@@ -307,73 +367,85 @@ theorem Step.preserves_wellFormed {before after : State}
   cases transition with
   | beginApply phase valid sufficient =>
       rw [State.WellFormed, phase] at wellFormed
-      rcases wellFormed with ⟨plan, completed, remaining, applyTrace,
-        rollbackTrace, noRollback, noReceipt, noTermination⟩
-      simp [State.beginApply, State.WellFormed, plan, completed, remaining,
-        applyTrace, rollbackTrace, noRollback, noReceipt, noTermination,
-        State.initial]
-  | applySuccess phase nextStage =>
-      rw [State.WellFormed, phase] at wellFormed
-      rcases wellFormed with ⟨plan, traceMatches, rollbackTrace,
+      rcases wellFormed with ⟨namespaceStatus, plan, namespaceCreated,
+        pidChildEntered, completed, remaining, applyTrace, rollbackTrace,
         noRollback, noReceipt, noTermination⟩
-      constructor
-      · rw [State.applySuccess, nextStage] at *
-        simpa [List.append_assoc] using plan
-      · simp [State.applySuccess, phase, traceMatches, rollbackTrace, noRollback,
-          noReceipt, noTermination]
+      simp [State.beginApply, State.WellFormed, namespaceStatus, plan,
+        namespaceCreated, pidChildEntered, completed, remaining, applyTrace,
+        rollbackTrace, noRollback, noReceipt, noTermination, State.initial,
+        State.NamespaceStatusValid]
+  | namespaceCreated phase nextStage notCreated =>
+      rw [State.WellFormed, phase] at wellFormed
+      rcases wellFormed with ⟨namespaceStatus, plan, traceMatches,
+        rollbackTrace, noRollback, noReceipt, noTermination⟩
+      simp [State.recordNamespaceCreated, State.WellFormed,
+        State.NamespaceStatusValid, phase, plan, traceMatches, rollbackTrace,
+        noRollback, noReceipt, noTermination]
+  | pidChildEntered phase nextStage namespaceCreated notEntered =>
+      rw [State.WellFormed, phase] at wellFormed
+      rcases wellFormed with ⟨namespaceStatus, plan, traceMatches,
+        rollbackTrace, noRollback, noReceipt, noTermination⟩
+      simp [State.recordPidChildEntered, State.WellFormed,
+        State.NamespaceStatusValid, phase, plan, traceMatches, rollbackTrace,
+        noRollback, noReceipt, noTermination, namespaceCreated]
+  | applySuccess phase nextStage childEntered =>
+      rw [State.WellFormed, phase] at wellFormed
+      rcases wellFormed with ⟨namespaceStatus, plan, traceMatches, rollbackTrace,
+        noRollback, noReceipt, noTermination⟩
+      refine ⟨namespaceStatus, ?_, ?_⟩
+      · simpa [State.applySuccess, nextStage, List.append_assoc] using plan
+      · simp [State.applySuccess, phase, traceMatches, rollbackTrace,
+          noRollback, noReceipt, noTermination]
   | applyFailure phase nextStage =>
       rw [State.WellFormed, phase] at wellFormed
-      rcases wellFormed with ⟨plan, traceMatches, rollbackTrace,
+      rcases wellFormed with ⟨namespaceStatus, plan, traceMatches, rollbackTrace,
         noRollback, noReceipt, noTermination⟩
-      constructor
-      · exact plan
-      · by_cases noCompleted : before.completed = []
-        · simp [State.applyFailure, State.FailureContext, noCompleted, noReceipt,
-            rollbackTrace, nextStage, traceMatches, noTermination]
-        · have reverseNonempty : before.completed.reverse ≠ [] := by
-            simpa using noCompleted
-          simp [State.applyFailure, State.FailureContext, noCompleted,
-            rollbackTrace, reverseNonempty, noReceipt, nextStage, traceMatches,
-            noTermination]
+      refine ⟨namespaceStatus, plan, ?_⟩
+      by_cases noCompleted : before.completed = []
+      · simp [State.applyFailure, State.FailureContext, noCompleted, noReceipt,
+          rollbackTrace, nextStage, traceMatches, noTermination]
+      · have reverseNonempty : before.completed.reverse ≠ [] := by
+          simpa using noCompleted
+        simp [State.applyFailure, State.FailureContext, noCompleted,
+          rollbackTrace, reverseNonempty, noReceipt, nextStage, traceMatches,
+          noTermination]
   | rollback phase pending =>
       rw [State.WellFormed, phase] at wellFormed
-      rcases wellFormed with ⟨plan, rollbackPartition, pendingNonempty, noReceipt,
-        failureContext⟩
-      constructor
-      · exact plan
-      · rename_i stage remaining failed
-        by_cases noRemaining : remaining = []
-        · have partitionAfter : before.rollbackTrace ++ [stage] =
+      rcases wellFormed with ⟨namespaceStatus, plan, rollbackPartition,
+        pendingNonempty, noReceipt, failureContext⟩
+      refine ⟨namespaceStatus, plan, ?_⟩
+      rename_i stage remaining failed
+      by_cases noRemaining : remaining = []
+      · have partitionAfter : before.rollbackTrace ++ [stage] =
+            before.completed.reverse := by
+          rw [← rollbackPartition, pending, noRemaining]
+        simp [State.recordRollback, noRemaining, noReceipt, partitionAfter,
+          failureContext]
+        change before.FailureContext
+        exact failureContext
+      · have partitionAfter :
+            (before.rollbackTrace ++ [stage]) ++ remaining =
               before.completed.reverse := by
-            rw [← rollbackPartition, pending, noRemaining]
-          simp [State.recordRollback, noRemaining, noReceipt, partitionAfter,
-            failureContext]
-          change before.FailureContext
-          exact failureContext
-        · have partitionAfter :
-              (before.rollbackTrace ++ [stage]) ++ remaining =
-                before.completed.reverse := by
-            rw [← rollbackPartition, pending]
-            simp [List.append_assoc]
-          simp [State.recordRollback, noRemaining, partitionAfter, noReceipt,
-            failureContext]
-          change before.FailureContext
-          exact failureContext
-  | finish phase noRemaining complete =>
+          rw [← rollbackPartition, pending]
+          simp [List.append_assoc]
+        simp [State.recordRollback, noRemaining, partitionAfter, noReceipt,
+          failureContext]
+        change before.FailureContext
+        exact failureContext
+  | finish phase noRemaining complete namespaceComplete pidChildComplete =>
       rw [State.WellFormed, phase] at wellFormed
-      rcases wellFormed with ⟨plan, traceMatches, rollbackTrace,
+      rcases wellFormed with ⟨namespaceStatus, plan, traceMatches, rollbackTrace,
         noRollback, noReceipt, noTermination⟩
-      constructor
-      · exact plan
-      · simp [State.WellFormed, complete, noRemaining, traceMatches,
-          noTermination]
+      refine ⟨namespaceStatus, plan, ?_⟩
+      simp [State.WellFormed, complete, noRemaining, traceMatches,
+        namespaceComplete, pidChildComplete, noTermination]
 
 /-- A rolling-back state attempts exactly the successful prefix in reverse order. -/
 theorem State.rollback_partition {state : State} (wellFormed : state.WellFormed)
     (rollingBack : state.phase = .rollingBack) :
     state.rollbackTrace ++ state.rollbackPending = state.completed.reverse := by
   rw [State.WellFormed, rollingBack] at wellFormed
-  exact wellFormed.2.1
+  exact wellFormed.2.2.1
 
 /-- A success receipt cannot coexist with rollback. -/
 theorem State.receipt_excludes_rollback {state : State}
@@ -383,23 +455,23 @@ theorem State.receipt_excludes_rollback {state : State}
   cases phase : state.phase with
   | preflight =>
       rw [State.WellFormed, phase] at wellFormed
-      rcases wellFormed.2 with ⟨_, _, _, _, _, noReceipt, _⟩
+      rcases wellFormed.2.2 with ⟨_, _, _, _, _, _, _, noReceipt, _⟩
       rw [noReceipt] at receiptLookup
       cases receiptLookup
   | applying =>
       rw [State.WellFormed, phase] at wellFormed
-      rcases wellFormed.2 with ⟨_, _, _, noReceipt, _⟩
+      rcases wellFormed.2.2 with ⟨_, _, _, noReceipt, _⟩
       rw [noReceipt] at receiptLookup
       cases receiptLookup
   | rollingBack =>
       rw [State.WellFormed, phase] at wellFormed
-      rcases wellFormed.2 with ⟨_, _, noReceipt, _⟩
+      rcases wellFormed.2.2 with ⟨_, _, noReceipt, _⟩
       rw [noReceipt] at receiptLookup
       cases receiptLookup
   | succeeded => rfl
   | failed =>
       rw [State.WellFormed, phase] at wellFormed
-      rcases wellFormed.2 with ⟨_, noReceipt, _, _⟩
+      rcases wellFormed.2.2 with ⟨_, noReceipt, _, _⟩
       rw [noReceipt] at receiptLookup
       cases receiptLookup
 
@@ -408,14 +480,42 @@ theorem State.success_receipt_exact {state : State} (wellFormed : state.WellForm
     (succeeded : state.phase = .succeeded) :
     ∃ receipt, state.receipt = some receipt ∧ receipt.stages = requiredStages := by
   rw [State.WellFormed, succeeded] at wellFormed
-  exact wellFormed.2.2.2.2.1
+  rcases wellFormed.2.2 with ⟨_, _, _, _, _, ⟨receipt, lookup, stages, _⟩, _⟩
+  exact ⟨receipt, lookup, stages⟩
+
+/-- Every receipt proves that the workload child entered its PID namespace. -/
+theorem Receipt.pidChildEntered_complete (receipt : Receipt) :
+    receipt.pidChildEntered = true :=
+  receipt.pidChildComplete
+
+/-- A well-formed state without PID child entry cannot be complete. -/
+theorem State.pidChildIncomplete_not_succeeded {state : State}
+    (wellFormed : state.WellFormed)
+    (incomplete : state.pidChildEntered = false) :
+    state.phase ≠ .succeeded := by
+  intro succeeded
+  rw [State.WellFormed, succeeded] at wellFormed
+  rcases wellFormed.2.2 with ⟨_, _, _, _, childEntered, _, _⟩
+  rw [incomplete] at childEntered
+  cases childEntered
+
+/-- A well-formed state without PID child entry cannot expose a receipt. -/
+theorem State.pidChildIncomplete_has_no_receipt {state : State}
+    (wellFormed : state.WellFormed)
+    (incomplete : state.pidChildEntered = false) :
+    state.receipt = none := by
+  cases receiptLookup : state.receipt with
+  | none => rfl
+  | some receipt =>
+      have succeeded := State.receipt_excludes_rollback wellFormed receiptLookup
+      exact (State.pidChildIncomplete_not_succeeded wellFormed incomplete succeeded).elim
 
 /-- A terminal failure retains the complete reverse-prefix rollback trace. -/
 theorem State.failed_rollback_complete {state : State} (wellFormed : state.WellFormed)
     (failed : state.phase = .failed) :
     state.rollbackTrace = state.completed.reverse := by
   rw [State.WellFormed, failed] at wellFormed
-  exact wellFormed.2.2.2.1
+  exact wellFormed.2.2.2.2.1
 
 /-- Failure while attempting or after completing an irreversible stage requires termination. -/
 theorem State.applyFailure_marks_mustTerminate {state : State}
@@ -440,7 +540,8 @@ theorem Step.mustTerminate_monotone {before after : State}
     (transition : Step before after)
     (required : before.mustTerminate = true) : after.mustTerminate = true := by
   cases transition with
-  | beginApply | applySuccess | rollback | finish => exact required
+  | beginApply | namespaceCreated | pidChildEntered | applySuccess | rollback |
+      finish => exact required
   | applyFailure => simp [State.applyFailure, required]
 
 /-- Arbitrary finite isolation execution. -/

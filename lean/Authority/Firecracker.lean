@@ -159,27 +159,27 @@ theorem fingerprint_unchanged_by_vcpu_count (config : RuntimeConfig) (count : Na
 inductive GuestIdentityKind where
   | vm
   | session
+  | request
   | subject
   | capability
-  | brokerSession
   deriving Repr, BEq, DecidableEq
 
 /-- Fresh guest-visible identity bundle. -/
 structure IdentityBundle where
   vm : Nat
   session : Nat
+  request : Nat
   subject : Nat
   capability : Nat
-  brokerSession : Nat
   deriving DecidableEq
 
 /-- Select one identity domain from a bundle. -/
 def IdentityBundle.forKind (bundle : IdentityBundle) : GuestIdentityKind → Nat
   | .vm => bundle.vm
   | .session => bundle.session
+  | .request => bundle.request
   | .subject => bundle.subject
   | .capability => bundle.capability
-  | .brokerSession => bundle.brokerSession
 
 /-- Exact nonzero, pairwise-distinct, snapshot-fresh identity contract. -/
 def IdentityBundle.Valid (bundle : IdentityBundle) (forbidden : List Nat) : Prop :=

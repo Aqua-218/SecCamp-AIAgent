@@ -1,2 +1,23 @@
+# Rust build and coverage artifacts
 /target/
+*.profraw
+/coverage/
+
+# Lean build artifacts
 /lean/.lake/
+
+# Local Codex configuration and agent state
+/.codex/
+
+# Local secrets; keep a documented template trackable
+/.env
+/.env.*
+!/.env.example
+
+# Editor and operating-system temporary files
+/.idea/
+/.vscode/
+.DS_Store
+*.swp
+*.swo
+*~

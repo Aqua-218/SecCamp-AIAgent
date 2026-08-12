@@ -227,6 +227,13 @@ pub enum NamespaceError {
     NoOpenHandle(ObjectId),
     /// The namespace generation cannot advance without wrapping.
     NamespaceGenerationExhausted,
+    /// A directory stream's namespace snapshot is no longer current.
+    DirectoryGenerationChanged {
+        /// Generation captured when the directory stream was opened.
+        expected: NamespaceGeneration,
+        /// Generation observed before producing the next directory entries.
+        actual: NamespaceGeneration,
+    },
     /// Internal path and object indexes no longer describe the same tree.
     InvariantViolation,
 }
@@ -295,6 +302,12 @@ impl fmt::Display for NamespaceError {
             Self::NamespaceGenerationExhausted => {
                 formatter.write_str("namespace generation is exhausted")
             }
+            Self::DirectoryGenerationChanged { expected, actual } => write!(
+                formatter,
+                "directory stream generation changed from {} to {}",
+                expected.as_u64(),
+                actual.as_u64()
+            ),
             Self::InvariantViolation => {
                 formatter.write_str("namespace path and object indexes are inconsistent")
             }
@@ -609,7 +622,47 @@ impl NamespaceRegistry {
         directory: &ObjectId,
         operation: impl FnOnce(&NamespaceObject, &NamespaceObject, &[&NamespaceObject]) -> Result<T, E>,
     ) -> Result<T, NamespaceOperationError<E>> {
+        self.with_directory_children_checked(directory, None, operation)
+    }
+
+    /// Enumerates direct children only when a captured namespace generation is
+    /// still current.
+    ///
+    /// This gives stateful directory streams an explicit restart contract:
+    /// after any committed namespace create, remove, or rename, callers must
+    /// discard prior index cookies and begin a new stream. The check and the
+    /// child view share one read guard, so a mutation cannot race between them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NamespaceError::DirectoryGenerationChanged`] without invoking
+    /// `operation` when the captured generation is stale. Other errors match
+    /// [`Self::with_directory_children`].
+    pub fn with_directory_children_at_generation<T, E>(
+        &self,
+        directory: &ObjectId,
+        generation: NamespaceGeneration,
+        operation: impl FnOnce(&NamespaceObject, &NamespaceObject, &[&NamespaceObject]) -> Result<T, E>,
+    ) -> Result<T, NamespaceOperationError<E>> {
+        self.with_directory_children_checked(directory, Some(generation), operation)
+    }
+
+    fn with_directory_children_checked<T, E>(
+        &self,
+        directory: &ObjectId,
+        expected_generation: Option<NamespaceGeneration>,
+        operation: impl FnOnce(&NamespaceObject, &NamespaceObject, &[&NamespaceObject]) -> Result<T, E>,
+    ) -> Result<T, NamespaceOperationError<E>> {
         let state = self.read_state()?;
+        if let Some(expected) = expected_generation
+            && state.generation != expected
+        {
+            return Err(NamespaceError::DirectoryGenerationChanged {
+                expected,
+                actual: state.generation,
+            }
+            .into());
+        }
         let directory = state
             .objects
             .get(directory)

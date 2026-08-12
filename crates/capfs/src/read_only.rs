@@ -38,8 +38,8 @@ use rustix::fs::OFlags;
 use crate::{
     backing::{ImportedRepository, ValidatedRepository},
     namespace::{
-        NamespaceError, NamespaceObject, NamespaceObjectKind, NamespaceOperationError,
-        NamespaceRegistry, RenamePlan,
+        NamespaceError, NamespaceGeneration, NamespaceObject, NamespaceObjectKind,
+        NamespaceOperationError, NamespaceRegistry, RenamePlan,
     },
     node::{ForgetOutcome, NodeId, NodeTable, NodeTableError},
     runtime::{
@@ -276,7 +276,7 @@ impl FileOpenIntent {
 #[derive(Debug)]
 enum OpenBacking {
     File(OpenedBackingFile),
-    Directory,
+    Directory(NamespaceGeneration),
 }
 
 /// One metadata dimension accepted by the initial `SETATTR` policy.
@@ -305,7 +305,7 @@ impl OpenBacking {
     const fn kind(&self) -> OpenResourceKind {
         match self {
             Self::File(_) => OpenResourceKind::File,
-            Self::Directory => OpenResourceKind::Directory,
+            Self::Directory(_) => OpenResourceKind::Directory,
         }
     }
 }
@@ -359,6 +359,7 @@ enum AdapterError {
     NotDirectory,
     DirectoryNotEmpty,
     Busy,
+    TryAgain,
     InvalidRequest,
     BadHandle,
     Internal,
@@ -375,6 +376,7 @@ impl AdapterError {
             Self::NotDirectory => Errno::ENOTDIR,
             Self::DirectoryNotEmpty => Errno::ENOTEMPTY,
             Self::Busy => Errno::EBUSY,
+            Self::TryAgain => Errno::EAGAIN,
             Self::InvalidRequest => Errno::EINVAL,
             Self::BadHandle => Errno::EBADF,
             Self::Internal => Errno::EIO,
@@ -579,6 +581,10 @@ impl CapabilityFilesystem {
         if flags.acc_mode() != OpenAccMode::O_RDONLY || raw_flags.contains(OFlags::TRUNC) {
             return Err(AdapterError::Unsupported);
         }
+        let generation = self
+            .namespace
+            .generation()
+            .map_err(|_| AdapterError::Internal)?;
         self.open_resource(
             node,
             NamespaceObjectKind::Directory,
@@ -589,7 +595,7 @@ impl CapabilityFilesystem {
                     self.file_request(FileEffect::ListDirectory, path.clone()),
                 )
             },
-            |_| Ok(OpenBacking::Directory),
+            |_| Ok(OpenBacking::Directory(generation)),
         )
     }
 
@@ -1161,68 +1167,79 @@ impl CapabilityFilesystem {
         {
             return Err(AdapterError::BadHandle);
         }
+        let OpenBacking::Directory(generation) = resource.backing else {
+            return Err(AdapterError::BadHandle);
+        };
 
         self.namespace
-            .with_directory_children(&resource.object, |directory, parent, children| {
-                let request =
-                    self.file_request(FileEffect::ListDirectory, directory.path().clone());
-                self.kernel
-                    .authorize_and_commit(
-                        &self.authority.subject,
-                        &self.authority.capability,
-                        &request,
-                        |capability| {
-                            let mut entries = Vec::with_capacity(children.len() + 2);
-                            entries.push((Some(node), NamespaceObjectKind::Directory, ".".into()));
-                            entries.push((
-                                self.nodes
-                                    .node_for_object(parent.id())
-                                    .map_err(|_| AdapterError::Internal)?,
-                                NamespaceObjectKind::Directory,
-                                "..".into(),
-                            ));
-                            for child in children {
-                                if !self.capability_may_observe(capability, child.path()) {
-                                    continue;
-                                }
-                                let name = child
-                                    .path()
-                                    .as_segments()
-                                    .last()
-                                    .cloned()
-                                    .ok_or(AdapterError::Internal)?;
+            .with_directory_children_at_generation(
+                &resource.object,
+                generation,
+                |directory, parent, children| {
+                    let request =
+                        self.file_request(FileEffect::ListDirectory, directory.path().clone());
+                    self.kernel
+                        .authorize_and_commit(
+                            &self.authority.subject,
+                            &self.authority.capability,
+                            &request,
+                            |capability| {
+                                let mut entries = Vec::with_capacity(children.len() + 2);
+                                entries.push((
+                                    Some(node),
+                                    NamespaceObjectKind::Directory,
+                                    ".".into(),
+                                ));
                                 entries.push((
                                     self.nodes
-                                        .node_for_object(child.id())
+                                        .node_for_object(parent.id())
                                         .map_err(|_| AdapterError::Internal)?,
-                                    child.kind(),
-                                    name,
+                                    NamespaceObjectKind::Directory,
+                                    "..".into(),
                                 ));
-                            }
-                            if offset > entries.len() {
-                                return Err(AdapterError::InvalidRequest);
-                            }
-                            entries
-                                .into_iter()
-                                .enumerate()
-                                .skip(offset)
-                                .map(|(index, (node, kind, name))| {
-                                    let next_offset = index
-                                        .checked_add(1)
-                                        .and_then(|value| u64::try_from(value).ok())
+                                for child in children {
+                                    if !self.capability_may_observe(capability, child.path()) {
+                                        continue;
+                                    }
+                                    let name = child
+                                        .path()
+                                        .as_segments()
+                                        .last()
+                                        .cloned()
                                         .ok_or(AdapterError::Internal)?;
-                                    Ok(DirectoryEntry {
-                                        node,
-                                        kind,
+                                    entries.push((
+                                        self.nodes
+                                            .node_for_object(child.id())
+                                            .map_err(|_| AdapterError::Internal)?,
+                                        child.kind(),
                                         name,
-                                        next_offset,
+                                    ));
+                                }
+                                if offset > entries.len() {
+                                    return Err(AdapterError::InvalidRequest);
+                                }
+                                entries
+                                    .into_iter()
+                                    .enumerate()
+                                    .skip(offset)
+                                    .map(|(index, (node, kind, name))| {
+                                        let next_offset = index
+                                            .checked_add(1)
+                                            .and_then(|value| u64::try_from(value).ok())
+                                            .ok_or(AdapterError::Internal)?;
+                                        Ok(DirectoryEntry {
+                                            node,
+                                            kind,
+                                            name,
+                                            next_offset,
+                                        })
                                     })
-                                })
-                                .collect()
-                        },
-                    )
-                    .map_err(|error| map_effect_error(&error))
-            })
+                                    .collect()
+                            },
+                        )
+                        .map_err(|error| map_effect_error(&error))
+                },
+            )
             .map_err(|error| map_namespace_operation_error(&error))
     }
 
@@ -1902,6 +1919,9 @@ const fn map_namespace_operation_error(
         NamespaceOperationError::Namespace(NamespaceError::DirectoryNotEmpty(_)) => {
             AdapterError::DirectoryNotEmpty
         }
+        NamespaceOperationError::Namespace(NamespaceError::DirectoryGenerationChanged {
+            ..
+        }) => AdapterError::TryAgain,
         NamespaceOperationError::Namespace(NamespaceError::DestinationInsideSource) => {
             AdapterError::InvalidRequest
         }
@@ -2848,6 +2868,53 @@ mod tests {
                 .map(|value| value.map(|record| record.open_handle_count())),
             Ok(Some(0))
         );
+    }
+
+    // Requirement: a directory handle never applies an old cookie to a
+    // changed namespace. Category: FUSE/readdir. Risk: high.
+    #[test]
+    fn directory_listing_requires_restart_after_namespace_mutation() {
+        let (_directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::from_effects([
+                FileEffect::ListDirectory,
+                FileEffect::CreateFile,
+                FileEffect::WriteData,
+            ]),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("directory authority must expose the test directory");
+        let directory_handle = filesystem
+            .open_directory(scoped.node, OpenFlags(0))
+            .expect("ListDirectory must open the initial stream");
+        assert!(
+            filesystem
+                .read_directory(scoped.node, directory_handle, 0)
+                .is_ok(),
+            "the generation captured at open must list the initial namespace"
+        );
+
+        let created = filesystem
+            .create_file(
+                scoped.node,
+                "later.txt",
+                0o600,
+                0,
+                create_flags(OFlags::WRONLY),
+            )
+            .expect("a capability-authorized creation must advance the namespace generation");
+        filesystem
+            .release_file(created.node, created.handle)
+            .expect("the test creation handle must release normally");
+        assert_eq!(
+            filesystem.read_directory(scoped.node, directory_handle, 2),
+            Err(AdapterError::TryAgain),
+            "the caller must restart after the namespace changed"
+        );
+        filesystem
+            .release_directory(scoped.node, directory_handle)
+            .expect("a stale directory handle must still release normally");
     }
 
     #[test]

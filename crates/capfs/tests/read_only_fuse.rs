@@ -64,7 +64,11 @@ fn mount_directory_view() -> MountedDirectoryView {
     ))));
     let authority = AuthorityBody::File(FileAuthority::new(
         repository.clone(),
-        FileEffects::only(FileEffect::ListDirectory),
+        FileEffects::from_effects([
+            FileEffect::ListDirectory,
+            FileEffect::CreateFile,
+            FileEffect::WriteData,
+        ]),
         PathPattern::Prefix(CanonicalPath::root()),
     ));
     kernel
@@ -79,7 +83,11 @@ fn mount_directory_view() -> MountedDirectoryView {
             validity,
             AuthorityBody::File(FileAuthority::new(
                 repository.clone(),
-                FileEffects::only(FileEffect::ListDirectory),
+                FileEffects::from_effects([
+                    FileEffect::ListDirectory,
+                    FileEffect::CreateFile,
+                    FileEffect::WriteData,
+                ]),
                 PathPattern::Prefix(
                     CanonicalPath::new(["scoped"]).expect("test path must be canonical"),
                 ),
@@ -704,6 +712,56 @@ fn mounted_directory_stream_denies_readdir_after_revoke() {
                 .expect("a second READDIR request must be attempted")
                 .expect_err("an existing directory stream must reauthorize after revoke"),
             rustix::io::Errno::ACCESS
+        );
+    }
+    drop(directory);
+    drop(session);
+}
+
+// Requirement: a directory stream reports EAGAIN after a namespace mutation,
+// so the kernel never uses a cookie against a different child set. Category:
+// FUSE/readdir. Risk: high.
+#[test]
+fn mounted_directory_stream_requires_restart_after_namespace_mutation() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+    let (_backing, mountpoint, _kernel, _capability, session) = mount_directory_view();
+    let scoped_mount = mountpoint.path().join("scoped");
+    let directory = open(
+        &scoped_mount,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("ListDirectory must authorize opening the test directory");
+    // Forty bytes hold one 32-byte dot entry after any alignment trim, forcing
+    // a second iterator step to send another READDIR request to capfs.
+    let mut buffer = [MaybeUninit::uninit(); 40];
+    {
+        let mut entries = RawDir::new(&directory, &mut buffer);
+        let first = entries
+            .next()
+            .expect("directory stream must contain its dot entry")
+            .expect("first authorized READDIR must succeed");
+        assert_eq!(first.file_name().to_bytes(), b".");
+
+        let mut created = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(scoped_mount.join("later.txt"))
+            .expect("CreateFile and WriteData must mutate the namespace");
+        created
+            .write_all(b"later")
+            .expect("the created FUSE file must be writable");
+        drop(created);
+
+        assert_eq!(
+            entries
+                .next()
+                .expect("a second READDIR request must be attempted")
+                .expect_err("the old stream must not enumerate after mutation"),
+            rustix::io::Errno::AGAIN
         );
     }
     drop(directory);

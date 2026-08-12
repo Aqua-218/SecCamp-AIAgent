@@ -495,6 +495,49 @@ fn directory_listing_is_direct_ordered_and_requires_a_directory() {
     );
 }
 
+// Requirement: a stateful READDIR stream must restart after the namespace
+// changes, rather than interpreting an old index against new children.
+// Category: listing/cursor. Risk: high.
+#[test]
+fn directory_listing_rejects_a_stale_generation_before_its_executor() {
+    let registry = NamespaceRegistry::new();
+    let root = registry
+        .object_at_path_snapshot(&CanonicalPath::root())
+        .expect("test registry should be readable")
+        .expect("test registry should contain its root")
+        .id()
+        .clone();
+    let generation = registry
+        .generation()
+        .expect("initial generation must be readable");
+    create_object(
+        &registry,
+        path(&["created.txt"]),
+        NamespaceObjectKind::RegularFile,
+    );
+    let actual = registry
+        .generation()
+        .expect("committed creation must advance the generation");
+    let executor_called = AtomicBool::new(false);
+
+    assert_eq!(
+        registry.with_directory_children_at_generation(&root, generation, |_, _, _| {
+            executor_called.store(true, Ordering::SeqCst);
+            Ok::<_, Infallible>(())
+        }),
+        Err(NamespaceOperationError::Namespace(
+            NamespaceError::DirectoryGenerationChanged {
+                expected: generation,
+                actual,
+            }
+        ))
+    );
+    assert!(
+        !executor_called.load(Ordering::SeqCst),
+        "a stale cursor must not enumerate a changed namespace"
+    );
+}
+
 // Requirement: the READDIR child view remains fixed through its operation.
 // Category: listing/concurrency. Risk: critical.
 #[test]

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/authority-core", "crates/capfs"]
+members = ["crates/authority-core", "crates/capfs", "crates/egress-protocol"]
 resolver = "3"
 
 [workspace.package]

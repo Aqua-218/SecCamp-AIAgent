@@ -16,8 +16,8 @@ use crate::session::{BrokerRequestId, MAX_CONTROL_FRAME_BYTES};
 
 /// The only accepted response schema version.
 pub const BROKER_RESPONSE_VERSION: u64 = 1;
-/// Maximum public body carried in one control response.
-pub const MAX_PUBLIC_WIRE_BODY_BYTES: usize = 512 * 1024;
+/// Maximum public body carried in one control response and admitted by dispatch.
+pub const MAX_PUBLIC_WIRE_BODY_BYTES: u64 = 512 * 1024;
 /// Maximum provider bytes that a GitHub success may report.
 pub const MAX_GITHUB_WIRE_RESPONSE_BYTES: u64 = 1024 * 1024;
 
@@ -61,7 +61,7 @@ impl PublicWireResponse {
         {
             return Err(ResponseCborError::InvalidValue);
         }
-        if body.len() > MAX_PUBLIC_WIRE_BODY_BYTES {
+        if body.len() > max_public_wire_body_bytes_as_usize() {
             return Err(ResponseCborError::PayloadTooLarge { length: body.len() });
         }
         Ok(Self {
@@ -461,6 +461,11 @@ fn valid_object_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn max_public_wire_body_bytes_as_usize() -> usize {
+    usize::try_from(MAX_PUBLIC_WIRE_BODY_BYTES)
+        .expect("the public wire body cap must fit the decoder address space")
+}
+
 fn write_array(output: &mut Vec<u8>, length: u64) {
     write_head(output, 4, length);
 }
@@ -530,7 +535,7 @@ impl<'input> Decoder<'input> {
             u16::try_from(self.unsigned()?).map_err(|_| ResponseCborError::InvalidValue)?;
         let host_text = self.text(MAX_HOST_BYTES)?;
         let path_text = self.text(MAX_PATH_BYTES)?;
-        let body = self.bytes(MAX_PUBLIC_WIRE_BODY_BYTES)?;
+        let body = self.bytes(max_public_wire_body_bytes_as_usize())?;
         let host = CanonicalHost::new(host_text).map_err(|_| ResponseCborError::InvalidValue)?;
         let path = CanonicalUrlPath::new(path_text).map_err(|_| ResponseCborError::InvalidValue)?;
         PublicWireResponse::new(status, host, path, body.to_vec())
@@ -689,7 +694,9 @@ mod tests {
 
     use super::{
         BROKER_RESPONSE_VERSION, BrokerWireOutcome, BrokerWireRejection, CanonicalBrokerResponse,
-        GitHubWireResponse, MAX_PUBLIC_WIRE_BODY_BYTES, PublicWireResponse, ResponseCborError,
+        GitHubWireResponse, MAX_PUBLIC_WIRE_BODY_BYTES, PUBLIC_ITEMS, PUBLIC_SUCCESS,
+        PublicWireResponse, RESPONSE_ITEMS, ResponseCborError, write_array, write_bytes,
+        write_text, write_unsigned,
     };
     use crate::session::{BrokerRequestId, MAX_CONTROL_FRAME_BYTES};
 
@@ -710,6 +717,20 @@ mod tests {
                 .expect("public fixture fits"),
             ),
         )
+    }
+
+    fn canonical_public_with_body(body: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        write_array(&mut encoded, RESPONSE_ITEMS);
+        write_unsigned(&mut encoded, BROKER_RESPONSE_VERSION);
+        write_bytes(&mut encoded, request().as_bytes());
+        write_unsigned(&mut encoded, PUBLIC_SUCCESS);
+        write_array(&mut encoded, PUBLIC_ITEMS);
+        write_unsigned(&mut encoded, 200);
+        write_text(&mut encoded, "docs.example");
+        write_text(&mut encoded, "/guide");
+        write_bytes(&mut encoded, body);
+        encoded
     }
 
     #[test]
@@ -744,13 +765,9 @@ mod tests {
         let host = CanonicalHost::new("docs.example").expect("host fixture is canonical");
         let path = CanonicalUrlPath::new("/guide").expect("path fixture is canonical");
         assert_eq!(
-            PublicWireResponse::new(99, host.clone(), path.clone(), Vec::new()),
+            PublicWireResponse::new(99, host, path, Vec::new()),
             Err(ResponseCborError::InvalidValue)
         );
-        assert!(matches!(
-            PublicWireResponse::new(200, host, path, vec![0; MAX_PUBLIC_WIRE_BODY_BYTES + 1]),
-            Err(ResponseCborError::PayloadTooLarge { .. })
-        ));
         assert_eq!(
             GitHubWireResponse::new(GitHubOperation::PublishBranch, 1, None, None),
             Err(ResponseCborError::InvalidValue)
@@ -767,6 +784,53 @@ mod tests {
                 Some("ABCDEF0123456789ABCDEF0123456789ABCDEF01".to_owned())
             ),
             Err(ResponseCborError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn public_body_at_wire_cap_has_one_canonical_round_trip() {
+        let maximum = usize::try_from(MAX_PUBLIC_WIRE_BODY_BYTES)
+            .expect("wire body cap must fit the test address space");
+        let body = vec![0xa5; maximum];
+        let response = CanonicalBrokerResponse::new(
+            request(),
+            BrokerWireOutcome::Public(
+                PublicWireResponse::new(
+                    200,
+                    CanonicalHost::new("docs.example").expect("host fixture is canonical"),
+                    CanonicalUrlPath::new("/guide").expect("path fixture is canonical"),
+                    body.clone(),
+                )
+                .expect("a body exactly at the wire cap must fit"),
+            ),
+        );
+        let canonical = canonical_public_with_body(&body);
+
+        assert_eq!(response.encode(), Ok(canonical.clone()));
+        assert_eq!(CanonicalBrokerResponse::decode(&canonical), Ok(response));
+    }
+
+    #[test]
+    fn public_body_one_byte_over_wire_cap_is_rejected_canonically() {
+        let length = usize::try_from(MAX_PUBLIC_WIRE_BODY_BYTES)
+            .expect("wire body cap must fit the test address space")
+            + 1;
+        let body = vec![0xa5; length];
+        assert_eq!(
+            PublicWireResponse::new(
+                200,
+                CanonicalHost::new("docs.example").expect("host fixture is canonical"),
+                CanonicalUrlPath::new("/guide").expect("path fixture is canonical"),
+                body.clone(),
+            ),
+            Err(ResponseCborError::PayloadTooLarge { length })
+        );
+
+        let canonical = canonical_public_with_body(&body);
+        assert!(canonical.len() <= MAX_CONTROL_FRAME_BYTES);
+        assert_eq!(
+            CanonicalBrokerResponse::decode(&canonical),
+            Err(ResponseCborError::PayloadTooLarge { length })
         );
     }
 

@@ -550,6 +550,103 @@ inductive Steps : State → State → Prop
   | tail {first middle last : State} :
       Steps first middle → Step middle last → Steps first last
 
+/-!
+## Owned Linux child lifecycle
+
+The coordinator state above covers the ordered isolation transaction. The
+following state machine covers the separate parent-owned process capability:
+readiness requires a final parent-liveness proof, and relinquishing ownership
+requires an observed reap rather than a best-effort signal.
+-/
+
+/-- Parent-owned lifecycle states for the direct PID-namespace child. -/
+inductive ChildLifecycle where
+  | starting
+  | ready
+  | killPending
+  | exited
+  | reaped
+  deriving Repr, BEq, DecidableEq
+
+/-- Concrete kernel evidence checked immediately before a ready notification. -/
+structure ChildReadyEvidence where
+  parentDeathSignalIsKill : Bool
+  startupReaderAlive : Bool
+  sourcePinnedBeforePivot : Bool
+  mountedSourceMatchesPin : Bool
+  deriving Repr, BEq, DecidableEq
+
+/-- Executable readiness predicate shaped like the Rust startup checks. -/
+def ChildReadyEvidence.checks (evidence : ChildReadyEvidence) : Bool :=
+  evidence.parentDeathSignalIsKill && evidence.startupReaderAlive &&
+    evidence.sourcePinnedBeforePivot && evidence.mountedSourceMatchesPin
+
+/-- Kernel events that may change or observe ownership of the direct child. -/
+inductive ChildLifecycleStep : ChildLifecycle → ChildLifecycle → Prop where
+  | ready (evidence : ChildReadyEvidence) : evidence.checks = true →
+      ChildLifecycleStep .starting .ready
+  | startupFailure : ChildLifecycleStep .starting .killPending
+  | parentDeath : ChildLifecycleStep .ready .killPending
+  | drop : ChildLifecycleStep .ready .killPending
+  | signalExit (terminationRequested childExited : Bool) :
+      terminationRequested = true → childExited = true →
+        ChildLifecycleStep .killPending .exited
+  | observeExit : ChildLifecycleStep .ready .exited
+  | reap (waitObserved : Bool) : waitObserved = true →
+      ChildLifecycleStep .exited .reaped
+
+/-- Arbitrary finite owned-child execution. -/
+inductive ChildLifecycleSteps : ChildLifecycle → ChildLifecycle → Prop where
+  | refl (state : ChildLifecycle) : ChildLifecycleSteps state state
+  | tail {first middle last : ChildLifecycle} :
+      ChildLifecycleSteps first middle → ChildLifecycleStep middle last →
+        ChildLifecycleSteps first last
+
+/-- A successful readiness transition contains every final kernel observation. -/
+theorem ChildLifecycleStep.ready_evidence_complete
+    {evidence : ChildReadyEvidence}
+    (checked : evidence.checks = true) :
+      evidence.parentDeathSignalIsKill = true ∧
+      evidence.startupReaderAlive = true ∧
+      evidence.sourcePinnedBeforePivot = true ∧
+      evidence.mountedSourceMatchesPin = true := by
+  simp [ChildReadyEvidence.checks] at checked
+  exact ⟨checked.1.1.1, checked.1.1.2, checked.1.2, checked.2⟩
+
+/-- A parent death reaches the kill-pending state through a concrete transition. -/
+theorem ChildLifecycle.parentDeath_requires_kill :
+    ChildLifecycleStep .ready .killPending :=
+  ChildLifecycleStep.parentDeath
+
+/-- No transition releases a live or merely exited child directly to reaped. -/
+theorem ChildLifecycleStep.reaped_has_exited_predecessor
+    {before : ChildLifecycle}
+    (transition : ChildLifecycleStep before .reaped) : before = .exited := by
+  cases transition
+  rfl
+
+/-- Parent death followed by termination and wait reaches an observed reap. -/
+theorem ChildLifecycle.parentDeath_kill_reap_trace :
+    ∀ terminationRequested childExited waitObserved,
+      terminationRequested = true → childExited = true → waitObserved = true →
+        ChildLifecycleSteps .ready .reaped := by
+  intro terminationRequested childExited waitObserved termination exit waited
+  exact .tail
+    (.tail (.tail (.refl .ready) .parentDeath)
+      (.signalExit terminationRequested childExited termination exit))
+    (.reap waitObserved waited)
+
+/-- Drop has the same non-detaching kill-and-reap trace as parent-side failure. -/
+theorem ChildLifecycle.drop_kill_reap_trace :
+    ∀ terminationRequested childExited waitObserved,
+      terminationRequested = true → childExited = true → waitObserved = true →
+        ChildLifecycleSteps .ready .reaped := by
+  intro terminationRequested childExited waitObserved termination exit waited
+  exact .tail
+    (.tail (.tail (.refl .ready) .drop)
+      (.signalExit terminationRequested childExited termination exit))
+    (.reap waitObserved waited)
+
 /-- Child-termination obligation persists across arbitrary retries and finishes. -/
 theorem Steps.mustTerminate_monotone {before after : State}
     (transitions : Steps before after)

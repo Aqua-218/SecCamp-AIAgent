@@ -53,6 +53,75 @@ def ProperDescendant (child ancestor : CanonicalPath) : Prop :=
 def AtOrBelow (path subtreeRoot : CanonicalPath) : Prop :=
   ∃ suffix, path.segments = subtreeRoot.segments ++ suffix
 
+/-- Canonical paths are determined by their validated segment lists. -/
+theorem canonicalPath_eq {first second : CanonicalPath}
+    (segmentsEqual : first.segments = second.segments) : first = second := by
+  cases first
+  cases second
+  simp_all
+
+/-- The executable prefix test recognizes exactly subtree membership. -/
+theorem isPrefixOf_eq_true_iff_atOrBelow {path subtreeRoot : CanonicalPath} :
+    subtreeRoot.segments.isPrefixOf path.segments = true ↔
+      AtOrBelow path subtreeRoot := by
+  rw [List.isPrefixOf_iff_prefix]
+  constructor
+  · rintro ⟨suffix, equality⟩
+    exact ⟨suffix, equality.symm⟩
+  · rintro ⟨suffix, equality⟩
+    exact ⟨suffix, equality.symm⟩
+
+/-- Dropping a prefix cannot introduce an invalid path segment. -/
+private theorem all_drop_of_all {predicate : α → Bool} {items : List α}
+    (count : Nat) (allItems : items.all predicate = true) :
+    (items.drop count).all predicate = true := by
+  induction count generalizing items with
+  | zero => exact allItems
+  | succ count inductionHypothesis =>
+      cases items with
+      | nil => simp
+      | cons item items =>
+          simp only [List.all_cons, Bool.and_eq_true] at allItems
+          exact inductionHypothesis allItems.2
+
+/-- Rebase a path under `source`, preserving its suffix; other paths are fixed. -/
+def rebasePath (path source destination : CanonicalPath) : CanonicalPath :=
+  if source.segments.isPrefixOf path.segments then
+    { segments := destination.segments ++ path.segments.drop source.segments.length
+      isValid := by
+        simp [List.all_append, destination.isValid,
+          all_drop_of_all source.segments.length path.isValid] }
+  else
+    path
+
+/-- Rebasing a path in the selected subtree preserves its exact suffix. -/
+theorem rebasePath_atOrBelow {path source destination : CanonicalPath}
+    {suffix : List String}
+    (pathEquality : path.segments = source.segments ++ suffix) :
+    (rebasePath path source destination).segments =
+      destination.segments ++ suffix := by
+  simp [rebasePath, pathEquality]
+
+/-- Rebasing fixes every path outside the selected subtree. -/
+theorem rebasePath_outside {path source destination : CanonicalPath}
+    (outside : ¬ AtOrBelow path source) :
+    rebasePath path source destination = path := by
+  have prefixIsFalse : source.segments.isPrefixOf path.segments = false := by
+    apply Bool.eq_false_iff.mpr
+    intro prefixIsTrue
+    exact outside (isPrefixOf_eq_true_iff_atOrBelow.mp prefixIsTrue)
+  simp [rebasePath, prefixIsFalse]
+
+/-- The root is outside every proper non-root subtree. -/
+theorem root_outside_subtree {subtreeRoot : CanonicalPath}
+    (notRoot : subtreeRoot ≠ CanonicalPath.root) :
+    ¬ AtOrBelow CanonicalPath.root subtreeRoot := by
+  rintro ⟨suffix, equality⟩
+  have appendIsEmpty : subtreeRoot.segments ++ suffix = [] := by
+    simpa [CanonicalPath.root] using equality.symm
+  have subtreeSegmentsEmpty := (List.append_eq_nil.mp appendIsEmpty).1
+  exact notRoot (canonicalPath_eq subtreeSegmentsEmpty)
+
 /-- Every immediate child is a proper descendant of its parent. -/
 theorem directParent_implies_properDescendant {parent child : CanonicalPath}
     (directParent : DirectParent parent child) : ProperDescendant child parent := by
@@ -505,35 +574,122 @@ theorem remove_preserves_treeWellFormed {state : NamespaceState}
     parentKind, directParent⟩
 
 /--
-A reversible subtree rebase. `sourceSubtreeRebased` fixes the exact suffix of
-every moved path. Parent edges are preserved except at the moved root, whose
-new parent is validated by `MayRename`.
+A subtree rebase request. Unlike a permutation of all canonical paths, this
+contains only the two roots used by Rust's finite live-namespace transaction.
 -/
 structure PathRenaming where
   source : CanonicalPath
   destination : CanonicalPath
-  forward : CanonicalPath → CanonicalPath
-  inverse : CanonicalPath → CanonicalPath
-  inverseForward : ∀ path, inverse (forward path) = path
-  forwardInverse : ∀ path, forward (inverse path) = path
-  preservesRoot : forward CanonicalPath.root = CanonicalPath.root
-  mapsSource : forward source = destination
-  sourceSubtreeRebased : ∀ path suffix,
-    path.segments = source.segments ++ suffix →
-      (forward path).segments = destination.segments ++ suffix
-  preservesDirectParentExceptSource : ∀ {parent child},
-    child ≠ source →
-      DirectParent parent child → DirectParent (forward parent) (forward child)
 
 namespace PathRenaming
 
-/-- A reversible path transformation is injective. -/
-theorem forward_injective (pathMapping : PathRenaming) :
-    ∀ {first second}, pathMapping.forward first = pathMapping.forward second →
-      first = second := by
-  intro first second sameDestination
-  have := congrArg pathMapping.inverse sameDestination
-  simpa [pathMapping.inverseForward] using this
+/-- Construct the unique suffix-preserving rebase request for any two paths. -/
+def between (source destination : CanonicalPath) : PathRenaming :=
+  { source, destination }
+
+/-- Every source/destination pair has a concrete subtree-rebase witness. -/
+theorem exists_between (source destination : CanonicalPath) :
+    ∃ pathMapping : PathRenaming,
+      pathMapping.source = source ∧ pathMapping.destination = destination := by
+  exact ⟨between source destination, rfl, rfl⟩
+
+/-- Rebase one path from the requested source to destination subtree. -/
+def forward (pathMapping : PathRenaming) (path : CanonicalPath) : CanonicalPath :=
+  rebasePath path pathMapping.source pathMapping.destination
+
+/-- Recover an old source path from a path in the destination subtree. -/
+def inverse (pathMapping : PathRenaming) (path : CanonicalPath) : CanonicalPath :=
+  rebasePath path pathMapping.destination pathMapping.source
+
+/-- The moved subtree root maps to the requested destination. -/
+theorem mapsSource (pathMapping : PathRenaming) :
+    pathMapping.forward pathMapping.source = pathMapping.destination := by
+  apply canonicalPath_eq
+  change (rebasePath pathMapping.source pathMapping.source
+    pathMapping.destination).segments = pathMapping.destination.segments
+  simpa using (rebasePath_atOrBelow
+    (path := pathMapping.source) (source := pathMapping.source)
+    (destination := pathMapping.destination) (suffix := []) (by simp))
+
+/-- Every moved path retains its exact suffix. -/
+theorem sourceSubtreeRebased (pathMapping : PathRenaming) {path : CanonicalPath}
+    {suffix : List String}
+    (pathEquality : path.segments = pathMapping.source.segments ++ suffix) :
+    (pathMapping.forward path).segments =
+      pathMapping.destination.segments ++ suffix := by
+  exact rebasePath_atOrBelow pathEquality
+
+/-- The local inverse restores every path in the destination subtree. -/
+theorem destinationSubtreeRestored (pathMapping : PathRenaming)
+    {path : CanonicalPath} {suffix : List String}
+    (pathEquality : path.segments = pathMapping.destination.segments ++ suffix) :
+    (pathMapping.inverse path).segments =
+      pathMapping.source.segments ++ suffix := by
+  exact rebasePath_atOrBelow pathEquality
+
+/-- The local inverse cancels forward rebasing on the source subtree. -/
+theorem inverseForward_atOrBelow (pathMapping : PathRenaming)
+    {path : CanonicalPath} (inSource : AtOrBelow path pathMapping.source) :
+    pathMapping.inverse (pathMapping.forward path) = path := by
+  rcases inSource with ⟨suffix, pathEquality⟩
+  apply canonicalPath_eq
+  rw [pathMapping.destinationSubtreeRestored
+    (pathMapping.sourceSubtreeRebased pathEquality), pathEquality]
+
+/-- Forward rebasing cancels the local inverse on the destination subtree. -/
+theorem forwardInverse_atOrBelow (pathMapping : PathRenaming)
+    {path : CanonicalPath} (inDestination : AtOrBelow path pathMapping.destination) :
+    pathMapping.forward (pathMapping.inverse path) = path := by
+  rcases inDestination with ⟨suffix, pathEquality⟩
+  apply canonicalPath_eq
+  rw [pathMapping.sourceSubtreeRebased
+    (pathMapping.destinationSubtreeRestored pathEquality), pathEquality]
+
+/-- Paths outside the moved source subtree remain unchanged. -/
+theorem forward_outside (pathMapping : PathRenaming) {path : CanonicalPath}
+    (outside : ¬ AtOrBelow path pathMapping.source) :
+    pathMapping.forward path = path := by
+  exact rebasePath_outside outside
+
+/-- Rebasing preserves every parent edge except the edge entering the moved root. -/
+theorem preservesDirectParentExceptSource (pathMapping : PathRenaming)
+    {parent child : CanonicalPath} (childIsNotSource : child ≠ pathMapping.source)
+    (directParent : DirectParent parent child) :
+    DirectParent (pathMapping.forward parent) (pathMapping.forward child) := by
+  rcases directParent with ⟨segment, childEquality⟩
+  by_cases childInSource : AtOrBelow child pathMapping.source
+  · have sourcePrefixChild : pathMapping.source.segments <+: child.segments := by
+      rcases childInSource with ⟨suffix, equality⟩
+      exact ⟨suffix, equality.symm⟩
+    have parentPrefixChild : parent.segments <+: child.segments :=
+      ⟨[segment], childEquality.symm⟩
+    have sourceLengthLess : pathMapping.source.segments.length < child.segments.length := by
+      apply Nat.lt_of_le_of_ne sourcePrefixChild.length_le
+      intro lengthsEqual
+      have sourceEqualsChild := sourcePrefixChild.eq_of_length lengthsEqual
+      exact childIsNotSource (canonicalPath_eq sourceEqualsChild.symm)
+    have sourcePrefixParent : pathMapping.source.segments <+: parent.segments :=
+      List.prefix_of_prefix_length_le sourcePrefixChild parentPrefixChild (by
+        have childLength : child.segments.length = parent.segments.length + 1 := by
+          simp [childEquality]
+        omega)
+    rcases sourcePrefixParent with ⟨parentSuffix, parentEquality⟩
+    have childSuffixEquality :
+        child.segments = pathMapping.source.segments ++ (parentSuffix ++ [segment]) := by
+      rw [childEquality, ← parentEquality, List.append_assoc]
+    exact ⟨segment, by
+      rw [pathMapping.sourceSubtreeRebased parentEquality.symm,
+        pathMapping.sourceSubtreeRebased childSuffixEquality]
+      simp [List.append_assoc]⟩
+  · have parentOutsideSource : ¬ AtOrBelow parent pathMapping.source := by
+      intro parentInSource
+      rcases parentInSource with ⟨suffix, parentEquality⟩
+      apply childInSource
+      exact ⟨suffix ++ [segment], by
+        rw [childEquality, parentEquality, List.append_assoc]⟩
+    simpa [pathMapping.forward_outside parentOutsideSource,
+      pathMapping.forward_outside childInSource] using
+      (⟨segment, childEquality⟩ : DirectParent parent child)
 
 end PathRenaming
 
@@ -554,21 +710,27 @@ structure MayRename (state : NamespaceState) (pathMapping : PathRenaming) : Prop
     parent.kind = .directory ∧
     DirectParent parent.path pathMapping.destination ∧
     pathMapping.forward parent.path = parent.path
-  outsideSourceUnchanged : ∀ objectId object,
-    state.objects objectId = some object →
-      ¬ AtOrBelow object.path pathMapping.source →
-      pathMapping.forward object.path = object.path
   movedHandlesClosed : ∀ objectId object,
     state.objects objectId = some object →
       AtOrBelow object.path pathMapping.source →
       object.openHandleCount = 0
 
-/-- Rename every live path through one reversible transformation. -/
+/-- Rebuild the path index exactly as Rust removes sources then inserts destinations. -/
+def renamedPaths (state : NamespaceState) (pathMapping : PathRenaming) :
+    CanonicalPath → Option ObjectId := fun path =>
+  if pathMapping.destination.segments.isPrefixOf path.segments then
+    state.paths (pathMapping.inverse path)
+  else if pathMapping.source.segments.isPrefixOf path.segments then
+    none
+  else
+    state.paths path
+
+/-- Rename every live path in the selected source subtree. -/
 def renamePaths (state : NamespaceState) (pathMapping : PathRenaming) : NamespaceState :=
   { state with
     objects := fun objectId => (state.objects objectId).map
       (fun object => { object with path := pathMapping.forward object.path })
-    paths := fun path => state.paths (pathMapping.inverse path)
+    paths := renamedPaths state pathMapping
     generation := state.generation + 1 }
 
 /-- Rename never changes object identity, kind, or open-handle count. -/
@@ -580,9 +742,40 @@ theorem rename_preserves_object_fields {state : NamespaceState}
     } := by
   simp [renamePaths, lookup]
 
-/-- Reciprocal indexes remain well formed under every reversible path rename. -/
+/-- The rebuilt index stores the new path of every old live object. -/
+theorem rename_stores_path {state : NamespaceState} {pathMapping : PathRenaming}
+    (allowed : state.MayRename pathMapping) {objectId : ObjectId}
+    {object : NamespaceObject}
+    (objectLookup : state.objects objectId = some object)
+    (pathLookup : state.paths object.path = some objectId) :
+    (state.renamePaths pathMapping).paths (pathMapping.forward object.path) =
+      some objectId := by
+  by_cases inSource : AtOrBelow object.path pathMapping.source
+  · rcases inSource with ⟨suffix, pathEquality⟩
+    have destinationPrefix :
+        pathMapping.destination.segments.isPrefixOf
+          (pathMapping.forward object.path).segments = true :=
+      isPrefixOf_eq_true_iff_atOrBelow.mpr
+        ⟨suffix, pathMapping.sourceSubtreeRebased pathEquality⟩
+    simp [renamePaths, renamedPaths, destinationPrefix,
+      pathMapping.inverseForward_atOrBelow ⟨suffix, pathEquality⟩, pathLookup]
+  · have pathUnchanged := pathMapping.forward_outside inSource
+    have outsideDestination := allowed.destinationSubtreeEmpty objectId object objectLookup
+    have destinationPrefix :
+        pathMapping.destination.segments.isPrefixOf object.path.segments = false :=
+      Bool.eq_false_iff.mpr fun prefixIsTrue =>
+        outsideDestination (isPrefixOf_eq_true_iff_atOrBelow.mp prefixIsTrue)
+    have sourcePrefix :
+        pathMapping.source.segments.isPrefixOf object.path.segments = false :=
+      Bool.eq_false_iff.mpr fun prefixIsTrue =>
+        inSource (isPrefixOf_eq_true_iff_atOrBelow.mp prefixIsTrue)
+    simp [renamePaths, renamedPaths, pathUnchanged, destinationPrefix,
+      sourcePrefix, pathLookup]
+
+/-- Reciprocal indexes remain well formed under a valid finite subtree rebase. -/
 theorem rename_preserves_wellFormed {state : NamespaceState}
-    (wellFormed : state.WellFormed) (pathMapping : PathRenaming) :
+    (wellFormed : state.WellFormed) (pathMapping : PathRenaming)
+    (allowed : state.MayRename pathMapping) :
     (state.renamePaths pathMapping).WellFormed := by
   constructor
   · intro objectId renamedObject renamedLookup
@@ -594,16 +787,30 @@ theorem rename_preserves_wellFormed {state : NamespaceState}
         subst renamedObject
         rcases wellFormed.objectToPath objectId oldObject oldLookup with
           ⟨identityMatches, oldPathLookup⟩
-        refine ⟨identityMatches, ?_⟩
-        simp [renamePaths, pathMapping.inverseForward, oldPathLookup]
+        exact ⟨identityMatches,
+          rename_stores_path allowed oldLookup oldPathLookup⟩
   · intro renamedPath objectId renamedLookup
-    have oldPathLookup : state.paths (pathMapping.inverse renamedPath) = some objectId :=
-      renamedLookup
-    rcases wellFormed.pathToObject (pathMapping.inverse renamedPath) objectId oldPathLookup with
-      ⟨oldObject, objectLookup, pathMatches⟩
-    refine ⟨{ oldObject with path := pathMapping.forward oldObject.path }, ?_, ?_⟩
-    · exact rename_preserves_object_fields objectLookup
-    · rw [pathMatches, pathMapping.forwardInverse]
+    simp only [renamePaths, renamedPaths] at renamedLookup
+    split at renamedLookup
+    · rename_i destinationPrefix
+      have inDestination := isPrefixOf_eq_true_iff_atOrBelow.mp destinationPrefix
+      rcases wellFormed.pathToObject (pathMapping.inverse renamedPath) objectId
+          renamedLookup with ⟨oldObject, objectLookup, pathMatches⟩
+      refine ⟨{ oldObject with path := pathMapping.forward oldObject.path },
+        rename_preserves_object_fields objectLookup, ?_⟩
+      rw [pathMatches, pathMapping.forwardInverse_atOrBelow inDestination]
+    · rename_i _outsideDestination
+      split at renamedLookup
+      · simp at renamedLookup
+      · rename_i sourcePrefix
+        have outsideSource : ¬ AtOrBelow renamedPath pathMapping.source := by
+          intro inSource
+          exact sourcePrefix (isPrefixOf_eq_true_iff_atOrBelow.mpr inSource)
+        rcases wellFormed.pathToObject renamedPath objectId renamedLookup with
+          ⟨oldObject, objectLookup, pathMatches⟩
+        refine ⟨{ oldObject with path := pathMapping.forward oldObject.path },
+          rename_preserves_object_fields objectLookup, ?_⟩
+        rw [pathMatches, pathMapping.forward_outside outsideSource]
   · intro objectId renamedObject renamedLookup
     simp only [renamePaths] at renamedLookup
     cases oldLookup : state.objects objectId with
@@ -620,10 +827,14 @@ theorem rename_preserves_treeWellFormed {state : NamespaceState}
     ⟨rootId, root, rootLookup, rootIdentity, rootPath, rootKind⟩
   let renamedRoot : NamespaceObject :=
     { root with path := pathMapping.forward root.path }
-  refine ⟨rename_preserves_wellFormed treeWellFormed.indexes pathMapping, ?_, ?_⟩
+  have rootUnchanged :
+      pathMapping.forward CanonicalPath.root = CanonicalPath.root :=
+    pathMapping.forward_outside (root_outside_subtree allowed.sourceNotRoot)
+  refine ⟨rename_preserves_wellFormed treeWellFormed.indexes pathMapping allowed,
+    ?_, ?_⟩
   · refine ⟨rootId, renamedRoot,
       rename_preserves_object_fields rootLookup, rootIdentity, ?_, rootKind⟩
-    simp [renamedRoot, rootPath, pathMapping.preservesRoot]
+    simp [renamedRoot, rootPath, rootUnchanged]
   intro objectId renamedObject renamedLookup renamedNotRoot
   simp only [renamePaths] at renamedLookup
   cases oldLookup : state.objects objectId with
@@ -634,14 +845,14 @@ theorem rename_preserves_treeWellFormed {state : NamespaceState}
       have oldNotRoot : oldObject.path ≠ CanonicalPath.root := by
         intro oldWasRoot
         apply renamedNotRoot
-        simp [oldWasRoot, pathMapping.preservesRoot]
+        simp [oldWasRoot, rootUnchanged]
       by_cases isMovedRoot : oldObject.path = pathMapping.source
       · rcases allowed.destinationParentExists with
           ⟨parentId, parent, parentLookup, parentPathLookup, parentKind,
             destinationParent, parentUnchanged⟩
         exact ⟨parentId, { parent with path := pathMapping.forward parent.path },
           rename_preserves_object_fields parentLookup,
-          by simp [renamePaths, pathMapping.inverseForward, parentPathLookup],
+          rename_stores_path allowed parentLookup parentPathLookup,
           parentKind,
           by simpa [isMovedRoot, pathMapping.mapsSource, parentUnchanged] using
             destinationParent⟩
@@ -649,7 +860,7 @@ theorem rename_preserves_treeWellFormed {state : NamespaceState}
           ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, directParent⟩
         exact ⟨parentId, { parent with path := pathMapping.forward parent.path },
           rename_preserves_object_fields parentLookup,
-          by simp [renamePaths, pathMapping.inverseForward, parentPathLookup],
+          rename_stores_path allowed parentLookup parentPathLookup,
           parentKind,
           pathMapping.preservesDirectParentExceptSource isMovedRoot directParent⟩
 
@@ -1102,7 +1313,7 @@ theorem Step.preserves_wellFormed {before after : NamespaceState}
   | create allowed => exact create_preserves_wellFormed wellFormed allowed
   | createOpen allowed => exact createOpen_preserves_wellFormed wellFormed allowed
   | remove allowed => exact remove_preserves_wellFormed wellFormed allowed
-  | renamePaths _ => exact rename_preserves_wellFormed wellFormed _
+  | renamePaths allowed => exact rename_preserves_wellFormed wellFormed _ allowed
   | openObject objectLookup =>
       exact openObject_preserves_wellFormed wellFormed objectLookup
   | closeObject objectLookup _ =>

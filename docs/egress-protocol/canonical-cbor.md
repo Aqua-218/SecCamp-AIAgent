@@ -55,7 +55,7 @@ installation と repository は host が割り当てる opaque identity なの�
 
 ## 実装境界
 
-`cbor.rs` は wire bytes を typed request にするまでを担当する。成功しただけでは、Capability を持つ、replay-safe、budget 内、または network policy を満たすことを意味しない。
+`cbor.rs` は wire bytes を typed request にするまでを担当する。`BrokerOperation::capability_request_at` はその closed union を、同じ tag の `CapabilityRequest` へ一意に写す。Broker adapter はこの変換結果を `CapabilityKernel` に渡せるが、成功した decode だけでは Capability を持つ、replay-safe、budget 内、または network policy を満たすことを意味しない。
 
 | まだ別途必要なもの | 担当すべき層 |
 |---|---|

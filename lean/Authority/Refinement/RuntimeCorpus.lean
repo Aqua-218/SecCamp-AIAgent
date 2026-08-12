@@ -6,9 +6,10 @@ import Authority.Refinement.OrchestratorRuntime
 # Rust Runtime Observation Corpus
 
 This module parses a closed, proof-free TSV schema emitted by the Rust runtime
-corpus binary. Acceptance validates only the supplied observations against the
-existing logical checkers; it does not prove that arbitrary Rust executions
-emit honest observations.
+corpus binary. Authority observations drive an executable state transition;
+Broker and orchestrator observations are checked against their existing
+refinement models. This does not prove that arbitrary Rust executions emit
+honest observations.
 -/
 
 namespace Authority.Refinement.RuntimeCorpus
@@ -40,14 +41,31 @@ def parseNat (value label : String) : Except String Nat :=
   | some parsed => .ok parsed
   | none => .error s!"invalid {label} `{value}`; expected a natural number"
 
+def parseFlag (value label : String) : Except String Bool :=
+  match value with
+  | "0" => .ok false
+  | "1" => .ok true
+  | _ => .error s!"invalid {label} `{value}`; expected 0 or 1"
+
 structure AuthorityRow where
   name : String
   version : Nat
   caller : String
+  owner : String
   capability : String
   outcome : String
   beforeEpoch : Nat
   afterEpoch : Nat
+  activeBefore : Bool
+  activeAfter : Bool
+  beforeNextAttempt : Nat
+  afterNextAttempt : Nat
+  attemptId : Option Nat
+  evidenceAttemptId : Option Nat
+  evidenceBytes : Nat
+  auditOutcome : String
+  beforeEffectCount : Nat
+  afterEffectCount : Nat
   deriving Repr, BEq
 
 structure BrokerRow where
@@ -112,17 +130,44 @@ private def takeNat (fields : Fields) (label : String) : Except String (Nat × F
   let (value, remaining) ← fields.take label
   pure (← parseNat value label, remaining)
 
+private def takeOptionalNat (fields : Fields) (label : String) :
+    Except String (Option Nat × Fields) := do
+  let (value, remaining) ← fields.take label
+  if value == "-" then
+    pure (none, remaining)
+  else
+    pure (some (← parseNat value label), remaining)
+
+private def takeFlag (fields : Fields) (label : String) : Except String (Bool × Fields) := do
+  let (value, remaining) ← fields.take label
+  pure (← parseFlag value label, remaining)
+
 private def parseAuthority (fields : Fields) : Except String Row := do
   let (name, fields) ← fields.take "authority row name"
   let (version, fields) ← takeNat fields "authority schema version"
   let (caller, fields) ← fields.take "authority caller"
+  let (owner, fields) ← fields.take "authority owner"
   let (capability, fields) ← fields.take "authority capability"
   let (outcome, fields) ← fields.take "authority outcome"
   let (beforeEpoch, fields) ← takeNat fields "authority epoch before"
   let (afterEpoch, fields) ← takeNat fields "authority epoch after"
+  let (activeBefore, fields) ← takeFlag fields "authority active before"
+  let (activeAfter, fields) ← takeFlag fields "authority active after"
+  let (beforeNextAttempt, fields) ← takeNat fields "authority next attempt before"
+  let (afterNextAttempt, fields) ← takeNat fields "authority next attempt after"
+  let (attemptId, fields) ← takeOptionalNat fields "authority attempt ID"
+  let (evidenceAttemptId, fields) ←
+    takeOptionalNat fields "authority evidence attempt ID"
+  let (evidenceBytes, fields) ← takeNat fields "authority evidence bytes"
+  let (auditOutcome, fields) ← fields.take "authority audit outcome"
+  let (beforeEffectCount, fields) ← takeNat fields "authority effect count before"
+  let (afterEffectCount, fields) ← takeNat fields "authority effect count after"
   fields.finish
   let row : AuthorityRow := {
-    name, version, caller, capability, outcome, beforeEpoch, afterEpoch }
+    name, version, caller, owner, capability, outcome, beforeEpoch, afterEpoch,
+    activeBefore, activeAfter,
+    beforeNextAttempt, afterNextAttempt, attemptId, evidenceAttemptId,
+    evidenceBytes, auditOutcome, beforeEffectCount, afterEffectCount }
   pure (.authority row)
 
 private def parseBroker (fields : Fields) : Except String Row := do
@@ -220,6 +265,7 @@ def parseRow (line : String) : Except String Row := do
   | other => .error s!"unknown runtime corpus row family `{other}`"
 
 structure Corpus where
+  commitUnknown : AuthorityRow
   foreignRevoke : AuthorityRow
   ownedRevoke : AuthorityRow
   acceptedPending : BrokerRow
@@ -245,15 +291,15 @@ def parseCorpus (input : String) : Except String Corpus := do
     throw s!"missing corpus header `{corpusHeader}`"
   let rows ← parseRows lines.tail
   match rows with
-  | [.authority foreignRevoke, .authority ownedRevoke,
+  | [.authority commitUnknown, .authority foreignRevoke, .authority ownedRevoke,
       .broker acceptedPending, .broker budgetReserved, .broker terminal,
       .chunk first, .chunk second, .retry exactRetry,
       .orchestrator orchestrator] =>
       pure {
-        foreignRevoke, ownedRevoke, acceptedPending, budgetReserved, terminal
+        commitUnknown, foreignRevoke, ownedRevoke, acceptedPending, budgetReserved, terminal
         chunks := [first, second]
         exactRetry, orchestrator }
-  | _ => throw "runtime corpus must contain the closed nine-row v1 sequence"
+  | _ => throw "runtime corpus must contain the closed ten-row v1 sequence"
 
 private def expectedRequestId := "32323232323232323232323232323232"
 private def expectedPayloadHash :=
@@ -263,87 +309,230 @@ private def expectedBrokerSessionId := "07070707070707070707070707070707"
 private def expectedOrchestratorEvents :=
   "clone,establish,worker-running,start-paused-vm,inject,worker-gate,release,poll,poll,revoke,kill,close,isolate"
 private def responseCap : Nat := 1_100_000
+private def maximumCommitUnknownEvidenceBytes : Nat := 64 * 1024
+private def u64Maximum : Nat := 18_446_744_073_709_551_615
 
-namespace CapabilityCheck
+inductive AuthorityCommand where
+  | authorizeCommitUnknown
+  | revokeForeign
+  | revokeOwned
+  deriving Repr, BEq
 
-open Authority
-open Authority.Refinement.CapabilityState
+inductive AuthorityOutcome where
+  | commitUnknown
+  | capabilityNotHeld
+  | newlyRevoked
+  deriving Repr, BEq
 
-private def subjectId : SubjectId := ⟨"runtime-subject"⟩
-private def foreignId : SubjectId := ⟨"foreign-subject"⟩
-private def capabilityId : CapId := ⟨"runtime-capability"⟩
+inductive AuthorityAuditOutcome where
+  | none
+  | commitUnknown
+  deriving Repr, BEq
 
-private def envelope : StaticAuthorityEnvelope where
-  validity := {
-    notBefore := { ticks := 0 }
-    expiresAt := { ticks := 10 }
-    isValid := by decide }
-  authority := .file {
-    repository := ⟨"runtime-repository"⟩
-    effects := FileEffects.ofList [.readData]
-    path := .prefix CanonicalPath.root }
+/-- A versioned, proof-free authority observation decoded from TSV fields. -/
+structure AuthorityObservation where
+  version : Nat
+  command : AuthorityCommand
+  caller : String
+  owner : String
+  capability : String
+  outcome : AuthorityOutcome
+  beforeEpoch : Nat
+  afterEpoch : Nat
+  activeBefore : Bool
+  activeAfter : Bool
+  beforeNextAttempt : Nat
+  afterNextAttempt : Nat
+  attemptId : Option Nat
+  evidenceAttemptId : Option Nat
+  evidenceBytes : Nat
+  auditOutcome : AuthorityAuditOutcome
+  beforeEffectCount : Nat
+  afterEffectCount : Nat
+  deriving Repr, BEq
 
-private def subject : Subject where
-  id := subjectId
-  parent := none
-  envelope := envelope
+/-- Closed authority state retained between proof-free observations. -/
+structure AuthoritySnapshot where
+  owner : String
+  capability : String
+  revoked : Bool
+  epoch : Nat
+  nextAttempt : Nat
+  effectCount : Nat
+  deriving Repr, BEq
 
-private def grant : CapabilityGrant where
-  subject := subjectId
-  validity := envelope.validity
-  authority := envelope.authority
-  delegable := false
+private def decodeAuthorityCommand (name : String) : Except String AuthorityCommand :=
+  match name with
+  | "commit-unknown" => .ok .authorizeCommitUnknown
+  | "revoke-foreign" => .ok .revokeForeign
+  | "revoke-owned" => .ok .revokeOwned
+  | other => .error s!"unknown authority command `{other}`"
 
-private def registered : Authority.CapabilityState :=
-  (Authority.CapabilityState.empty ⟨"runtime-corpus"⟩).registerSubject subject
+private def decodeAuthorityOutcome (outcome : String) : Except String AuthorityOutcome :=
+  match outcome with
+  | "commit-unknown" => .ok .commitUnknown
+  | "capability-not-held" => .ok .capabilityNotHeld
+  | "newly-revoked" => .ok .newlyRevoked
+  | other => .error s!"unknown authority outcome `{other}`"
 
-private def issued : Authority.CapabilityState :=
-  registered.issue capabilityId none grant
+private def decodeAuthorityAuditOutcome
+    (outcome : String) : Except String AuthorityAuditOutcome :=
+  match outcome with
+  | "none" => .ok .none
+  | "commit-unknown" => .ok .commitUnknown
+  | other => .error s!"unknown authority audit outcome `{other}`"
 
-private def foreignEvent : Event where
-  schemaVersion := observationSchemaVersion
-  command := .revoke foreignId capabilityId
-  outcome := .rejectedNoEffect .capabilityNotHeld
+/-- Converts parsed strings to the closed executable authority observation. -/
+def AuthorityRow.toObservation (row : AuthorityRow) : Except String AuthorityObservation := do
+  pure {
+    version := row.version
+    command := ← decodeAuthorityCommand row.name
+    caller := row.caller
+    owner := row.owner
+    capability := row.capability
+    outcome := ← decodeAuthorityOutcome row.outcome
+    beforeEpoch := row.beforeEpoch
+    afterEpoch := row.afterEpoch
+    activeBefore := row.activeBefore
+    activeAfter := row.activeAfter
+    beforeNextAttempt := row.beforeNextAttempt
+    afterNextAttempt := row.afterNextAttempt
+    attemptId := row.attemptId
+    evidenceAttemptId := row.evidenceAttemptId
+    evidenceBytes := row.evidenceBytes
+    auditOutcome := ← decodeAuthorityAuditOutcome row.auditOutcome
+    beforeEffectCount := row.beforeEffectCount
+    afterEffectCount := row.afterEffectCount }
 
-private def foreignCandidate : EventCandidate issued foreignEvent :=
-  ⟨issued, by
-    refine ⟨rfl, .revokeCapabilityNotHeld ?_ ?_⟩
-    · exact ⟨registered.capabilityFromGrant capabilityId none grant, by
-        simp [issued, Authority.CapabilityState.issue]⟩
-    · simp [issued, registered, grant, subjectId, foreignId,
-        Authority.CapabilityState.issue, Authority.CapabilityState.registerSubject,
-        Authority.CapabilityState.HeldBy, Authority.CapabilityState.empty, replace]⟩
+private def AuthorityObservation.matchesBefore
+    (observation : AuthorityObservation) (state : AuthoritySnapshot) : Bool :=
+  observation.version == 1 && observation.owner == state.owner &&
+    observation.capability == state.capability &&
+    observation.beforeEpoch == state.epoch &&
+    observation.activeBefore == !state.revoked &&
+    observation.beforeNextAttempt == state.nextAttempt &&
+    observation.beforeEffectCount == state.effectCount &&
+    observation.beforeEpoch ≤ u64Maximum &&
+    observation.beforeNextAttempt ≤ u64Maximum
 
-private def ownedEvent : Event where
-  schemaVersion := observationSchemaVersion
-  command := .revoke subjectId capabilityId
-  outcome := .accepted
+private def AuthorityObservation.matchesAfter
+    (observation : AuthorityObservation) (state : AuthoritySnapshot) : Bool :=
+  observation.afterEpoch == state.epoch &&
+    observation.activeAfter == !state.revoked &&
+    observation.afterNextAttempt == state.nextAttempt &&
+    observation.afterEffectCount == state.effectCount
 
-private def revoked : Authority.CapabilityState := issued.revoke capabilityId
+private def noAttemptEvidence (observation : AuthorityObservation) : Bool :=
+  observation.attemptId == none && observation.evidenceAttemptId == none &&
+    observation.evidenceBytes == 0 && observation.auditOutcome == .none
 
-private def ownedCandidate : EventCandidate issued ownedEvent :=
-  ⟨revoked, by
-    exact .revoke
-      ⟨registered.capabilityFromGrant capabilityId none grant, by
-        simp [issued, Authority.CapabilityState.issue]⟩
-      (by simp [issued, registered, grant, subjectId,
-        Authority.CapabilityState.issue, Authority.CapabilityState.registerSubject,
-        Authority.CapabilityState.HeldBy, Authority.CapabilityState.empty, replace])
-      (by rfl)
-      (by simp [issued, registered, Authority.CapabilityState.issue,
-        Authority.CapabilityState.registerSubject,
-        Authority.CapabilityState.empty, CanIncrementU64, u64Maximum])⟩
+/-- Computes one authority transition entirely from parsed, proof-free data. -/
+def checkAuthorityObservation (before : AuthoritySnapshot)
+    (observation : AuthorityObservation) : Option AuthoritySnapshot :=
+  if !observation.matchesBefore before then
+    none
+  else
+    let after? := match observation.command with
+      | .authorizeCommitUnknown =>
+          if observation.caller == before.owner && !before.revoked &&
+              observation.outcome == .commitUnknown &&
+              observation.auditOutcome == .commitUnknown &&
+              observation.attemptId == some before.nextAttempt &&
+              observation.evidenceAttemptId == observation.attemptId &&
+              0 < observation.evidenceBytes &&
+              observation.evidenceBytes ≤ maximumCommitUnknownEvidenceBytes &&
+              before.nextAttempt < u64Maximum then
+            some { before with nextAttempt := before.nextAttempt + 1 }
+          else
+            none
+      | .revokeForeign =>
+          if observation.caller != before.owner &&
+              observation.outcome == .capabilityNotHeld &&
+              noAttemptEvidence observation then
+            some before
+          else
+            none
+      | .revokeOwned =>
+          if observation.caller == before.owner && !before.revoked &&
+              observation.outcome == .newlyRevoked &&
+              noAttemptEvidence observation && before.epoch < u64Maximum then
+            some { before with revoked := true, epoch := before.epoch + 1 }
+          else
+            none
+    match after? with
+    | some after => if observation.matchesAfter after then some after else none
+    | none => none
 
-def foreignAccepted : Bool :=
-  (checkEvent issued foreignEvent foreignCandidate).isSome
+private def checkAuthorityTrace :
+    AuthoritySnapshot → List AuthorityObservation → Option AuthoritySnapshot
+  | state, [] => some state
+  | state, observation :: remaining => do
+      let next ← checkAuthorityObservation state observation
+      checkAuthorityTrace next remaining
 
-def ownedAccepted : Bool :=
-  (checkEvent issued ownedEvent ownedCandidate).isSome
+private def authorityTraceValid (corpus : Corpus) : Bool :=
+  let rows := [corpus.commitUnknown, corpus.foreignRevoke, corpus.ownedRevoke]
+  match rows.mapM AuthorityRow.toObservation with
+  | .error _ => false
+  | .ok [commitUnknown, revokeForeign, revokeOwned] =>
+      let initial : AuthoritySnapshot := {
+        owner := corpus.commitUnknown.owner
+        capability := corpus.commitUnknown.capability
+        revoked := false
+        epoch := corpus.commitUnknown.beforeEpoch
+        nextAttempt := corpus.commitUnknown.beforeNextAttempt
+        effectCount := corpus.commitUnknown.beforeEffectCount }
+      match checkAuthorityTrace initial [commitUnknown, revokeForeign, revokeOwned] with
+      | some final =>
+          commitUnknown.command == .authorizeCommitUnknown &&
+            revokeForeign.command == .revokeForeign &&
+            revokeOwned.command == .revokeOwned && final.revoked
+      | none => false
+  | .ok _ => false
 
-theorem foreignAccepted_sound : foreignAccepted = true := by native_decide
-theorem ownedAccepted_sound : ownedAccepted = true := by native_decide
+private def exampleAuthorityState : AuthoritySnapshot := {
+  owner := "owner"
+  capability := "capability"
+  revoked := false
+  epoch := 7
+  nextAttempt := 11
+  effectCount := 3 }
 
-end CapabilityCheck
+private def exampleCommitUnknown : AuthorityObservation := {
+  version := 1
+  command := .authorizeCommitUnknown
+  caller := "owner"
+  owner := "owner"
+  capability := "capability"
+  outcome := .commitUnknown
+  beforeEpoch := 7
+  afterEpoch := 7
+  activeBefore := true
+  activeAfter := true
+  beforeNextAttempt := 11
+  afterNextAttempt := 12
+  attemptId := some 11
+  evidenceAttemptId := some 11
+  evidenceBytes := 9
+  auditOutcome := .commitUnknown
+  beforeEffectCount := 3
+  afterEffectCount := 3 }
+
+example : (checkAuthorityObservation exampleAuthorityState exampleCommitUnknown ==
+    some { exampleAuthorityState with nextAttempt := 12 }) = true := by native_decide
+
+example : (checkAuthorityObservation exampleAuthorityState
+    { exampleCommitUnknown with evidenceAttemptId := some 12 }).isNone = true := by native_decide
+
+example : (checkAuthorityObservation exampleAuthorityState {
+    exampleCommitUnknown with
+    command := .revokeForeign
+    outcome := .capabilityNotHeld
+    attemptId := none
+    evidenceAttemptId := none
+    evidenceBytes := 0
+    auditOutcome := .none
+    afterNextAttempt := 11 }).isNone = true := by native_decide
 
 namespace BrokerCheck
 
@@ -759,22 +948,7 @@ theorem traceAccepted_sound : traceAccepted = true := by native_decide
 end OrchestratorCheck
 
 private def authoritySchemaValid (corpus : Corpus) : Bool :=
-  corpus.foreignRevoke == {
-    name := "revoke-foreign"
-    version := 1
-    caller := "foreign-subject"
-    capability := "runtime-capability"
-    outcome := "capability-not-held"
-    beforeEpoch := 0
-    afterEpoch := 0 : AuthorityRow } &&
-  corpus.ownedRevoke == {
-    name := "revoke-owned"
-    version := 1
-    caller := "runtime-subject"
-    capability := "runtime-capability"
-    outcome := "newly-revoked"
-    beforeEpoch := 0
-    afterEpoch := 1 : AuthorityRow }
+  authorityTraceValid corpus
 
 private def brokerSchemaValid (corpus : Corpus) : Bool :=
   let accepted := corpus.acceptedPending
@@ -825,13 +999,12 @@ private def orchestratorSchemaValid (corpus : Corpus) : Bool :=
     shutdownReason := "broker-exited"
     events := expectedOrchestratorEvents : OrchestratorRow }
 
-/-- Existing refinement checkers applied to the parsed proof-free observations. -/
+/-- Existing Broker and orchestrator refinements applied to parsed observations. -/
 def checkerAgreement (corpus : Corpus) : Bool :=
   match corpus.terminal.terminalDigest with
   | none => false
   | some digest =>
-      CapabilityCheck.foreignAccepted && CapabilityCheck.ownedAccepted &&
-        BrokerCheck.traceAccepted digest &&
+      BrokerCheck.traceAccepted digest &&
         BrokerCheck.chunkTraceAccepted digest corpus.chunks &&
         OrchestratorCheck.traceAccepted
 
@@ -840,7 +1013,7 @@ def checkCorpus (corpus : Corpus) : Bool :=
   authoritySchemaValid corpus && brokerSchemaValid corpus &&
     orchestratorSchemaValid corpus && checkerAgreement corpus
 
-/-- Acceptance explicitly includes all three existing executable checkers. -/
+/-- Acceptance explicitly includes both proof-carrying subsystem checkers. -/
 theorem checkCorpus_checkerAgreement {corpus : Corpus}
     (accepted : checkCorpus corpus = true) : checkerAgreement corpus = true := by
   simp only [checkCorpus, Bool.and_eq_true] at accepted
@@ -850,8 +1023,6 @@ theorem checkCorpus_checkerAgreement {corpus : Corpus}
 theorem checkerAgreement_sound {corpus : Corpus}
     (accepted : checkerAgreement corpus = true) :
     ∃ digest, corpus.terminal.terminalDigest = some digest ∧
-      CapabilityCheck.foreignAccepted = true ∧
-      CapabilityCheck.ownedAccepted = true ∧
       BrokerCheck.traceAccepted digest = true ∧
       BrokerCheck.chunkTraceAccepted digest corpus.chunks = true ∧
       OrchestratorCheck.traceAccepted = true := by
@@ -860,11 +1031,14 @@ theorem checkerAgreement_sound {corpus : Corpus}
   · contradiction
   · rename_i digest terminalDigest
     simp only [Bool.and_eq_true] at accepted
-    exact ⟨digest, terminalDigest, accepted.1.1.1.1,
-      accepted.1.1.1.2, accepted.1.1.2, accepted.1.2, accepted.2⟩
+    exact ⟨digest, terminalDigest, accepted.1.1, accepted.1.2, accepted.2⟩
 
 private def renderAuthority (row : AuthorityRow) : String :=
-  s!"authority\t{row.name}\t{row.version}\t{row.caller}\t{row.capability}\t{row.outcome}\t{row.beforeEpoch}\t{row.afterEpoch}"
+  let attemptId := row.attemptId.map toString |>.getD "-"
+  let evidenceAttemptId := row.evidenceAttemptId.map toString |>.getD "-"
+  let activeBefore := if row.activeBefore then "1" else "0"
+  let activeAfter := if row.activeAfter then "1" else "0"
+  s!"authority\t{row.name}\t{row.version}\t{row.caller}\t{row.owner}\t{row.capability}\t{row.outcome}\t{row.beforeEpoch}\t{row.afterEpoch}\t{activeBefore}\t{activeAfter}\t{row.beforeNextAttempt}\t{row.afterNextAttempt}\t{attemptId}\t{evidenceAttemptId}\t{row.evidenceBytes}\t{row.auditOutcome}\t{row.beforeEffectCount}\t{row.afterEffectCount}"
 
 private def renderBroker (row : BrokerRow) : String :=
   let baseLine :=
@@ -885,7 +1059,8 @@ private def renderOrchestrator (row : OrchestratorRow) : String :=
 
 /-- Canonical lines emitted after successful validation. -/
 def normalizedLines (corpus : Corpus) : List String :=
-  [corpusHeader, renderAuthority corpus.foreignRevoke,
+  [corpusHeader, renderAuthority corpus.commitUnknown,
+    renderAuthority corpus.foreignRevoke,
     renderAuthority corpus.ownedRevoke, renderBroker corpus.acceptedPending,
     renderBroker corpus.budgetReserved, renderBroker corpus.terminal] ++
     corpus.chunks.map renderChunk ++

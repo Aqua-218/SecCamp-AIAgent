@@ -81,7 +81,9 @@ structure AttemptRecord where
 /-- Sequential audit state before byte-level serialization. -/
 structure AuditState where
   nextSequence : Nat
+  sequenceExhausted : Bool
   nextAttemptId : Nat
+  attemptIdExhausted : Bool
   attempts : AttemptId → Option AttemptRecord
 
 namespace AuditState
@@ -89,7 +91,9 @@ namespace AuditState
 /-- Empty journal state. -/
 def empty : AuditState where
   nextSequence := 0
+  sequenceExhausted := false
   nextAttemptId := 0
+  attemptIdExhausted := false
   attempts := fun _ => none
 
 /-- An attempt identity is permanently reserved after its start record. -/
@@ -108,8 +112,10 @@ def HasEffect (state : AuditState) (attemptId : AttemptId) : Prop :=
 structure MayBegin (state : AuditState) (attemptId : AttemptId) where
   fresh : state.attempts attemptId = none
   allocatedIdentity : attemptId.value = state.nextAttemptId
-  sequenceCanIncrement : CanIncrementU64 state.nextSequence
-  identityCanIncrement : CanIncrementU64 state.nextAttemptId
+  sequenceAvailable : state.sequenceExhausted = false
+  sequenceRepresentable : FitsU64 state.nextSequence
+  identityAvailable : state.attemptIdExhausted = false
+  identityRepresentable : FitsU64 state.nextAttemptId
 
 /-- Receipt policy for a terminal record. -/
 def ValidReceipt (attemptId : AttemptId) (outcome : AttemptOutcome)
@@ -130,7 +136,8 @@ structure MayFinish (state : AuditState) (attemptId : AttemptId)
   currentLookup : state.attempts attemptId = some currentRecord
   stillStarted : currentRecord.outcome = .started
   receiptValid : ValidReceipt attemptId outcome receipt
-  sequenceCanIncrement : CanIncrementU64 state.nextSequence
+  sequenceAvailable : state.sequenceExhausted = false
+  sequenceRepresentable : FitsU64 state.nextSequence
 
 /-- Recover the attempt identity indexed by validated finish evidence. -/
 def MayFinish.attemptId {state : AuditState} {attemptId : AttemptId}
@@ -150,8 +157,10 @@ def startedRecord (state : AuditState) (attemptId : AttemptId)
 /-- Append one start record and consume one journal sequence. -/
 def beginAttempt (state : AuditState) (attemptId : AttemptId)
     (metadata : AttemptMetadata) : AuditState :=
-  { nextSequence := state.nextSequence + 1
-    nextAttemptId := state.nextAttemptId + 1
+  { nextSequence := (advanceU64 state.nextSequence).1
+    sequenceExhausted := (advanceU64 state.nextSequence).2
+    nextAttemptId := (advanceU64 state.nextAttemptId).1
+    attemptIdExhausted := (advanceU64 state.nextAttemptId).2
     attempts := replace state.attempts attemptId
       (some (state.startedRecord attemptId metadata)) }
 
@@ -167,8 +176,10 @@ def terminalRecord (state : AuditState) (current : AttemptRecord)
 def finishAttempt (state : AuditState) (attemptId : AttemptId)
     (current : AttemptRecord) (outcome : AttemptOutcome)
     (receipt : Option CommitReceipt) : AuditState :=
-  { nextSequence := state.nextSequence + 1
+  { nextSequence := (advanceU64 state.nextSequence).1
+    sequenceExhausted := (advanceU64 state.nextSequence).2
     nextAttemptId := state.nextAttemptId
+    attemptIdExhausted := state.attemptIdExhausted
     attempts := replace state.attempts attemptId
       (some (state.terminalRecord current outcome receipt)) }
 
@@ -196,7 +207,7 @@ theorem beginAttempt_uses_allocated_identity {state : AuditState}
     (allowed : MayBegin state attemptId) :
     attemptId.value = state.nextAttemptId ∧
       (state.beginAttempt attemptId metadata).nextAttemptId =
-        state.nextAttemptId + 1 := by
+        (advanceU64 state.nextAttemptId).1 := by
   exact ⟨allowed.allocatedIdentity, rfl⟩
 
 /-- Beginning a fresh attempt preserves every earlier attempt record. -/
@@ -277,19 +288,53 @@ inductive Step : AuditState → AuditState → Prop
       (allowed : MayFinish state attemptId outcome receipt) →
       Step state (state.finishAttempt attemptId allowed.currentRecord outcome receipt)
 
-/-- Every accepted append consumes exactly one sequence number. -/
-theorem Step.nextSequence_exact {before after : AuditState}
+/-- Every accepted append advances or consumes the final `u64` sequence. -/
+theorem Step.nextSequence_monotone {before after : AuditState}
     (transition : Step before after) :
-    after.nextSequence = before.nextSequence + 1 := by
-  cases transition <;> rfl
+    before.nextSequence ≤ after.nextSequence := by
+  cases transition <;> exact advanceU64_value_monotone _
 
 /-- Attempt allocation is monotone and advances only on begin. -/
 theorem Step.nextAttemptId_monotone {before after : AuditState}
     (transition : Step before after) :
     before.nextAttemptId ≤ after.nextAttemptId := by
   cases transition with
-  | begin => exact Nat.le_succ _
+  | begin => exact advanceU64_value_monotone _
   | finish => exact Nat.le_refl _
+
+/-- Once the append sequence is exhausted, no later audit append is accepted. -/
+theorem exhausted_sequence_rejects_step {state after : AuditState}
+    (exhausted : state.sequenceExhausted = true) : ¬ Step state after := by
+  intro transition
+  cases transition with
+  | begin allowed =>
+      have available := allowed.sequenceAvailable
+      rw [exhausted] at available
+      contradiction
+  | finish allowed =>
+      have available := allowed.sequenceAvailable
+      rw [exhausted] at available
+      contradiction
+
+/-- The final `u64` append sequence is usable exactly once. -/
+theorem begin_at_maximum_exhausts_sequence {state : AuditState}
+    {attemptId : AttemptId} {metadata : AttemptMetadata}
+    (_allowed : MayBegin state attemptId)
+    (atMaximum : state.nextSequence = u64Maximum) :
+    (state.beginAttempt attemptId metadata).nextSequence = u64Maximum ∧
+      (state.beginAttempt attemptId metadata).sequenceExhausted = true := by
+  simp [beginAttempt, atMaximum, advanceU64_maximum]
+
+/-- The final attempt identity is allocated once before allocation exhausts. -/
+theorem begin_at_maximum_exhausts_attempt_ids {state : AuditState}
+    {attemptId : AttemptId} {metadata : AttemptMetadata}
+    (allowed : MayBegin state attemptId)
+    (atMaximum : state.nextAttemptId = u64Maximum) :
+    attemptId.value = u64Maximum ∧
+      (state.beginAttempt attemptId metadata).nextAttemptId = u64Maximum ∧
+      (state.beginAttempt attemptId metadata).attemptIdExhausted = true := by
+  refine ⟨allowed.allocatedIdentity.trans atMaximum, ?_⟩
+  simp [beginAttempt, atMaximum, advanceU64_maximum]
 
 /-- Both append sequence and attempt allocator fit their Rust `u64` fields. -/
 def CountersRepresentable (state : AuditState) : Prop :=
@@ -306,10 +351,10 @@ theorem Step.preserves_countersRepresentable {before after : AuditState}
     after.CountersRepresentable := by
   cases transition with
   | begin allowed =>
-      exact ⟨allowed.sequenceCanIncrement.increment_fits,
-        allowed.identityCanIncrement.increment_fits⟩
+      exact ⟨advanceU64_value_fits allowed.sequenceRepresentable,
+        advanceU64_value_fits allowed.identityRepresentable⟩
   | finish allowed =>
-      exact ⟨allowed.sequenceCanIncrement.increment_fits, representable.2⟩
+      exact ⟨advanceU64_value_fits allowed.sequenceRepresentable, representable.2⟩
 
 /-- Once started, an attempt identity remains permanently reserved. -/
 theorem Step.started_attempt_persists {before after : AuditState}
@@ -402,15 +447,14 @@ inductive Steps : AuditState → AuditState → Nat → Prop
       Step before middle → Steps middle after remainingLength →
       Steps before after (remainingLength + 1)
 
-/-- Sequence growth exactly counts every accepted append in an arbitrary run. -/
-theorem Steps.nextSequence_exact {before after : AuditState} {length : Nat}
+/-- Sequence allocation never moves backwards in an arbitrary run. -/
+theorem Steps.nextSequence_monotone {before after : AuditState} {length : Nat}
     (execution : Steps before after length) :
-    after.nextSequence = before.nextSequence + length := by
+    before.nextSequence ≤ after.nextSequence := by
   induction execution with
-  | refl => simp
+  | refl => exact Nat.le_refl _
   | next firstStep remainingSteps inductionResult =>
-      rw [inductionResult, firstStep.nextSequence_exact]
-      omega
+      exact Nat.le_trans firstStep.nextSequence_monotone inductionResult
 
 /-- Attempt allocation never decreases across an arbitrary journal execution. -/
 theorem Steps.nextAttemptId_monotone {before after : AuditState} {length : Nat}

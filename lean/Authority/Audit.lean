@@ -81,6 +81,7 @@ structure AttemptRecord where
 /-- Sequential audit state before byte-level serialization. -/
 structure AuditState where
   nextSequence : Nat
+  nextAttemptId : Nat
   attempts : AttemptId → Option AttemptRecord
 
 namespace AuditState
@@ -88,6 +89,7 @@ namespace AuditState
 /-- Empty journal state. -/
 def empty : AuditState where
   nextSequence := 0
+  nextAttemptId := 0
   attempts := fun _ => none
 
 /-- An attempt identity is permanently reserved after its start record. -/
@@ -105,6 +107,7 @@ def HasEffect (state : AuditState) (attemptId : AttemptId) : Prop :=
 /-- Preconditions for appending and syncing a start record. -/
 structure MayBegin (state : AuditState) (attemptId : AttemptId) where
   fresh : state.attempts attemptId = none
+  allocatedIdentity : attemptId.value = state.nextAttemptId
 
 /-- Receipt policy for a terminal record. -/
 def ValidReceipt (attemptId : AttemptId) (outcome : AttemptOutcome)
@@ -145,6 +148,7 @@ def startedRecord (state : AuditState) (attemptId : AttemptId)
 def beginAttempt (state : AuditState) (attemptId : AttemptId)
     (metadata : AttemptMetadata) : AuditState :=
   { nextSequence := state.nextSequence + 1
+    nextAttemptId := state.nextAttemptId + 1
     attempts := replace state.attempts attemptId
       (some (state.startedRecord attemptId metadata)) }
 
@@ -161,6 +165,7 @@ def finishAttempt (state : AuditState) (attemptId : AttemptId)
     (current : AttemptRecord) (outcome : AttemptOutcome)
     (receipt : Option CommitReceipt) : AuditState :=
   { nextSequence := state.nextSequence + 1
+    nextAttemptId := state.nextAttemptId
     attempts := replace state.attempts attemptId
       (some (state.terminalRecord current outcome receipt)) }
 
@@ -181,6 +186,15 @@ theorem startedRecord_fields (state : AuditState) (attemptId : AttemptId)
     (state.startedRecord attemptId metadata).finishSequence = none ∧
     (state.startedRecord attemptId metadata).receipt = none := by
   simp [startedRecord]
+
+/-- Begin consumes exactly the allocator-selected attempt identity. -/
+theorem beginAttempt_uses_allocated_identity {state : AuditState}
+    {attemptId : AttemptId} {metadata : AttemptMetadata}
+    (allowed : MayBegin state attemptId) :
+    attemptId.value = state.nextAttemptId ∧
+      (state.beginAttempt attemptId metadata).nextAttemptId =
+        state.nextAttemptId + 1 := by
+  exact ⟨allowed.allocatedIdentity, rfl⟩
 
 /-- Beginning a fresh attempt preserves every earlier attempt record. -/
 theorem beginAttempt_preserves_existing {state : AuditState}
@@ -265,6 +279,14 @@ theorem Step.nextSequence_exact {before after : AuditState}
     (transition : Step before after) :
     after.nextSequence = before.nextSequence + 1 := by
   cases transition <;> rfl
+
+/-- Attempt allocation is monotone and advances only on begin. -/
+theorem Step.nextAttemptId_monotone {before after : AuditState}
+    (transition : Step before after) :
+    before.nextAttemptId ≤ after.nextAttemptId := by
+  cases transition with
+  | begin => exact Nat.le_succ _
+  | finish => exact Nat.le_refl _
 
 /-- Once started, an attempt identity remains permanently reserved. -/
 theorem Step.started_attempt_persists {before after : AuditState}
@@ -366,6 +388,15 @@ theorem Steps.nextSequence_exact {before after : AuditState} {length : Nat}
   | next firstStep remainingSteps inductionResult =>
       rw [inductionResult, firstStep.nextSequence_exact]
       omega
+
+/-- Attempt allocation never decreases across an arbitrary journal execution. -/
+theorem Steps.nextAttemptId_monotone {before after : AuditState} {length : Nat}
+    (execution : Steps before after length) :
+    before.nextAttemptId ≤ after.nextAttemptId := by
+  induction execution with
+  | refl => exact Nat.le_refl _
+  | next firstStep _ inductionResult =>
+      exact Nat.le_trans firstStep.nextAttemptId_monotone inductionResult
 
 /-- Terminal records remain immutable across an arbitrary accepted execution. -/
 theorem Steps.terminal_attempt_immutable {before after : AuditState} {length : Nat}

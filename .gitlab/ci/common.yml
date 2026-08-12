@@ -1,0 +1,28 @@
+.rust_job:
+  cache:
+    key:
+      files:
+        - Cargo.lock
+      prefix: cargo-v3
+    paths:
+      - .cargo-home/registry/index/
+      - .cargo-home/registry/cache/
+      - .cargo-home/git/db/
+      - .ci-tools/cargo/
+    policy: pull-push
+  before_script:
+    - rustc --version | grep -F "rustc 1.93.1 "
+    - cargo --version
+    - cargo fetch --locked
+
+.lean_cache:
+  cache:
+    key:
+      files:
+        - lean/lean-toolchain
+        - lean/lake-manifest.json
+      prefix: lean-v2
+    paths:
+      - .ci-tools/elan/
+      - lean/.lake/
+    policy: pull-push

@@ -7,7 +7,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     num::NonZeroUsize,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::Path,
     sync::Arc,
 };
@@ -26,7 +26,7 @@ use capfs::{
     filesystem::{CapabilityFilesystem, MountAuthority, MountInstanceId, spawn_mount},
 };
 use fuser::BackgroundSession;
-use rustix::fs::{AtFlags, Mode, OFlags, RawDir, mkdirat, open, unlinkat};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawDir, mkdirat, mknodat, open, unlinkat};
 use tempfile::tempdir;
 
 type MountedDirectoryView = (
@@ -766,4 +766,683 @@ fn mounted_directory_stream_requires_restart_after_namespace_mutation() {
     }
     drop(directory);
     drop(session);
+}
+
+// Requirement: closing a subject revokes every capability it holds, so it must
+// discard the operating system's caches for that subject's mount exactly as an
+// explicit revoke does. Without that, a read already served into the page cache
+// stays readable after the subject is closed.
+// Category: FUSE/security. Risk: critical.
+#[test]
+fn mounted_view_denies_cached_read_after_subject_close() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let backing = tempdir().expect("temporary backing directory must be creatable");
+    let mountpoint = tempdir().expect("temporary mountpoint must be creatable");
+    fs::write(backing.path().join("allowed.txt"), b"capability")
+        .expect("authorized backing file must be writable");
+    let repository = RepoId::new("workspace");
+    let imported = ImportedRepository::open(
+        repository.clone(),
+        backing.path(),
+        PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 1),
+    )
+    .expect("test backing must pass preflight");
+
+    let subject = SubjectId::new("fuse-close-subject");
+    let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+        .expect("test validity must be non-empty");
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "fuse-close-session",
+    ))));
+    kernel
+        .register_subject(Subject::new(
+            subject.clone(),
+            StaticAuthorityEnvelope::new(
+                validity,
+                AuthorityBody::File(FileAuthority::new(
+                    repository.clone(),
+                    FileEffects::only(FileEffect::ReadData),
+                    PathPattern::Prefix(CanonicalPath::root()),
+                )),
+            ),
+        ))
+        .expect("test subject registration must succeed");
+    let capability = kernel
+        .issue_root(CapabilityGrant::new(
+            subject.clone(),
+            validity,
+            AuthorityBody::File(FileAuthority::new(
+                repository.clone(),
+                FileEffects::only(FileEffect::ReadData),
+                PathPattern::Exact(
+                    CanonicalPath::new(["allowed.txt"]).expect("test path must be canonical"),
+                ),
+            )),
+        ))
+        .expect("test capability issuance must succeed");
+    let filesystem = CapabilityFilesystem::new(
+        imported,
+        Arc::clone(&kernel),
+        MountAuthority::new(
+            MountInstanceId::new("fuse-close-integration"),
+            subject.clone(),
+            capability,
+            repository,
+        ),
+        Arc::new(MonotonicTime::from_ticks(5)),
+    )
+    .expect("filesystem must initialize");
+    let session = spawn_mount(filesystem, mountpoint.path()).expect("FUSE mount must succeed");
+
+    // Read the whole file first. This is the step that fills the operating
+    // system's cache; without it the assertion below would pass even if the
+    // cache were never invalidated.
+    let mut file =
+        File::open(mountpoint.path().join("allowed.txt")).expect("authorized FUSE file must open");
+    let mut before_close = String::new();
+    file.read_to_string(&mut before_close)
+        .expect("authorized FUSE read must succeed");
+    assert_eq!(before_close, "capability");
+
+    kernel
+        .begin_subject_close(&subject)
+        .expect("subject close must begin");
+
+    file.seek(SeekFrom::Start(0))
+        .expect("file offset must remain seekable");
+    let mut after_close = [0_u8; 10];
+    assert_eq!(
+        file.read(&mut after_close)
+            .expect_err("a closed subject must not read from a cache filled before the close")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+
+    drop(file);
+    drop(session);
+}
+
+// Requirement: the capability kernel keeps registered observers for its own
+// lifetime, which outlasts any single mount. A revoke issued after a mount is
+// unmounted must still succeed, because a mount that no longer exists has no
+// cache left to invalidate. Category: FUSE/lifecycle. Risk: high.
+#[test]
+fn revoke_after_unmount_reports_no_propagation_failure() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let (_backing, _mountpoint, kernel, first_capability, session) = mount_directory_view();
+
+    // A second capability on the same kernel outlives the mount.
+    let second_capability = kernel
+        .issue_root(CapabilityGrant::new(
+            SubjectId::new("fuse-directory-subject"),
+            TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+                .expect("test validity must be non-empty"),
+            AuthorityBody::File(FileAuthority::new(
+                RepoId::new("workspace"),
+                FileEffects::only(FileEffect::ListDirectory),
+                PathPattern::Prefix(
+                    CanonicalPath::new(["scoped"]).expect("test path must be canonical"),
+                ),
+            )),
+        ))
+        .expect("second capability issuance must succeed");
+
+    kernel
+        .revoke(&first_capability)
+        .expect("revoking while the mount is live must propagate");
+
+    drop(session);
+
+    // The observer is still registered, but its mount is gone.
+    kernel
+        .revoke(&second_capability)
+        .expect("revoking after unmount must not report a propagation failure");
+}
+
+// Requirement: read-only handles are cached and writable handles are not, so a
+// process holding both on one file must still observe its own writes. If the
+// cached handle could keep serving overwritten content, the split cache mode is
+// not safe to use. Category: FUSE/coherence. Risk: high.
+#[test]
+fn cached_read_handle_observes_writes_made_through_a_direct_handle() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let backing = tempdir().expect("temporary backing directory must be creatable");
+    let mountpoint = tempdir().expect("temporary mountpoint must be creatable");
+    fs::write(backing.path().join("shared.txt"), b"aaaaaaaaaa")
+        .expect("backing file must be writable");
+    let repository = RepoId::new("workspace");
+    let imported = ImportedRepository::open(
+        repository.clone(),
+        backing.path(),
+        PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 1),
+    )
+    .expect("test backing must pass preflight");
+
+    let subject = SubjectId::new("fuse-coherence-subject");
+    let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+        .expect("test validity must be non-empty");
+    let effects = FileEffects::from_effects([FileEffect::ReadData, FileEffect::WriteData]);
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "fuse-coherence-session",
+    ))));
+    kernel
+        .register_subject(Subject::new(
+            subject.clone(),
+            StaticAuthorityEnvelope::new(
+                validity,
+                AuthorityBody::File(FileAuthority::new(
+                    repository.clone(),
+                    effects,
+                    PathPattern::Prefix(CanonicalPath::root()),
+                )),
+            ),
+        ))
+        .expect("test subject registration must succeed");
+    let capability = kernel
+        .issue_root(CapabilityGrant::new(
+            subject.clone(),
+            validity,
+            AuthorityBody::File(FileAuthority::new(
+                repository.clone(),
+                effects,
+                PathPattern::Prefix(CanonicalPath::root()),
+            )),
+        ))
+        .expect("test capability issuance must succeed");
+    let filesystem = CapabilityFilesystem::new(
+        imported,
+        Arc::clone(&kernel),
+        MountAuthority::new(
+            MountInstanceId::new("fuse-coherence-integration"),
+            subject,
+            capability,
+            repository,
+        ),
+        Arc::new(MonotonicTime::from_ticks(5)),
+    )
+    .expect("filesystem must initialize");
+    let session = spawn_mount(filesystem, mountpoint.path()).expect("FUSE mount must succeed");
+
+    let path = mountpoint.path().join("shared.txt");
+
+    // Fill the cached handle's page cache first.
+    let mut reader = File::open(&path).expect("read-only handle must open");
+    let mut first = String::new();
+    reader
+        .read_to_string(&mut first)
+        .expect("read must succeed");
+    assert_eq!(first, "aaaaaaaaaa");
+
+    // Overwrite through a separate writable handle, which is on direct I/O.
+    let mut writer = OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("writable handle must open");
+    writer.write_all(b"bbbbbbbbbb").expect("write must succeed");
+    writer.flush().expect("flush must succeed");
+    drop(writer);
+
+    // The already-open cached handle must not keep serving the old content.
+    reader.seek(SeekFrom::Start(0)).expect("handle must seek");
+    let mut second = String::new();
+    reader
+        .read_to_string(&mut second)
+        .expect("read after the write must succeed");
+    assert_eq!(
+        second, "bbbbbbbbbb",
+        "a cached read handle served content that a direct write handle had already overwritten"
+    );
+
+    drop(reader);
+    drop(session);
+}
+
+/// A mounted view with one capability over `prefix` carrying exactly `effects`.
+///
+/// The link tests each need a different effect set, and what they are proving is
+/// which effect gates which operation, so the effect set is the parameter.
+struct ScopedMount {
+    backing: tempfile::TempDir,
+    mountpoint: tempfile::TempDir,
+    session: BackgroundSession,
+}
+
+fn mount_with_effects(
+    name: &str,
+    prefix: &[&str],
+    effects: &[FileEffect],
+    populate: impl FnOnce(&Path),
+) -> ScopedMount {
+    let backing = tempdir().expect("temporary backing directory must be creatable");
+    let mountpoint = tempdir().expect("temporary mountpoint must be creatable");
+    populate(backing.path());
+    let repository = RepoId::new("workspace");
+    let imported = ImportedRepository::open(
+        repository.clone(),
+        backing.path(),
+        PreflightLimits::new(NonZeroUsize::new(32).expect("limit must be non-zero"), 3),
+    )
+    .expect("test backing must pass preflight");
+
+    let subject = SubjectId::new(format!("{name}-subject"));
+    let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+        .expect("test validity window must be non-empty");
+    let effects = FileEffects::from_effects(effects.iter().copied());
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        format!("{name}-session"),
+    ))));
+    kernel
+        .register_subject(Subject::new(
+            subject.clone(),
+            StaticAuthorityEnvelope::new(
+                validity,
+                AuthorityBody::File(FileAuthority::new(
+                    repository.clone(),
+                    effects,
+                    PathPattern::Prefix(CanonicalPath::root()),
+                )),
+            ),
+        ))
+        .expect("test subject registration must succeed");
+    let capability = kernel
+        .issue_root(CapabilityGrant::new(
+            subject.clone(),
+            validity,
+            AuthorityBody::File(FileAuthority::new(
+                repository.clone(),
+                effects,
+                PathPattern::Prefix(
+                    CanonicalPath::new(prefix).expect("test path must be canonical"),
+                ),
+            )),
+        ))
+        .expect("test capability issuance must succeed");
+    let filesystem = CapabilityFilesystem::new(
+        imported,
+        Arc::clone(&kernel),
+        MountAuthority::new(
+            MountInstanceId::new(format!("{name}-integration")),
+            subject,
+            capability,
+            repository,
+        ),
+        Arc::new(MonotonicTime::from_ticks(5)),
+    )
+    .expect("filesystem must initialize");
+    let session = spawn_mount(filesystem, mountpoint.path()).expect("FUSE mount must succeed");
+
+    ScopedMount {
+        backing,
+        mountpoint,
+        session,
+    }
+}
+
+// Requirement: a symbolic link is created, read back, and followed through the
+// mount, and following it is authorized on the path it resolves to rather than
+// on the link's own path. Category: FUSE/links. Risk: critical.
+#[test]
+fn mounted_view_creates_reads_and_follows_symlinks_inside_its_range() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let mount = mount_with_effects(
+        "fuse-symlink",
+        &["scoped"],
+        &[
+            FileEffect::ListDirectory,
+            FileEffect::ReadData,
+            FileEffect::CreateSymlink,
+            FileEffect::ReadLink,
+        ],
+        |backing| {
+            fs::create_dir(backing.join("scoped")).expect("scoped directory must be creatable");
+            fs::write(backing.join("scoped/target.txt"), b"target contents")
+                .expect("target file must be writable");
+            fs::write(backing.join("hidden.txt"), b"hidden contents")
+                .expect("hidden file must be writable");
+        },
+    );
+    let scoped = mount.mountpoint.path().join("scoped");
+
+    std::os::unix::fs::symlink("target.txt", scoped.join("link.txt"))
+        .expect("CreateSymlink must authorize FUSE SYMLINK");
+    assert!(
+        fs::symlink_metadata(mount.backing.path().join("scoped/link.txt"))
+            .expect("the backing link must exist")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_link(scoped.join("link.txt")).expect("ReadLink must authorize FUSE READLINK"),
+        Path::new("target.txt")
+    );
+    assert_eq!(
+        fs::read(scoped.join("link.txt")).expect("following the link must reach its target"),
+        b"target contents"
+    );
+
+    // The link body is stored, but resolution is authorized where it lands: a
+    // link inside the authorized prefix that points outside it resolves to a
+    // path this capability cannot reach, and the walk stops there.
+    std::os::unix::fs::symlink("../hidden.txt", scoped.join("peek.txt"))
+        .expect("a link whose target is inside the repository is representable");
+    assert_eq!(
+        fs::read_link(scoped.join("peek.txt")).expect("its body remains readable"),
+        Path::new("../hidden.txt")
+    );
+    let denied = fs::read(scoped.join("peek.txt"))
+        .expect_err("a link must not reach a target the capability does not cover");
+    assert!(
+        matches!(
+            denied.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        ),
+        "unexpected error following an out-of-range link: {denied:?}"
+    );
+    assert_eq!(
+        fs::read(mount.backing.path().join("hidden.txt"))
+            .expect("the out-of-range file must be untouched"),
+        b"hidden contents"
+    );
+
+    drop(mount.session);
+}
+
+// Requirement: a link body that the mount cannot prove stays inside the
+// repository is never stored and never handed to the kernel. Category:
+// FUSE/links. Risk: critical.
+#[test]
+fn mounted_view_refuses_symlink_targets_that_leave_the_repository() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let mount = mount_with_effects(
+        "fuse-symlink-escape",
+        &["scoped"],
+        &[
+            FileEffect::ListDirectory,
+            FileEffect::ReadData,
+            FileEffect::CreateSymlink,
+            FileEffect::ReadLink,
+        ],
+        |backing| {
+            fs::create_dir(backing.join("scoped")).expect("scoped directory must be creatable");
+        },
+    );
+    let scoped = mount.mountpoint.path().join("scoped");
+
+    let absolute = std::os::unix::fs::symlink("/etc/passwd", scoped.join("absolute"))
+        .expect_err("an absolute target must be refused");
+    assert_eq!(
+        absolute.raw_os_error(),
+        Some(rustix::io::Errno::PERM.raw_os_error())
+    );
+
+    let escaping = std::os::unix::fs::symlink("../../etc/passwd", scoped.join("escape"))
+        .expect_err("a target above the repository root must be refused");
+    assert_eq!(
+        escaping.raw_os_error(),
+        Some(rustix::io::Errno::XDEV.raw_os_error())
+    );
+
+    // A `..` after a named component cannot be shown to stay inside, because
+    // the named component may itself be a link to a shallower directory.
+    let interior = std::os::unix::fs::symlink("a/../../elsewhere", scoped.join("interior"))
+        .expect_err("an interior parent component must be refused");
+    assert_eq!(
+        interior.raw_os_error(),
+        Some(rustix::io::Errno::PERM.raw_os_error())
+    );
+
+    assert!(!mount.backing.path().join("scoped/absolute").exists());
+    assert!(!mount.backing.path().join("scoped/escape").exists());
+    assert!(!mount.backing.path().join("scoped/interior").exists());
+
+    drop(mount.session);
+}
+
+// Requirement: SYMLINK and READLINK each require their own effect. Category:
+// FUSE/links. Risk: critical.
+#[test]
+fn mounted_view_gates_symlink_creation_and_reading_on_their_own_effects() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let populate = |backing: &Path| {
+        fs::create_dir(backing.join("scoped")).expect("scoped directory must be creatable");
+        fs::write(backing.join("scoped/target.txt"), b"target").expect("file must be writable");
+        std::os::unix::fs::symlink("target.txt", backing.join("scoped/existing.txt"))
+            .expect("backing link must be creatable");
+    };
+
+    let without_create = mount_with_effects(
+        "fuse-symlink-nocreate",
+        &["scoped"],
+        &[
+            FileEffect::ListDirectory,
+            FileEffect::ReadData,
+            FileEffect::ReadLink,
+        ],
+        populate,
+    );
+    let scoped = without_create.mountpoint.path().join("scoped");
+    let denied = std::os::unix::fs::symlink("target.txt", scoped.join("new.txt"))
+        .expect_err("SYMLINK without CreateSymlink must be denied");
+    assert_eq!(
+        denied.kind(),
+        io::ErrorKind::PermissionDenied,
+        "unexpected error creating a link without its effect: {denied:?}"
+    );
+    assert!(
+        !without_create
+            .backing
+            .path()
+            .join("scoped/new.txt")
+            .exists()
+    );
+    assert_eq!(
+        fs::read_link(scoped.join("existing.txt")).expect("ReadLink must still authorize READLINK"),
+        Path::new("target.txt")
+    );
+    drop(without_create.session);
+
+    let without_readlink = mount_with_effects(
+        "fuse-symlink-noread",
+        &["scoped"],
+        &[
+            FileEffect::ListDirectory,
+            FileEffect::ReadData,
+            FileEffect::CreateSymlink,
+        ],
+        populate,
+    );
+    let scoped = without_readlink.mountpoint.path().join("scoped");
+    let denied = fs::read_link(scoped.join("existing.txt"))
+        .expect_err("READLINK without ReadLink must be denied");
+    assert_eq!(
+        denied.kind(),
+        io::ErrorKind::PermissionDenied,
+        "unexpected error reading a link without its effect: {denied:?}"
+    );
+    drop(without_readlink.session);
+}
+
+// Requirement: a hard link needs CreateHardLink on the new name and on every
+// name the inode already has, and both names then reach one inode. Category:
+// FUSE/links. Risk: critical.
+#[test]
+fn mounted_view_creates_hard_links_only_within_its_authorized_range() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let mount = mount_with_effects(
+        "fuse-hardlink",
+        &["scoped"],
+        &[
+            FileEffect::ListDirectory,
+            FileEffect::ReadData,
+            FileEffect::WriteData,
+            FileEffect::CreateHardLink,
+        ],
+        |backing| {
+            fs::create_dir(backing.join("scoped")).expect("scoped directory must be creatable");
+            fs::write(backing.join("scoped/original.txt"), b"shared")
+                .expect("file must be writable");
+            fs::write(backing.join("outside.txt"), b"outside").expect("file must be writable");
+        },
+    );
+    let scoped = mount.mountpoint.path().join("scoped");
+
+    fs::hard_link(scoped.join("original.txt"), scoped.join("alias.txt"))
+        .expect("CreateHardLink must authorize FUSE LINK inside the range");
+    assert_eq!(
+        fs::read(scoped.join("alias.txt")).expect("the second name must read the same inode"),
+        b"shared"
+    );
+    assert_eq!(
+        fs::metadata(mount.backing.path().join("scoped/original.txt"))
+            .expect("the backing file must be readable")
+            .nlink(),
+        2,
+        "the backing inode must really have two names"
+    );
+
+    // A destination outside the authorized prefix fails: the capability covers
+    // neither the new name nor, therefore, the resulting alias set.
+    let denied = fs::hard_link(
+        scoped.join("original.txt"),
+        mount.mountpoint.path().join("smuggled.txt"),
+    )
+    .expect_err("LINK must not place a name outside the authorized range");
+    assert!(
+        matches!(
+            denied.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        ),
+        "unexpected error linking outside the range: {denied:?}"
+    );
+    assert!(!mount.backing.path().join("smuggled.txt").exists());
+
+    drop(mount.session);
+}
+
+// Requirement: authority over a hard-linked inode is the intersection of the
+// authority over its names. An inode whose other name lies outside the
+// capability's range is unreachable through the name inside it, so a link
+// cannot be used to widen access. Category: FUSE/links. Risk: critical.
+#[test]
+fn mounted_view_denies_an_inode_whose_other_name_is_out_of_range() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let mount = mount_with_effects(
+        "fuse-hardlink-intersection",
+        &["scoped"],
+        &[FileEffect::ListDirectory, FileEffect::ReadData],
+        |backing| {
+            fs::create_dir(backing.join("scoped")).expect("scoped directory must be creatable");
+            fs::write(backing.join("scoped/plain.txt"), b"plain").expect("file must be writable");
+            fs::write(backing.join("secret.txt"), b"secret").expect("file must be writable");
+            // The alias exists before the mount does, exactly as it would if it
+            // had been created by a capability that covered both names.
+            fs::hard_link(backing.join("secret.txt"), backing.join("scoped/alias.txt"))
+                .expect("alias must be creatable");
+        },
+    );
+    let scoped = mount.mountpoint.path().join("scoped");
+
+    assert_eq!(
+        fs::read(scoped.join("plain.txt")).expect("a single-named file in range stays readable"),
+        b"plain",
+        "the denial below must come from aliasing, not from the prefix"
+    );
+
+    let denied = fs::read(scoped.join("alias.txt"))
+        .expect_err("a name whose inode is also named out of range must not be readable");
+    assert_eq!(
+        denied.kind(),
+        io::ErrorKind::NotFound,
+        "unexpected error reading an out-of-range alias: {denied:?}"
+    );
+
+    let listed = fs::read_dir(&scoped)
+        .expect("ListDirectory must authorize the listing")
+        .map(|entry| {
+            entry
+                .expect("directory entries must be readable")
+                .file_name()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        listed.iter().any(|name| name == "plain.txt"),
+        "the in-range file must still be listed: {listed:?}"
+    );
+    assert!(
+        !listed.iter().any(|name| name == "alias.txt"),
+        "an inode with an out-of-range name must not be advertised: {listed:?}"
+    );
+
+    drop(mount.session);
+}
+
+// Requirement: object kinds outside the modelled universe are refused as policy
+// rather than reported as unimplemented. Category: FUSE/links. Risk: high.
+#[test]
+fn mounted_view_refuses_device_and_fifo_creation_with_eperm() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let mount = mount_with_effects(
+        "fuse-mknod",
+        &["scoped"],
+        &[
+            FileEffect::ListDirectory,
+            FileEffect::CreateFile,
+            FileEffect::CreateSymlink,
+            FileEffect::CreateHardLink,
+        ],
+        |backing| {
+            fs::create_dir(backing.join("scoped")).expect("scoped directory must be creatable");
+        },
+    );
+    let scoped = open(
+        mount.mountpoint.path().join("scoped"),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("ListDirectory must authorize opening the directory");
+
+    assert_eq!(
+        mknodat(&scoped, "pipe", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0)
+            .expect_err("FIFO creation must be refused"),
+        rustix::io::Errno::PERM
+    );
+    assert!(!mount.backing.path().join("scoped/pipe").exists());
+
+    drop(mount.session);
 }

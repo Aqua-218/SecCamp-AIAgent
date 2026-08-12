@@ -1,0 +1,134 @@
+<!-- doc-type: concept -->
+
+# snapshot と identity gate
+
+[Firecracker runtime](README.md) / snapshot と identity gate
+
+> **対象読者:** snapshot 経路を触る実装者、session 間の分離をレビューする人
+
+microVM を毎回 boot から起動すると数百 ms かかる。boot 済みの状態を snapshot しておき、session ごとに restore すれば、その時間を消せる。ただし restore は memory image をそのまま複製するので、素朴にやると全 session が同じ秘密を持つことになる。
+
+[`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) の 8 状態の lifecycle は、この問題を解くためにある。
+
+## 何を防ぎたいのか
+
+snapshot を取った時点の guest memory には、その VM が持っていた identity が全部入っている。restore した VM は、その identity を持ったまま起動する。
+
+```text
+snapshot 時点の guest memory
+  VM ID       = a1b2...
+  session ID  = c3d4...
+  subject ID  = e5f6...
+
+restore すると、これが N 台に複製される
+  VM #1 : a1b2... c3d4... e5f6...
+  VM #2 : a1b2... c3d4... e5f6...   <- 同じ
+  VM #3 : a1b2... c3d4... e5f6...   <- 同じ
+```
+
+identity が衝突すると、audit record がどの session のものか判別できなくなる。もっと悪いのは Broker 側で、session ID が同じなら replay guard の sequence 空間を共有してしまう。VM #2 が送った request を VM #1 の retry として扱う経路ができる。
+
+だから restore 後に identity を作り直すまで、workload を走らせてはいけない。
+
+```mermaid
+stateDiagram-v2
+    [*] --> New
+    New --> WorkloadStopped: launch()<br/>boot して gate で停止
+    WorkloadStopped --> Snapshotted: create_snapshot()
+    Snapshotted --> RestoredStopped: restore の途中
+    RestoredStopped --> IdentityRegenerated: 128-bit × 5 を再生成
+    IdentityRegenerated --> IdentityInjected: guest へ注入
+    IdentityInjected --> Running: workload を明示的に解放
+    Running --> Stopped: shutdown
+    WorkloadStopped --> Stopped: shutdown
+```
+
+`Running` に到達する経路は `IdentityInjected` からの 1 本だけ。restore 直後の `IdentityRegenerated` から直接 `Running` へ跳べる遷移は無い。
+
+## snapshot を取れるのは 1 状態だけ
+
+```rust
+if instance.state != RuntimeState::WorkloadStopped {
+    return Err(RuntimeError::InvalidState {
+        expected: "WorkloadStopped".to_owned(),
+        actual: format!("{:?}", instance.state),
+    });
+}
+```
+
+`create_snapshot` は `WorkloadStopped` 以外を拒否する。つまり workload が一度でも走った VM からは snapshot を取れない。
+
+理由は単純で、走った後の memory には session 固有のデータが混ざるから。identity だけなら再生成できるが、workload が読み込んだ file の内容や、確立済みの Broker session の状態までは追跡できない。「pre-session gate で止まっている VM だけが snapshot 元になれる」という制約にしておけば、snapshot に何が入っているかを考えなくて済む。
+
+## fingerprint が違う snapshot は restore しない
+
+```rust
+if config.fingerprint() != snapshot.artifact_fingerprint {
+    return Err(RuntimeError::StaleSnapshot(...));
+}
+```
+
+`Snapshot` は作られた時点の config fingerprint を保持する。kernel を差し替えた後に古い snapshot を restore しようとすると、ここで止まる。
+
+memory image は、それを作った kernel の構造を前提にしている。別の kernel で restore した場合に何が起きるかは予測できない。動いてしまう可能性があるのが一番まずい。詳細は [artifact の固定と fingerprint](pinned-artifacts.md)。
+
+この検査は `verify_artifacts` より前、side effect が始まる前にある。
+
+## 5 つの identity を作り直す
+
+`IdentityBundle` は 128-bit の `IdentityId` を 5 つ持つ。`IdentityBundle::generate` が `IdentitySource` から取得し、`validate` が 2 種類の検査をかける。
+
+1 つは全ゼロの拒否。`IdentityId::is_zero()` は、entropy source が失敗して初期値のまま返ってきた場合に気付くためにある。
+
+もう 1 つが `forbidden_identities` との照合。
+
+```rust
+identities.validate(Some(&snapshot.forbidden_identities))?;
+```
+
+snapshot に焼き込まれた古い identity の一覧を持っていて、再生成した値がそこに含まれていたら `StaleIdentity` を返す。確率的にはまず起きないが、entropy source が壊れて同じ値を返し続ける場合に検出できる。`duplicate_identity_generation_is_rejected_as_stale` がこの経路を見ている。
+
+restore が identity 検査で失敗した場合、`rollback` が jailer プロセス、dm-verity mapping、workspace を逆順に片付ける。`stale_identity_is_rejected_and_restored_process_is_rolled_back` の名前どおり、プロセスを起動した後で拒否しても resource は残らない。
+
+## host が identity を割り当てる経路もある
+
+`restore` は自前で生成するが、host 側が割り当てた identity を渡す経路も別にある。`restore_accepts_exact_host_allocated_identities` と `restore_rejects_host_identity_reuse_before_side_effects` がその 2 つの分岐を見ている。
+
+後者が重要で、host が渡した identity が過去に使われたものだった場合、side effect の前に拒否する。[session-orchestrator](../session-orchestrator/README.md) の no-reuse ledger と組み合わせると、restart をまたいでも identity が再利用されないことになる。この crate 側は「渡された値が snapshot の forbidden 一覧に無いこと」しか見ておらず、ledger 全体との照合は orchestrator の責務。
+
+## 何が助かるのか
+
+state が 8 個の enum になっているので、「この VM で workload を走らせてよいか」が 1 つの比較で判断できる。identity を注入したかどうかを別途追跡しなくてよい。
+
+snapshot 元を `WorkloadStopped` に限っているため、snapshot に何が含まれるかを都度検討する必要がない。含まれるのは常に「boot 直後、workload 実行前」の状態。
+
+restore の失敗が resource を残さないので、retry が安全に書ける。
+
+## 正確な保証範囲
+
+state 遷移と identity 検査は fake adapter を使う test で確認している。
+
+- guest 側の init が本当に pre-session gate で止まるかは、この crate では確認できない。`IdentityInjected` から `Running` への遷移は host 側の状態を進めるだけで、guest がそれに従うことは guest supervisor の実装に依存する。
+- identity の注入が guest に届いたことは確認していない。`control_call` は fake client 越しにしか実行していない。
+- 実 Firecracker の `/snapshot/load` が `resume_vm: true` でどう振る舞うかは未検証。
+- `forbidden_identities` の一覧が「snapshot に焼き込まれた全 identity」を漏れなく含んでいることは、この crate では保証できない。一覧を作るのは snapshot を取る側。
+- entropy source の品質は `IdentitySource` の実装依存。`SystemIdentitySource` は host kernel の entropy device を使うが、その品質はここでは検証していない。
+- 同じ snapshot から restore した 2 台の VM が、identity 以外で区別できることは主張していない。memory の内容は同じ。
+
+## 変更時の確認点
+
+- `RuntimeState` に状態を足すときは、`Running` への遷移経路が `IdentityInjected` からの 1 本だけであることを保つ。ここに近道を作ると gate の意味が消える。
+- `create_snapshot` の state 検査を緩めるときは、緩めた先の状態の memory に何が入っているかを列挙する。列挙できないなら緩めない。
+- `IdentityBundle` の要素を増やすときは `generate`、`validate`、`ids()`、`forbidden_identities` の生成側を同時に直す。`ids()` を忘れると、新しい identity だけ forbidden 照合を通らない。
+- fingerprint 検査を `verify_artifacts` より後ろへ動かさない。stale snapshot の拒否が side effect の後になる。
+- state 名を条件に使うコードを書くときは、`Running` が「workload 解放済み」であって「VM 稼働中」ではないことを確認する。
+
+## 関連
+
+- [artifact の固定と fingerprint](pinned-artifacts.md)
+- [起動の順序と rollback](launch-sequence.md)
+- [workspace clone](workspace-clone.md)
+- [検証対応表](verification.md)
+- [Session orchestrator](../session-orchestrator/README.md)
+- [Broker session envelope](../egress-protocol/session-envelopes.md)
+- [用語集](../glossary.md)

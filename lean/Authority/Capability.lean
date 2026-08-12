@@ -226,6 +226,14 @@ theorem authorityBodyBelow_complete_of_nonempty {child parent : AuthorityBody}
       · intro request childMatches
         exact isSubset (.gitHub request) childMatches
 
+/-- For a nonempty child body, structural containment exactly matches inclusion. -/
+theorem authorityBodyBelow_iff_matches_subset_of_nonempty
+    {child parent : AuthorityBody} (hasRequest : child.Nonempty) :
+    authorityBodyBelow child parent = true ↔
+      ∀ request, child.Matches request → parent.Matches request :=
+  ⟨authorityBodyBelow_sound,
+    authorityBodyBelow_complete_of_nonempty hasRequest⟩
+
 /-- An immutable capability envelope. -/
 structure Capability where
   /-- Identity and issuance metadata. -/

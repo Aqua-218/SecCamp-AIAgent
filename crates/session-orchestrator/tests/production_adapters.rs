@@ -295,10 +295,15 @@ impl ApiClient for TestApi {
         if request.path == "/actions/inject-identity" {
             record_event(&self.lifecycle, "workload-release");
         }
-        Ok(ApiResponse {
-            status: 200,
-            body: String::new(),
-        })
+        let body = match request.path.as_str() {
+            "/actions/inject-identity" => Some("identity-injected"),
+            "/actions/start-workload" => Some("workload-started"),
+            _ => None,
+        }
+        .map_or_else(String::new, |acknowledgement| {
+            format!("{{\"ack\":\"{acknowledgement}\",{}", &request.body[1..])
+        });
+        Ok(ApiResponse { status: 200, body })
     }
 
     fn verify_restore_resources(
@@ -729,13 +734,20 @@ fn assert_successful_restore_observations(
             session_jail_root().join("dev/rootfs"),
         )]
     );
-    assert!(
-        api.requests
-            .lock()
-            .expect("API log must not be poisoned")
-            .iter()
-            .any(|request| request.path == "/actions/inject-identity")
-    );
+    let requests = api.requests.lock().expect("API log must not be poisoned");
+    let resume = requests
+        .iter()
+        .position(|request| request.path == "/vm" && request.body == r#"{"state":"Resumed"}"#)
+        .expect("explicit resume request must be present");
+    let inject = requests
+        .iter()
+        .position(|request| request.path == "/actions/inject-identity")
+        .expect("identity injection request must be present");
+    let start = requests
+        .iter()
+        .position(|request| request.path == "/actions/start-workload")
+        .expect("workload start request must be present");
+    assert!(resume < inject && inject < start);
 }
 
 fn assert_failed_restore_observations(

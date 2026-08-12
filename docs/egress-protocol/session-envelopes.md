@@ -44,11 +44,13 @@ sequenceDiagram
 
 deduplication table は `NonZeroUsize` の capacity を持つ。無限に request identity を保持してメモリを使い切ることはできない。容量超過なら新しい外部副作用を dispatch せずに拒否する。response の保持先、session budget、connection close は transport / Broker の責務である。
 
-`MAX_CONTROL_FRAME_BYTES` は 1 MiB の allocation 前チェック用の上限として定義済みである。length-prefixed canonical CBOR の encode/decode と vsock I/O はまだこの crate に入れていない。そこを実装するときも、decode 前にこの上限を確認し、decode 後に canonical bytes を hash してから guard へ渡す。
+`frame.rs` は 4 byte big-endian length prefix と 1 MiB 上限を実装済みである。streaming transport は prefix を読んだ直後に `ValidatedFrameLength` で検査し、その値を超える allocation をしない。buffered decoder も truncated prefix/payload、trailing bytes、oversized length を拒否する。
+
+canonical CBOR の schema 検証と vsock I/O はまだこの crate に入れていない。CBOR decoder を追加するときは、frame の payload が canonical であることを確認してからその同じ bytes を hash し、guard へ渡す。
 
 ## 何がまだ必要か
 
-- canonical CBOR schema と length-prefixed frame decoder。
+- canonical CBOR schema と decoder。
 - vsock listener、session handshake、connection close と response cache。
 - `HttpFetchRequest` / `GitHubRequest` を Broker の typed dispatch へつなぐ adapter。
 - redirect / DNS / public-IP / TLS / response streaming の強制。

@@ -107,7 +107,7 @@ renameはsource subtree内を調べ、1件でもlive handleがあればexecutor�
 
 これにより初期実装では、rename / unlink後にpathを失ったinodeをopen fdだけで使い続ける状態を作らない。POSIX互換性より「live objectは必ず1つのcanonical pathを持つ」という認可上の単純さを優先している。
 
-read-only FUSE adapterは、fileとdirectoryのopen時にnamespace open countとAuthority coreのsubject-boundな`OpenHandle` recordを同じobjectへ登録する。片方の登録や認可に失敗すればcountをrollbackし、releaseでは両方を閉じる。adapterはlocal handle table、namespace、Capability kernelの順にlockを取得し、全経路で順序を統一している。変更系operationにも同じtransaction境界を適用する作業は残っている。
+Direct-I/O FUSE adapterは、fileとdirectoryのopen時にnamespace open countとAuthority coreのsubject-boundな`OpenHandle` recordを同じobjectへ登録する。片方の登録や認可に失敗すればcountをrollbackし、releaseでは両方を閉じる。adapterはlocal handle table、namespace、Capability kernelの順にlockを取得し、全経路で順序を統一している。既存fileへのread / writeはこのread-side transactionに載っており、create、remove、renameにも同じtransaction境界を適用する作業が残っている。
 
 ## 通常のread / listingでpathを固定する
 
@@ -142,7 +142,7 @@ directory listingでは`with_directory_children`を使う。対象directory、�
 
 module内のtestはgeneration、open count、Object ID sequenceの上限、manifest rootとparent関係、writer panic後のfail closedを確認する。namespace registryについてcontract test 10件とmodule test 5件を実行する。
 
-capfs package全体では、backing、runtime、node table、read-only FUSEを含めて、共有importのcontract testも実行する。
+capfs package全体では、backing、runtime、node table、Direct-I/O FUSEを含めて、共有importのcontract testも実行する。
 
 ここで確認できるのはRust APIの具体的な境界と1つのthread競合である。実FUSE mountではread / readdir後のrevokeを検査しているが、rename、open、close、revokeを組み合わせた全bounded interleavingのLoom modelは次段階に残る。
 
@@ -153,7 +153,7 @@ capfs package全体では、backing、runtime、node table、read-only FUSEを�
 - 変更系operationをAuthority coreのhandle registryとnamespace更新へ一体でcommitするadapter。
 - durable stateやsupervisor再起動後の復元。
 
-したがって、read-only syscallはこのregistryを通るが、変更系syscallを含む隔離境界はまだ完成していない。
+したがって、既存fileへのread / writeはこのregistryを通るが、create・remove・rename・metadata変更を含む隔離境界はまだ完成していない。
 
 ## 関連
 

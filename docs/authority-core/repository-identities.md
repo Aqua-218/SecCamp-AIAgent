@@ -133,7 +133,7 @@ decide (child.repository = parent.repository)
 
 これらは identity issuer、Capability state、workspace mapping の責務である。現在の `RepoId` は入力 validation を行わないため、空文字列を含む値の許可・拒否も契約に含まれていない。
 
-実装済みのread-only capfsでは、workspace mappingの入口で`ImportedRepository::open`へhost-assigned `RepoId`を渡し、backing root、manifest由来namespaceと同じownerへ保持する。FUSE adapterのconstructorは、そのidentityと`MountAuthority`のrepositoryがexact equalityで一致しなければmount objectを作らない。これによりadapter設定時の別repository取り違えを型付きerrorで止める。ただし元のIDを正しく発行する責任は引き続きhostにある。[read-only FUSE adapter](../capfs/read-only-fuse.md)
+実装済みのDirect-I/O capfsでは、workspace mappingの入口で`ImportedRepository::open`へhost-assigned `RepoId`を渡し、backing root、manifest由来namespaceと同じshared ownerへ保持する。cloneしたsubject mountもこの対応を共有する。FUSE adapterのconstructorは、そのidentityと`MountAuthority`のrepositoryがexact equalityで一致しなければmount objectを作らない。これによりadapter設定時の別repository取り違えを型付きerrorで止める。ただし元のIDを正しく発行する責任は引き続きhostにある。[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)
 
 また、Lean の `RepoId` field は直接参照でき、Rust の field は private という表現上の違いがある。概念は対応しているが、Lean の型が Rust newtype のカプセル化を直接証明しているわけではない。
 

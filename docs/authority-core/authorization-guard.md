@@ -97,7 +97,7 @@ with_active_capability: authority metadataからvisibilityを導く
 authorize_and_commit:  backing read/writeなど外部effectを実行する
 ```
 
-この2つを混同しないことが契約である。現在のread-only capfsは、`LOOKUP` / `GETATTR`のvisibilityに前者、`OPEN` / `READ`の実操作に後者を使う。[read-only FUSE adapter](../capfs/read-only-fuse.md)
+この2つを混同しないことが契約である。現在のDirect-I/O capfsは、`LOOKUP` / `GETATTR`のvisibilityに前者、`OPEN` / `READ` / `WRITE`の実操作に後者を使う。[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)
 
 ## Executor が守る契約
 
@@ -173,12 +173,12 @@ RUSTFLAGS='--cfg loom' cargo clippy --package authority-core --test authorizatio
 次はまだ含まれない。
 
 - open handle、rename、unlink を含む filesystem 固有の競合。
-- read-only範囲を越えるexecutor adapterが、実際のsyscallを正しい線形化点まで実行すること。
+- truncate、create、remove、renameを含むexecutor adapterが、実際のsyscallを正しい線形化点まで実行すること。
 - writer fairness、revoke latency、負荷時の性能。
 - 4 thread 以上、複数 Capability tree、複数 revoke を組み合わせた model。
 - Rust 状態機械や lock 実装全体の数学的証明。
 
-read-only capfsの`OPEN` / `READ`については、executorがfd openまたは`pread`の完了までreturnしない実装と、実FUSE mount上のread-after-revoke testを追加している。これはwrite、rename、unlinkまで一般化した検証ではない。
+Direct-I/O capfsの`OPEN` / `READ` / `WRITE`については、executorがfd open、`pread`、`pwrite`の完了までreturnしない実装と、実FUSE mount上のread-after-revoke / write-after-revoke testを追加している。これはtruncate、rename、unlinkまで一般化した検証ではない。
 
 loom自身にもC11 memory modelの未対応部分があるため、bounded modelのpassを実システム全体の証明とは扱わない。今回のmodelはatomicだけで認可を組み立てず、reader-writer lockの排他順序を検査対象にしている。
 

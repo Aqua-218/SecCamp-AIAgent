@@ -59,7 +59,7 @@ flowchart LR
 
 ## 現在の実装位置
 
-[`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) に起動時の backing repository 検査、[`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) にVM共通の link-free namespace registry、[`crates/capfs/src/node.rs`](../../crates/capfs/src/node.rs) にsubject mountごとのnode table、[`crates/capfs/src/runtime.rs`](../../crates/capfs/src/runtime.rs)と[`crates/capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs)にread-only FUSE adapterを実装している。
+[`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) に起動時の backing repository 検査、[`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) にVM共通の link-free namespace registry、[`crates/capfs/src/node.rs`](../../crates/capfs/src/node.rs) にsubject mountごとのnode table、[`crates/capfs/src/runtime.rs`](../../crates/capfs/src/runtime.rs)と[`crates/capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs)にDirect-I/O FUSE adapterを実装している。
 
 - root を symlink follow なしで開き、mount ID と inode の再照合後に directory fd を保持する。
 - `statx` と `openat2` による fd-relative scan で symlink、hard link、special file、nested mount を拒否する。
@@ -80,12 +80,12 @@ flowchart LR
 - nodeidはsubject mount内だけのidentityとし、VM共通のpath解決には`ObjectId`を使う。
 
 - `LOOKUP`と`GETATTR`はCapabilityの許可範囲またはその祖先だけをzero TTLで公開する。
-- `OPEN`と毎回の`READ`はnamespace上の現在pathに対して`ReadData`を再認可する。
+- `OPEN`はaccess modeを`ReadData` / `WriteData`の単一または複合認可へ変換し、毎回の`READ` / `WRITE`はnamespace上の現在pathに対して対応effectを再認可する。
 - regular fileは`FOPEN_DIRECT_IO`で開き、revoke後のreadがpage cacheを迂回しないようにする。
-- runtime metadata/open/readはroot fdから`openat2`で解決し、symlink、mount越境、hard linkの出現をfail closedで拒否する。
+- runtime metadata/open/read/writeはroot fdから`openat2`で解決し、symlink、mount越境、hard linkの出現をfail closedで拒否する。
 - FUSE handle、namespace open count、Authority open handleを同じ`ObjectId`へ結び、`RELEASE`で一緒に閉じる。
 
-詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[read-only FUSE adapter](../capfs/read-only-fuse.md)を参照する。`READDIR`まで実装済みであり、次段階はwrite、create、remove、no-replace renameである。
+詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。`WRITE`まで実装済みであり、次段階はtruncate、create、remove、no-replace renameである。
 
 ## 初期実装は workspace を木に限定する
 

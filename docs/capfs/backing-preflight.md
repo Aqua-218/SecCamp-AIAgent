@@ -148,14 +148,14 @@ module 内の test は mount ID の相違と、Linux が返し得る全 unsuppor
 
 supervisor は、事前検証を始める前から `capfs` の稼働終了まで、workload や他の非信頼 process が backing tree を直接変更できない配置にする必要がある。検証後の create、remove、rename は namespace registry と同じ transaction に置き、通常の read / write も root fd から `openat2` で解決する。
 
-read-only範囲では、[`runtime.rs`](../../crates/capfs/src/runtime.rs)と[`read_only.rs`](../../crates/capfs/src/read_only.rs)がroot fdからのruntime metadata、open、readをFUSE opcodeとCapability guardへ接続している。`runtime.rs`には、同じfd-relative検証を通るpositioned writeの低層APIもあるが、FUSEのwrite認可はadapter側の次段階で接続する。実装内容は[read-only FUSE adapter](read-only-fuse.md)を参照する。
+現在は、[`runtime.rs`](../../crates/capfs/src/runtime.rs)と[`read_only.rs`](../../crates/capfs/src/read_only.rs)がroot fdからのruntime metadata、open、read、positioned writeをFUSE opcodeとCapability guardへ接続している。read / writeごとにadapterが現在pathを再認可し、runtimeはそのguardの内側でのみfd-relative I/Oを行う。実装内容は[Direct-I/O FUSE adapter](read-only-fuse.md)を参照する。
 
 まだ実装していないのは次である。
 
 - write、create、remove、renameを`openat2` / `renameat2`で実行する処理。
 - 実 FUSE mount 上のrename race、mount越境、敵対的な差し替えtest。
 
-したがって、read-onlyの既知pathについては起動時検査から実I/Oまで接続されたが、「全 workload syscall が認可を通る」隔離境界はまだ完成していない。
+したがって、既知pathのread / positioned writeについては起動時検査から実I/Oまで接続されたが、「全 workload syscall が認可を通る」隔離境界はまだ完成していない。
 
 ## 関連
 

@@ -295,6 +295,14 @@ fn root_derive_and_revoke_use_typed_authority_kernel_transitions() {
             time(30),
         )
         .expect("narrow child derivation must succeed");
+    assert!(matches!(
+        supervisor.revoke(&child_identity, &root),
+        Err(SupervisorError::Kernel(
+            authority_core::kernel::CapabilityKernelError::StateTransition(
+                authority_core::state::CapabilityStateError::CapabilityNotHeld { .. }
+            )
+        ))
+    ));
     assert_eq!(
         supervisor
             .revoke(&root_identity, &root)

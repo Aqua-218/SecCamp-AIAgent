@@ -117,7 +117,8 @@ Rust は実際の認可経路から呼ぶ純粋な `bool` 判定を担当する�
 | [`crates/authority-core/tests/capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 状態遷移の成功・拒否条件と失敗時の atomicity | [Capability state](capability-state.md) |
 | [`crates/authority-core/tests/capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) | 生成した操作列を独立した参照モデルと比較する stateful property test | [Capability state](capability-state.md) |
 | [`crates/authority-core/src/handle.rs`](../../crates/authority-core/src/handle.rs) | `HandleId`、`ObjectId`、subject-bound `OpenHandle` | [Subject lifecycle と open handle](subject-lifecycle-and-handles.md) |
-| [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs) | attempt journal、terminal outcome、単一/複合requestを含むcommit済み effect snapshot | [Attempt / effect audit](audit-records.md) |
+| [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs) | attempt journal、terminal outcome、単一/複合requestを含むcommit済み effect snapshot | [Durable audit journal](durable-audit.md) | 2 phase WAL、crash 後の Started、frame 形式、改竄検出の限界 |
+| [Attempt / effect audit](audit-records.md) |
 | [`crates/authority-core/src/kernel.rs`](../../crates/authority-core/src/kernel.rs) | shared/exclusive guard、active authority inspection、単一/複合effectの最終認可、同期 transition、audit integration | [Authorization guard](authorization-guard.md) / [Attempt / effect audit](audit-records.md) |
 | [`crates/authority-core/tests/authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | guard 公開 API の成功・拒否・error契約、inspection中のrevoke待機 | [Authorization guard](authorization-guard.md) |
 | [`crates/authority-core/tests/authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | revoke/commit interleaving と unlocked negative control | [Authorization guard](authorization-guard.md) |

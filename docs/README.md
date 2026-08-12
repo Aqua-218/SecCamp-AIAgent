@@ -62,6 +62,7 @@
 | [Authorization guard](authority-core/authorization-guard.md) | effect commit と revoke の線形化、executor 契約、loom の positive / negative control |
 | [Subject lifecycle と open handle](authority-core/subject-lifecycle-and-handles.md) | shutdown、`auth_epoch`、handle の subject/object binding と ID 非再利用 |
 | [Attempt / effect audit](authority-core/audit-records.md) | 全認可試行と commit 済み effect の区別、記録失敗時の fail closed |
+| [Durable audit journal](authority-core/durable-audit.md) | 2 phase WAL、crash 後の `Started`、frame 形式、改竄検出の限界 |
 | [検証とテスト](authority-core/verification.md) | Rust unit・状態遷移・property・loom test、Lean example・theorem、共通 corpus の役割分担 |
 
 ## capfs 文書

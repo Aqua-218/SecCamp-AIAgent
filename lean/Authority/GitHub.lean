@@ -18,7 +18,7 @@ structure InstallationId where
 /-- Returns whether a character is forbidden in a Git branch component. -/
 def isForbiddenBranchCharacter (character : Char) : Bool :=
   decide (character.toNat < 0x20) ||
-    character == '\x7f' ||
+    decide (0x7f ≤ character.toNat && character.toNat ≤ 0x9f) ||
     character == ' ' ||
     character == '~' ||
     character == '^' ||
@@ -27,8 +27,16 @@ def isForbiddenBranchCharacter (character : Char) : Bool :=
     character == '*' ||
     character == '[' ||
     character == '\\' ||
-    character == '/' ||
-    character == '{'
+    character == '/'
+
+private def containsSubsequence (needle : List Char) : List Char → Bool
+  | [] => false
+  | haystack :: remaining =>
+    needle.isPrefixOf (haystack :: remaining) ||
+      containsSubsequence needle remaining
+
+private def containsBranchSequence (needle : List Char) (segment : String) : Bool :=
+  containsSubsequence needle segment.toList
 
 /-- Returns whether a string is a safe Git branch-name component. -/
 def isValidBranchSegment (segment : String) : Bool :=
@@ -36,8 +44,26 @@ def isValidBranchSegment (segment : String) : Bool :=
   !characters.isEmpty &&
     characters.head? != some '.' &&
     !['.', 'l', 'o', 'c', 'k'].isSuffixOf characters &&
-    segment != "@" &&
+    !segment.endsWith "." &&
+    !containsBranchSequence ['.', '.'] segment &&
+    !containsBranchSequence ['@', '{'] segment &&
     !characters.any isForbiddenBranchCharacter
+
+private def firstSegmentStartsWithDash : List String → Bool
+  | [] => false
+  | first :: _ => first.toList.head? == some '-'
+
+private def isRefsNamespace : List String → Bool
+  | "refs" :: _ :: _ => true
+  | _ => false
+
+/-- Returns whether slash-separated segments form a safe branch shorthand. -/
+def isValidBranchName (segments : List String) : Bool :=
+  segments.all isValidBranchSegment &&
+    (!segments.isEmpty &&
+      !firstSegmentStartsWithDash segments &&
+      !isRefsNamespace segments &&
+      segments != ["@"])
 
 /--
 A Git branch name whose components have passed validation.
@@ -55,10 +81,10 @@ namespace BranchName
 
 /-- Creates a branch name when every supplied component is valid. -/
 def ofSegments (segments : List String) : Option BranchName :=
-  if isValid : (!segments.isEmpty && segments.all isValidBranchSegment) = true then
+  if isValid : isValidBranchName segments = true then
     have segmentsAreValid : segments.all isValidBranchSegment = true := by
-      simp only [Bool.and_eq_true] at isValid
-      exact isValid.2
+      simp only [isValidBranchName, Bool.and_eq_true] at isValid
+      exact isValid.1
     some ⟨segments, segmentsAreValid⟩
   else
     none
@@ -140,8 +166,7 @@ theorem branchPatternBelow_sound {child parent : BranchPattern}
 private def strictBranchSuffix : BranchName :=
   { segments := ["child"]
     isValid := by
-      simp [isValidBranchSegment, isForbiddenBranchCharacter,
-        List.isSuffixOf, List.isPrefixOf] }
+      native_decide }
 
 /-- Semantic branch-set inclusion implies a successful containment decision. -/
 theorem branchPatternBelow_complete {child parent : BranchPattern}

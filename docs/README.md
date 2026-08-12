@@ -73,6 +73,7 @@
 | [Backing repository の事前検証](capfs/backing-preflight.md) | root fd、link 検査、mount・inode identity、startup import |
 | [共有 namespace registry](capfs/namespace-registry.md) | `ObjectId` 割り当て、現在 path、generation、open handle、namespace lock 契約 |
 | [mount ごとの node table](capfs/node-tables.md) | subject-local `nodeid -> ObjectId`、LOOKUP / FORGET、nodeid 非再利用 |
+| [backing への実 I/O](capfs/runtime-backing-io.md) | root fd 相対の解決、毎回の kind / mount / nlink 検査、create と rename の原子性 |
 | [Direct-I/O FUSE adapter](capfs/read-only-fuse.md) | 各 FUSE operation、runtime backing I/O、revoke 後の再認可 |
 
 ## 文書の使い分け

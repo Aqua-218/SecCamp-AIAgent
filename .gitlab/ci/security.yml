@@ -1,0 +1,60 @@
+dependency_audit:
+  extends: .rust_job
+  stage: security
+  timeout: 15m
+  script:
+    - scripts/ci/install-cargo-tools.sh security
+    - scripts/ci/run.sh audit
+  artifacts:
+    when: always
+    expire_in: 30 days
+    access: developer
+    paths:
+      - reports/cargo-audit.json
+
+dependency_policy:
+  extends: .rust_job
+  stage: security
+  timeout: 15m
+  script:
+    - scripts/ci/install-cargo-tools.sh security
+    - scripts/ci/run.sh deny
+  artifacts:
+    when: always
+    expire_in: 30 days
+    access: developer
+    paths:
+      - reports/cargo-deny.json
+
+sast:
+  image:
+    name: docker.io/semgrep/semgrep:1.172.0@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b
+    entrypoint: [""]
+  stage: security
+  timeout: 15m
+  script:
+    - scripts/ci/sast.sh
+  artifacts:
+    when: always
+    expire_in: 30 days
+    access: developer
+    paths:
+      - reports/semgrep.json
+
+secret_detection:
+  image:
+    name: docker.io/zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+    entrypoint: [""]
+  stage: security
+  timeout: 15m
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - mkdir -p -- reports
+    - gitleaks git --redact --report-format sarif --report-path reports/gitleaks.sarif .
+  artifacts:
+    when: always
+    expire_in: 30 days
+    access: developer
+    paths:
+      - reports/gitleaks.sarif

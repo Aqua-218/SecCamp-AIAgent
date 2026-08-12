@@ -253,8 +253,11 @@ where
     match wire.encode() {
         Ok(payload) => write_payload_frame(transport, payload),
         Err(ResponseCborError::PayloadTooLarge { .. }) => {
-            for chunk in wire.chunks().map_err(ServerError::ResponseChunk)? {
-                let payload = chunk.encode().map_err(ServerError::ResponseChunk)?;
+            for payload in wire
+                .encoded_chunk_iter()
+                .map_err(ServerError::ResponseChunk)?
+            {
+                let payload = payload.map_err(ServerError::ResponseChunk)?;
                 write_payload_frame(transport, payload)?;
             }
             Ok(())

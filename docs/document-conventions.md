@@ -182,10 +182,22 @@ rename 中でも各 object の現在 path を一意に決める仕組みを説�
 **目的:** 子ページへの入口と、crate 全体の実装範囲・検証境界の要約。
 
 ```markdown
-## <この crate が持つ境界の要約>
+## <この crate が持つ境界の要約>   ← アーキテクチャ図を 1 枚置く
 ## 文書一覧                    ← 必須。表で子ページを列挙する
 ## 関連                        ← 必須
 ```
+
+**アーキテクチャ図を必須にする。** 索引ページは、その crate を初めて見る人が最初に開く場所である。module の一覧を表で読む前に、「この crate はどこに座っていて、何と話すのか」が 1 枚で分かる必要がある。
+
+図は 3 つを描く。crate 自身の module、外側との境界（他 crate、kernel、外部サービス）、そして test double が入る trait の継ぎ目。色は[全体アーキテクチャ](design/architecture.md)と揃える。
+
+| classDef | 用途 |
+|---|---|
+| `host` | host 側で動く module |
+| `guest` | guest 側で動く module |
+| `seam` | trait の継ぎ目。ここに test double が入る |
+| `data` | on-disk / kernel の resource |
+| `external` | この crate の外 |
 
 子ページの表には、必ず**対象ソース**と**内容**の列を持たせる。[capfs/README.md](capfs/README.md) がこの形である。
 
@@ -240,7 +252,7 @@ rename 中でも各 object の現在 path を一意に決める仕組みを説�
 | `> **対象読者:**` がある | 全型 |
 | `## 関連` がある | 全型 |
 | `crates/**/*.rs` へのリンクが 1 つ以上ある | `concept`, `contract` |
-| ```mermaid ブロックが 1 つ以上ある | `concept` |
+| ```mermaid ブロックが 1 つ以上ある | `concept`, `design`, `index` |
 | `## 正確な保証範囲` がある | `concept` |
 | `## 変更時の確認点` がある | `concept` |
 | `## 保証範囲外` がある | `contract` |

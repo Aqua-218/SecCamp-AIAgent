@@ -176,6 +176,8 @@ check_file() {
     index)
       has_table "${prose}" ||
         fail "${file}" ' missing table listing the child pages'
+      has_fence "${file}" 'mermaid' ||
+        fail "${file}" ' missing architecture diagram (at least one mermaid block required)'
       ;;
     exempt) ;;
   esac

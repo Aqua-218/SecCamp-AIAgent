@@ -1,5 +1,3 @@
-import Authority.Path
-
 /-!
 # HTTP Fetch Authorities
 
@@ -88,18 +86,39 @@ theorem httpMethodsBelow_trans {first second third : HttpMethods}
   exact httpMethodsBelow_iff_subset.mp secondBelowThird method
     (httpMethodsBelow_iff_subset.mp firstBelowSecond method firstContains)
 
+/-- Returns whether a character is an ASCII letter or digit. -/
+private def isAsciiAlphaNumeric (character : Char) : Bool :=
+  let code := character.toNat
+  (48 ≤ code && code ≤ 57) ||
+    (65 ≤ code && code ≤ 90) ||
+    (97 ≤ code && code ≤ 122)
+
+/-- Returns whether a character is an unencoded RFC 3986 URL path character. -/
+private def isUnencodedUrlPathCharacter (character : Char) : Bool :=
+  isAsciiAlphaNumeric character ||
+    List.contains ['-', '.', '_', '~', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', ':', '@']
+      character
+
+/-- Returns whether one URL path segment has the authority's sole safe spelling. -/
+def isValidUrlPathSegment (segment : String) : Bool :=
+  let characters := segment.toList
+  !characters.isEmpty &&
+    segment != "." &&
+    segment != ".." &&
+    characters.all isUnencodedUrlPathCharacter
+
 /--
-A canonical URL path represented as validated path segments.
+A canonical URL path represented as validated URL path segments.
 
 The empty segment list denotes `/`. The HTTP boundary must remove query and
-fragment components and apply URL decoding and dot-segment normalization before
-constructing this value.
+fragment components and reject alternate percent-encoded or dot-segment
+spellings before constructing this value.
 -/
 structure CanonicalUrlPath where
   /-- Validated URL path segments in order. -/
   segments : List String
-  /-- Evidence that every segment is a safe canonical path segment. -/
-  isValid : segments.all isValidPathSegment = true
+  /-- Evidence that every segment has the authority's canonical URL spelling. -/
+  isValid : segments.all isValidUrlPathSegment = true
 
 namespace CanonicalUrlPath
 
@@ -110,7 +129,7 @@ def root : CanonicalUrlPath :=
 
 /-- Creates a canonical URL path when every supplied segment is valid. -/
 def ofSegments (segments : List String) : Option CanonicalUrlPath :=
-  if isValid : segments.all isValidPathSegment = true then
+  if isValid : segments.all isValidUrlPathSegment = true then
     some { segments, isValid }
   else
     none

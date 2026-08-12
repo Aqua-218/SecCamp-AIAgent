@@ -233,6 +233,68 @@ pub struct GitHubResponse {
     pub number: Option<u64>,
     /// Published object, when applicable.
     pub object: Option<GitObjectId>,
+    disposition: GitHubCommitDisposition,
+}
+
+impl GitHubResponse {
+    /// Creates a provider response for a mutation known to have committed.
+    #[must_use]
+    pub const fn committed(
+        response_bytes: u64,
+        operation: GitHubOperation,
+        number: Option<u64>,
+        object: Option<GitObjectId>,
+    ) -> Self {
+        Self {
+            response_bytes,
+            operation,
+            number,
+            object,
+            disposition: GitHubCommitDisposition::Committed,
+        }
+    }
+
+    /// Converts opaque commit-unknown evidence into an internal effect marker.
+    pub(crate) const fn commit_unknown(unknown: GitHubCommitUnknown) -> Self {
+        Self {
+            response_bytes: unknown.response_bytes,
+            operation: unknown.operation,
+            number: None,
+            object: None,
+            disposition: GitHubCommitDisposition::Unknown,
+        }
+    }
+
+    /// Returns whether this response marks an effect with unknown commit state.
+    pub(crate) const fn is_commit_unknown(&self) -> bool {
+        matches!(self.disposition, GitHubCommitDisposition::Unknown)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitHubCommitDisposition {
+    Committed,
+    Unknown,
+}
+
+/// Opaque evidence that a GitHub mutation may have reached its commit point.
+///
+/// Only this module can create the evidence. The dispatcher can consume it to
+/// record a committed effect without exposing a constructor that lets an
+/// arbitrary adapter manufacture a successful-looking unknown outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GitHubCommitUnknown {
+    operation: GitHubOperation,
+    response_bytes: u64,
+}
+
+impl GitHubCommitUnknown {
+    const fn new(operation: GitHubOperation, response_bytes: u64) -> Self {
+        Self {
+            operation,
+            response_bytes,
+        }
+    }
 }
 
 /// Typed provider boundary. There is no raw request method.
@@ -331,36 +393,58 @@ where
                     request: request.clone(),
                     plan,
                 };
-                let response = self
-                    .provider
-                    .publish_branch(&input, credential, max_response_bytes)
-                    .map_err(GitHubAdapterError::from)?;
-                validate_provider_response(
-                    &response,
+                finish_provider_mutation(
+                    self.provider
+                        .publish_branch(&input, credential, max_response_bytes),
                     request.operation(),
                     max_response_bytes,
                     Some(input.plan.new_object()),
-                )?;
-                Ok(response)
+                )
             }
             GitHubOperation::CreatePullRequest => {
                 let input = CreatePullRequestInput {
                     request: request.clone(),
                 };
-                let response = self
-                    .provider
-                    .create_pull_request(&input, credential, max_response_bytes)
-                    .map_err(GitHubAdapterError::from)?;
-                validate_provider_response(
-                    &response,
+                finish_provider_mutation(
+                    self.provider
+                        .create_pull_request(&input, credential, max_response_bytes),
                     request.operation(),
                     max_response_bytes,
                     None,
-                )?;
-                Ok(response)
+                )
             }
         }
     }
+}
+
+fn finish_provider_mutation(
+    result: Result<GitHubResponse, GitHubProviderError>,
+    operation: GitHubOperation,
+    max_response_bytes: u64,
+    expected_object: Option<&GitObjectId>,
+) -> Result<GitHubResponse, GitHubAdapterError> {
+    let response = match result {
+        Ok(response) => response,
+        Err(GitHubProviderError::CommitUnknown) => {
+            return Err(GitHubAdapterError::CommitUnknown(GitHubCommitUnknown::new(
+                operation,
+                max_response_bytes,
+            )));
+        }
+        Err(error) => return Err(GitHubAdapterError::from_provider_before_commit(error)),
+    };
+    if validate_provider_response(&response, operation, max_response_bytes, expected_object)
+        .is_err()
+    {
+        // A provider that returns `Ok` has already crossed its mutation
+        // boundary. Invalid typed fields cannot safely turn that effect into a
+        // pre-commit denial because a retry could execute it a second time.
+        return Err(GitHubAdapterError::CommitUnknown(GitHubCommitUnknown::new(
+            operation,
+            max_response_bytes,
+        )));
+    }
+    Ok(response)
 }
 
 fn validate_provider_response(
@@ -369,7 +453,10 @@ fn validate_provider_response(
     max_response_bytes: u64,
     expected_object: Option<&GitObjectId>,
 ) -> Result<(), GitHubAdapterError> {
-    if response.operation != operation || response.response_bytes > max_response_bytes {
+    if response.is_commit_unknown()
+        || response.operation != operation
+        || response.response_bytes > max_response_bytes
+    {
         return Err(GitHubAdapterError::InvalidProviderResponse);
     }
     match operation {
@@ -406,7 +493,7 @@ pub struct RateLimitInfo {
 }
 
 /// Typed provider failures with no raw response passthrough.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitHubProviderError {
     /// Authentication was rejected.
     Unauthorized,
@@ -427,6 +514,8 @@ pub enum GitHubProviderError {
     Transport,
     /// Provider response failed its fixed schema validation.
     InvalidResponse,
+    /// A mutation was sent but its terminal provider result could not be proven.
+    CommitUnknown,
 }
 
 /// Typed adapter failures retained in broker outcomes.
@@ -459,10 +548,12 @@ pub enum GitHubAdapterError {
     InvalidProviderResponse,
     /// Provider transport failed.
     ProviderTransport,
+    /// A mutation may have committed and must be recorded terminally.
+    CommitUnknown(GitHubCommitUnknown),
 }
 
-impl From<GitHubProviderError> for GitHubAdapterError {
-    fn from(error: GitHubProviderError) -> Self {
+impl GitHubAdapterError {
+    fn from_provider_before_commit(error: GitHubProviderError) -> Self {
         match error {
             GitHubProviderError::RateLimited(info) => Self::RateLimited(info),
             GitHubProviderError::InvalidResponse => Self::InvalidProviderResponse,
@@ -472,6 +563,9 @@ impl From<GitHubProviderError> for GitHubAdapterError {
             GitHubProviderError::NotFound => Self::ProviderNotFound,
             GitHubProviderError::Conflict => Self::ProviderConflict,
             GitHubProviderError::Server { status } => Self::ProviderServer { status },
+            GitHubProviderError::CommitUnknown => {
+                unreachable!("commit-unknown errors require request context")
+            }
         }
     }
 }
@@ -495,6 +589,9 @@ impl fmt::Display for GitHubAdapterError {
             Self::RateLimited(_) => "GitHub provider rate limit was reached",
             Self::InvalidProviderResponse => "GitHub provider returned an invalid typed response",
             Self::ProviderTransport => "GitHub provider transport failed",
+            Self::CommitUnknown(_) => {
+                "GitHub mutation may have committed without a valid provider response"
+            }
         };
         formatter.write_str(message)
     }
@@ -591,20 +688,20 @@ impl RustlsGitHubProvider {
                 },
             }))
             .send()
-            .map_err(|_| GitHubProviderError::Transport)?;
-        let update_bytes = response_bytes(update, remaining)?;
+            .map_err(|_| GitHubProviderError::CommitUnknown)?;
+        let update_bytes = mutation_response_bytes(update, remaining)?;
         parse_update_refs_response(&update_bytes)?;
         let update_response_bytes =
-            u64::try_from(update_bytes.len()).map_err(|_| GitHubProviderError::InvalidResponse)?;
+            u64::try_from(update_bytes.len()).map_err(|_| GitHubProviderError::CommitUnknown)?;
         let total_response_bytes = repository_response_bytes
             .checked_add(update_response_bytes)
-            .ok_or(GitHubProviderError::InvalidResponse)?;
-        Ok(GitHubResponse {
-            response_bytes: total_response_bytes,
-            operation: GitHubOperation::PublishBranch,
-            number: None,
-            object: Some(input.plan.new_object().clone()),
-        })
+            .ok_or(GitHubProviderError::CommitUnknown)?;
+        Ok(GitHubResponse::committed(
+            total_response_bytes,
+            GitHubOperation::PublishBranch,
+            None,
+            Some(input.plan.new_object().clone()),
+        ))
     }
 
     fn send_pull_request(
@@ -625,22 +722,16 @@ impl RustlsGitHubProvider {
                 "head": input.request.head().to_string(),
             }))
             .send()
-            .map_err(|_| GitHubProviderError::Transport)?;
-        let bytes = response_bytes(response, max_response_bytes.min(MAX_GITHUB_RESPONSE_BYTES))?;
-        let json: Value =
-            serde_json::from_slice(&bytes).map_err(|_| GitHubProviderError::InvalidResponse)?;
-        let number = json
-            .get("number")
-            .and_then(Value::as_u64)
-            .filter(|number| *number != 0)
-            .ok_or(GitHubProviderError::InvalidResponse)?;
-        Ok(GitHubResponse {
-            response_bytes: u64::try_from(bytes.len())
-                .map_err(|_| GitHubProviderError::InvalidResponse)?,
-            operation: GitHubOperation::CreatePullRequest,
-            number: Some(number),
-            object: None,
-        })
+            .map_err(|_| GitHubProviderError::CommitUnknown)?;
+        let bytes =
+            mutation_response_bytes(response, max_response_bytes.min(MAX_GITHUB_RESPONSE_BYTES))?;
+        let number = parse_pull_request_number(&bytes)?;
+        Ok(GitHubResponse::committed(
+            u64::try_from(bytes.len()).map_err(|_| GitHubProviderError::CommitUnknown)?,
+            GitHubOperation::CreatePullRequest,
+            Some(number),
+            None,
+        ))
     }
 }
 
@@ -712,7 +803,7 @@ fn parse_repository_node_id(bytes: &[u8]) -> Result<String, GitHubProviderError>
 
 fn parse_update_refs_response(bytes: &[u8]) -> Result<(), GitHubProviderError> {
     let json: Value =
-        serde_json::from_slice(bytes).map_err(|_| GitHubProviderError::InvalidResponse)?;
+        serde_json::from_slice(bytes).map_err(|_| GitHubProviderError::CommitUnknown)?;
     if json
         .get("errors")
         .and_then(Value::as_array)
@@ -737,22 +828,59 @@ fn parse_update_refs_response(bytes: &[u8]) -> Result<(), GitHubProviderError> {
         return Err(if expected_old_conflict {
             GitHubProviderError::Conflict
         } else {
-            GitHubProviderError::InvalidResponse
+            GitHubProviderError::CommitUnknown
         });
     }
     let update_refs = json
         .get("data")
         .and_then(|data| data.get("updateRefs"))
-        .ok_or(GitHubProviderError::InvalidResponse)?;
+        .ok_or(GitHubProviderError::CommitUnknown)?;
     if !update_refs.is_object() {
-        return Err(GitHubProviderError::InvalidResponse);
+        return Err(GitHubProviderError::CommitUnknown);
     }
     Ok(())
+}
+
+fn parse_pull_request_number(bytes: &[u8]) -> Result<u64, GitHubProviderError> {
+    let json: Value =
+        serde_json::from_slice(bytes).map_err(|_| GitHubProviderError::CommitUnknown)?;
+    json.get("number")
+        .and_then(Value::as_u64)
+        .filter(|number| *number != 0)
+        .ok_or(GitHubProviderError::CommitUnknown)
 }
 
 fn response_bytes(mut response: Response, limit: u64) -> Result<Vec<u8>, GitHubProviderError> {
     let status = response.status().as_u16();
     let rate_limit = rate_limit_info(&response);
+    if !(200..300).contains(&status) {
+        return Err(provider_error_from_status(status, rate_limit));
+    }
+    read_response_body(&mut response, limit)
+}
+
+fn mutation_response_bytes(
+    mut response: Response,
+    limit: u64,
+) -> Result<Vec<u8>, GitHubProviderError> {
+    let status = response.status().as_u16();
+    let rate_limit = rate_limit_info(&response);
+    if !(200..300).contains(&status) {
+        return match provider_error_from_status(status, rate_limit) {
+            GitHubProviderError::Server { .. } => Err(GitHubProviderError::CommitUnknown),
+            error => Err(error),
+        };
+    }
+    mutation_body_result(read_response_body(&mut response, limit))
+}
+
+fn mutation_body_result<T>(
+    result: Result<T, GitHubProviderError>,
+) -> Result<T, GitHubProviderError> {
+    result.map_err(|_| GitHubProviderError::CommitUnknown)
+}
+
+fn read_response_body(response: &mut Response, limit: u64) -> Result<Vec<u8>, GitHubProviderError> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 8 * 1024];
     loop {
@@ -767,9 +895,6 @@ fn response_bytes(mut response: Response, limit: u64) -> Result<Vec<u8>, GitHubP
             return Err(GitHubProviderError::InvalidResponse);
         }
         bytes.extend_from_slice(&buffer[..read]);
-    }
-    if !(200..300).contains(&status) {
-        return Err(provider_error_from_status(status, rate_limit));
     }
     Ok(bytes)
 }
@@ -890,14 +1015,14 @@ mod tests {
                 input.plan().expected_old_object().as_str(),
                 "0000000000000000000000000000000000000000"
             );
-            self.error.clone().map_or_else(
+            self.error.map_or_else(
                 || {
-                    Ok(GitHubResponse {
-                        response_bytes: 2,
-                        operation: GitHubOperation::PublishBranch,
-                        number: None,
-                        object: Some(input.plan().new_object().clone()),
-                    })
+                    Ok(GitHubResponse::committed(
+                        2,
+                        GitHubOperation::PublishBranch,
+                        None,
+                        Some(input.plan().new_object().clone()),
+                    ))
                 },
                 Err,
             )
@@ -909,14 +1034,14 @@ mod tests {
             _max_response_bytes: u64,
         ) -> Result<GitHubResponse, GitHubProviderError> {
             *self.calls.lock().expect("call mutex is not poisoned") += 1;
-            self.error.clone().map_or_else(
+            self.error.map_or_else(
                 || {
-                    Ok(GitHubResponse {
-                        response_bytes: 2,
-                        operation: GitHubOperation::CreatePullRequest,
-                        number: Some(9),
-                        object: None,
-                    })
+                    Ok(GitHubResponse::committed(
+                        2,
+                        GitHubOperation::CreatePullRequest,
+                        Some(9),
+                        None,
+                    ))
                 },
                 Err,
             )
@@ -1001,16 +1126,52 @@ mod tests {
     #[test]
     fn provider_response_over_budget_is_rejected_at_the_typed_boundary() {
         let (mut adapter, calls) = adapter(None);
-        assert_eq!(
+        assert!(matches!(
             adapter.execute(
                 BrokerRequestId::new([7; 16]),
                 &request(GitHubOperation::PublishBranch),
                 &authority(GitHubOperation::PublishBranch),
                 1,
             ),
-            Err(GitHubAdapterError::InvalidProviderResponse)
-        );
+            Err(GitHubAdapterError::CommitUnknown(_))
+        ));
         assert_eq!(*calls.lock().expect("call mutex is not poisoned"), 1);
+    }
+
+    // Requirement: failures after a mutation send cannot authorize a second mutation attempt.
+    // Category: state transition/security. Risk: critical.
+    #[test]
+    fn provider_commit_unknown_is_preserved_as_opaque_adapter_evidence() {
+        let (mut adapter, calls) = adapter(Some(GitHubProviderError::CommitUnknown));
+
+        assert!(matches!(
+            adapter.execute(
+                BrokerRequestId::new([7; 16]),
+                &request(GitHubOperation::CreatePullRequest),
+                &authority(GitHubOperation::CreatePullRequest),
+                MAX_GITHUB_RESPONSE_BYTES,
+            ),
+            Err(GitHubAdapterError::CommitUnknown(_))
+        ));
+        assert_eq!(*calls.lock().expect("call mutex is not poisoned"), 1);
+    }
+
+    // Requirement: failed reads and malformed 2xx bodies after a mutation send are commit-unknown.
+    // Category: fault injection/security. Risk: critical.
+    #[test]
+    fn failed_and_malformed_post_send_responses_are_commit_unknown() {
+        assert_eq!(
+            super::mutation_body_result::<Vec<u8>>(Err(GitHubProviderError::Transport)),
+            Err(GitHubProviderError::CommitUnknown)
+        );
+        assert_eq!(
+            super::parse_pull_request_number(br#"{"number":"not-a-number"}"#),
+            Err(GitHubProviderError::CommitUnknown)
+        );
+        assert_eq!(
+            super::parse_update_refs_response(br#"{"data":{"updateRefs":null}}"#),
+            Err(GitHubProviderError::CommitUnknown)
+        );
     }
 
     // Requirement: missing host precondition rejects before provider invocation.
@@ -1053,7 +1214,7 @@ mod tests {
     // Requirement: provider JSON errors are classified without returning raw provider content.
     // Category: contract/error/security. Risk: high.
     #[test]
-    fn graphql_expected_old_conflict_is_typed_and_malformed_success_is_rejected() {
+    fn graphql_expected_old_conflict_is_typed_and_malformed_success_is_commit_unknown() {
         assert_eq!(
             super::parse_update_refs_response(
                 br#"{"errors":[{"message":"Expected ref beforeOid to point to the supplied value"}]}"#,
@@ -1062,7 +1223,7 @@ mod tests {
         );
         assert_eq!(
             super::parse_update_refs_response(br#"{"data":{"updateRefs":null}}"#),
-            Err(GitHubProviderError::InvalidResponse)
+            Err(GitHubProviderError::CommitUnknown)
         );
     }
 }

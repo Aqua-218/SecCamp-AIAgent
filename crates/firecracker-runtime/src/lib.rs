@@ -489,7 +489,7 @@ impl RuntimeConfig {
     /// Explicitly session-scoped host paths are normalized to their jail-visible paths because
     /// paused restore binds a fresh workspace and vsock while preserving the guest-visible
     /// resource contract. The clone ID, cgroup leaf, mapper name, and corresponding host paths
-    /// are bound separately by [`Self::instance_fingerprint`]. Every non-overridable
+    /// are bound separately by the internal instance fingerprint. Every non-overridable
     /// restore-relevant field is encoded here.
     #[must_use]
     #[allow(clippy::too_many_lines)] // The encoding deliberately enumerates the full config.

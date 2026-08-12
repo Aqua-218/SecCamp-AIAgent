@@ -29,6 +29,9 @@ case "${command_name}" in
   docs)
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --locked --no-deps
     ;;
+  docs-policy)
+    scripts/ci/check-docs.sh
+    ;;
   test)
     if [[ "$#" -ne 1 ]]; then
       printf 'test requires one shard number\n' >&2

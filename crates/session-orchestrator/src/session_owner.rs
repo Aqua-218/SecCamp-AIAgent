@@ -461,6 +461,19 @@ mod tests {
             Ok(lease)
         }
 
+        fn ensure_broker_session_running(
+            &mut self,
+            lease: &BrokerLease,
+        ) -> Result<(), BackendError> {
+            if self.active.as_ref() == Some(lease) {
+                Ok(())
+            } else {
+                Err(BackendError::new(
+                    "test rejected an inexact Broker health check",
+                ))
+            }
+        }
+
         fn close_broker_session(&mut self, lease: &BrokerLease) -> Result<(), BackendError> {
             record(&self.events, "close");
             if self.active.as_ref() != Some(lease) {

@@ -111,8 +111,11 @@ check_file() {
   if [[ "$(grep -c '^# ' -- "${prose}")" -ne 1 ]]; then
     fail "${file}" ' expected exactly one H1 heading'
   fi
-  has_breadcrumb ||
-    fail "${file}" ' missing breadcrumb line directly below the H1'
+  # docs/README.md is the root of the tree and has no parent to point at.
+  if [[ "${file}" != 'docs/README.md' ]]; then
+    has_breadcrumb ||
+      fail "${file}" ' missing breadcrumb line directly below the H1'
+  fi
   grep -qE '^> \*\*対象読者:\*\* .+' -- "${prose}" ||
     fail "${file}" ' missing "> **対象読者:**" line'
   has_section "${prose}" '関連' ||

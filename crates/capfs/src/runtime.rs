@@ -1,6 +1,7 @@
 //! Descriptor-relative runtime access to a validated backing repository.
 
 use std::{
+    collections::{HashMap, HashSet},
     error::Error,
     fmt, io,
     os::fd::AsFd,
@@ -12,15 +13,15 @@ use authority_core::path::CanonicalPath;
 use rustix::{
     fd::OwnedFd,
     fs::{
-        AtFlags, FileType, Mode, OFlags, ResolveFlags, Statx, StatxFlags, StatxTimestamp, fchmod,
-        ftruncate, mkdirat, openat2, statx, unlinkat,
+        AtFlags, FileType, Mode, OFlags, RenameFlags, ResolveFlags, Statx, StatxFlags,
+        StatxTimestamp, fchmod, ftruncate, mkdirat, openat2, renameat_with, statx, unlinkat,
     },
     io::{fcntl_dupfd_cloexec, pread, pwrite},
 };
 
 use crate::{
     backing::ValidatedRepository,
-    namespace::{NamespaceObject, NamespaceObjectKind},
+    namespace::{NamespaceObject, NamespaceObjectKind, RenamePlan},
 };
 
 const REQUIRED_METADATA: StatxFlags = StatxFlags::BASIC_STATS.union(StatxFlags::MNT_ID);
@@ -86,9 +87,21 @@ pub(crate) enum RuntimeBackingError {
     NestedMount(CanonicalPath),
     TimestampOutOfRange(CanonicalPath),
     #[allow(dead_code)]
-    CreationPathNotDirectChild {
+    PathNotDirectChild {
         parent: CanonicalPath,
         child: CanonicalPath,
+    },
+    #[allow(dead_code)]
+    InvalidRenamePlan {
+        source: CanonicalPath,
+        destination: CanonicalPath,
+        reason: &'static str,
+    },
+    #[allow(dead_code)]
+    RenameIo {
+        source: CanonicalPath,
+        destination: CanonicalPath,
+        cause: io::Error,
     },
 }
 
@@ -133,11 +146,31 @@ impl fmt::Display for RuntimeBackingError {
                 "backing object `{}` has a timestamp outside SystemTime range",
                 DisplayCanonicalPath(path)
             ),
-            Self::CreationPathNotDirectChild { parent, child } => write!(
+            Self::PathNotDirectChild { parent, child } => write!(
                 formatter,
-                "backing creation path `{}` is not a direct child of `{}`",
+                "backing path `{}` is not a direct child of `{}`",
                 DisplayCanonicalPath(child),
                 DisplayCanonicalPath(parent)
+            ),
+            Self::InvalidRenamePlan {
+                source,
+                destination,
+                reason,
+            } => write!(
+                formatter,
+                "invalid backing rename plan from `{}` to `{}`: {reason}",
+                DisplayCanonicalPath(source),
+                DisplayCanonicalPath(destination)
+            ),
+            Self::RenameIo {
+                source,
+                destination,
+                cause,
+            } => write!(
+                formatter,
+                "failed to rename backing path `{}` to `{}` without replacement: {cause}",
+                DisplayCanonicalPath(source),
+                DisplayCanonicalPath(destination)
             ),
         }
     }
@@ -147,6 +180,7 @@ impl Error for RuntimeBackingError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::RenameIo { cause, .. } => Some(cause),
             _ => None,
         }
     }
@@ -343,6 +377,88 @@ impl ValidatedRepository {
         rollback_created_entry_on_error(&parent_fd, child, child_name, AtFlags::REMOVEDIR, result)
     }
 
+    /// Removes one validated direct child using its live parent descriptor.
+    ///
+    /// Every validation happens before `unlinkat`. A successful syscall is the
+    /// operation's linearization point and the method performs no fallible work
+    /// afterward, so the namespace transaction may publish its staged removal.
+    #[allow(dead_code)]
+    pub(crate) fn remove_runtime_object(
+        &self,
+        parent: &NamespaceObject,
+        object: &NamespaceObject,
+    ) -> Result<(), RuntimeBackingError> {
+        let child_name = direct_child_name(parent, object)?;
+        let parent_fd = self.open_runtime_directory(parent)?;
+        let _validated_object = self.open_and_validate_runtime_child(
+            &parent_fd,
+            child_name,
+            object.path(),
+            object.kind(),
+        )?;
+        let (flags, operation) = match object.kind() {
+            NamespaceObjectKind::Directory => (AtFlags::REMOVEDIR, "remove directory"),
+            NamespaceObjectKind::RegularFile => (AtFlags::empty(), "remove regular file"),
+        };
+        unlinkat(&parent_fd, child_name, flags)
+            .map_err(|error| runtime_io_error(operation, object.path(), error))
+    }
+
+    /// Executes one validated no-replace subtree rename.
+    ///
+    /// The complete plan, both parent directories, and every moved backing
+    /// object are validated before `renameat2`. The `NOREPLACE` syscall is the
+    /// final fallible step, which preserves the namespace executor contract:
+    /// `Err` means the backing rename did not commit, and `Ok` means it did.
+    #[allow(dead_code)]
+    pub(crate) fn rename_runtime_subtree(
+        &self,
+        plan: &RenamePlan,
+    ) -> Result<(), RuntimeBackingError> {
+        validate_rename_plan(plan)?;
+        let source_parent_path = plan
+            .source()
+            .parent()
+            .ok_or_else(|| invalid_rename_plan(plan, "the repository root cannot be renamed"))?;
+        let destination_parent_path = plan.destination().parent().ok_or_else(|| {
+            invalid_rename_plan(plan, "the repository root cannot be a rename destination")
+        })?;
+        let source_name = final_name(plan.source())
+            .ok_or_else(|| invalid_rename_plan(plan, "the source has no final path segment"))?;
+        let destination_name = final_name(plan.destination()).ok_or_else(|| {
+            invalid_rename_plan(plan, "the destination has no final path segment")
+        })?;
+
+        let source_parent_fd = self.open_runtime_directory_path(&source_parent_path)?;
+        let destination_parent_fd = self.open_runtime_directory_path(&destination_parent_path)?;
+        for movement in plan.moved_objects() {
+            let fd = if movement.source() == plan.source() {
+                self.open_and_validate_runtime_child(
+                    &source_parent_fd,
+                    source_name,
+                    movement.source(),
+                    movement.kind(),
+                )?
+            } else {
+                self.open_and_validate_runtime_path(movement.source(), movement.kind())?
+            };
+            drop(fd);
+        }
+
+        renameat_with(
+            &source_parent_fd,
+            source_name,
+            &destination_parent_fd,
+            destination_name,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| RuntimeBackingError::RenameIo {
+            source: plan.source().clone(),
+            destination: plan.destination().clone(),
+            cause: io::Error::from_raw_os_error(error.raw_os_error()),
+        })
+    }
+
     fn open_runtime_file_with_access(
         &self,
         object: &NamespaceObject,
@@ -382,23 +498,190 @@ impl ValidatedRepository {
                 actual: Some(object.kind()),
             });
         }
-        let fd = if object.path().is_root() {
-            fcntl_dupfd_cloexec(self.as_fd(), 0).map_err(|error| {
-                runtime_io_error("duplicate root directory", object.path(), error)
-            })?
+        let fd = self.open_runtime_directory_path(object.path())?;
+        validate_runtime_metadata(self, object, metadata_for_fd(&fd, object.path())?)?;
+        Ok(fd)
+    }
+
+    fn open_runtime_directory_path(
+        &self,
+        path: &CanonicalPath,
+    ) -> Result<OwnedFd, RuntimeBackingError> {
+        let fd = if path.is_root() {
+            fcntl_dupfd_cloexec(self.as_fd(), 0)
+                .map_err(|error| runtime_io_error("duplicate root directory", path, error))?
         } else {
             openat2(
                 self.as_fd(),
-                path_buf(object.path()),
+                path_buf(path),
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::empty(),
                 RESOLVE_WITHIN_ROOT,
             )
-            .map_err(|error| runtime_io_error("open parent directory", object.path(), error))?
+            .map_err(|error| runtime_io_error("open parent directory", path, error))?
         };
-        validate_runtime_metadata(self, object, metadata_for_fd(&fd, object.path())?)?;
+        validate_runtime_metadata_for(
+            self,
+            path,
+            NamespaceObjectKind::Directory,
+            metadata_for_fd(&fd, path)?,
+        )?;
         Ok(fd)
     }
+
+    #[allow(dead_code)]
+    fn open_and_validate_runtime_child(
+        &self,
+        parent_fd: &OwnedFd,
+        child_name: &str,
+        child_path: &CanonicalPath,
+        expected_kind: NamespaceObjectKind,
+    ) -> Result<OwnedFd, RuntimeBackingError> {
+        let fd = openat2(
+            parent_fd,
+            child_name,
+            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            RESOLVE_WITHIN_ROOT,
+        )
+        .map_err(|error| runtime_io_error("open child for mutation", child_path, error))?;
+        validate_runtime_metadata_for(
+            self,
+            child_path,
+            expected_kind,
+            metadata_for_fd(&fd, child_path)?,
+        )?;
+        Ok(fd)
+    }
+
+    #[allow(dead_code)]
+    fn open_and_validate_runtime_path(
+        &self,
+        path: &CanonicalPath,
+        expected_kind: NamespaceObjectKind,
+    ) -> Result<OwnedFd, RuntimeBackingError> {
+        let fd = openat2(
+            self.as_fd(),
+            path_buf(path),
+            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            RESOLVE_WITHIN_ROOT,
+        )
+        .map_err(|error| runtime_io_error("open rename source", path, error))?;
+        validate_runtime_metadata_for(self, path, expected_kind, metadata_for_fd(&fd, path)?)?;
+        Ok(fd)
+    }
+}
+
+fn direct_child_name<'a>(
+    parent: &NamespaceObject,
+    child: &'a NamespaceObject,
+) -> Result<&'a str, RuntimeBackingError> {
+    if parent.kind() != NamespaceObjectKind::Directory
+        || child.path().parent().as_ref() != Some(parent.path())
+    {
+        return Err(RuntimeBackingError::PathNotDirectChild {
+            parent: parent.path().clone(),
+            child: child.path().clone(),
+        });
+    }
+    final_name(child.path()).ok_or_else(|| RuntimeBackingError::PathNotDirectChild {
+        parent: parent.path().clone(),
+        child: child.path().clone(),
+    })
+}
+
+fn final_name(path: &CanonicalPath) -> Option<&str> {
+    path.as_segments().last().map(String::as_str)
+}
+
+#[allow(dead_code)]
+fn invalid_rename_plan(plan: &RenamePlan, reason: &'static str) -> RuntimeBackingError {
+    RuntimeBackingError::InvalidRenamePlan {
+        source: plan.source().clone(),
+        destination: plan.destination().clone(),
+        reason,
+    }
+}
+
+#[allow(dead_code)]
+fn validate_rename_plan(plan: &RenamePlan) -> Result<(), RuntimeBackingError> {
+    if plan.source().is_root() || plan.destination().is_root() {
+        return Err(invalid_rename_plan(
+            plan,
+            "source and destination must both be below the repository root",
+        ));
+    }
+    if plan.destination().is_at_or_below(plan.source()) {
+        return Err(invalid_rename_plan(
+            plan,
+            "destination must not be inside the source subtree",
+        ));
+    }
+    if plan.moved_objects().is_empty() {
+        return Err(invalid_rename_plan(
+            plan,
+            "the moved-object set must not be empty",
+        ));
+    }
+
+    let mut objects = HashSet::with_capacity(plan.moved_objects().len());
+    let mut sources = HashMap::with_capacity(plan.moved_objects().len());
+    let mut destinations = HashSet::with_capacity(plan.moved_objects().len());
+    let mut root_movement_count = 0_usize;
+    for movement in plan.moved_objects() {
+        if !objects.insert(movement.object())
+            || sources.insert(movement.source(), movement.kind()).is_some()
+            || !destinations.insert(movement.destination())
+        {
+            return Err(invalid_rename_plan(
+                plan,
+                "object identities and source/destination paths must be unique",
+            ));
+        }
+        let expected_destination = movement
+            .source()
+            .rebase(plan.source(), plan.destination())
+            .ok_or_else(|| {
+                invalid_rename_plan(plan, "every moved source must be inside the source subtree")
+            })?;
+        if &expected_destination != movement.destination() {
+            return Err(invalid_rename_plan(
+                plan,
+                "every destination must preserve its source-relative suffix",
+            ));
+        }
+        if movement.source() == plan.source() {
+            if movement.destination() != plan.destination() {
+                return Err(invalid_rename_plan(
+                    plan,
+                    "the root movement must match the requested destination",
+                ));
+            }
+            root_movement_count += 1;
+        }
+    }
+    if root_movement_count != 1 {
+        return Err(invalid_rename_plan(
+            plan,
+            "the source root must appear exactly once",
+        ));
+    }
+    for movement in plan.moved_objects() {
+        if movement.source() == plan.source() {
+            continue;
+        }
+        let parent = movement.source().parent().ok_or_else(|| {
+            invalid_rename_plan(plan, "a moved descendant must have a moved parent")
+        })?;
+        if sources.get(&parent) != Some(&NamespaceObjectKind::Directory) {
+            return Err(invalid_rename_plan(
+                plan,
+                "every moved descendant must have a directory parent in the plan",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -407,13 +690,6 @@ fn validate_creation_objects<'a>(
     child: &'a NamespaceObject,
     expected_kind: NamespaceObjectKind,
 ) -> Result<&'a str, RuntimeBackingError> {
-    if parent.kind() != NamespaceObjectKind::Directory {
-        return Err(RuntimeBackingError::ObjectKindChanged {
-            path: parent.path().clone(),
-            expected: NamespaceObjectKind::Directory,
-            actual: Some(parent.kind()),
-        });
-    }
     if child.kind() != expected_kind {
         return Err(RuntimeBackingError::ObjectKindChanged {
             path: child.path().clone(),
@@ -421,21 +697,7 @@ fn validate_creation_objects<'a>(
             actual: Some(child.kind()),
         });
     }
-    if child.path().parent().as_ref() != Some(parent.path()) {
-        return Err(RuntimeBackingError::CreationPathNotDirectChild {
-            parent: parent.path().clone(),
-            child: child.path().clone(),
-        });
-    }
-    child
-        .path()
-        .as_segments()
-        .last()
-        .map(String::as_str)
-        .ok_or_else(|| RuntimeBackingError::CreationPathNotDirectChild {
-            parent: parent.path().clone(),
-            child: child.path().clone(),
-        })
+    direct_child_name(parent, child)
 }
 
 #[allow(dead_code)]
@@ -484,19 +746,27 @@ fn validate_runtime_metadata(
     object: &NamespaceObject,
     metadata: Statx,
 ) -> Result<BackingMetadata, RuntimeBackingError> {
-    let path = object.path();
+    validate_runtime_metadata_for(repository, object.path(), object.kind(), metadata)
+}
+
+fn validate_runtime_metadata_for(
+    repository: &ValidatedRepository,
+    path: &CanonicalPath,
+    expected_kind: NamespaceObjectKind,
+    metadata: Statx,
+) -> Result<BackingMetadata, RuntimeBackingError> {
     let actual_kind = namespace_kind(FileType::from_raw_mode(metadata.stx_mode.into()));
-    if actual_kind != Some(object.kind()) {
+    if actual_kind != Some(expected_kind) {
         return Err(RuntimeBackingError::ObjectKindChanged {
             path: path.clone(),
-            expected: object.kind(),
+            expected: expected_kind,
             actual: actual_kind,
         });
     }
     if metadata.stx_mnt_id != repository.root_mount_id() {
         return Err(RuntimeBackingError::NestedMount(path.clone()));
     }
-    if object.kind() == NamespaceObjectKind::RegularFile && metadata.stx_nlink != 1 {
+    if expected_kind == NamespaceObjectKind::RegularFile && metadata.stx_nlink != 1 {
         return Err(RuntimeBackingError::HardLinkAppeared {
             path: path.clone(),
             link_count: metadata.stx_nlink,
@@ -509,7 +779,7 @@ fn validate_runtime_metadata(
         atime: system_time(metadata.stx_atime, path)?,
         mtime: system_time(metadata.stx_mtime, path)?,
         ctime: system_time(metadata.stx_ctime, path)?,
-        kind: object.kind(),
+        kind: expected_kind,
         permissions: metadata.stx_mode & 0o7777,
         link_count: metadata.stx_nlink,
         uid: metadata.stx_uid,
@@ -1054,7 +1324,7 @@ mod tests {
                         child,
                         "rolled-back.txt",
                         AtFlags::empty(),
-                        Err::<(), _>(RuntimeBackingError::CreationPathNotDirectChild {
+                        Err::<(), _>(RuntimeBackingError::PathNotDirectChild {
                             parent: CanonicalPath::root(),
                             child: child.path().clone(),
                         }),
@@ -1064,9 +1334,7 @@ mod tests {
             .expect_err("post-create validation failure must abort the transaction");
         assert!(matches!(
             error,
-            NamespaceOperationError::Executor(
-                RuntimeBackingError::CreationPathNotDirectChild { .. }
-            )
+            NamespaceOperationError::Executor(RuntimeBackingError::PathNotDirectChild { .. })
         ));
         assert!(!directory.path().join("rolled-back.txt").exists());
         assert!(
@@ -1110,9 +1378,7 @@ mod tests {
             .expect_err("a mismatched parent must reject creation");
         assert!(matches!(
             error,
-            NamespaceOperationError::Executor(
-                RuntimeBackingError::CreationPathNotDirectChild { .. }
-            )
+            NamespaceOperationError::Executor(RuntimeBackingError::PathNotDirectChild { .. })
         ));
         assert!(!directory.path().join("left/new.txt").exists());
         assert!(!directory.path().join("right/new.txt").exists());
@@ -1166,6 +1432,509 @@ mod tests {
                 .object_at_path_snapshot(&child_path)
                 .expect("namespace must remain readable")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_remove_file_commits_backing_and_namespace_together() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::write(directory.path().join("obsolete.txt"), b"obsolete")
+            .expect("test file must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let root = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+        let removed_path =
+            CanonicalPath::new(["obsolete.txt"]).expect("test path must be canonical");
+
+        namespace
+            .remove_child(root.id(), "obsolete.txt", |parent, object| {
+                backing.remove_runtime_object(parent, object)
+            })
+            .expect("validated regular file must be removed");
+
+        assert!(!directory.path().join("obsolete.txt").exists());
+        assert!(
+            namespace
+                .object_at_path_snapshot(&removed_path)
+                .expect("namespace must remain readable")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_remove_directory_uses_removedir_without_cross_kind_fallback() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::create_dir(directory.path().join("empty")).expect("test directory must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let root = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+        let removed_path = CanonicalPath::new(["empty"]).expect("test path must be canonical");
+
+        namespace
+            .remove_child(root.id(), "empty", |parent, object| {
+                backing.remove_runtime_object(parent, object)
+            })
+            .expect("validated empty directory must be removed");
+
+        assert!(!directory.path().join("empty").exists());
+        assert!(
+            namespace
+                .object_at_path_snapshot(&removed_path)
+                .expect("namespace must remain readable")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_backing_remove_keeps_namespace_and_directory() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let object_path = directory.path().join("initially-empty");
+        fs::create_dir(&object_path).expect("test directory must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let root = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+        let canonical =
+            CanonicalPath::new(["initially-empty"]).expect("test path must be canonical");
+        fs::write(object_path.join("untracked-child"), b"blocks rmdir")
+            .expect("out-of-band child must be creatable");
+
+        let error = namespace
+            .remove_child(root.id(), "initially-empty", |parent, object| {
+                backing.remove_runtime_object(parent, object)
+            })
+            .expect_err("non-empty backing directory must reject removal");
+        assert!(matches!(
+            error,
+            NamespaceOperationError::Executor(RuntimeBackingError::Io {
+                operation: "remove directory",
+                ..
+            })
+        ));
+        assert!(object_path.join("untracked-child").exists());
+        assert!(
+            namespace
+                .object_at_path_snapshot(&canonical)
+                .expect("namespace must remain readable")
+                .is_some(),
+            "a failed unlinkat must not publish the staged namespace removal"
+        );
+    }
+
+    #[test]
+    fn runtime_remove_rejects_hard_link_introduced_after_preflight() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let file_path = directory.path().join("kept.txt");
+        fs::write(&file_path, b"kept").expect("test file must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let root = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+        let canonical = CanonicalPath::new(["kept.txt"]).expect("test path must be canonical");
+        fs::hard_link(&file_path, directory.path().join("alias.txt"))
+            .expect("out-of-band hard link must be creatable");
+
+        let error = namespace
+            .remove_child(root.id(), "kept.txt", |parent, object| {
+                backing.remove_runtime_object(parent, object)
+            })
+            .expect_err("hard-linked file must reject removal");
+        assert!(matches!(
+            error,
+            NamespaceOperationError::Executor(RuntimeBackingError::HardLinkAppeared {
+                link_count: 2,
+                ..
+            })
+        ));
+        assert!(file_path.exists());
+        assert!(directory.path().join("alias.txt").exists());
+        assert!(
+            namespace
+                .object_at_path_snapshot(&canonical)
+                .expect("namespace must remain readable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn runtime_rename_file_is_no_replace_and_updates_the_same_object() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::create_dir(directory.path().join("source")).expect("source parent must be creatable");
+        fs::create_dir(directory.path().join("destination"))
+            .expect("destination parent must be creatable");
+        fs::write(directory.path().join("source/item.txt"), b"payload")
+            .expect("source file must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let source_parent_path =
+            CanonicalPath::new(["source"]).expect("test path must be canonical");
+        let destination_parent_path =
+            CanonicalPath::new(["destination"]).expect("test path must be canonical");
+        let source_path = source_parent_path
+            .child("item.txt")
+            .expect("source path must be canonical");
+        let destination_path = destination_parent_path
+            .child("moved.txt")
+            .expect("destination path must be canonical");
+        let source_parent = namespace
+            .object_at_path_snapshot(&source_parent_path)
+            .expect("namespace must remain readable")
+            .expect("source parent must be imported");
+        let destination_parent = namespace
+            .object_at_path_snapshot(&destination_parent_path)
+            .expect("namespace must remain readable")
+            .expect("destination parent must be imported");
+        let original_object = namespace
+            .object_at_path_snapshot(&source_path)
+            .expect("namespace must remain readable")
+            .expect("source file must be imported")
+            .id()
+            .clone();
+
+        namespace
+            .rename_child(
+                source_parent.id(),
+                "item.txt",
+                destination_parent.id(),
+                "moved.txt",
+                |plan| backing.rename_runtime_subtree(plan),
+            )
+            .expect("validated no-replace rename must commit");
+
+        assert!(!directory.path().join("source/item.txt").exists());
+        assert_eq!(
+            fs::read(directory.path().join("destination/moved.txt"))
+                .expect("renamed file must remain readable"),
+            b"payload"
+        );
+        assert!(
+            namespace
+                .object_at_path_snapshot(&source_path)
+                .expect("namespace must remain readable")
+                .is_none()
+        );
+        assert_eq!(
+            namespace
+                .object_at_path_snapshot(&destination_path)
+                .expect("namespace must remain readable")
+                .expect("destination must be published")
+                .id(),
+            &original_object
+        );
+    }
+
+    #[test]
+    fn runtime_rename_validates_and_moves_every_subtree_object() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::create_dir_all(directory.path().join("source/nested"))
+            .expect("source subtree must be creatable");
+        fs::create_dir(directory.path().join("destination"))
+            .expect("destination parent must be creatable");
+        fs::write(directory.path().join("source/nested/item.txt"), b"payload")
+            .expect("nested file must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let source_parent = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+        let destination_parent_path =
+            CanonicalPath::new(["destination"]).expect("test path must be canonical");
+        let destination_parent = namespace
+            .object_at_path_snapshot(&destination_parent_path)
+            .expect("namespace must remain readable")
+            .expect("destination parent must be imported");
+
+        namespace
+            .rename_child(
+                source_parent.id(),
+                "source",
+                destination_parent.id(),
+                "renamed",
+                |plan| backing.rename_runtime_subtree(plan),
+            )
+            .expect("validated subtree rename must commit");
+
+        assert_eq!(
+            fs::read(directory.path().join("destination/renamed/nested/item.txt"))
+                .expect("renamed descendant must remain readable"),
+            b"payload"
+        );
+        let moved_path = CanonicalPath::new(["destination", "renamed", "nested", "item.txt"])
+            .expect("test path must be canonical");
+        assert!(
+            namespace
+                .object_at_path_snapshot(&moved_path)
+                .expect("namespace must remain readable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn failed_no_replace_rename_leaves_backing_and_namespace_unchanged() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::create_dir(directory.path().join("source")).expect("source parent must be creatable");
+        fs::create_dir(directory.path().join("destination"))
+            .expect("destination parent must be creatable");
+        fs::write(directory.path().join("source/item.txt"), b"source")
+            .expect("source file must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let source_parent_path =
+            CanonicalPath::new(["source"]).expect("test path must be canonical");
+        let destination_parent_path =
+            CanonicalPath::new(["destination"]).expect("test path must be canonical");
+        let source_path = source_parent_path
+            .child("item.txt")
+            .expect("source path must be canonical");
+        let destination_path = destination_parent_path
+            .child("occupied.txt")
+            .expect("destination path must be canonical");
+        let source_parent = namespace
+            .object_at_path_snapshot(&source_parent_path)
+            .expect("namespace must remain readable")
+            .expect("source parent must be imported");
+        let destination_parent = namespace
+            .object_at_path_snapshot(&destination_parent_path)
+            .expect("namespace must remain readable")
+            .expect("destination parent must be imported");
+        fs::write(
+            directory.path().join("destination/occupied.txt"),
+            b"destination",
+        )
+        .expect("out-of-band destination must be creatable");
+
+        let error = namespace
+            .rename_child(
+                source_parent.id(),
+                "item.txt",
+                destination_parent.id(),
+                "occupied.txt",
+                |plan| backing.rename_runtime_subtree(plan),
+            )
+            .expect_err("NOREPLACE must reject an occupied backing destination");
+        assert!(matches!(
+            error,
+            NamespaceOperationError::Executor(RuntimeBackingError::RenameIo { .. })
+        ));
+        assert_eq!(
+            fs::read(directory.path().join("source/item.txt"))
+                .expect("source must remain readable"),
+            b"source"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("destination/occupied.txt"))
+                .expect("destination must remain readable"),
+            b"destination"
+        );
+        assert!(
+            namespace
+                .object_at_path_snapshot(&source_path)
+                .expect("namespace must remain readable")
+                .is_some()
+        );
+        assert!(
+            namespace
+                .object_at_path_snapshot(&destination_path)
+                .expect("namespace must remain readable")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_rename_rejects_descendant_kind_change_before_syscall() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::create_dir(directory.path().join("source"))
+            .expect("source directory must be creatable");
+        fs::write(directory.path().join("source/item.txt"), b"source")
+            .expect("source child must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let root = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+        fs::remove_file(directory.path().join("source/item.txt"))
+            .expect("test child must be replaceable");
+        fs::create_dir(directory.path().join("source/item.txt"))
+            .expect("replacement directory must be creatable");
+
+        let error = namespace
+            .rename_child(root.id(), "source", root.id(), "destination", |plan| {
+                backing.rename_runtime_subtree(plan)
+            })
+            .expect_err("changed descendant kind must reject the entire rename");
+        assert!(matches!(
+            error,
+            NamespaceOperationError::Executor(RuntimeBackingError::ObjectKindChanged {
+                expected: NamespaceObjectKind::RegularFile,
+                actual: Some(NamespaceObjectKind::Directory),
+                ..
+            })
+        ));
+        assert!(directory.path().join("source/item.txt").is_dir());
+        assert!(!directory.path().join("destination").exists());
+        assert!(
+            namespace
+                .object_at_path_snapshot(
+                    &CanonicalPath::new(["source"]).expect("test path must be canonical")
+                )
+                .expect("namespace must remain readable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn runtime_rename_does_not_follow_a_source_symlink() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let outside = tempdir().expect("outside directory must be creatable");
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, b"secret").expect("outside file must be creatable");
+        fs::write(directory.path().join("source.txt"), b"source")
+            .expect("source file must be creatable");
+        fs::create_dir(directory.path().join("destination"))
+            .expect("destination parent must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let root = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+        let destination_parent = namespace
+            .object_at_path_snapshot(
+                &CanonicalPath::new(["destination"]).expect("test path must be canonical"),
+            )
+            .expect("namespace must remain readable")
+            .expect("destination parent must be imported");
+        fs::remove_file(directory.path().join("source.txt")).expect("source must be replaceable");
+        symlink(&outside_file, directory.path().join("source.txt"))
+            .expect("replacement symlink must be creatable");
+
+        let error = namespace
+            .rename_child(
+                root.id(),
+                "source.txt",
+                destination_parent.id(),
+                "moved.txt",
+                |plan| backing.rename_runtime_subtree(plan),
+            )
+            .expect_err("source symlink must reject rename");
+        assert!(matches!(
+            error,
+            NamespaceOperationError::Executor(
+                RuntimeBackingError::Io { .. }
+                    | RuntimeBackingError::ObjectKindChanged { actual: None, .. }
+            )
+        ));
+        assert_eq!(
+            fs::read(&outside_file).expect("outside file must remain readable"),
+            b"secret"
+        );
+        assert!(
+            fs::symlink_metadata(directory.path().join("source.txt"))
+                .expect("source symlink must remain present")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!directory.path().join("destination/moved.txt").exists());
+        assert!(
+            namespace
+                .object_at_path_snapshot(
+                    &CanonicalPath::new(["source.txt"]).expect("test path must be canonical")
+                )
+                .expect("namespace must remain readable")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn runtime_rename_rejects_a_destination_parent_symlink() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let outside = tempdir().expect("outside directory must be creatable");
+        fs::create_dir(directory.path().join("source")).expect("source parent must be creatable");
+        fs::create_dir(directory.path().join("destination"))
+            .expect("destination parent must be creatable");
+        fs::write(directory.path().join("source/item.txt"), b"source")
+            .expect("source file must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let source_parent = namespace
+            .object_at_path_snapshot(
+                &CanonicalPath::new(["source"]).expect("test path must be canonical"),
+            )
+            .expect("namespace must remain readable")
+            .expect("source parent must be imported");
+        let destination_parent = namespace
+            .object_at_path_snapshot(
+                &CanonicalPath::new(["destination"]).expect("test path must be canonical"),
+            )
+            .expect("namespace must remain readable")
+            .expect("destination parent must be imported");
+        fs::remove_dir(directory.path().join("destination"))
+            .expect("destination parent must be replaceable");
+        symlink(outside.path(), directory.path().join("destination"))
+            .expect("replacement parent symlink must be creatable");
+
+        let error = namespace
+            .rename_child(
+                source_parent.id(),
+                "item.txt",
+                destination_parent.id(),
+                "moved.txt",
+                |plan| backing.rename_runtime_subtree(plan),
+            )
+            .expect_err("destination parent symlink must reject rename");
+        assert!(matches!(
+            error,
+            NamespaceOperationError::Executor(RuntimeBackingError::Io {
+                operation: "open parent directory",
+                ..
+            })
+        ));
+        assert_eq!(
+            fs::read(directory.path().join("source/item.txt"))
+                .expect("source must remain readable"),
+            b"source"
+        );
+        assert!(!outside.path().join("moved.txt").exists());
+        assert!(
+            namespace
+                .object_at_path_snapshot(
+                    &CanonicalPath::new(["source", "item.txt"])
+                        .expect("test path must be canonical")
+                )
+                .expect("namespace must remain readable")
+                .is_some()
         );
     }
 

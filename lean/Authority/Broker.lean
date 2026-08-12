@@ -17,10 +17,11 @@ structure BrokerEffectReceipt where
 
 /-- Cached outcome controlling exact-duplicate behavior. -/
 inductive BrokerOutcome where
-  | retryableBudget
+  | retryableBudget (maximumResponseBytes : Nat)
   | pending
   | effectLinearized (receipt : BrokerEffectReceipt)
   | finalDenied
+  | accountingInvariant
   | committedButUnrecorded
   | committed (receipt : BrokerEffectReceipt)
   deriving Repr, DecidableEq
@@ -29,8 +30,8 @@ namespace BrokerOutcome
 
 /-- Terminal outcomes can never re-enter dispatch. -/
 def Terminal : BrokerOutcome → Prop
-  | .finalDenied | .committedButUnrecorded | .committed _ => True
-  | .retryableBudget | .pending | .effectLinearized _ => False
+  | .finalDenied | .accountingInvariant | .committedButUnrecorded | .committed _ => True
+  | .retryableBudget _ | .pending | .effectLinearized _ => False
 
 end BrokerOutcome
 
@@ -91,11 +92,38 @@ inductive PermanentStartDenial (budget : SessionBudget)
       budget.reservedResponseBytes = 0 →
       PermanentStartDenial budget request maximumResponseBytes
 
+/-- A transient denial and successful admission cannot both describe one state. -/
+theorem RetryableStartDenial.excludes_start {budget : SessionBudget}
+    {request : BrokerRequestId} {maximumResponseBytes : Nat}
+    (denial : RetryableStartDenial budget request maximumResponseBytes) :
+    ¬ budget.MayStart request maximumResponseBytes := by
+  intro allowed
+  cases denial with
+  | concurrencyLimit _ _ exhausted =>
+      exact (Nat.not_lt_of_ge exhausted) allowed.concurrencyAvailable
+  | responseBytesReserved _ _ _ exhausted _ =>
+      exact (Nat.not_le_of_lt exhausted) allowed.bytesAvailable
+
+/-- A permanent denial and successful admission cannot both describe one state. -/
+theorem PermanentStartDenial.excludes_start {budget : SessionBudget}
+    {request : BrokerRequestId} {maximumResponseBytes : Nat}
+    (denial : PermanentStartDenial budget request maximumResponseBytes) :
+    ¬ budget.MayStart request maximumResponseBytes := by
+  intro allowed
+  cases denial with
+  | reservationAlreadyActive active => exact active allowed.requestInactive
+  | requestCountExhausted _ exhausted =>
+      exact (Nat.not_lt_of_ge exhausted) allowed.requestAvailable
+  | responseBytesExhausted _ _ _ exhausted _ =>
+      exact (Nat.not_le_of_lt exhausted) allowed.bytesAvailable
+
 /-- Accept a new replay binding and cache a retryable budget denial. -/
-def acceptRetryable (state : BrokerState) (envelope : BrokerEnvelope) : BrokerState :=
+def acceptRetryable (state : BrokerState) (envelope : BrokerEnvelope)
+    (maximumResponseBytes : Nat) : BrokerState :=
   { state with
     replay := state.replay.acceptNew envelope
-    outcomes := replace state.outcomes envelope.request (some .retryableBudget) }
+    outcomes := replace state.outcomes envelope.request
+      (some (.retryableBudget maximumResponseBytes)) }
 
 /-- Accept a new replay binding and cache a permanent budget denial. -/
 def acceptFinalDenied (state : BrokerState) (envelope : BrokerEnvelope) : BrokerState :=
@@ -151,7 +179,7 @@ def abortAfterEffect (state : BrokerState) (request : BrokerRequestId)
     (reservation : ResponseReservation) : BrokerState :=
   { state with
     budget := state.budget.abort request reservation
-    outcomes := replace state.outcomes request (some .committedButUnrecorded) }
+    outcomes := replace state.outcomes request (some .accountingInvariant) }
 
 /-- Abort one pending reservation and cache a terminal denial. -/
 def deny (state : BrokerState) (request : BrokerRequestId)
@@ -174,7 +202,7 @@ def RequestCoupled (state : BrokerState) (request : BrokerRequestId) : Prop :=
   match state.outcomes request with
   | none => state.replay.accepted request = none ∧
       state.budget.active request = none ∧ state.effects request = false
-  | some .retryableBudget => state.HasReplayBinding request ∧
+  | some (.retryableBudget _) => state.HasReplayBinding request ∧
       state.budget.active request = none ∧ state.effects request = false
   | some .pending => state.HasReplayBinding request ∧
       state.HasActiveReservation request ∧ state.effects request = false
@@ -182,6 +210,8 @@ def RequestCoupled (state : BrokerState) (request : BrokerRequestId) : Prop :=
       state.HasActiveReservation request ∧ state.effects request = true
   | some .finalDenied => state.HasReplayBinding request ∧
       state.budget.active request = none ∧ state.effects request = false
+  | some .accountingInvariant => state.HasReplayBinding request ∧
+      state.budget.active request = none ∧ state.effects request = true
   | some .committedButUnrecorded => state.HasReplayBinding request ∧
       state.budget.active request = none ∧ state.effects request = true
   | some (.committed _) => state.HasReplayBinding request ∧
@@ -189,21 +219,26 @@ def RequestCoupled (state : BrokerState) (request : BrokerRequestId) : Prop :=
 
 /-- Exact finite accounting and all broker views agree request by request. -/
 structure WellFormed (state : BrokerState) : Prop where
+  replayWellFormed : state.replay.WellFormed
   replayAccounted : state.replay.FullyAccounted
   budgetAccounted : state.budget.FullyAccounted
   budgetWithinLimits : state.budget.WithinLimits
   budgetCountersRepresentable : state.budget.CountersRepresentable
+  positiveLimits : 0 < state.budget.limits.maxRequests ∧
+    0 < state.budget.limits.maxConcurrentRequests
   requestCoupled : ∀ request, state.RequestCoupled request
 
 /-- The empty broker state satisfies every composed invariant. -/
 theorem empty_wellFormed (session : BrokerSessionId) (capacity : Nat)
     {limits : SessionBudgetLimits}
-    (representable : SessionBudget.LimitsRepresentable limits) :
+    (representable : SessionBudget.LimitsRepresentable limits)
+    (positive : 0 < limits.maxRequests ∧ 0 < limits.maxConcurrentRequests) :
     (empty session capacity limits).WellFormed := by
-  refine ⟨⟨[], ReplayState.empty_accounting session capacity⟩,
+  refine ⟨ReplayState.empty_wellFormed session capacity,
+    ⟨[], ReplayState.empty_accounting session capacity⟩,
     ⟨[], SessionBudget.empty_accounting limits⟩,
     SessionBudget.empty_withinLimits limits,
-    SessionBudget.empty_countersRepresentable representable, ?_⟩
+    SessionBudget.empty_countersRepresentable representable, positive, ?_⟩
   intro request
   simp [RequestCoupled, BrokerState.empty, ReplayState.empty, SessionBudget.empty]
 
@@ -214,12 +249,14 @@ inductive Step : BrokerState → BrokerState → Prop
       state.replay.MayAcceptNew envelope →
       state.outcomes envelope.request = none →
       RetryableStartDenial state.budget envelope.request maximumResponseBytes →
-      Step state (state.acceptRetryable envelope)
+      FitsU64 maximumResponseBytes →
+      Step state (state.acceptRetryable envelope maximumResponseBytes)
   | acceptFinalDenied {state : BrokerState} {envelope : BrokerEnvelope}
       {maximumResponseBytes : Nat} :
       state.replay.MayAcceptNew envelope →
       state.outcomes envelope.request = none →
       PermanentStartDenial state.budget envelope.request maximumResponseBytes →
+      FitsU64 maximumResponseBytes →
       Step state (state.acceptFinalDenied envelope)
   | acceptAndStart {state : BrokerState} {envelope : BrokerEnvelope}
       {maximumResponseBytes : Nat} :
@@ -230,14 +267,15 @@ inductive Step : BrokerState → BrokerState → Prop
   | retryStart {state : BrokerState} {envelope : BrokerEnvelope}
       {maximumResponseBytes : Nat} :
       state.replay.ExactDuplicate envelope →
-      state.outcomes envelope.request = some .retryableBudget →
+      state.outcomes envelope.request = some (.retryableBudget maximumResponseBytes) →
       state.budget.MayStart envelope.request maximumResponseBytes →
       Step state (state.retryStart envelope.request maximumResponseBytes)
   | retryFinalDenied {state : BrokerState} {envelope : BrokerEnvelope}
       {maximumResponseBytes : Nat} :
       state.replay.ExactDuplicate envelope →
-      state.outcomes envelope.request = some .retryableBudget →
+      state.outcomes envelope.request = some (.retryableBudget maximumResponseBytes) →
       PermanentStartDenial state.budget envelope.request maximumResponseBytes →
+      FitsU64 maximumResponseBytes →
       Step state (state.retryFinalDenied envelope.request)
   | linearizeEffect {state : BrokerState} {request : BrokerRequestId}
       {receipt : BrokerEffectReceipt} :
@@ -278,7 +316,7 @@ theorem Step.preserves_requestCoupling {before after : BrokerState}
     ∀ request, after.RequestCoupled request := by
   intro request
   cases transition with
-  | acceptRetryable replayAllowed cacheFresh denial =>
+  | acceptRetryable replayAllowed cacheFresh denial representable =>
       rename_i envelope maximumResponseBytes
       by_cases sameRequest : request = envelope.request
       · subst request
@@ -291,7 +329,7 @@ theorem Step.preserves_requestCoupling {before after : BrokerState}
       · simpa [RequestCoupled, HasReplayBinding, HasActiveReservation,
           BrokerState.acceptRetryable, ReplayState.acceptNew, replace, sameRequest]
           using coupled request
-  | acceptFinalDenied replayAllowed cacheFresh denial =>
+  | acceptFinalDenied replayAllowed cacheFresh denial representable =>
       rename_i envelope maximumResponseBytes
       by_cases sameRequest : request = envelope.request
       · subst request
@@ -332,7 +370,7 @@ theorem Step.preserves_requestCoupling {before after : BrokerState}
       · simpa [RequestCoupled, HasReplayBinding, HasActiveReservation,
           BrokerState.retryStart, SessionBudget.start, replace, sameRequest]
           using coupled request
-  | retryFinalDenied duplicate retryable denial =>
+  | retryFinalDenied duplicate retryable denial representable =>
       rename_i envelope maximumResponseBytes
       by_cases sameRequest : request = envelope.request
       · subst request
@@ -448,7 +486,7 @@ theorem Step.terminal_outcome_immutable {before after : BrokerState}
     {outcome : BrokerOutcome} (cached : before.outcomes request = some outcome)
     (terminal : outcome.Terminal) : after.outcomes request = some outcome := by
   cases transition with
-  | acceptRetryable replayAllowed cacheFresh denial =>
+  | acceptRetryable replayAllowed cacheFresh denial representable =>
       rename_i envelope maximumResponseBytes
       have differentRequest : request ≠ envelope.request := by
         intro sameRequest
@@ -456,7 +494,7 @@ theorem Step.terminal_outcome_immutable {before after : BrokerState}
         rw [cached] at cacheFresh
         cases cacheFresh
       simpa [BrokerState.acceptRetryable, replace, differentRequest] using cached
-  | acceptFinalDenied replayAllowed cacheFresh denial =>
+  | acceptFinalDenied replayAllowed cacheFresh denial representable =>
       rename_i envelope maximumResponseBytes
       have differentRequest : request ≠ envelope.request := by
         intro sameRequest
@@ -481,7 +519,7 @@ theorem Step.terminal_outcome_immutable {before after : BrokerState}
         subst outcome
         simp [BrokerOutcome.Terminal] at terminal
       simpa [BrokerState.retryStart, replace, differentRequest] using cached
-  | retryFinalDenied duplicate retryable denial =>
+  | retryFinalDenied duplicate retryable denial representable =>
       rename_i envelope maximumResponseBytes
       have differentRequest : request ≠ envelope.request := by
         intro sameRequest
@@ -539,13 +577,25 @@ theorem Step.terminal_outcome_immutable {before after : BrokerState}
   | terminalDuplicate => exact cached
 
 /-- Replay finite accounting survives every composed broker transition. -/
+theorem Step.preserves_replay_wellFormed {before after : BrokerState}
+    (transition : Step before after) (wellFormed : before.replay.WellFormed) :
+    after.replay.WellFormed := by
+  cases transition with
+  | acceptRetryable replayAllowed _ _ _ | acceptFinalDenied replayAllowed _ _ _ |
+      acceptAndStart replayAllowed _ _ =>
+      exact ReplayState.acceptNew_preserves_wellFormed wellFormed replayAllowed
+  | retryStart | retryFinalDenied | linearizeEffect | recordCommit |
+      recordCommittedButUnrecorded | abortAfterEffect | deny | terminalDuplicate =>
+      exact wellFormed
+
+/-- Replay finite accounting survives every composed broker transition. -/
 theorem Step.preserves_replay_accounting {before after : BrokerState}
     (transition : Step before after) (accounted : before.replay.FullyAccounted) :
     after.replay.FullyAccounted := by
   cases transition with
-  | acceptRetryable replayAllowed _ _ =>
+  | acceptRetryable replayAllowed _ _ _ =>
       exact ReplayState.Step.preserves_accounting (.fresh replayAllowed) accounted
-  | acceptFinalDenied replayAllowed _ _ =>
+  | acceptFinalDenied replayAllowed _ _ _ =>
       exact ReplayState.Step.preserves_accounting (.fresh replayAllowed) accounted
   | acceptAndStart replayAllowed _ _ =>
       exact ReplayState.Step.preserves_accounting (.fresh replayAllowed) accounted
@@ -604,15 +654,22 @@ theorem Step.preserves_budget_countersRepresentable {before after : BrokerState}
       exact SessionBudget.Step.preserves_countersRepresentable (.abort allowed)
         withinLimits representable
 
+/-- Broker transitions never replace immutable session ceilings. -/
+theorem Step.budget_limits_immutable {before after : BrokerState}
+    (transition : Step before after) : after.budget.limits = before.budget.limits := by
+  cases transition <;> rfl
+
 /-- The complete replay/budget/cache/effect invariant is inductive. -/
 theorem Step.preserves_wellFormed {before after : BrokerState}
     (transition : Step before after) (wellFormed : before.WellFormed) :
     after.WellFormed :=
-  ⟨transition.preserves_replay_accounting wellFormed.replayAccounted,
+  ⟨transition.preserves_replay_wellFormed wellFormed.replayWellFormed,
+    transition.preserves_replay_accounting wellFormed.replayAccounted,
     transition.preserves_budget_accounting wellFormed.budgetAccounted,
     transition.preserves_budget_limits wellFormed.budgetWithinLimits,
     transition.preserves_budget_countersRepresentable wellFormed.budgetWithinLimits
       wellFormed.budgetCountersRepresentable,
+    by simpa [transition.budget_limits_immutable] using wellFormed.positiveLimits,
     transition.preserves_requestCoupling wellFormed.requestCoupled⟩
 
 /-- Finite composed broker execution. -/

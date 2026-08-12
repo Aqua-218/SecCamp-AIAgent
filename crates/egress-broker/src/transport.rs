@@ -5,7 +5,10 @@
 //! memory, and callers then pass the complete `ControlFrame` to
 //! `BrokerDispatcher` for canonical CBOR, replay, budget, and authorization.
 
-use std::io::{self, Read, Write};
+use std::{
+    io::{self, Read, Write},
+    net::Shutdown,
+};
 
 use egress_protocol::{
     frame::{CONTROL_FRAME_LENGTH_PREFIX_BYTES, ControlFrame, FrameError, ValidatedFrameLength},
@@ -48,6 +51,46 @@ pub struct VsockStream {
     socket: socket2::Socket,
 }
 
+impl VsockStream {
+    /// Clones only the socket ownership needed by the worker owner to cancel a
+    /// connected Broker operation.
+    ///
+    /// The returned handle cannot read, write, or be converted back into a
+    /// stream. Calling [`VsockShutdownHandle::shutdown`] interrupts blocking
+    /// frame I/O by applying `SHUT_RDWR` to the shared socket endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error if the socket descriptor cannot be
+    /// duplicated.
+    pub fn shutdown_handle(&self) -> io::Result<VsockShutdownHandle> {
+        self.socket
+            .try_clone()
+            .map(|socket| VsockShutdownHandle { socket })
+    }
+}
+
+/// Owner-only cancellation capability for one accepted vsock connection.
+///
+/// This type deliberately implements neither [`Read`] nor [`Write`]. Holding
+/// it grants only the ability to interrupt both directions of the associated
+/// stream; it does not duplicate the Broker data plane.
+#[derive(Debug)]
+pub struct VsockShutdownHandle {
+    socket: socket2::Socket,
+}
+
+impl VsockShutdownHandle {
+    /// Interrupts reads and writes on every descriptor for this socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system shutdown error.
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.socket.shutdown(Shutdown::Both)
+    }
+}
+
 impl Read for VsockStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         self.socket.read(buffer)
@@ -70,6 +113,7 @@ pub struct AfVsockListener {
     socket: socket2::Socket,
     cid: u32,
     port: u32,
+    nonblocking: bool,
 }
 
 impl AfVsockListener {
@@ -83,6 +127,23 @@ impl AfVsockListener {
     /// Returns the operating-system error if `AF_VSOCK` is unavailable or the
     /// address cannot be bound.
     pub fn bind(cid: u32, port: u32, backlog: i32) -> io::Result<Self> {
+        Self::bind_with_mode(cid, port, backlog, false)
+    }
+
+    /// Binds an `AF_VSOCK` listener whose accept path never blocks.
+    ///
+    /// Owners can poll [`Self::try_accept_peer`] between cancellation checks.
+    /// Accepted streams are restored to blocking mode for ordinary framed I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same endpoint validation, socket, bind, or listen errors as
+    /// [`Self::bind`], plus an error if nonblocking mode cannot be enabled.
+    pub fn bind_nonblocking(cid: u32, port: u32, backlog: i32) -> io::Result<Self> {
+        Self::bind_with_mode(cid, port, backlog, true)
+    }
+
+    fn bind_with_mode(cid: u32, port: u32, backlog: i32, nonblocking: bool) -> io::Result<Self> {
         if cid == VMADDR_CID_ANY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -105,7 +166,13 @@ impl AfVsockListener {
         let address = socket2::SockAddr::vsock(cid, port);
         socket.bind(&address)?;
         socket.listen(backlog)?;
-        Ok(Self { socket, cid, port })
+        socket.set_nonblocking(nonblocking)?;
+        Ok(Self {
+            socket,
+            cid,
+            port,
+            nonblocking,
+        })
     }
 
     /// Returns the bound CID configured by the host.
@@ -118,6 +185,56 @@ impl AfVsockListener {
     #[must_use]
     pub const fn port(&self) -> u32 {
         self.port
+    }
+
+    /// Returns whether this listener was created for nonblocking polling.
+    #[must_use]
+    pub const fn is_nonblocking(&self) -> bool {
+        self.nonblocking
+    }
+
+    /// Attempts one nonblocking accept without allocating a worker thread.
+    ///
+    /// `Ok(None)` means no connection is ready, allowing the owner to check its
+    /// cancellation signal before polling again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if this listener was created by
+    /// [`Self::bind`] rather than [`Self::bind_nonblocking`]. Other errors come
+    /// from accepting or validating the peer address.
+    pub fn try_accept(&self) -> io::Result<Option<VsockStream>> {
+        self.try_accept_peer()
+            .map(|accepted| accepted.map(|(_, stream)| stream))
+    }
+
+    /// Attempts one nonblocking accept and returns the kernel-reported peer CID.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::try_accept`].
+    pub fn try_accept_peer(&self) -> io::Result<Option<(u32, VsockStream)>> {
+        if !self.nonblocking {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nonblocking accept requires AfVsockListener::bind_nonblocking",
+            ));
+        }
+        classify_nonblocking_accept(self.accept_peer_socket(true))
+    }
+
+    fn accept_peer_socket(&self, blocking_stream: bool) -> io::Result<(u32, VsockStream)> {
+        let (socket, peer) = self.socket.accept()?;
+        if blocking_stream {
+            socket.set_nonblocking(false)?;
+        }
+        let (peer_cid, _peer_port) = peer.as_vsock_address().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "accepted peer did not provide an AF_VSOCK address",
+            )
+        })?;
+        Ok((peer_cid, VsockStream { socket }))
     }
 }
 
@@ -133,14 +250,15 @@ impl PeerBoundListener for AfVsockListener {
     type Stream = VsockStream;
 
     fn accept_peer(&self) -> io::Result<(u32, Self::Stream)> {
-        let (socket, peer) = self.socket.accept()?;
-        let (peer_cid, _peer_port) = peer.as_vsock_address().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "accepted peer did not provide an AF_VSOCK address",
-            )
-        })?;
-        Ok((peer_cid, VsockStream { socket }))
+        self.accept_peer_socket(false)
+    }
+}
+
+fn classify_nonblocking_accept<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(accepted) => Ok(Some(accepted)),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -222,11 +340,71 @@ impl std::error::Error for TransportError {}
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{
+        io::{self, Cursor, Read},
+        os::unix::net::UnixStream,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use egress_protocol::frame::ControlFrame;
 
-    use super::{FramedTransport, TransportError};
+    use super::{FramedTransport, TransportError, VsockStream, classify_nonblocking_accept};
+
+    // Requirement: WouldBlock is a normal empty poll, while all other accept failures propagate.
+    // Category: boundary/cancellation. Risk: critical.
+    #[test]
+    fn nonblocking_accept_classification_preserves_poll_and_error_semantics() {
+        assert_eq!(
+            classify_nonblocking_accept::<u32>(Ok(7)).expect("ready accept must succeed"),
+            Some(7)
+        );
+        assert_eq!(
+            classify_nonblocking_accept::<u32>(Err(io::Error::from(io::ErrorKind::WouldBlock)))
+                .expect("WouldBlock must be an empty poll"),
+            None
+        );
+
+        let error = classify_nonblocking_accept::<u32>(Err(io::Error::from(
+            io::ErrorKind::ConnectionAborted,
+        )))
+        .expect_err("non-poll errors must propagate");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    }
+
+    // Requirement: a separately owned cancellation handle interrupts connected blocking I/O.
+    // Category: concurrency/cancellation. Risk: critical.
+    #[test]
+    fn shutdown_handle_interrupts_blocking_stream_io() {
+        let (socket, peer) = UnixStream::pair().expect("socket pair must be available");
+        let stream = VsockStream {
+            socket: socket.into(),
+        };
+        let shutdown = stream
+            .shutdown_handle()
+            .expect("owner cancellation handle must clone");
+        let ready = Arc::new(Barrier::new(2));
+        let reader_ready = Arc::clone(&ready);
+
+        let reader = thread::spawn(move || {
+            let mut stream = stream;
+            let mut byte = [0_u8; 1];
+            reader_ready.wait();
+            stream.read(&mut byte)
+        });
+        ready.wait();
+
+        shutdown
+            .shutdown()
+            .expect("owner cancellation must shut down both directions");
+        assert_eq!(
+            reader.join().expect("reader thread must not panic").expect(
+                "a blocking read interrupted by orderly local shutdown must complete successfully"
+            ),
+            0
+        );
+        drop(peer);
+    }
 
     // Requirement: valid frames round-trip through streaming transport.
     // Category: normal/contract. Risk: high.
@@ -272,6 +450,10 @@ mod tests {
             assert!(
                 super::AfVsockListener::bind(cid, port, backlog).is_err(),
                 "invalid AF_VSOCK endpoint ({cid}, {port}, {backlog}) must be rejected"
+            );
+            assert!(
+                super::AfVsockListener::bind_nonblocking(cid, port, backlog).is_err(),
+                "invalid nonblocking AF_VSOCK endpoint ({cid}, {port}, {backlog}) must be rejected"
             );
         }
     }

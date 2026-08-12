@@ -58,7 +58,7 @@ theorem AuditState.finish_preserves_metadata {state : AuditState}
 structure KernelState where
   authority : CapabilityState
   audit : AuditState
-  lockedAttempt : Option AttemptId
+  activeAttempts : List AttemptId
   durableStarts : AttemptId → Option AttemptMetadata
   authorizations : AttemptId → Option AttemptMetadata
   authorizationAuthorities : AttemptId → Option CapabilityState
@@ -70,7 +70,7 @@ namespace KernelState
 def initial (authority : CapabilityState) : KernelState where
   authority := authority
   audit := .empty
-  lockedAttempt := none
+  activeAttempts := []
   durableStarts := fun _ => none
   authorizations := fun _ => none
   authorizationAuthorities := fun _ => none
@@ -86,6 +86,13 @@ def HasAuthorizedSnapshot (state : KernelState) (attemptId : AttemptId) : Prop :
 
 /-- Audit, authorization, and external-effect views agree. -/
 structure WellFormed (state : KernelState) : Prop where
+  activeAttemptsNodup : state.activeAttempts.Nodup
+  activeAttemptStarted : ∀ attemptId, attemptId ∈ state.activeAttempts →
+    ∃ metadata record,
+      state.durableStarts attemptId = some metadata ∧
+        state.audit.attempts attemptId = some record ∧
+        record.metadata = metadata ∧
+        record.outcome = .started
   durableStartMirrored : ∀ attemptId metadata,
     state.durableStarts attemptId = some metadata →
       state.audit.HasMetadata attemptId metadata
@@ -101,6 +108,9 @@ structure WellFormed (state : KernelState) : Prop where
 theorem initial_wellFormed (authority : CapabilityState) :
     (initial authority).WellFormed := by
   constructor
+  · simp [initial]
+  · intro attemptId active
+    simp [initial] at active
   · intro attemptId metadata lookup
     simp [initial] at lookup
   · intro attemptId effect
@@ -111,7 +121,7 @@ theorem initial_wellFormed (authority : CapabilityState) :
 
 /-- Preconditions for writing durable intent for a fresh attempt. -/
 structure MayBegin (state : KernelState) (attemptId : AttemptId) where
-  lockAvailable : state.lockedAttempt = none
+  notActive : attemptId ∉ state.activeAttempts
   auditAllowed : state.audit.MayBegin attemptId
   noDurableStart : state.durableStarts attemptId = none
   noAuthorization : state.authorizations attemptId = none
@@ -122,12 +132,12 @@ def beginAttempt (state : KernelState) (attemptId : AttemptId)
     (metadata : AttemptMetadata) : KernelState :=
   { state with
     audit := state.audit.beginAttempt attemptId metadata
-    lockedAttempt := some attemptId
+    activeAttempts := attemptId :: state.activeAttempts
     durableStarts := replace state.durableStarts attemptId (some metadata) }
 
 /-- Preconditions for the final authorization check under the shared guard. -/
 structure MayAuthorize (state : KernelState) (attemptId : AttemptId) where
-  lockHeld : state.lockedAttempt = some attemptId
+  active : attemptId ∈ state.activeAttempts
   metadata : AttemptMetadata
   durableLookup : state.durableStarts attemptId = some metadata
   currentRecord : AttemptRecord
@@ -148,7 +158,7 @@ def authorizeAttempt (state : KernelState) (attemptId : AttemptId)
 structure MayLinearizeEffect (state : KernelState) (attemptId : AttemptId)
     (receipt : CommitReceipt) where
   receiptMatches : receipt.attemptId = attemptId
-  lockHeld : state.lockedAttempt = some attemptId
+  active : attemptId ∈ state.activeAttempts
   authorized : state.HasAuthorizedSnapshot attemptId
   currentRecord : AttemptRecord
   auditLookup : state.audit.attempts attemptId = some currentRecord
@@ -189,7 +199,7 @@ theorem terminal_attempt_rejects_effect {state : KernelState}
 structure MayCommit (state : KernelState) (attemptId : AttemptId)
     (receipt : CommitReceipt) where
   auditAllowed : state.audit.MayFinish attemptId .committed (some receipt)
-  lockHeld : state.lockedAttempt = some attemptId
+  active : attemptId ∈ state.activeAttempts
   effectLookup : state.externalEffects attemptId = some receipt
   authorized : state.HasAuthorizedSnapshot attemptId
 
@@ -197,22 +207,75 @@ structure MayCommit (state : KernelState) (attemptId : AttemptId)
 structure MayReject (state : KernelState) (attemptId : AttemptId)
     (outcome : AttemptOutcome) where
   nonCommitted : outcome = .denied ∨ outcome = .failedBeforeCommit
-  lockHeld : state.lockedAttempt = some attemptId
+  active : attemptId ∈ state.activeAttempts
   auditAllowed : state.audit.MayFinish attemptId outcome none
   noExternalEffect : state.externalEffects attemptId = none
+
+/-- The three Rust error paths where a terminal audit append can fail. -/
+inductive TerminalAuditFailure where
+  | denialAudit
+  | precommitAudit
+  | committedButAudit
+  deriving Repr, BEq, DecidableEq
+
+namespace TerminalAuditFailure
+
+/-- Evidence retained for each explicit terminal-audit failure result. -/
+def Evidence (failure : TerminalAuditFailure) (state : KernelState)
+    (attemptId : AttemptId) : Prop :=
+  match failure with
+  | .denialAudit =>
+      state.authorizations attemptId = none ∧
+        state.externalEffects attemptId = none
+  | .precommitAudit =>
+      state.HasAuthorizedSnapshot attemptId ∧
+        state.externalEffects attemptId = none
+  | .committedButAudit =>
+      ∃ receipt,
+        state.externalEffects attemptId = some receipt ∧
+          receipt.attemptId = attemptId ∧
+          state.HasAuthorizedSnapshot attemptId
+
+end TerminalAuditFailure
+
+/-- Preconditions for releasing a read guard after a terminal audit write fails. -/
+structure MayFailTerminalAudit (state : KernelState) (attemptId : AttemptId)
+    (failure : TerminalAuditFailure) where
+  active : attemptId ∈ state.activeAttempts
+  currentRecord : AttemptRecord
+  auditLookup : state.audit.attempts attemptId = some currentRecord
+  auditStillStarted : currentRecord.outcome = .started
+  evidence : failure.Evidence state attemptId
+
+/-- Remove every occurrence of one attempt from the finite active-reader set. -/
+def releaseAttempt (state : KernelState) (attemptId : AttemptId) : KernelState :=
+  { state with
+    activeAttempts := state.activeAttempts.filter fun activeAttempt =>
+      activeAttempt ≠ attemptId }
+
+/-- Releasing a guard removes only the selected active-attempt identity. -/
+theorem mem_releaseAttempt_iff (state : KernelState)
+    (releasedAttempt queriedAttempt : AttemptId) :
+    queriedAttempt ∈ (state.releaseAttempt releasedAttempt).activeAttempts ↔
+      queriedAttempt ∈ state.activeAttempts ∧ queriedAttempt ≠ releasedAttempt := by
+  simp [releaseAttempt]
 
 /-- Append a matching committed terminal audit record. -/
 def commitAttempt (state : KernelState) (attemptId : AttemptId)
     (receipt : CommitReceipt) (current : AttemptRecord) : KernelState :=
   let finishedAudit := state.audit.finishAttempt attemptId current
     .committed (some receipt)
-  { state with audit := finishedAudit, lockedAttempt := none }
+  { state.releaseAttempt attemptId with audit := finishedAudit }
 
 /-- Append a terminal denial or pre-commit failure. -/
 def rejectAttempt (state : KernelState) (attemptId : AttemptId)
     (outcome : AttemptOutcome) (current : AttemptRecord) : KernelState :=
   let finishedAudit := state.audit.finishAttempt attemptId current outcome none
-  { state with audit := finishedAudit, lockedAttempt := none }
+  { state.releaseAttempt attemptId with audit := finishedAudit }
+
+/-- Release the shared guard while retaining the Started audit and result evidence. -/
+def failTerminalAudit (state : KernelState) (attemptId : AttemptId) : KernelState :=
+  state.releaseAttempt attemptId
 
 /-- Mutate capability state only while no effect protocol holds the shared guard. -/
 def mutateAuthority (state : KernelState) (authority : CapabilityState) : KernelState :=
@@ -238,28 +301,32 @@ inductive Step : KernelState → KernelState → Prop
       {outcome : AttemptOutcome} :
       (allowed : MayReject state attemptId outcome) →
       Step state (state.rejectAttempt attemptId outcome allowed.auditAllowed.currentRecord)
+  | terminalAuditFailure {state : KernelState} {attemptId : AttemptId}
+      {failure : TerminalAuditFailure} :
+      MayFailTerminalAudit state attemptId failure →
+      Step state (state.failTerminalAudit attemptId)
   | authorityTransition {state : KernelState} {authority : CapabilityState} :
-      state.lockedAttempt = none →
+      state.activeAttempts = [] →
       CapabilityState.Step state.authority authority →
       Step state (state.mutateAuthority authority)
 
 /-- Authority mutations are accepted only outside a guarded effect protocol. -/
 theorem Step.authority_change_requires_unlocked {before after : KernelState}
     (transition : Step before after) (changed : after.authority ≠ before.authority) :
-    before.lockedAttempt = none ∧ after.lockedAttempt = none := by
+    before.activeAttempts = [] ∧ after.activeAttempts = [] := by
   cases transition with
   | authorityTransition unlocked _ => exact ⟨unlocked, unlocked⟩
-  | begin | authorize | linearizeEffect | commit | reject =>
+  | begin | authorize | linearizeEffect | commit | reject | terminalAuditFailure =>
       exact False.elim (changed rfl)
 
 /-- While an attempt owns the guard, one step cannot mutate authority. -/
 theorem Step.locked_authority_stable {before after : KernelState}
     (transition : Step before after) {attemptId : AttemptId}
-    (locked : before.lockedAttempt = some attemptId) :
+    (active : attemptId ∈ before.activeAttempts) :
     after.authority = before.authority := by
   cases transition with
-  | authorityTransition unlocked _ => rw [locked] at unlocked; contradiction
-  | begin | authorize | linearizeEffect | commit | reject => rfl
+  | authorityTransition unlocked _ => simp [unlocked] at active
+  | begin | authorize | linearizeEffect | commit | reject | terminalAuditFailure => rfl
 
 /-- Begin stores both the exact audit record and durable-intent mirror. -/
 theorem begin_stores_exact_intent (state : KernelState) (attemptId : AttemptId)
@@ -285,6 +352,173 @@ theorem linearizeEffect_stores_exact_receipt (state : KernelState)
     (state.linearizeEffect attemptId receipt).externalEffects attemptId = some receipt := by
   simp [KernelState.linearizeEffect]
 
+/-- Beginning an attempt activates its shared authority guard. -/
+theorem begin_activates_attempt (state : KernelState) (attemptId : AttemptId)
+    (metadata : AttemptMetadata) :
+    attemptId ∈ (state.beginAttempt attemptId metadata).activeAttempts := by
+  simp [KernelState.beginAttempt]
+
+/-- Beginning a distinct reader does not displace an already-active reader. -/
+theorem begin_preserves_active_attempt (state : KernelState)
+    (newAttempt activeAttempt : AttemptId) (metadata : AttemptMetadata)
+    (active : activeAttempt ∈ state.activeAttempts) :
+    activeAttempt ∈ (state.beginAttempt newAttempt metadata).activeAttempts := by
+  simp [KernelState.beginAttempt, active]
+
+/-- A terminal audit failure releases exactly the named shared guard. -/
+theorem failTerminalAudit_releases_attempt (state : KernelState)
+    (attemptId : AttemptId) :
+    attemptId ∉ (state.failTerminalAudit attemptId).activeAttempts := by
+  simp [failTerminalAudit, releaseAttempt]
+
+/-- Releasing the only reader makes the authority guard globally available. -/
+theorem failTerminalAudit_unlocks_singleton {state : KernelState}
+    {attemptId : AttemptId}
+    (onlyActive : state.activeAttempts = [attemptId]) :
+    (state.failTerminalAudit attemptId).activeAttempts = [] := by
+  simp [failTerminalAudit, releaseAttempt, onlyActive]
+
+/-- Releasing one failed attempt preserves every other active reader. -/
+theorem failTerminalAudit_preserves_other_active (state : KernelState)
+    {failedAttempt activeAttempt : AttemptId}
+    (different : activeAttempt ≠ failedAttempt)
+    (active : activeAttempt ∈ state.activeAttempts) :
+    activeAttempt ∈ (state.failTerminalAudit failedAttempt).activeAttempts := by
+  simp [failTerminalAudit, releaseAttempt, different, active]
+
+/-- A terminal audit failure leaves the durable Started record unchanged. -/
+theorem failTerminalAudit_retains_started {state : KernelState}
+    {attemptId : AttemptId} {failure : TerminalAuditFailure}
+    (allowed : MayFailTerminalAudit state attemptId failure) :
+    ∃ record,
+      (state.failTerminalAudit attemptId).audit.attempts attemptId = some record ∧
+        record.outcome = .started := by
+  exact ⟨allowed.currentRecord, allowed.auditLookup, allowed.auditStillStarted⟩
+
+/-- A terminal audit failure retains its denial, pre-commit, or commit evidence. -/
+theorem failTerminalAudit_retains_evidence {state : KernelState}
+    {attemptId : AttemptId} {failure : TerminalAuditFailure}
+    (allowed : MayFailTerminalAudit state attemptId failure) :
+    failure.Evidence (state.failTerminalAudit attemptId) attemptId := by
+  cases failure <;>
+    simpa [TerminalAuditFailure.Evidence, failTerminalAudit, releaseAttempt]
+      using allowed.evidence
+
+/-- In particular, a failed terminal append cannot erase a linearized effect. -/
+theorem failTerminalAudit_retains_effect {state : KernelState}
+    (attemptId : AttemptId) {receipt : CommitReceipt}
+    (effect : state.externalEffects attemptId = some receipt) :
+    (state.failTerminalAudit attemptId).externalEffects attemptId = some receipt := by
+  exact effect
+
+/-- A denial-audit error releases the guard with no authorization or effect. -/
+theorem denialAudit_failure_result {state : KernelState}
+    {attemptId : AttemptId}
+    (allowed : MayFailTerminalAudit state attemptId .denialAudit) :
+    attemptId ∉ (state.failTerminalAudit attemptId).activeAttempts ∧
+      (∃ record,
+        (state.failTerminalAudit attemptId).audit.attempts attemptId = some record ∧
+          record.outcome = .started) ∧
+      (state.failTerminalAudit attemptId).authorizations attemptId = none ∧
+      (state.failTerminalAudit attemptId).externalEffects attemptId = none := by
+  rcases allowed.evidence with ⟨noAuthorization, noEffect⟩
+  exact ⟨failTerminalAudit_releases_attempt state attemptId,
+    failTerminalAudit_retains_started allowed, noAuthorization, noEffect⟩
+
+/-- A pre-commit audit error releases the guard with authorization but no effect. -/
+theorem precommitAudit_failure_result {state : KernelState}
+    {attemptId : AttemptId}
+    (allowed : MayFailTerminalAudit state attemptId .precommitAudit) :
+    attemptId ∉ (state.failTerminalAudit attemptId).activeAttempts ∧
+      (∃ record,
+        (state.failTerminalAudit attemptId).audit.attempts attemptId = some record ∧
+          record.outcome = .started) ∧
+      (state.failTerminalAudit attemptId).HasAuthorizedSnapshot attemptId ∧
+      (state.failTerminalAudit attemptId).externalEffects attemptId = none := by
+  rcases allowed.evidence with ⟨authorized, noEffect⟩
+  exact ⟨failTerminalAudit_releases_attempt state attemptId,
+    failTerminalAudit_retains_started allowed, authorized, noEffect⟩
+
+/-- `CommittedButAudit` releases the guard without losing the possible effect. -/
+theorem committedButAudit_failure_result {state : KernelState}
+    {attemptId : AttemptId}
+    (allowed : MayFailTerminalAudit state attemptId .committedButAudit) :
+    attemptId ∉ (state.failTerminalAudit attemptId).activeAttempts ∧
+      ∃ record receipt,
+        (state.failTerminalAudit attemptId).audit.attempts attemptId = some record ∧
+          record.outcome = .started ∧
+          (state.failTerminalAudit attemptId).externalEffects attemptId = some receipt ∧
+          receipt.attemptId = attemptId ∧
+          (state.failTerminalAudit attemptId).HasAuthorizedSnapshot attemptId := by
+  rcases allowed.evidence with ⟨receipt, effect, matching, authorized⟩
+  exact ⟨failTerminalAudit_releases_attempt state attemptId,
+    allowed.currentRecord, receipt, allowed.auditLookup, allowed.auditStillStarted,
+    effect, matching, authorized⟩
+
+/-- Two distinct read-side attempts can be active at the same time. -/
+theorem two_attempts_can_overlap (authority : CapabilityState)
+    (firstMetadata secondMetadata : AttemptMetadata) :
+    ∃ afterFirst afterSecond,
+      Step (initial authority) afterFirst ∧
+        Step afterFirst afterSecond ∧
+        (⟨0⟩ : AttemptId) ∈ afterSecond.activeAttempts ∧
+        (⟨1⟩ : AttemptId) ∈ afterSecond.activeAttempts ∧
+        (⟨0⟩ : AttemptId) ≠ ⟨1⟩ := by
+  let firstAttempt : AttemptId := ⟨0⟩
+  let secondAttempt : AttemptId := ⟨1⟩
+  let afterFirst := (initial authority).beginAttempt firstAttempt firstMetadata
+  let afterSecond := afterFirst.beginAttempt secondAttempt secondMetadata
+  have firstAllowed : MayBegin (initial authority) firstAttempt := by
+    refine ⟨?_, ?_, ?_, ?_, ?_⟩
+    · simp [firstAttempt, initial]
+    · exact
+        { fresh := by simp [firstAttempt, initial, AuditState.empty]
+          allocatedIdentity := by simp [firstAttempt, initial, AuditState.empty]
+          sequenceAvailable := by simp [initial, AuditState.empty]
+          sequenceRepresentable := by
+            change FitsU64 0
+            simp [FitsU64, u64Maximum]
+          identityAvailable := by simp [initial, AuditState.empty]
+          identityRepresentable := by
+            change FitsU64 0
+            simp [FitsU64, u64Maximum] }
+    · rfl
+    · rfl
+    · rfl
+  have secondAllowed : MayBegin afterFirst secondAttempt := by
+    refine ⟨?_, ?_, ?_, ?_, ?_⟩
+    · change secondAttempt ∉ firstAttempt :: []
+      simp [secondAttempt, firstAttempt]
+    · exact
+        { fresh := by
+            simp [afterFirst, secondAttempt, firstAttempt, initial,
+              KernelState.beginAttempt, AuditState.beginAttempt, AuditState.empty,
+              replace]
+          allocatedIdentity := by
+            simp [afterFirst, secondAttempt, firstAttempt, initial,
+              KernelState.beginAttempt, AuditState.beginAttempt, AuditState.empty,
+              advanceU64, u64Maximum]
+          sequenceAvailable := by
+            simp [afterFirst, firstAttempt, initial, KernelState.beginAttempt,
+              AuditState.beginAttempt, AuditState.empty, advanceU64, u64Maximum]
+          sequenceRepresentable := by
+            change FitsU64 1
+            simp [FitsU64, u64Maximum]
+          identityAvailable := by
+            simp [afterFirst, firstAttempt, initial, KernelState.beginAttempt,
+              AuditState.beginAttempt, AuditState.empty, advanceU64, u64Maximum]
+          identityRepresentable := by
+            change FitsU64 1
+            simp [FitsU64, u64Maximum] }
+    · change replace (fun _ => none) firstAttempt (some firstMetadata)
+          secondAttempt = none
+      simp [replace, firstAttempt, secondAttempt]
+    · rfl
+    · rfl
+  refine ⟨afterFirst, afterSecond, .begin firstAllowed, .begin secondAllowed, ?_⟩
+  simp [afterSecond, afterFirst, secondAttempt, firstAttempt,
+    KernelState.beginAttempt]
+
 /-- Durable start mirrors persist across one accepted step. -/
 theorem Step.durable_start_persists {before after : KernelState}
     (transition : Step before after) {attemptId : AttemptId}
@@ -301,7 +535,8 @@ theorem Step.durable_start_persists {before after : KernelState}
         rw [started] at absent
         cases absent
       simpa [KernelState.beginAttempt, replace, differentAttempt] using started
-  | authorize | linearizeEffect | commit | reject | authorityTransition => exact started
+  | authorize | linearizeEffect | commit | reject | terminalAuditFailure |
+      authorityTransition => exact started
 
 /-- Same-snapshot authorization evidence persists across one accepted step. -/
 theorem Step.authorized_snapshot_persists {before after : KernelState}
@@ -329,7 +564,7 @@ theorem Step.authorized_snapshot_persists {before after : KernelState}
           using authorizationLookup
       · simpa [KernelState.authorizeAttempt, replace, differentAttempt]
           using authorityLookup
-  | linearizeEffect | commit | reject | authorityTransition =>
+  | linearizeEffect | commit | reject | terminalAuditFailure | authorityTransition =>
       exact ⟨metadata, authoritySnapshot, durableLookup, authorizationLookup,
         authorityLookup, allAuthorized⟩
 
@@ -339,7 +574,8 @@ theorem Step.external_effect_persists {before after : KernelState}
     (effect : before.externalEffects attemptId = some receipt) :
     after.externalEffects attemptId = some receipt := by
   cases transition with
-  | begin | authorize | commit | reject | authorityTransition => exact effect
+  | begin | authorize | commit | reject | terminalAuditFailure | authorityTransition =>
+      exact effect
   | linearizeEffect allowed =>
       rename_i newAttempt newReceipt
       have differentAttempt : attemptId ≠ newAttempt := by
@@ -359,7 +595,7 @@ theorem Step.audit_metadata_persists {before after : KernelState}
   cases transition with
   | begin allowed =>
       exact AuditState.begin_preserves_metadata allowed.auditAllowed mirrored
-  | authorize | linearizeEffect => exact mirrored
+  | authorize | linearizeEffect | terminalAuditFailure => exact mirrored
   | commit allowed =>
       exact AuditState.finish_preserves_metadata allowed.auditAllowed mirrored
   | reject allowed =>
@@ -406,6 +642,95 @@ theorem Step.preserves_wellFormed {before after : KernelState}
     (transition : Step before after) (wellFormed : before.WellFormed) :
     after.WellFormed := by
   constructor
+  · cases transition with
+    | begin allowed =>
+        apply wellFormed.activeAttemptsNodup.cons
+        intro activeAttempt activeBefore sameAttempt
+        subst activeAttempt
+        exact allowed.notActive activeBefore
+    | commit allowed =>
+        simpa [commitAttempt, releaseAttempt] using
+          wellFormed.activeAttemptsNodup.filter
+            (fun activeAttempt => activeAttempt ≠ allowed.auditAllowed.attemptId)
+    | reject allowed =>
+        simpa [rejectAttempt, releaseAttempt] using
+          wellFormed.activeAttemptsNodup.filter
+            (fun activeAttempt => activeAttempt ≠ allowed.auditAllowed.attemptId)
+    | terminalAuditFailure allowed =>
+        rename_i failedAttempt failure
+        simpa [failTerminalAudit, releaseAttempt] using
+          wellFormed.activeAttemptsNodup.filter
+            (fun activeAttempt => activeAttempt ≠ failedAttempt)
+    | authorize | linearizeEffect | authorityTransition =>
+        exact wellFormed.activeAttemptsNodup
+  · intro attemptId activeAfter
+    cases transition with
+    | begin allowed =>
+        rename_i newAttempt newMetadata
+        change attemptId ∈ newAttempt :: before.activeAttempts at activeAfter
+        simp only [List.mem_cons] at activeAfter
+        rcases activeAfter with sameAttempt | activeBefore
+        · subst attemptId
+          exact ⟨newMetadata, before.audit.startedRecord newAttempt newMetadata,
+            by simp [KernelState.beginAttempt],
+            AuditState.beginAttempt_stores_exact_record
+              before.audit newAttempt newMetadata,
+            rfl, rfl⟩
+        · rcases wellFormed.activeAttemptStarted attemptId activeBefore with
+            ⟨metadata, record, durableLookup, auditLookup, metadataMatches,
+              stillStarted⟩
+          have differentAttempt : attemptId ≠ newAttempt := by
+            intro sameAttempt
+            subst attemptId
+            exact allowed.notActive activeBefore
+          exact ⟨metadata, record,
+            by simpa [KernelState.beginAttempt, replace, differentAttempt]
+              using durableLookup,
+            AuditState.beginAttempt_preserves_existing
+              allowed.auditAllowed auditLookup,
+            metadataMatches, stillStarted⟩
+    | authorize | linearizeEffect =>
+        exact wellFormed.activeAttemptStarted attemptId activeAfter
+    | commit allowed =>
+        rename_i finishedAttempt receipt
+        have activeAndDifferent :
+            attemptId ∈ before.activeAttempts ∧ attemptId ≠ finishedAttempt := by
+          simpa [commitAttempt, releaseAttempt] using activeAfter
+        have activeBefore := activeAndDifferent.1
+        have differentAttempt := activeAndDifferent.2
+        rcases wellFormed.activeAttemptStarted attemptId activeBefore with
+          ⟨metadata, record, durableLookup, auditLookup, metadataMatches,
+            stillStarted⟩
+        exact ⟨metadata, record, durableLookup,
+          by simpa [commitAttempt, releaseAttempt] using
+            (AuditState.finishAttempt_preserves_other before.audit finishedAttempt
+              allowed.auditAllowed.currentRecord .committed (some receipt)
+              differentAttempt).trans auditLookup,
+          metadataMatches, stillStarted⟩
+    | reject allowed =>
+        rename_i finishedAttempt outcome
+        have activeAndDifferent :
+            attemptId ∈ before.activeAttempts ∧ attemptId ≠ finishedAttempt := by
+          simpa [rejectAttempt, releaseAttempt] using activeAfter
+        have activeBefore := activeAndDifferent.1
+        have differentAttempt := activeAndDifferent.2
+        rcases wellFormed.activeAttemptStarted attemptId activeBefore with
+          ⟨metadata, record, durableLookup, auditLookup, metadataMatches,
+            stillStarted⟩
+        exact ⟨metadata, record, durableLookup,
+          by simpa [rejectAttempt, releaseAttempt] using
+            (AuditState.finishAttempt_preserves_other before.audit finishedAttempt
+              allowed.auditAllowed.currentRecord outcome none
+              differentAttempt).trans auditLookup,
+          metadataMatches, stillStarted⟩
+    | terminalAuditFailure allowed =>
+        rename_i failedAttempt failure
+        have activeAndDifferent :
+            attemptId ∈ before.activeAttempts ∧ attemptId ≠ failedAttempt := by
+          simpa [failTerminalAudit, releaseAttempt] using activeAfter
+        exact wellFormed.activeAttemptStarted attemptId activeAndDifferent.1
+    | authorityTransition unlocked _ =>
+        simp [mutateAuthority, unlocked] at activeAfter
   · intro attemptId metadata durableLookup
     cases transition with
     | begin allowed =>
@@ -431,6 +756,9 @@ theorem Step.preserves_wellFormed {before after : KernelState}
           (wellFormed.durableStartMirrored attemptId metadata durableLookup)
     | reject allowed =>
         exact Step.audit_metadata_persists (.reject allowed)
+          (wellFormed.durableStartMirrored attemptId metadata durableLookup)
+    | terminalAuditFailure allowed =>
+        exact Step.audit_metadata_persists (.terminalAuditFailure allowed)
           (wellFormed.durableStartMirrored attemptId metadata durableLookup)
     | authorityTransition unlocked authorityStep =>
         exact Step.audit_metadata_persists (.authorityTransition unlocked authorityStep)
@@ -471,7 +799,8 @@ theorem Step.preserves_wellFormed {before after : KernelState}
             simp [AuditState.terminalRecord] at committedOutcome
         · exact wellFormed.committedHasEffect attemptId
             (committed_before_other_finish allowed.auditAllowed sameAttempt committed)
-    | authorityTransition => exact wellFormed.committedHasEffect attemptId committed
+    | terminalAuditFailure | authorityTransition =>
+        exact wellFormed.committedHasEffect attemptId committed
   · intro attemptId receipt effect
     cases transition with
     | begin allowed =>
@@ -494,6 +823,11 @@ theorem Step.preserves_wellFormed {before after : KernelState}
           ⟨matching, authorized⟩
         exact ⟨matching,
           Step.authorized_snapshot_persists (.reject allowed) authorized⟩
+    | terminalAuditFailure allowed =>
+        rcases wellFormed.effectWasAuthorized attemptId receipt effect with
+          ⟨matching, authorized⟩
+        exact ⟨matching,
+          Step.authorized_snapshot_persists (.terminalAuditFailure allowed) authorized⟩
     | linearizeEffect allowed =>
         rename_i newAttempt newReceipt
         by_cases sameAttempt : attemptId = newAttempt
@@ -516,6 +850,14 @@ theorem Step.preserves_wellFormed {before after : KernelState}
           Step.authorized_snapshot_persists (.authorityTransition unlocked authorityStep)
             authorized⟩
 
+/-- Releasing a failed terminal audit append preserves the composed invariant. -/
+theorem failTerminalAudit_preserves_wellFormed {state : KernelState}
+    {attemptId : AttemptId} {failure : TerminalAuditFailure}
+    (allowed : MayFailTerminalAudit state attemptId failure)
+    (wellFormed : state.WellFormed) :
+    (state.failTerminalAudit attemptId).WellFormed :=
+  Step.preserves_wellFormed (.terminalAuditFailure allowed) wellFormed
+
 /-- Finite executions of the guarded protocol. -/
 inductive Steps : KernelState → KernelState → Prop
   | refl (state : KernelState) : Steps state state
@@ -530,6 +872,38 @@ theorem Steps.preserve_wellFormed {before after : KernelState}
   | refl => exact wellFormed
   | tail _ transition inductionHypothesis =>
       exact transition.preserves_wellFormed inductionHypothesis
+
+/-- Durable start evidence persists across arbitrary finite protocol execution. -/
+theorem Steps.durable_start_persists {before after : KernelState}
+    (transitions : Steps before after) {attemptId : AttemptId}
+    {metadata : AttemptMetadata}
+    (started : before.durableStarts attemptId = some metadata) :
+    after.durableStarts attemptId = some metadata := by
+  induction transitions with
+  | refl => exact started
+  | tail _ transition inductionHypothesis =>
+      exact transition.durable_start_persists inductionHypothesis
+
+/-- Authorization snapshots persist across arbitrary finite protocol execution. -/
+theorem Steps.authorized_snapshot_persists {before after : KernelState}
+    (transitions : Steps before after) {attemptId : AttemptId}
+    (authorized : before.HasAuthorizedSnapshot attemptId) :
+    after.HasAuthorizedSnapshot attemptId := by
+  induction transitions with
+  | refl => exact authorized
+  | tail _ transition inductionHypothesis =>
+      exact transition.authorized_snapshot_persists inductionHypothesis
+
+/-- Linearized effects persist across arbitrary finite protocol execution. -/
+theorem Steps.external_effect_persists {before after : KernelState}
+    (transitions : Steps before after) {attemptId : AttemptId}
+    {receipt : CommitReceipt}
+    (effect : before.externalEffects attemptId = some receipt) :
+    after.externalEffects attemptId = some receipt := by
+  induction transitions with
+  | refl => exact effect
+  | tail _ transition inductionHypothesis =>
+      exact transition.external_effect_persists inductionHypothesis
 
 /-- Every committed audit record denotes a real, matching external effect. -/
 theorem committed_audit_implies_external_effect {state : KernelState}

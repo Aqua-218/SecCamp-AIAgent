@@ -7,3 +7,8 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+authority-core = { path = "../authority-core" }
+egress-broker = { path = "../egress-broker" }
+firecracker-runtime = { path = "../firecracker-runtime" }

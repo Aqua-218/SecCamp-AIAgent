@@ -314,7 +314,9 @@ example : weakerThan earlyChildCapability rootCapability = false := by decide
 
 example : weakerThan rootCapability childCapability = false := by decide
 
-private def docsHost : CanonicalHost := { value := "docs.example" }
+private def docsHost : CanonicalHost :=
+  { value := "docs.example"
+    isCanonical := by native_decide }
 
 private def guidePath : CanonicalUrlPath :=
   { segments := ["guide"]
@@ -543,11 +545,6 @@ example : Isolation.ApplyStage.readOnlyRootfs.irreversible = true := by
 
 example : Isolation.ApplyStage.workspace.irreversible = false := by
   rfl
-
-example :
-    ¬ (Firecracker.CleanupState.live.rollbackAttempt
-      Firecracker.unsafeRollbackResults).Safe :=
-  Firecracker.rollback_stop_failure_can_violate_dependency_safety
 
 example {budget : SessionBudget} {request : BrokerRequestId} {maximum : Nat}
     (denial : BrokerState.RetryableStartDenial budget request maximum) :

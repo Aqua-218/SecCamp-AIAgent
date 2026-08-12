@@ -61,6 +61,8 @@ AuthorityRequest = File(FileRequest) | HttpFetch(HttpFetchRequest) | GitHub(GitH
 
 `authority_matches` / `authorityMatches` は同じ種類の body と request を対応させる。Lean の `authorityMatches_iff_matches` は、実行可能な `Bool` と `AuthorityBody.Matches` という命題が一致することを証明する。
 
+非空の child body については `authorityBodyBelow_iff_matches_subset_of_nonempty` が、tagged family の構造判定と request 集合包含の同値をまとめて与える。異なる family は child が非空なら包含になり得ないため、cross-family の拒否もこの定理の範囲に含まれる。
+
 ## 1件の request を許可する条件
 
 `CapabilityRequest` は request 本体と、認可する単調時刻を組にする。

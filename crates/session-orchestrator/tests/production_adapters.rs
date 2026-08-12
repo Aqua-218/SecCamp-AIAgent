@@ -2,12 +2,14 @@
 
 use std::{
     collections::VecDeque,
-    io,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    thread,
+    time::{Duration, Instant},
 };
 
 use authority_core::{
@@ -27,14 +29,36 @@ use firecracker_runtime::{
     sha256,
 };
 use session_orchestrator::{
-    CleanupStage, CryptographicRandom, EntropyError, LifecycleState, SessionOrchestrator,
-    SnapshotDescriptor, SnapshotId, StartStage, SubjectId as OrchestratedSubjectId, VmBackend,
-    WorkspaceId, WorkspaceTemplateId,
+    BackendError, BrokerBackend as BrokerBackendTrait, BrokerLease, CapabilityBackend,
+    CapabilityLease, CapabilityRevocationBackend, CleanupStage, CryptographicRandom, EntropyError,
+    LifecycleState, SessionIdentity, SessionOrchestrator, SnapshotDescriptor, SnapshotId,
+    StartStage, SubjectId as OrchestratedSubjectId, VmBackend, WorkspaceId, WorkspaceTemplateId,
     authority_backend::{AuthorityCoreBackend, AuthorityRootGrant},
-    egress_backend::{BrokerBackend, VsockListenerFactory},
-    firecracker_backend::FirecrackerBackendFactory,
-    firecracker_workspace::new_firecracker_workspace_adapters,
+    egress_backend::{
+        BrokerBackend as OwnedBrokerBackend, BrokerCancellation, BrokerConnectionExit,
+        BrokerRuntime, BrokerRuntimeFactory, BrokerServiceListener, BrokerStreamShutdown,
+        VsockListenerFactory,
+    },
+    firecracker_backend::{
+        FirecrackerBackendFactory, FirecrackerVmBackend, FirecrackerWorkloadBackend,
+    },
+    firecracker_workspace::{
+        FirecrackerFileSystem, FirecrackerWorkspaceBackend, new_firecracker_workspace_adapters,
+    },
+    session_owner::{
+        BrokerRuntimeStatus, BrokerStatusBackend, OwnerPollOutcome, OwnerPollRequest,
+        SessionBackends, SessionOwner, ShutdownReason,
+    },
 };
+
+type LifecycleEvents = Arc<Mutex<Vec<&'static str>>>;
+
+fn record_event(events: &LifecycleEvents, event: &'static str) {
+    events
+        .lock()
+        .expect("lifecycle event log must not be poisoned")
+        .push(event);
+}
 
 #[derive(Clone, Default)]
 struct FsLog {
@@ -42,6 +66,7 @@ struct FsLog {
     clones: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
     removals: Arc<Mutex<Vec<PathBuf>>>,
     device_bindings: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
+    lifecycle: LifecycleEvents,
 }
 
 struct TestFileSystem {
@@ -129,6 +154,7 @@ impl FileSystem for TestFileSystem {
             .lock()
             .expect("filesystem log must not be poisoned")
             .push(path.to_owned());
+        record_event(&self.log.lifecycle, "isolate");
         Ok(())
     }
 }
@@ -138,6 +164,7 @@ struct RunnerLog {
     stop_attempts: Arc<AtomicUsize>,
     owned_starts: Arc<Mutex<Vec<ProcessOwnership>>>,
     running_verifications: Arc<Mutex<Vec<ProcessHandle>>>,
+    lifecycle: LifecycleEvents,
 }
 
 #[derive(Default)]
@@ -237,6 +264,7 @@ impl CommandRunner for TestRunner {
                 "test process stop failure".to_owned(),
             ));
         }
+        record_event(&self.log.lifecycle, "kill");
         Ok(())
     }
 }
@@ -246,6 +274,7 @@ struct TestApi {
     requests: Arc<Mutex<Vec<ApiRequest>>>,
     failures: Arc<Mutex<VecDeque<bool>>>,
     restore_verifications: Arc<Mutex<Vec<(PathBuf, PathBuf, u32)>>>,
+    lifecycle: LifecycleEvents,
 }
 
 impl ApiClient for TestApi {
@@ -262,6 +291,9 @@ impl ApiClient for TestApi {
             .unwrap_or(false)
         {
             return Err(RuntimeError::Api("test restore API failure".to_owned()));
+        }
+        if request.path == "/actions/inject-identity" {
+            record_event(&self.lifecycle, "workload-release");
         }
         Ok(ApiResponse {
             status: 200,
@@ -326,19 +358,88 @@ impl CryptographicRandom for SequenceRandom {
     }
 }
 
-#[derive(Clone)]
-struct ListenerFactory {
+#[derive(Clone, Default)]
+struct BrokerLog {
     binds: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
+    shutdowns: Arc<AtomicUsize>,
+    builds: Arc<AtomicUsize>,
+    starts: Arc<AtomicUsize>,
+    exits: Arc<AtomicUsize>,
+    exit_requested: Arc<AtomicBool>,
+    lifecycle: LifecycleEvents,
+}
+
+#[derive(Clone)]
+struct ListenerFactory {
+    log: BrokerLog,
+    accepted: Arc<AtomicBool>,
 }
 
 struct Listener {
-    drops: Arc<AtomicUsize>,
+    log: BrokerLog,
+    accepted: Arc<AtomicBool>,
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        self.drops.fetch_add(1, Ordering::SeqCst);
+        self.log.drops.fetch_add(1, Ordering::SeqCst);
+        record_event(&self.log.lifecycle, "broker-worker-exit");
+    }
+}
+
+struct TestStream {
+    log: BrokerLog,
+}
+
+impl Read for TestStream {
+    fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "test Broker runtime owns stream reads",
+        ))
+    }
+}
+
+impl Write for TestStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct TestShutdown {
+    log: BrokerLog,
+}
+
+impl BrokerStreamShutdown for TestShutdown {
+    fn shutdown(&self) -> io::Result<()> {
+        self.log.shutdowns.fetch_add(1, Ordering::SeqCst);
+        record_event(&self.log.lifecycle, "broker-stream-shutdown");
+        Ok(())
+    }
+}
+
+impl BrokerServiceListener for Listener {
+    type Stream = TestStream;
+    type Shutdown = TestShutdown;
+
+    fn try_accept_peer(&self) -> io::Result<Option<(u32, Self::Stream)>> {
+        Ok((!self.accepted.swap(true, Ordering::SeqCst)).then_some((
+            3,
+            TestStream {
+                log: self.log.clone(),
+            },
+        )))
+    }
+
+    fn shutdown_handle(stream: &Self::Stream) -> io::Result<Self::Shutdown> {
+        Ok(TestShutdown {
+            log: stream.log.clone(),
+        })
     }
 }
 
@@ -346,21 +447,93 @@ impl VsockListenerFactory for ListenerFactory {
     type Listener = Listener;
 
     fn bind(&self, _host_cid: u32, _port: u32, _backlog: i32) -> io::Result<Self::Listener> {
-        self.binds.fetch_add(1, Ordering::SeqCst);
+        self.log.binds.fetch_add(1, Ordering::SeqCst);
+        record_event(&self.log.lifecycle, "broker-bind");
         Ok(Listener {
-            drops: Arc::clone(&self.drops),
+            log: self.log.clone(),
+            accepted: Arc::clone(&self.accepted),
         })
     }
 }
 
-fn test_broker(
-    binds: &Arc<AtomicUsize>,
-    drops: &Arc<AtomicUsize>,
-) -> BrokerBackend<ListenerFactory> {
-    BrokerBackend::new(
+#[derive(Clone, Copy)]
+enum RuntimeBehavior {
+    WaitForCancellation,
+    ExitWhenSignalled,
+}
+
+#[derive(Clone)]
+struct RuntimeFactory {
+    behavior: RuntimeBehavior,
+    log: BrokerLog,
+}
+
+struct TestBrokerRuntime {
+    behavior: RuntimeBehavior,
+    log: BrokerLog,
+}
+
+impl BrokerRuntime<TestStream> for TestBrokerRuntime {
+    fn serve(self, _stream: TestStream, cancellation: &BrokerCancellation) -> BrokerConnectionExit {
+        self.log.starts.fetch_add(1, Ordering::SeqCst);
+        record_event(&self.log.lifecycle, "broker-runtime-start");
+        match self.behavior {
+            RuntimeBehavior::WaitForCancellation => {
+                while !cancellation.is_cancelled() {
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                record_event(&self.log.lifecycle, "broker-runtime-cancelled");
+                self.log.exits.fetch_add(1, Ordering::SeqCst);
+                BrokerConnectionExit::Cancelled
+            }
+            RuntimeBehavior::ExitWhenSignalled => {
+                while !self.log.exit_requested.load(Ordering::SeqCst) {
+                    if cancellation.is_cancelled() {
+                        record_event(&self.log.lifecycle, "broker-runtime-cancelled");
+                        self.log.exits.fetch_add(1, Ordering::SeqCst);
+                        return BrokerConnectionExit::Cancelled;
+                    }
+                    thread::park_timeout(Duration::from_millis(1));
+                }
+                record_event(&self.log.lifecycle, "broker-runtime-exit");
+                self.log.exits.fetch_add(1, Ordering::SeqCst);
+                BrokerConnectionExit::EndOfStream
+            }
+        }
+    }
+}
+
+impl BrokerRuntimeFactory<TestStream> for RuntimeFactory {
+    type Runtime = TestBrokerRuntime;
+
+    fn build(&self, identity: &SessionIdentity) -> Result<Self::Runtime, BackendError> {
+        if identity.session_id().as_bytes() != [1; 16]
+            || identity.broker_session_id().as_bytes() != [7; 16]
+        {
+            return Err(BackendError::new(
+                "test Broker runtime rejected inexact session identities",
+            ));
+        }
+        self.log.builds.fetch_add(1, Ordering::SeqCst);
+        record_event(&self.log.lifecycle, "broker-build");
+        Ok(TestBrokerRuntime {
+            behavior: self.behavior,
+            log: self.log.clone(),
+        })
+    }
+}
+
+type TestBroker = OwnedBrokerBackend<ListenerFactory, RuntimeFactory>;
+
+fn test_broker(log: &BrokerLog, behavior: RuntimeBehavior) -> TestBroker {
+    OwnedBrokerBackend::new(
         ListenerFactory {
-            binds: Arc::clone(binds),
-            drops: Arc::clone(drops),
+            log: log.clone(),
+            accepted: Arc::new(AtomicBool::new(false)),
+        },
+        RuntimeFactory {
+            behavior,
+            log: log.clone(),
         },
         2,
         3,
@@ -368,6 +541,98 @@ fn test_broker(
         16,
     )
     .expect("test broker configuration must be valid")
+}
+
+struct ObservedBroker {
+    inner: TestBroker,
+    lifecycle: LifecycleEvents,
+}
+
+impl BrokerBackendTrait for ObservedBroker {
+    fn establish_broker_session(
+        &mut self,
+        identity: &SessionIdentity,
+    ) -> Result<BrokerLease, BackendError> {
+        self.inner.establish_broker_session(identity)
+    }
+
+    fn close_broker_session(&mut self, lease: &BrokerLease) -> Result<(), BackendError> {
+        self.inner.close_broker_session(lease)?;
+        record_event(&self.lifecycle, "broker-joined");
+        Ok(())
+    }
+
+    fn ensure_broker_session_running(&mut self, lease: &BrokerLease) -> Result<(), BackendError> {
+        self.inner.ensure_broker_session_running(lease)?;
+        record_event(&self.lifecycle, "broker-ready");
+        Ok(())
+    }
+}
+
+impl BrokerStatusBackend for ObservedBroker {
+    fn poll_broker_status(
+        &mut self,
+        lease: &BrokerLease,
+    ) -> Result<BrokerRuntimeStatus, BackendError> {
+        let status = BrokerStatusBackend::poll_broker_status(&mut self.inner, lease)?;
+        record_event(
+            &self.lifecycle,
+            match status {
+                BrokerRuntimeStatus::Running => "broker-running",
+                BrokerRuntimeStatus::Exited => "broker-exited",
+            },
+        );
+        Ok(status)
+    }
+}
+
+struct ObservedCapability {
+    inner: AuthorityCoreBackend,
+    lifecycle: LifecycleEvents,
+}
+
+impl CapabilityBackend<AuthorityRootGrant> for ObservedCapability {
+    fn inject_root_capability(
+        &mut self,
+        identity: &SessionIdentity,
+        grant: &AuthorityRootGrant,
+    ) -> Result<CapabilityLease, BackendError> {
+        let lease = self.inner.inject_root_capability(identity, grant)?;
+        record_event(&self.lifecycle, "capability-injected");
+        Ok(lease)
+    }
+}
+
+impl CapabilityRevocationBackend for ObservedCapability {
+    fn revoke_root_capability(&mut self, lease: &CapabilityLease) -> Result<(), BackendError> {
+        self.inner.revoke_root_capability(lease)?;
+        record_event(&self.lifecycle, "revoke");
+        Ok(())
+    }
+}
+
+fn wait_for_counter(counter: &AtomicUsize, expected: usize, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while counter.load(Ordering::SeqCst) < expected {
+        assert!(Instant::now() < deadline, "timed out waiting for {label}");
+        thread::yield_now();
+    }
+}
+
+fn assert_event_order(events: &LifecycleEvents, expected: &[&'static str]) {
+    let events = events
+        .lock()
+        .expect("lifecycle event log must not be poisoned");
+    let mut cursor = 0;
+    for expected_event in expected {
+        let Some(offset) = events[cursor..]
+            .iter()
+            .position(|event| event == expected_event)
+        else {
+            panic!("missing ordered event {expected_event:?} in {events:?}");
+        };
+        cursor += offset + 1;
+    }
 }
 
 fn cloned_workspace(fs_log: &FsLog) -> PathBuf {
@@ -477,8 +742,7 @@ fn assert_failed_restore_observations(
     fs_log: &FsLog,
     runner_log: &RunnerLog,
     api: &TestApi,
-    binds: &AtomicUsize,
-    drops: &AtomicUsize,
+    broker_log: &BrokerLog,
 ) {
     assert_eq!(runner_log.stop_attempts.load(Ordering::SeqCst), 2);
     assert_eq!(
@@ -497,8 +761,8 @@ fn assert_failed_restore_observations(
             .as_slice(),
         [ProcessHandle { pid: 1 }]
     );
-    assert_eq!(binds.load(Ordering::SeqCst), 1);
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(broker_log.binds.load(Ordering::SeqCst), 1);
+    assert_eq!(broker_log.drops.load(Ordering::SeqCst), 1);
     assert_eq!(
         api.requests
             .lock()
@@ -635,6 +899,74 @@ fn snapshot(config: &RuntimeConfig) -> Snapshot {
     )
 }
 
+type TestRuntimeFileSystem = FirecrackerFileSystem<TestFileSystem>;
+type TestVmBackend =
+    FirecrackerVmBackend<TestRunner, TestRuntimeFileSystem, TestApi, TestApi, UnusedIdentitySource>;
+type TestWorkloadBackend = FirecrackerWorkloadBackend<
+    TestRunner,
+    TestRuntimeFileSystem,
+    TestApi,
+    TestApi,
+    UnusedIdentitySource,
+>;
+
+struct AdapterStack {
+    template: WorkspaceTemplateId,
+    workspace: FirecrackerWorkspaceBackend<TestFileSystem>,
+    vm: TestVmBackend,
+    workload: TestWorkloadBackend,
+    fs_log: FsLog,
+    runner_log: RunnerLog,
+    api: TestApi,
+}
+
+fn adapter_stack(lifecycle: &LifecycleEvents, snapshot_id: SnapshotId) -> AdapterStack {
+    let fs_log = FsLog {
+        lifecycle: Arc::clone(lifecycle),
+        ..FsLog::default()
+    };
+    let template = WorkspaceTemplateId::new("template");
+    let (workspace, runtime_filesystem) = new_firecracker_workspace_adapters(
+        TestFileSystem {
+            log: fs_log.clone(),
+        },
+        template.clone(),
+        "/test/source",
+        "/test/jailer/firecracker",
+    );
+    let api = TestApi {
+        lifecycle: Arc::clone(lifecycle),
+        ..TestApi::default()
+    };
+    let runner_log = RunnerLog {
+        lifecycle: Arc::clone(lifecycle),
+        ..RunnerLog::default()
+    };
+    let config = runtime_config();
+    let runtime = Runtime::new(
+        TestRunner {
+            log: runner_log.clone(),
+            ..TestRunner::default()
+        },
+        runtime_filesystem,
+        api.clone(),
+        api.clone(),
+        UnusedIdentitySource,
+    );
+    let snapshot = snapshot(&config);
+    let (vm, workload) =
+        FirecrackerBackendFactory::new(runtime, config, snapshot, snapshot_id).into_handles();
+    AdapterStack {
+        template,
+        workspace,
+        vm,
+        workload,
+        fs_log,
+        runner_log,
+        api,
+    }
+}
+
 fn authority_grant() -> AuthorityRootGrant {
     AuthorityRootGrant::new(
         TimeWindow::new(MonotonicTime::from_ticks(1), MonotonicTime::from_ticks(100))
@@ -660,63 +992,52 @@ fn assert_subject_closed(kernel: &CapabilityKernel, subject_id: OrchestratedSubj
 }
 
 #[test]
-fn production_adapters_preserve_exact_bindings_through_start_and_stop() {
-    let fs_log = FsLog::default();
-    let template = WorkspaceTemplateId::new("template");
-    let (mut workspace, runtime_filesystem) = new_firecracker_workspace_adapters(
-        TestFileSystem {
-            log: fs_log.clone(),
-        },
-        template.clone(),
-        "/test/source",
-        "/test/jailer/firecracker",
-    );
-    let config = runtime_config();
-    let api = TestApi::default();
-    let api_observer = api.clone();
-    let runner_log = RunnerLog::default();
-    let runtime = Runtime::new(
-        TestRunner {
-            log: runner_log.clone(),
-            ..TestRunner::default()
-        },
-        runtime_filesystem,
-        api.clone(),
-        api,
-        UnusedIdentitySource,
-    );
+fn production_owner_keeps_worker_live_then_cancels_joins_and_closes() {
+    let lifecycle = LifecycleEvents::default();
     let snapshot_id = SnapshotId::new([0x90; 16]);
-    let snapshot = snapshot(&config);
-    let (mut vm, mut workload) =
-        FirecrackerBackendFactory::new(runtime, config, snapshot, snapshot_id).into_handles();
+    let stack = adapter_stack(&lifecycle, snapshot_id);
+    let fs_log = stack.fs_log.clone();
+    let api_observer = stack.api.clone();
+    let runner_log = stack.runner_log.clone();
 
-    let binds = Arc::new(AtomicUsize::new(0));
-    let drops = Arc::new(AtomicUsize::new(0));
-    let mut broker = test_broker(&binds, &drops);
+    let broker_log = BrokerLog {
+        lifecycle: Arc::clone(&lifecycle),
+        ..BrokerLog::default()
+    };
+    let broker = ObservedBroker {
+        inner: test_broker(&broker_log, RuntimeBehavior::WaitForCancellation),
+        lifecycle: Arc::clone(&lifecycle),
+    };
     let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
         "host",
     ))));
-    let mut capability = AuthorityCoreBackend::new(Arc::clone(&kernel));
-    let mut orchestrator = SessionOrchestrator::new(SequenceRandom {
+    let capability = ObservedCapability {
+        inner: AuthorityCoreBackend::new(Arc::clone(&kernel)),
+        lifecycle: Arc::clone(&lifecycle),
+    };
+    let orchestrator = SessionOrchestrator::new(SequenceRandom {
         values: (1_u8..=7).map(|byte| [byte; 16]).collect(),
     });
+    let mut owner = SessionOwner::new(
+        orchestrator,
+        SessionBackends::new(
+            stack.workspace,
+            broker,
+            stack.vm,
+            capability,
+            stack.workload,
+        ),
+    );
     let descriptor = SnapshotDescriptor::clean(snapshot_id);
 
-    let info = orchestrator
-        .start_session(
-            &descriptor,
-            &template,
-            &authority_grant(),
-            &mut workspace,
-            &mut broker,
-            &mut vm,
-            &mut capability,
-            &mut workload,
-        )
+    let info = owner
+        .start(&descriptor, &stack.template, &authority_grant())
         .expect("all production adapters must compose");
     let identity = info.identity();
-    assert_eq!(binds.load(Ordering::SeqCst), 1);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    wait_for_counter(&broker_log.starts, 1, "Broker runtime start");
+    assert_eq!(broker_log.binds.load(Ordering::SeqCst), 1);
+    assert_eq!(broker_log.builds.load(Ordering::SeqCst), 1);
+    assert_eq!(broker_log.drops.load(Ordering::SeqCst), 0);
     assert_eq!(identity.workspace_id(), expected_workspace_id());
     assert_successful_restore_observations(
         &fs_log,
@@ -724,12 +1045,20 @@ fn production_adapters_preserve_exact_bindings_through_start_and_stop() {
         &api_observer,
         identity.workspace_id(),
     );
+    assert_eq!(
+        owner.poll(OwnerPollRequest::Continue),
+        Ok(OwnerPollOutcome::Running(info))
+    );
 
-    orchestrator
-        .stop_session(&mut workspace, &mut broker, &mut vm, &mut capability)
-        .expect("composed cleanup must complete");
+    assert_eq!(
+        owner.stop().expect("composed cleanup must complete"),
+        OwnerPollOutcome::Closed(ShutdownReason::ExternalRequest)
+    );
 
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(owner.state(), LifecycleState::Closed);
+    assert_eq!(broker_log.drops.load(Ordering::SeqCst), 1);
+    assert_eq!(broker_log.shutdowns.load(Ordering::SeqCst), 1);
+    assert_eq!(broker_log.exits.load(Ordering::SeqCst), 1);
     assert_eq!(
         fs_log
             .removals
@@ -741,6 +1070,109 @@ fn production_adapters_preserve_exact_bindings_through_start_and_stop() {
             .join(identity.workspace_id().to_string())]
     );
     assert_subject_closed(&kernel, identity.subject_id());
+    assert_event_order(
+        &lifecycle,
+        &[
+            "broker-build",
+            "capability-injected",
+            "broker-ready",
+            "workload-release",
+            "broker-running",
+            "revoke",
+            "kill",
+            "broker-stream-shutdown",
+            "broker-worker-exit",
+            "broker-joined",
+            "isolate",
+        ],
+    );
+}
+
+#[test]
+fn unexpected_owned_broker_exit_drives_ordered_production_cleanup() {
+    let lifecycle = LifecycleEvents::default();
+    let snapshot_id = SnapshotId::new([0x92; 16]);
+    let stack = adapter_stack(&lifecycle, snapshot_id);
+    let fs_log = stack.fs_log.clone();
+    let runner_log = stack.runner_log.clone();
+    let api_observer = stack.api.clone();
+    let broker_log = BrokerLog {
+        lifecycle: Arc::clone(&lifecycle),
+        ..BrokerLog::default()
+    };
+    let broker = ObservedBroker {
+        inner: test_broker(&broker_log, RuntimeBehavior::ExitWhenSignalled),
+        lifecycle: Arc::clone(&lifecycle),
+    };
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "host",
+    ))));
+    let capability = ObservedCapability {
+        inner: AuthorityCoreBackend::new(Arc::clone(&kernel)),
+        lifecycle: Arc::clone(&lifecycle),
+    };
+    let orchestrator = SessionOrchestrator::new(SequenceRandom {
+        values: (1_u8..=7).map(|byte| [byte; 16]).collect(),
+    });
+    let mut owner = SessionOwner::new(
+        orchestrator,
+        SessionBackends::new(
+            stack.workspace,
+            broker,
+            stack.vm,
+            capability,
+            stack.workload,
+        ),
+    );
+
+    let info = owner
+        .start(
+            &SnapshotDescriptor::clean(snapshot_id),
+            &stack.template,
+            &authority_grant(),
+        )
+        .expect("production composition must start before Broker exit is observed");
+    broker_log.exit_requested.store(true, Ordering::SeqCst);
+    wait_for_counter(&broker_log.exits, 1, "unexpected Broker exit");
+    assert_successful_restore_observations(
+        &fs_log,
+        &runner_log,
+        &api_observer,
+        info.identity().workspace_id(),
+    );
+
+    assert_eq!(
+        owner.poll(OwnerPollRequest::Continue),
+        Ok(OwnerPollOutcome::Closed(ShutdownReason::BrokerExited))
+    );
+    assert_eq!(owner.state(), LifecycleState::Closed);
+    assert_eq!(broker_log.binds.load(Ordering::SeqCst), 1);
+    assert_eq!(broker_log.builds.load(Ordering::SeqCst), 1);
+    assert_eq!(broker_log.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(broker_log.drops.load(Ordering::SeqCst), 1);
+    assert_eq!(broker_log.shutdowns.load(Ordering::SeqCst), 1);
+    assert_subject_closed(&kernel, info.identity().subject_id());
+    assert_workspace_removals(
+        &fs_log,
+        &[session_jail_root()
+            .join("workspace")
+            .join(info.identity().workspace_id().to_string())],
+    );
+    assert_event_order(
+        &lifecycle,
+        &[
+            "capability-injected",
+            "broker-ready",
+            "workload-release",
+            "broker-runtime-exit",
+            "broker-exited",
+            "revoke",
+            "kill",
+            "broker-stream-shutdown",
+            "broker-joined",
+            "isolate",
+        ],
+    );
 }
 
 #[test]
@@ -778,9 +1210,8 @@ fn failed_firecracker_restore_cleanup_is_retried_by_orchestrator_stop() {
     let (mut vm, mut workload) =
         FirecrackerBackendFactory::new(runtime, config, snapshot, snapshot_id).into_handles();
 
-    let binds = Arc::new(AtomicUsize::new(0));
-    let drops = Arc::new(AtomicUsize::new(0));
-    let mut broker = test_broker(&binds, &drops);
+    let broker_log = BrokerLog::default();
+    let mut broker = test_broker(&broker_log, RuntimeBehavior::WaitForCancellation);
     let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
         "host",
     ))));
@@ -807,7 +1238,7 @@ fn failed_firecracker_restore_cleanup_is_retried_by_orchestrator_stop() {
     assert_eq!(error.rollback_failures().len(), 1);
     assert_eq!(error.rollback_failures()[0].stage(), CleanupStage::VmKill);
     assert_eq!(orchestrator.state(), LifecycleState::Stopping);
-    assert_failed_restore_observations(&fs_log, &runner_log, &api_observer, &binds, &drops);
+    assert_failed_restore_observations(&fs_log, &runner_log, &api_observer, &broker_log);
     let cloned_workspace = cloned_workspace(&fs_log);
 
     orchestrator

@@ -11,12 +11,12 @@
 //! `SessionOrchestrator::new` は既存の contract test と組み込み用途のため、
 //! process 内だけで動く `InMemoryIdentityLedger` を使用する。production host
 //! は `SessionOrchestrator::new_durable` を使い、専用 ledger file を渡すこと。
-//! `DurableIdentityLedger` は exclusive lock を取得し、versioned header と
-//! checksummed fixed-size record を全て検証してから開く。session の七つの
-//! identity は一つの batch として append され、`sync_data` が成功するまで
-//! backend の副作用は開始されない。破損、切断、容量超過、write/sync failure
-//! は operator-readable な typed error になり、identity を再利用できるように
-//! ledger を修復・切り詰めることは許可しない。
+//! `DurableIdentityLedger` は trusted parent directory と stable sidecar lock の
+//! descriptor を保持し、versioned header と checksummed fixed-size record を全て
+//! 検証してから開く。session の七つの identity は一つの batch として append
+//! され、`sync_all` が成功するまで backend の副作用は開始されない。破損、
+//! 切断、容量超過、write/sync failure は operator-readable な typed error になり、
+//! identity を再利用できるように ledger を修復・切り詰めることは許可しない。
 
 #![forbid(unsafe_code)]
 
@@ -31,11 +31,17 @@ pub mod session_owner;
 use std::{
     collections::BTreeSet,
     error::Error,
+    ffi::{OsStr, OsString},
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 /// Width of every cryptographic session-scoped identity.
 pub const ID_BYTES: usize = 16;
@@ -181,10 +187,22 @@ const LEDGER_VERSION: u8 = 1;
 const LEDGER_HEADER_BYTES: usize = 32;
 const LEDGER_RECORD_BYTES: usize = 32;
 const MAX_LEDGER_BYTES: usize = LEDGER_HEADER_BYTES + (MAX_LEDGER_RECORDS * LEDGER_RECORD_BYTES);
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0o400_000;
+#[cfg(unix)]
+const PRIVATE_LEDGER_MODE: u32 = 0o600;
+#[cfg(unix)]
+const WRITE_BY_GROUP_OR_OTHER: u32 = 0o022;
+#[cfg(unix)]
+const STICKY_DIRECTORY: u32 = 0o1000;
 
 /// Operations reported by durable-ledger I/O failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerOperation {
+    /// Opening and retaining the trusted parent directory.
+    DirectoryOpen,
+    /// Synchronizing a newly created directory entry.
+    DirectorySync,
     /// Inspecting the ledger path.
     Metadata,
     /// Opening the ledger file.
@@ -197,13 +215,15 @@ pub enum LedgerOperation {
     Append,
     /// Synchronizing appended identity records.
     Sync,
-    /// Acquiring or writing the ownership lock.
+    /// Opening or acquiring the ownership lock.
     Lock,
 }
 
 impl fmt::Display for LedgerOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
+            Self::DirectoryOpen => "open ledger parent directory",
+            Self::DirectorySync => "sync ledger parent directory",
             Self::Metadata => "inspect ledger metadata",
             Self::Open => "open ledger",
             Self::HeaderWrite => "write ledger header",
@@ -233,6 +253,41 @@ pub enum LedgerError {
     NotRegularFile {
         /// Rejected path.
         path: PathBuf,
+    },
+    /// A path component or named file changed after its descriptor was opened.
+    PathIdentityChanged {
+        /// Path whose device/inode identity no longer matches.
+        path: PathBuf,
+    },
+    /// A ledger or lock file is not owned by the process effective user.
+    WrongOwner {
+        /// Path with the unexpected owner.
+        path: PathBuf,
+        /// Effective user required to own the file.
+        expected: u32,
+        /// Owner observed on the file.
+        actual: u32,
+    },
+    /// A ledger or lock file does not have exact owner-only read/write mode.
+    UnsafePermissions {
+        /// Path with unsafe permissions.
+        path: PathBuf,
+        /// Observed Unix permission bits.
+        mode: u32,
+    },
+    /// The parent directory is replaceable by an untrusted local principal.
+    UnsafeParentDirectory {
+        /// Rejected parent directory.
+        path: PathBuf,
+    },
+    /// The open ledger or lock length differs from the validated durable length.
+    LengthChanged {
+        /// Path whose length changed.
+        path: PathBuf,
+        /// Length required by the current durable state.
+        expected: u64,
+        /// Length observed from the open descriptor.
+        actual: u64,
     },
     /// A filesystem operation failed.
     Io {
@@ -325,6 +380,7 @@ impl LedgerError {
 }
 
 impl fmt::Display for LedgerError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Locked { path } => {
@@ -338,6 +394,39 @@ impl fmt::Display for LedgerError {
             Self::NotRegularFile { path } => write!(
                 formatter,
                 "identity ledger path is not a regular file: {}",
+                path.display()
+            ),
+            Self::PathIdentityChanged { path } => write!(
+                formatter,
+                "identity ledger path identity changed: {}",
+                path.display()
+            ),
+            Self::WrongOwner {
+                path,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "identity ledger owner {actual} does not match effective user {expected}: {}",
+                path.display()
+            ),
+            Self::UnsafePermissions { path, mode } => write!(
+                formatter,
+                "identity ledger permissions {mode:o} are not 600: {}",
+                path.display()
+            ),
+            Self::UnsafeParentDirectory { path } => write!(
+                formatter,
+                "identity ledger parent directory is not trusted: {}",
+                path.display()
+            ),
+            Self::LengthChanged {
+                path,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "identity ledger length changed at {}: expected {expected} bytes, found {actual}",
                 path.display()
             ),
             Self::Io {
@@ -483,24 +572,123 @@ impl IdentityLedger for InMemoryIdentityLedger {
 
 #[derive(Debug)]
 struct ExclusiveLedgerLock {
-    path: PathBuf,
-    _file: File,
+    file: File,
 }
 
-impl Drop for ExclusiveLedgerLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug)]
+struct DurableLedgerDirectory {
+    file: File,
+    path: PathBuf,
+    ledger_name: OsString,
+    lock_name: OsString,
+    effective_uid: u32,
+}
+
+impl DurableLedgerDirectory {
+    fn open(ledger_path: &Path) -> Result<Self, LedgerError> {
+        let ledger_name = ledger_path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| LedgerError::UnsafeParentDirectory {
+                path: ledger_path.to_path_buf(),
+            })?
+            .to_os_string();
+        let path = ledger_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let effective_uid = effective_uid()?;
+        let expected = validate_parent_path(&path, effective_uid)?;
+        let file = File::open(&path)
+            .map_err(|error| LedgerError::io(LedgerOperation::DirectoryOpen, &path, &error))?;
+        validate_directory_metadata(
+            &path,
+            &file
+                .metadata()
+                .map_err(|error| LedgerError::io(LedgerOperation::Metadata, &path, &error))?,
+            effective_uid,
+        )?;
+        if file_identity(
+            &file
+                .metadata()
+                .map_err(|error| LedgerError::io(LedgerOperation::Metadata, &path, &error))?,
+        ) != expected
+        {
+            return Err(LedgerError::PathIdentityChanged { path });
+        }
+        let lock_name = ledger_lock_name(&ledger_name);
+        let directory = Self {
+            file,
+            path,
+            ledger_name,
+            lock_name,
+            effective_uid,
+        };
+        directory.validate()?;
+        Ok(directory)
+    }
+
+    fn ledger_path(&self) -> PathBuf {
+        self.child_path(&self.ledger_name)
+    }
+
+    fn ledger_display_path(&self) -> PathBuf {
+        self.path.join(&self.ledger_name)
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.child_path(&self.lock_name)
+    }
+
+    fn lock_display_path(&self) -> PathBuf {
+        self.path.join(&self.lock_name)
+    }
+
+    fn child_path(&self, name: &OsStr) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            let mut path = PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+            path.push(name);
+            path
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.path.join(name)
+        }
+    }
+
+    fn validate(&self) -> Result<(), LedgerError> {
+        validate_parent_path_identity(&self.path, &self.file, self.effective_uid)
+    }
+
+    fn sync(&self) -> Result<(), LedgerError> {
+        self.file
+            .sync_all()
+            .map_err(|error| LedgerError::io(LedgerOperation::DirectorySync, &self.path, &error))
     }
 }
 
 /// A versioned, checksummed, process-exclusive durable identity ledger.
+///
+/// Production ownership is anchored by a held parent-directory descriptor and
+/// a stable `0600` sidecar whose kernel lock is retained for this value's
+/// lifetime. The sidecar is intentionally not unlinked when ownership ends.
 #[derive(Debug)]
 pub struct DurableIdentityLedger {
     path: PathBuf,
+    directory: DurableLedgerDirectory,
     file: File,
-    _lock: ExclusiveLedgerLock,
+    lock: ExclusiveLedgerLock,
     issued: BTreeSet<[u8; ID_BYTES]>,
     next_sequence: u64,
+    length: u64,
     poisoned: bool,
 }
 
@@ -511,8 +699,9 @@ impl DurableIdentityLedger {
     /// Opens or creates a durable ledger and acquires exclusive ownership.
     ///
     /// Existing bytes are parsed completely before the ledger is returned.
-    /// Symlinks, non-regular files, malformed records, truncation, unsupported
-    /// versions, duplicate records, and capacity violations are rejected.
+    /// Unsafe parent directories, symlinks, non-regular or non-`0600` files,
+    /// wrong ownership, malformed records, truncation, unsupported versions,
+    /// duplicate records, and capacity violations are rejected.
     ///
     /// # Errors
     ///
@@ -520,60 +709,87 @@ impl DurableIdentityLedger {
     /// cannot be safely opened and recovered.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let path = path.as_ref().to_path_buf();
-        validate_ledger_path(&path)?;
-        let lock = acquire_ledger_lock(&path)?;
-        let existing = fs::symlink_metadata(&path).map(|metadata| metadata.is_file());
-        let mut file_options = OpenOptions::new();
-        file_options.read(true).write(true);
-        let (mut file, created) = match existing {
-            Ok(true) => file_options
-                .open(&path)
-                .map(|file| (file, false))
-                .map_err(|error| LedgerError::io(LedgerOperation::Open, &path, &error))?,
-            Ok(false) => {
-                return Err(LedgerError::NotRegularFile { path });
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => file_options
-                .create_new(true)
-                .open(&path)
-                .map(|file| (file, true))
-                .map_err(|error| LedgerError::io(LedgerOperation::Open, &path, &error))?,
+        let directory = DurableLedgerDirectory::open(&path)?;
+        let lock = acquire_ledger_lock(&directory, &path)?;
+        let descriptor_path = directory.ledger_path();
+        let (mut file, created) = match create_private_file(&descriptor_path) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+                open_existing_file(&descriptor_path).map_err(|error| {
+                    classify_open_error(LedgerOperation::Open, &path, &descriptor_path, &error)
+                })?,
+                false,
+            ),
             Err(error) => {
-                return Err(LedgerError::io(LedgerOperation::Metadata, &path, &error));
+                return Err(classify_open_error(
+                    LedgerOperation::Open,
+                    &path,
+                    &descriptor_path,
+                    &error,
+                ));
             }
         };
 
-        reject_non_regular_or_symlink(&path, &file)?;
         if created {
+            validate_open_ledger(&directory, &file, Some(0))?;
             let header = ledger_header(0, LEDGER_HEADER_BYTES as u64);
             file.write_all(&header)
                 .map_err(|error| LedgerError::WriteFailed {
                     path: path.clone(),
                     message: error.to_string(),
                 })?;
-            file.sync_data().map_err(|error| LedgerError::SyncFailed {
+            file.sync_all().map_err(|error| LedgerError::SyncFailed {
                 path: path.clone(),
                 message: error.to_string(),
             })?;
+            validate_open_ledger(&directory, &file, Some(LEDGER_HEADER_BYTES as u64))?;
+            validate_open_lock(&directory, &lock.file)?;
+            directory.sync()?;
+            validate_open_ledger(&directory, &file, Some(LEDGER_HEADER_BYTES as u64))?;
             Ok(Self {
                 path,
+                directory,
                 file,
-                _lock: lock,
+                lock,
                 issued: BTreeSet::new(),
                 next_sequence: 0,
+                length: LEDGER_HEADER_BYTES as u64,
                 poisoned: false,
             })
         } else {
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
+            let metadata = validate_open_ledger(&directory, &file, None)?;
+            let length = metadata.len();
+            let capacity = usize::try_from(length).map_err(|_| LedgerError::CapacityExceeded {
+                records: u64::MAX,
+                max_records: MAX_LEDGER_RECORDS as u64,
+            })?;
+            let mut bytes = Vec::with_capacity(capacity);
+            file.seek(SeekFrom::Start(0))
+                .and_then(|_| {
+                    (&mut file)
+                        .take(MAX_LEDGER_BYTES as u64 + 1)
+                        .read_to_end(&mut bytes)
+                })
                 .map_err(|error| LedgerError::io(LedgerOperation::Read, &path, &error))?;
+            let observed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if observed != length {
+                return Err(LedgerError::LengthChanged {
+                    path,
+                    expected: length,
+                    actual: observed,
+                });
+            }
             let (issued, next_sequence) = parse_ledger(&bytes)?;
+            validate_open_ledger(&directory, &file, Some(length))?;
+            validate_open_lock(&directory, &lock.file)?;
             Ok(Self {
                 path,
+                directory,
                 file,
-                _lock: lock,
+                lock,
                 issued,
                 next_sequence,
+                length,
                 poisoned: false,
             })
         }
@@ -635,7 +851,11 @@ impl IdentityLedger for DurableIdentityLedger {
         if encoded.is_empty() {
             return Ok(());
         }
-        if let Err(error) = self.file.seek(SeekFrom::End(0)) {
+        if let Err(error) = self.validate_append_target(self.length) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        if let Err(error) = self.file.seek(SeekFrom::Start(self.length)) {
             self.poisoned = true;
             return Err(LedgerError::io(LedgerOperation::Append, &self.path, &error));
         }
@@ -650,12 +870,18 @@ impl IdentityLedger for DurableIdentityLedger {
         // prefix. Only after this barrier may the header publish the new
         // record count. A crash can therefore leave an invalid trailing suffix,
         // but can never publish records that were not durably written first.
-        if let Err(error) = self.file.sync_data() {
+        if let Err(error) = self.file.sync_all() {
             self.poisoned = true;
             return Err(LedgerError::SyncFailed {
                 path: self.path.clone(),
                 message: error.to_string(),
             });
+        }
+        let committed_length =
+            LEDGER_HEADER_BYTES as u64 + new_records * LEDGER_RECORD_BYTES as u64;
+        if let Err(error) = self.validate_append_target(committed_length) {
+            self.poisoned = true;
+            return Err(error);
         }
         if let Err(error) = self.file.seek(SeekFrom::Start(0)) {
             self.poisoned = true;
@@ -665,8 +891,6 @@ impl IdentityLedger for DurableIdentityLedger {
                 &error,
             ));
         }
-        let committed_length =
-            LEDGER_HEADER_BYTES as u64 + new_records * LEDGER_RECORD_BYTES as u64;
         let header = ledger_header(new_records, committed_length);
         if let Err(error) = self.file.write_all(&header) {
             self.poisoned = true;
@@ -675,7 +899,7 @@ impl IdentityLedger for DurableIdentityLedger {
                 message: error.to_string(),
             });
         }
-        if let Err(error) = self.file.sync_data() {
+        if let Err(error) = self.file.sync_all() {
             self.poisoned = true;
             return Err(LedgerError::SyncFailed {
                 path: self.path.clone(),
@@ -690,123 +914,374 @@ impl IdentityLedger for DurableIdentityLedger {
         // append writes at an unknown offset.
         self.issued.extend(pending);
         self.next_sequence = new_records;
-        if self.file.seek(SeekFrom::End(0)).is_err() {
+        self.length = committed_length;
+        if let Err(error) = self.validate_append_target(committed_length) {
             self.poisoned = true;
+            return Err(error);
         }
         Ok(())
     }
 }
 
-fn validate_ledger_path(path: &Path) -> Result<(), LedgerError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(LedgerError::Symlink {
-            path: path.to_path_buf(),
-        }),
-        Ok(metadata) if !metadata.is_file() => Err(LedgerError::NotRegularFile {
-            path: path.to_path_buf(),
-        }),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(LedgerError::io(LedgerOperation::Metadata, path, &error)),
+impl DurableIdentityLedger {
+    fn validate_append_target(&self, expected_length: u64) -> Result<(), LedgerError> {
+        self.directory.validate()?;
+        validate_open_lock(&self.directory, &self.lock.file)?;
+        validate_open_ledger(&self.directory, &self.file, Some(expected_length)).map(|_| ())
     }
 }
 
-fn reject_non_regular_or_symlink(path: &Path, file: &File) -> Result<(), LedgerError> {
-    let link_metadata = fs::symlink_metadata(path)
-        .map_err(|error| LedgerError::io(LedgerOperation::Metadata, path, &error))?;
-    if link_metadata.file_type().is_symlink() {
+fn ledger_lock_name(ledger_name: &OsStr) -> OsString {
+    let mut lock_name = ledger_name.to_os_string();
+    lock_name.push(".lock");
+    lock_name
+}
+
+fn acquire_ledger_lock(
+    directory: &DurableLedgerDirectory,
+    ledger_path: &Path,
+) -> Result<ExclusiveLedgerLock, LedgerError> {
+    directory.validate()?;
+    let descriptor_path = directory.lock_path();
+    let display_path = directory.lock_display_path();
+    let (file, created) = match create_private_file(&descriptor_path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (
+            open_existing_file(&descriptor_path).map_err(|error| {
+                classify_open_error(
+                    LedgerOperation::Lock,
+                    &display_path,
+                    &descriptor_path,
+                    &error,
+                )
+            })?,
+            false,
+        ),
+        Err(error) => {
+            return Err(classify_open_error(
+                LedgerOperation::Lock,
+                &display_path,
+                &descriptor_path,
+                &error,
+            ));
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            return Err(LedgerError::Locked {
+                path: ledger_path.to_path_buf(),
+            });
+        }
+        Err(TryLockError::Error(error)) => {
+            return Err(LedgerError::io(
+                LedgerOperation::Lock,
+                &display_path,
+                &error,
+            ));
+        }
+    }
+    validate_open_lock(directory, &file)?;
+    if created {
+        file.sync_all()
+            .map_err(|error| LedgerError::io(LedgerOperation::Lock, &display_path, &error))?;
+        directory.sync()?;
+        validate_open_lock(directory, &file)?;
+    }
+    Ok(ExclusiveLedgerLock { file })
+}
+
+fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).read(true).write(true);
+    configure_secure_open(&mut options);
+    let file = options.open(path)?;
+    set_private_permissions(&file)?;
+    Ok(file)
+}
+
+fn open_existing_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    configure_secure_open(&mut options);
+    options.open(path)
+}
+
+fn configure_secure_open(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    options.mode(PRIVATE_LEDGER_MODE);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(O_NOFOLLOW);
+}
+
+fn set_private_permissions(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(PRIVATE_LEDGER_MODE))?;
+    Ok(())
+}
+
+fn classify_open_error(
+    operation: LedgerOperation,
+    display_path: &Path,
+    descriptor_path: &Path,
+    error: &io::Error,
+) -> LedgerError {
+    if fs::symlink_metadata(descriptor_path).is_ok_and(|metadata| metadata.is_symlink()) {
+        LedgerError::Symlink {
+            path: display_path.to_path_buf(),
+        }
+    } else {
+        LedgerError::io(operation, display_path, error)
+    }
+}
+
+fn validate_open_ledger(
+    directory: &DurableLedgerDirectory,
+    file: &File,
+    expected_length: Option<u64>,
+) -> Result<fs::Metadata, LedgerError> {
+    validate_open_named_file(
+        directory,
+        &directory.ledger_name,
+        &directory.ledger_display_path(),
+        file,
+        expected_length,
+        Some(MAX_LEDGER_BYTES as u64),
+    )
+}
+
+fn validate_open_lock(directory: &DurableLedgerDirectory, file: &File) -> Result<(), LedgerError> {
+    validate_open_named_file(
+        directory,
+        &directory.lock_name,
+        &directory.lock_display_path(),
+        file,
+        Some(0),
+        Some(0),
+    )
+    .map(|_| ())
+}
+
+fn validate_open_named_file(
+    directory: &DurableLedgerDirectory,
+    name: &OsStr,
+    display_path: &Path,
+    file: &File,
+    expected_length: Option<u64>,
+    maximum_length: Option<u64>,
+) -> Result<fs::Metadata, LedgerError> {
+    directory.validate()?;
+    let descriptor_path = directory.child_path(name);
+    let path_metadata = fs::symlink_metadata(&descriptor_path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            LedgerError::PathIdentityChanged {
+                path: display_path.to_path_buf(),
+            }
+        } else {
+            LedgerError::io(LedgerOperation::Metadata, display_path, &error)
+        }
+    })?;
+    if path_metadata.file_type().is_symlink() {
         return Err(LedgerError::Symlink {
-            path: path.to_path_buf(),
+            path: display_path.to_path_buf(),
         });
     }
     let metadata = file
         .metadata()
-        .map_err(|error| LedgerError::io(LedgerOperation::Metadata, path, &error))?;
-    if !metadata.is_file() {
+        .map_err(|error| LedgerError::io(LedgerOperation::Metadata, display_path, &error))?;
+    if !metadata.is_file() || !path_metadata.is_file() {
         return Err(LedgerError::NotRegularFile {
-            path: path.to_path_buf(),
+            path: display_path.to_path_buf(),
         });
     }
-    let length = metadata.len();
-    if length > MAX_LEDGER_BYTES as u64 {
-        let records = (length - LEDGER_HEADER_BYTES as u64)
-            .saturating_add(LEDGER_RECORD_BYTES as u64 - 1)
-            / LEDGER_RECORD_BYTES as u64;
-        return Err(LedgerError::CapacityExceeded {
-            records,
-            max_records: MAX_LEDGER_RECORDS as u64,
+    if file_identity(&metadata) != file_identity(&path_metadata) {
+        return Err(LedgerError::PathIdentityChanged {
+            path: display_path.to_path_buf(),
+        });
+    }
+    validate_file_metadata(display_path, &metadata, directory.effective_uid)?;
+    if let Some(maximum) = maximum_length
+        && metadata.len() > maximum
+    {
+        if display_path == directory.ledger_display_path() {
+            let records = metadata
+                .len()
+                .saturating_sub(LEDGER_HEADER_BYTES as u64)
+                .saturating_add(LEDGER_RECORD_BYTES as u64 - 1)
+                / LEDGER_RECORD_BYTES as u64;
+            return Err(LedgerError::CapacityExceeded {
+                records,
+                max_records: MAX_LEDGER_RECORDS as u64,
+            });
+        }
+        return Err(LedgerError::LengthChanged {
+            path: display_path.to_path_buf(),
+            expected: maximum,
+            actual: metadata.len(),
+        });
+    }
+    if let Some(expected) = expected_length
+        && metadata.len() != expected
+    {
+        return Err(LedgerError::LengthChanged {
+            path: display_path.to_path_buf(),
+            expected,
+            actual: metadata.len(),
+        });
+    }
+    Ok(metadata)
+}
+
+fn validate_parent_path(path: &Path, effective_uid: u32) -> Result<FileIdentity, LedgerError> {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        PathBuf::from(".")
+    };
+    let mut final_identity = None;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => current.push(Path::new("/")),
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => current.push(name),
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                return Err(LedgerError::UnsafeParentDirectory {
+                    path: path.to_path_buf(),
+                });
+            }
+        }
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| LedgerError::io(LedgerOperation::Metadata, &current, &error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(LedgerError::Symlink {
+                path: current.clone(),
+            });
+        }
+        validate_directory_metadata(&current, &metadata, effective_uid)?;
+        final_identity = Some(file_identity(&metadata));
+    }
+    if final_identity.is_none() {
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| LedgerError::io(LedgerOperation::Metadata, &current, &error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(LedgerError::Symlink {
+                path: current.clone(),
+            });
+        }
+        validate_directory_metadata(&current, &metadata, effective_uid)?;
+        final_identity = Some(file_identity(&metadata));
+    }
+    final_identity.ok_or_else(|| LedgerError::UnsafeParentDirectory {
+        path: path.to_path_buf(),
+    })
+}
+
+fn validate_parent_path_identity(
+    path: &Path,
+    directory: &File,
+    effective_uid: u32,
+) -> Result<(), LedgerError> {
+    let expected = validate_parent_path(path, effective_uid)?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| LedgerError::io(LedgerOperation::Metadata, path, &error))?;
+    validate_directory_metadata(path, &metadata, effective_uid)?;
+    if expected != file_identity(&metadata) {
+        return Err(LedgerError::PathIdentityChanged {
+            path: path.to_path_buf(),
         });
     }
     Ok(())
 }
 
-fn ledger_lock_path(path: &Path) -> PathBuf {
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".lock");
-    PathBuf::from(lock_path)
-}
-
-fn acquire_ledger_lock(path: &Path) -> Result<ExclusiveLedgerLock, LedgerError> {
-    let lock_path = ledger_lock_path(path);
-    match fs::symlink_metadata(&lock_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(LedgerError::Symlink { path: lock_path });
-        }
-        Ok(_) => {
-            if !stale_lock(&lock_path) {
-                return Err(LedgerError::Locked {
-                    path: path.to_path_buf(),
-                });
-            }
-            fs::remove_file(&lock_path)
-                .map_err(|error| LedgerError::io(LedgerOperation::Lock, &lock_path, &error))?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(LedgerError::io(LedgerOperation::Lock, &lock_path, &error)),
+fn validate_directory_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    effective_uid: u32,
+) -> Result<(), LedgerError> {
+    if !metadata.is_dir() {
+        return Err(LedgerError::UnsafeParentDirectory {
+            path: path.to_path_buf(),
+        });
     }
-    let mut file = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
+    #[cfg(unix)]
     {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(LedgerError::Locked {
+        let mode = metadata.mode();
+        let owner = metadata.uid();
+        if mode & WRITE_BY_GROUP_OR_OTHER != 0
+            && (mode & STICKY_DIRECTORY == 0 || (owner != 0 && owner != effective_uid))
+        {
+            return Err(LedgerError::UnsafeParentDirectory {
                 path: path.to_path_buf(),
             });
         }
-        Err(error) => return Err(LedgerError::io(LedgerOperation::Lock, &lock_path, &error)),
-    };
-    let owner = format!("{}\n", std::process::id());
-    if let Err(error) = file
-        .write_all(owner.as_bytes())
-        .and_then(|()| file.sync_data())
-    {
-        let _ = fs::remove_file(&lock_path);
-        return Err(LedgerError::io(LedgerOperation::Lock, &lock_path, &error));
     }
-    Ok(ExclusiveLedgerLock {
-        path: lock_path,
-        _file: file,
+    Ok(())
+}
+
+fn validate_file_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    effective_uid: u32,
+) -> Result<(), LedgerError> {
+    #[cfg(unix)]
+    {
+        if metadata.uid() != effective_uid {
+            return Err(LedgerError::WrongOwner {
+                path: path.to_path_buf(),
+                expected: effective_uid,
+                actual: metadata.uid(),
+            });
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode != PRIVATE_LEDGER_MODE {
+            return Err(LedgerError::UnsafePermissions {
+                path: path.to_path_buf(),
+                mode,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: 0,
+        inode: 0,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn effective_uid() -> Result<u32, LedgerError> {
+    let path = Path::new("/proc/self/status");
+    let status = fs::read_to_string(path)
+        .map_err(|error| LedgerError::io(LedgerOperation::Metadata, path, &error))?;
+    let value = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .and_then(|line| line.split_ascii_whitespace().nth(2))
+        .ok_or_else(|| LedgerError::Unavailable {
+            reason: "/proc/self/status has no effective uid".into(),
+        })?;
+    value.parse().map_err(|_| LedgerError::Unavailable {
+        reason: "/proc/self/status effective uid is invalid".into(),
     })
 }
 
-fn stale_lock(path: &Path) -> bool {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(pid) = contents.trim().parse::<u32>() else {
-        return false;
-    };
-    #[cfg(target_os = "linux")]
-    {
-        pid != std::process::id() && fs::metadata(format!("/proc/{pid}")).is_err()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        false
-    }
+#[cfg(not(target_os = "linux"))]
+fn effective_uid() -> Result<u32, LedgerError> {
+    Err(LedgerError::Unavailable {
+        reason: "durable identity ledger ownership validation requires Linux".into(),
+    })
 }
 
 fn ledger_header(record_count: u64, data_length: u64) -> [u8; LEDGER_HEADER_BYTES] {
@@ -2466,9 +2941,292 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        process::{Command, Stdio},
+        sync::atomic::{AtomicU64, Ordering},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
     use super::*;
 
     const FOREIGN_SESSION: SessionId = SessionId::new([0xee; ID_BYTES]);
+    const LEDGER_CHILD_PATH: &str = "SESSION_ORCHESTRATOR_LEDGER_CHILD_PATH";
+    const LEDGER_CHILD_READY: &str = "SESSION_ORCHESTRATOR_LEDGER_CHILD_READY";
+    const LEDGER_CHILD_RELEASE: &str = "SESSION_ORCHESTRATOR_LEDGER_CHILD_RELEASE";
+
+    static NEXT_LEDGER_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct DurableLedgerFixture {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl DurableLedgerFixture {
+        fn new(name: &str) -> Self {
+            let sequence = NEXT_LEDGER_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("test clock must follow Unix epoch")
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "session-orchestrator-ledger-{}-{name}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&directory).expect("test ledger directory must be created");
+            #[cfg(unix)]
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .expect("test ledger directory must be private");
+            let path = directory.join("identity.ledger");
+            Self { directory, path }
+        }
+
+        fn lock_path(&self) -> PathBuf {
+            self.directory.join("identity.ledger.lock")
+        }
+    }
+
+    impl Drop for DurableLedgerFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn durable_ledger_cross_process_lock_helper() {
+        let Some(path) = std::env::var_os(LEDGER_CHILD_PATH).map(PathBuf::from) else {
+            return;
+        };
+        let ready = PathBuf::from(
+            std::env::var_os(LEDGER_CHILD_READY).expect("child ready path must be provided"),
+        );
+        let release = PathBuf::from(
+            std::env::var_os(LEDGER_CHILD_RELEASE).expect("child release path must be provided"),
+        );
+        let ledger = DurableIdentityLedger::open(path).expect("child must own durable ledger");
+        fs::write(&ready, b"ready").expect("child must publish readiness");
+        for _ in 0..1_000 {
+            if release.exists() {
+                drop(ledger);
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("parent did not release durable ledger child");
+    }
+
+    #[test]
+    fn durable_ledger_stable_sidecar_serializes_same_process_owners() {
+        let fixture = DurableLedgerFixture::new("same-process-lock");
+        let first = DurableIdentityLedger::open(&fixture.path).expect("first owner must open");
+        let before = fs::metadata(fixture.lock_path()).expect("stable lock must exist");
+        let error = DurableIdentityLedger::open(&fixture.path)
+            .expect_err("second live owner must be rejected");
+        assert!(matches!(error, LedgerError::Locked { .. }));
+        drop(first);
+
+        let after = fs::metadata(fixture.lock_path()).expect("lock must survive owner drop");
+        #[cfg(unix)]
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        DurableIdentityLedger::open(&fixture.path)
+            .expect("released kernel lock must permit the next owner");
+    }
+
+    #[test]
+    fn durable_ledger_serializes_cross_process_owners() {
+        let fixture = DurableLedgerFixture::new("cross-process-lock");
+        let ready = fixture.directory.join("child.ready");
+        let release = fixture.directory.join("child.release");
+        let mut child = Command::new(std::env::current_exe().expect("test executable must exist"))
+            .args([
+                "--exact",
+                "tests::durable_ledger_cross_process_lock_helper",
+                "--nocapture",
+            ])
+            .env(LEDGER_CHILD_PATH, &fixture.path)
+            .env(LEDGER_CHILD_READY, &ready)
+            .env(LEDGER_CHILD_RELEASE, &release)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ledger lock child must start");
+
+        let mut child_ready = false;
+        for _ in 0..500 {
+            if ready.exists() {
+                child_ready = true;
+                break;
+            }
+            if child
+                .try_wait()
+                .expect("child status must be readable")
+                .is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let contention = if child_ready {
+            Some(
+                DurableIdentityLedger::open(&fixture.path)
+                    .expect_err("parent must not bypass child ownership"),
+            )
+        } else {
+            None
+        };
+        fs::write(&release, b"release").expect("parent must release child");
+        let output = child
+            .wait_with_output()
+            .expect("ledger lock child must finish");
+        assert!(
+            child_ready,
+            "child did not acquire ledger: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "child failed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(matches!(contention, Some(LedgerError::Locked { .. })));
+        DurableIdentityLedger::open(&fixture.path)
+            .expect("child exit must release its kernel lock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_ledger_creates_exact_private_files() {
+        let fixture = DurableLedgerFixture::new("private-mode");
+        let ledger = DurableIdentityLedger::open(&fixture.path).expect("ledger must open");
+        assert_eq!(
+            fs::metadata(&fixture.path)
+                .expect("ledger metadata must exist")
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(fixture.lock_path())
+                .expect("lock metadata must exist")
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(ledger);
+        fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o640))
+            .expect("test must widen ledger permissions");
+        assert!(matches!(
+            DurableIdentityLedger::open(&fixture.path),
+            Err(LedgerError::UnsafePermissions { mode: 0o640, .. })
+        ));
+        fs::set_permissions(&fixture.path, fs::Permissions::from_mode(0o600))
+            .expect("test must restore ledger permissions");
+        fs::set_permissions(fixture.lock_path(), fs::Permissions::from_mode(0o640))
+            .expect("test must widen lock permissions");
+        assert!(matches!(
+            DurableIdentityLedger::open(&fixture.path),
+            Err(LedgerError::UnsafePermissions { mode: 0o640, .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_ledger_rejects_untrusted_parent_directory() {
+        let fixture = DurableLedgerFixture::new("untrusted-parent");
+        fs::set_permissions(&fixture.directory, fs::Permissions::from_mode(0o777))
+            .expect("test must make parent replaceable");
+        assert!(matches!(
+            DurableIdentityLedger::open(&fixture.path),
+            Err(LedgerError::UnsafeParentDirectory { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_ledger_rejects_ledger_and_lock_symlinks() {
+        let ledger_fixture = DurableLedgerFixture::new("ledger-symlink");
+        let target = ledger_fixture.directory.join("target");
+        fs::write(&target, b"target").expect("symlink target must be created");
+        symlink(&target, &ledger_fixture.path).expect("ledger symlink must be created");
+        assert!(matches!(
+            DurableIdentityLedger::open(&ledger_fixture.path),
+            Err(LedgerError::Symlink { .. })
+        ));
+
+        let lock_fixture = DurableLedgerFixture::new("lock-symlink");
+        let lock_target = lock_fixture.directory.join("lock-target");
+        fs::write(&lock_target, b"").expect("lock symlink target must be created");
+        symlink(&lock_target, lock_fixture.lock_path()).expect("lock symlink must be created");
+        assert!(matches!(
+            DurableIdentityLedger::open(&lock_fixture.path),
+            Err(LedgerError::Symlink { .. })
+        ));
+    }
+
+    #[test]
+    fn durable_ledger_path_swap_seals_writer() {
+        let fixture = DurableLedgerFixture::new("path-swap");
+        let mut ledger = DurableIdentityLedger::open(&fixture.path).expect("ledger must open");
+        let displaced = fixture.directory.join("displaced.ledger");
+        fs::rename(&fixture.path, &displaced).expect("ledger path must be displaced");
+        fs::copy(&displaced, &fixture.path).expect("replacement ledger must be installed");
+
+        assert!(matches!(
+            ledger.reserve(IdentityKind::Session, [0x71; ID_BYTES]),
+            Err(LedgerError::PathIdentityChanged { .. })
+        ));
+        assert!(matches!(
+            ledger.reserve(IdentityKind::Session, [0x72; ID_BYTES]),
+            Err(LedgerError::Unavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn durable_ledger_length_change_seals_writer() {
+        let fixture = DurableLedgerFixture::new("length-change");
+        let mut ledger = DurableIdentityLedger::open(&fixture.path).expect("ledger must open");
+        OpenOptions::new()
+            .append(true)
+            .open(&fixture.path)
+            .and_then(|mut file| file.write_all(&[0xaa]).and_then(|()| file.sync_all()))
+            .expect("test must append an uncommitted byte");
+
+        assert!(matches!(
+            ledger.reserve(IdentityKind::Session, [0x73; ID_BYTES]),
+            Err(LedgerError::LengthChanged { .. })
+        ));
+        assert!(matches!(
+            ledger.reserve(IdentityKind::Session, [0x74; ID_BYTES]),
+            Err(LedgerError::Unavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn durable_ledger_nonempty_torn_tail_fails_closed() {
+        let fixture = DurableLedgerFixture::new("torn-tail");
+        drop(DurableIdentityLedger::open(&fixture.path).expect("ledger must open"));
+        OpenOptions::new()
+            .append(true)
+            .open(&fixture.path)
+            .and_then(|mut file| file.write_all(&[0xbb]).and_then(|()| file.sync_all()))
+            .expect("test must append a torn tail");
+
+        assert!(matches!(
+            DurableIdentityLedger::open(&fixture.path),
+            Err(LedgerError::Corrupt { .. })
+        ));
+        assert_eq!(
+            fs::metadata(&fixture.path)
+                .expect("rejected ledger must remain for operator recovery")
+                .len(),
+            LEDGER_HEADER_BYTES as u64 + 1
+        );
+    }
 
     #[derive(Debug, Default)]
     struct TestRandom(u8);

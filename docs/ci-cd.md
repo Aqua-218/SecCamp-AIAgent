@@ -2,6 +2,8 @@
 
 # CI/CD Operations
 
+[ドキュメント一覧](README.md) / CI/CD operations
+
 > **対象読者:** リポジトリ管理者、リリース担当者、pipeline を変更する人
 
 This repository ships equivalent, fail-closed delivery pipelines for GitHub Actions and GitLab CI. Both platforms execute the same repository-owned scripts so that a platform migration does not change the quality, security, or release contract.
@@ -130,3 +132,9 @@ A failed package or signature job publishes nothing. A failed protected publicat
 The four test shards, quality checks, specialized verification, coverage, and security scanners run in parallel where their dependencies allow it. The first run compiles pinned Cargo tools; caches reduce subsequent latency. Expect approximately 15–35 minutes of wall time and 20–60 Linux runner-minutes for a cold full run, depending on runner size and registry performance. Release pipelines intentionally repeat all gates and therefore cost roughly another full run.
 
 The pipelines do not claim production deployment readiness. They do not exercise a real Firecracker host, FUSE mount, AF_VSOCK transport, external DNS/HTTPS service, or cloud environment. Container digest and Action SHA updates still require human review, and a compromised hosted runner remains inside the trusted build boundary. The protected release environment, minimal job permissions, OIDC signing, immutable tag policy, provenance, checksums, and fail-closed rerun behavior reduce that boundary but do not eliminate it.
+
+## 関連
+
+- [ドキュメント一覧](README.md)
+- [検証戦略](design/verification.md)
+- [文書規約](document-conventions.md)

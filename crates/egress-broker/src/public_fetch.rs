@@ -18,6 +18,7 @@ use authority_core::http::{
     CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethod, HttpFetchRequest,
     http_fetch_matches,
 };
+use egress_protocol::response::PublicWireResponse;
 use reqwest::blocking::Client;
 use url::Url;
 
@@ -202,14 +203,54 @@ impl Default for FetchPolicy {
 /// A complete public response after streaming-cap enforcement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicResponse {
-    /// Final HTTP status code.
-    pub status: u16,
-    /// Final canonical host after redirect processing.
-    pub host: CanonicalHost,
-    /// Final canonical path after redirect processing.
-    pub path: CanonicalUrlPath,
-    /// Body bytes, bounded by both the authority and host policy.
-    pub body: Vec<u8>,
+    wire: PublicWireResponse,
+}
+
+impl PublicResponse {
+    /// Constructs a response only when it already satisfies the canonical wire contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FetchError::InvalidResponse`] when the status, canonical
+    /// destination, or body cannot be represented by the broker response wire.
+    pub fn new(
+        status: u16,
+        host: CanonicalHost,
+        path: CanonicalUrlPath,
+        body: Vec<u8>,
+    ) -> Result<Self, FetchError> {
+        PublicWireResponse::new(status, host, path, body)
+            .map(|wire| Self { wire })
+            .map_err(|_| FetchError::InvalidResponse)
+    }
+
+    /// Returns the final HTTP status code.
+    #[must_use]
+    pub const fn status(&self) -> u16 {
+        self.wire.status()
+    }
+
+    /// Returns the final canonical host after redirect processing.
+    #[must_use]
+    pub const fn host(&self) -> &CanonicalHost {
+        self.wire.host()
+    }
+
+    /// Returns the final canonical path after redirect processing.
+    #[must_use]
+    pub const fn path(&self) -> &CanonicalUrlPath {
+        self.wire.path()
+    }
+
+    /// Returns body bytes bounded by both authority and canonical wire policy.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        self.wire.body()
+    }
+
+    pub(crate) fn into_wire(self) -> PublicWireResponse {
+        self.wire
+    }
 }
 
 /// DNS resolver failures that do not disclose the queried address.
@@ -277,6 +318,8 @@ pub enum FetchError {
     OverallTimeout,
     /// Reading the response stream failed.
     ResponseRead,
+    /// The completed response cannot be represented by the canonical broker wire.
+    InvalidResponse,
 }
 
 impl fmt::Display for FetchError {
@@ -302,6 +345,9 @@ impl fmt::Display for FetchError {
             }
             Self::OverallTimeout => formatter.write_str("public fetch exceeded its total timeout"),
             Self::ResponseRead => formatter.write_str("reading the HTTPS response failed"),
+            Self::InvalidResponse => {
+                formatter.write_str("public response is outside the canonical broker wire")
+            }
         }
     }
 }
@@ -412,12 +458,7 @@ where
             } else {
                 read_bounded(response.body, request.max_response_bytes(), deadline)?
             };
-            return Ok(PublicResponse {
-                status: response.status,
-                host: target.host,
-                path: target.path,
-                body,
-            });
+            return PublicResponse::new(response.status, target.host, target.path, body);
         }
     }
 }
@@ -503,10 +544,11 @@ mod tests {
     use authority_core::http::{
         CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethods, UrlPathPattern,
     };
+    use egress_protocol::response::MAX_PUBLIC_WIRE_BODY_BYTES;
 
     use super::{
         ConnectorError, ConnectorResponse, FetchError, FetchPolicy, FetchTarget, HttpsConnector,
-        PublicFetcher, Resolver, read_bounded,
+        PublicFetcher, PublicResponse, Resolver, read_bounded,
     };
     use crate::ip_policy::IpPolicy;
 
@@ -628,8 +670,8 @@ mod tests {
         let response = fetcher
             .fetch(&request("/guide", 32), &authority("/guide", 32))
             .expect("public GET should succeed");
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"hello");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), b"hello");
         assert_eq!(
             targets
                 .lock()
@@ -658,8 +700,27 @@ mod tests {
                 &authority_with_method(authority_core::http::HttpFetchMethod::Head, "/guide", 4),
             )
             .expect("public HEAD should succeed");
-        assert_eq!(response.status, 200);
-        assert!(response.body.is_empty());
+        assert_eq!(response.status(), 200);
+        assert!(response.body().is_empty());
+    }
+
+    // Requirement: every constructible successful response fits the canonical response wire.
+    // Category: boundary/security. Risk: critical.
+    #[test]
+    fn public_response_constructor_rejects_unencodable_successes() {
+        let host = CanonicalHost::new("public.example").expect("fixture host is valid");
+        let path = CanonicalUrlPath::new("/guide").expect("fixture path is valid");
+        assert_eq!(
+            PublicResponse::new(99, host.clone(), path.clone(), Vec::new()),
+            Err(FetchError::InvalidResponse)
+        );
+        let oversized = usize::try_from(MAX_PUBLIC_WIRE_BODY_BYTES)
+            .expect("wire cap fits the test address space")
+            + 1;
+        assert_eq!(
+            PublicResponse::new(200, host, path, vec![0; oversized]),
+            Err(FetchError::InvalidResponse)
+        );
     }
 
     // Requirement: every redirect re-resolves and re-checks the capability path.
@@ -781,7 +842,7 @@ mod tests {
         let response = fetcher
             .fetch(&request("/guide", 32), &authority("/guide", 32))
             .expect("request under the hard policy cap should succeed");
-        assert_eq!(response.body, b"bounded");
+        assert_eq!(response.body(), b"bounded");
     }
 
     struct SlowEmptyReader;

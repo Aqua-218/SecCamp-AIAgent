@@ -229,6 +229,23 @@ pub enum ResourceMutation<E> {
 }
 
 /// Resource operations required by the supervisor lifecycle.
+///
+/// # Implementation contract
+///
+/// Resource tokens must remain stable and must not be reused for another
+/// resource while this supervisor can retain or retry them. Every cleanup
+/// mutation (`remove_cgroup`, `unmount_capfs`, `close_control_fd`,
+/// `stop_workload`, and `close_handle`) must be idempotent for its token: if a
+/// prior call may already have completed, repeating the call must not affect a
+/// replacement resource, and an already-absent target must be reported as
+/// [`ResourceMutation::Applied`]. Implementations must classify effects
+/// honestly; in particular, [`ResourceMutation::NoEffect`] must mean the
+/// target still exists unchanged and [`ResourceMutation::EffectUnknown`] must
+/// be used when completion cannot be determined.
+///
+/// Violating this contract can make failure recovery repeat an effect against
+/// the wrong OS resource. Implementations are therefore part of the trusted
+/// host boundary and must be reviewed together with their token allocator.
 pub trait RuntimeResources {
     /// Resource-adapter failure type.
     type Error: Error + Send + Sync + 'static;
@@ -281,8 +298,7 @@ pub trait RuntimeResources {
         handle: &HandleId,
     ) -> ResourceMutation<Self::Error>;
 
-    /// Closes a runtime handle. Implementations should make this idempotent so
-    /// authority registration rollback can retry safely.
+    /// Closes a runtime handle under the trait-wide idempotent cleanup contract.
     fn close_handle(
         &mut self,
         subject: &SubjectId,
@@ -316,8 +332,13 @@ pub trait AuthorityKernel {
         now: MonotonicTime,
     ) -> Result<CapId, Self::Error>;
 
-    /// Revokes a capability and all authority derived from it.
-    fn revoke(&self, capability: &CapId) -> Result<RevocationStatus, Self::Error>;
+    /// Revokes a capability held by the transport-authenticated caller and all
+    /// authority derived from it.
+    fn revoke(
+        &self,
+        caller: &SubjectId,
+        capability: &CapId,
+    ) -> Result<RevocationStatus, Self::Error>;
 
     /// Begins shutdown and stops new authorization before resource cleanup.
     fn begin_subject_close(&self, subject: &SubjectId) -> Result<SubjectCloseStatus, Self::Error>;
@@ -365,8 +386,12 @@ impl AuthorityKernel for CapabilityKernel {
         CapabilityKernel::derive(self, caller, parent, grant, now)
     }
 
-    fn revoke(&self, capability: &CapId) -> Result<RevocationStatus, Self::Error> {
-        CapabilityKernel::revoke(self, capability)
+    fn revoke(
+        &self,
+        caller: &SubjectId,
+        capability: &CapId,
+    ) -> Result<RevocationStatus, Self::Error> {
+        CapabilityKernel::revoke_held_by(self, caller, capability)
     }
 
     fn begin_subject_close(&self, subject: &SubjectId) -> Result<SubjectCloseStatus, Self::Error> {
@@ -982,7 +1007,7 @@ where
         let caller = self.resolve_caller(identity)?;
         self.ensure_running(&caller)?;
         self.kernel
-            .revoke(capability)
+            .revoke(&caller, capability)
             .map_err(SupervisorError::Kernel)
     }
 

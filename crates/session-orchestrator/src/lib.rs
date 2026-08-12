@@ -680,12 +680,17 @@ impl IdentityLedger for DurableIdentityLedger {
                 message: error.to_string(),
             });
         }
-        if let Err(error) = self.file.seek(SeekFrom::End(0)) {
-            self.poisoned = true;
-            return Err(LedgerError::io(LedgerOperation::Append, &self.path, &error));
-        }
+        // The records and the header are both durable at this point, so the
+        // reservation has committed. Commit the in-memory view first: returning
+        // Err here would tell the caller the identities are free while they are
+        // permanently on disk, and retrying them after a reopen yields
+        // Duplicate. A failed reposition still poisons the ledger so no later
+        // append writes at an unknown offset.
         self.issued.extend(pending);
         self.next_sequence = new_records;
+        if self.file.seek(SeekFrom::End(0)).is_err() {
+            self.poisoned = true;
+        }
         Ok(())
     }
 }
@@ -1959,7 +1964,21 @@ where
         let workspace = match workspace_backend.clone_workspace(&identity, workspace_template) {
             Ok(lease) => {
                 if let Some(error) = validate_workspace(&identity, &lease) {
-                    return Err(StartError::new(StartStage::WorkspaceClone, error));
+                    // The clone exists on disk even though its lease is not
+                    // usable. Every other stage rolls back; without this the
+                    // directory is left behind with no lease to reach it.
+                    let mut rollback = Vec::new();
+                    if let Err(cleanup) = workspace_backend.isolate_workspace(&lease) {
+                        rollback.push(CleanupFailure {
+                            stage: CleanupStage::WorkspaceIsolation,
+                            error: cleanup,
+                        });
+                    }
+                    return Err(StartError::with_rollback(
+                        StartStage::WorkspaceClone,
+                        error,
+                        rollback,
+                    ));
                 }
                 self.state = LifecycleState::WorkspaceCloned;
                 lease
@@ -2131,8 +2150,24 @@ where
         Ok(info)
     }
 
+    fn draw_identities<const N: usize>(
+        &mut self,
+        kinds: [IdentityKind; N],
+    ) -> Result<[(IdentityKind, [u8; ID_BYTES]); N], StartFailure> {
+        let mut identities = [(IdentityKind::Session, [0_u8; ID_BYTES]); N];
+        for (slot, kind) in identities.iter_mut().zip(kinds) {
+            slot.0 = kind;
+            slot.1 = self.random.random_128().map_err(StartFailure::Entropy)?;
+        }
+        Ok(identities)
+    }
+
     fn allocate_session_identity(&mut self) -> Result<SessionIdentity, StartFailure> {
-        let kinds = [
+        // One list, destructured by name. Keeping the kinds and the positional
+        // reads as two arrays let a reordering compile while mislabelling every
+        // ledger record and assigning each drawn value to the wrong field, and
+        // an added kind was silently dropped by `zip`.
+        let identities = self.draw_identities([
             IdentityKind::Session,
             IdentityKind::Request,
             IdentityKind::Vm,
@@ -2140,25 +2175,29 @@ where
             IdentityKind::Workspace,
             IdentityKind::Capability,
             IdentityKind::BrokerSession,
-        ];
-        let mut identities = [(IdentityKind::Session, [0_u8; ID_BYTES]); 7];
-        for (slot, kind) in identities.iter_mut().zip(kinds) {
-            slot.0 = kind;
-            slot.1 = self.random.random_128().map_err(StartFailure::Entropy)?;
-        }
+        ])?;
         self.ledger
             .reserve_batch(&identities)
             .map_err(|error| match error {
                 LedgerError::Duplicate { kind, .. } => StartFailure::IdentityReused(kind),
                 error => StartFailure::Ledger(error),
             })?;
-        let session_id = SessionId::new(identities[0].1);
-        let request_id = RequestId::new(identities[1].1);
-        let vm_id = VmId::new(identities[2].1);
-        let subject_id = SubjectId::new(identities[3].1);
-        let workspace_id = WorkspaceId::new(identities[4].1);
-        let capability_id = CapabilityId::new(identities[5].1);
-        let broker_session_id = BrokerSessionId::new(identities[6].1);
+        let [
+            (_, session_bytes),
+            (_, request_bytes),
+            (_, vm_bytes),
+            (_, subject_bytes),
+            (_, workspace_bytes),
+            (_, capability_bytes),
+            (_, broker_session_bytes),
+        ] = identities;
+        let session_id = SessionId::new(session_bytes);
+        let request_id = RequestId::new(request_bytes);
+        let vm_id = VmId::new(vm_bytes);
+        let subject_id = SubjectId::new(subject_bytes);
+        let workspace_id = WorkspaceId::new(workspace_bytes);
+        let capability_id = CapabilityId::new(capability_bytes);
+        let broker_session_id = BrokerSessionId::new(broker_session_bytes);
         Ok(SessionIdentity {
             session_id,
             request_id,

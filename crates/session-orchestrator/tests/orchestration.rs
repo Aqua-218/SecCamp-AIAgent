@@ -715,6 +715,64 @@ fn startup_rollback_failure_is_retained_for_stop_retry() {
     );
 }
 
+// Requirement: a workspace clone whose lease fails validation is never left on the host.
+// Category: failure containment. Risk: high.
+#[test]
+fn foreign_workspace_lease_isolates_the_clone_before_returning() {
+    let log = CallLog::default();
+    let mut workspace = MockWorkspace {
+        log: log.clone(),
+        foreign_session: Some(SessionId::new([0xAA; 16])),
+        ..MockWorkspace::default()
+    };
+    let mut broker = MockBroker {
+        log: log.clone(),
+        ..MockBroker::default()
+    };
+    let mut vm = MockVm {
+        log: log.clone(),
+        ..MockVm::default()
+    };
+    let mut capability = MockCapability {
+        log: log.clone(),
+        ..MockCapability::default()
+    };
+    let mut workload = MockWorkload {
+        log: log.clone(),
+        ..MockWorkload::default()
+    };
+    let mut orchestrator = SessionOrchestrator::new(SequenceRandom::new(identity_values(80, 7)));
+
+    let error = orchestrator
+        .start_session(
+            &snapshot(),
+            &template(),
+            &7_u64,
+            &mut workspace,
+            &mut broker,
+            &mut vm,
+            &mut capability,
+            &mut workload,
+        )
+        .expect_err("a lease bound to another session must not start a session");
+
+    assert_eq!(error.stage(), StartStage::WorkspaceClone);
+    assert!(matches!(
+        error.failure(),
+        StartFailure::CrossSessionLease { .. }
+    ));
+    assert!(
+        error.rollback_failures().is_empty(),
+        "isolation succeeded, so nothing is outstanding"
+    );
+    assert_eq!(
+        log.values(),
+        vec!["workspace.clone", "workspace.isolate"],
+        "the clone must be released and no later backend touched"
+    );
+    assert_eq!(orchestrator.state(), LifecycleState::Ready);
+}
+
 // Requirement: workspace isolation never runs while a live VM kill has failed.
 // Category: failure containment. Risk: critical.
 #[test]

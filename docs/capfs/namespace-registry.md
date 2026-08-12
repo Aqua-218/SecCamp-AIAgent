@@ -170,12 +170,20 @@ read / readdir後のrevokeを検査し、実kernelが送る複数thread request�
 backing差し替え、実syscallを含むrename / writeの物理的な競合は、実行環境依存の統合境界
 として別に扱う。
 
-## 現在含まないもの
+## 正確な保証範囲
 
 - modeとtimestampを同時に求めるmetadata requestの原子性契約。
 - durable stateやsupervisor再起動後の復元。
 
 したがって、initial file modelのread / write / truncate / metadata、create、remove、renameとdirectory streamはこのregistryを通る。残る複合metadataの原子性とdurable stateは、別途明示的な意味論を追加してから接続する。
+
+## 変更時の確認点
+
+- backing 操作と registry 更新の順序を入れ替えない。順序が逆になると、registry が指す path に実体が無い時間帯、あるいはその逆ができる。
+- generation を進める箇所を増やすときは、その generation を key に含めている cache を全部洗う。片方だけ増えると、古い mapping を新しい generation で有効と見なす経路ができる。
+- `ObjectId` を path から導出しない。rename で identity が変わり、open handle の binding が切れる。
+- open count の増減を lock の外に出さない。rename / remove の可否判定と count の観測が別の時点になる。
+- lock 契約を変えるときは、[mount ごとの node table](node-tables.md) 側の呼び出し順も同時に見る。registry は node table から呼ばれる前提で lock の粒度を決めている。
 
 ## 関連
 

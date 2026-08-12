@@ -11,7 +11,10 @@ use std::{collections::BTreeMap, error::Error, fmt, io::Read, time::Duration};
 use authority_core::github::{
     GitHubAuthority, GitHubOperation, GitHubRequest, InstallationId, github_matches,
 };
-use egress_protocol::session::BrokerRequestId;
+use egress_protocol::{
+    response::{GitHubWireResponse, ResponseCborError},
+    session::BrokerRequestId,
+};
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use reqwest::blocking::{Client, Response};
 use serde_json::Value;
@@ -243,56 +246,73 @@ impl CreatePullRequestInput {
 /// Typed result of a GitHub provider call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitHubResponse {
-    /// Number of provider response bytes accounted to the session budget.
-    pub response_bytes: u64,
-    /// Operation completed by the provider.
-    pub operation: GitHubOperation,
-    /// Created pull-request number, when applicable.
-    pub number: Option<u64>,
-    /// Published object, when applicable.
-    pub object: Option<GitObjectId>,
-    disposition: GitHubCommitDisposition,
+    wire: GitHubWireResponse,
+    binding: Option<(BrokerRequestId, GitHubRequest)>,
 }
 
 impl GitHubResponse {
-    /// Creates a provider response for a mutation known to have committed.
-    #[must_use]
-    pub const fn committed(
+    /// Creates a response only when it satisfies the canonical GitHub wire contract.
+    pub(crate) fn committed(
         response_bytes: u64,
         operation: GitHubOperation,
         number: Option<u64>,
         object: Option<GitObjectId>,
-    ) -> Self {
-        Self {
-            response_bytes,
+    ) -> Result<Self, ResponseCborError> {
+        let wire = GitHubWireResponse::new(
             operation,
+            response_bytes,
             number,
-            object,
-            disposition: GitHubCommitDisposition::Committed,
+            object.map(|object| object.as_str().to_owned()),
+        )?;
+        Ok(Self {
+            wire,
+            binding: None,
+        })
+    }
+
+    /// Returns the broker-measured provider bytes carried by a committed response.
+    #[must_use]
+    pub const fn response_bytes(&self) -> u64 {
+        self.wire.response_bytes()
+    }
+
+    /// Returns the operation carried by a committed response.
+    #[must_use]
+    pub const fn operation(&self) -> GitHubOperation {
+        self.wire.operation()
+    }
+
+    pub(crate) fn bind(mut self, request_id: BrokerRequestId, request: &GitHubRequest) -> Self {
+        self.binding = Some((request_id, request.clone()));
+        self
+    }
+
+    pub(crate) fn validate_dispatch_binding(
+        self,
+        request_id: BrokerRequestId,
+        request: &GitHubRequest,
+        maximum_response_bytes: u64,
+    ) -> Result<Self, GitHubAdapterError> {
+        if self.response_bytes() > maximum_response_bytes
+            || self.operation() != request.operation()
+            || self
+                .binding
+                .as_ref()
+                .is_none_or(|(bound_id, bound_request)| {
+                    *bound_id != request_id || bound_request != request
+                })
+        {
+            return Err(GitHubAdapterError::CommitUnknown(GitHubCommitUnknown::new(
+                request.operation(),
+                maximum_response_bytes,
+            )));
         }
+        Ok(self)
     }
 
-    /// Converts opaque commit-unknown evidence into an internal effect marker.
-    pub(crate) const fn commit_unknown(unknown: GitHubCommitUnknown) -> Self {
-        Self {
-            response_bytes: unknown.response_bytes,
-            operation: unknown.operation,
-            number: None,
-            object: None,
-            disposition: GitHubCommitDisposition::Unknown,
-        }
+    pub(crate) fn into_wire(self) -> GitHubWireResponse {
+        self.wire
     }
-
-    /// Returns whether this response marks an effect with unknown commit state.
-    pub(crate) const fn is_commit_unknown(&self) -> bool {
-        matches!(self.disposition, GitHubCommitDisposition::Unknown)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GitHubCommitDisposition {
-    Committed,
-    Unknown,
 }
 
 /// Opaque evidence that a GitHub mutation may have reached its commit point.
@@ -414,7 +434,8 @@ where
                 finish_provider_mutation(
                     self.provider
                         .publish_branch(&input, credential, max_response_bytes),
-                    request.operation(),
+                    request_id,
+                    request,
                     max_response_bytes,
                     Some(input.plan.new_object()),
                 )
@@ -426,7 +447,8 @@ where
                 finish_provider_mutation(
                     self.provider
                         .create_pull_request(&input, credential, max_response_bytes),
-                    request.operation(),
+                    request_id,
+                    request,
                     max_response_bytes,
                     None,
                 )
@@ -437,10 +459,12 @@ where
 
 fn finish_provider_mutation(
     result: Result<GitHubResponse, GitHubProviderError>,
-    operation: GitHubOperation,
+    request_id: BrokerRequestId,
+    request: &GitHubRequest,
     max_response_bytes: u64,
     expected_object: Option<&GitObjectId>,
 ) -> Result<GitHubResponse, GitHubAdapterError> {
+    let operation = request.operation();
     let response = match result {
         Ok(response) => response,
         Err(GitHubProviderError::CommitUnknown) => {
@@ -462,7 +486,7 @@ fn finish_provider_mutation(
             max_response_bytes,
         )));
     }
-    Ok(response)
+    Ok(response.bind(request_id, request))
 }
 
 fn validate_provider_response(
@@ -471,20 +495,19 @@ fn validate_provider_response(
     max_response_bytes: u64,
     expected_object: Option<&GitObjectId>,
 ) -> Result<(), GitHubAdapterError> {
-    if response.is_commit_unknown()
-        || response.operation != operation
-        || response.response_bytes > max_response_bytes
-    {
+    if response.operation() != operation || response.response_bytes() > max_response_bytes {
         return Err(GitHubAdapterError::InvalidProviderResponse);
     }
+    let wire = &response.wire;
     match operation {
         GitHubOperation::PublishBranch
-            if response.number.is_some() || response.object != expected_object.cloned() =>
+            if wire.pull_request_number().is_some()
+                || wire.object_id() != expected_object.map(GitObjectId::as_str) =>
         {
             Err(GitHubAdapterError::InvalidProviderResponse)
         }
         GitHubOperation::CreatePullRequest
-            if response.number.is_none() || response.object.is_some() =>
+            if wire.pull_request_number().is_none() || wire.object_id().is_some() =>
         {
             Err(GitHubAdapterError::InvalidProviderResponse)
         }
@@ -714,12 +737,13 @@ impl RustlsGitHubProvider {
         let total_response_bytes = repository_response_bytes
             .checked_add(update_response_bytes)
             .ok_or(GitHubProviderError::CommitUnknown)?;
-        Ok(GitHubResponse::committed(
+        GitHubResponse::committed(
             total_response_bytes,
             GitHubOperation::PublishBranch,
             None,
             Some(input.plan.new_object().clone()),
-        ))
+        )
+        .map_err(|_| GitHubProviderError::CommitUnknown)
     }
 
     fn send_pull_request(
@@ -744,12 +768,13 @@ impl RustlsGitHubProvider {
         let bytes =
             mutation_response_bytes(response, max_response_bytes.min(MAX_GITHUB_RESPONSE_BYTES))?;
         let number = parse_pull_request_number(&bytes)?;
-        Ok(GitHubResponse::committed(
+        GitHubResponse::committed(
             u64::try_from(bytes.len()).map_err(|_| GitHubProviderError::CommitUnknown)?,
             GitHubOperation::CreatePullRequest,
             Some(number),
             None,
-        ))
+        )
+        .map_err(|_| GitHubProviderError::CommitUnknown)
     }
 }
 
@@ -1035,12 +1060,13 @@ mod tests {
             );
             self.error.map_or_else(
                 || {
-                    Ok(GitHubResponse::committed(
+                    GitHubResponse::committed(
                         2,
                         GitHubOperation::PublishBranch,
                         None,
                         Some(input.plan().new_object().clone()),
-                    ))
+                    )
+                    .map_err(|_| GitHubProviderError::InvalidResponse)
                 },
                 Err,
             )
@@ -1054,12 +1080,8 @@ mod tests {
             *self.calls.lock().expect("call mutex is not poisoned") += 1;
             self.error.map_or_else(
                 || {
-                    Ok(GitHubResponse::committed(
-                        2,
-                        GitHubOperation::CreatePullRequest,
-                        Some(9),
-                        None,
-                    ))
+                    GitHubResponse::committed(2, GitHubOperation::CreatePullRequest, Some(9), None)
+                        .map_err(|_| GitHubProviderError::InvalidResponse)
                 },
                 Err,
             )
@@ -1105,16 +1127,53 @@ mod tests {
     #[test]
     fn typed_publish_branch_uses_plan_and_opaque_credential() {
         let (mut adapter, calls) = adapter(None);
+        let publish_request = request(GitHubOperation::PublishBranch);
         let response = adapter
             .execute(
                 BrokerRequestId::new([7; 16]),
-                &request(GitHubOperation::PublishBranch),
+                &publish_request,
                 &authority(GitHubOperation::PublishBranch),
                 MAX_GITHUB_RESPONSE_BYTES,
             )
             .expect("typed publish should succeed");
-        assert_eq!(response.operation, GitHubOperation::PublishBranch);
+        assert_eq!(response.operation(), GitHubOperation::PublishBranch);
+        assert!(
+            response
+                .clone()
+                .validate_dispatch_binding(
+                    BrokerRequestId::new([7; 16]),
+                    &publish_request,
+                    MAX_GITHUB_RESPONSE_BYTES,
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            response.validate_dispatch_binding(
+                BrokerRequestId::new([8; 16]),
+                &publish_request,
+                MAX_GITHUB_RESPONSE_BYTES,
+            ),
+            Err(GitHubAdapterError::CommitUnknown(_))
+        ));
         assert_eq!(*calls.lock().expect("call mutex is not poisoned"), 1);
+    }
+
+    // Requirement: provider success values cannot bypass the canonical GitHub wire schema.
+    // Category: boundary/accounting. Risk: critical.
+    #[test]
+    fn github_response_constructor_rejects_unencodable_successes() {
+        assert!(
+            GitHubResponse::committed(
+                MAX_GITHUB_RESPONSE_BYTES + 1,
+                GitHubOperation::CreatePullRequest,
+                Some(1),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            GitHubResponse::committed(1, GitHubOperation::CreatePullRequest, None, None,).is_err()
+        );
     }
 
     // Requirement: a caller-issued request-ID collision cannot select a plan for another request.

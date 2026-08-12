@@ -161,15 +161,32 @@ pub trait PublishPlanProvider: Send + Sync {
 /// A deterministic plan provider suitable for a host-owned dispatch table.
 #[derive(Debug, Clone)]
 pub struct StaticPublishPlanProvider {
-    plans: BTreeMap<BrokerRequestId, PublishBranchPlan>,
+    plans: BTreeMap<BrokerRequestId, RequestBoundPublishPlan>,
+}
+
+#[derive(Debug, Clone)]
+struct RequestBoundPublishPlan {
+    request: GitHubRequest,
+    plan: PublishBranchPlan,
 }
 
 impl StaticPublishPlanProvider {
-    /// Creates a provider from request-bound host plans.
+    /// Creates a provider from request-identity and typed-request-bound host plans.
+    ///
+    /// Binding the complete typed request prevents a caller-issued request ID
+    /// collision from selecting a plan prepared for another repository or
+    /// branch transition.
     #[must_use]
-    pub fn new(plans: impl IntoIterator<Item = (BrokerRequestId, PublishBranchPlan)>) -> Self {
+    pub fn new(
+        plans: impl IntoIterator<Item = (BrokerRequestId, GitHubRequest, PublishBranchPlan)>,
+    ) -> Self {
         Self {
-            plans: plans.into_iter().collect(),
+            plans: plans
+                .into_iter()
+                .map(|(request_id, request, plan)| {
+                    (request_id, RequestBoundPublishPlan { request, plan })
+                })
+                .collect(),
         }
     }
 }
@@ -178,11 +195,12 @@ impl PublishPlanProvider for StaticPublishPlanProvider {
     fn plan_for(
         &self,
         request_id: BrokerRequestId,
-        _request: &GitHubRequest,
+        request: &GitHubRequest,
     ) -> Result<PublishBranchPlan, GitHubAdapterError> {
         self.plans
             .get(&request_id)
-            .cloned()
+            .filter(|bound| bound.request == *request)
+            .map(|bound| bound.plan.clone())
             .ok_or(GitHubAdapterError::MissingPublishPrecondition)
     }
 }
@@ -1072,7 +1090,11 @@ mod tests {
                     InstallationId::new("install-a"),
                     CredentialHandle::from_host_id(1),
                 ),
-                StaticPublishPlanProvider::new([(request_id, plan)]),
+                StaticPublishPlanProvider::new([(
+                    request_id,
+                    request(GitHubOperation::PublishBranch),
+                    plan,
+                )]),
             ),
             calls,
         )
@@ -1093,6 +1115,31 @@ mod tests {
             .expect("typed publish should succeed");
         assert_eq!(response.operation, GitHubOperation::PublishBranch);
         assert_eq!(*calls.lock().expect("call mutex is not poisoned"), 1);
+    }
+
+    // Requirement: a caller-issued request-ID collision cannot select a plan for another request.
+    // Category: authorization/confused-deputy. Risk: critical.
+    #[test]
+    fn publish_plan_is_bound_to_the_complete_typed_request() {
+        let (mut adapter, calls) = adapter(None);
+        let colliding_request = GitHubRequest::new(
+            InstallationId::new("install-a"),
+            RepoId::new("owner/repo"),
+            GitHubOperation::PublishBranch,
+            BranchName::new("main").expect("fixture branch is valid"),
+            BranchName::new("agents/other").expect("fixture branch is valid"),
+        );
+
+        assert_eq!(
+            adapter.execute(
+                BrokerRequestId::new([7; 16]),
+                &colliding_request,
+                &authority(GitHubOperation::PublishBranch),
+                MAX_GITHUB_RESPONSE_BYTES,
+            ),
+            Err(GitHubAdapterError::MissingPublishPrecondition)
+        );
+        assert_eq!(*calls.lock().expect("call mutex is not poisoned"), 0);
     }
 
     // Requirement: provider rate-limit failures remain typed and contain no raw response/body.

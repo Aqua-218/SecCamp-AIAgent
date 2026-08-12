@@ -6,80 +6,49 @@
 
 > **対象読者:** guest supervisor の統合担当者、Authority Core 実装者、runtime adapter のレビュー担当者
 
-`supervisor` は、認証済み local connection、既存の `authority-core` kernel、OS runtime resource の間に置くホスト側 lifecycle adapter である。namespace、cgroup、mount、descriptor syscall 自体は実装せず、`RuntimeResources` が提供する token と操作へ委譲する。
+`supervisor` は、認証済みの local connection、既存の `authority-core` kernel、OS の runtime resource の 3 つの間に置く lifecycle adapter である。
+
+**syscall を 1 つも呼ばない。** namespace、cgroup、mount、descriptor の操作はすべて `RuntimeResources` trait に委ね、権限判定はすべて `AuthorityKernel` trait に委ねる。この crate が持つのは、どの subject として動くかを決めることと、resource を確保・解放する順序だけ。
+
+## この crate が決めること
+
+| 決めること | どこで |
+|---|---|
+| 要求が誰のものか。wire 上の申告は使わない | [誰の要求として扱うか](caller-identity.md) |
+| 何を受け付けるか。4 KiB の bounded envelope、tag 2 種 | [wire protocol](wire-protocol.md) |
+| resource をどの順で確保し、どの順で解放するか | [subject の setup と shutdown](subject-lifecycle.md) |
+| descriptor と authority の記録をどう同期させるか | [handle の lifecycle](handle-lifecycle.md) |
 
 ## 文書一覧
 
-| 節 | 対象ソース | 内容 |
+| 文書 | 対象ソース | 内容 |
 |---|---|---|
-| [identity 境界](#identity-境界) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | connection identity から subject を解決する。wire 上の claim を認可に使わない |
-| [wire protocol](#wire-protocol) | [`protocol.rs`](../../crates/supervisor/src/protocol.rs) | 4 KiB の bounded envelope、閉じた tag 集合 |
-| [lifecycle](#lifecycle) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | subject setup の transaction と単調な shutdown |
-| [Authority と handle の境界](#authority-と-handle-の境界) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | Authority Core への委譲、runtime handle の open と close |
+| [誰の要求として扱うか](caller-identity.md) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | connection からの subject 解決、3 段の照合、wire に無い操作 |
+| [wire protocol](wire-protocol.md) | [`protocol.rs`](../../crates/supervisor/src/protocol.rs) | datagram の形、閉じた tag 集合、decode の検査順序 |
+| [subject の setup と shutdown](subject-lifecycle.md) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | setup transaction、rollback、authority を先に落とす順序 |
+| [handle の lifecycle](handle-lifecycle.md) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | 所有権検査の位置、2 つの集合、2 つの永久予約表 |
+| [検証対応表](verification.md) | — | contract test で見た範囲と、検査があるのに test が無い箇所 |
 
-`supervisor.rs` は 1,323 行ある。上の 4 節はその要約で、独立した概念ページと契約ページに分ける予定。
+## 実装範囲と検証境界
 
-## identity 境界
+lifecycle、順序、rollback、handle の所有権はすべて `CapabilityKernel`（本物）と `FakeResources`（event log）を使う contract test で検証済み。
 
-transport は受理済み socket identity と peer credential を持つ `ConnectionIdentity` を渡す。`CallerResolver` はその identity を host が割り当てた `authority_core::capability::SubjectId` へ写像する。wire request に含まれる `claimed_subject` は診断用に保持できるが、`Supervisor::dispatch_wire` は認可に使わない。production caller resolver は、request bytes を decode する前に `SOCK_SEQPACKET` または同等の認証済み connection へ subject binding を確定させる必要がある。
+一方、Linux の namespace / cgroup / mount 実装、実 socket listener、実 workload、実 guest control channel はこの crate に存在しない。production の caller resolver も未実装で、`StaticCallerResolver` は in-memory の map である。
 
-## wire protocol
+検査があるのに test が無い箇所がいくつかある。`ConnectionNotBoundToSubject`、`GrantSubjectMismatch`、`DuplicateSubject`、親の非 Running gate、`derive` の拒否経路。詳細は[検証対応表](verification.md)。
 
-wire protocol は最大 4 KiB の bounded binary envelope である。version は固定値 1、tag は `CloseSubject` と `CloseHandle` の閉じた集合、body length は datagram 全体と一致しなければならない。文字列 field は UTF-8 で最大 256 bytes、trailing data、unknown tag、malformed length、oversized datagram は dispatch 前に拒否する。
+## 特に注意する点
 
-`WireRequest` の subject field は untrusted claim であり、実際の caller は受理済み connection identity から解決する。このため、別 subject を claim した `CloseSubject` や `CloseHandle` は claim を根拠に権限を得ない。
-
-## lifecycle
-
-subject setup は一つの transaction であり、resource は次の順で確保する。
-
-1. cgroup を作る。
-2. subject の capability filesystem を mount する。
-3. private control descriptor を開く。
-4. `AuthorityKernel` に subject と static authority envelope を登録する。
-5. workload を開始する。
-6. すべて成功してから subject を `Running` として公開する。
-
-途中で失敗した場合は、確保済み resource だけを rollback する。authority registration 後の rollback は `begin_subject_close` を先に行い、workload、control fd、authority handle、mount、cgroup を安全な順で cleanup し、全外部 resource の cleanup が成功した後だけ `finish_subject_close` を行う。
-
-shutdown は単調で fail closed である。
-
-```text
-Running
-  -> begin_subject_close（新規要求停止、保持 Capability の失効）
-  -> stop workload
-  -> close control fd と runtime handle
-  -> unmount capability filesystem
-  -> remove cgroup
-  -> finish_subject_close
-  -> Closed
-```
-
-全 safe cleanup phase を順に試み、いずれかが失敗した場合は subject を `Closing` に保持する。`Closing` と `Closed` は dispatch、root issuance、derivation、handle 操作を拒否する。transient resource failure は、未完了の cleanup を retry できる。
-
-## Authority と handle の境界
-
-`AuthorityKernel` は既存 Authority Core の subject registration、root issuance、derivation、revoke、subject close、open-handle registry を adapter 越しに呼ぶ。derivation の caller は常に resolver が返した subject であり、wire claim ではない。
-
-runtime handle は、Authority Core へ registration する前に `RuntimeResources::open_handle` で開く。registration が失敗した場合は runtime handle を閉じる。handle は authority-core identity のままで、close 後の rebinding は許可しない。stale または foreign handle は resource close 前に拒否する。
-
-## 検証状態
-
-protocol の round trip、unknown tag、length/trailing data、4 KiB 上限は module test で検証済みである。supervisor の setup/shutdown 順序、partial setup rollback、caller identity による subject spoofing 防止、root/derive/revoke、stale handle、cleanup failure の retry は `CapabilityKernel`、`StaticCallerResolver`、`FakeResources` を使う test で検証済みである。
-
-この crate には Linux の namespace/cgroup/mount 実装、実 socket listener、実 workload、実 guest control channel はない。したがって OS resource の実適用、実 connection credential、VM 内 end-to-end は未検証である。
-
-focused test は次のとおりである。
-
-```bash
-cargo fmt --manifest-path crates/supervisor/Cargo.toml -- --check
-cargo test --manifest-path crates/supervisor/Cargo.toml
-cargo clippy --manifest-path crates/supervisor/Cargo.toml --all-targets -- -D warnings
-```
+- `revoke` は `ConnectionIdentity` を取らず、lifecycle も見ない。guest から到達できないのは `WireRequest` に revoke tag が無いからにすぎない。tag を足す変更は caller 検査と同時に入れる。
+- `issue_root` は grant の対象 subject を確認するが、`derive` は確認しない。この非対称は意図された契約である。
+- `resources_mut()` は無制限の `&mut R` を返し、この crate の gate を全部迂回する。test での failure 注入用で、production から呼ばない。
+- `DispatchResponse` に wire encoder が無い。返信の形式はまだ決まっていない。
 
 ## 関連
 
 - [Authority Core の subject lifecycle](../authority-core/subject-lifecycle-and-handles.md)
-- [session orchestrator](../session-orchestrator/README.md)
+- [Session orchestrator](../session-orchestrator/README.md)
+- [runtime-isolation](../runtime-isolation/README.md)
 - [隔離基盤の設計](../design/runtime-isolation.md)
-- [検証戦略](../design/verification.md)
+- [決定記録](../decisions/README.md)
+- [用語集](../glossary.md)

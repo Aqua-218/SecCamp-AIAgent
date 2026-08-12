@@ -200,6 +200,15 @@ pub enum AuditError {
     AttemptIdExhausted,
     /// The durable backend rejected or could not persist the journal update.
     Durable(DurableAuditError),
+    /// Recovery found attempts whose external completion cannot be determined.
+    ///
+    /// A fresh operational kernel must not silently forget these records. The
+    /// session remains fail-closed until a typed reconciliation boundary has
+    /// resolved every ambiguous attempt.
+    UnresolvedRecovery {
+        /// Number of recovered `Started` or `CommitUnknown` attempts.
+        attempts: usize,
+    },
 }
 
 impl fmt::Display for AuditError {
@@ -210,6 +219,10 @@ impl fmt::Display for AuditError {
                 formatter.write_str("session-local attempt ID sequence is exhausted")
             }
             Self::Durable(error) => error.fmt(formatter),
+            Self::UnresolvedRecovery { attempts } => write!(
+                formatter,
+                "durable audit recovery contains {attempts} unresolved attempt(s)"
+            ),
         }
     }
 }
@@ -218,7 +231,7 @@ impl Error for AuditError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Durable(error) => Some(error),
-            Self::LockPoisoned | Self::AttemptIdExhausted => None,
+            Self::LockPoisoned | Self::AttemptIdExhausted | Self::UnresolvedRecovery { .. } => None,
         }
     }
 }
@@ -299,6 +312,21 @@ impl AuditTrail {
     }
 
     pub(crate) fn new_with_backend(backend: Arc<DurableAuditLog>) -> Result<Self, AuditError> {
+        let unresolved = backend
+            .attempts()?
+            .into_iter()
+            .filter(|attempt| {
+                matches!(
+                    attempt.outcome(),
+                    AttemptOutcome::Started | AttemptOutcome::CommitUnknown
+                )
+            })
+            .count();
+        if unresolved != 0 {
+            return Err(AuditError::UnresolvedRecovery {
+                attempts: unresolved,
+            });
+        }
         let next_attempt_sequence = backend.next_attempt_sequence()?;
         Ok(Self {
             state: Mutex::new(AuditState {

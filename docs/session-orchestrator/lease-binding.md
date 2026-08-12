@@ -52,6 +52,19 @@ workload の 3 点照合も同じ。root capability がこの orchestrator の�
 
 型で守られていない順序もある。workspace が Broker より前であることは規約で、cleanup の gate がそれに依存している。詳細は [session の commit 順序](lifecycle.md#commit-の順序)。
 
+## 照合は次の stage へ進む条件
+
+`validate_*` は `Option<StartFailure>` を返し、`Some` なら `start_session` がそこで止まる。warning を出して続けることはしない。
+
+失敗は 2 種類に分かれる。
+
+| 失敗 | 意味 |
+|---|---|
+| `CrossSessionLease { resource, expected, received }` | `session_id` が別 session のもの |
+| `LeaseIdentityMismatch(resource)` | session は合っているが、resource identity が違う |
+
+前者は backend が他 tenant の resource を返した状態で、tenant 分離の問題。後者は同じ session 内の取り違えで、backend 実装の bug。運用上の対処が違うので分けてある。
+
 ## 検出であって防止ではない
 
 照合が保証するのは、orchestrator が誤った lease を**次の stage へ渡さない**ことだけ。
@@ -60,17 +73,11 @@ backend が正しい identity を持つ lease を作ることは強制できな�
 
 契約としての詳細は [production backend 契約](contracts.md)。
 
-## workspace だけ rollback しない
+## workspace は `active` の前に検証される
 
-lease 検証が失敗したとき、他の stage は rollback するが、workspace だけしない。
+workspace の lease 検証だけは `ActiveSession` を作る前に走るので、通常の rollback 経路に乗らない。失敗したときは、その場で `isolate_workspace` を呼んで clone を解放する。解放にも失敗したら `rollback_failures` に載せて返す。
 
-```text
-clone_workspace が成功
-  -> validate_workspace が失敗
-  -> StartError を返す。isolate_workspace を呼ばない
-```
-
-物理的な clone directory が残り、lease は呼び出し側に返らない。**この経路の test も無い。** `MockWorkspace.foreign_session` を設定する test が 1 つも存在せず、`CrossSessionLease` と `LeaseIdentityMismatch` の両分岐が未検証。
+詳細は [session の commit 順序と cleanup](lifecycle.md#workspace-の-lease-検証失敗も-rollback-する)。
 
 ## 何が助かるのか
 
@@ -81,7 +88,7 @@ backend の bug が、その stage で止まる。誤った lease を持った�
 ## 正確な保証範囲
 
 - 照合は lease が持つ identity 値の比較だけ。lease が指す実 resource が存在すること、その resource がその identity を持つことは確認していない。
-- `WorkspaceLease` の照合経路は完全に未検証。
+- `WorkspaceLease` の `CrossSessionLease` 経路と、その clone 解放は test 済み。`LeaseIdentityMismatch` 側は未検証。
 - backend が commit point 到達後にだけ lease を返すという約束は、型でも test でも確認していない。
 - production adapter の test は外部境界をすべて fake に置き換えている。identity が adapter を貫通することは示すが、Firecracker が起動すること、実 `AF_VSOCK` が bind することは示さない。
 
@@ -89,7 +96,7 @@ backend の bug が、その stage で止まる。誤った lease を持った�
 
 - lease に identity field を足すときは、対応する `validate_*` にも照合を足す。field だけ足しても compile は通り、照合されない値が増える。
 - 照合を「一致しなければ warning」に変えない。次の stage へ進む条件であることが、この検査の意味。
-- `validate_workspace` の失敗経路に rollback を足す場合、`active` がまだ構築されていない点に注意する。他の stage と同じ経路には乗らない。
+- `validate_workspace` の失敗経路の rollback を消さない。`active` がまだ無いので、他の stage の rollback は届かない。
 - backend の trait signature から `&BrokerLease` や `&CapabilityLease` を外さない。順序を型で守っている数少ない箇所。
 
 ## 関連

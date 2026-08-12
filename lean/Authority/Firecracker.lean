@@ -166,6 +166,55 @@ theorem fingerprint_unchanged_by_vcpu_count (config : RuntimeConfig) (count : Na
       config.fingerprintPayload := by
   rfl
 
+/-- Fingerprints also omit the dm-verity mapper selected during launch. -/
+theorem fingerprint_unchanged_by_mapper_name (config : RuntimeConfig) (mapperName : String) :
+    ({ config with mapperName := mapperName }).fingerprintPayload =
+      config.fingerprintPayload := by
+  rfl
+
+/-- Shutdown-relevant configuration retained by a live Rust runtime instance. -/
+structure InstanceBinding where
+  fingerprint : FingerprintPayload
+  mapperName : String
+  deriving DecidableEq
+
+/-- Capture the configuration identity and mapper owned at instance creation. -/
+def InstanceBinding.fromConfig (config : RuntimeConfig) : InstanceBinding where
+  fingerprint := config.fingerprintPayload
+  mapperName := config.mapperName
+
+/-- A shutdown configuration must identify both the original config and mapper. -/
+def InstanceBinding.MatchesShutdownConfig (binding : InstanceBinding)
+    (config : RuntimeConfig) : Prop :=
+  config.fingerprintPayload = binding.fingerprint ∧
+    config.mapperName = binding.mapperName
+
+/-- Launch configuration is bound to the instance metadata it creates. -/
+theorem InstanceBinding.fromConfig_matches_shutdown (config : RuntimeConfig) :
+    (InstanceBinding.fromConfig config).MatchesShutdownConfig config := by
+  exact ⟨rfl, rfl⟩
+
+/-- A bound shutdown configuration necessarily closes the instance-owned mapper. -/
+theorem InstanceBinding.shutdown_config_closes_owned_mapper
+    {binding : InstanceBinding} {config : RuntimeConfig}
+    (bound : binding.MatchesShutdownConfig config) :
+    config.mapperName = binding.mapperName :=
+  bound.2
+
+/-- Fingerprint equality alone cannot bind shutdown to the instance-owned mapper. -/
+theorem fingerprint_match_does_not_bind_shutdown_mapper
+    (config : RuntimeConfig) (otherMapper : String)
+    (different : otherMapper ≠ config.mapperName) :
+    ({ config with mapperName := otherMapper }).fingerprintPayload =
+        (InstanceBinding.fromConfig config).fingerprint ∧
+      ¬ (InstanceBinding.fromConfig config).MatchesShutdownConfig
+        { config with mapperName := otherMapper } := by
+  constructor
+  · rfl
+  · intro bound
+    exact different (by simpa [InstanceBinding.MatchesShutdownConfig,
+      InstanceBinding.fromConfig] using bound.2)
+
 /-- Five guest-visible identity domains regenerated after restore. -/
 inductive GuestIdentityKind where
   | vm
@@ -212,6 +261,14 @@ def createInternalSnapshot (config : RuntimeConfig) : Snapshot where
 theorem internal_snapshot_forbidden_empty (config : RuntimeConfig) :
     (createInternalSnapshot config).forbiddenIdentities = [] := by
   rfl
+
+/-- Internal snapshots therefore reduce freshness to intrinsic bundle validity. -/
+theorem internal_snapshot_freshness_check_is_vacuous
+    (config : RuntimeConfig) (bundle : IdentityBundle) :
+    bundle.Valid (createInternalSnapshot config).forbiddenIdentities ↔
+      ((∀ kind, bundle.forKind kind ≠ 0) ∧
+        ∀ first second, bundle.forKind first = bundle.forKind second → first = second) := by
+  simp [IdentityBundle.Valid, createInternalSnapshot]
 
 /-- Publicly reachable successful lifecycle phases. -/
 inductive Phase where
@@ -489,9 +546,11 @@ theorem Step.after_ne_stopped {before after : State} (transition : Step before a
   cases transition <;> simp [State.markSnapshotted, State.restore,
     State.markIdentityInjected, State.markRunning]
 
-/-- Accepted lifecycle steps, cleanup commits, and the terminal shutdown gate. -/
+/-- Same-instance lifecycle steps, cleanup commits, and the terminal shutdown gate.
+Rust restore returns a new instance rather than reviving a stopped one. -/
 inductive ManagedStep : ManagedState → ManagedState → Prop
   | runtime {state : ManagedState} {core : State} :
+      state.core.phase ≠ .stopped →
       Step state.core core → ManagedStep state { state with core := core }
   | cleanup {state : ManagedState} {cleanup : CleanupState} :
       CleanupStep state.cleanup cleanup →
@@ -504,7 +563,7 @@ theorem ManagedStep.preserves_wellFormed {before after : ManagedState}
     (transition : ManagedStep before after) (wellFormed : before.WellFormed) :
     after.WellFormed := by
   cases transition with
-  | runtime runtimeStep =>
+  | runtime _ runtimeStep =>
       exact ⟨runtimeStep.preserves_wellFormed wellFormed.coreWellFormed,
         fun stopped => False.elim (runtimeStep.after_ne_stopped stopped),
         wellFormed.cleanupSafe⟩
@@ -518,6 +577,16 @@ theorem ManagedStep.preserves_wellFormed {before after : ManagedState}
   | finishShutdown complete =>
       exact ⟨by simp [ManagedState.finishShutdown, State.WellFormed],
         fun _ => complete, wellFormed.cleanupSafe⟩
+
+/-- Stopped is terminal for the instance core, including cleanup retries. -/
+theorem ManagedStep.stopped_terminal {before after : ManagedState}
+    (transition : ManagedStep before after)
+    (stopped : before.core.phase = .stopped) :
+    after.core.phase = .stopped := by
+  cases transition with
+  | runtime live _ => exact False.elim (live stopped)
+  | cleanup => exact stopped
+  | finishShutdown => rfl
 
 /-- A Stopped runtime has no live process, dm-verity mapping, or workspace. -/
 theorem ManagedState.stopped_implies_cleanup_complete {state : ManagedState}
@@ -539,6 +608,16 @@ theorem ManagedSteps.preserves_wellFormed {before after : ManagedState}
   | refl => exact wellFormed
   | tail _ transition inductionHypothesis =>
       exact transition.preserves_wellFormed inductionHypothesis
+
+/-- No finite execution can revive the core of a stopped runtime instance. -/
+theorem ManagedSteps.stopped_terminal {before after : ManagedState}
+    (transitions : ManagedSteps before after)
+    (stopped : before.core.phase = .stopped) :
+    after.core.phase = .stopped := by
+  induction transitions with
+  | refl => exact stopped
+  | tail _ transition inductionHypothesis =>
+      exact transition.stopped_terminal inductionHypothesis
 
 end Firecracker
 

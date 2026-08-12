@@ -131,6 +131,22 @@ memory内のnode identityと参照数は、現在[Direct-I/O FUSE adapter](read-
 
 basic `READDIR`はlookup済みobjectのlive nodeだけをinode hintとして使い、未lookupのentryには0を返す。directory reply自体はlookup referenceを発生させないため、`remember_lookup`を呼んで架空の参照数を増やさない。実mount testはlookup、read-after-revoke、readdir-after-revokeを通すが、kernelが送るFORGETの全順序やmount teardown時の参照状態まではまだ固定していない。変更系opcodeと複数thread sessionも後続である。
 
+## 正確な保証範囲
+
+この module が保証するのは、1 つの mount 内での `nodeid -> ObjectId` 対応と、その参照数の管理だけ。
+
+- FUSE kernel が `FORGET` をいつ送るかは制御していない。参照数は kernel の申告に従う。
+- `nodeid` を再利用しないことは、この table の中でだけ成り立つ。別 mount の同じ数値は無関係の object を指す。
+- object の実体が存在するかは見ていない。それは [共有 namespace registry](namespace-registry.md) と backing 側の担当。
+- 認可は行わない。`nodeid` から `ObjectId` を引けることと、その object を操作してよいことは別。
+
+## 変更時の確認点
+
+- `nodeid` の払い出しを単調増加以外に変えない。再利用すると、kernel が保持している古い `nodeid` が別 object を指す。
+- `LOOKUP` と `FORGET` の参照数の増減を非対称にしない。片方だけ変えると、解放されない entry か、早すぎる解放のどちらかが起きる。
+- table を mount 間で共有しない。`nodeid` は subject-local であることが前提で、共有すると別 subject の object へ到達できる。
+- entry を削除する条件を緩めるときは、kernel がまだその `nodeid` を保持している可能性を考える。
+
 ## 関連
 
 - [共有 namespace registry](namespace-registry.md)

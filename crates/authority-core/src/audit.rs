@@ -15,7 +15,7 @@ use std::sync::{
 
 use crate::{
     capability::{CapId, CapabilityRequest, CapabilityRequestSet, SubjectId},
-    durable_audit::{CommitReceipt, DurableAuditError, DurableAuditLog},
+    durable_audit::{CommitReceipt, CommitUnknownEvidence, DurableAuditError, DurableAuditLog},
     state::AuthorizationEpoch,
 };
 
@@ -23,6 +23,7 @@ const OUTCOME_STARTED: u8 = 0;
 const OUTCOME_DENIED: u8 = 1;
 const OUTCOME_FAILED_BEFORE_COMMIT: u8 = 2;
 const OUTCOME_COMMITTED: u8 = 3;
+const OUTCOME_COMMIT_UNKNOWN: u8 = 4;
 
 /// Monotone identity for one authorization attempt in a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -53,6 +54,8 @@ pub enum AttemptOutcome {
     FailedBeforeCommit,
     /// The executor reached its documented linearization point.
     Committed,
+    /// The executor may have crossed its linearization point, but completion could not be proven.
+    CommitUnknown,
 }
 
 impl AttemptOutcome {
@@ -62,6 +65,7 @@ impl AttemptOutcome {
             Self::Denied => OUTCOME_DENIED,
             Self::FailedBeforeCommit => OUTCOME_FAILED_BEFORE_COMMIT,
             Self::Committed => OUTCOME_COMMITTED,
+            Self::CommitUnknown => OUTCOME_COMMIT_UNKNOWN,
         }
     }
 
@@ -70,6 +74,7 @@ impl AttemptOutcome {
             OUTCOME_DENIED => Self::Denied,
             OUTCOME_FAILED_BEFORE_COMMIT => Self::FailedBeforeCommit,
             OUTCOME_COMMITTED => Self::Committed,
+            OUTCOME_COMMIT_UNKNOWN => Self::CommitUnknown,
             _ => Self::Started,
         }
     }
@@ -392,11 +397,11 @@ impl AttemptGuard {
     }
 
     pub(crate) fn deny(self) -> Result<(), AuditError> {
-        self.finish(AttemptOutcome::Denied, None)
+        self.finish(AttemptOutcome::Denied, None, None)
     }
 
     pub(crate) fn fail_before_commit(self) -> Result<(), AuditError> {
-        self.finish(AttemptOutcome::FailedBeforeCommit, None)
+        self.finish(AttemptOutcome::FailedBeforeCommit, None, None)
     }
 
     #[cfg(test)]
@@ -406,16 +411,23 @@ impl AttemptGuard {
     }
 
     pub(crate) fn commit_with_receipt(self, receipt: &CommitReceipt) -> Result<(), AuditError> {
-        self.finish(AttemptOutcome::Committed, Some(receipt))
+        self.finish(AttemptOutcome::Committed, Some(receipt), None)
+    }
+
+    #[allow(dead_code)] // The kernel's bounded ambiguous-result callback wires this terminal path.
+    pub(crate) fn commit_unknown(self, evidence: impl Into<Vec<u8>>) -> Result<(), AuditError> {
+        let evidence = CommitUnknownEvidence::new(self.journal.id, evidence)?;
+        self.finish(AttemptOutcome::CommitUnknown, None, Some(&evidence))
     }
 
     fn finish(
         self,
         outcome: AttemptOutcome,
         receipt: Option<&CommitReceipt>,
+        commit_unknown_evidence: Option<&CommitUnknownEvidence>,
     ) -> Result<(), AuditError> {
         if let Some(backend) = &self.backend {
-            backend.finish_attempt(self.journal.id, outcome, receipt)?;
+            backend.finish_attempt(self.journal.id, outcome, receipt, commit_unknown_evidence)?;
         }
         self.journal.finish(outcome);
         Ok(())
@@ -464,14 +476,18 @@ mod tests {
             .fail_before_commit()
             .expect("pre-commit failure must be recorded");
         start(&trail, 2).commit().expect("commit must be recorded");
+        start(&trail, 3)
+            .commit_unknown(b"provider-timeout-after-send")
+            .expect("commit-unknown must be recorded");
 
         let attempts = trail
             .attempts()
             .expect("the audit lock must remain healthy");
-        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts.len(), 4);
         assert_eq!(attempts[0].outcome(), AttemptOutcome::Denied);
         assert_eq!(attempts[1].outcome(), AttemptOutcome::FailedBeforeCommit);
         assert_eq!(attempts[2].outcome(), AttemptOutcome::Committed);
+        assert_eq!(attempts[3].outcome(), AttemptOutcome::CommitUnknown);
         let effects = trail.effects().expect("the audit lock must remain healthy");
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].attempt_id(), attempts[2].id());
@@ -499,6 +515,29 @@ mod tests {
             trail
                 .attempts()
                 .expect("the audit lock must remain healthy")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn empty_commit_unknown_evidence_leaves_attempt_non_terminal() {
+        let trail = AuditTrail::new();
+        let attempt = start(&trail, 0);
+
+        assert!(matches!(
+            attempt.commit_unknown(Vec::new()),
+            Err(AuditError::Durable(
+                crate::durable_audit::DurableAuditError::InvalidRecord(message)
+            )) if message == "CommitUnknown evidence cannot be empty"
+        ));
+        let attempts = trail
+            .attempts()
+            .expect("rejected evidence must leave the audit readable");
+        assert_eq!(attempts[0].outcome(), AttemptOutcome::Started);
+        assert!(
+            trail
+                .effects()
+                .expect("rejected evidence must not poison effects")
                 .is_empty()
         );
     }

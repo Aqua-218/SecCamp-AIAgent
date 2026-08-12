@@ -6,8 +6,8 @@ import Authority.Integration
 
 This module gives the Rust CapFS adapter a failure-aware abstract machine. It
 separates the staged namespace from the externally visible backing view,
-records repository-wide quarantine, preserves unresolved attempts across
-restart, and admits only destruction-time handle cleanup while quarantined.
+records repository-wide quarantine, rejects startup while attempts remain
+unresolved, and admits only destruction-time handle cleanup while quarantined.
 
 The observation checker is proof carrying: schema validation is executable,
 while the candidate supplies the exact successful integrated execution that
@@ -81,7 +81,7 @@ def cleanupClose (state : State) (handleId : HandleId)
   let integrated := { state.integrated.closeHandle handleId handle object with
     repositoryHealth := .inDoubt }
   { integrated
-    backingNamespace := integrated.namespaceState
+    backingNamespace := state.backingNamespace
     unresolvedAttempts := state.unresolvedAttempts }
 
 /-- A crash records the durable started attempt before any recovery scan. -/
@@ -89,37 +89,36 @@ def crashStarted (state : State) (attemptId : AttemptId) : State :=
   { (state.withHealth .inDoubt) with
     unresolvedAttempts := attemptId :: state.unresolvedAttempts }
 
-/-- Recovered health is operational exactly when no durable ambiguity remains. -/
-def recoveredHealth : List AttemptId → RepositoryHealth
-  | [] => .operational
-  | _ :: _ => .inDoubt
-
-/-- Restart imports the backing manifest but preserves durable ambiguity. -/
-def restart (state : State) (recoveredNamespace : NamespaceState) : State where
-  integrated := {
-    state.integrated with
-      namespaceState := recoveredNamespace
-      repositoryHealth := recoveredHealth state.unresolvedAttempts }
-  backingNamespace := recoveredNamespace
-  unresolvedAttempts := state.unresolvedAttempts
-
-/-- Restart always realigns the imported registry with the recovered backing view. -/
-theorem restart_aligned (state : State) (recoveredNamespace : NamespaceState) :
-    (state.restart recoveredNamespace).Aligned := rfl
-
 end State
+
+/-- Full CapFS invariant: both views are exact, and operational means aligned/clean. -/
+structure State.WellFormed (state : State) : Prop where
+  integratedComplete : state.integrated.CompleteWellFormed
+  backingComplete : state.backingNamespace.CompleteWellFormed
+  operationalAligned : state.repositoryHealth = .operational →
+    state.Aligned ∧ state.unresolvedAttempts = []
+  unresolvedQuarantined : state.unresolvedAttempts ≠ [] →
+    state.repositoryHealth = .inDoubt
+
+/-- A clean exact integrated state lifts to a well-formed aligned CapFS state. -/
+theorem State.ofIntegrated_wellFormed {integrated : IntegratedHandleState}
+    (complete : integrated.CompleteWellFormed) :
+    (State.ofIntegrated integrated).WellFormed := by
+  exact ⟨complete, by simpa [State.ofIntegrated] using complete.namespaceComplete,
+    fun _ => ⟨rfl, rfl⟩, by simp [State.ofIntegrated]⟩
 
 /-- A staged effect is an existing finite integrated execution admitted while healthy. -/
 structure ProposedEffect (before : State) (staged : IntegratedHandleState) : Prop where
   operational : before.repositoryHealth = .operational
   noUnresolved : before.unresolvedAttempts = []
-  execution : IntegratedHandleState.Steps before.integrated staged
+  beforeWellFormed : before.WellFormed
+  execution : IntegratedHandleState.CompleteSteps before.integrated staged
 
 /-- A staged effect cannot silently change shared repository health. -/
 theorem ProposedEffect.staged_operational {before : State}
     {staged : IntegratedHandleState} (proposed : ProposedEffect before staged) :
     staged.repositoryHealth = .operational := by
-  rw [proposed.execution.preserve_repositoryHealth]
+  rw [proposed.execution.toSteps.preserve_repositoryHealth]
   exact proposed.operational
 
 /-- All ordinary executor outcomes require admission from an operational repository. -/
@@ -142,20 +141,63 @@ inductive OrdinaryStep : State → State → Prop
       OrdinaryStep before
         (before.publishUnknown staged attemptId backing)
 
-/-- Reconciliation evidence binds every unresolved attempt to its own receipt. -/
-structure ReconciliationEvidence (state : State) : Type where
-  receipts : AttemptId → Option CommitReceipt
-  verified : ∀ attemptId, attemptId ∈ state.unresolvedAttempts →
-    ∃ receipt, receipts attemptId = some receipt ∧ receipt.attemptId = attemptId
+/-- Repository health changes do not alter bridge, alias, or counter facts. -/
+private theorem integratedComplete_withHealth
+    (integrated : IntegratedHandleState)
+    (complete : integrated.CompleteWellFormed) (health : RepositoryHealth) :
+    ({ integrated with repositoryHealth := health } :
+      IntegratedHandleState).CompleteWellFormed := by
+  refine ⟨?_, ?_⟩
+  · exact {
+      accountedHandlesNodup := complete.bridge.accountedHandlesNodup
+      authorityHandlesExact := complete.bridge.authorityHandlesExact
+      namespaceCountsExact := complete.bridge.namespaceCountsExact
+      everyManagedHandleHasLiveObject :=
+        complete.bridge.everyManagedHandleHasLiveObject
+      liveHandleOwnerExact := complete.bridge.liveHandleOwnerExact
+      managedHandleReserved := complete.bridge.managedHandleReserved
+      namespaceWellFormed := complete.bridge.namespaceWellFormed
+      authorityCountersRepresentable :=
+        complete.bridge.authorityCountersRepresentable
+      namespaceCountersRepresentable :=
+        complete.bridge.namespaceCountersRepresentable }
+  · simpa using complete.namespaceComplete
 
-/-- Verified reconciliation adopts backing as authoritative and clears quarantine. -/
-def reconcile (state : State) (_evidence : ReconciliationEvidence state) : State where
-  integrated := {
-    state.integrated with
-      namespaceState := state.backingNamespace
-      repositoryHealth := .operational }
-  backingNamespace := state.backingNamespace
-  unresolvedAttempts := []
+/-- Every classified ordinary outcome preserves complete state/quarantine facts. -/
+theorem OrdinaryStep.preserves_wellFormed {before after : State}
+    (transition : OrdinaryStep before after) : after.WellFormed := by
+  cases transition with
+  | committed proposed =>
+      have stagedComplete := proposed.execution.preserves_completeWellFormed
+        proposed.beforeWellFormed.integratedComplete
+      refine ⟨integratedComplete_withHealth _ stagedComplete .operational,
+        by simpa [State.publish] using stagedComplete.namespaceComplete, ?_, ?_⟩
+      · intro _
+        exact ⟨rfl, proposed.noUnresolved⟩
+      · simp [State.publish, proposed.noUnresolved]
+  | failedBeforeCommit proposed => exact proposed.beforeWellFormed
+  | committedButAudit proposed =>
+      have stagedComplete := proposed.execution.preserves_completeWellFormed
+        proposed.beforeWellFormed.integratedComplete
+      refine ⟨integratedComplete_withHealth _ stagedComplete .inDoubt,
+        by simpa [State.publish] using stagedComplete.namespaceComplete, ?_, ?_⟩
+      · intro impossible
+        cases impossible
+      · intro _
+        rfl
+  | commitUnknown proposed =>
+      rename_i attemptId backing
+      have stagedComplete := proposed.execution.preserves_completeWellFormed
+        proposed.beforeWellFormed.integratedComplete
+      refine ⟨integratedComplete_withHealth _
+          proposed.beforeWellFormed.integratedComplete .inDoubt, ?_, ?_, ?_⟩
+      · cases backing with
+        | before => exact proposed.beforeWellFormed.backingComplete
+        | staged => exact stagedComplete.namespaceComplete
+      · intro impossible
+        cases impossible
+      · intro _
+        rfl
 
 /-- Complete CapFS transitions distinguish ordinary effects from lifecycle repair. -/
 inductive Step : State → State → Prop
@@ -167,16 +209,44 @@ inductive Step : State → State → Prop
         (before.cleanupClose handleId allowed.handle allowed.object)
   | crashStarted {before : State} {attemptId : AttemptId} :
       Step before (before.crashStarted attemptId)
-  | restart {before : State} {recoveredNamespace : NamespaceState} :
-      Step before (before.restart recoveredNamespace)
-  | reconcile {before : State} (evidence : ReconciliationEvidence before) :
-      Step before (Capfs.reconcile before evidence)
+
+/-- Ordinary effects and the two lifecycle actions preserve the full invariant. -/
+theorem Step.preserves_wellFormed {before after : State}
+    (transition : Step before after) (wellFormed : before.WellFormed) :
+    after.WellFormed := by
+  cases transition with
+  | ordinary ordinary => exact ordinary.preserves_wellFormed
+  | cleanupClose quarantined allowed =>
+      have closed := (IntegratedHandleState.CompleteStep.closeAtomic
+        wellFormed.integratedComplete allowed).preserves_completeWellFormed
+      refine ⟨integratedComplete_withHealth _ closed .inDoubt,
+        wellFormed.backingComplete, ?_, ?_⟩
+      · intro impossible
+        cases impossible
+      · intro _
+        rfl
+  | crashStarted =>
+      refine ⟨integratedComplete_withHealth _ wellFormed.integratedComplete .inDoubt,
+        wellFormed.backingComplete, ?_, ?_⟩
+      · intro impossible
+        cases impossible
+      · intro _
+        rfl
 
 /-- Finite failure-aware executions. -/
 inductive Steps : State → State → Prop
   | refl (state : State) : Steps state state
   | tail {first middle last : State} :
       Steps first middle → Step middle last → Steps first last
+
+/-- Every arbitrary finite failure-aware execution preserves the full invariant. -/
+theorem Steps.preserves_wellFormed {before after : State}
+    (transitions : Steps before after) (wellFormed : before.WellFormed) :
+    after.WellFormed := by
+  induction transitions with
+  | refl => exact wellFormed
+  | tail _ transition inductionHypothesis =>
+      exact transition.preserves_wellFormed inductionHypothesis
 
 /-- A known post-commit audit error publishes staged state before quarantine. -/
 theorem committedButAudit_quarantines_and_publishes {before : State}
@@ -223,15 +293,28 @@ theorem cleanupClose_allowedInDoubt {before : State} {caller : SubjectId}
   let after := before.cleanupClose handleId allowed.handle allowed.object
   exact ⟨after, .cleanupClose quarantined allowed, rfl⟩
 
-/-- A nonempty recovered attempt set can never restart as operational. -/
-theorem restart_unresolved_notOperational {state : State}
-    (unresolved : state.unresolvedAttempts ≠ [])
-    (recoveredNamespace : NamespaceState) :
-    (state.restart recoveredNamespace).repositoryHealth ≠ .operational := by
-  cases attempts : state.unresolvedAttempts with
-  | nil => exact False.elim (unresolved attempts)
-  | cons attempt remaining =>
-      simp [State.restart, State.repositoryHealth, State.recoveredHealth, attempts]
+/-- Production recovery has no state-producing branch while ambiguity persists. -/
+inductive StartupDecision where
+  | admitClean
+  | rejectUnresolved
+  deriving Repr, BEq, DecidableEq
+
+/-- Executable startup gate matching the production nonempty-attempt rejection. -/
+def startupDecision (unresolvedAttempts : List AttemptId) : StartupDecision :=
+  if unresolvedAttempts.isEmpty then .admitClean else .rejectUnresolved
+
+/-- Every nonempty durable attempt set is rejected, never imported as operational. -/
+theorem unresolved_startup_rejected {unresolvedAttempts : List AttemptId}
+    (unresolved : unresolvedAttempts ≠ []) :
+    startupDecision unresolvedAttempts = .rejectUnresolved := by
+  cases unresolvedAttempts with
+  | nil => contradiction
+  | cons attempt remaining => simp [startupDecision]
+
+/-- Only an empty durable attempt set reaches the clean-admission branch. -/
+theorem startup_admitted_iff_clean {unresolvedAttempts : List AttemptId} :
+    startupDecision unresolvedAttempts = .admitClean ↔ unresolvedAttempts = [] := by
+  cases unresolvedAttempts <;> simp [startupDecision]
 
 /-- The crash-start transition itself immediately quarantines the repository. -/
 theorem crashStarted_quarantines (state : State) (attemptId : AttemptId) :
@@ -239,17 +322,46 @@ theorem crashStarted_quarantines (state : State) (attemptId : AttemptId) :
       attemptId ∈ (state.crashStarted attemptId).unresolvedAttempts := by
   exact ⟨rfl, by simp [State.crashStarted]⟩
 
+/-- A process crash after durable start forces the next production gate to reject. -/
+theorem crashStarted_forces_startup_rejection (state : State)
+    (attemptId : AttemptId) :
+    startupDecision (state.crashStarted attemptId).unresolvedAttempts =
+      .rejectUnresolved := by
+  apply unresolved_startup_rejected
+  simp [State.crashStarted]
+
+/-- Cleanup never guesses or rewrites the externally visible backing snapshot. -/
+theorem cleanupClose_preserves_backing (state : State) (handleId : HandleId)
+    (handle : OpenHandle) (object : NamespaceObject) :
+    (state.cleanupClose handleId handle object).backingNamespace =
+      state.backingNamespace := rfl
+
 /-- A restorable CapFS snapshot has no ambiguity and exact backing alignment. -/
 structure Restorable (state : State) : Prop where
   integrated : state.integrated.Restorable
   aligned : state.Aligned
   noUnresolved : state.unresolvedAttempts = []
 
-/-- Startup includes both concrete empty state and explicitly reconciled imports. -/
+/-- Abstract starts include concrete empty state and explicitly trusted clean imports. -/
 inductive Start : State → Prop
   | runtime (issuer : IssuerId) :
       Start (State.ofIntegrated (IntegratedHandleState.initial issuer))
   | restored {state : State} : Restorable state → Start state
+
+/-- Production additionally binds abstract startup to the durable recovery gate. -/
+structure ProductionStart (persistedAttempts : List AttemptId)
+    (state : State) : Prop where
+  recoveryAdmitted : startupDecision persistedAttempts = .admitClean
+  abstractStart : Start state
+
+/-- No abstract state can bypass a nonempty durable recovery rejection. -/
+theorem unresolved_noProductionStart {persistedAttempts : List AttemptId}
+    (unresolved : persistedAttempts ≠ []) (state : State) :
+    ¬ ProductionStart persistedAttempts state := by
+  intro start
+  have admitted := start.recoveryAdmitted
+  rw [unresolved_startup_rejected unresolved] at admitted
+  cases admitted
 
 /-- Reachability starts only from concrete runtime or reconciled restore evidence. -/
 def Reachable (state : State) : Prop :=
@@ -260,6 +372,29 @@ theorem reconciled_restorable_reachable {state : State}
     (restorable : Restorable state) : Reachable state :=
   ⟨state, .restored restorable, .refl state⟩
 
+/-- Every admitted start has complete views, exact alignment, and no ambiguity. -/
+theorem Start.wellFormed {state : State} (start : Start state) : state.WellFormed := by
+  cases start with
+  | runtime issuer =>
+      exact State.ofIntegrated_wellFormed
+        (IntegratedHandleState.initial_completeWellFormed issuer)
+  | restored restorable =>
+      refine ⟨⟨restorable.integrated.wellFormed,
+          restorable.integrated.namespaceComplete⟩, ?_, ?_, ?_⟩
+      · have alignment : state.integrated.namespaceState = state.backingNamespace :=
+          restorable.aligned
+        rw [← alignment]
+        exact restorable.integrated.namespaceComplete
+      · intro _
+        exact ⟨restorable.aligned, restorable.noUnresolved⟩
+      · simp [restorable.noUnresolved]
+
+/-- Every runtime or trusted-restore execution remains fully well formed. -/
+theorem Reachable.wellFormed {state : State} (reachable : Reachable state) :
+    state.WellFormed := by
+  rcases reachable with ⟨initial, start, transitions⟩
+  exact transitions.preserves_wellFormed start.wellFormed
+
 /-- Observation schema version shared with the Rust-shaped event stream. -/
 def observationSchemaVersion : Nat := 1
 
@@ -267,7 +402,8 @@ def observationSchemaVersion : Nat := 1
 inductive RustOperation where
   | hardLink (objectId : ObjectId) (alias : CanonicalPath)
   | unlinkName (objectId : ObjectId) (alias newPrimary : CanonicalPath)
-  | createSymlink (objectId : ObjectId) (path target : CanonicalPath)
+  | createSymlink (objectId : ObjectId) (path : CanonicalPath)
+      (target : SymlinkTarget)
   deriving DecidableEq
 
 /-- Versioned Rust-shaped outcome without embedding abstract state. -/
@@ -313,11 +449,13 @@ inductive OperationEffect (before : State) :
 theorem OperationEffect.integratedStep {before : State}
     {operation : RustOperation} {staged : IntegratedHandleState}
     (effect : OperationEffect before operation staged) :
-    IntegratedHandleState.Step before.integrated staged := by
+    before.integrated.CompleteWellFormed →
+      IntegratedHandleState.CompleteStep before.integrated staged := by
+  intro complete
   cases effect with
-  | hardLink allowed => exact .hardLinkAtomic allowed
-  | unlinkName allowed => exact .unlinkNameAtomic allowed
-  | createSymlink allowed => exact .createSymlinkAtomic allowed
+  | hardLink allowed => exact .hardLinkAtomic complete allowed
+  | unlinkName allowed => exact .unlinkNameAtomic complete allowed
+  | createSymlink allowed => exact .createSymlinkAtomic complete allowed
 
 /-- An operation-specific step supplies the ordinary staging proof when healthy. -/
 def OperationEffect.proposed {before : State} {operation : RustOperation}
@@ -325,16 +463,21 @@ def OperationEffect.proposed {before : State} {operation : RustOperation}
     (effect : OperationEffect before operation staged)
     (operational : before.repositoryHealth = .operational)
     (noUnresolved : before.unresolvedAttempts = []) :
-    ProposedEffect before staged := {
+    before.WellFormed → ProposedEffect before staged := by
+  intro beforeWellFormed
+  exact {
   operational
   noUnresolved
-  execution := .tail (.refl before.integrated) effect.integratedStep }
+  beforeWellFormed
+  execution := .tail (.refl before.integrated)
+    (effect.integratedStep beforeWellFormed.integratedComplete) }
 
 /-- Proof-carrying candidate binds a Rust label to its one concrete transition. -/
 structure Candidate (before : State) (observation : Observation) where
   staged : IntegratedHandleState
   operational : before.repositoryHealth = .operational
   noUnresolved : before.unresolvedAttempts = []
+  beforeWellFormed : before.WellFormed
   effect : OperationEffect before observation.operation staged
 
 /-- Successful observation checking returns its exact abstract state. -/
@@ -355,7 +498,7 @@ def checkObservation (before : State) (observation : Observation)
       staged := candidate.staged
       effect := candidate.effect
       proposed := candidate.effect.proposed candidate.operational
-        candidate.noUnresolved
+        candidate.noUnresolved candidate.beforeWellFormed
       exactOutcome := rfl }
   else
     none
@@ -423,9 +566,15 @@ private def symlinkName : CanonicalPath :=
   { segments := ["shortcut"]
     isValid := by decide }
 
-private def symlinkTarget : CanonicalPath :=
+private def symlinkResolved : CanonicalPath :=
   { segments := ["target"]
     isValid := by decide }
+
+private def symlinkTarget : SymlinkTarget := {
+  literal := "target"
+  parents := 0
+  segments := ["target"]
+  parsed := by native_decide }
 
 private def aliasObject : NamespaceObject := {
   id := ⟨"alias-object"⟩
@@ -462,7 +611,7 @@ theorem concrete_alias_witness :
 
 /-- The exact two-name index has a concrete alias-well-formed state witness. -/
 theorem concrete_alias_state_witness : aliasNamespace.AliasWellFormed := by
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro objectId object objectLookup
     by_cases sameId : objectId = aliasObject.id
     · subst objectId
@@ -505,6 +654,20 @@ theorem concrete_alias_state_witness : aliasNamespace.AliasWellFormed := by
         subst objectId
         exact ⟨aliasObject, by simp [aliasNamespace, replace], by simp [aliasObject]⟩
       · simp [aliasNamespace, replace, secondary, primary] at pathLookup
+  · intro objectId object path objectLookup pathMember
+    by_cases sameId : objectId = aliasObject.id
+    · subst objectId
+      simp [aliasNamespace, replace] at objectLookup
+      subst object
+      simp only [aliasObject, List.mem_cons, List.mem_singleton] at pathMember
+      rcases pathMember with primary | secondary
+      · subst path
+        exact List.lt_irrefl _
+      · rcases secondary with secondary | impossible
+        · subst path
+          native_decide
+        · contradiction
+    · simp [aliasNamespace, replace, sameId] at objectLookup
   · intro objectId object objectLookup
     by_cases sameId : objectId = aliasObject.id
     · subst objectId
@@ -528,7 +691,7 @@ theorem concrete_symlink_witness :
   simp [object, NamespaceObject.ShapeWellFormed,
     NamespaceObject.AliasesWellFormed, NamespaceObject.TargetWellFormed]
 
-private def traceRootId : ObjectId := ⟨"trace-root"⟩
+private def traceRootId : ObjectId := NamespaceState.allocatedObjectId 0
 
 private def traceObject : NamespaceObject := {
   id := NamespaceState.allocatedObjectId 1
@@ -596,7 +759,11 @@ private def traceMayCreateSymlink :
   kindIsSymlink := rfl
   aliasesSingleton := rfl
   target := symlinkTarget
-  targetStored := rfl }
+  targetStored := rfl
+  targetContained := by
+    refine ⟨symlinkResolved, [], "shortcut", rfl, ?_, ?_⟩
+    · simp [symlinkTarget]
+    · rfl }
 
 private def traceCreated : NamespaceState := traceInitial.createSymlink traceObject
 
@@ -649,12 +816,16 @@ private def traceMayUnlink :
     complete := traceLinked_complete
     object := NamespaceState.withAddedAlias traceObject aliasSecondary
     objectLookup := ?_
-    sourceIsNotDirectory := by simp [NamespaceState.withAddedAlias, traceObject]
-    noOpenHandles := rfl
+    sourceIsNotDirectory := by native_decide
     aliasIndexed := ?_
     newPrimary := aliasSecondary
     remaining := []
-    partition := by simp [NamespaceState.withAddedAlias, traceObject]
+    partition := by native_decide
+    newPrimaryLeast := by
+      intro path member
+      simp at member
+      subst path
+      exact List.lt_irrefl _
     newPrimaryIndexed := ?_
     newPrimaryNotRoot := aliasSecondary_ne_root
     parentId := traceRootId
@@ -723,6 +894,70 @@ theorem concrete_multiAlias_symlink_trace :
       aliasSecondary []
   · rfl
 
+private def operationWitnessIssuer : IssuerId := ⟨"operation-witness-issuer"⟩
+
+private def operationWitnessState : State :=
+  State.ofIntegrated (IntegratedHandleState.initial operationWitnessIssuer)
+
+private def operationWitnessAllowed :
+    operationWitnessState.integrated.namespaceState.MayCreateSymlink traceObject := by
+  simpa [operationWitnessState, IntegratedHandleState.initial,
+    IntegratedHandleState.initializeClosed, traceInitial, traceRootId] using
+    traceMayCreateSymlink
+
+private def operationWitnessStaged : IntegratedHandleState :=
+  operationWitnessState.integrated.createSymlink traceObject
+
+private def operationWitnessObservation : Observation := {
+  schemaVersion := observationSchemaVersion
+  operation := .createSymlink traceObject.id traceObject.path symlinkTarget
+  outcome := .committed }
+
+private def operationWitnessCandidate :
+    Candidate operationWitnessState operationWitnessObservation := {
+  staged := operationWitnessStaged
+  operational := rfl
+  noUnresolved := rfl
+  beforeWellFormed := State.ofIntegrated_wellFormed
+    (IntegratedHandleState.initial_completeWellFormed operationWitnessIssuer)
+  effect := .createSymlink operationWitnessAllowed }
+
+private def operationWitnessChecked :
+    CheckedObservation operationWitnessState operationWitnessObservation := {
+  after := outcomeState operationWitnessState operationWitnessStaged .committed
+  staged := operationWitnessStaged
+  effect := .createSymlink operationWitnessAllowed
+  proposed := operationWitnessCandidate.effect.proposed rfl rfl
+    operationWitnessCandidate.beforeWellFormed
+  exactOutcome := rfl }
+
+/-- A concrete accepted Rust symlink observation changes state and forward-simulates. -/
+theorem concrete_symlink_observation_nonreflexive :
+    checkObservation operationWitnessState operationWitnessObservation
+        operationWitnessCandidate = some operationWitnessChecked ∧
+      Steps operationWitnessState operationWitnessChecked.after ∧
+      operationWitnessChecked.after ≠ operationWitnessState ∧
+      operationWitnessChecked.after.integrated.namespaceState.objects traceObject.id =
+        some traceObject := by
+  refine ⟨rfl, ?_, ?_, ?_⟩
+  · exact operationWitnessChecked.forwardSimulation
+      |> fun transition => Steps.tail (.refl operationWitnessState) transition
+  · intro equality
+    have objectLookup := congrArg
+      (fun state : State => state.integrated.namespaceState.objects traceObject.id)
+      equality
+    simp [operationWitnessChecked, outcomeState, State.publish, State.ofIntegrated,
+      operationWitnessStaged, operationWitnessState,
+      IntegratedHandleState.createSymlink,
+      IntegratedHandleState.createClosedObject, NamespaceState.createSymlink,
+      NamespaceState.create, IntegratedHandleState.initial,
+      IntegratedHandleState.initializeClosed, NamespaceState.runtimeInitial,
+      NamespaceState.withRoot, replace, traceObject, traceObjectId_ne_rootId]
+      at objectLookup
+    exact traceObjectId_ne_rootId objectLookup.1
+  · exact NamespaceState.create_stores_object
+      operationWitnessState.integrated.namespaceState traceObject
+
 private def unknownWitnessState : State :=
   State.ofIntegrated (IntegratedHandleState.initial ⟨"capfs-issuer"⟩)
 
@@ -730,6 +965,8 @@ private def unknownWitnessProposed :
     ProposedEffect unknownWitnessState unknownWitnessState.integrated := {
   operational := rfl
   noUnresolved := rfl
+  beforeWellFormed := State.ofIntegrated_wellFormed
+    (IntegratedHandleState.initial_completeWellFormed ⟨"capfs-issuer"⟩)
   execution := .refl unknownWitnessState.integrated }
 
 /-- A concrete indeterminate syscall retains a durable attempt and quarantines. -/

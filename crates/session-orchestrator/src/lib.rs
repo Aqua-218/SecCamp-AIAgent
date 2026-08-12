@@ -20,6 +20,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod authority_backend;
+pub mod egress_backend;
+pub mod firecracker_backend;
+pub mod firecracker_identity;
+pub mod firecracker_workspace;
+
 use std::{
     collections::BTreeSet,
     error::Error,
@@ -1435,13 +1441,14 @@ pub trait BrokerBackend {
 
 /// Starts and kills exactly one Firecracker VM per session.
 pub trait VmBackend {
-    /// Starts Firecracker with the exact workspace and Broker bindings.
+    /// Starts Firecracker with the exact snapshot, workspace, and Broker bindings.
     ///
     /// # Errors
     ///
     /// Returns [`BackendError`] if Firecracker cannot start with the requested bindings.
     fn start_vm(
         &mut self,
+        snapshot: &SnapshotDescriptor,
         identity: &SessionIdentity,
         workspace: &WorkspaceLease,
         broker: &BrokerLease,
@@ -2006,7 +2013,7 @@ where
         active.broker = Some(broker.clone());
         active.cleanup.broker_closed = false;
 
-        let vm = match vm_backend.start_vm(&identity, &active.workspace, &broker) {
+        let vm = match vm_backend.start_vm(snapshot, &identity, &active.workspace, &broker) {
             Ok(lease) => {
                 if let Some(error) = validate_vm(&identity, &lease) {
                     let rollback = cleanup_active(

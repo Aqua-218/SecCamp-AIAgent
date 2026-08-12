@@ -209,7 +209,8 @@ def State.applyFailure (state : State) (stage : ApplyStage) : State :=
     phase := if state.completed = [] then .failed else .rollingBack
     applyTrace := state.applyTrace ++ [stage]
     rollbackPending := state.completed.reverse
-    mustTerminate := state.mustTerminate || state.completed.any ApplyStage.irreversible }
+    mustTerminate := state.mustTerminate || stage.irreversible ||
+      state.completed.any ApplyStage.irreversible }
 
 /-- Record one rollback attempt and whether that attempt failed. -/
 def State.recordRollback (state : State) (stage : ApplyStage)
@@ -221,6 +222,14 @@ def State.recordRollback (state : State) (stage : ApplyStage)
     rollbackFailures := if failed then state.rollbackFailures ++ [stage]
       else state.rollbackFailures }
 
+/-- Failure metadata identifies the attempted stage and exact termination obligation. -/
+def State.FailureContext (state : State) : Prop :=
+  ∃ failedStage remaining,
+    state.remaining = failedStage :: remaining ∧
+    state.applyTrace = state.completed ++ [failedStage] ∧
+    state.mustTerminate =
+      (failedStage.irreversible || state.completed.any ApplyStage.irreversible)
+
 /-- Exact coordinator-shape invariant. -/
 def State.WellFormed (state : State) : Prop :=
   state.completed ++ state.remaining = requiredStages ∧
@@ -228,24 +237,43 @@ def State.WellFormed (state : State) : Prop :=
   | .preflight =>
       state.completed = [] ∧ state.remaining = requiredStages ∧
       state.applyTrace = [] ∧ state.rollbackTrace = [] ∧
-        state.rollbackPending = [] ∧ state.receipt = none
+        state.rollbackPending = [] ∧ state.receipt = none ∧
+        state.mustTerminate = false
   | .applying =>
       state.applyTrace = state.completed ∧ state.rollbackTrace = [] ∧
-        state.rollbackPending = [] ∧ state.receipt = none
+        state.rollbackPending = [] ∧ state.receipt = none ∧
+        state.mustTerminate = false
   | .rollingBack =>
       state.rollbackTrace ++ state.rollbackPending = state.completed.reverse ∧
-        state.rollbackPending ≠ [] ∧ state.receipt = none
+        state.rollbackPending ≠ [] ∧ state.receipt = none ∧
+        state.FailureContext
   | .succeeded =>
       state.completed = requiredStages ∧ state.remaining = [] ∧
         state.applyTrace = requiredStages ∧
-        ∃ receipt, state.receipt = some receipt ∧ receipt.stages = requiredStages
+        (∃ receipt, state.receipt = some receipt ∧ receipt.stages = requiredStages) ∧
+        state.mustTerminate = false
   | .failed =>
       state.rollbackPending = [] ∧ state.receipt = none ∧
-        state.rollbackTrace = state.completed.reverse
+        state.rollbackTrace = state.completed.reverse ∧ state.FailureContext
 
 /-- Initial coordinator shape is valid. -/
 theorem State.initial_wellFormed : State.initial.WellFormed := by
   simp [State.initial, State.WellFormed]
+
+/-- Concrete state where the first namespace operation failed after a partial effect. -/
+def State.firstNamespaceFailure : State :=
+  State.initial.beginApply.applyFailure .namespaces
+
+/-- The first namespace failure is well formed and requires process termination. -/
+theorem State.firstNamespaceFailure_witness :
+    State.firstNamespaceFailure.WellFormed ∧
+    State.firstNamespaceFailure.phase = .failed ∧
+    State.firstNamespaceFailure.completed = [] ∧
+    State.firstNamespaceFailure.applyTrace = [.namespaces] ∧
+    State.firstNamespaceFailure.mustTerminate = true := by
+  simp [State.firstNamespaceFailure, State.initial, State.beginApply,
+    State.applyFailure, State.WellFormed, State.FailureContext, requiredStages,
+    ApplyStage.irreversible]
 
 /-- Accepted coordinator transitions. Failed preflight makes no transition. -/
 inductive Step : State → State → Prop
@@ -280,33 +308,37 @@ theorem Step.preserves_wellFormed {before after : State}
   | beginApply phase valid sufficient =>
       rw [State.WellFormed, phase] at wellFormed
       rcases wellFormed with ⟨plan, completed, remaining, applyTrace,
-        rollbackTrace, noRollback, noReceipt⟩
+        rollbackTrace, noRollback, noReceipt, noTermination⟩
       simp [State.beginApply, State.WellFormed, plan, completed, remaining,
-        applyTrace, rollbackTrace, noRollback, noReceipt, State.initial]
+        applyTrace, rollbackTrace, noRollback, noReceipt, noTermination,
+        State.initial]
   | applySuccess phase nextStage =>
       rw [State.WellFormed, phase] at wellFormed
       rcases wellFormed with ⟨plan, traceMatches, rollbackTrace,
-        noRollback, noReceipt⟩
+        noRollback, noReceipt, noTermination⟩
       constructor
       · rw [State.applySuccess, nextStage] at *
         simpa [List.append_assoc] using plan
       · simp [State.applySuccess, phase, traceMatches, rollbackTrace, noRollback,
-          noReceipt]
+          noReceipt, noTermination]
   | applyFailure phase nextStage =>
       rw [State.WellFormed, phase] at wellFormed
       rcases wellFormed with ⟨plan, traceMatches, rollbackTrace,
-        noRollback, noReceipt⟩
+        noRollback, noReceipt, noTermination⟩
       constructor
       · exact plan
       · by_cases noCompleted : before.completed = []
-        · simp [State.applyFailure, noCompleted, noReceipt, rollbackTrace]
+        · simp [State.applyFailure, State.FailureContext, noCompleted, noReceipt,
+            rollbackTrace, nextStage, traceMatches, noTermination]
         · have reverseNonempty : before.completed.reverse ≠ [] := by
             simpa using noCompleted
-          simp [State.applyFailure, noCompleted, rollbackTrace, reverseNonempty,
-            noReceipt]
+          simp [State.applyFailure, State.FailureContext, noCompleted,
+            rollbackTrace, reverseNonempty, noReceipt, nextStage, traceMatches,
+            noTermination]
   | rollback phase pending =>
       rw [State.WellFormed, phase] at wellFormed
-      rcases wellFormed with ⟨plan, rollbackPartition, pendingNonempty, noReceipt⟩
+      rcases wellFormed with ⟨plan, rollbackPartition, pendingNonempty, noReceipt,
+        failureContext⟩
       constructor
       · exact plan
       · rename_i stage remaining failed
@@ -314,20 +346,27 @@ theorem Step.preserves_wellFormed {before after : State}
         · have partitionAfter : before.rollbackTrace ++ [stage] =
               before.completed.reverse := by
             rw [← rollbackPartition, pending, noRemaining]
-          simp [State.recordRollback, noRemaining, noReceipt, partitionAfter]
+          simp [State.recordRollback, noRemaining, noReceipt, partitionAfter,
+            failureContext]
+          change before.FailureContext
+          exact failureContext
         · have partitionAfter :
               (before.rollbackTrace ++ [stage]) ++ remaining =
                 before.completed.reverse := by
             rw [← rollbackPartition, pending]
             simp [List.append_assoc]
-          simp [State.recordRollback, noRemaining, partitionAfter, noReceipt]
+          simp [State.recordRollback, noRemaining, partitionAfter, noReceipt,
+            failureContext]
+          change before.FailureContext
+          exact failureContext
   | finish phase noRemaining complete =>
       rw [State.WellFormed, phase] at wellFormed
       rcases wellFormed with ⟨plan, traceMatches, rollbackTrace,
-        noRollback, noReceipt⟩
+        noRollback, noReceipt, noTermination⟩
       constructor
       · exact plan
-      · simp [State.WellFormed, complete, noRemaining, traceMatches]
+      · simp [State.WellFormed, complete, noRemaining, traceMatches,
+          noTermination]
 
 /-- A rolling-back state attempts exactly the successful prefix in reverse order. -/
 theorem State.rollback_partition {state : State} (wellFormed : state.WellFormed)
@@ -344,20 +383,24 @@ theorem State.receipt_excludes_rollback {state : State}
   cases phase : state.phase with
   | preflight =>
       rw [State.WellFormed, phase] at wellFormed
-      rw [wellFormed.2.2.2.2.2.2] at receiptLookup
+      rcases wellFormed.2 with ⟨_, _, _, _, _, noReceipt, _⟩
+      rw [noReceipt] at receiptLookup
       cases receiptLookup
   | applying =>
       rw [State.WellFormed, phase] at wellFormed
-      rw [wellFormed.2.2.2.2] at receiptLookup
+      rcases wellFormed.2 with ⟨_, _, _, noReceipt, _⟩
+      rw [noReceipt] at receiptLookup
       cases receiptLookup
   | rollingBack =>
       rw [State.WellFormed, phase] at wellFormed
-      rw [wellFormed.2.2.2] at receiptLookup
+      rcases wellFormed.2 with ⟨_, _, noReceipt, _⟩
+      rw [noReceipt] at receiptLookup
       cases receiptLookup
   | succeeded => rfl
   | failed =>
       rw [State.WellFormed, phase] at wellFormed
-      rw [wellFormed.2.2.1] at receiptLookup
+      rcases wellFormed.2 with ⟨_, noReceipt, _, _⟩
+      rw [noReceipt] at receiptLookup
       cases receiptLookup
 
 /-- Every successful state exposes the complete required stage list. -/
@@ -365,22 +408,32 @@ theorem State.success_receipt_exact {state : State} (wellFormed : state.WellForm
     (succeeded : state.phase = .succeeded) :
     ∃ receipt, state.receipt = some receipt ∧ receipt.stages = requiredStages := by
   rw [State.WellFormed, succeeded] at wellFormed
-  exact wellFormed.2.2.2.2
+  exact wellFormed.2.2.2.2.1
 
 /-- A terminal failure retains the complete reverse-prefix rollback trace. -/
 theorem State.failed_rollback_complete {state : State} (wellFormed : state.WellFormed)
     (failed : state.phase = .failed) :
     state.rollbackTrace = state.completed.reverse := by
   rw [State.WellFormed, failed] at wellFormed
-  exact wellFormed.2.2.2
+  exact wellFormed.2.2.2.1
 
-/-- Failure after any irreversible Linux stage requires terminating the child. -/
+/-- Failure while attempting or after completing an irreversible stage requires termination. -/
 theorem State.applyFailure_marks_mustTerminate {state : State}
     (failedStage : ApplyStage)
-    (irreversibleCompleted : ∃ stage,
-      stage ∈ state.completed ∧ stage.irreversible = true) :
+    (irreversibleAttempt : failedStage.irreversible = true ∨
+      ∃ stage, stage ∈ state.completed ∧ stage.irreversible = true) :
     (state.applyFailure failedStage).mustTerminate = true := by
-  simp [State.applyFailure, List.any_eq_true, irreversibleCompleted]
+  rcases irreversibleAttempt with failedStageIrreversible | irreversibleCompleted
+  · simp [State.applyFailure, failedStageIrreversible]
+  · simp [State.applyFailure, List.any_eq_true, irreversibleCompleted]
+
+/-- From a reusable applying state, termination is required exactly for Rust's two cases. -/
+theorem State.applyFailure_mustTerminate_iff {state : State}
+    (failedStage : ApplyStage) (reusable : state.mustTerminate = false) :
+    (state.applyFailure failedStage).mustTerminate = true ↔
+      failedStage.irreversible = true ∨
+        ∃ stage, stage ∈ state.completed ∧ stage.irreversible = true := by
+  simp [State.applyFailure, reusable, List.any_eq_true]
 
 /-- Once required, child termination cannot be cleared by a coordinator step. -/
 theorem Step.mustTerminate_monotone {before after : State}
@@ -404,6 +457,22 @@ theorem Steps.mustTerminate_monotone {before after : State}
   | refl => exact required
   | tail _ transition inductionHypothesis =>
       exact transition.mustTerminate_monotone inductionHypothesis
+
+/-- An irreversible apply failure remains termination-required through any execution suffix. -/
+theorem Steps.applyFailure_marks_mustTerminate {state after : State}
+    (failedStage : ApplyStage)
+    (irreversibleAttempt : failedStage.irreversible = true ∨
+      ∃ stage, stage ∈ state.completed ∧ stage.irreversible = true)
+    (transitions : Steps (state.applyFailure failedStage) after) :
+    after.mustTerminate = true :=
+  transitions.mustTerminate_monotone
+    (state.applyFailure_marks_mustTerminate failedStage irreversibleAttempt)
+
+/-- Every continuation of the concrete first namespace failure must terminate. -/
+theorem Steps.firstNamespaceFailure_mustTerminate {after : State}
+    (transitions : Steps State.firstNamespaceFailure after) :
+    after.mustTerminate = true :=
+  transitions.mustTerminate_monotone State.firstNamespaceFailure_witness.2.2.2.2
 
 /-- Exact coordinator shape is inductive across arbitrary finite execution. -/
 theorem Steps.preserves_wellFormed {before after : State}

@@ -190,6 +190,10 @@ pub enum BrokerWireRejection {
     GitHub,
     /// Post-effect accounting could not be trusted.
     AccountingInvariant,
+    /// The attempt could not be journaled, so no effect was attempted.
+    AuditUnavailable,
+    /// The effect committed but its terminal record could not be persisted.
+    CommittedButUnrecorded,
 }
 
 impl BrokerWireRejection {
@@ -201,6 +205,8 @@ impl BrokerWireRejection {
             Self::PublicFetch => 3,
             Self::GitHub => 4,
             Self::AccountingInvariant => 5,
+            Self::AuditUnavailable => 6,
+            Self::CommittedButUnrecorded => 7,
         }
     }
 
@@ -212,6 +218,8 @@ impl BrokerWireRejection {
             3 => Ok(Self::PublicFetch),
             4 => Ok(Self::GitHub),
             5 => Ok(Self::AccountingInvariant),
+            6 => Ok(Self::AuditUnavailable),
+            7 => Ok(Self::CommittedButUnrecorded),
             _ => Err(ResponseCborError::UnknownRejection { received: code }),
         }
     }

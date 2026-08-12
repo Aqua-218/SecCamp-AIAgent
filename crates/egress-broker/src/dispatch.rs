@@ -80,6 +80,11 @@ pub enum BrokerRejection {
     GitHub(GitHubAdapterError),
     /// Session accounting failed after the effect completed; the session must be closed.
     AccountingInvariant,
+    /// The attempt could not be journaled, so no external effect was attempted.
+    AuditUnavailable,
+    /// The external effect committed but its terminal audit record was not
+    /// persisted. The effect may exist at the provider and must be reconciled.
+    CommittedButUnrecorded,
 }
 
 /// A response retained for exact retries.
@@ -182,6 +187,11 @@ pub enum ExecutorError {
     NotAuthorized,
     /// The kernel state lock could not be trusted.
     LockPoisoned,
+    /// The attempt could not be journaled; the executor was never called.
+    AuditUnavailable,
+    /// The executor reported success but the terminal receipt was not
+    /// persisted. The external effect may already exist.
+    CommittedButUnrecorded,
     /// The adapter failed before its effect linearization point.
     Adapter(AdapterError),
 }
@@ -203,9 +213,8 @@ impl CapabilityExecutor for CapabilityKernel {
             EffectCommitError::NotAuthorized => ExecutorError::NotAuthorized,
             EffectCommitError::LockPoisoned => ExecutorError::LockPoisoned,
             EffectCommitError::Effect(error) => ExecutorError::Adapter(error),
-            EffectCommitError::Audit(_) | EffectCommitError::CommittedButAudit(_) => {
-                ExecutorError::LockPoisoned
-            }
+            EffectCommitError::Audit(_) => ExecutorError::AuditUnavailable,
+            EffectCommitError::CommittedButAudit(_) => ExecutorError::CommittedButUnrecorded,
         })
     }
 }
@@ -398,14 +407,31 @@ where
                     )
                 }
             }
+            Err(ExecutorError::CommittedButUnrecorded) => {
+                // The executor crossed its linearization point, so the external
+                // effect may exist at the provider. Charging the reservation
+                // keeps the session total honest; aborting it would let the
+                // guest spend those bytes twice.
+                if self.budget.complete(request_id, response_cap).is_err() {
+                    let _ = self.budget.abort(request_id);
+                }
+                (
+                    Self::rejected(request_id, BrokerRejection::CommittedButUnrecorded),
+                    None,
+                )
+            }
             Err(error) => {
                 let _ = self.budget.abort(request_id);
                 (
                     Self::rejected(
                         request_id,
                         match error {
-                            ExecutorError::NotAuthorized | ExecutorError::LockPoisoned => {
-                                BrokerRejection::NotAuthorized
+                            ExecutorError::NotAuthorized => BrokerRejection::NotAuthorized,
+                            ExecutorError::LockPoisoned | ExecutorError::AuditUnavailable => {
+                                BrokerRejection::AuditUnavailable
+                            }
+                            ExecutorError::CommittedButUnrecorded => {
+                                unreachable!("handled by the preceding arm")
                             }
                             ExecutorError::Adapter(AdapterError::Public(error)) => {
                                 BrokerRejection::PublicFetch(error)
@@ -520,7 +546,7 @@ mod tests {
     };
 
     use authority_core::{
-        capability::{AuthorityBody, CapId, IssuerId, SubjectId},
+        capability::{AuthorityBody, CapId, Capability, CapabilityRequest, IssuerId, SubjectId},
         github::{GitHubAuthority, GitHubOperation, GitHubRequest},
         http::{
             CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethod, HttpFetchMethods,
@@ -539,8 +565,9 @@ mod tests {
     };
 
     use super::{
-        BrokerDispatcher, BrokerEffect, BrokerOutcome, BrokerRejection, DispatchContext,
-        DispatchError, default_github_response_cap,
+        AdapterError, BrokerDispatcher, BrokerEffect, BrokerOutcome, BrokerRejection,
+        CapabilityExecutor, DispatchContext, DispatchError, ExecutorError,
+        default_github_response_cap,
     };
     use crate::{
         github::{GitHubAdapter, GitHubAdapterError, GitHubResponse},
@@ -659,6 +686,118 @@ mod tests {
             CanonicalUrlPath::new("/guide").expect("fixture path is valid"),
             32,
         ))
+    }
+
+    /// Reports a fixed executor failure so the post-executor budget and
+    /// rejection handling can be exercised without a real kernel state.
+    struct FailingExecutor(fn() -> ExecutorError);
+    impl CapabilityExecutor for FailingExecutor {
+        fn execute(
+            &self,
+            _context: &DispatchContext,
+            _request: &CapabilityRequest,
+            _effect: &mut dyn FnMut(&Capability) -> Result<BrokerEffect, AdapterError>,
+        ) -> Result<BrokerEffect, ExecutorError> {
+            Err((self.0)())
+        }
+    }
+
+    fn dispatcher_with_executor(
+        executor: FailingExecutor,
+    ) -> BrokerDispatcher<
+        FailingExecutor,
+        PublicFetcher<ResolverFixture, ConnectorFixture>,
+        MockGithub,
+    > {
+        BrokerDispatcher::new(
+            executor,
+            PublicFetcher::new(
+                ResolverFixture,
+                ConnectorFixture,
+                IpPolicy::default(),
+                FetchPolicy::default(),
+            ),
+            MockGithub {
+                calls: Arc::new(Mutex::new(0)),
+                failure: false,
+            },
+            BrokerSessionId::new([1; 16]),
+            NonZeroUsize::new(8).expect("fixture capacity is non-zero"),
+            SessionBudgetLimits::new(
+                NonZeroU64::new(4).expect("fixture request limit is non-zero"),
+                128,
+                NonZeroUsize::new(2).expect("fixture concurrency limit is non-zero"),
+            ),
+            default_github_response_cap(),
+        )
+    }
+
+    // Requirement: an effect that crossed its linearization point is never reported as a denial.
+    // Category: unit/security. Risk: high.
+    #[test]
+    fn committed_but_unrecorded_is_distinct_and_keeps_the_reserved_bytes_charged() {
+        let mut dispatcher =
+            dispatcher_with_executor(FailingExecutor(|| ExecutorError::CommittedButUnrecorded));
+        let context = DispatchContext {
+            caller: SubjectId::new("subject"),
+            capability: CapId::new("capability"),
+            now: MonotonicTime::from_ticks(1),
+        };
+        let encoded = frame(BrokerSessionId::new([1; 16]), 0, 9, public_operation());
+
+        let response = dispatcher
+            .dispatch_frame(&encoded, &context)
+            .expect("a committed-but-unrecorded effect is an outcome, not a dispatch error");
+
+        assert_eq!(
+            response.outcome,
+            BrokerOutcome::Rejected(BrokerRejection::CommittedButUnrecorded),
+            "an effect that may exist at the provider must not be reported as NotAuthorized"
+        );
+        let usage = dispatcher.budget_usage();
+        assert_eq!(
+            usage.reserved_response_bytes(),
+            0,
+            "the reservation settles"
+        );
+        assert_ne!(
+            usage.committed_response_bytes(),
+            0,
+            "bytes for a committed effect must stay charged to the session"
+        );
+    }
+
+    // Requirement: an unjournalable attempt is not indistinguishable from an authorization denial.
+    // Category: unit/security. Risk: high.
+    #[test]
+    fn audit_failure_is_reported_separately_from_authorization_denial() {
+        for error in [ExecutorError::AuditUnavailable, ExecutorError::LockPoisoned] {
+            let make: fn() -> ExecutorError = match error {
+                ExecutorError::AuditUnavailable => || ExecutorError::AuditUnavailable,
+                _ => || ExecutorError::LockPoisoned,
+            };
+            let mut dispatcher = dispatcher_with_executor(FailingExecutor(make));
+            let context = DispatchContext {
+                caller: SubjectId::new("subject"),
+                capability: CapId::new("capability"),
+                now: MonotonicTime::from_ticks(1),
+            };
+            let encoded = frame(BrokerSessionId::new([1; 16]), 0, 9, public_operation());
+
+            let response = dispatcher
+                .dispatch_frame(&encoded, &context)
+                .expect("an audit failure is an outcome, not a dispatch error");
+
+            assert_eq!(
+                response.outcome,
+                BrokerOutcome::Rejected(BrokerRejection::AuditUnavailable)
+            );
+            assert_eq!(
+                dispatcher.budget_usage().committed_response_bytes(),
+                0,
+                "no effect ran, so nothing is charged"
+            );
+        }
     }
 
     fn dispatcher_with_response_budget(

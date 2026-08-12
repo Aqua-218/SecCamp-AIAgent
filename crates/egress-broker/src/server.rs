@@ -167,9 +167,14 @@ where
         let response = dispatcher
             .dispatch_request(&frame, context)
             .map_err(ServerError::Dispatch)?;
+        // Both cases leave host state the guest must not keep transacting
+        // against: broken byte accounting, or an external effect whose terminal
+        // audit record is missing and that an operator has to reconcile.
         let close_after_response = matches!(
             response.outcome,
-            BrokerOutcome::Rejected(BrokerRejection::AccountingInvariant)
+            BrokerOutcome::Rejected(
+                BrokerRejection::AccountingInvariant | BrokerRejection::CommittedButUnrecorded
+            )
         );
         let wire = response_to_wire(response).map_err(ServerError::Response)?;
         let payload = wire.encode().map_err(ServerError::Response)?;
@@ -213,6 +218,8 @@ fn response_to_wire(
             BrokerRejection::PublicFetch(_) => BrokerWireRejection::PublicFetch,
             BrokerRejection::GitHub(_) => BrokerWireRejection::GitHub,
             BrokerRejection::AccountingInvariant => BrokerWireRejection::AccountingInvariant,
+            BrokerRejection::AuditUnavailable => BrokerWireRejection::AuditUnavailable,
+            BrokerRejection::CommittedButUnrecorded => BrokerWireRejection::CommittedButUnrecorded,
         }),
     };
     Ok(CanonicalBrokerResponse::new(response.request, outcome))

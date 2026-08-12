@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dispatch;
+pub mod durable;
 pub mod github;
 pub mod ip_policy;
 pub mod public_fetch;

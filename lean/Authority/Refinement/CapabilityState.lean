@@ -1,3 +1,4 @@
+import Authority.Kernel
 import Authority.Refinement.Observation
 
 /-!
@@ -20,7 +21,7 @@ inductive Command where
   | allocateRoot (grant : CapabilityGrant)
   | derive (caller : SubjectId) (parentId : CapId) (grant : CapabilityGrant)
       (now : MonotonicTime)
-  | revoke (capabilityId : CapId)
+  | revoke (caller : SubjectId) (capabilityId : CapId)
   | beginSubjectClose (subject : SubjectId)
   | finishSubjectClose (subject : SubjectId)
   | registerHandle (handle : OpenHandle)
@@ -35,6 +36,7 @@ inductive RejectionReason where
   | invalidCapabilityId
   | capabilityAlreadyIssued
   | unknownCapability
+  | capabilityNotHeld
   | parentNotHeld
   | parentChainInactive
   | parentNotDelegable
@@ -65,6 +67,8 @@ inductive Outcome where
   | accepted
   | rejectedNoEffect (reason : RejectionReason)
   | effectFailedBeforeCommit
+  | commitUnknown (evidence : CommitUnknownEvidence)
+  | commitUnknownAndAudit (evidence : CommitUnknownEvidence)
   | allocatorExhausted
   | revocationCommittedButPropagationError
   | auditFailure (phase : AuditFailurePhase)
@@ -124,11 +128,12 @@ theorem FirstAllocationExhaustion.scanEvidence {command : Command}
 
 /-- State already committed when revocation propagation subsequently reports an error. -/
 inductive PropagationFailure : Command → ModelState → ModelState → Prop
-  | revoke {state : ModelState} {capabilityId : CapId}
+  | revoke {state : ModelState} {caller : SubjectId} {capabilityId : CapId}
       (issued : state.WasIssued capabilityId)
+      (held : state.HeldBy caller capabilityId)
       (unrevoked : state.revoked capabilityId = false)
       (canIncrement : CanIncrementU64 state.authorizationEpoch) :
-      PropagationFailure (.revoke capabilityId) state (state.revoke capabilityId)
+      PropagationFailure (.revoke caller capabilityId) state (state.revoke capabilityId)
   | beginClose {state : ModelState} {subject : SubjectId}
       (running : state.subjectStatuses subject = some .running)
       (canIncrement : CanIncrementU64 state.authorizationEpoch) :
@@ -140,8 +145,8 @@ theorem PropagationFailure.toSteps {command : Command} {before after : ModelStat
     (failure : PropagationFailure command before after) :
     Authority.CapabilityState.Steps before after := by
   cases failure with
-  | revoke issued unrevoked canIncrement =>
-      exact .tail (.refl _) (.revoke issued unrevoked canIncrement)
+  | revoke issued held unrevoked canIncrement =>
+      exact .tail (.refl _) (.revoke issued held unrevoked canIncrement)
   | beginClose running canIncrement =>
       exact .tail (.refl _) (.beginClose running canIncrement)
 
@@ -165,15 +170,17 @@ inductive Accepted : Command → ModelState → ModelState → Prop
         state caller parentId grant now) :
       Accepted (.derive caller parentId grant now) state
         (state.allocateDerived parentId grant allowed.allocation.selectedSequence)
-  | revoke {state : ModelState} {capabilityId : CapId}
+  | revoke {state : ModelState} {caller : SubjectId} {capabilityId : CapId}
       (issued : state.WasIssued capabilityId)
+      (held : state.HeldBy caller capabilityId)
       (unrevoked : state.revoked capabilityId = false)
       (canIncrement : CanIncrementU64 state.authorizationEpoch) :
-      Accepted (.revoke capabilityId) state (state.revoke capabilityId)
-  | revokeAlready {state : ModelState} {capabilityId : CapId}
+      Accepted (.revoke caller capabilityId) state (state.revoke capabilityId)
+  | revokeAlready {state : ModelState} {caller : SubjectId} {capabilityId : CapId}
       (issued : state.WasIssued capabilityId)
+      (held : state.HeldBy caller capabilityId)
       (revoked : state.revoked capabilityId = true) :
-      Accepted (.revoke capabilityId) state state
+      Accepted (.revoke caller capabilityId) state state
   | beginClose {state : ModelState} {subject : SubjectId}
       (running : state.subjectStatuses subject = some .running)
       (canIncrement : CanIncrementU64 state.authorizationEpoch) :
@@ -213,10 +220,10 @@ theorem Accepted.toSteps {command : Command} {before after : ModelState}
   | issueRootWithId allowed => exact .tail (.refl _) (.issueRoot allowed)
   | allocateRoot allowed => exact .tail (.refl _) (.issueAllocatedRoot allowed)
   | derive allowed => exact .tail (.refl _) (.derive allowed)
-  | revoke issued unrevoked canIncrement =>
-      exact .tail (.refl _) (.revoke issued unrevoked canIncrement)
-  | revokeAlready issued revoked =>
-      exact .tail (.refl _) (.successfulNoop (.revokeAlready issued revoked))
+  | revoke issued held unrevoked canIncrement =>
+      exact .tail (.refl _) (.revoke issued held unrevoked canIncrement)
+  | revokeAlready issued held revoked =>
+      exact .tail (.refl _) (.successfulNoop (.revokeAlready issued held revoked))
   | beginClose running canIncrement =>
       exact .tail (.refl _) (.beginClose running canIncrement)
   | beginCloseAlreadyClosing closing =>
@@ -339,12 +346,21 @@ inductive Rejected : Command → RejectionReason → ModelState → Prop
       (ready : DeriveReady state caller parentId grant now)
       (exhausted : state.capabilityIdsExhausted = true) :
       Rejected (.derive caller parentId grant now) .capabilityIdExhausted state
-  | unknownRevoke {state : ModelState} {capabilityId : CapId}
+  | unknownRevoke {state : ModelState} {caller : SubjectId} {capabilityId : CapId}
       (unknown : state.capabilities capabilityId = none) :
-      Rejected (.revoke capabilityId) .unknownCapability state
-  | revokeEpochExhausted {state : ModelState} {capabilityId : CapId}
+      Rejected (.revoke caller capabilityId) .unknownCapability state
+  | revokeCapabilityNotHeld {state : ModelState} {caller : SubjectId}
+      {capabilityId : CapId}
+      (issued : state.WasIssued capabilityId)
+      (notHeld : ¬ state.HeldBy caller capabilityId) :
+      Rejected (.revoke caller capabilityId) .capabilityNotHeld state
+  | revokeEpochExhausted {state : ModelState} {caller : SubjectId}
+      {capabilityId : CapId}
+      (issued : state.WasIssued capabilityId)
+      (held : state.HeldBy caller capabilityId)
+      (unrevoked : state.revoked capabilityId = false)
       (exhausted : state.authorizationEpoch = u64Maximum) :
-      Rejected (.revoke capabilityId) .authorizationEpochExhausted state
+      Rejected (.revoke caller capabilityId) .authorizationEpochExhausted state
   | beginCloseUnknown {state : ModelState} {subject : SubjectId}
       (unknown : state.subjectStatuses subject = none) :
       Rejected (.beginSubjectClose subject) .unknownSubject state
@@ -395,6 +411,20 @@ def Event.ValidOutcome (event : Event) (before after : ModelState) : Prop :=
           ∃ caller capabilityId request,
             event.command = .effectAttempt caller capabilityId request ∧
               before.Authorizes caller capabilityId request
+    | .commitUnknown evidence =>
+        after = before ∧
+          ∃ caller capabilityId request,
+            event.command = .effectAttempt caller capabilityId request ∧
+              before.Authorizes caller capabilityId request ∧
+              evidence.token ≠ [] ∧
+              evidence.token.length ≤ commitUnknownEvidenceMaximumBytes
+    | .commitUnknownAndAudit evidence =>
+        after = before ∧
+          ∃ caller capabilityId request,
+            event.command = .effectAttempt caller capabilityId request ∧
+              before.Authorizes caller capabilityId request ∧
+              evidence.token ≠ [] ∧
+              evidence.token.length ≤ commitUnknownEvidenceMaximumBytes
     | .allocatorExhausted =>
         after = before.exhaustAllocator ∧
           FirstAllocationExhaustion event.command before
@@ -450,6 +480,8 @@ def checkEvent (before : ModelState) (event : Event)
     | .accepted => some ⟨candidate.after, version, candidate.outcomeValid⟩
     | .rejectedNoEffect _ => some ⟨candidate.after, version, candidate.outcomeValid⟩
     | .effectFailedBeforeCommit => some ⟨candidate.after, version, candidate.outcomeValid⟩
+    | .commitUnknown _ => some ⟨candidate.after, version, candidate.outcomeValid⟩
+    | .commitUnknownAndAudit _ => some ⟨candidate.after, version, candidate.outcomeValid⟩
     | .allocatorExhausted => some ⟨candidate.after, version, candidate.outcomeValid⟩
     | .revocationCommittedButPropagationError =>
         some ⟨candidate.after, version, candidate.outcomeValid⟩
@@ -482,6 +514,16 @@ theorem CheckedEvent.forwardSimulation {before : ModelState} {event : Event}
       rw [validOutcome.1]
       exact .refl before
   | effectFailedBeforeCommit =>
+      simp only [Event.ValidOutcome, outcomeEq] at validOutcome
+      change after = before ∧ _ at validOutcome
+      rw [validOutcome.1]
+      exact .refl before
+  | commitUnknown =>
+      simp only [Event.ValidOutcome, outcomeEq] at validOutcome
+      change after = before ∧ _ at validOutcome
+      rw [validOutcome.1]
+      exact .refl before
+  | commitUnknownAndAudit =>
       simp only [Event.ValidOutcome, outcomeEq] at validOutcome
       change after = before ∧ _ at validOutcome
       rw [validOutcome.1]
@@ -646,8 +688,10 @@ theorem first_allocator_exhaustion_forwardSimulation {state : ModelState}
   exact .tail (.refl state) (.allocatorExhausted failure.scanEvidence)
 
 private def witnessSubject : SubjectId := ⟨"checked-subject"⟩
+private def foreignWitnessSubject : SubjectId := ⟨"foreign-subject"⟩
 private def witnessHandleId : HandleId := ⟨"checked-handle"⟩
 private def witnessObject : ObjectId := ⟨"checked-object"⟩
+private def witnessCapabilityId : CapId := ⟨"checked-capability"⟩
 
 private def witnessEnvelope : StaticAuthorityEnvelope where
   validity := {
@@ -683,6 +727,41 @@ private def witnessHandle : OpenHandle where
 private def witnessState : ModelState :=
   (Authority.CapabilityState.empty ⟨"checked-issuer"⟩).registerSubject
     witnessSubjectRecord
+
+private def witnessCapabilityGrant : CapabilityGrant where
+  subject := witnessSubject
+  validity := witnessEnvelope.validity
+  authority := witnessEnvelope.authority
+  delegable := true
+
+private def witnessCapabilityState : ModelState :=
+  witnessState.issue witnessCapabilityId none witnessCapabilityGrant
+
+private def foreignRevokeEvent : Event where
+  schemaVersion := observationSchemaVersion
+  command := .revoke foreignWitnessSubject witnessCapabilityId
+  outcome := .rejectedNoEffect .capabilityNotHeld
+
+private def foreignRevokeCandidate :
+    EventCandidate witnessCapabilityState foreignRevokeEvent :=
+  ⟨witnessCapabilityState, by
+    refine ⟨rfl, .revokeCapabilityNotHeld ?_ ?_⟩
+    · exact ⟨witnessState.capabilityFromGrant witnessCapabilityId none
+        witnessCapabilityGrant, by
+          simp [witnessCapabilityState, Authority.CapabilityState.issue]⟩
+    · simp [witnessCapabilityState, witnessState, witnessCapabilityGrant,
+        witnessSubject, foreignWitnessSubject, Authority.CapabilityState.issue,
+        Authority.CapabilityState.registerSubject, Authority.CapabilityState.HeldBy,
+        Authority.CapabilityState.empty, replace]⟩
+
+/-- A concrete foreign caller is rejected without changing the capability state. -/
+theorem foreign_revoke_capabilityNotHeld_witness :
+    ∃ checked,
+      checkEvent witnessCapabilityState foreignRevokeEvent foreignRevokeCandidate =
+          some checked ∧
+        checked.after = witnessCapabilityState := by
+  simp [checkEvent, foreignRevokeCandidate, foreignRevokeEvent,
+    observationSchemaVersion]
 
 /-- The concrete trace begins in a reachable, structurally well-formed state. -/
 theorem witnessState_structuralWellFormed : witnessState.StructuralWellFormed := by

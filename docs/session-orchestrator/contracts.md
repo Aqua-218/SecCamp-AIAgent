@@ -118,7 +118,7 @@ orchestrator は前段の cleanup が失敗しても、後段の safe な cleanu
 
 ## 検証状態
 
-この契約の state machine test は mock backend で実行される。実 Authority Core、実 capfs、実 Broker/vsock、実 Firecracker、実 guest supervisor へ接続する integration test はまだない。
+この契約の state machine test に加え、production adapter composition test は実 `CapabilityKernel`、Broker / Firecracker / workspace adapter を同じ startup/stop 経路へ接続する。外部 command、filesystem、API、listener は test double であり、実 capfs mount、実 `AF_VSOCK`、実 Firecracker、特権 guest isolation の end-to-end test はまだない。
 
 ## 関連
 

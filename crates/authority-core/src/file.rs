@@ -29,10 +29,29 @@ pub enum FileEffect {
     Rename,
     /// Changes supported metadata such as mode or timestamps.
     SetMetadata,
+    /// Reads a symbolic link's target without following it.
+    ReadLink,
+    /// Creates a symbolic link.
+    CreateSymlink,
+    /// Creates an additional name for an existing inode.
+    CreateHardLink,
 }
 
 impl FileEffect {
+    /// The highest discriminant the [`FileEffects`] bitset can represent.
+    ///
+    /// New effects must be appended so that existing discriminants keep their
+    /// bit positions: a durable audit record encodes the effect it authorized,
+    /// and renumbering would silently reinterpret past receipts.
+    const MAX_DISCRIMINANT: u8 = 15;
+
     const fn mask(self) -> u16 {
+        const {
+            assert!(
+                FileEffect::CreateHardLink as u8 <= FileEffect::MAX_DISCRIMINANT,
+                "FileEffects is a u16 bitset; the last effect must fit in it"
+            );
+        }
         1_u16 << (self as u8)
     }
 }

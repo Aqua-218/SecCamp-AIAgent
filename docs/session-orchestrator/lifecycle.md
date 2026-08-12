@@ -78,18 +78,18 @@ startup rollback が失敗した場合も同じ。`finish_failed_start` は失�
 
 保持しないと、解放できなかった resource の lease が消える。retry する手段が無くなり、orchestrator は漏れた resource の隣で新しい session を始めてしまう。
 
-## 埋まらない穴が 1 つある
+## workspace の lease 検証失敗も rollback する
 
-workspace の lease 検証が失敗したときだけ、rollback が走らない。
+lease 検証はどの stage でも次へ進む条件だが、workspace だけは `active` を作る前に起きる。
 
 ```text
 clone_workspace が成功
   -> validate_workspace が失敗
-  -> StartError を返す
-  -> isolate_workspace を呼ばない、active も作らない
+  -> isolate_workspace で clone を解放
+  -> 失敗したら rollback_failures に載せて StartError を返す
 ```
 
-物理的な clone directory が、lease も返らないまま残る。他の全 stage は rollback するが、ここだけしない。**test も無い。**
+`active` がまだ無いので通常の rollback 経路には乗らない。ここで解放しないと、物理的な clone directory が lease も返らないまま host に残り、到達手段が消える。`foreign_workspace_lease_isolates_the_clone_before_returning` が、`workspace.clone` と `workspace.isolate` だけが呼ばれ、以降の backend に触れないことを固定している。
 
 ## 状態 enum の半分は観測できない
 
@@ -114,7 +114,7 @@ clone_workspace が成功
 ## 正確な保証範囲
 
 - backend はすべて trait 越し。この file が行う I/O は ledger file と `/dev/urandom` だけ。
-- `MockWorkspace.foreign_session` を設定する test が 1 つも無い。`validate_workspace` の `CrossSessionLease` と `LeaseIdentityMismatch` は両方とも未検証で、そこから生じる clone の漏れも未検証。
+- `validate_workspace` の `CrossSessionLease` 経路と、その rollback は test 済み。`LeaseIdentityMismatch` 側の分岐は未検証。
 - `StopError::Cleanup` が空の failure vector を持つ場合（flag が false で lease が `None`）は、`Stopping` に永久に固着する。structural には防いでいない。test も無い。
 - `rollback_failures` の完全性を確認する test が無い。gate で飛ばされた stage は failure に現れないが、その挙動を固定した test が無い。
 - production adapter の test は外部境界を全部 fake に置き換えている。identity が adapter を貫通することは示すが、Firecracker が起動すること、dm-verity や seccomp が適用されること、実 `AF_VSOCK` が bind することは示さない。

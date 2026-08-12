@@ -135,6 +135,7 @@ pub struct NamespaceMove {
     object: ObjectId,
     source: CanonicalPath,
     destination: CanonicalPath,
+    kind: NamespaceObjectKind,
 }
 
 impl NamespaceMove {
@@ -154,6 +155,12 @@ impl NamespaceMove {
     #[must_use]
     pub const fn destination(&self) -> &CanonicalPath {
         &self.destination
+    }
+
+    /// Returns the namespace kind that the backing rename must preserve.
+    #[must_use]
+    pub const fn kind(&self) -> NamespaceObjectKind {
+        self.kind
     }
 }
 
@@ -798,29 +805,54 @@ impl NamespaceRegistry {
             .get(object)
             .cloned()
             .ok_or_else(|| NamespaceError::UnknownObject(object.clone()))?;
-        if object_record.path.is_root() {
-            return Err(NamespaceError::CannotModifyRoot.into());
-        }
-        if object_record.open_handle_count != 0 {
-            return Err(NamespaceError::OpenHandleInSubtree(object.clone()).into());
-        }
-        if state.objects.values().any(|candidate| {
-            candidate.id != object_record.id && candidate.path.is_at_or_below(&object_record.path)
-        }) {
-            return Err(NamespaceError::DirectoryNotEmpty(object.clone()).into());
-        }
-        let next_generation = state.next_generation()?;
-        let mut next_state = state.clone();
-        if next_state.objects.remove(object).is_none()
-            || next_state.paths.remove(&object_record.path).is_none()
-        {
-            return Err(NamespaceError::InvariantViolation.into());
-        }
-        next_state.generation = next_generation;
+        remove_record(&mut state, &object_record, operation)
+    }
 
-        let result = operation(&object_record).map_err(NamespaceOperationError::Executor)?;
-        *state = next_state;
-        Ok(result)
+    /// Removes a direct child of its current parent as one namespace transaction.
+    ///
+    /// Both the parent-relative lookup and the removal executor run under the
+    /// writer lock. This prevents a FUSE `UNLINK` or `RMDIR` request from
+    /// resolving one name and later removing the same object after it has been
+    /// renamed somewhere else. The executor receives the live parent record so
+    /// its backing operation can use a validated parent descriptor directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown or non-directory parent, invalid or
+    /// missing child name, root removal, live handles, a non-empty directory,
+    /// exhausted generation, poisoned registry, or backing operation failure.
+    pub fn remove_child<T, E>(
+        &self,
+        parent: &ObjectId,
+        child_name: &str,
+        operation: impl FnOnce(&NamespaceObject, &NamespaceObject) -> Result<T, E>,
+    ) -> Result<T, NamespaceOperationError<E>> {
+        let mut state = self.write_state()?;
+        let parent_record = state
+            .objects
+            .get(parent)
+            .cloned()
+            .ok_or_else(|| NamespaceError::UnknownObject(parent.clone()))?;
+        if parent_record.kind != NamespaceObjectKind::Directory {
+            return Err(NamespaceError::ParentNotDirectory(parent_record.path.clone()).into());
+        }
+        let child_path = parent_record
+            .path
+            .child(child_name)
+            .map_err(NamespaceError::InvalidChildName)?;
+        let child_id = state
+            .paths
+            .get(&child_path)
+            .ok_or_else(|| NamespaceError::UnknownPath(child_path.clone()))?;
+        let child_record = state
+            .objects
+            .get(child_id)
+            .cloned()
+            .ok_or(NamespaceError::InvariantViolation)?;
+
+        remove_record(&mut state, &child_record, |child| {
+            operation(&parent_record, child)
+        })
     }
 
     fn create_child_with_open_count<T, E>(
@@ -887,68 +919,55 @@ impl NamespaceRegistry {
         operation: impl FnOnce(&RenamePlan) -> Result<T, E>,
     ) -> Result<T, NamespaceOperationError<E>> {
         let mut state = self.write_state()?;
-        if source.is_root() {
-            return Err(NamespaceError::CannotModifyRoot.into());
-        }
-        if !state.paths.contains_key(source) {
-            return Err(NamespaceError::UnknownPath(source.clone()).into());
-        }
-        if state.paths.contains_key(&destination) {
-            return Err(NamespaceError::PathOccupied(destination).into());
-        }
-        if destination.is_at_or_below(source) {
-            return Err(NamespaceError::DestinationInsideSource.into());
-        }
-        state.validate_parent(&destination)?;
+        rename_records(&mut state, source.clone(), destination, operation)
+    }
 
-        let mut moved_objects = Vec::new();
-        for object in state
+    /// Renames a direct child between current parent objects without replacement.
+    ///
+    /// Both names are constructed after the writer lock resolves the two
+    /// parent identities. A parent rename therefore cannot turn an authorized
+    /// FUSE `RENAME` source or destination into a different backing path before
+    /// the no-replace rename reaches its linearization point.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unknown or non-directory parents, invalid names,
+    /// a missing source, occupied destination, a destination inside the source
+    /// subtree, live handles, exhausted generation, poisoned registry, or
+    /// backing operation failure.
+    pub fn rename_child<T, E>(
+        &self,
+        source_parent: &ObjectId,
+        source_name: &str,
+        destination_parent: &ObjectId,
+        destination_name: &str,
+        operation: impl FnOnce(&RenamePlan) -> Result<T, E>,
+    ) -> Result<T, NamespaceOperationError<E>> {
+        let mut state = self.write_state()?;
+        let source_parent = state
             .objects
-            .values()
-            .filter(|object| object.path.is_at_or_below(source))
-        {
-            if object.open_handle_count != 0 {
-                return Err(NamespaceError::OpenHandleInSubtree(object.id.clone()).into());
-            }
-            let Some(rebased_path) = object.path.rebase(source, &destination) else {
-                return Err(NamespaceError::InvariantViolation.into());
-            };
-            moved_objects.push(NamespaceMove {
-                object: object.id.clone(),
-                source: object.path.clone(),
-                destination: rebased_path,
-            });
+            .get(source_parent)
+            .ok_or_else(|| NamespaceError::UnknownObject(source_parent.clone()))?;
+        if source_parent.kind != NamespaceObjectKind::Directory {
+            return Err(NamespaceError::ParentNotDirectory(source_parent.path.clone()).into());
         }
+        let source = source_parent
+            .path
+            .child(source_name)
+            .map_err(NamespaceError::InvalidChildName)?;
+        let destination_parent = state
+            .objects
+            .get(destination_parent)
+            .ok_or_else(|| NamespaceError::UnknownObject(destination_parent.clone()))?;
+        if destination_parent.kind != NamespaceObjectKind::Directory {
+            return Err(NamespaceError::ParentNotDirectory(destination_parent.path.clone()).into());
+        }
+        let destination = destination_parent
+            .path
+            .child(destination_name)
+            .map_err(NamespaceError::InvalidChildName)?;
 
-        let next_generation = state.next_generation()?;
-        let plan = RenamePlan {
-            source: source.clone(),
-            destination,
-            moved_objects,
-        };
-        let mut next_state = state.clone();
-        for movement in &plan.moved_objects {
-            if next_state.paths.remove(&movement.source).is_none() {
-                return Err(NamespaceError::InvariantViolation.into());
-            }
-        }
-        for movement in &plan.moved_objects {
-            if next_state.paths.contains_key(&movement.destination) {
-                return Err(NamespaceError::PathOccupied(movement.destination.clone()).into());
-            }
-            let Some(object) = next_state.objects.get_mut(&movement.object) else {
-                return Err(NamespaceError::InvariantViolation.into());
-            };
-            object.path.clone_from(&movement.destination);
-            next_state
-                .paths
-                .insert(movement.destination.clone(), movement.object.clone());
-        }
-        next_state.generation = next_generation;
-
-        let result = operation(&plan).map_err(NamespaceOperationError::Executor)?;
-        *state = next_state;
-        Ok(result)
+        rename_records(&mut state, source, destination, operation)
     }
 
     fn read_state(&self) -> Result<RwLockReadGuard<'_, NamespaceState>, NamespaceError> {
@@ -958,6 +977,107 @@ impl NamespaceRegistry {
     fn write_state(&self) -> Result<RwLockWriteGuard<'_, NamespaceState>, NamespaceError> {
         self.state.write().map_err(|_| NamespaceError::LockPoisoned)
     }
+}
+
+fn remove_record<T, E>(
+    state: &mut NamespaceState,
+    object_record: &NamespaceObject,
+    operation: impl FnOnce(&NamespaceObject) -> Result<T, E>,
+) -> Result<T, NamespaceOperationError<E>> {
+    if object_record.path.is_root() {
+        return Err(NamespaceError::CannotModifyRoot.into());
+    }
+    if object_record.open_handle_count != 0 {
+        return Err(NamespaceError::OpenHandleInSubtree(object_record.id.clone()).into());
+    }
+    if state.objects.values().any(|candidate| {
+        candidate.id != object_record.id && candidate.path.is_at_or_below(&object_record.path)
+    }) {
+        return Err(NamespaceError::DirectoryNotEmpty(object_record.id.clone()).into());
+    }
+    let next_generation = state.next_generation()?;
+    let mut next_state = state.clone();
+    if next_state.objects.remove(&object_record.id).is_none()
+        || next_state.paths.remove(&object_record.path).is_none()
+    {
+        return Err(NamespaceError::InvariantViolation.into());
+    }
+    next_state.generation = next_generation;
+
+    let result = operation(object_record).map_err(NamespaceOperationError::Executor)?;
+    *state = next_state;
+    Ok(result)
+}
+
+fn rename_records<T, E>(
+    state: &mut NamespaceState,
+    source: CanonicalPath,
+    destination: CanonicalPath,
+    operation: impl FnOnce(&RenamePlan) -> Result<T, E>,
+) -> Result<T, NamespaceOperationError<E>> {
+    if source.is_root() {
+        return Err(NamespaceError::CannotModifyRoot.into());
+    }
+    if !state.paths.contains_key(&source) {
+        return Err(NamespaceError::UnknownPath(source).into());
+    }
+    if state.paths.contains_key(&destination) {
+        return Err(NamespaceError::PathOccupied(destination).into());
+    }
+    if destination.is_at_or_below(&source) {
+        return Err(NamespaceError::DestinationInsideSource.into());
+    }
+    state.validate_parent(&destination)?;
+
+    let mut moved_objects = Vec::new();
+    for object in state
+        .objects
+        .values()
+        .filter(|object| object.path.is_at_or_below(&source))
+    {
+        if object.open_handle_count != 0 {
+            return Err(NamespaceError::OpenHandleInSubtree(object.id.clone()).into());
+        }
+        let Some(rebased_path) = object.path.rebase(&source, &destination) else {
+            return Err(NamespaceError::InvariantViolation.into());
+        };
+        moved_objects.push(NamespaceMove {
+            object: object.id.clone(),
+            source: object.path.clone(),
+            destination: rebased_path,
+            kind: object.kind,
+        });
+    }
+
+    let next_generation = state.next_generation()?;
+    let plan = RenamePlan {
+        source,
+        destination,
+        moved_objects,
+    };
+    let mut next_state = state.clone();
+    for movement in &plan.moved_objects {
+        if next_state.paths.remove(&movement.source).is_none() {
+            return Err(NamespaceError::InvariantViolation.into());
+        }
+    }
+    for movement in &plan.moved_objects {
+        if next_state.paths.contains_key(&movement.destination) {
+            return Err(NamespaceError::PathOccupied(movement.destination.clone()).into());
+        }
+        let Some(object) = next_state.objects.get_mut(&movement.object) else {
+            return Err(NamespaceError::InvariantViolation.into());
+        };
+        object.path.clone_from(&movement.destination);
+        next_state
+            .paths
+            .insert(movement.destination.clone(), movement.object.clone());
+    }
+    next_state.generation = next_generation;
+
+    let result = operation(&plan).map_err(NamespaceOperationError::Executor)?;
+    *state = next_state;
+    Ok(result)
 }
 
 struct DisplayPath<'a>(&'a CanonicalPath);

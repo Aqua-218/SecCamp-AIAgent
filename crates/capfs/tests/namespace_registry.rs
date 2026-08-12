@@ -218,6 +218,112 @@ fn failed_child_creation_has_no_visible_namespace_effect() {
     );
 }
 
+// Requirement: UNLINK and RENAME derive both operation paths from live parent
+// identities while holding one write transaction. Category: namespace/race.
+// Risk: critical.
+#[test]
+fn child_mutations_use_current_parent_paths_and_preserve_object_kind() {
+    let registry = NamespaceRegistry::new();
+    let source_parent = create_object(&registry, path(&["source"]), NamespaceObjectKind::Directory);
+    let destination_parent = create_object(
+        &registry,
+        path(&["destination"]),
+        NamespaceObjectKind::Directory,
+    );
+    registry
+        .create_child(
+            &source_parent,
+            "entry.txt",
+            NamespaceObjectKind::RegularFile,
+            |_, _| Ok::<_, Infallible>(()),
+        )
+        .expect("test source child must be creatable");
+    registry
+        .rename_subtree(&path(&["source"]), path(&["renamed-source"]), |_| {
+            Ok::<_, Infallible>(())
+        })
+        .expect("test source parent rename must succeed");
+    registry
+        .rename_subtree(
+            &path(&["destination"]),
+            path(&["renamed-destination"]),
+            |_| Ok::<_, Infallible>(()),
+        )
+        .expect("test destination parent rename must succeed");
+
+    registry
+        .rename_child(
+            &source_parent,
+            "entry.txt",
+            &destination_parent,
+            "moved.txt",
+            |plan| {
+                assert_eq!(plan.source(), &path(&["renamed-source", "entry.txt"]));
+                assert_eq!(
+                    plan.destination(),
+                    &path(&["renamed-destination", "moved.txt"])
+                );
+                assert_eq!(plan.moved_objects().len(), 1);
+                assert_eq!(
+                    plan.moved_objects()[0].kind(),
+                    NamespaceObjectKind::RegularFile
+                );
+                Ok::<_, Infallible>(())
+            },
+        )
+        .expect("child rename must use the live parent paths");
+    let moved_path = path(&["renamed-destination", "moved.txt"]);
+    assert!(
+        registry
+            .object_at_path_snapshot(&moved_path)
+            .expect("namespace lookup must succeed")
+            .is_some()
+    );
+
+    registry
+        .remove_child(&destination_parent, "moved.txt", |parent, child| {
+            assert_eq!(parent.path(), &path(&["renamed-destination"]));
+            assert_eq!(child.path(), &moved_path);
+            assert_eq!(child.kind(), NamespaceObjectKind::RegularFile);
+            Ok::<_, Infallible>(())
+        })
+        .expect("child removal must use the live parent path");
+    assert_eq!(registry.object_at_path_snapshot(&moved_path), Ok(None));
+}
+
+// Requirement: a failed child removal does not publish its staged namespace
+// state. Category: namespace/atomicity. Risk: critical.
+#[test]
+fn failed_child_removal_preserves_the_named_object_and_generation() {
+    let registry = NamespaceRegistry::new();
+    let parent = create_object(&registry, path(&["parent"]), NamespaceObjectKind::Directory);
+    let child_path = path(&["parent", "entry.txt"]);
+    create_object(
+        &registry,
+        child_path.clone(),
+        NamespaceObjectKind::RegularFile,
+    );
+    let generation = registry
+        .generation()
+        .expect("generation must be readable before failed removal");
+
+    assert_eq!(
+        registry.remove_child(&parent, "entry.txt", |_, _| Err::<(), _>(BackingFailure)),
+        Err(NamespaceOperationError::Executor(BackingFailure))
+    );
+    assert!(
+        registry
+            .object_at_path_snapshot(&child_path)
+            .expect("namespace lookup must succeed after failed removal")
+            .is_some()
+    );
+    assert_eq!(
+        registry.generation(),
+        Ok(generation),
+        "failed removal must not advance namespace generation"
+    );
+}
+
 // Requirement: child lookup validates the parent and name, then resolves the
 // child without releasing the namespace guard. Category: lookup/security. Risk: critical.
 #[test]

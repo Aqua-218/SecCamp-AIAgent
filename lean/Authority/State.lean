@@ -72,6 +72,23 @@ structure HandleId where
   value : String
   deriving Repr, BEq, DecidableEq
 
+instance : LawfulBEq HandleId where
+  eq_of_beq {a b} equal := by
+    cases a with
+    | mk aValue =>
+      cases b with
+      | mk bValue =>
+        change (aValue == bValue) = true at equal
+        have valuesEqual : aValue = bValue :=
+          LawfulBEq.eq_of_beq (α := String) equal
+        subst bValue
+        rfl
+  rfl {a} := by
+    cases a with
+    | mk value =>
+      change (value == value) = true
+      exact LawfulBEq.rfl
+
 /-- An opaque identity for one object in the shared filesystem namespace. -/
 structure ObjectId where
   value : String

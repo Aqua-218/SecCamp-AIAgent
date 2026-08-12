@@ -75,6 +75,7 @@ inductive Success where
 inductive Failure where
   | setupBeforeRegistration (outcome : ResourceAcquisition)
   | setupAfterRegistration
+  | runtimeOpen (outcome : ResourceMutation)
   | handleRegistration
   | handleRegistrationCleanup
   | handleRegistrationUnknown
@@ -120,6 +121,8 @@ structure State where
   ownsControl : ResourceOwnership
   ownsWorkload : ResourceOwnership
   runtimeHandles : List HandleId
+  /-- Runtime-open identities whose external effect cannot be classified. -/
+  unresolvedRuntimeHandles : List HandleId
   authorityHandles : List HandleId
   pendingOpen : Option OpenHandle
   issuedSubjects : SubjectId → Bool
@@ -208,6 +211,7 @@ def initial (issuer : IssuerId) (subjectId : SubjectId) : State where
   ownsControl := .none
   ownsWorkload := .none
   runtimeHandles := []
+  unresolvedRuntimeHandles := []
   authorityHandles := []
   pendingOpen := none
   issuedSubjects := fun _ => false
@@ -298,6 +302,166 @@ theorem failAcquisition_preserves_allocator (state : State)
       (state.failAcquisition resource outcome).integrated.authority.capabilityIdsExhausted =
         state.integrated.authority.capabilityIdsExhausted := by
   cases resource <;> cases outcome <;> exact ⟨rfl, rfl⟩
+
+/-- Record a failed initial runtime open before any Authority registration attempt. -/
+def failRuntimeOpen (state : State) (handle : OpenHandle)
+    (outcome : ResourceMutation) : State :=
+  let reserved :=
+    { state with issuedHandles := replace state.issuedHandles handle.id true }
+  match outcome with
+  | .noEffect => reserved
+  | .cleanupRequired =>
+      { reserved with
+        lifecycle := .closing
+        runtimeHandles := handle.id :: state.runtimeHandles }
+  | .effectUnknown =>
+      { reserved with
+        lifecycle := .cleanupBlocked
+        unresolvedRuntimeHandles := handle.id :: state.unresolvedRuntimeHandles }
+
+/-- Every failed runtime open consumes only the supervisor-local identity. -/
+theorem failRuntimeOpen_reserves_local_only (state : State) (handle : OpenHandle)
+    (outcome : ResourceMutation) :
+    (state.failRuntimeOpen handle outcome).issuedHandles handle.id = true ∧
+      (state.failRuntimeOpen handle outcome).integrated = state.integrated ∧
+      (state.failRuntimeOpen handle outcome).integrated.authority.issuedHandleOwners =
+        state.integrated.authority.issuedHandleOwners := by
+  cases outcome <;> simp [failRuntimeOpen]
+
+/-- A definitely failed open retains no runtime or unresolved ownership. -/
+theorem failRuntimeOpen_noEffect_exact (state : State) (handle : OpenHandle) :
+    (state.failRuntimeOpen handle .noEffect).runtimeHandles = state.runtimeHandles ∧
+      (state.failRuntimeOpen handle .noEffect).unresolvedRuntimeHandles =
+        state.unresolvedRuntimeHandles ∧
+      (state.failRuntimeOpen handle .noEffect).lifecycle = state.lifecycle := by
+  simp [failRuntimeOpen]
+
+/-- A cleanup-required open owns the known descriptor and enters cleanup. -/
+theorem failRuntimeOpen_cleanupRequired_exact (state : State)
+    (handle : OpenHandle) :
+    (state.failRuntimeOpen handle .cleanupRequired).RuntimeOwns handle.id ∧
+      (state.failRuntimeOpen handle .cleanupRequired).lifecycle = .closing ∧
+      (state.failRuntimeOpen handle .cleanupRequired).unresolvedRuntimeHandles =
+        state.unresolvedRuntimeHandles := by
+  simp [failRuntimeOpen, RuntimeOwns]
+
+/-- An unknown initial open is retained as unresolved and cannot enter cleanup. -/
+theorem failRuntimeOpen_effectUnknown_exact (state : State)
+    (handle : OpenHandle) :
+    handle.id ∈ (state.failRuntimeOpen handle .effectUnknown).unresolvedRuntimeHandles ∧
+      (state.failRuntimeOpen handle .effectUnknown).lifecycle = .cleanupBlocked ∧
+      (state.failRuntimeOpen handle .effectUnknown).runtimeHandles =
+        state.runtimeHandles := by
+  simp [failRuntimeOpen]
+
+/-- No-effect open failure changes only the permanent local handle tombstone. -/
+theorem failRuntimeOpen_noEffect_local_tombstone_only (state : State)
+    (handle : OpenHandle) :
+    (state.failRuntimeOpen handle .noEffect).issuedHandles handle.id = true ∧
+      (state.failRuntimeOpen handle .noEffect).integrated = state.integrated ∧
+      (state.failRuntimeOpen handle .noEffect).runtimeHandles = state.runtimeHandles ∧
+      (state.failRuntimeOpen handle .noEffect).unresolvedRuntimeHandles =
+        state.unresolvedRuntimeHandles ∧
+      (state.failRuntimeOpen handle .noEffect).lifecycle = state.lifecycle := by
+  exact ⟨(failRuntimeOpen_reserves_local_only state handle .noEffect).1,
+    (failRuntimeOpen_reserves_local_only state handle .noEffect).2.1,
+    failRuntimeOpen_noEffect_exact state handle⟩
+
+/-- Initial runtime-open failure never consumes an Authority handle identity. -/
+theorem failRuntimeOpen_authority_identity_unchanged (state : State)
+    (handle : OpenHandle) (outcome : ResourceMutation) :
+    (state.failRuntimeOpen handle outcome).integrated.authority.issuedHandleOwners =
+      state.integrated.authority.issuedHandleOwners :=
+  (failRuntimeOpen_reserves_local_only state handle outcome).2.2
+
+/-- Initial runtime-open failures preserve every cross-component invariant. -/
+theorem Invariant.failRuntimeOpen {state : State} (invariant : state.Invariant)
+    {handle : OpenHandle} (fresh : state.issuedHandles handle.id = false)
+    (outcome : ResourceMutation) :
+    (state.failRuntimeOpen handle outcome).Invariant := by
+  let reserved : State :=
+    { state with issuedHandles := replace state.issuedHandles handle.id true }
+  have reservedInvariant : reserved.Invariant := by
+    constructor
+    · exact invariant.integratedWellFormed
+    · simpa [reserved] using invariant.knownSubjectIssued
+    · simpa [reserved] using invariant.registeredSubjectExact
+    · simpa [reserved] using invariant.authoritySubjectIssued
+    · intro handleId managed owner
+      by_cases sameId : handleId = handle.id
+      · subst handleId
+        simp [reserved]
+      · have oldIssued := invariant.selectedManagedHandleIssued handleId managed owner
+        simpa [reserved, replace, sameId] using oldIssued
+    · simpa [reserved] using invariant.runtimeHandlesNodup
+    · simpa [reserved] using invariant.authorityHandlesNodup
+    · intro handleId runtimeOwned
+      have oldIssued := invariant.runtimeHandleIssued handleId runtimeOwned
+      by_cases sameId : handleId = handle.id
+      · subst handleId
+        simp [reserved]
+      · simpa [reserved, replace, sameId] using oldIssued
+    · simpa [reserved] using invariant.authorityHandleSound
+    · simpa [reserved] using invariant.authorityHandleRuntimeOwned
+    · simpa [reserved] using invariant.pendingRuntimeOwned
+    · intro pendingHandle pending
+      have oldIssued := invariant.pendingHandleIssued pendingHandle pending
+      by_cases sameId : pendingHandle.id = handle.id
+      · rw [sameId]
+        simp [reserved]
+      · simpa [reserved, replace, sameId] using oldIssued
+  cases outcome with
+  | noEffect =>
+      simpa [failRuntimeOpen, reserved] using reservedInvariant
+  | cleanupRequired =>
+      have notRuntime : handle.id ∉ state.runtimeHandles := by
+        intro runtimeOwned
+        have issued := invariant.runtimeHandleIssued handle.id runtimeOwned
+        rw [fresh] at issued
+        cases issued
+      constructor
+      · exact invariant.integratedWellFormed
+      · simpa [failRuntimeOpen, reserved] using invariant.knownSubjectIssued
+      · simpa [failRuntimeOpen, reserved] using invariant.registeredSubjectExact
+      · simpa [failRuntimeOpen, reserved] using invariant.authoritySubjectIssued
+      · simpa [failRuntimeOpen, reserved] using
+          reservedInvariant.selectedManagedHandleIssued
+      · change (handle.id :: state.runtimeHandles).Nodup
+        simp only [List.nodup_cons]
+        exact ⟨notRuntime, invariant.runtimeHandlesNodup⟩
+      · simpa [failRuntimeOpen, reserved] using invariant.authorityHandlesNodup
+      · intro handleId runtimeOwned
+        change handleId ∈ handle.id :: state.runtimeHandles at runtimeOwned
+        cases runtimeOwned with
+        | head => exact
+            (failRuntimeOpen_reserves_local_only state handle .cleanupRequired).1
+        | tail _ oldOwned =>
+            simpa [failRuntimeOpen, reserved] using
+              reservedInvariant.runtimeHandleIssued handleId oldOwned
+      · simpa [failRuntimeOpen, reserved] using invariant.authorityHandleSound
+      · intro handleId authorityOwned
+        exact List.mem_cons_of_mem handle.id
+          (invariant.authorityHandleRuntimeOwned handleId authorityOwned)
+      · intro pendingHandle pending
+        exact List.mem_cons_of_mem handle.id
+          (invariant.pendingRuntimeOwned pendingHandle pending)
+      · simpa [failRuntimeOpen, reserved] using reservedInvariant.pendingHandleIssued
+  | effectUnknown =>
+      constructor
+      · simpa [failRuntimeOpen, reserved] using reservedInvariant.integratedWellFormed
+      · simpa [failRuntimeOpen, reserved] using reservedInvariant.knownSubjectIssued
+      · simpa [failRuntimeOpen, reserved] using reservedInvariant.registeredSubjectExact
+      · simpa [failRuntimeOpen, reserved] using reservedInvariant.authoritySubjectIssued
+      · simpa [failRuntimeOpen, reserved] using
+          reservedInvariant.selectedManagedHandleIssued
+      · simpa [failRuntimeOpen, reserved] using reservedInvariant.runtimeHandlesNodup
+      · simpa [failRuntimeOpen, reserved] using reservedInvariant.authorityHandlesNodup
+      · simpa [failRuntimeOpen, reserved] using reservedInvariant.runtimeHandleIssued
+      · simpa [failRuntimeOpen, reserved] using reservedInvariant.authorityHandleSound
+      · simpa [failRuntimeOpen, reserved] using
+          reservedInvariant.authorityHandleRuntimeOwned
+      · simpa [failRuntimeOpen, reserved] using reservedInvariant.pendingRuntimeOwned
+      · simpa [failRuntimeOpen, reserved] using reservedInvariant.pendingHandleIssued
 
 /-- Reserve and open one runtime descriptor before Authority registration. -/
 def beginOpen (state : State) (handle : OpenHandle) : State :=
@@ -568,8 +732,29 @@ theorem failed_registered_create_reserves_subject {state : State}
   exact ⟨CreateStep.failAfterRegistration known creating registered, rfl,
     invariant.knownSubjectIssued known⟩
 
-/-- Multi-stage runtime handle open, including both compensation outcomes. -/
+/-- Multi-stage runtime handle open, including initial and registration failures. -/
 inductive OpenStep : State → ResultLabel → State → Prop
+  | runtimeOpenFailedNoEffect {state : State} {handle : OpenHandle} :
+      state.known = true → state.lifecycle = .running →
+      state.pendingOpen = none →
+      handle.subject = state.subject.id →
+      state.issuedHandles handle.id = false →
+      OpenStep state (.error (.runtimeOpen .noEffect))
+        (state.failRuntimeOpen handle .noEffect)
+  | runtimeOpenFailedCleanupRequired {state : State} {handle : OpenHandle} :
+      state.known = true → state.lifecycle = .running →
+      state.pendingOpen = none →
+      handle.subject = state.subject.id →
+      state.issuedHandles handle.id = false →
+      OpenStep state (.error (.runtimeOpen .cleanupRequired))
+        (state.failRuntimeOpen handle .cleanupRequired)
+  | runtimeOpenFailedEffectUnknown {state : State} {handle : OpenHandle} :
+      state.known = true → state.lifecycle = .running →
+      state.pendingOpen = none →
+      handle.subject = state.subject.id →
+      state.issuedHandles handle.id = false →
+      OpenStep state (.error (.runtimeOpen .effectUnknown))
+        (state.failRuntimeOpen handle .effectUnknown)
   | openRuntime {state : State} {handle : OpenHandle} :
       state.known = true → state.lifecycle = .running →
       state.pendingOpen = none →
@@ -613,6 +798,12 @@ theorem OpenStep.preserves_invariant {before after : State}
     {result : ResultLabel} (transition : OpenStep before result after)
     (invariant : before.Invariant) : after.Invariant := by
   cases transition with
+  | runtimeOpenFailedNoEffect known running noPending subjectMatches fresh =>
+      exact invariant.failRuntimeOpen fresh .noEffect
+  | runtimeOpenFailedCleanupRequired known running noPending subjectMatches fresh =>
+      exact invariant.failRuntimeOpen fresh .cleanupRequired
+  | runtimeOpenFailedEffectUnknown known running noPending subjectMatches fresh =>
+      exact invariant.failRuntimeOpen fresh .effectUnknown
   | openRuntime known running noPending subjectMatches fresh =>
       rename_i handle
       have notRuntime : handle.id ∉ before.runtimeHandles := by
@@ -1197,6 +1388,36 @@ theorem cleanupBlocked_is_terminal {state : State}
   rintro ⟨result, after, transition⟩
   cases transition <;> simp_all
 
+/-- A cleanup-required initial open retains a known descriptor for immediate retry. -/
+theorem runtimeOpen_cleanupRequired_cleanup_retriable {state : State}
+    {handle : OpenHandle} (invariant : state.Invariant)
+    (noPending : state.pendingOpen = none)
+    (fresh : state.issuedHandles handle.id = false) :
+    CleanupStep (state.failRuntimeOpen handle .cleanupRequired)
+      (.ok .closeRuntimeHandle)
+      ((state.failRuntimeOpen handle .cleanupRequired).closeRuntimeOnly handle.id) := by
+  have notAuthority : ¬ state.AuthorityOwns handle.id := by
+    intro authorityOwned
+    have runtimeOwned :=
+      invariant.authorityHandleRuntimeOwned handle.id authorityOwned
+    have issued := invariant.runtimeHandleIssued handle.id runtimeOwned
+    rw [fresh] at issued
+    cases issued
+  apply CleanupStep.closeRuntimeOnly
+  · exact (State.failRuntimeOpen_cleanupRequired_exact state handle).2.1
+  · exact (State.failRuntimeOpen_cleanupRequired_exact state handle).1
+  · simpa [State.failRuntimeOpen, State.AuthorityOwns] using notAuthority
+  · simpa [State.failRuntimeOpen] using noPending
+
+/-- An unknown initial open is fail-stopped because no cleanup token is known. -/
+theorem runtimeOpen_effectUnknown_cleanup_blocked (state : State)
+    (handle : OpenHandle) :
+    (state.failRuntimeOpen handle .effectUnknown).lifecycle = .cleanupBlocked ∧
+      ¬ ∃ result after,
+        CleanupStep (state.failRuntimeOpen handle .effectUnknown) result after := by
+  have blocked := (State.failRuntimeOpen_effectUnknown_exact state handle).2.1
+  exact ⟨blocked, cleanupBlocked_is_terminal blocked⟩
+
 /-- A partial-open mutation with a known descriptor can immediately resume cleanup. -/
 theorem failOpenUnknown_cleanup_retriable {state : State} {handle : OpenHandle}
     (invariant : state.Invariant) (pending : state.pendingOpen = some handle)
@@ -1651,7 +1872,8 @@ theorem OpenStep.tombstones_extend {before after : State}
     TombstonesExtend before after := by
   cases transition <;> constructor <;> intro identity issued <;>
     simp_all [TombstonesExtend, State.beginOpen, State.commitOpen,
-      State.failOpenClean, State.failOpenRetained, State.failOpenUnknown, replace]
+      State.failRuntimeOpen, State.failOpenClean, State.failOpenRetained,
+      State.failOpenUnknown, replace]
 
 /-- Cleanup never removes a subject or handle tombstone. -/
 theorem CleanupStep.tombstones_extend {before after : State}
@@ -1856,6 +2078,12 @@ def openedInitial (issuer : IssuerId) (subjectId : SubjectId)
   commitOpen (beginOpen (runningInitial issuer subjectId) handle) handle
     (NamespaceState.rootObject (NamespaceState.allocatedObjectId 0))
 
+/-- Concrete initial runtime-open failure before any Authority handle registration. -/
+def failedRuntimeOpenInitial (issuer : IssuerId) (subjectId : SubjectId)
+    (handleId : HandleId) (outcome : ResourceMutation) : State :=
+  let handle := IntegratedHandleState.startupRootHandle subjectId handleId
+  (runningInitial issuer subjectId).failRuntimeOpen handle outcome
+
 /-- Concrete shutdown completion after releasing all local resources. -/
 def closedInitial (issuer : IssuerId) (subjectId : SubjectId) : State :=
   finishRegisteredShutdown (removeCgroup (unmount (closeControl
@@ -1945,6 +2173,142 @@ theorem runningInitial_steps (issuer : IssuerId) (subjectId : SubjectId) :
 theorem runningInitial_reachable (issuer : IssuerId) (subjectId : SubjectId) :
     Reachable (State.runningInitial issuer subjectId) :=
   (initial_reachable issuer subjectId).steps (runningInitial_steps issuer subjectId)
+
+/-- Every typed initial runtime-open failure has a concrete one-step Rust-order trace. -/
+theorem failedRuntimeOpenInitial_reachable (issuer : IssuerId)
+    (subjectId : SubjectId) (handleId : HandleId)
+    (outcome : ResourceMutation) :
+    Reachable (State.failedRuntimeOpenInitial issuer subjectId handleId outcome) := by
+  let running := State.runningInitial issuer subjectId
+  let handle := IntegratedHandleState.startupRootHandle subjectId handleId
+  have known : running.known = true := by
+    simp [running, State.runningInitial, State.registeredInitial,
+      State.publishRunning, State.startWorkload, State.registerSubject,
+      State.acquireControl, State.acquireMount, State.acquireCgroup,
+      State.reserveSubject, State.initial]
+  have runningLifecycle : running.lifecycle = .running := by
+    simp [running, State.runningInitial, State.publishRunning]
+  have noPending : running.pendingOpen = none := by
+    simp [running, State.runningInitial, State.registeredInitial,
+      State.publishRunning, State.startWorkload, State.registerSubject,
+      State.acquireControl, State.acquireMount, State.acquireCgroup,
+      State.reserveSubject, State.initial]
+  have subjectMatches : handle.subject = running.subject.id := by
+    simp [handle, running, State.runningInitial, State.registeredInitial,
+      State.publishRunning, State.startWorkload, State.registerSubject,
+      State.acquireControl, State.acquireMount, State.acquireCgroup,
+      State.reserveSubject, State.initial,
+      IntegratedHandleState.startupRootHandle,
+      IntegratedHandleState.startupSubject]
+  have fresh : running.issuedHandles handle.id = false := by
+    simp [handle, running, State.runningInitial, State.registeredInitial,
+      State.publishRunning, State.startWorkload, State.registerSubject,
+      State.acquireControl, State.acquireMount, State.acquireCgroup,
+      State.reserveSubject, State.initial]
+  have transition : Step running (.error (.runtimeOpen outcome))
+      (running.failRuntimeOpen handle outcome) := by
+    cases outcome with
+    | noEffect =>
+        exact .opening (OpenStep.runtimeOpenFailedNoEffect known runningLifecycle
+          noPending subjectMatches fresh)
+    | cleanupRequired =>
+        exact .opening (OpenStep.runtimeOpenFailedCleanupRequired known runningLifecycle
+          noPending subjectMatches fresh)
+    | effectUnknown =>
+        exact .opening (OpenStep.runtimeOpenFailedEffectUnknown known runningLifecycle
+          noPending subjectMatches fresh)
+  apply (runningInitial_reachable issuer subjectId).steps
+  simpa [State.failedRuntimeOpenInitial, running, handle] using
+    Steps.tail (Steps.refl running) transition
+
+/-- All three initial runtime-open failure classes are concretely non-vacuous. -/
+theorem concrete_runtimeOpenFailureStates_reachable (issuer : IssuerId)
+    (subjectId : SubjectId) (handleId : HandleId) :
+    Reachable (State.failedRuntimeOpenInitial issuer subjectId handleId .noEffect) ∧
+      Reachable (State.failedRuntimeOpenInitial issuer subjectId handleId
+        .cleanupRequired) ∧
+      Reachable (State.failedRuntimeOpenInitial issuer subjectId handleId
+        .effectUnknown) :=
+  ⟨failedRuntimeOpenInitial_reachable issuer subjectId handleId .noEffect,
+    failedRuntimeOpenInitial_reachable issuer subjectId handleId .cleanupRequired,
+    failedRuntimeOpenInitial_reachable issuer subjectId handleId .effectUnknown⟩
+
+/-- No concrete initial runtime-open failure reserves the identity in Authority. -/
+theorem failedRuntimeOpenInitial_authority_identity_unconsumed (issuer : IssuerId)
+    (subjectId : SubjectId) (handleId : HandleId)
+    (outcome : ResourceMutation) :
+    (State.failedRuntimeOpenInitial issuer subjectId handleId outcome).integrated.authority.issuedHandleOwners
+        handleId = none := by
+  let running := State.runningInitial issuer subjectId
+  let handle := IntegratedHandleState.startupRootHandle subjectId handleId
+  have unchanged := congrFun
+    (State.failRuntimeOpen_authority_identity_unchanged running handle outcome) handleId
+  calc
+    (State.failedRuntimeOpenInitial issuer subjectId handleId outcome).integrated.authority.issuedHandleOwners
+          handleId =
+        running.integrated.authority.issuedHandleOwners handleId := by
+          simpa [State.failedRuntimeOpenInitial, running, handle] using unchanged
+    _ = none := by
+      simp [running, State.runningInitial, State.registeredInitial,
+        State.publishRunning, State.startWorkload, State.registerSubject,
+        State.acquireControl, State.acquireMount, State.acquireCgroup,
+        State.reserveSubject, State.initial, IntegratedHandleState.withAuthority,
+        IntegratedHandleState.initial, IntegratedHandleState.initializeClosed,
+        CapabilityState.registerSubject, CapabilityState.empty]
+
+/-- The concrete cleanup-required failure owns a retryable runtime descriptor. -/
+theorem concrete_runtimeOpenCleanupRequired_retries (issuer : IssuerId)
+    (subjectId : SubjectId) (handleId : HandleId) :
+    ∃ after,
+      Step (State.failedRuntimeOpenInitial issuer subjectId handleId .cleanupRequired)
+        (.ok .closeRuntimeHandle) after ∧
+      Reachable after := by
+  let running := State.runningInitial issuer subjectId
+  let handle := IntegratedHandleState.startupRootHandle subjectId handleId
+  let failed := running.failRuntimeOpen handle .cleanupRequired
+  let after := failed.closeRuntimeOnly handle.id
+  have runningReachable := runningInitial_reachable issuer subjectId
+  have noPending : running.pendingOpen = none := by
+    simp [running, State.runningInitial, State.registeredInitial,
+      State.publishRunning, State.startWorkload, State.registerSubject,
+      State.acquireControl, State.acquireMount, State.acquireCgroup,
+      State.reserveSubject, State.initial]
+  have fresh : running.issuedHandles handle.id = false := by
+    simp [handle, running, State.runningInitial, State.registeredInitial,
+      State.publishRunning, State.startWorkload, State.registerSubject,
+      State.acquireControl, State.acquireMount, State.acquireCgroup,
+      State.reserveSubject, State.initial]
+  have cleanup : CleanupStep failed (.ok .closeRuntimeHandle) after := by
+    simpa [failed, after] using
+      runtimeOpen_cleanupRequired_cleanup_retriable
+        runningReachable.invariant noPending fresh
+  have cleanupStep : Step failed (.ok .closeRuntimeHandle) after := .cleanup cleanup
+  refine ⟨after, ?_, ?_⟩
+  · simpa [State.failedRuntimeOpenInitial, failed, running, handle] using cleanupStep
+  · exact (failedRuntimeOpenInitial_reachable issuer subjectId handleId
+      .cleanupRequired).steps (Steps.tail (Steps.refl failed) cleanupStep)
+
+/-- The concrete unknown-effect failure is unresolved and terminal for all supervisor steps. -/
+theorem concrete_runtimeOpenEffectUnknown_terminal (issuer : IssuerId)
+    (subjectId : SubjectId) (handleId : HandleId) :
+    let failed := State.failedRuntimeOpenInitial issuer subjectId handleId .effectUnknown
+    Reachable failed ∧ failed.Invariant ∧
+      handleId ∈ failed.unresolvedRuntimeHandles ∧
+      ¬ ∃ result after, Step failed result after := by
+  let running := State.runningInitial issuer subjectId
+  let handle := IntegratedHandleState.startupRootHandle subjectId handleId
+  let failed := State.failedRuntimeOpenInitial issuer subjectId handleId .effectUnknown
+  have reachable := failedRuntimeOpenInitial_reachable issuer subjectId handleId
+    .effectUnknown
+  have unresolved : handleId ∈ failed.unresolvedRuntimeHandles := by
+    simpa [failed, State.failedRuntimeOpenInitial, running, handle,
+      IntegratedHandleState.startupRootHandle] using
+      (State.failRuntimeOpen_effectUnknown_exact running handle).1
+  have blocked : failed.lifecycle = .cleanupBlocked := by
+    simpa [failed, State.failedRuntimeOpenInitial, running, handle] using
+      (State.failRuntimeOpen_effectUnknown_exact running handle).2.1
+  exact ⟨reachable, reachable.invariant, unresolved,
+    Step.cleanupBlocked_terminal blocked⟩
 
 /-- A registered create failure is concretely reachable through an error result. -/
 theorem failedRegisteredInitial_reachable (issuer : IssuerId)

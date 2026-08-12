@@ -102,11 +102,14 @@ fn kernel_durable_audit_survives_reopen_and_continues_attempt_ids() {
         .expect("a healthy backend must construct a kernel");
     let capability_id = issue_root(&kernel);
     kernel
-        .authorize_and_commit(
+        .authorize_and_execute_classified(
             &SubjectId::new("subject"),
             &capability_id,
             &request(),
-            |_| Ok::<_, std::convert::Infallible>(()),
+            |_| EffectExecution::<_, std::convert::Infallible>::Committed {
+                value: (),
+                receipt: None,
+            },
         )
         .expect("authorized effect must commit");
     drop(kernel);
@@ -125,16 +128,26 @@ fn kernel_durable_audit_survives_reopen_and_continues_attempt_ids() {
             .attempt_id(),
         AttemptId::from_u64(0)
     );
+    assert_eq!(
+        records[0]
+            .receipt()
+            .expect("commit receipt must persist")
+            .token(),
+        b"kernel-executor-returned-success"
+    );
 
     let next_kernel = CapabilityKernel::try_new_with_durable_audit(initial_state(), reopened)
         .expect("reopened backend must construct a new kernel");
     let next_capability_id = issue_root(&next_kernel);
     next_kernel
-        .authorize_and_commit(
+        .authorize_and_execute_classified(
             &SubjectId::new("subject"),
             &next_capability_id,
             &request(),
-            |_| Ok::<_, std::convert::Infallible>(()),
+            |_| EffectExecution::<_, std::convert::Infallible>::Committed {
+                value: (),
+                receipt: None,
+            },
         )
         .expect("the reopened session must accept a new effect");
     let records = next_kernel
@@ -160,9 +173,15 @@ fn durable_kernel_preserves_external_root_identity_and_skips_it_sequentially() {
     assert_eq!(issue_root(&kernel).as_str(), "durable-issuer:1");
 
     kernel
-        .authorize_and_commit(&SubjectId::new("subject"), &external_id, &request(), |_| {
-            Ok::<_, std::convert::Infallible>(())
-        })
+        .authorize_and_execute_classified(
+            &SubjectId::new("subject"),
+            &external_id,
+            &request(),
+            |_| EffectExecution::<_, std::convert::Infallible>::Committed {
+                value: (),
+                receipt: None,
+            },
+        )
         .expect("the exact external identity must authorize normally");
     let attempts = kernel
         .attempt_records()
@@ -178,11 +197,14 @@ fn durable_wal_preserves_unknown_completion_after_crash_window() {
     let kernel = CapabilityKernel::try_new_with_durable_audit(initial_state(), backend)
         .expect("a healthy backend must construct a kernel");
     let capability_id = issue_root(&kernel);
-    let result = kernel.authorize_and_commit_with_receipt(
+    let result = kernel.authorize_and_execute_classified(
         &SubjectId::new("subject"),
         &capability_id,
         &request(),
-        |_| Ok::<_, std::convert::Infallible>(((), vec![0_u8; 8 * 1024 * 1024])),
+        |_| EffectExecution::<_, std::convert::Infallible>::Committed {
+            value: (),
+            receipt: Some(vec![0_u8; 8 * 1024 * 1024]),
+        },
     );
     assert!(matches!(
         result,
@@ -241,11 +263,14 @@ fn terminal_receipt_failure_reports_possible_external_commit() {
     let kernel = CapabilityKernel::try_new_with_durable_audit(initial_state(), backend)
         .expect("a healthy backend must construct a kernel");
     let capability_id = issue_root(&kernel);
-    let result = kernel.authorize_and_commit_with_receipt(
+    let result = kernel.authorize_and_execute_classified(
         &SubjectId::new("subject"),
         &capability_id,
         &request(),
-        |_| Ok::<_, std::convert::Infallible>(((), vec![0_u8; 8 * 1024 * 1024])),
+        |_| EffectExecution::<_, std::convert::Infallible>::Committed {
+            value: (),
+            receipt: Some(vec![0_u8; 8 * 1024 * 1024]),
+        },
     );
 
     assert!(matches!(
@@ -277,13 +302,16 @@ fn retained_recovery_view_cannot_mutate_the_kernel_writer() {
     let executor_called = AtomicBool::new(false);
 
     kernel
-        .authorize_and_commit(
+        .authorize_and_execute_classified(
             &SubjectId::new("subject"),
             &capability_id,
             &request(),
             |_| {
                 executor_called.store(true, Ordering::Release);
-                Ok::<_, std::convert::Infallible>(())
+                EffectExecution::<_, std::convert::Infallible>::Committed {
+                    value: (),
+                    receipt: None,
+                }
             },
         )
         .expect("the sole writer must commit normally");

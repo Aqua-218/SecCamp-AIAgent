@@ -80,6 +80,19 @@ file_matches	file-other-repository-is-rejected	false	workspace	read_data	prefix	
 file_matches	file-outside-path-is-rejected	false	workspace	read_data	prefix	src	workspace	read_data	docs|design.md
 file_matches	file-duplicate-effects-remain-a-set	true	workspace	read_data|write_data|read_data	prefix	src	workspace	write_data	src|main.rs
 
+# Every FileEffect must remain independently requestable. Keeping one effect
+# in each authority makes accidental bit overlap or membership widening fail.
+file_matches	read-data-effect-matches	true	workspace	read_data	prefix	src	workspace	read_data	src|main.rs
+file_matches	list-directory-effect-matches	true	workspace	list_directory	prefix	src	workspace	list_directory	src
+file_matches	write-data-effect-matches	true	workspace	write_data	prefix	src	workspace	write_data	src|main.rs
+file_matches	truncate-effect-matches	true	workspace	truncate	prefix	src	workspace	truncate	src|main.rs
+file_matches	create-file-effect-matches	true	workspace	create_file	prefix	src	workspace	create_file	src|generated.rs
+file_matches	create-directory-effect-matches	true	workspace	create_directory	prefix	src	workspace	create_directory	src|generated
+file_matches	remove-file-effect-matches	true	workspace	remove_file	prefix	src	workspace	remove_file	src|obsolete.rs
+file_matches	remove-directory-effect-matches	true	workspace	remove_directory	prefix	src	workspace	remove_directory	src|obsolete
+file_matches	rename-effect-matches	true	workspace	rename	prefix	src	workspace	rename	src|main.rs
+file_matches	set-metadata-effect-matches	true	workspace	set_metadata	prefix	src	workspace	set_metadata	src|main.rs
+
 file_below	file-authority-below-itself	true	workspace	read_data|write_data	prefix	src	workspace	read_data|write_data	prefix	src
 file_below	narrow-file-authority-is-below-parent	true	workspace	read_data	exact	src|main.rs	workspace	read_data|write_data	prefix	src
 file_below	file-effect-escalation-is-rejected	false	workspace	read_data|rename	exact	src|main.rs	workspace	read_data|write_data	prefix	src
@@ -87,6 +100,31 @@ file_below	file-repository-change-is-rejected	false	other	read_data	exact	src|ma
 file_below	file-path-expansion-is-rejected	false	workspace	read_data	prefix	-	workspace	read_data|write_data	prefix	src
 file_below	empty-file-effects-remain-structurally-below	true	workspace	-	exact	src|main.rs	workspace	read_data	prefix	src
 file_below	empty-file-effects-do-not-bypass-path-check	false	workspace	-	prefix	-	workspace	read_data	prefix	src
+
+# Each individual effect is a valid subset of the complete effect universe.
+file_below	read-data-effect-is-below-complete-parent	true	workspace	read_data	exact	src|main.rs	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	list-directory-effect-is-below-complete-parent	true	workspace	list_directory	exact	src	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	write-data-effect-is-below-complete-parent	true	workspace	write_data	exact	src|main.rs	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	truncate-effect-is-below-complete-parent	true	workspace	truncate	exact	src|main.rs	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	create-file-effect-is-below-complete-parent	true	workspace	create_file	exact	src|generated.rs	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	create-directory-effect-is-below-complete-parent	true	workspace	create_directory	exact	src|generated	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	remove-file-effect-is-below-complete-parent	true	workspace	remove_file	exact	src|obsolete.rs	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	remove-directory-effect-is-below-complete-parent	true	workspace	remove_directory	exact	src|obsolete	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	rename-effect-is-below-complete-parent	true	workspace	rename	exact	src|main.rs	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	set-metadata-effect-is-below-complete-parent	true	workspace	set_metadata	exact	src|main.rs	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+
+# Omitting exactly the child effect from an otherwise complete parent must
+# reject escalation. This also distinguishes every effect from the other nine.
+file_below	read-data-effect-escalation-is-rejected	false	workspace	read_data	exact	src|main.rs	workspace	list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	list-directory-effect-escalation-is-rejected	false	workspace	list_directory	exact	src	workspace	read_data|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	write-data-effect-escalation-is-rejected	false	workspace	write_data	exact	src|main.rs	workspace	read_data|list_directory|truncate|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	truncate-effect-escalation-is-rejected	false	workspace	truncate	exact	src|main.rs	workspace	read_data|list_directory|write_data|create_file|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	create-file-effect-escalation-is-rejected	false	workspace	create_file	exact	src|generated.rs	workspace	read_data|list_directory|write_data|truncate|create_directory|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	create-directory-effect-escalation-is-rejected	false	workspace	create_directory	exact	src|generated	workspace	read_data|list_directory|write_data|truncate|create_file|remove_file|remove_directory|rename|set_metadata	prefix	src
+file_below	remove-file-effect-escalation-is-rejected	false	workspace	remove_file	exact	src|obsolete.rs	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_directory|rename|set_metadata	prefix	src
+file_below	remove-directory-effect-escalation-is-rejected	false	workspace	remove_directory	exact	src|obsolete	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|rename|set_metadata	prefix	src
+file_below	rename-effect-escalation-is-rejected	false	workspace	rename	exact	src|main.rs	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|set_metadata	prefix	src
+file_below	set-metadata-effect-escalation-is-rejected	false	workspace	set_metadata	exact	src|main.rs	workspace	read_data|list_directory|write_data|truncate|create_file|create_directory|remove_file|remove_directory|rename	prefix	src
 
 capability_matches	capability-allows-valid-read-at-lower-bound	true	10	20	workspace	read_data	prefix	src	10	workspace	read_data	src|main.rs
 capability_matches	capability-rejects-read-at-expiry	false	10	20	workspace	read_data	prefix	src	20	workspace	read_data	src|main.rs

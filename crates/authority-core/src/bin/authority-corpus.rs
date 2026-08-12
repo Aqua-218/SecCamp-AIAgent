@@ -382,7 +382,7 @@ mod tests {
 
         let results = evaluate_corpus(&input).expect("all Rust decisions must match the corpus");
 
-        assert_eq!(results.len(), 71, "every version-one case must execute");
+        assert_eq!(results.len(), 101, "every version-one case must execute");
         assert_eq!(results[0].name, "path-root-is-valid");
         assert_eq!(
             results.last().map(|result| result.name.as_str()),

@@ -437,6 +437,53 @@ theorem running_has_exact_resource_chain {state : State}
   exact ⟨identity, workspace, broker, vm, capability, workload, identityLookup,
     rfl, rfl, rfl, rfl, rfl, bindings⟩
 
+/-- Resources retained solely so failed-start cleanup can be retried.
+
+These leases are deliberately separate from `State.resources`: a backend may
+return a lease with invalid bindings, and a failed VM start may leave backend
+state to clean up without returning any VM lease.
+-/
+structure CleanupOwnership where
+  resources : Resources
+  vmStartAttempted : Bool
+  deriving DecidableEq
+
+/-- No failed-start or normal-stop resources are retained. -/
+def CleanupOwnership.empty : CleanupOwnership where
+  resources := .empty
+  vmStartAttempted := false
+
+/-- Normal cleanup owns exactly the successfully committed resource prefix. -/
+def CleanupOwnership.forResources (resources : Resources) : CleanupOwnership where
+  resources := resources
+  vmStartAttempted := resources.vm.isSome
+
+/-- Retain an invalid workspace lease outside the valid core resource chain. -/
+def CleanupOwnership.invalidWorkspace (workspace : WorkspaceLease) :
+    CleanupOwnership where
+  resources := { Resources.empty with workspace := some workspace }
+  vmStartAttempted := false
+
+/-- Extend the valid workspace prefix with the exact invalid Broker lease returned. -/
+def CleanupOwnership.invalidBroker (resources : Resources)
+    (broker : BrokerLease) : CleanupOwnership :=
+  CleanupOwnership.forResources { resources with broker := some broker }
+
+/-- Extend the valid Broker prefix with the exact invalid VM lease returned. -/
+def CleanupOwnership.invalidVm (resources : Resources) (vm : VmLease) :
+    CleanupOwnership :=
+  CleanupOwnership.forResources { resources with vm := some vm }
+
+/-- Extend the valid VM prefix with the exact invalid capability lease returned. -/
+def CleanupOwnership.invalidCapability (resources : Resources)
+    (capability : CapabilityLease) : CleanupOwnership :=
+  CleanupOwnership.forResources { resources with capability := some capability }
+
+/-- A VM start attempt can require cleanup even though it returned no lease. -/
+def CleanupOwnership.failedVmStart (resources : Resources) : CleanupOwnership where
+  resources := resources
+  vmStartAttempted := true
+
 /-- Retryable cleanup progress for one active session. -/
 structure CleanupState where
   capabilityRevoked : Bool
@@ -452,33 +499,39 @@ def CleanupState.pending : CleanupState where
   brokerClosed := false
   workspaceIsolated := false
 
-/-- Cleanup starts complete for resources that a failed startup never acquired. -/
-def CleanupState.forResources (resources : Resources) : CleanupState where
-  capabilityRevoked := resources.capability.isNone
-  vmKilled := resources.vm.isNone
-  brokerClosed := resources.broker.isNone
-  workspaceIsolated := resources.workspace.isNone
+/-- Cleanup starts complete only for resources and effects that were never acquired. -/
+def CleanupState.forOwnership (ownership : CleanupOwnership) : CleanupState where
+  capabilityRevoked := ownership.resources.capability.isNone
+  vmKilled := ownership.resources.vm.isNone && !ownership.vmStartAttempted
+  brokerClosed := ownership.resources.broker.isNone
+  workspaceIsolated := ownership.resources.workspace.isNone
 
 /-- All cleanup dependencies have committed. -/
 def CleanupState.Complete (state : CleanupState) : Prop :=
   state.capabilityRevoked = true ∧ state.vmKilled = true ∧
     state.brokerClosed = true ∧ state.workspaceIsolated = true
 
-/-- Every absent resource is already accounted for by cleanup progress. -/
-def CleanupState.CoversAbsentResources (state : CleanupState)
-    (resources : Resources) : Prop :=
-  (resources.capability = none → state.capabilityRevoked = true) ∧
-  (resources.vm = none → state.vmKilled = true) ∧
-  (resources.broker = none → state.brokerClosed = true) ∧
-  (resources.workspace = none → state.workspaceIsolated = true)
+/-- Every cleanup effect known to be absent is already accounted for. -/
+def CleanupState.CoversAbsentOwnership (state : CleanupState)
+    (ownership : CleanupOwnership) : Prop :=
+  (ownership.resources.capability = none → state.capabilityRevoked = true) ∧
+  (ownership.resources.vm = none → ownership.vmStartAttempted = false →
+    state.vmKilled = true) ∧
+  (ownership.resources.broker = none → state.brokerClosed = true) ∧
+  (ownership.resources.workspace = none → state.workspaceIsolated = true)
 
-/-- Resource-derived cleanup progress accounts for every unacquired stage. -/
-theorem CleanupState.forResources_coversAbsentResources (resources : Resources) :
-    (CleanupState.forResources resources).CoversAbsentResources resources := by
-  cases resources with
-  | mk workspace broker vm capability workload =>
-      cases workspace <;> cases broker <;> cases vm <;> cases capability <;>
-        simp [CleanupState.forResources, CleanupState.CoversAbsentResources]
+/-- Ownership-derived cleanup progress accounts for every absent effect. -/
+theorem CleanupState.forOwnership_coversAbsentOwnership
+    (ownership : CleanupOwnership) :
+    (CleanupState.forOwnership ownership).CoversAbsentOwnership ownership := by
+  cases ownership with
+  | mk resources vmStartAttempted =>
+      cases resources with
+      | mk workspace broker vm capability workload =>
+          cases workspace <;> cases broker <;> cases vm <;> cases capability <;>
+            cases vmStartAttempted <;>
+              simp [CleanupState.forOwnership,
+                CleanupState.CoversAbsentOwnership]
 
 /-- Mark a successful capability revocation. -/
 def CleanupState.revokeCapability (state : CleanupState) : CleanupState :=
@@ -516,15 +569,15 @@ theorem CleanupStep.flags_monotone {before after : CleanupState}
   cases transition <;> simp [CleanupState.revokeCapability, CleanupState.killVm,
     CleanupState.closeBroker, CleanupState.isolateWorkspace]
 
-/-- Cleanup retries preserve the accounting for resources absent at startup failure. -/
-theorem CleanupStep.preserves_coversAbsentResources {before after : CleanupState}
-    {resources : Resources} (transition : CleanupStep before after)
-    (covers : before.CoversAbsentResources resources) :
-    after.CoversAbsentResources resources := by
+/-- Cleanup retries preserve the accounting for effects absent at startup failure. -/
+theorem CleanupStep.preserves_coversAbsentOwnership {before after : CleanupState}
+    {ownership : CleanupOwnership} (transition : CleanupStep before after)
+    (covers : before.CoversAbsentOwnership ownership) :
+    after.CoversAbsentOwnership ownership := by
   rcases transition.flags_monotone with ⟨capability, vm, broker, workspace⟩
   rcases covers with ⟨capabilityAbsent, vmAbsent, brokerAbsent, workspaceAbsent⟩
   exact ⟨fun absent => capability (capabilityAbsent absent),
-    fun absent => vm (vmAbsent absent),
+    fun absent notAttempted => vm (vmAbsent absent notAttempted),
     fun absent => broker (brokerAbsent absent),
     fun absent => workspace (workspaceAbsent absent)⟩
 
@@ -583,18 +636,30 @@ structure ManagedState where
   core : State
   stopping : Bool
   cleanup : CleanupState
+  ownership : CleanupOwnership
 
 /-- Initial managed session has no active cleanup transaction. -/
 def ManagedState.initial (ledger : IdentityLedger) : ManagedState where
   core := State.initial ledger
   stopping := false
   cleanup := .pending
+  ownership := .empty
 
 /-- Enter retryable cleanup while retaining a normal or partial startup resource chain. -/
 def ManagedState.beginStop (state : ManagedState) : ManagedState :=
-  { state with
-    stopping := true
-    cleanup := CleanupState.forResources state.core.resources }
+  let ownership := CleanupOwnership.forResources state.core.resources
+  { core := state.core,
+    stopping := true,
+    cleanup := CleanupState.forOwnership ownership,
+    ownership := ownership }
+
+/-- Retain cleanup-only ownership after startup and its first cleanup attempt fail. -/
+def ManagedState.retainFailedStart (state : ManagedState)
+    (ownership : CleanupOwnership) : ManagedState :=
+  { core := state.core,
+    stopping := true,
+    cleanup := CleanupState.forOwnership ownership,
+    ownership := ownership }
 
 /-- Commit one successful cleanup action without discarding resource leases. -/
 def ManagedState.recordCleanup (state : ManagedState)
@@ -603,23 +668,77 @@ def ManagedState.recordCleanup (state : ManagedState)
 
 /-- Publish Closed only after all cleanup dependencies have committed. -/
 def ManagedState.finishStop (state : ManagedState) : ManagedState :=
-  { core := markClosed state.core, stopping := false, cleanup := state.cleanup }
+  { core := markClosed state.core,
+    stopping := false,
+    cleanup := state.cleanup,
+    ownership := .empty }
 
-/-- Core bindings, Closed gating, and partial-start cleanup accounting agree. -/
+/-- Exact origins of cleanup ownership, kept separate from valid core bindings. -/
+inductive ManagedState.HasCleanupContext (state : ManagedState) : Prop
+  | normal :
+      state.core.phase.CleanupEligible →
+      state.ownership = CleanupOwnership.forResources state.core.resources →
+      HasCleanupContext state
+  | invalidWorkspace {identity : SessionIdentity} {workspace : WorkspaceLease} :
+      state.core.phase = .identitiesReserved →
+      state.core.identity = some identity →
+      state.ownership = CleanupOwnership.invalidWorkspace workspace →
+      ¬workspace.Matches identity → HasCleanupContext state
+  | invalidBroker {identity : SessionIdentity} {broker : BrokerLease} :
+      state.core.phase = .workspaceCloned →
+      state.core.identity = some identity →
+      state.ownership = CleanupOwnership.invalidBroker state.core.resources broker →
+      ¬broker.Matches identity → HasCleanupContext state
+  | invalidVm {identity : SessionIdentity} {vm : VmLease} :
+      state.core.phase = .brokerEstablished →
+      state.core.identity = some identity →
+      state.ownership = CleanupOwnership.invalidVm state.core.resources vm →
+      ¬vm.Matches identity → HasCleanupContext state
+  | invalidCapability {identity : SessionIdentity}
+      {capability : CapabilityLease} :
+      state.core.phase = .vmStarted →
+      state.core.identity = some identity →
+      state.ownership =
+        CleanupOwnership.invalidCapability state.core.resources capability →
+      ¬capability.Matches identity → HasCleanupContext state
+  | failedVmStart :
+      state.core.phase = .brokerEstablished →
+      state.ownership = CleanupOwnership.failedVmStart state.core.resources →
+      HasCleanupContext state
+
+/-- Every exact cleanup origin retains a nonterminal core phase. -/
+theorem ManagedState.HasCleanupContext.ne_closed {state : ManagedState}
+    (context : state.HasCleanupContext) : state.core.phase ≠ .closed := by
+  intro closed
+  cases context with
+  | normal eligible _ => exact eligible.ne_closed closed
+  | invalidWorkspace phase _ _ _
+  | invalidBroker phase _ _ _
+  | invalidVm phase _ _ _
+  | invalidCapability phase _ _ _
+  | failedVmStart phase _ =>
+      rw [phase] at closed
+      cases closed
+
+/-- Core bindings, Closed gating, and cleanup-only ownership accounting agree. -/
 structure ManagedState.WellFormed (state : ManagedState) : Prop where
   coreWellFormed : state.core.WellFormed
+  inactiveReleasesOwnership :
+    state.stopping = false → state.ownership = .empty
   closedRequiresCleanup : state.core.phase = .closed → state.cleanup.Complete
-  stoppingRetainsCleanupPrefix :
-    state.stopping = true → state.core.phase.CleanupEligible
-  stoppingCoversAbsentResources :
+  stoppingRetainsCleanupContext :
+    state.stopping = true → state.HasCleanupContext
+  stoppingCoversAbsentOwnership :
     state.stopping = true →
-      state.cleanup.CoversAbsentResources state.core.resources
+      state.cleanup.CoversAbsentOwnership state.ownership
 
 /-- The initial managed state satisfies lifecycle/cleanup coupling. -/
 theorem ManagedState.initial_wellFormed (ledger : IdentityLedger) :
     (ManagedState.initial ledger).WellFormed := by
   constructor
   · exact State.initial_wellFormed ledger
+  · intro _
+    rfl
   · intro impossible
     simp [ManagedState.initial, State.initial] at impossible
   · intro impossible
@@ -641,12 +760,62 @@ inductive ManagedStep : ManagedState → ManagedState → Prop
   | beginStop {state : ManagedState} :
       state.stopping = false → state.core.phase.CleanupEligible →
       ManagedStep state state.beginStop
+  | retainInvalidWorkspace {state : ManagedState} {identity : SessionIdentity}
+      {workspace : WorkspaceLease} :
+      state.stopping = false →
+      state.core.phase = .identitiesReserved →
+      state.core.identity = some identity →
+      ¬workspace.Matches identity →
+      ManagedStep state
+        (state.retainFailedStart (CleanupOwnership.invalidWorkspace workspace))
+  | retainInvalidBroker {state : ManagedState} {identity : SessionIdentity}
+      {broker : BrokerLease} :
+      state.stopping = false →
+      state.core.phase = .workspaceCloned →
+      state.core.identity = some identity →
+      ¬broker.Matches identity →
+      ManagedStep state
+        (state.retainFailedStart
+          (CleanupOwnership.invalidBroker state.core.resources broker))
+  | retainInvalidVm {state : ManagedState} {identity : SessionIdentity}
+      {vm : VmLease} :
+      state.stopping = false →
+      state.core.phase = .brokerEstablished →
+      state.core.identity = some identity →
+      ¬vm.Matches identity →
+      ManagedStep state
+        (state.retainFailedStart
+          (CleanupOwnership.invalidVm state.core.resources vm))
+  | retainInvalidCapability {state : ManagedState} {identity : SessionIdentity}
+      {capability : CapabilityLease} :
+      state.stopping = false →
+      state.core.phase = .vmStarted →
+      state.core.identity = some identity →
+      ¬capability.Matches identity →
+      ManagedStep state
+        (state.retainFailedStart
+          (CleanupOwnership.invalidCapability state.core.resources capability))
+  | retainFailedVmStart {state : ManagedState} :
+      state.stopping = false → state.core.phase = .brokerEstablished →
+      ManagedStep state
+        (state.retainFailedStart
+          (CleanupOwnership.failedVmStart state.core.resources))
   | cleanup {state : ManagedState} {cleanup : CleanupState} :
       state.stopping = true → CleanupStep state.cleanup cleanup →
       ManagedStep state (state.recordCleanup cleanup)
+  | cleanupFailure {state : ManagedState} :
+      state.stopping = true → ManagedStep state state
   | finishStop {state : ManagedState} :
       state.stopping = true → state.cleanup.Complete →
       ManagedStep state state.finishStop
+
+/-- A failed cleanup call leaves both Stopping and cleanup ownership intact. -/
+theorem cleanupFailure_retains_stopping_and_ownership {state : ManagedState}
+    (stopping : state.stopping = true) :
+    ∃ after,
+      ManagedStep state after ∧ after.stopping = true ∧
+      after.ownership = state.ownership :=
+  ⟨state, ManagedStep.cleanupFailure stopping, stopping, rfl⟩
 
 /-- Lifecycle/cleanup coupling is inductive across every accepted managed step. -/
 theorem ManagedStep.preserves_wellFormed {before after : ManagedState}
@@ -656,6 +825,8 @@ theorem ManagedStep.preserves_wellFormed {before after : ManagedState}
   | startup notStopping startupStep =>
       constructor
       · exact startupStep.preserves_wellFormed wellFormed.coreWellFormed
+      · intro _
+        exact wellFormed.inactiveReleasesOwnership notStopping
       · intro closed
         exact False.elim (startupStep.after_ne_closed closed)
       · intro impossible
@@ -664,26 +835,122 @@ theorem ManagedStep.preserves_wellFormed {before after : ManagedState}
         simp [notStopping] at impossible
   | beginStop notStopping eligible =>
       exact ⟨wellFormed.coreWellFormed,
+        fun impossible => False.elim (by
+          simp [ManagedState.beginStop] at impossible),
         fun closed => False.elim (by
           change before.core.phase = .closed at closed
           exact eligible.ne_closed closed),
-        fun _ => eligible,
+        fun _ => ManagedState.HasCleanupContext.normal eligible rfl,
         fun _ => by
           simpa [ManagedState.beginStop] using
-            CleanupState.forResources_coversAbsentResources before.core.resources⟩
+            CleanupState.forOwnership_coversAbsentOwnership
+              (CleanupOwnership.forResources before.core.resources)⟩
+  | retainInvalidWorkspace notStopping phase identityLookup mismatch =>
+      exact ⟨wellFormed.coreWellFormed,
+        fun impossible => False.elim (by
+          simp [ManagedState.retainFailedStart] at impossible),
+        fun closed => False.elim (by
+          change before.core.phase = .closed at closed
+          rw [phase] at closed
+          cases closed),
+        fun _ => ManagedState.HasCleanupContext.invalidWorkspace
+          phase identityLookup rfl mismatch,
+        fun _ => by
+          simpa [ManagedState.retainFailedStart] using
+            CleanupState.forOwnership_coversAbsentOwnership
+              (CleanupOwnership.invalidWorkspace _)⟩
+  | retainInvalidBroker notStopping phase identityLookup mismatch =>
+      exact ⟨wellFormed.coreWellFormed,
+        fun impossible => False.elim (by
+          simp [ManagedState.retainFailedStart] at impossible),
+        fun closed => False.elim (by
+          change before.core.phase = .closed at closed
+          rw [phase] at closed
+          cases closed),
+        fun _ => ManagedState.HasCleanupContext.invalidBroker
+          phase identityLookup rfl mismatch,
+        fun _ => by
+          simpa [ManagedState.retainFailedStart] using
+            CleanupState.forOwnership_coversAbsentOwnership
+              (CleanupOwnership.invalidBroker before.core.resources _)⟩
+  | retainInvalidVm notStopping phase identityLookup mismatch =>
+      exact ⟨wellFormed.coreWellFormed,
+        fun impossible => False.elim (by
+          simp [ManagedState.retainFailedStart] at impossible),
+        fun closed => False.elim (by
+          change before.core.phase = .closed at closed
+          rw [phase] at closed
+          cases closed),
+        fun _ => ManagedState.HasCleanupContext.invalidVm
+          phase identityLookup rfl mismatch,
+        fun _ => by
+          simpa [ManagedState.retainFailedStart] using
+            CleanupState.forOwnership_coversAbsentOwnership
+              (CleanupOwnership.invalidVm before.core.resources _)⟩
+  | retainInvalidCapability notStopping phase identityLookup mismatch =>
+      exact ⟨wellFormed.coreWellFormed,
+        fun impossible => False.elim (by
+          simp [ManagedState.retainFailedStart] at impossible),
+        fun closed => False.elim (by
+          change before.core.phase = .closed at closed
+          rw [phase] at closed
+          cases closed),
+        fun _ => ManagedState.HasCleanupContext.invalidCapability
+          phase identityLookup rfl mismatch,
+        fun _ => by
+          simpa [ManagedState.retainFailedStart] using
+            CleanupState.forOwnership_coversAbsentOwnership
+              (CleanupOwnership.invalidCapability before.core.resources _)⟩
+  | retainFailedVmStart notStopping phase =>
+      exact ⟨wellFormed.coreWellFormed,
+        fun impossible => False.elim (by
+          simp [ManagedState.retainFailedStart] at impossible),
+        fun closed => False.elim (by
+          change before.core.phase = .closed at closed
+          rw [phase] at closed
+          cases closed),
+        fun _ => ManagedState.HasCleanupContext.failedVmStart phase rfl,
+        fun _ => by
+          simpa [ManagedState.retainFailedStart] using
+            CleanupState.forOwnership_coversAbsentOwnership
+              (CleanupOwnership.failedVmStart before.core.resources)⟩
   | cleanup stopping cleanupStep =>
       exact ⟨wellFormed.coreWellFormed,
+        fun impossible => False.elim (by
+          simp [ManagedState.recordCleanup, stopping] at impossible),
         fun closed => False.elim (by
-          have eligible := wellFormed.stoppingRetainsCleanupPrefix stopping
+          have context := wellFormed.stoppingRetainsCleanupContext stopping
           change before.core.phase = .closed at closed
-          exact eligible.ne_closed closed),
-        fun _ => wellFormed.stoppingRetainsCleanupPrefix stopping,
-        fun _ => cleanupStep.preserves_coversAbsentResources
-          (wellFormed.stoppingCoversAbsentResources stopping)⟩
+          exact context.ne_closed closed),
+        fun _ => by
+          have context := wellFormed.stoppingRetainsCleanupContext stopping
+          cases context with
+          | normal eligible ownership =>
+              exact ManagedState.HasCleanupContext.normal eligible ownership
+          | invalidWorkspace phase identityLookup ownership mismatch =>
+              exact ManagedState.HasCleanupContext.invalidWorkspace
+                phase identityLookup ownership mismatch
+          | invalidBroker phase identityLookup ownership mismatch =>
+              exact ManagedState.HasCleanupContext.invalidBroker
+                phase identityLookup ownership mismatch
+          | invalidVm phase identityLookup ownership mismatch =>
+              exact ManagedState.HasCleanupContext.invalidVm
+                phase identityLookup ownership mismatch
+          | invalidCapability phase identityLookup ownership mismatch =>
+              exact ManagedState.HasCleanupContext.invalidCapability
+                phase identityLookup ownership mismatch
+          | failedVmStart phase ownership =>
+              exact ManagedState.HasCleanupContext.failedVmStart phase ownership,
+        fun _ => cleanupStep.preserves_coversAbsentOwnership
+          (wellFormed.stoppingCoversAbsentOwnership stopping)⟩
+  | cleanupFailure _ =>
+      exact wellFormed
   | finishStop stopping complete =>
       constructor
       · simp [ManagedState.finishStop, markClosed, State.WellFormed,
           Resources.empty]
+      · intro _
+        rfl
       · intro _
         exact complete
       · intro impossible
@@ -713,6 +980,71 @@ theorem ManagedSteps.preserves_wellFormed {before after : ManagedState}
   | tail _ transition inductionHypothesis =>
       exact transition.preserves_wellFormed inductionHypothesis
 
+/-- Concatenate two finite managed executions. -/
+theorem ManagedSteps.trans {first middle last : ManagedState}
+    (firstSteps : ManagedSteps first middle) (lastSteps : ManagedSteps middle last) :
+    ManagedSteps first last := by
+  induction lastSteps with
+  | refl => exact firstSteps
+  | tail _ transition inductionHypothesis =>
+      exact ManagedSteps.tail inductionHypothesis transition
+
+/-- Any retained cleanup transaction can commit its retries and then close. -/
+theorem stopping_reaches_closed {state : ManagedState}
+    (stopping : state.stopping = true) :
+    ∃ closed,
+      ManagedSteps state closed ∧ closed.core.phase = .closed ∧
+      closed.cleanup.Complete ∧ closed.ownership = .empty := by
+  let revoked := state.recordCleanup state.cleanup.revokeCapability
+  let killed := revoked.recordCleanup revoked.cleanup.killVm
+  let brokerClosed := killed.recordCleanup killed.cleanup.closeBroker
+  let workspaceIsolated :=
+    brokerClosed.recordCleanup brokerClosed.cleanup.isolateWorkspace
+  let closed := workspaceIsolated.finishStop
+  have revokeTransition : ManagedStep state revoked := by
+    apply ManagedStep.cleanup stopping
+    exact CleanupStep.revokeCapability
+  have killTransition : ManagedStep revoked killed := by
+    apply ManagedStep.cleanup
+    · simpa [revoked, ManagedState.recordCleanup] using stopping
+    · exact CleanupStep.killVm
+  have brokerTransition : ManagedStep killed brokerClosed := by
+    apply ManagedStep.cleanup
+    · simpa [brokerClosed, killed, revoked, ManagedState.recordCleanup] using stopping
+    · exact CleanupStep.closeBroker
+  have workspaceTransition : ManagedStep brokerClosed workspaceIsolated := by
+    apply ManagedStep.cleanup
+    · simpa [brokerClosed, killed, revoked, ManagedState.recordCleanup] using stopping
+    · apply CleanupStep.isolateWorkspace
+      · simp [brokerClosed, killed, revoked, ManagedState.recordCleanup,
+          CleanupState.revokeCapability, CleanupState.killVm,
+          CleanupState.closeBroker]
+      · simp [brokerClosed, killed, revoked, ManagedState.recordCleanup,
+          CleanupState.revokeCapability, CleanupState.killVm,
+          CleanupState.closeBroker]
+  have complete : workspaceIsolated.cleanup.Complete := by
+    simp [workspaceIsolated, brokerClosed, killed, revoked,
+      ManagedState.recordCleanup, CleanupState.Complete,
+      CleanupState.revokeCapability, CleanupState.killVm,
+      CleanupState.closeBroker, CleanupState.isolateWorkspace]
+  have finishTransition : ManagedStep workspaceIsolated closed := by
+    apply ManagedStep.finishStop
+    · simpa [workspaceIsolated, brokerClosed, killed, revoked,
+        ManagedState.recordCleanup] using stopping
+    · exact complete
+  have revokedSteps : ManagedSteps state revoked :=
+    ManagedSteps.tail (ManagedSteps.refl state) revokeTransition
+  have killedSteps : ManagedSteps state killed :=
+    ManagedSteps.tail revokedSteps killTransition
+  have brokerSteps : ManagedSteps state brokerClosed :=
+    ManagedSteps.tail killedSteps brokerTransition
+  have isolatedSteps : ManagedSteps state workspaceIsolated :=
+    ManagedSteps.tail brokerSteps workspaceTransition
+  refine ⟨closed, ManagedSteps.tail isolatedSteps finishTransition, ?_, ?_, ?_⟩
+  · simp [closed, ManagedState.finishStop, markClosed]
+  · simpa [closed, ManagedState.finishStop] using complete
+  · rfl
+
 /-- Finite reachability from an initial managed orchestrator state. -/
 def ManagedState.Reachable (ledger : IdentityLedger) (state : ManagedState) : Prop :=
   ManagedSteps (ManagedState.initial ledger) state
@@ -730,6 +1062,222 @@ theorem ManagedState.Reachable.closed_implies_cleanup_complete
     state.cleanup.Complete :=
   ManagedState.closed_implies_cleanup_complete reachable.wellFormed closed
 
+/-- An invalid first workspace lease is retained outside the well-formed core
+chain and can be retried constructively to Closed. -/
+theorem invalidWorkspaceCleanup_constructively_reachable
+    {ledger : IdentityLedger} {identity : SessionIdentity}
+    {workspace : WorkspaceLease}
+    (fresh : IdentityBatchFresh ledger identity)
+    (mismatch : ¬workspace.Matches identity) :
+    ∃ retained closed,
+      retained.Reachable ledger ∧
+      retained.core.phase = .identitiesReserved ∧
+      retained.core.WellFormed ∧ retained.stopping = true ∧
+      retained.ownership = CleanupOwnership.invalidWorkspace workspace ∧
+      retained.cleanup.workspaceIsolated = false ∧
+      ManagedSteps retained closed ∧ closed.core.phase = .closed ∧
+      closed.cleanup.Complete := by
+  let initial := ManagedState.initial ledger
+  let reserved : ManagedState :=
+    { initial with core := reserveIdentities initial.core identity }
+  let retained :=
+    reserved.retainFailedStart (CleanupOwnership.invalidWorkspace workspace)
+  have reserveTransition : ManagedStep initial reserved := by
+    apply ManagedStep.startup
+    · rfl
+    · apply Step.reserve
+      · exact Or.inl rfl
+      · exact fresh
+  have retainTransition : ManagedStep reserved retained := by
+    apply @ManagedStep.retainInvalidWorkspace reserved identity workspace
+    · simp [reserved, initial, ManagedState.initial]
+    · simp [reserved, reserveIdentities]
+    · simp [reserved, reserveIdentities]
+    · exact mismatch
+  have reservedSteps : ManagedSteps initial reserved :=
+    ManagedSteps.tail (ManagedSteps.refl initial) reserveTransition
+  have retainedSteps : ManagedSteps initial retained :=
+    ManagedSteps.tail reservedSteps retainTransition
+  have reachable : retained.Reachable ledger := by
+    simpa [initial] using retainedSteps
+  have stopping : retained.stopping = true := by
+    simp [retained, ManagedState.retainFailedStart]
+  rcases stopping_reaches_closed stopping with
+    ⟨closed, cleanupSteps, closedPhase, closedComplete, _⟩
+  refine ⟨retained, closed, reachable, ?_, reachable.wellFormed.coreWellFormed,
+    stopping, ?_, ?_, cleanupSteps, closedPhase, closedComplete⟩
+  · simp [retained, reserved, ManagedState.retainFailedStart,
+      reserveIdentities]
+  · simp [retained, ManagedState.retainFailedStart]
+  · simp [retained, ManagedState.retainFailedStart,
+      CleanupState.forOwnership, CleanupOwnership.invalidWorkspace,
+      Resources.empty]
+
+/-- A failed VM start retains a cleanup obligation without inventing a VM
+lease, and successful retries constructively reach Closed. -/
+theorem failedVmStartCleanup_constructively_reachable
+    {ledger : IdentityLedger} {identity : SessionIdentity}
+    {workspace : WorkspaceLease} {broker : BrokerLease}
+    (fresh : IdentityBatchFresh ledger identity)
+    (workspaceBinding : workspace.Matches identity)
+    (brokerBinding : broker.Matches identity) :
+    ∃ retained closed,
+      retained.Reachable ledger ∧
+      retained.core.phase = .brokerEstablished ∧
+      retained.core.WellFormed ∧ retained.stopping = true ∧
+      retained.ownership.resources.workspace = some workspace ∧
+      retained.ownership.resources.broker = some broker ∧
+      retained.ownership.resources.vm = none ∧
+      retained.ownership.vmStartAttempted = true ∧
+      retained.cleanup.vmKilled = false ∧
+      ManagedSteps retained closed ∧ closed.core.phase = .closed ∧
+      closed.cleanup.Complete := by
+  let initial := ManagedState.initial ledger
+  let reserved : ManagedState :=
+    { initial with core := reserveIdentities initial.core identity }
+  let cloned : ManagedState :=
+    { reserved with core := commitWorkspace reserved.core workspace }
+  let brokered : ManagedState :=
+    { cloned with core := commitBroker cloned.core broker }
+  let retained := brokered.retainFailedStart
+    (CleanupOwnership.failedVmStart brokered.core.resources)
+  have reserveTransition : ManagedStep initial reserved := by
+    apply ManagedStep.startup
+    · rfl
+    · apply Step.reserve
+      · exact Or.inl rfl
+      · exact fresh
+  have workspaceTransition : ManagedStep reserved cloned := by
+    apply ManagedStep.startup
+    · simp [reserved, initial, ManagedState.initial]
+    · apply @Step.workspace reserved.core identity workspace
+      · simp [reserved, reserveIdentities]
+      · simp [reserved, reserveIdentities]
+      · exact workspaceBinding
+  have brokerTransition : ManagedStep cloned brokered := by
+    apply ManagedStep.startup
+    · simp [cloned, reserved, initial, ManagedState.initial]
+    · apply @Step.broker cloned.core identity broker
+      · simp [cloned, commitWorkspace]
+      · simp [cloned, reserved, commitWorkspace, reserveIdentities]
+      · exact brokerBinding
+  have retainTransition : ManagedStep brokered retained := by
+    apply ManagedStep.retainFailedVmStart
+    · simp [brokered, cloned, reserved, initial, ManagedState.initial]
+    · simp [brokered, commitBroker]
+  have retainedSteps : ManagedSteps initial retained :=
+    ManagedSteps.tail
+      (ManagedSteps.tail
+        (ManagedSteps.tail (ManagedSteps.refl initial) reserveTransition)
+        workspaceTransition)
+      brokerTransition |>.tail retainTransition
+  have reachable : retained.Reachable ledger := by
+    simpa [initial] using retainedSteps
+  have stopping : retained.stopping = true := by
+    simp [retained, ManagedState.retainFailedStart]
+  rcases stopping_reaches_closed stopping with
+    ⟨closed, cleanupSteps, closedPhase, closedComplete, _⟩
+  refine ⟨retained, closed, reachable, ?_, reachable.wellFormed.coreWellFormed,
+    stopping, ?_, ?_, ?_, ?_, ?_, cleanupSteps, closedPhase, closedComplete⟩
+  · simp [retained, brokered, cloned, ManagedState.retainFailedStart,
+      commitBroker, commitWorkspace]
+  · simp [retained, brokered, cloned, ManagedState.retainFailedStart,
+      CleanupOwnership.failedVmStart, commitBroker, commitWorkspace]
+  · simp [retained, brokered, ManagedState.retainFailedStart,
+      cloned, reserved, CleanupOwnership.failedVmStart, commitBroker,
+      commitWorkspace, reserveIdentities]
+  · simp [retained, brokered, cloned, reserved,
+      ManagedState.retainFailedStart, CleanupOwnership.failedVmStart,
+      commitBroker, commitWorkspace, reserveIdentities, Resources.empty]
+  · simp [retained, ManagedState.retainFailedStart,
+      CleanupOwnership.failedVmStart]
+  · simp [retained, brokered, ManagedState.retainFailedStart,
+      CleanupOwnership.failedVmStart, CleanupState.forOwnership, commitBroker]
+
+/-- An invalid Broker lease extends the exact valid workspace prefix and remains
+owned until a cleanup-complete path closes the session. -/
+theorem invalidBrokerCleanup_retains_and_reaches_closed
+    {state : ManagedState} {identity : SessionIdentity} {broker : BrokerLease}
+    (notStopping : state.stopping = false)
+    (phase : state.core.phase = .workspaceCloned)
+    (identityLookup : state.core.identity = some identity)
+    (mismatch : ¬broker.Matches identity) :
+    let retained := state.retainFailedStart
+      (CleanupOwnership.invalidBroker state.core.resources broker)
+    ManagedStep state retained ∧
+      retained.ownership.resources =
+        { state.core.resources with broker := some broker } ∧
+      ∃ closed,
+        ManagedSteps retained closed ∧ closed.core.phase = .closed ∧
+        closed.cleanup.Complete := by
+  dsimp
+  have retainedTransition := ManagedStep.retainInvalidBroker
+    notStopping phase identityLookup mismatch
+  have stopping :
+      (state.retainFailedStart
+        (CleanupOwnership.invalidBroker state.core.resources broker)).stopping = true := by
+    rfl
+  rcases stopping_reaches_closed stopping with
+    ⟨closed, cleanupSteps, closedPhase, closedComplete, _⟩
+  exact ⟨retainedTransition, rfl, closed, cleanupSteps, closedPhase,
+    closedComplete⟩
+
+/-- An invalid VM lease extends the exact valid Broker prefix and remains owned
+until a cleanup-complete path closes the session. -/
+theorem invalidVmCleanup_retains_and_reaches_closed
+    {state : ManagedState} {identity : SessionIdentity} {vm : VmLease}
+    (notStopping : state.stopping = false)
+    (phase : state.core.phase = .brokerEstablished)
+    (identityLookup : state.core.identity = some identity)
+    (mismatch : ¬vm.Matches identity) :
+    let retained := state.retainFailedStart
+      (CleanupOwnership.invalidVm state.core.resources vm)
+    ManagedStep state retained ∧
+      retained.ownership.resources = { state.core.resources with vm := some vm } ∧
+      ∃ closed,
+        ManagedSteps retained closed ∧ closed.core.phase = .closed ∧
+        closed.cleanup.Complete := by
+  dsimp
+  have retainedTransition := ManagedStep.retainInvalidVm
+    notStopping phase identityLookup mismatch
+  have stopping :
+      (state.retainFailedStart
+        (CleanupOwnership.invalidVm state.core.resources vm)).stopping = true := by
+    rfl
+  rcases stopping_reaches_closed stopping with
+    ⟨closed, cleanupSteps, closedPhase, closedComplete, _⟩
+  exact ⟨retainedTransition, rfl, closed, cleanupSteps, closedPhase,
+    closedComplete⟩
+
+/-- An invalid capability lease extends the exact valid VM prefix and remains
+owned until a cleanup-complete path closes the session. -/
+theorem invalidCapabilityCleanup_retains_and_reaches_closed
+    {state : ManagedState} {identity : SessionIdentity}
+    {capability : CapabilityLease}
+    (notStopping : state.stopping = false)
+    (phase : state.core.phase = .vmStarted)
+    (identityLookup : state.core.identity = some identity)
+    (mismatch : ¬capability.Matches identity) :
+    let retained := state.retainFailedStart
+      (CleanupOwnership.invalidCapability state.core.resources capability)
+    ManagedStep state retained ∧
+      retained.ownership.resources =
+        { state.core.resources with capability := some capability } ∧
+      ∃ closed,
+        ManagedSteps retained closed ∧ closed.core.phase = .closed ∧
+        closed.cleanup.Complete := by
+  dsimp
+  have retainedTransition := ManagedStep.retainInvalidCapability
+    notStopping phase identityLookup mismatch
+  have stopping :
+      (state.retainFailedStart
+        (CleanupOwnership.invalidCapability state.core.resources capability)).stopping = true := by
+    rfl
+  rcases stopping_reaches_closed stopping with
+    ⟨closed, cleanupSteps, closedPhase, closedComplete, _⟩
+  exact ⟨retainedTransition, rfl, closed, cleanupSteps, closedPhase,
+    closedComplete⟩
+
 /-- Every committed startup prefix, including Running, has a finite path to Closed. -/
 theorem cleanupEligible_reaches_closed {state : ManagedState}
     (notStopping : state.stopping = false)
@@ -738,66 +1286,15 @@ theorem cleanupEligible_reaches_closed {state : ManagedState}
       ManagedSteps state closed ∧ closed.core.phase = .closed ∧
       closed.cleanup.Complete := by
   let stopping := state.beginStop
-  let revoked := stopping.recordCleanup stopping.cleanup.revokeCapability
-  let killed := revoked.recordCleanup revoked.cleanup.killVm
-  let brokerClosed := killed.recordCleanup killed.cleanup.closeBroker
-  let workspaceIsolated :=
-    brokerClosed.recordCleanup brokerClosed.cleanup.isolateWorkspace
-  let closed := workspaceIsolated.finishStop
   have beginTransition : ManagedStep state stopping :=
     ManagedStep.beginStop notStopping eligible
-  have revokeTransition : ManagedStep stopping revoked := by
-    apply ManagedStep.cleanup
-    · simp [stopping, ManagedState.beginStop]
-    · exact CleanupStep.revokeCapability
-  have killTransition : ManagedStep revoked killed := by
-    apply ManagedStep.cleanup
-    · simp [revoked, stopping, ManagedState.recordCleanup,
-        ManagedState.beginStop]
-    · exact CleanupStep.killVm
-  have brokerTransition : ManagedStep killed brokerClosed := by
-    apply ManagedStep.cleanup
-    · simp [killed, revoked, stopping, ManagedState.recordCleanup,
-        ManagedState.beginStop]
-    · exact CleanupStep.closeBroker
-  have workspaceTransition : ManagedStep brokerClosed workspaceIsolated := by
-    apply ManagedStep.cleanup
-    · simp [brokerClosed, killed, revoked, stopping,
-        ManagedState.recordCleanup, ManagedState.beginStop]
-    · apply CleanupStep.isolateWorkspace
-      · simp [brokerClosed, killed, revoked, stopping,
-          ManagedState.recordCleanup, ManagedState.beginStop,
-          CleanupState.revokeCapability, CleanupState.killVm,
-          CleanupState.closeBroker]
-      · simp [brokerClosed, killed, revoked, stopping,
-          ManagedState.recordCleanup, ManagedState.beginStop,
-          CleanupState.revokeCapability, CleanupState.killVm,
-          CleanupState.closeBroker]
-  have complete : workspaceIsolated.cleanup.Complete := by
-    simp [workspaceIsolated, brokerClosed, killed, revoked, stopping,
-      ManagedState.recordCleanup, ManagedState.beginStop,
-      CleanupState.Complete, CleanupState.revokeCapability,
-      CleanupState.killVm, CleanupState.closeBroker,
-      CleanupState.isolateWorkspace]
-  have finishTransition : ManagedStep workspaceIsolated closed := by
-    apply ManagedStep.finishStop
-    · simp [workspaceIsolated, brokerClosed, killed, revoked, stopping,
-        ManagedState.recordCleanup, ManagedState.beginStop]
-    · exact complete
   have began : ManagedSteps state stopping :=
     ManagedSteps.tail (ManagedSteps.refl state) beginTransition
-  have revokedSteps : ManagedSteps state revoked :=
-    ManagedSteps.tail began revokeTransition
-  have killedSteps : ManagedSteps state killed :=
-    ManagedSteps.tail revokedSteps killTransition
-  have brokerSteps : ManagedSteps state brokerClosed :=
-    ManagedSteps.tail killedSteps brokerTransition
-  have isolatedSteps : ManagedSteps state workspaceIsolated :=
-    ManagedSteps.tail brokerSteps workspaceTransition
-  refine ⟨closed, ?_, ?_, ?_⟩
-  · exact ManagedSteps.tail isolatedSteps finishTransition
-  · simp [closed, ManagedState.finishStop, markClosed]
-  · simpa [closed, ManagedState.finishStop] using complete
+  have stoppingActive : stopping.stopping = true := by
+    simp [stopping, ManagedState.beginStop]
+  rcases stopping_reaches_closed stoppingActive with
+    ⟨closed, cleanupSteps, closedPhase, complete, _⟩
+  exact ⟨closed, began.trans cleanupSteps, closedPhase, complete⟩
 
 end Orchestrator
 

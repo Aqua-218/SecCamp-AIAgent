@@ -4,6 +4,7 @@
 
 pub mod audit;
 pub mod capability;
+pub mod durable_audit;
 pub mod file;
 pub mod github;
 pub mod handle;

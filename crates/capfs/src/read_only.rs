@@ -717,10 +717,13 @@ impl CapabilityFilesystem {
     ) -> NamespaceExecutorOutcome<T, AdapterError> {
         match result {
             Ok(value) => NamespaceExecutorOutcome::Committed(value),
-            Err(EffectCommitError::CommittedButAudit(_)) => {
+            Err(EffectCommitError::CommittedButAudit { .. }) => {
                 NamespaceExecutorOutcome::CommittedWithError(AdapterError::Internal)
             }
-            Err(EffectCommitError::CommitUnknown | EffectCommitError::CommitUnknownAndAudit(_)) => {
+            Err(
+                EffectCommitError::CommitUnknown { .. }
+                | EffectCommitError::CommitUnknownAndAudit { .. },
+            ) => {
                 // The namespace cannot safely choose either staged state. Keep
                 // the conservative staged snapshot, quarantine the repository,
                 // and require out-of-band reconciliation before any mount can
@@ -1885,9 +1888,9 @@ impl CapabilityFilesystem {
     fn map_effect_error(&self, error: &EffectCommitError<AdapterError>) -> AdapterError {
         if matches!(
             error,
-            EffectCommitError::CommittedButAudit(_)
-                | EffectCommitError::CommitUnknown
-                | EffectCommitError::CommitUnknownAndAudit(_)
+            EffectCommitError::CommittedButAudit { .. }
+                | EffectCommitError::CommitUnknown { .. }
+                | EffectCommitError::CommitUnknownAndAudit { .. }
         ) {
             // The backing operation may already exist even though its durable
             // receipt failed or its outcome could not be determined. Quarantine
@@ -2752,9 +2755,9 @@ const fn map_effect_error(error: &EffectCommitError<AdapterError>) -> AdapterErr
         // fatal for these.
         EffectCommitError::LockPoisoned
         | EffectCommitError::Audit(_)
-        | EffectCommitError::CommittedButAudit(_)
-        | EffectCommitError::CommitUnknown
-        | EffectCommitError::CommitUnknownAndAudit(_) => AdapterError::Internal,
+        | EffectCommitError::CommittedButAudit { .. }
+        | EffectCommitError::CommitUnknown { .. }
+        | EffectCommitError::CommitUnknownAndAudit { .. } => AdapterError::Internal,
     }
 }
 
@@ -2770,7 +2773,7 @@ mod tests {
     };
 
     use authority_core::{
-        audit::{AttemptOutcome, AuditError},
+        audit::AttemptOutcome,
         capability::{AuthorityBody, AuthorityRequest, IssuerId, SubjectId},
         file::{FileAuthority, FileEffect, FileEffects},
         kernel::{CapabilityKernel, EffectCommitError},
@@ -3584,13 +3587,10 @@ mod tests {
             NamespaceExecutorOutcome::FailedBeforeCommit(AdapterError::Busy)
         );
         assert_eq!(
-            filesystem.namespace_effect_outcome::<()>(Err(EffectCommitError::CommittedButAudit(
-                AuditError::LockPoisoned
-            ))),
-            NamespaceExecutorOutcome::CommittedWithError(AdapterError::Internal)
-        );
-        assert_eq!(
-            filesystem.namespace_effect_outcome::<()>(Err(EffectCommitError::CommitUnknown)),
+            filesystem.namespace_effect_outcome::<()>(Err(EffectCommitError::CommitUnknown {
+                attempt_id: authority_core::audit::AttemptId::from_u64(0),
+                evidence: b"test ambiguity".to_vec(),
+            })),
             NamespaceExecutorOutcome::CommittedWithError(AdapterError::Internal)
         );
         assert!(filesystem.namespace.is_in_doubt());

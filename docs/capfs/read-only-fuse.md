@@ -249,9 +249,17 @@ rename / writeの物理的な競合、複数thread FUSE sessionはこのunit con
 実FUSE mount testは`/dev/fuse`がない環境では実行不能理由を標準エラーへ記録して終了し、
 deviceが存在するのにmount設定または権限が壊れている場合は失敗として扱う。
 
-## 現在対象外のoperation
+## 正確な保証範囲
 
 `SYMLINK`、`LINK`、`MKNOD`、xattr、ioctl、fallocate、copy-rangeは初期link-free filesystem modelの外なので`EPERM`のままである。metadataではowner / group、BSD flag、creation / status-change / backup timeと、modeとtimestampを同時に変えるatomic requestをまだ表現しない。後者を追加するには、Linuxの複数syscallをまたぐ部分成功の意味論を先に定義する必要がある。
+
+## 変更時の確認点
+
+- operation を足すときは、対応する `FileEffect` を[File authority](../authority-core/file-authorities.md)の 10 種から選ぶ。対応が無いなら、まず effect 側の設計を決める。
+- 認可を operation の入口だけで行い、実 I/O の直前で省略しない。revoke は認可と I/O の間に効きうる。
+- fd-relative I/O を path 再構築に変えない。rename と競合したときに別 object を触る。
+- `EAGAIN` で再開を要求している箇所を、成功として返すように変えない。古い cookie で listing を続けると、既に消えた entry を返す。
+- Direct-I/O を外さない。page cache 経由で revoke 後の読み出しが通る。
 
 ## 関連
 

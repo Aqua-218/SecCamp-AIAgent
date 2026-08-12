@@ -72,6 +72,33 @@ installation と repository は host が割り当てる opaque identity なの�
 
 この分離により、CBOR decoder へ network client や credential を置かず、transport の自由な bytes が adapter の自由な認証付き HTTP call へ変換される経路を作らない。
 
+## payload を外側から分けている理由
+
+外側の request は `[version, session, sequence, request, payload hash, payload]` の 6 要素で、`payload` は 2 つ目の canonical CBOR item を収めた byte string になっている。operation を外側に展開せず、byte string として埋め込んでいる。
+
+理由は 2 つある。1 つは自己参照の回避で、hash 対象を外側の request 全体にすると、hash を書き込む前に hash を計算する必要が出る。もう 1 つは安定性で、operation bytes を独立した item にしておけば、外側の envelope の形が変わっても hash 対象は変わらない。
+
+副作用として、wire 上で envelope と operation が視覚的にも分かれる。frame を読んだ時点で、認可に使う metadata と、adapter に渡す操作の bytes が別の場所にある。
+
+## 正確な保証範囲
+
+この module が保証するのは、bytes と型付き `BrokerOperation` の対応が 1 対 1 であることだけ。
+
+- 同じ operation を表す綴りが 2 つ以上あれば、そのうち 1 つしか受理しない。非正規形は decode 前に落ちる。
+- payload hash は埋め込み payload の SHA-256 と一致しなければならない。外側の request を含めた自己参照 hash にはしていないので、operation bytes は encode 後も安定する。
+- 復元した `BrokerOperation` が認可されることは保証しない。認可は `CapabilityKernel` の担当で、この層は形だけを見る。
+- decode が成功しても、その操作が session budget に収まることは見ていない。
+- CBOR library の実装の正しさは仮定している。canonical 性の検査は自前だが、基本的な item の読み書きは委ねている。
+- version 1 以外の request は拒否するが、将来 version が増えたときに v1 の解釈が変わらないことは、schema 側の運用に依存する。
+
+## 変更時の確認点
+
+- `OUTER_REQUEST_ITEMS`、`PUBLIC_FETCH_ITEMS`、`GITHUB_ITEMS` の値を変えるときは、encode 側と decode 側の両方を直す。片方だけでも compile は通り、round trip test を書いていない field で初めて壊れる。
+- operation の discriminant（`PUBLIC_FETCH_OPERATION` = 0、`GITHUB_OPERATION` = 1 など）を再割り当てしない。古い guest が送った bytes が別の操作として復元される。
+- 新しい operation を足すときは、`BROKER_CBOR_PROTOCOL_VERSION` を上げるか、既存 discriminant の後ろに追加する。間に挿入しない。
+- `SESSION_ID_BYTES` / `REQUEST_ID_BYTES` / `PAYLOAD_HASH_BYTES` の長さ検査を緩めない。可変長を許すと、同じ値を表す綴りが複数できる。
+- 非正規形の受理を増やさない。「読めるなら受ける」に倒すと、同じ操作に複数の payload hash が対応し、replay 判定が効かなくなる。
+
 ## 関連
 
 - [Broker session envelope](session-envelopes.md)

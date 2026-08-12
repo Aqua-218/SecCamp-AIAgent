@@ -116,7 +116,7 @@ impl Error for RevocationObserverError {}
 ///
 /// Observers run after the state transition has committed and after the state
 /// lock has been released, and before the revoking call returns. That is what
-/// makes the guarantee stated on [`CapabilityKernel::revoke`] — that later
+/// makes the guarantee stated on [`CapabilityKernel::revoke_held_by`] — that later
 /// attempts recheck against the revoked state once the call returns — hold for
 /// cached decisions as well as for kernel state.
 ///
@@ -244,8 +244,9 @@ pub enum EffectExecution<T, E> {
 /// A failed inspection of active capability authority.
 ///
 /// Inspection does not represent an external effect and therefore does not
-/// append an audit attempt. Callers must still use [`CapabilityKernel::authorize_and_commit`]
-/// before reading or mutating protected data.
+/// append an audit attempt. Callers must still use
+/// [`CapabilityKernel::authorize_and_execute_classified`] before reading or
+/// mutating protected data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityInspectionError<E> {
     /// The capability-state lock cannot be trusted after a writer panic.
@@ -435,7 +436,7 @@ impl CapabilityKernel {
         self.with_state_mut(|state| state.derive(caller, parent_id, grant, now))
     }
 
-    /// Revokes a capability while holding exclusive state access.
+    /// Revokes a capability for an in-crate test of the trusted state transition.
     ///
     /// The exclusive lock waits for every already-authorized effect to reach
     /// its linearization point. Once this method returns, later effect attempts
@@ -445,7 +446,11 @@ impl CapabilityKernel {
     ///
     /// Returns [`CapabilityKernelError::LockPoisoned`] if a writer previously
     /// panicked, or wraps the sequential revocation error.
-    pub fn revoke(&self, capability: &CapId) -> Result<RevocationStatus, CapabilityKernelError> {
+    #[cfg(test)]
+    pub(crate) fn revoke(
+        &self,
+        capability: &CapId,
+    ) -> Result<RevocationStatus, CapabilityKernelError> {
         let status = self.with_state_mut(|state| state.revoke(capability))?;
         // The state lock is released here. Observers run before this returns,
         // so a decision cached outside the kernel cannot outlive the call
@@ -465,8 +470,8 @@ impl CapabilityKernel {
     ///
     /// # Errors
     ///
-    /// Returns the same propagation errors as [`Self::revoke`], or a typed
-    /// state error when the capability is unknown or not held by `caller`.
+    /// Returns propagation errors after a committed revocation, or a typed state
+    /// error when the capability is unknown or not held by `caller`.
     pub fn revoke_held_by(
         &self,
         caller: &SubjectId,
@@ -649,7 +654,7 @@ impl CapabilityKernel {
     ///
     /// This method is for policy-derived metadata decisions only. It does not
     /// record an effect attempt; protected external effects must pass through
-    /// [`Self::authorize_and_commit`].
+    /// [`Self::authorize_and_execute_classified`].
     ///
     /// # Errors
     ///
@@ -676,132 +681,24 @@ impl CapabilityKernel {
         inspect(capability).map_err(CapabilityInspectionError::Inspection)
     }
 
-    /// Reauthorizes an effect and executes it through its linearization point.
-    ///
-    /// The executor runs while a shared state guard is held. It must return
-    /// only after the external effect has either reached its documented
-    /// linearization point or failed without committing. It must not re-enter
-    /// this kernel, because attempting an exclusive transition while retaining
-    /// shared access can deadlock.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EffectCommitError::LockPoisoned`] if a writer previously
-    /// panicked, [`EffectCommitError::NotAuthorized`] without invoking the
-    /// executor when the final check fails, or [`EffectCommitError::Effect`]
-    /// when the executor reports a pre-commit failure.
-    pub fn authorize_and_commit<T, E>(
-        &self,
-        caller: &SubjectId,
-        capability_id: &CapId,
-        request: &CapabilityRequest,
-        commit_to_linearization: impl FnOnce(&Capability) -> Result<T, E>,
-    ) -> Result<T, EffectCommitError<E>> {
-        self.authorize_all_and_commit(
-            caller,
-            capability_id,
-            &CapabilityRequestSet::one(request.clone()),
-            commit_to_linearization,
-        )
-    }
-
-    /// Reauthorizes one request and persists an adapter-provided commit
-    /// receipt with the terminal durable audit record.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EffectCommitError::CommittedButAudit`] if the executor
-    /// succeeds but the terminal receipt cannot be persisted.
-    pub fn authorize_and_commit_with_receipt<T, E>(
-        &self,
-        caller: &SubjectId,
-        capability_id: &CapId,
-        request: &CapabilityRequest,
-        commit_to_linearization: impl FnOnce(&Capability) -> Result<(T, Vec<u8>), E>,
-    ) -> Result<T, EffectCommitError<E>> {
-        self.authorize_all_and_commit_with_receipt(
-            caller,
-            capability_id,
-            &CapabilityRequestSet::one(request.clone()),
-            commit_to_linearization,
-        )
-    }
-
-    /// Reauthorizes every request in one non-empty external operation and
-    /// executes it through its linearization point.
-    ///
-    /// The kernel holds one shared state guard across all final checks and the
-    /// executor. A revoke that returns therefore excludes the whole compound
-    /// operation, not merely its first request. One audit attempt records the
-    /// complete request set and becomes a committed effect only when the
-    /// executor reaches its documented linearization point.
-    ///
-    /// The executor must not re-enter this kernel. It must return an error
-    /// unless the operation either failed before its linearization point or
-    /// reached that point for the whole request set.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EffectCommitError::LockPoisoned`] if a writer previously
-    /// panicked, [`EffectCommitError::NotAuthorized`] without invoking the
-    /// executor when any request is denied, or [`EffectCommitError::Effect`]
-    /// when the executor reports a pre-commit failure.
-    pub fn authorize_all_and_commit<T, E>(
-        &self,
-        caller: &SubjectId,
-        capability_id: &CapId,
-        requests: &CapabilityRequestSet,
-        commit_to_linearization: impl FnOnce(&Capability) -> Result<T, E>,
-    ) -> Result<T, EffectCommitError<E>> {
-        self.authorize_all_and_commit_inner(caller, capability_id, requests, |capability| {
-            match commit_to_linearization(capability) {
-                Ok(value) => EffectExecution::Committed {
-                    value,
-                    receipt: None,
-                },
-                Err(error) => EffectExecution::FailedBeforeCommit(error),
-            }
-        })
-    }
-
-    /// Reauthorizes every request and accepts an adapter-provided commit
-    /// receipt from the executor.
-    ///
-    /// The returned token is persisted with the terminal WAL record. This is
-    /// the preferred entry point for external providers with an idempotency
-    /// or acceptance identifier. A provider token is only meaningful if the
-    /// executor returns it after its documented linearization point.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EffectCommitError::CommittedButAudit`] when the executor
-    /// succeeded but the receipt could not be durably recorded; that result
-    /// means the external effect may already exist and needs reconciliation.
-    pub fn authorize_all_and_commit_with_receipt<T, E>(
-        &self,
-        caller: &SubjectId,
-        capability_id: &CapId,
-        requests: &CapabilityRequestSet,
-        commit_to_linearization: impl FnOnce(&Capability) -> Result<(T, Vec<u8>), E>,
-    ) -> Result<T, EffectCommitError<E>> {
-        self.authorize_all_and_commit_inner(caller, capability_id, requests, |capability| {
-            match commit_to_linearization(capability) {
-                Ok((value, token)) => EffectExecution::Committed {
-                    value,
-                    receipt: Some(token),
-                },
-                Err(error) => EffectExecution::FailedBeforeCommit(error),
-            }
-        })
-    }
-
     /// Reauthorizes one request and preserves an executor's explicit
     /// pre-commit, committed, or commit-unknown classification.
     ///
+    /// The executor runs while a shared state guard is held, so a revocation
+    /// that returns cannot race an already-authorized effect past this call.
+    /// The executor must not re-enter this kernel: an exclusive transition
+    /// would deadlock while the shared guard remains held. Its classification
+    /// must describe the outcome at the provider's documented linearization
+    /// point.
+    ///
     /// # Errors
     ///
-    /// Returns [`EffectCommitError::CommitUnknown`] only after the unknown
-    /// evidence is durably terminal. Returns
+    /// Returns [`EffectCommitError::LockPoisoned`] when state cannot be
+    /// trusted, [`EffectCommitError::NotAuthorized`] without invoking the
+    /// executor when the final check fails, and [`EffectCommitError::Effect`]
+    /// only for an explicit [`EffectExecution::FailedBeforeCommit`]. Returns
+    /// [`EffectCommitError::CommitUnknown`] only after unknown evidence is
+    /// durably terminal. Returns
     /// [`EffectCommitError::CommitUnknownAndAudit`] when that terminal write
     /// fails.
     pub fn authorize_and_execute_classified<T, E>(
@@ -821,6 +718,11 @@ impl CapabilityKernel {
 
     /// Reauthorizes a non-empty request set and preserves the executor's
     /// explicit external-outcome classification.
+    ///
+    /// One shared state guard covers every final request check and the entire
+    /// executor call, making the compound operation one revocation boundary.
+    /// The executor has the same non-reentrancy and truthful-classification
+    /// obligations as [`Self::authorize_and_execute_classified`].
     ///
     /// # Errors
     ///
@@ -933,13 +835,16 @@ impl CapabilityKernel {
 mod tests {
     use std::thread;
 
-    use super::{CapabilityKernel, CapabilityKernelError};
+    use super::{CapabilityKernel, CapabilityKernelError, EffectCommitError, EffectExecution};
     use crate::{
-        capability::{AuthorityBody, IssuerId, SubjectId},
-        file::{FileAuthority, FileEffects},
+        audit::AttemptOutcome,
+        capability::{AuthorityBody, AuthorityRequest, CapabilityRequest, IssuerId, SubjectId},
+        file::{FileAuthority, FileEffect, FileEffects, FileRequest},
         path::{CanonicalPath, PathPattern},
         repository::RepoId,
-        state::{CapabilityState, StaticAuthorityEnvelope, Subject},
+        state::{
+            CapabilityGrant, CapabilityState, RevocationStatus, StaticAuthorityEnvelope, Subject,
+        },
         time::{MonotonicTime, TimeWindow},
     };
 
@@ -953,6 +858,14 @@ mod tests {
                 PathPattern::Prefix(CanonicalPath::root()),
             )),
         )
+    }
+
+    fn read_authority() -> AuthorityBody {
+        AuthorityBody::File(FileAuthority::new(
+            RepoId::new("workspace"),
+            FileEffects::only(FileEffect::ReadData),
+            PathPattern::Prefix(CanonicalPath::root()),
+        ))
     }
 
     // Requirement: a writer panic makes every later transition fail closed.
@@ -975,6 +888,67 @@ mod tests {
         assert_eq!(
             kernel.register_subject(Subject::new(SubjectId::new("subject"), empty_envelope())),
             Err(CapabilityKernelError::LockPoisoned)
+        );
+    }
+
+    // Requirement: the public effect boundary requires an explicit commit
+    // classification, while raw host revocation remains test-only and
+    // crate-private. Category: authorization/API boundary. Risk: critical.
+    #[test]
+    fn classified_execution_records_pre_commit_failure_before_test_only_raw_revoke() {
+        let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("issuer")));
+        let subject = SubjectId::new("subject");
+        let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+            .expect("fixed test bounds must form a non-empty window");
+        kernel
+            .register_subject(Subject::new(
+                subject.clone(),
+                StaticAuthorityEnvelope::new(validity, read_authority()),
+            ))
+            .expect("subject registration must succeed");
+        let capability = kernel
+            .issue_root(CapabilityGrant::new(
+                subject.clone(),
+                validity,
+                read_authority(),
+            ))
+            .expect("root capability issuance must succeed");
+        let request = CapabilityRequest::new(
+            MonotonicTime::from_ticks(1),
+            AuthorityRequest::File(FileRequest::new(
+                RepoId::new("workspace"),
+                FileEffect::ReadData,
+                CanonicalPath::root(),
+            )),
+        );
+
+        let result =
+            kernel.authorize_and_execute_classified(&subject, &capability, &request, |_| {
+                EffectExecution::<(), _>::FailedBeforeCommit("backing read rejected")
+            });
+
+        assert_eq!(
+            result,
+            Err(EffectCommitError::Effect("backing read rejected"))
+        );
+        assert_eq!(
+            kernel
+                .attempt_records()
+                .expect("audit attempts must remain readable")[0]
+                .outcome(),
+            AttemptOutcome::FailedBeforeCommit
+        );
+        assert!(
+            kernel
+                .effect_records()
+                .expect("effect records must remain readable")
+                .is_empty()
+        );
+        assert_eq!(
+            kernel
+                .revoke(&capability)
+                .expect("trusted raw test revocation must succeed"),
+            RevocationStatus::NewlyRevoked
         );
     }
 }

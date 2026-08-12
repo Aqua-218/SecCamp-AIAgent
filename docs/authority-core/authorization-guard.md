@@ -45,6 +45,7 @@ flowchart LR
 | `CapabilityKernel` | `CapabilityState` を同期境界に入れ、発行 transition、revoke、effect commit を直列化する |
 | `CapabilityKernelError` | lock poisoning と逐次状態機械の typed error を区別する |
 | `EffectCommitError<E>` | state/audit lock failure、認可拒否、executor の pre-commit 失敗を区別する |
+| `DurableAuditLog` / `CommitReceipt` | Started WAL、terminal receipt、reopen 時の厳密な検証 |
 | `CapabilityInspectionError<E>` | effectを起こさないauthority inspectionのinactive、lock、callback errorを区別する |
 | `AttemptRecord` / `EffectRecord` | 全 checked request と、commit 済み effect を区別する |
 
@@ -71,7 +72,7 @@ shared guard を取得
 
 Capability の参照は read guard 内の `CapabilityState` を借用している。この参照を executor 呼び出しへ渡すことで、lock の寿命が認可判定だけで終わらずexecutor完了まで続く。
 
-set内の1件でも認可が失敗した場合、executor は一度も呼ばれず `EffectCommitError::NotAuthorized` を返す。executor が線形化点より前に失敗した場合は `EffectCommitError::Effect(error)` となる。executor 前に audit entry を作れない場合は `EffectCommitError::Audit(error)` で fail closed にする。記録の仕組みは[Attempt / effect audit](audit-records.md)を参照する。
+set内の1件でも認可が失敗した場合、executor は一度も呼ばれず `EffectCommitError::NotAuthorized` を返す。executor が線形化点より前に失敗した場合は `EffectCommitError::Effect(error)` となる。executor 前に audit entry を作れない場合は `EffectCommitError::Audit(error)` で fail closed にする。executor が成功した後に durable receipt を保存できなかった場合は `EffectCommitError::CommittedButAudit(error)` となる。この場合は外部 effect の可能性を失敗に偽装せず、provider の reconciliation が必要である。記録の仕組みは[Attempt / effect audit](audit-records.md)を参照する。
 
 現在のsetは1つの`CapId`に対して使う。複数Capabilityを合成して権限を足し合わせない。mountへ固定したCapabilityが、操作に必要な全requestを単独で許可しなければならない。この制限により、どのCapabilityが副作用を許可したかをaudit recordから一意に追える。
 
@@ -97,6 +98,7 @@ filesystemのpath walkでは、file内容を読む前に「このpathのmetadata
 ```text
 with_active_capability: authority metadataからvisibilityを導く
 authorize_and_commit:  backing read/writeなど外部effectを実行する
+authorize_and_commit_with_receipt: external acceptance tokenをterminal WALへ保存する
 ```
 
 この2つを混同しないことが契約である。現在のDirect-I/O capfsは、`LOOKUP` / `GETATTR`のvisibilityに前者、`OPEN` / `READ` / `WRITE`の実操作に後者を使う。[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)
@@ -146,11 +148,18 @@ revoke が `revoked` へ追加してreturnした後、effect は shared guard �
 
 標準 `RwLock` はreaderとwriterの取得順序やwriter starvationを保証しない。この実装が閉じるのはauthorization safetyであり、revoke latencyの上限ではない。運用で待ち時間上限が必要になった場合は、計測した上でfair lockまたは直列executorを別途評価する。
 
+## Durable journal が検査するもの
+
+WAL は `Started` を外部 effect 前に `sync_all` し、executor 成功後に receipt 付き terminal frame を
+`sync_all` する。reopen は途中 frame、checksum mismatch、sequence gap、attempt の二重 finish / replay を
+fail closed で拒否する。linearization point と terminal frame の間に原子的な境界はないため、crash 後の
+`Started` は「effect 未成立」ではなく「完了不明」である。
+
 ## Loom が検査するもの
 
 通常buildでは `std::sync::RwLock` を使う。`RUSTFLAGS='--cfg loom'` を付けたmodel testでは、同じ `CapabilityKernel` のlockだけを `loom::sync::RwLock` へ差し替える。
 
-[`crates/authority-core/tests/authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) には6つの model がある。
+[`crates/authority-core/tests/authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) には8つの model がある。
 
 | Model | 期待する結果 | 確認すること |
 |---|---|---|
@@ -159,6 +168,8 @@ revoke が `revoked` へ追加してreturnした後、effect は shared guard �
 | direct revoke / compound effect | 全 interleaving で pass | request set全件のexecutor処理がguard内で完了するか、executorへ入らずset全体が拒否される |
 | ancestor revoke / descendant compound effect | 全 interleaving で pass | root revokeでもcompound effectが部分実行・部分監査されず、全requestが1件のattemptとして残る |
 | direct revoke / 2 effects | preemption bound 2 で pass | 両 effect が先、revoke が先、effect が1件ずつ両側になる順序で audit と commit 数が一致する |
+| open handle / shutdown | preemption bound 2 で pass | 登録が先なら live handle が Closed を止め、shutdown が先なら登録を拒否する |
+| direct + ancestor / 2 revoke | preemption bound 2 で pass | 2つの revoke が各1回だけ epoch を進め、descendant effect と順序付く |
 | unlocked negative control | 指定した assertion で panic | 認可直後に guard を解放すると、revoke return 後の commit 順序が実在する |
 
 negative controlは「壊れた実装もtestが緑になる」ことを防ぐ検査である。loomはthread実行順を繰り返し変え、bounded model内の可能な並行実行を探索する。[Loom documentation](https://docs.rs/loom/latest/loom/model/fn.model.html) / [Loom repository and limitations](https://github.com/tokio-rs/loom)（2026-08-11参照）
@@ -172,11 +183,11 @@ RUSTFLAGS='--cfg loom' cargo clippy --package authority-core --test authorizatio
 
 ## 正確な保証範囲
 
-現在は、単一・compound effectと1 direct revoke、単一・compound descendant effectと1 ancestor revoke、2 effectsと1 direct revokeを検査する。2 threadのmodelは全interleaving、3 threadのmodelは同値なscheduleの爆発を避けるためpreemption bound 2で探索する。各modelはattempt outcomeとeffect countを確認し、単一requestでは`auth_epoch`、compound requestでは監査されたrequest set全件との対応も確認する。
+現在は、単一・compound effectとdirect / ancestor revoke、2 effects、open handle と shutdown、direct + ancestor の複数 revoke を検査する。2 threadのmodelは全interleaving、3 thread以上のmodelは同値なscheduleの爆発を避けるためpreemption bound 2で探索する。各modelはattempt outcomeとeffect countを確認し、単一requestでは`auth_epoch`、compound requestでは監査されたrequest set全件との対応も確認する。
 
 次はまだ含まれない。
 
-- open handle、rename、unlink を含む filesystem 固有の競合。
+- rename、unlink を含む filesystem 固有の競合。
 - truncate、create、remove、renameを含むexecutor adapterが、実際のsyscallを正しい線形化点まで実行すること。
 - writer fairness、revoke latency、負荷時の性能。
 - 4 thread 以上、複数 Capability tree、複数 revoke を組み合わせた model。

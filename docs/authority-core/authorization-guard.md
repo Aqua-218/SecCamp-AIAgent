@@ -201,6 +201,14 @@ Direct-I/O capfsの`OPEN` / `READ` / `WRITE`については、executorがfd open
 
 loom自身にもC11 memory modelの未対応部分があるため、bounded modelのpassを実システム全体の証明とは扱わない。今回のmodelはatomicだけで認可を組み立てず、reader-writer lockの排他順序を検査対象にしている。
 
+## 変更時の確認点
+
+- read guard を保持する区間を短くしない。commit point より前に手放すと、revoke と effect の順序が入れ替わる。
+- executor 契約に「effect を起こさない場合がある」を追加するときは、audit 側が commit されなかったことを記録できるかを確認する。
+- lock 取得の失敗を retry に変えない。現在は fail closed で、これが loom の negative control の前提になっている。
+- loom の探索対象を増やすときは、positive control（本来通るべき順序が通ること）も同時に足す。negative control だけだと、全部拒否する実装でも通る。
+- 認可と effect commit を別の lock に分けない。線形化が壊れる。
+
 ## 関連
 
 - [Capability の発行と逐次状態機械](capability-state.md)

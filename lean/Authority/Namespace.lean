@@ -458,8 +458,8 @@ theorem remove_preserves_treeWellFormed {state : NamespaceState}
 
 /--
 A reversible subtree rebase. `sourceSubtreeRebased` fixes the exact suffix of
-every moved path, while `preservesDirectParent` prevents arbitrary bijections
-from scrambling the directory tree.
+every moved path. Parent edges are preserved except at the moved root, whose
+new parent is validated by `MayRename`.
 -/
 structure PathRenaming where
   source : CanonicalPath
@@ -469,11 +469,13 @@ structure PathRenaming where
   inverseForward : ∀ path, inverse (forward path) = path
   forwardInverse : ∀ path, forward (inverse path) = path
   preservesRoot : forward CanonicalPath.root = CanonicalPath.root
+  mapsSource : forward source = destination
   sourceSubtreeRebased : ∀ path suffix,
     path.segments = source.segments ++ suffix →
       (forward path).segments = destination.segments ++ suffix
-  preservesDirectParent : ∀ {parent child},
-    DirectParent parent child → DirectParent (forward parent) (forward child)
+  preservesDirectParentExceptSource : ∀ {parent child},
+    child ≠ source →
+      DirectParent parent child → DirectParent (forward parent) (forward child)
 
 namespace PathRenaming
 
@@ -502,7 +504,8 @@ structure MayRename (state : NamespaceState) (pathMapping : PathRenaming) : Prop
     state.objects parentId = some parent ∧
     state.paths parent.path = some parentId ∧
     parent.kind = .directory ∧
-    DirectParent parent.path pathMapping.destination
+    DirectParent parent.path pathMapping.destination ∧
+    pathMapping.forward parent.path = parent.path
   outsideSourceUnchanged : ∀ objectId object,
     state.objects objectId = some object →
       ¬ AtOrBelow object.path pathMapping.source →
@@ -562,7 +565,8 @@ theorem rename_preserves_wellFormed {state : NamespaceState}
 
 /-- A parent-preserving subtree rebase preserves the rooted directory tree. -/
 theorem rename_preserves_treeWellFormed {state : NamespaceState}
-    (treeWellFormed : state.TreeWellFormed) (pathMapping : PathRenaming) :
+    (treeWellFormed : state.TreeWellFormed) (pathMapping : PathRenaming)
+    (allowed : state.MayRename pathMapping) :
     (state.renamePaths pathMapping).TreeWellFormed := by
   rcases treeWellFormed.rootExists with
     ⟨rootId, root, rootLookup, rootIdentity, rootPath, rootKind⟩
@@ -583,13 +587,23 @@ theorem rename_preserves_treeWellFormed {state : NamespaceState}
         intro oldWasRoot
         apply renamedNotRoot
         simp [oldWasRoot, pathMapping.preservesRoot]
-      rcases treeWellFormed.parentDirectory objectId oldObject oldLookup oldNotRoot with
-        ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, directParent⟩
-      exact ⟨parentId, { parent with path := pathMapping.forward parent.path },
-        rename_preserves_object_fields parentLookup,
-        by simp [renamePaths, pathMapping.inverseForward, parentPathLookup],
-        parentKind,
-        pathMapping.preservesDirectParent directParent⟩
+      by_cases isMovedRoot : oldObject.path = pathMapping.source
+      · rcases allowed.destinationParentExists with
+          ⟨parentId, parent, parentLookup, parentPathLookup, parentKind,
+            destinationParent, parentUnchanged⟩
+        exact ⟨parentId, { parent with path := pathMapping.forward parent.path },
+          rename_preserves_object_fields parentLookup,
+          by simp [renamePaths, pathMapping.inverseForward, parentPathLookup],
+          parentKind,
+          by simpa [isMovedRoot, pathMapping.mapsSource, parentUnchanged] using
+            destinationParent⟩
+      · rcases treeWellFormed.parentDirectory objectId oldObject oldLookup oldNotRoot with
+          ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, directParent⟩
+        exact ⟨parentId, { parent with path := pathMapping.forward parent.path },
+          rename_preserves_object_fields parentLookup,
+          by simp [renamePaths, pathMapping.inverseForward, parentPathLookup],
+          parentKind,
+          pathMapping.preservesDirectParentExceptSource isMovedRoot directParent⟩
 
 /-- Open one live object without changing its canonical path or generation. -/
 def withOpenHandleCount (object : NamespaceObject) (count : Nat) : NamespaceObject :=
@@ -955,7 +969,8 @@ theorem Step.preserves_treeWellFormed {before after : NamespaceState}
   cases transition with
   | create allowed => exact create_preserves_treeWellFormed treeWellFormed allowed
   | remove allowed => exact remove_preserves_treeWellFormed treeWellFormed allowed
-  | renamePaths _ => exact rename_preserves_treeWellFormed treeWellFormed _
+  | renamePaths allowed =>
+      exact rename_preserves_treeWellFormed treeWellFormed _ allowed
   | openObject objectLookup =>
       exact openObject_preserves_treeWellFormed treeWellFormed objectLookup
   | closeObject objectLookup _ =>

@@ -452,10 +452,33 @@ def CleanupState.pending : CleanupState where
   brokerClosed := false
   workspaceIsolated := false
 
+/-- Cleanup starts complete for resources that a failed startup never acquired. -/
+def CleanupState.forResources (resources : Resources) : CleanupState where
+  capabilityRevoked := resources.capability.isNone
+  vmKilled := resources.vm.isNone
+  brokerClosed := resources.broker.isNone
+  workspaceIsolated := resources.workspace.isNone
+
 /-- All cleanup dependencies have committed. -/
 def CleanupState.Complete (state : CleanupState) : Prop :=
   state.capabilityRevoked = true ∧ state.vmKilled = true ∧
     state.brokerClosed = true ∧ state.workspaceIsolated = true
+
+/-- Every absent resource is already accounted for by cleanup progress. -/
+def CleanupState.CoversAbsentResources (state : CleanupState)
+    (resources : Resources) : Prop :=
+  (resources.capability = none → state.capabilityRevoked = true) ∧
+  (resources.vm = none → state.vmKilled = true) ∧
+  (resources.broker = none → state.brokerClosed = true) ∧
+  (resources.workspace = none → state.workspaceIsolated = true)
+
+/-- Resource-derived cleanup progress accounts for every unacquired stage. -/
+theorem CleanupState.forResources_coversAbsentResources (resources : Resources) :
+    (CleanupState.forResources resources).CoversAbsentResources resources := by
+  cases resources with
+  | mk workspace broker vm capability workload =>
+      cases workspace <;> cases broker <;> cases vm <;> cases capability <;>
+        simp [CleanupState.forResources, CleanupState.CoversAbsentResources]
 
 /-- Mark a successful capability revocation. -/
 def CleanupState.revokeCapability (state : CleanupState) : CleanupState :=
@@ -492,6 +515,18 @@ theorem CleanupStep.flags_monotone {before after : CleanupState}
     (before.workspaceIsolated = true → after.workspaceIsolated = true) := by
   cases transition <;> simp [CleanupState.revokeCapability, CleanupState.killVm,
     CleanupState.closeBroker, CleanupState.isolateWorkspace]
+
+/-- Cleanup retries preserve the accounting for resources absent at startup failure. -/
+theorem CleanupStep.preserves_coversAbsentResources {before after : CleanupState}
+    {resources : Resources} (transition : CleanupStep before after)
+    (covers : before.CoversAbsentResources resources) :
+    after.CoversAbsentResources resources := by
+  rcases transition.flags_monotone with ⟨capability, vm, broker, workspace⟩
+  rcases covers with ⟨capabilityAbsent, vmAbsent, brokerAbsent, workspaceAbsent⟩
+  exact ⟨fun absent => capability (capabilityAbsent absent),
+    fun absent => vm (vmAbsent absent),
+    fun absent => broker (brokerAbsent absent),
+    fun absent => workspace (workspaceAbsent absent)⟩
 
 /-- Workspace isolation cannot commit while the VM or Broker is still live. -/
 theorem CleanupStep.workspace_isolation_requires_dependencies
@@ -530,6 +565,19 @@ theorem CleanupSteps.flags_monotone {before after : CleanupState}
         fun closed => brokerAfter (brokerBefore closed),
         fun isolated => workspaceAfter (workspaceBefore isolated)⟩
 
+/-- Phases with a committed workspace retain a cleanup-reachable startup prefix. -/
+def LifecyclePhase.CleanupEligible : LifecyclePhase → Prop
+  | .workspaceCloned | .brokerEstablished | .vmStarted
+  | .rootCapabilityInjected | .workloadReleased | .running => True
+  | .ready | .identitiesReserved | .closed => False
+
+/-- A cleanup-eligible startup prefix cannot already be Closed. -/
+theorem LifecyclePhase.CleanupEligible.ne_closed {phase : LifecyclePhase}
+    (eligible : phase.CleanupEligible) : phase ≠ .closed := by
+  intro closed
+  subst phase
+  exact eligible
+
 /-- Lifecycle state composed with retryable cleanup progress. -/
 structure ManagedState where
   core : State
@@ -542,9 +590,11 @@ def ManagedState.initial (ledger : IdentityLedger) : ManagedState where
   stopping := false
   cleanup := .pending
 
-/-- Enter retryable cleanup while retaining the exact active resource chain. -/
+/-- Enter retryable cleanup while retaining a normal or partial startup resource chain. -/
 def ManagedState.beginStop (state : ManagedState) : ManagedState :=
-  { state with stopping := true, cleanup := .pending }
+  { state with
+    stopping := true
+    cleanup := CleanupState.forResources state.core.resources }
 
 /-- Commit one successful cleanup action without discarding resource leases. -/
 def ManagedState.recordCleanup (state : ManagedState)
@@ -555,11 +605,15 @@ def ManagedState.recordCleanup (state : ManagedState)
 def ManagedState.finishStop (state : ManagedState) : ManagedState :=
   { core := markClosed state.core, stopping := false, cleanup := state.cleanup }
 
-/-- Core bindings, Closed gating, and Stopping resource retention agree. -/
+/-- Core bindings, Closed gating, and partial-start cleanup accounting agree. -/
 structure ManagedState.WellFormed (state : ManagedState) : Prop where
   coreWellFormed : state.core.WellFormed
   closedRequiresCleanup : state.core.phase = .closed → state.cleanup.Complete
-  stoppingRetainsRunning : state.stopping = true → state.core.phase = .running
+  stoppingRetainsCleanupPrefix :
+    state.stopping = true → state.core.phase.CleanupEligible
+  stoppingCoversAbsentResources :
+    state.stopping = true →
+      state.cleanup.CoversAbsentResources state.core.resources
 
 /-- The initial managed state satisfies lifecycle/cleanup coupling. -/
 theorem ManagedState.initial_wellFormed (ledger : IdentityLedger) :
@@ -568,6 +622,8 @@ theorem ManagedState.initial_wellFormed (ledger : IdentityLedger) :
   · exact State.initial_wellFormed ledger
   · intro impossible
     simp [ManagedState.initial, State.initial] at impossible
+  · intro impossible
+    simp [ManagedState.initial] at impossible
   · intro impossible
     simp [ManagedState.initial] at impossible
 
@@ -583,7 +639,7 @@ inductive ManagedStep : ManagedState → ManagedState → Prop
       state.stopping = false → Step state.core core →
       ManagedStep state { state with core := core }
   | beginStop {state : ManagedState} :
-      state.stopping = false → state.core.phase = .running →
+      state.stopping = false → state.core.phase.CleanupEligible →
       ManagedStep state state.beginStop
   | cleanup {state : ManagedState} {cleanup : CleanupState} :
       state.stopping = true → CleanupStep state.cleanup cleanup →
@@ -604,27 +660,34 @@ theorem ManagedStep.preserves_wellFormed {before after : ManagedState}
         exact False.elim (startupStep.after_ne_closed closed)
       · intro impossible
         simp [notStopping] at impossible
-  | beginStop notStopping running =>
+      · intro impossible
+        simp [notStopping] at impossible
+  | beginStop notStopping eligible =>
       exact ⟨wellFormed.coreWellFormed,
         fun closed => False.elim (by
           change before.core.phase = .closed at closed
-          rw [running] at closed
-          cases closed),
-        fun _ => running⟩
+          exact eligible.ne_closed closed),
+        fun _ => eligible,
+        fun _ => by
+          simpa [ManagedState.beginStop] using
+            CleanupState.forResources_coversAbsentResources before.core.resources⟩
   | cleanup stopping cleanupStep =>
       exact ⟨wellFormed.coreWellFormed,
         fun closed => False.elim (by
-          have running := wellFormed.stoppingRetainsRunning stopping
+          have eligible := wellFormed.stoppingRetainsCleanupPrefix stopping
           change before.core.phase = .closed at closed
-          rw [running] at closed
-          cases closed),
-        fun _ => wellFormed.stoppingRetainsRunning stopping⟩
+          exact eligible.ne_closed closed),
+        fun _ => wellFormed.stoppingRetainsCleanupPrefix stopping,
+        fun _ => cleanupStep.preserves_coversAbsentResources
+          (wellFormed.stoppingCoversAbsentResources stopping)⟩
   | finishStop stopping complete =>
       constructor
       · simp [ManagedState.finishStop, markClosed, State.WellFormed,
           Resources.empty]
       · intro _
         exact complete
+      · intro impossible
+        simp [ManagedState.finishStop] at impossible
       · intro impossible
         simp [ManagedState.finishStop] at impossible
 
@@ -649,6 +712,92 @@ theorem ManagedSteps.preserves_wellFormed {before after : ManagedState}
   | refl => exact wellFormed
   | tail _ transition inductionHypothesis =>
       exact transition.preserves_wellFormed inductionHypothesis
+
+/-- Finite reachability from an initial managed orchestrator state. -/
+def ManagedState.Reachable (ledger : IdentityLedger) (state : ManagedState) : Prop :=
+  ManagedSteps (ManagedState.initial ledger) state
+
+/-- Every finitely reachable managed state preserves lifecycle and cleanup coupling. -/
+theorem ManagedState.Reachable.wellFormed {ledger : IdentityLedger}
+    {state : ManagedState} (reachable : state.Reachable ledger) :
+    state.WellFormed :=
+  reachable.preserves_wellFormed (ManagedState.initial_wellFormed ledger)
+
+/-- Closed is cleanup-complete on every finite normal-stop or failed-start execution. -/
+theorem ManagedState.Reachable.closed_implies_cleanup_complete
+    {ledger : IdentityLedger} {state : ManagedState}
+    (reachable : state.Reachable ledger) (closed : state.core.phase = .closed) :
+    state.cleanup.Complete :=
+  ManagedState.closed_implies_cleanup_complete reachable.wellFormed closed
+
+/-- Every committed startup prefix, including Running, has a finite path to Closed. -/
+theorem cleanupEligible_reaches_closed {state : ManagedState}
+    (notStopping : state.stopping = false)
+    (eligible : state.core.phase.CleanupEligible) :
+    ∃ closed,
+      ManagedSteps state closed ∧ closed.core.phase = .closed ∧
+      closed.cleanup.Complete := by
+  let stopping := state.beginStop
+  let revoked := stopping.recordCleanup stopping.cleanup.revokeCapability
+  let killed := revoked.recordCleanup revoked.cleanup.killVm
+  let brokerClosed := killed.recordCleanup killed.cleanup.closeBroker
+  let workspaceIsolated :=
+    brokerClosed.recordCleanup brokerClosed.cleanup.isolateWorkspace
+  let closed := workspaceIsolated.finishStop
+  have beginTransition : ManagedStep state stopping :=
+    ManagedStep.beginStop notStopping eligible
+  have revokeTransition : ManagedStep stopping revoked := by
+    apply ManagedStep.cleanup
+    · simp [stopping, ManagedState.beginStop]
+    · exact CleanupStep.revokeCapability
+  have killTransition : ManagedStep revoked killed := by
+    apply ManagedStep.cleanup
+    · simp [revoked, stopping, ManagedState.recordCleanup,
+        ManagedState.beginStop]
+    · exact CleanupStep.killVm
+  have brokerTransition : ManagedStep killed brokerClosed := by
+    apply ManagedStep.cleanup
+    · simp [killed, revoked, stopping, ManagedState.recordCleanup,
+        ManagedState.beginStop]
+    · exact CleanupStep.closeBroker
+  have workspaceTransition : ManagedStep brokerClosed workspaceIsolated := by
+    apply ManagedStep.cleanup
+    · simp [brokerClosed, killed, revoked, stopping,
+        ManagedState.recordCleanup, ManagedState.beginStop]
+    · apply CleanupStep.isolateWorkspace
+      · simp [brokerClosed, killed, revoked, stopping,
+          ManagedState.recordCleanup, ManagedState.beginStop,
+          CleanupState.revokeCapability, CleanupState.killVm,
+          CleanupState.closeBroker]
+      · simp [brokerClosed, killed, revoked, stopping,
+          ManagedState.recordCleanup, ManagedState.beginStop,
+          CleanupState.revokeCapability, CleanupState.killVm,
+          CleanupState.closeBroker]
+  have complete : workspaceIsolated.cleanup.Complete := by
+    simp [workspaceIsolated, brokerClosed, killed, revoked, stopping,
+      ManagedState.recordCleanup, ManagedState.beginStop,
+      CleanupState.Complete, CleanupState.revokeCapability,
+      CleanupState.killVm, CleanupState.closeBroker,
+      CleanupState.isolateWorkspace]
+  have finishTransition : ManagedStep workspaceIsolated closed := by
+    apply ManagedStep.finishStop
+    · simp [workspaceIsolated, brokerClosed, killed, revoked, stopping,
+        ManagedState.recordCleanup, ManagedState.beginStop]
+    · exact complete
+  have began : ManagedSteps state stopping :=
+    ManagedSteps.tail (ManagedSteps.refl state) beginTransition
+  have revokedSteps : ManagedSteps state revoked :=
+    ManagedSteps.tail began revokeTransition
+  have killedSteps : ManagedSteps state killed :=
+    ManagedSteps.tail revokedSteps killTransition
+  have brokerSteps : ManagedSteps state brokerClosed :=
+    ManagedSteps.tail killedSteps brokerTransition
+  have isolatedSteps : ManagedSteps state workspaceIsolated :=
+    ManagedSteps.tail brokerSteps workspaceTransition
+  refine ⟨closed, ?_, ?_, ?_⟩
+  · exact ManagedSteps.tail isolatedSteps finishTransition
+  · simp [closed, ManagedState.finishStop, markClosed]
+  · simpa [closed, ManagedState.finishStop] using complete
 
 end Orchestrator
 

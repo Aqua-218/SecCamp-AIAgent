@@ -236,11 +236,14 @@ fn kernel_derives_and_commits_with_the_exact_authorizing_capability() {
         .expect("a narrower child must be derivable");
 
     let committed_id = kernel
-        .authorize_and_commit(
+        .authorize_and_execute_classified(
             &child_subject_id(),
             &child_id,
             &read_request(30, &["src", "main.rs"]),
-            |capability| Ok::<_, Infallible>(capability.metadata().id().clone()),
+            |capability| EffectExecution::<_, Infallible>::Committed {
+                value: capability.metadata().id().clone(),
+                receipt: None,
+            },
         )
         .expect("the child must authorize a read inside its scope");
 
@@ -257,8 +260,11 @@ fn compound_commit_requires_every_request_and_records_the_complete_set() {
     let requests = CapabilityRequestSet::new(read.clone(), [write.clone()]);
 
     kernel
-        .authorize_all_and_commit(&root_subject_id(), &root_id, &requests, |_| {
-            Ok::<_, Infallible>(())
+        .authorize_all_and_execute_classified(&root_subject_id(), &root_id, &requests, |_| {
+            EffectExecution::<_, Infallible>::Committed {
+                value: (),
+                receipt: None,
+            }
         })
         .expect("the root capability must authorize both requested effects");
 
@@ -295,7 +301,7 @@ fn active_capability_inspection_preserves_subject_and_lifecycle_binding() {
     );
 
     kernel
-        .revoke(&root_id)
+        .revoke_held_by(&root_subject_id(), &root_id)
         .expect("the active root capability must be revocable");
     assert_eq!(
         kernel.with_active_capability(&root_subject_id(), &root_id, time(30), |_| Ok::<
@@ -349,7 +355,7 @@ fn revoke_waits_for_active_capability_inspection() {
             revoke_started_tx
                 .send(())
                 .expect("the test observer must remain connected");
-            let result = revoking_kernel.revoke(&revoking_id);
+            let result = revoking_kernel.revoke_held_by(&root_subject_id(), &revoking_id);
             revoke_finished_tx
                 .send(())
                 .expect("the test observer must remain connected");
@@ -411,10 +417,14 @@ fn denied_effects_never_invoke_the_executor() {
     ];
 
     for (caller, capability_id, request) in cases {
-        let result = kernel.authorize_and_commit(&caller, &capability_id, &request, |_| {
-            executor_calls.set(executor_calls.get() + 1);
-            Ok::<_, Infallible>(())
-        });
+        let result =
+            kernel.authorize_and_execute_classified(&caller, &capability_id, &request, |_| {
+                executor_calls.set(executor_calls.get() + 1);
+                EffectExecution::<_, Infallible>::Committed {
+                    value: (),
+                    receipt: None,
+                }
+            });
 
         assert_eq!(result, Err(EffectCommitError::NotAuthorized));
     }
@@ -428,11 +438,11 @@ fn pre_commit_effect_failure_is_reported_and_releases_the_guard() {
     let (kernel, root_id) = kernel_with_root();
 
     let error = kernel
-        .authorize_and_commit(
+        .authorize_and_execute_classified(
             &root_subject_id(),
             &root_id,
             &read_request(30, &["src", "main.rs"]),
-            |_| Err::<(), _>(ExecutorFailure),
+            |_| EffectExecution::<(), _>::FailedBeforeCommit(ExecutorFailure),
         )
         .expect_err("the executor failure must be propagated");
 
@@ -445,7 +455,10 @@ fn pre_commit_effect_failure_is_reported_and_releases_the_guard() {
         error.source().map(ToString::to_string),
         Some("backing operation was rejected".to_owned())
     );
-    assert_eq!(kernel.revoke(&root_id), Ok(RevocationStatus::NewlyRevoked));
+    assert_eq!(
+        kernel.revoke_held_by(&root_subject_id(), &root_id),
+        Ok(RevocationStatus::NewlyRevoked)
+    );
 }
 
 // Requirement: an ambiguous provider result is durable but never counted as a committed effect.
@@ -477,7 +490,10 @@ fn commit_unknown_is_terminal_without_creating_an_effect_record() {
             .expect("effect records must remain readable")
             .is_empty()
     );
-    assert_eq!(kernel.revoke(&root_id), Ok(RevocationStatus::NewlyRevoked));
+    assert_eq!(
+        kernel.revoke_held_by(&root_subject_id(), &root_id),
+        Ok(RevocationStatus::NewlyRevoked)
+    );
 }
 
 // Requirement: once ancestor revoke returns, a descendant cannot start an
@@ -494,25 +510,31 @@ fn ancestor_revoke_prevents_every_later_executor_call() {
         kernel.authorization_epoch(),
         Ok(AuthorizationEpoch::default())
     );
-    assert_eq!(kernel.revoke(&root_id), Ok(RevocationStatus::NewlyRevoked));
+    assert_eq!(
+        kernel.revoke_held_by(&root_subject_id(), &root_id),
+        Ok(RevocationStatus::NewlyRevoked)
+    );
     assert_eq!(
         kernel.authorization_epoch().map(AuthorizationEpoch::as_u64),
         Ok(1)
     );
-    let result = kernel.authorize_and_commit(
+    let result = kernel.authorize_and_execute_classified(
         &child_subject_id(),
         &child_id,
         &read_request(30, &["src", "main.rs"]),
         |_| {
             executor_calls.set(executor_calls.get() + 1);
-            Ok::<_, Infallible>(())
+            EffectExecution::<_, Infallible>::Committed {
+                value: (),
+                receipt: None,
+            }
         },
     );
 
     assert_eq!(result, Err(EffectCommitError::NotAuthorized));
     assert_eq!(executor_calls.get(), 0);
     assert_eq!(
-        kernel.revoke(&root_id),
+        kernel.revoke_held_by(&root_subject_id(), &root_id),
         Ok(RevocationStatus::AlreadyRevoked)
     );
     assert_eq!(
@@ -536,13 +558,16 @@ fn subject_close_blocks_later_executor_calls() {
         kernel.subject_status(&root_subject_id()),
         Ok(Some(SubjectStatus::Closing))
     );
-    let result = kernel.authorize_and_commit(
+    let result = kernel.authorize_and_execute_classified(
         &root_subject_id(),
         &root_id,
         &read_request(30, &["src", "main.rs"]),
         |_| {
             executor_calls.set(executor_calls.get() + 1);
-            Ok::<_, Infallible>(())
+            EffectExecution::<_, Infallible>::Committed {
+                value: (),
+                receipt: None,
+            }
         },
     );
 
@@ -598,26 +623,32 @@ fn audit_distinguishes_denied_failed_and_committed_attempts() {
     let committed_request = read_request(30, &["src", "committed.rs"]);
 
     assert_eq!(
-        kernel.authorize_and_commit(&root_subject_id(), &root_id, &denied_request, |_| Ok::<
-            _,
-            Infallible,
-        >(
-            ()
-        ),),
+        kernel.authorize_and_execute_classified(
+            &root_subject_id(),
+            &root_id,
+            &denied_request,
+            |_| EffectExecution::<_, Infallible>::Committed {
+                value: (),
+                receipt: None,
+            },
+        ),
         Err(EffectCommitError::NotAuthorized)
     );
     assert_eq!(
-        kernel.authorize_and_commit(&root_subject_id(), &root_id, &failed_request, |_| Err::<
-            (),
-            _,
-        >(
-            ExecutorFailure
-        ),),
+        kernel.authorize_and_execute_classified(
+            &root_subject_id(),
+            &root_id,
+            &failed_request,
+            |_| EffectExecution::<(), _>::FailedBeforeCommit(ExecutorFailure),
+        ),
         Err(EffectCommitError::Effect(ExecutorFailure))
     );
     kernel
-        .authorize_and_commit(&root_subject_id(), &root_id, &committed_request, |_| {
-            Ok::<_, Infallible>(())
+        .authorize_and_execute_classified(&root_subject_id(), &root_id, &committed_request, |_| {
+            EffectExecution::<_, Infallible>::Committed {
+                value: (),
+                receipt: None,
+            }
         })
         .expect("the final request must commit");
 

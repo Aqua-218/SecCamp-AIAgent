@@ -5,7 +5,7 @@
 //! effects carry only a stable reason code. Provider diagnostics, credentials,
 //! and arbitrary strings never cross this boundary.
 
-use std::{error::Error, fmt, str};
+use std::{error::Error, fmt, iter::FusedIterator, str};
 
 use authority_core::{
     github::GitHubOperation,
@@ -299,26 +299,38 @@ impl CanonicalBrokerResponse {
     /// Returns [`ResponseChunkError::Response`] when the expanded response is
     /// invalid or exceeds its bounded allocation policy.
     pub fn chunks(&self) -> Result<Vec<CanonicalResponseChunk>, ResponseChunkError> {
-        let encoded = self
-            .encode_with_limit(MAX_EXPANDED_CANONICAL_RESPONSE_BYTES)
-            .map_err(ResponseChunkError::Response)?;
-        let total_length = encoded.len();
-        let chunk_count = canonical_chunk_count(total_length)?;
-        let digest = ResponseDigest::of_canonical_response(&encoded);
-        encoded
-            .chunks(MAX_RESPONSE_CHUNK_BYTES)
-            .enumerate()
-            .map(|(index, bytes)| {
-                CanonicalResponseChunk::from_parts(
-                    self.request,
-                    u64::try_from(index).map_err(|_| ResponseChunkError::InvalidMetadata)?,
-                    chunk_count,
-                    total_length,
-                    digest,
-                    bytes.to_vec(),
-                )
-            })
-            .collect()
+        self.chunk_iter()?.collect()
+    }
+
+    /// Lazily produces the canonical typed chunk sequence.
+    ///
+    /// The iterator borrows this response and retains only bounded encoding
+    /// metadata. Each call allocates exactly one chunk body; collecting the
+    /// iterator is an explicit compatibility choice by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResponseChunkError::Response`] when the expanded response is
+    /// invalid or exceeds its bounded allocation policy.
+    pub fn chunk_iter(&self) -> Result<CanonicalResponseChunks<'_>, ResponseChunkError> {
+        CanonicalResponseChunks::new(self)
+    }
+
+    /// Lazily encodes one canonical chunk payload at a time.
+    ///
+    /// This is the production streaming path. It hashes the response directly
+    /// from its typed fields, then copies each canonical byte into exactly one
+    /// bounded chunk envelope. It never materializes the complete expanded
+    /// response or a collection containing every chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResponseChunkError`] when the expanded response metadata or a
+    /// generated chunk would violate the canonical wire bounds.
+    pub fn encoded_chunk_iter(
+        &self,
+    ) -> Result<CanonicalResponseChunkPayloads<'_>, ResponseChunkError> {
+        CanonicalResponseChunkPayloads::new(self)
     }
 
     /// Reassembles and decodes one complete ordered response chunk sequence.
@@ -333,38 +345,15 @@ impl CanonicalBrokerResponse {
     }
 
     fn encode_with_limit(&self, maximum: usize) -> Result<Vec<u8>, ResponseCborError> {
-        let encoded_length = self.encoded_length();
+        let encoding = CanonicalResponseEncoding::new(self);
+        let encoded_length = encoding.total_length();
         if encoded_length > maximum {
             return Err(ResponseCborError::PayloadTooLarge {
                 length: encoded_length,
             });
         }
         let mut output = Vec::with_capacity(encoded_length);
-        write_array(&mut output, RESPONSE_ITEMS);
-        write_unsigned(&mut output, BROKER_RESPONSE_VERSION);
-        write_bytes(&mut output, self.request.as_bytes());
-        match &self.outcome {
-            BrokerWireOutcome::Public(response) => {
-                write_unsigned(&mut output, PUBLIC_SUCCESS);
-                write_array(&mut output, PUBLIC_ITEMS);
-                write_unsigned(&mut output, u64::from(response.status));
-                write_text(&mut output, response.host.as_str());
-                write_text(&mut output, &response.path.to_string());
-                write_bytes(&mut output, &response.body);
-            }
-            BrokerWireOutcome::GitHub(response) => {
-                write_unsigned(&mut output, GITHUB_SUCCESS);
-                write_array(&mut output, GITHUB_ITEMS);
-                write_unsigned(&mut output, github_operation_code(response.operation));
-                write_unsigned(&mut output, response.response_bytes);
-                write_optional_unsigned(&mut output, response.pull_request_number);
-                write_optional_text(&mut output, response.object_id.as_deref());
-            }
-            BrokerWireOutcome::Rejected(rejection) => {
-                write_unsigned(&mut output, REJECTED);
-                write_unsigned(&mut output, rejection.code());
-            }
-        }
+        encoding.for_each_part(|part| output.extend_from_slice(part));
         debug_assert_eq!(output.len(), encoded_length);
         Ok(output)
     }
@@ -406,35 +395,269 @@ impl CanonicalBrokerResponse {
         Ok(Self { request, outcome })
     }
 
+    #[cfg(test)]
     fn encoded_length(&self) -> usize {
-        let fixed = cbor_head_length(RESPONSE_ITEMS)
-            + cbor_head_length(BROKER_RESPONSE_VERSION)
-            + cbor_bytes_length(REQUEST_ID_BYTES)
-            + cbor_head_length(match self.outcome {
-                BrokerWireOutcome::Public(_) => PUBLIC_SUCCESS,
-                BrokerWireOutcome::GitHub(_) => GITHUB_SUCCESS,
-                BrokerWireOutcome::Rejected(_) => REJECTED,
-            });
-        fixed
-            + match &self.outcome {
-                BrokerWireOutcome::Public(response) => {
-                    cbor_head_length(PUBLIC_ITEMS)
-                        + cbor_head_length(u64::from(response.status))
-                        + cbor_text_length(response.host.as_str())
-                        + cbor_text_length(&response.path.to_string())
-                        + cbor_bytes_length(response.body.len())
-                }
-                BrokerWireOutcome::GitHub(response) => {
-                    cbor_head_length(GITHUB_ITEMS)
-                        + cbor_head_length(github_operation_code(response.operation))
-                        + cbor_head_length(response.response_bytes)
-                        + response.pull_request_number.map_or(1, cbor_head_length)
-                        + response.object_id.as_deref().map_or(1, cbor_text_length)
-                }
-                BrokerWireOutcome::Rejected(rejection) => cbor_head_length(rejection.code()),
-            }
+        CanonicalResponseEncoding::new(self).total_length()
     }
 }
+
+#[derive(Debug)]
+struct CanonicalResponseEncoding<'response> {
+    response: &'response CanonicalBrokerResponse,
+    path_text: Box<str>,
+    total_length: usize,
+}
+
+impl<'response> CanonicalResponseEncoding<'response> {
+    fn new(response: &'response CanonicalBrokerResponse) -> Self {
+        let path_text = match response.outcome() {
+            BrokerWireOutcome::Public(public) => public.path().to_string().into_boxed_str(),
+            BrokerWireOutcome::GitHub(_) | BrokerWireOutcome::Rejected(_) => Box::default(),
+        };
+        let mut encoding = Self {
+            response,
+            path_text,
+            total_length: 0,
+        };
+        let mut total_length = 0_usize;
+        encoding.for_each_part(|part| {
+            total_length = total_length.saturating_add(part.len());
+        });
+        encoding.total_length = total_length;
+        encoding
+    }
+
+    const fn total_length(&self) -> usize {
+        self.total_length
+    }
+
+    fn digest(&self) -> ResponseDigest {
+        let mut digest = Sha256::new();
+        self.for_each_part(|part| digest.update(part));
+        ResponseDigest(digest.finalize().into())
+    }
+
+    fn copy_range(
+        &self,
+        start: usize,
+        length: usize,
+        output: &mut Vec<u8>,
+    ) -> Result<(), ResponseChunkError> {
+        let end = start
+            .checked_add(length)
+            .filter(|end| *end <= self.total_length)
+            .ok_or(ResponseChunkError::InvalidMetadata)?;
+        let initial_length = output.len();
+        let mut position = 0_usize;
+        self.for_each_part(|part| {
+            let part_end = position.saturating_add(part.len());
+            let overlap_start = start.max(position);
+            let overlap_end = end.min(part_end);
+            if overlap_start < overlap_end {
+                output.extend_from_slice(&part[overlap_start - position..overlap_end - position]);
+            }
+            position = part_end;
+        });
+        if output.len().saturating_sub(initial_length) != length {
+            return Err(ResponseChunkError::InvalidMetadata);
+        }
+        Ok(())
+    }
+
+    fn for_each_part(&self, mut consumer: impl FnMut(&[u8])) {
+        emit_head(&mut consumer, 4, RESPONSE_ITEMS);
+        emit_head(&mut consumer, 0, BROKER_RESPONSE_VERSION);
+        emit_bytes(&mut consumer, self.response.request.as_bytes());
+        match &self.response.outcome {
+            BrokerWireOutcome::Public(response) => {
+                emit_head(&mut consumer, 0, PUBLIC_SUCCESS);
+                emit_head(&mut consumer, 4, PUBLIC_ITEMS);
+                emit_head(&mut consumer, 0, u64::from(response.status));
+                emit_text(&mut consumer, response.host.as_str());
+                emit_text(&mut consumer, &self.path_text);
+                emit_bytes(&mut consumer, &response.body);
+            }
+            BrokerWireOutcome::GitHub(response) => {
+                emit_head(&mut consumer, 0, GITHUB_SUCCESS);
+                emit_head(&mut consumer, 4, GITHUB_ITEMS);
+                emit_head(&mut consumer, 0, github_operation_code(response.operation));
+                emit_head(&mut consumer, 0, response.response_bytes);
+                emit_optional_unsigned(&mut consumer, response.pull_request_number);
+                emit_optional_text(&mut consumer, response.object_id.as_deref());
+            }
+            BrokerWireOutcome::Rejected(rejection) => {
+                emit_head(&mut consumer, 0, REJECTED);
+                emit_head(&mut consumer, 0, rejection.code());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn owned_scratch_bytes(&self) -> usize {
+        self.path_text.len()
+    }
+}
+
+#[derive(Debug)]
+struct CanonicalChunkSequence<'response> {
+    encoding: CanonicalResponseEncoding<'response>,
+    count: u64,
+    digest: ResponseDigest,
+}
+
+impl<'response> CanonicalChunkSequence<'response> {
+    fn new(response: &'response CanonicalBrokerResponse) -> Result<Self, ResponseChunkError> {
+        let encoding = CanonicalResponseEncoding::new(response);
+        if encoding.total_length() > MAX_EXPANDED_CANONICAL_RESPONSE_BYTES {
+            return Err(ResponseChunkError::Response(
+                ResponseCborError::PayloadTooLarge {
+                    length: encoding.total_length(),
+                },
+            ));
+        }
+        let count = canonical_chunk_count(encoding.total_length())?;
+        let digest = encoding.digest();
+        Ok(Self {
+            encoding,
+            count,
+            digest,
+        })
+    }
+
+    fn chunk(&self, index: u64) -> Result<CanonicalResponseChunk, ResponseChunkError> {
+        let length = canonical_chunk_length(self.encoding.total_length(), index)?;
+        let offset = chunk_offset(index)?;
+        let mut bytes = Vec::with_capacity(length);
+        self.encoding.copy_range(offset, length, &mut bytes)?;
+        CanonicalResponseChunk::from_parts(
+            self.encoding.response.request,
+            index,
+            self.count,
+            self.encoding.total_length(),
+            self.digest,
+            bytes,
+        )
+    }
+
+    fn encoded_chunk(&self, index: u64) -> Result<Vec<u8>, ResponseChunkError> {
+        let length = canonical_chunk_length(self.encoding.total_length(), index)?;
+        let offset = chunk_offset(index)?;
+        let mut output = Vec::with_capacity(length.saturating_add(128));
+        write_array(&mut output, RESPONSE_CHUNK_ITEMS);
+        write_unsigned(&mut output, BROKER_RESPONSE_CHUNK_VERSION);
+        write_bytes(&mut output, self.encoding.response.request.as_bytes());
+        write_unsigned(&mut output, index);
+        write_unsigned(&mut output, self.count);
+        write_unsigned(
+            &mut output,
+            u64::try_from(self.encoding.total_length())
+                .map_err(|_| ResponseChunkError::InvalidMetadata)?,
+        );
+        write_bytes(&mut output, self.digest.as_bytes());
+        write_head(
+            &mut output,
+            2,
+            u64::try_from(length).map_err(|_| ResponseChunkError::InvalidMetadata)?,
+        );
+        self.encoding.copy_range(offset, length, &mut output)?;
+        if output.len() > MAX_CONTROL_FRAME_BYTES {
+            return Err(ResponseChunkError::EncodedChunkTooLarge {
+                length: output.len(),
+            });
+        }
+        Ok(output)
+    }
+}
+
+/// A bounded lazy iterator over typed canonical response chunks.
+#[derive(Debug)]
+pub struct CanonicalResponseChunks<'response> {
+    sequence: CanonicalChunkSequence<'response>,
+    next_index: u64,
+}
+
+impl<'response> CanonicalResponseChunks<'response> {
+    fn new(response: &'response CanonicalBrokerResponse) -> Result<Self, ResponseChunkError> {
+        Ok(Self {
+            sequence: CanonicalChunkSequence::new(response)?,
+            next_index: 0,
+        })
+    }
+
+    fn remaining(&self) -> usize {
+        usize::try_from(self.sequence.count.saturating_sub(self.next_index)).unwrap_or(usize::MAX)
+    }
+}
+
+impl Iterator for CanonicalResponseChunks<'_> {
+    type Item = Result<CanonicalResponseChunk, ResponseChunkError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_index >= self.sequence.count {
+            return None;
+        }
+        let index = self.next_index;
+        self.next_index = self.next_index.saturating_add(1);
+        Some(self.sequence.chunk(index))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining();
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for CanonicalResponseChunks<'_> {}
+impl FusedIterator for CanonicalResponseChunks<'_> {}
+
+/// A bounded lazy iterator over already encoded canonical chunk payloads.
+///
+/// Each yielded vector is suitable for one control frame and is independent of
+/// every other iteration. The iterator itself borrows the typed response body.
+#[derive(Debug)]
+pub struct CanonicalResponseChunkPayloads<'response> {
+    sequence: CanonicalChunkSequence<'response>,
+    next_index: u64,
+}
+
+impl<'response> CanonicalResponseChunkPayloads<'response> {
+    fn new(response: &'response CanonicalBrokerResponse) -> Result<Self, ResponseChunkError> {
+        Ok(Self {
+            sequence: CanonicalChunkSequence::new(response)?,
+            next_index: 0,
+        })
+    }
+
+    fn remaining(&self) -> usize {
+        usize::try_from(self.sequence.count.saturating_sub(self.next_index)).unwrap_or(usize::MAX)
+    }
+
+    #[cfg(test)]
+    fn owned_scratch_bytes(&self) -> usize {
+        self.sequence.encoding.owned_scratch_bytes()
+    }
+}
+
+impl Iterator for CanonicalResponseChunkPayloads<'_> {
+    type Item = Result<Vec<u8>, ResponseChunkError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_index >= self.sequence.count {
+            return None;
+        }
+        let index = self.next_index;
+        self.next_index = self.next_index.saturating_add(1);
+        Some(self.sequence.encoded_chunk(index))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining();
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for CanonicalResponseChunkPayloads<'_> {}
+impl FusedIterator for CanonicalResponseChunkPayloads<'_> {}
 
 /// SHA-256 identity of one complete canonical Broker response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -961,26 +1184,11 @@ fn canonical_chunk_length(total_length: usize, index: u64) -> Result<usize, Resp
     Ok(remaining.min(MAX_RESPONSE_CHUNK_BYTES))
 }
 
-const fn cbor_head_length(value: u64) -> usize {
-    if value < 24 {
-        1
-    } else if value <= u8::MAX as u64 {
-        2
-    } else if value <= u16::MAX as u64 {
-        3
-    } else if value <= u32::MAX as u64 {
-        5
-    } else {
-        9
-    }
-}
-
-fn cbor_bytes_length(length: usize) -> usize {
-    cbor_head_length(length as u64).saturating_add(length)
-}
-
-fn cbor_text_length(text: &str) -> usize {
-    cbor_bytes_length(text.len())
+fn chunk_offset(index: u64) -> Result<usize, ResponseChunkError> {
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| index.checked_mul(MAX_RESPONSE_CHUNK_BYTES))
+        .ok_or(ResponseChunkError::InvalidMetadata)
 }
 
 fn write_array(output: &mut Vec<u8>, length: u64) {
@@ -992,6 +1200,7 @@ fn write_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(bytes);
 }
 
+#[cfg(test)]
 fn write_text(output: &mut Vec<u8>, text: &str) {
     write_head(output, 3, text.len() as u64);
     output.extend_from_slice(text.as_bytes());
@@ -1001,34 +1210,60 @@ fn write_unsigned(output: &mut Vec<u8>, value: u64) {
     write_head(output, 0, value);
 }
 
-fn write_optional_unsigned(output: &mut Vec<u8>, value: Option<u64>) {
-    match value {
-        Some(value) => write_unsigned(output, value),
-        None => output.push(0xf6),
-    }
-}
-
-fn write_optional_text(output: &mut Vec<u8>, value: Option<&str>) {
-    match value {
-        Some(value) => write_text(output, value),
-        None => output.push(0xf6),
-    }
-}
-
 fn write_head(output: &mut Vec<u8>, major: u8, value: u64) {
+    let (encoded, length) = encoded_head(major, value);
+    output.extend_from_slice(&encoded[..length]);
+}
+
+fn emit_bytes(consumer: &mut impl FnMut(&[u8]), bytes: &[u8]) {
+    emit_head(consumer, 2, bytes.len() as u64);
+    consumer(bytes);
+}
+
+fn emit_text(consumer: &mut impl FnMut(&[u8]), text: &str) {
+    emit_head(consumer, 3, text.len() as u64);
+    consumer(text.as_bytes());
+}
+
+fn emit_optional_unsigned(consumer: &mut impl FnMut(&[u8]), value: Option<u64>) {
+    match value {
+        Some(value) => emit_head(consumer, 0, value),
+        None => consumer(&[0xf6]),
+    }
+}
+
+fn emit_optional_text(consumer: &mut impl FnMut(&[u8]), value: Option<&str>) {
+    match value {
+        Some(value) => emit_text(consumer, value),
+        None => consumer(&[0xf6]),
+    }
+}
+
+fn emit_head(consumer: &mut impl FnMut(&[u8]), major: u8, value: u64) {
+    let (encoded, length) = encoded_head(major, value);
+    consumer(&encoded[..length]);
+}
+
+fn encoded_head(major: u8, value: u64) -> ([u8; 9], usize) {
+    let mut encoded = [0_u8; 9];
     if value < 24 {
-        output.push((major << 5) | u8::try_from(value).expect("small value must fit"));
+        encoded[0] = (major << 5) | value.to_be_bytes()[7];
+        (encoded, 1)
     } else if let Ok(value) = u8::try_from(value) {
-        output.extend_from_slice(&[(major << 5) | 24, value]);
+        encoded[..2].copy_from_slice(&[(major << 5) | 24, value]);
+        (encoded, 2)
     } else if let Ok(value) = u16::try_from(value) {
-        output.push((major << 5) | 25);
-        output.extend_from_slice(&value.to_be_bytes());
+        encoded[0] = (major << 5) | 25;
+        encoded[1..3].copy_from_slice(&value.to_be_bytes());
+        (encoded, 3)
     } else if let Ok(value) = u32::try_from(value) {
-        output.push((major << 5) | 26);
-        output.extend_from_slice(&value.to_be_bytes());
+        encoded[0] = (major << 5) | 26;
+        encoded[1..5].copy_from_slice(&value.to_be_bytes());
+        (encoded, 5)
     } else {
-        output.push((major << 5) | 27);
-        output.extend_from_slice(&value.to_be_bytes());
+        encoded[0] = (major << 5) | 27;
+        encoded[1..9].copy_from_slice(&value.to_be_bytes());
+        (encoded, 9)
     }
 }
 
@@ -1208,6 +1443,7 @@ mod tests {
         github::GitHubOperation,
         http::{CanonicalHost, CanonicalUrlPath},
     };
+    use sha2::{Digest, Sha256};
 
     use super::{
         BROKER_RESPONSE_CHUNK_VERSION, BROKER_RESPONSE_VERSION, BrokerWireOutcome,
@@ -1362,7 +1598,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_public_response_at_32_mib_round_trips_through_bounded_chunks() {
+    fn expanded_public_response_at_32_mib_streams_with_bounded_iterator_state() {
         let maximum = usize::try_from(MAX_PUBLIC_WIRE_BODY_BYTES)
             .expect("expanded body cap must fit the test address space");
         let response = public_with_body(vec![0xa5; maximum]);
@@ -1371,30 +1607,69 @@ mod tests {
             response.encode(),
             Err(ResponseCborError::PayloadTooLarge { .. })
         ));
-        let chunks = response
-            .chunks()
-            .expect("a response at the expanded cap must split");
-        assert!(chunks.len() > 1);
-        assert_eq!(chunks[0].total_length(), response.encoded_length());
-        assert!(chunks[0].total_length() <= MAX_EXPANDED_CANONICAL_RESPONSE_BYTES);
-        for (expected, chunk) in chunks.iter().enumerate() {
+        let mut payloads = response
+            .encoded_chunk_iter()
+            .expect("a response at the expanded cap must split lazily");
+        let chunk_count = payloads.len();
+        assert!(chunk_count > 1);
+        assert!(
+            payloads.owned_scratch_bytes() <= super::MAX_PATH_BYTES,
+            "the iterator may retain bounded path text but never a response-body copy"
+        );
+        let mut complete_digest = Sha256::new();
+        let mut expected_digest = None;
+        let mut received = 0_usize;
+        for expected in 0..chunk_count {
+            let encoded = payloads
+                .next()
+                .expect("declared chunk must exist")
+                .expect("each chunk must encode");
+            assert!(encoded.len() <= MAX_CONTROL_FRAME_BYTES);
+            let chunk = CanonicalResponseChunk::decode(&encoded).expect("canonical chunk");
             assert_eq!(chunk.index(), expected as u64);
-            assert_eq!(chunk.count(), chunks.len() as u64);
+            assert_eq!(chunk.count(), chunk_count as u64);
             assert_eq!(chunk.request(), request());
             assert!(chunk.bytes().len() <= MAX_RESPONSE_CHUNK_BYTES);
-            let encoded = chunk.encode().expect("each chunk must encode");
-            assert!(encoded.len() <= MAX_CONTROL_FRAME_BYTES);
-            assert_eq!(CanonicalResponseChunk::decode(&encoded), Ok(chunk.clone()));
+            assert_eq!(chunk.total_length(), response.encoded_length());
+            assert!(chunk.total_length() <= MAX_EXPANDED_CANONICAL_RESPONSE_BYTES);
+            complete_digest.update(chunk.bytes());
+            received += chunk.bytes().len();
+            assert_eq!(
+                *expected_digest.get_or_insert(chunk.digest()),
+                chunk.digest()
+            );
         }
+        assert!(payloads.next().is_none());
+        assert_eq!(received, response.encoded_length());
+        let calculated_digest: [u8; 32] = complete_digest.finalize().into();
+        assert_eq!(
+            expected_digest
+                .expect("expanded sequence carries a digest")
+                .as_bytes(),
+            &calculated_digest
+        );
+    }
 
-        let reassembled = CanonicalBrokerResponse::from_chunks(&chunks)
-            .expect("complete ordered chunks must reassemble");
-        let BrokerWireOutcome::Public(reassembled) = reassembled.outcome() else {
-            panic!("expanded fixture must remain a public response");
-        };
-        assert_eq!(reassembled.body().len(), maximum);
-        assert_eq!(reassembled.body().first(), Some(&0xa5));
-        assert_eq!(reassembled.body().last(), Some(&0xa5));
+    #[test]
+    fn lazy_encoded_chunk_payloads_match_typed_chunks_and_round_trip() {
+        let response = public_with_body(vec![0x7c; MAX_RESPONSE_CHUNK_BYTES + 17]);
+        let encoded = response
+            .encoded_chunk_iter()
+            .expect("fixture must stream")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every lazy chunk must encode");
+        let typed = response
+            .chunk_iter()
+            .expect("fixture must split")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every typed chunk must construct");
+        let compatibility = typed
+            .iter()
+            .map(|chunk| chunk.encode().expect("typed chunk must encode"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(encoded, compatibility);
+        assert_eq!(CanonicalBrokerResponse::from_chunks(&typed), Ok(response));
     }
 
     #[test]

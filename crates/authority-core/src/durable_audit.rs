@@ -2,9 +2,9 @@
 //!
 //! The journal deliberately separates an attempt start from its terminal
 //! outcome. The start is synced before an executor is called; the terminal
-//! record is synced only after the executor reports that its documented
-//! linearization point was reached. A crash between those writes therefore
-//! reopens as `Started` (unknown completion), never as an inferred success.
+//! record is synced after the executor reports a committed, definitely failed,
+//! denied, or evidence-backed ambiguous result. A crash between those writes
+//! therefore reopens as `Started`, never as an inferred success.
 
 use std::{
     collections::BTreeMap,
@@ -31,6 +31,8 @@ const CHECKSUM_LEN: usize = 8;
 const MAX_RECORD_PAYLOAD: usize = 8 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
 const ATTEMPT_PAYLOAD_VERSION: u8 = 1;
+/// Maximum opaque evidence retained for one `CommitUnknown` terminal outcome.
+pub const MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES: usize = 64 * 1024;
 
 /// A bounded receipt that identifies the external acceptance observed by the
 /// executor.
@@ -70,6 +72,46 @@ impl CommitReceipt {
     }
 }
 
+/// Bounded opaque evidence that an executor's commit result is ambiguous.
+///
+/// Evidence is bound to one attempt when constructed by authority-core and cannot be used to
+/// produce an effect snapshot. It is retained only for reconciliation and incident analysis.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CommitUnknownEvidence {
+    attempt_id: crate::audit::AttemptId,
+    token: Vec<u8>,
+}
+
+impl CommitUnknownEvidence {
+    /// Binds non-empty bounded executor evidence to an existing attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableAuditError::InvalidRecord`] for empty evidence and
+    /// [`DurableAuditError::RecordTooLarge`] when the evidence exceeds
+    /// [`MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES`].
+    pub(crate) fn new(
+        attempt_id: crate::audit::AttemptId,
+        token: impl Into<Vec<u8>>,
+    ) -> Result<Self, DurableAuditError> {
+        let token = token.into();
+        validate_commit_unknown_token(&token)?;
+        Ok(Self { attempt_id, token })
+    }
+
+    /// Returns the attempt identity covered by this evidence.
+    #[must_use]
+    pub const fn attempt_id(&self) -> crate::audit::AttemptId {
+        self.attempt_id
+    }
+
+    /// Returns the opaque adapter or executor evidence.
+    #[must_use]
+    pub fn token(&self) -> &[u8] {
+        &self.token
+    }
+}
+
 /// A recovered durable attempt, including attempts whose completion was not
 /// known when the process stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +122,7 @@ pub struct DurableAttempt {
     outcome: AttemptOutcome,
     finish_sequence: Option<u64>,
     receipt: Option<CommitReceipt>,
+    commit_unknown_evidence: Option<CommitUnknownEvidence>,
 }
 
 impl DurableAttempt {
@@ -117,6 +160,12 @@ impl DurableAttempt {
     #[must_use]
     pub fn receipt(&self) -> Option<&CommitReceipt> {
         self.receipt.as_ref()
+    }
+
+    /// Returns the durable ambiguity evidence, if commit completion is unknown.
+    #[must_use]
+    pub fn commit_unknown_evidence(&self) -> Option<&CommitUnknownEvidence> {
+        self.commit_unknown_evidence.as_ref()
     }
 }
 
@@ -246,6 +295,7 @@ struct DurableAttemptState {
     outcome: AttemptOutcome,
     finish_sequence: Option<u64>,
     receipt: Option<CommitReceipt>,
+    commit_unknown_evidence: Option<CommitUnknownEvidence>,
 }
 
 impl DurableAttemptState {
@@ -257,6 +307,7 @@ impl DurableAttemptState {
             outcome: self.outcome,
             finish_sequence: self.finish_sequence,
             receipt: self.receipt.clone(),
+            commit_unknown_evidence: self.commit_unknown_evidence.clone(),
         }
     }
 }
@@ -521,6 +572,7 @@ impl DurableAuditLog {
                 outcome: AttemptOutcome::Started,
                 finish_sequence: None,
                 receipt: None,
+                commit_unknown_evidence: None,
             },
         );
         state.next_sequence = sequence.checked_add(1);
@@ -529,8 +581,9 @@ impl DurableAuditLog {
 
     /// Appends and syncs a terminal outcome after executor completion.
     ///
-    /// A committed outcome requires a receipt tied to the same attempt. The
-    /// absence of a receipt is rejected before any frame is appended.
+    /// `Committed` requires a receipt tied to the same attempt; `CommitUnknown` requires
+    /// separately typed, bounded ambiguity evidence. Denied and pre-commit failures reject all
+    /// terminal evidence. Invalid combinations are rejected before any frame is appended.
     ///
     /// # Errors
     ///
@@ -542,8 +595,9 @@ impl DurableAuditLog {
         attempt_id: crate::audit::AttemptId,
         outcome: AttemptOutcome,
         receipt: Option<&CommitReceipt>,
+        commit_unknown_evidence: Option<&CommitUnknownEvidence>,
     ) -> Result<(), DurableAuditError> {
-        let payload = encode_finish_payload(attempt_id, outcome, receipt)?;
+        let payload = encode_finish_payload(attempt_id, outcome, receipt, commit_unknown_evidence)?;
         let mut state = self.lock_state()?;
         if state.unusable {
             return Err(DurableAuditError::JournalUnavailable);
@@ -562,6 +616,7 @@ impl DurableAuditLog {
         attempt.outcome = outcome;
         attempt.finish_sequence = Some(sequence);
         attempt.receipt = receipt.cloned();
+        attempt.commit_unknown_evidence = commit_unknown_evidence.cloned();
         state.next_sequence = sequence.checked_add(1);
         Ok(())
     }
@@ -721,11 +776,13 @@ fn parse_journal(
                         outcome: AttemptOutcome::Started,
                         finish_sequence: None,
                         receipt: None,
+                        commit_unknown_evidence: None,
                     },
                 );
             }
             FINISH_KIND => {
-                let (outcome, receipt) = decode_finish_payload(payload, attempt_id)?;
+                let (outcome, receipt, commit_unknown_evidence) =
+                    decode_finish_payload(payload, attempt_id)?;
                 let Some(attempt) = attempts.get_mut(&attempt_id) else {
                     return Err(DurableAuditError::ReplayDetected { attempt_id });
                 };
@@ -735,6 +792,7 @@ fn parse_journal(
                 attempt.outcome = outcome;
                 attempt.finish_sequence = Some(sequence);
                 attempt.receipt = receipt;
+                attempt.commit_unknown_evidence = commit_unknown_evidence;
             }
             _ => {
                 return Err(DurableAuditError::InvalidRecord(
@@ -752,6 +810,7 @@ fn parse_journal(
 fn validate_finish(
     outcome: AttemptOutcome,
     receipt: Option<&CommitReceipt>,
+    commit_unknown_evidence: Option<&CommitUnknownEvidence>,
     attempt_id: crate::audit::AttemptId,
 ) -> Result<(), DurableAuditError> {
     if let Some(receipt) = receipt
@@ -761,21 +820,53 @@ fn validate_finish(
             "commit receipt belongs to another attempt".to_owned(),
         ));
     }
+    if let Some(evidence) = commit_unknown_evidence {
+        if evidence.attempt_id() != attempt_id {
+            return Err(DurableAuditError::InvalidRecord(
+                "commit-unknown evidence belongs to another attempt".to_owned(),
+            ));
+        }
+        validate_commit_unknown_token(evidence.token())?;
+    }
     if outcome == AttemptOutcome::Started {
         return Err(DurableAuditError::InvalidRecord(
             "Started is not a terminal outcome".to_owned(),
         ));
     }
-    if outcome == AttemptOutcome::Committed {
-        if receipt.is_none() {
+    match outcome {
+        AttemptOutcome::Committed if receipt.is_some() && commit_unknown_evidence.is_none() => {}
+        AttemptOutcome::Committed => {
             return Err(DurableAuditError::InvalidRecord(
-                "Committed requires a commit receipt".to_owned(),
+                "Committed requires only a commit receipt".to_owned(),
             ));
         }
-    } else if receipt.is_some() {
+        AttemptOutcome::CommitUnknown if receipt.is_none() && commit_unknown_evidence.is_some() => {
+        }
+        AttemptOutcome::CommitUnknown => {
+            return Err(DurableAuditError::InvalidRecord(
+                "CommitUnknown requires only bounded ambiguity evidence".to_owned(),
+            ));
+        }
+        AttemptOutcome::Denied | AttemptOutcome::FailedBeforeCommit
+            if receipt.is_none() && commit_unknown_evidence.is_none() => {}
+        AttemptOutcome::Denied | AttemptOutcome::FailedBeforeCommit => {
+            return Err(DurableAuditError::InvalidRecord(
+                "Denied and FailedBeforeCommit cannot carry terminal evidence".to_owned(),
+            ));
+        }
+        AttemptOutcome::Started => unreachable!("Started was rejected above"),
+    }
+    Ok(())
+}
+
+fn validate_commit_unknown_token(token: &[u8]) -> Result<(), DurableAuditError> {
+    if token.is_empty() {
         return Err(DurableAuditError::InvalidRecord(
-            "non-committed outcomes cannot carry a commit receipt".to_owned(),
+            "CommitUnknown evidence cannot be empty".to_owned(),
         ));
+    }
+    if token.len() > MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES {
+        return Err(DurableAuditError::RecordTooLarge(token.len()));
     }
     Ok(())
 }
@@ -784,14 +875,18 @@ fn encode_finish_payload(
     attempt_id: crate::audit::AttemptId,
     outcome: AttemptOutcome,
     receipt: Option<&CommitReceipt>,
+    commit_unknown_evidence: Option<&CommitUnknownEvidence>,
 ) -> Result<Vec<u8>, DurableAuditError> {
-    validate_finish(outcome, receipt, attempt_id)?;
+    validate_finish(outcome, receipt, commit_unknown_evidence, attempt_id)?;
     let mut payload = vec![outcome_code(outcome)];
-    if let Some(receipt) = receipt {
-        let token_length = u32::try_from(receipt.token().len())
-            .map_err(|_| DurableAuditError::RecordTooLarge(receipt.token().len()))?;
+    if let Some(token) = receipt
+        .map(CommitReceipt::token)
+        .or_else(|| commit_unknown_evidence.map(CommitUnknownEvidence::token))
+    {
+        let token_length = u32::try_from(token.len())
+            .map_err(|_| DurableAuditError::RecordTooLarge(token.len()))?;
         payload.extend_from_slice(&token_length.to_le_bytes());
-        payload.extend_from_slice(receipt.token());
+        payload.extend_from_slice(token);
     }
     Ok(payload)
 }
@@ -799,14 +894,24 @@ fn encode_finish_payload(
 fn decode_finish_payload(
     payload: &[u8],
     attempt_id: crate::audit::AttemptId,
-) -> Result<(AttemptOutcome, Option<CommitReceipt>), DurableAuditError> {
+) -> Result<
+    (
+        AttemptOutcome,
+        Option<CommitReceipt>,
+        Option<CommitUnknownEvidence>,
+    ),
+    DurableAuditError,
+> {
     let Some((&code, rest)) = payload.split_first() else {
         return Err(DurableAuditError::InvalidRecord(
             "empty finish payload".to_owned(),
         ));
     };
     let outcome = decode_outcome(code)?;
-    if outcome == AttemptOutcome::Committed {
+    if matches!(
+        outcome,
+        AttemptOutcome::Committed | AttemptOutcome::CommitUnknown
+    ) {
         if rest.len() < 4 {
             return Err(DurableAuditError::TruncatedRecord);
         }
@@ -818,20 +923,28 @@ fn decode_finish_payload(
             .ok_or(DurableAuditError::RecordTooLarge(token_length))?;
         if rest.len() != expected_length {
             return Err(DurableAuditError::InvalidRecord(
-                "commit receipt length does not match finish payload".to_owned(),
+                "terminal evidence length does not match finish payload".to_owned(),
             ));
         }
-        return Ok((
-            outcome,
-            Some(CommitReceipt::new(attempt_id, rest[4..].to_vec())),
-        ));
+        let token = rest[4..].to_vec();
+        return match outcome {
+            AttemptOutcome::Committed => {
+                Ok((outcome, Some(CommitReceipt::new(attempt_id, token)), None))
+            }
+            AttemptOutcome::CommitUnknown => Ok((
+                outcome,
+                None,
+                Some(CommitUnknownEvidence::new(attempt_id, token)?),
+            )),
+            _ => unreachable!("terminal evidence outcomes were matched above"),
+        };
     }
     if !rest.is_empty() {
         return Err(DurableAuditError::InvalidRecord(
             "non-committed finish payload has trailing bytes".to_owned(),
         ));
     }
-    Ok((outcome, None))
+    Ok((outcome, None, None))
 }
 
 fn outcome_code(outcome: AttemptOutcome) -> u8 {
@@ -840,6 +953,7 @@ fn outcome_code(outcome: AttemptOutcome) -> u8 {
         AttemptOutcome::Denied => 1,
         AttemptOutcome::FailedBeforeCommit => 2,
         AttemptOutcome::Committed => 3,
+        AttemptOutcome::CommitUnknown => 4,
     }
 }
 
@@ -848,6 +962,7 @@ fn decode_outcome(code: u8) -> Result<AttemptOutcome, DurableAuditError> {
         1 => Ok(AttemptOutcome::Denied),
         2 => Ok(AttemptOutcome::FailedBeforeCommit),
         3 => Ok(AttemptOutcome::Committed),
+        4 => Ok(AttemptOutcome::CommitUnknown),
         _ => Err(DurableAuditError::InvalidRecord(
             "unknown terminal outcome".to_owned(),
         )),
@@ -1037,7 +1152,10 @@ mod tests {
         thread,
     };
 
-    use super::{CommitReceipt, DurableAuditError, DurableAuditLog, DurableAuditView};
+    use super::{
+        CommitReceipt, CommitUnknownEvidence, DurableAuditError, DurableAuditLog, DurableAuditView,
+        MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES,
+    };
     use crate::{
         audit::{AttemptId, AttemptOutcome},
         capability::{AuthorityRequest, CapId, CapabilityRequest, CapabilityRequestSet, SubjectId},
@@ -1095,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_log_reopens_committed_and_incomplete_attempts() {
+    fn durable_log_reopens_committed_unknown_and_incomplete_attempts() {
         let journal = TestJournal::new();
         let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
         begin(&log, 0);
@@ -1106,23 +1224,49 @@ mod tests {
                 AttemptId::from_u64(0),
                 b"provider-7".to_vec(),
             )),
+            None,
         )
         .expect("commit receipt must be durable");
         begin(&log, 1);
+        let unknown = CommitUnknownEvidence::new(
+            AttemptId::from_u64(1),
+            b"provider-timeout-after-request-write",
+        )
+        .expect("bounded ambiguity evidence must validate");
+        log.finish_attempt(
+            AttemptId::from_u64(1),
+            AttemptOutcome::CommitUnknown,
+            None,
+            Some(&unknown),
+        )
+        .expect("commit-unknown evidence must be durable");
+        begin(&log, 2);
         drop(log);
 
         let reopened = DurableAuditLog::open(&journal.path).expect("complete frames must reopen");
         let attempts = reopened
             .attempts()
             .expect("recovered attempts must be readable");
-        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts.len(), 3);
         assert_eq!(attempts[0].outcome(), AttemptOutcome::Committed);
         assert_eq!(
             attempts[0].receipt().expect("receipt must survive").token(),
             b"provider-7"
         );
-        assert_eq!(attempts[1].outcome(), AttemptOutcome::Started);
-        assert_eq!(reopened.next_attempt_sequence(), Ok(Some(2)));
+        assert!(attempts[0].commit_unknown_evidence().is_none());
+        assert_eq!(attempts[1].outcome(), AttemptOutcome::CommitUnknown);
+        assert!(attempts[1].receipt().is_none());
+        assert_eq!(
+            attempts[1]
+                .commit_unknown_evidence()
+                .expect("ambiguity evidence must survive recovery")
+                .token(),
+            b"provider-timeout-after-request-write"
+        );
+        assert_eq!(attempts[2].outcome(), AttemptOutcome::Started);
+        assert!(attempts[2].receipt().is_none());
+        assert!(attempts[2].commit_unknown_evidence().is_none());
+        assert_eq!(reopened.next_attempt_sequence(), Ok(Some(3)));
     }
 
     #[test]
@@ -1170,10 +1314,10 @@ mod tests {
         let journal = TestJournal::new();
         let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
         begin(&log, 0);
-        log.finish_attempt(AttemptId::from_u64(0), AttemptOutcome::Denied, None)
+        log.finish_attempt(AttemptId::from_u64(0), AttemptOutcome::Denied, None, None)
             .expect("denial must be durable");
         assert!(matches!(
-            log.finish_attempt(AttemptId::from_u64(0), AttemptOutcome::Denied, None),
+            log.finish_attempt(AttemptId::from_u64(0), AttemptOutcome::Denied, None, None,),
             Err(DurableAuditError::ReplayDetected { .. })
         ));
         drop(log);
@@ -1217,7 +1361,12 @@ mod tests {
         let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
         begin(&log, 0);
         assert!(matches!(
-            log.finish_attempt(AttemptId::from_u64(0), AttemptOutcome::Committed, None),
+            log.finish_attempt(
+                AttemptId::from_u64(0),
+                AttemptOutcome::Committed,
+                None,
+                None,
+            ),
             Err(DurableAuditError::InvalidRecord(_))
         ));
         assert_eq!(
@@ -1225,6 +1374,143 @@ mod tests {
                 .expect("the rejected finish must not poison the journal")[0]
                 .outcome(),
             AttemptOutcome::Started
+        );
+    }
+
+    #[test]
+    fn commit_unknown_evidence_is_non_empty_and_bounded() {
+        let attempt_id = AttemptId::from_u64(0);
+        assert!(matches!(
+            CommitUnknownEvidence::new(attempt_id, Vec::new()),
+            Err(DurableAuditError::InvalidRecord(message))
+                if message == "CommitUnknown evidence cannot be empty"
+        ));
+        let maximum = vec![0x5a; MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES];
+        assert_eq!(
+            CommitUnknownEvidence::new(attempt_id, maximum.clone())
+                .expect("maximum-sized ambiguity evidence must validate")
+                .token(),
+            maximum
+        );
+        assert_eq!(
+            CommitUnknownEvidence::new(
+                attempt_id,
+                vec![0x5a; MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES + 1],
+            ),
+            Err(DurableAuditError::RecordTooLarge(
+                MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn terminal_outcomes_require_exactly_their_own_evidence_type() {
+        let journal = TestJournal::new();
+        let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
+        let attempt_id = AttemptId::from_u64(0);
+        begin(&log, attempt_id.as_u64());
+        let receipt = CommitReceipt::new(attempt_id, b"provider-accepted");
+        let unknown = CommitUnknownEvidence::new(attempt_id, b"provider-timeout")
+            .expect("bounded ambiguity evidence must validate");
+
+        for result in [
+            log.finish_attempt(attempt_id, AttemptOutcome::CommitUnknown, None, None),
+            log.finish_attempt(
+                attempt_id,
+                AttemptOutcome::CommitUnknown,
+                Some(&receipt),
+                None,
+            ),
+            log.finish_attempt(attempt_id, AttemptOutcome::Committed, None, Some(&unknown)),
+            log.finish_attempt(attempt_id, AttemptOutcome::Denied, None, Some(&unknown)),
+            log.finish_attempt(
+                attempt_id,
+                AttemptOutcome::FailedBeforeCommit,
+                Some(&receipt),
+                None,
+            ),
+        ] {
+            assert!(matches!(result, Err(DurableAuditError::InvalidRecord(_))));
+            assert_eq!(
+                log.attempts()
+                    .expect("rejected finish must leave the journal readable")[0]
+                    .outcome(),
+                AttemptOutcome::Started
+            );
+        }
+
+        log.finish_attempt(
+            attempt_id,
+            AttemptOutcome::CommitUnknown,
+            None,
+            Some(&unknown),
+        )
+        .expect("exact ambiguity evidence must terminate the attempt");
+    }
+
+    #[test]
+    fn mismatched_commit_unknown_evidence_is_rejected_without_mutation() {
+        let journal = TestJournal::new();
+        let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
+        begin(&log, 0);
+        let mismatched = CommitUnknownEvidence::new(AttemptId::from_u64(1), b"provider-timeout")
+            .expect("bounded ambiguity evidence must validate");
+
+        assert!(matches!(
+            log.finish_attempt(
+                AttemptId::from_u64(0),
+                AttemptOutcome::CommitUnknown,
+                None,
+                Some(&mismatched),
+            ),
+            Err(DurableAuditError::InvalidRecord(message))
+                if message == "commit-unknown evidence belongs to another attempt"
+        ));
+        assert_eq!(
+            log.attempts()
+                .expect("rejected evidence must leave the journal readable")[0]
+                .outcome(),
+            AttemptOutcome::Started
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_empty_and_oversized_commit_unknown_evidence() {
+        fn journal_with_raw_unknown(token: &[u8]) -> TestJournal {
+            let journal = TestJournal::new();
+            let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
+            let attempt_id = AttemptId::from_u64(0);
+            begin(&log, attempt_id.as_u64());
+            let mut payload = vec![super::outcome_code(AttemptOutcome::CommitUnknown)];
+            payload.extend_from_slice(
+                &u32::try_from(token.len())
+                    .expect("test evidence length must fit the wire field")
+                    .to_le_bytes(),
+            );
+            payload.extend_from_slice(token);
+            {
+                let mut state = log.state.lock().expect("journal lock must remain healthy");
+                super::append_frame(&mut state, 1, super::FINISH_KIND, attempt_id, &payload)
+                    .expect("malformed fixture frame must have valid framing");
+            }
+            drop(log);
+            journal
+        }
+
+        let empty = journal_with_raw_unknown(&[]);
+        assert!(matches!(
+            DurableAuditView::open(&empty.path),
+            Err(DurableAuditError::InvalidRecord(message))
+                if message == "CommitUnknown evidence cannot be empty"
+        ));
+
+        let oversized =
+            journal_with_raw_unknown(&vec![0x5a; MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES + 1]);
+        assert_eq!(
+            DurableAuditView::open(&oversized.path),
+            Err(DurableAuditError::RecordTooLarge(
+                MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES + 1
+            ))
         );
     }
 
@@ -1240,6 +1526,7 @@ mod tests {
                 AttemptId::from_u64(0),
                 AttemptOutcome::Committed,
                 Some(&mismatched),
+                None,
             ),
             Err(DurableAuditError::InvalidRecord(message))
                 if message == "commit receipt belongs to another attempt"
@@ -1264,6 +1551,7 @@ mod tests {
                 AttemptId::from_u64(7),
                 AttemptOutcome::Committed,
                 Some(&arbitrary),
+                None,
             ),
             Err(DurableAuditError::ReplayDetected {
                 attempt_id: AttemptId::from_u64(7),

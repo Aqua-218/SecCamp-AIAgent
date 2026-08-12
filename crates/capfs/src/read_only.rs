@@ -42,7 +42,10 @@ use crate::{
         NamespaceRegistry, RenamePlan,
     },
     node::{ForgetOutcome, NodeId, NodeTable, NodeTableError},
-    runtime::{BackingMetadata, CreationPermissions, OpenedBackingFile},
+    runtime::{
+        BackingMetadata, CreationPermissions, MetadataPermissions, MetadataTime, MetadataTimes,
+        OpenedBackingFile,
+    },
 };
 
 const ATTRIBUTE_TTL: Duration = Duration::ZERO;
@@ -274,6 +277,28 @@ impl FileOpenIntent {
 enum OpenBacking {
     File(OpenedBackingFile),
     Directory,
+}
+
+/// One metadata dimension accepted by the initial `SETATTR` policy.
+///
+/// A mode update and a timestamp update need separate Linux syscalls. Keeping
+/// them separate means an error cannot report a failed compound update after
+/// one dimension has already committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataUpdate {
+    Permissions(MetadataPermissions),
+    Timestamps(MetadataTimes),
+}
+
+/// The one effectful change accepted from a single FUSE `SETATTR` request.
+///
+/// `fchmod` and `futimens` have distinct linearization points. The adapter
+/// rejects their combination, and combinations with truncation, rather than
+/// pretending a multi-syscall request is atomic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetattrMutation {
+    Truncate(u64),
+    Metadata(MetadataUpdate),
 }
 
 impl OpenBacking {
@@ -1058,6 +1083,42 @@ impl CapabilityFilesystem {
         }
     }
 
+    /// Changes exactly one supported metadata dimension under `SetMetadata`.
+    ///
+    /// The runtime operation ends at `fchmod` or `futimens`. It intentionally
+    /// returns no attributes: fetching reply metadata after that syscall is a
+    /// separate, fallible observation and must not turn a committed mutation
+    /// into an uncommitted audit outcome.
+    fn set_metadata(&self, node: NodeId, update: MetadataUpdate) -> Result<(), AdapterError> {
+        self.ensure_healthy()?;
+        let object = self
+            .nodes
+            .resolve(node)
+            .map_err(|error| map_node_lookup_error(&error))?;
+        self.namespace
+            .with_object(&object, |object| {
+                let request = self.file_request(FileEffect::SetMetadata, object.path().clone());
+                self.kernel
+                    .authorize_and_commit(
+                        &self.authority.subject,
+                        &self.authority.capability,
+                        &request,
+                        |_| match update {
+                            MetadataUpdate::Permissions(permissions) => self
+                                .backing
+                                .set_runtime_permissions(object, permissions)
+                                .map_err(|_| AdapterError::Internal),
+                            MetadataUpdate::Timestamps(timestamps) => self
+                                .backing
+                                .set_runtime_timestamps(object, timestamps)
+                                .map_err(|_| AdapterError::Internal),
+                        },
+                    )
+                    .map_err(|error| map_effect_error(&error))
+            })
+            .map_err(|error| map_namespace_operation_error(&error))
+    }
+
     fn with_authorized_truncate<T>(
         &self,
         object: &ObjectId,
@@ -1423,15 +1484,8 @@ impl Filesystem for CapabilityFilesystem {
             reply.error(Errno::EIO);
             return;
         };
-        let Some(size) = size else {
-            reply.error(Errno::EPERM);
-            return;
-        };
-        if mode.is_some()
-            || uid.is_some()
+        if uid.is_some()
             || gid.is_some()
-            || atime.is_some()
-            || mtime.is_some()
             || changed_time.is_some()
             || created_time.is_some()
             || status_change_time.is_some()
@@ -1442,8 +1496,16 @@ impl Filesystem for CapabilityFilesystem {
             return;
         }
 
-        match self.truncate_file(node, handle.map(|value| value.0), size) {
-            Ok(metadata) => reply.attr(&ATTRIBUTE_TTL, &file_attr(node, metadata)),
+        let mutation = match supported_setattr_mutation(size, mode, atime, mtime) {
+            Ok(SetattrMutation::Truncate(size)) => self
+                .truncate_file(node, handle.map(|value| value.0), size)
+                .map(|_| ()),
+            Ok(SetattrMutation::Metadata(update)) => self.set_metadata(node, update),
+            Err(error) => Err(error),
+        };
+
+        match mutation.and_then(|()| self.getattr_entry(node, None)) {
+            Ok(entry) => reply.attr(&ATTRIBUTE_TTL, &file_attr(entry.node, entry.metadata)),
             Err(error) => reply.error(error.errno()),
         }
     }
@@ -1764,6 +1826,36 @@ fn file_attr(node: NodeId, metadata: BackingMetadata) -> FileAttr {
     }
 }
 
+const fn metadata_time(value: TimeOrNow) -> MetadataTime {
+    match value {
+        TimeOrNow::Now => MetadataTime::Now,
+        TimeOrNow::SpecificTime(time) => MetadataTime::Exact(time),
+    }
+}
+
+fn supported_setattr_mutation(
+    size: Option<u64>,
+    mode: Option<u32>,
+    atime: Option<TimeOrNow>,
+    mtime: Option<TimeOrNow>,
+) -> Result<SetattrMutation, AdapterError> {
+    match (size, mode, atime, mtime) {
+        (Some(size), None, None, None) => Ok(SetattrMutation::Truncate(size)),
+        (None, Some(mode), None, None) => Ok(SetattrMutation::Metadata(
+            MetadataUpdate::Permissions(MetadataPermissions::from_requested_mode(mode)),
+        )),
+        (None, None, access, modification) if access.is_some() || modification.is_some() => {
+            let timestamps =
+                MetadataTimes::new(access.map(metadata_time), modification.map(metadata_time))
+                    .expect("the match guarantees a non-empty timestamp update");
+            Ok(SetattrMutation::Metadata(MetadataUpdate::Timestamps(
+                timestamps,
+            )))
+        }
+        _ => Err(AdapterError::Unsupported),
+    }
+}
+
 const fn namespace_file_type(kind: NamespaceObjectKind) -> FileType {
     match kind {
         NamespaceObjectKind::Directory => FileType::Directory,
@@ -1838,7 +1930,13 @@ const fn map_effect_error(error: &EffectCommitError<AdapterError>) -> AdapterErr
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, num::NonZeroUsize, sync::Arc};
+    use std::{
+        fs,
+        num::NonZeroUsize,
+        os::unix::fs::PermissionsExt,
+        sync::Arc,
+        time::{Duration, UNIX_EPOCH},
+    };
 
     use authority_core::{
         capability::{AuthorityBody, AuthorityRequest, IssuerId, SubjectId},
@@ -1849,17 +1947,18 @@ mod tests {
         state::{CapabilityGrant, CapabilityState, StaticAuthorityEnvelope, Subject},
         time::{MonotonicTime, TimeWindow},
     };
-    use fuser::{OpenFlags, RenameFlags};
+    use fuser::{OpenFlags, RenameFlags, TimeOrNow};
     use rustix::fs::OFlags;
     use tempfile::{TempDir, tempdir};
 
     use super::{
-        AdapterError, CapabilityFilesystem, CapabilityFilesystemError, MountAuthority,
-        MountInstanceId, NodeId,
+        AdapterError, CapabilityFilesystem, CapabilityFilesystemError, MetadataUpdate,
+        MountAuthority, MountInstanceId, NodeId, SetattrMutation, supported_setattr_mutation,
     };
     use crate::{
         backing::{ImportedRepository, PreflightLimits},
         namespace::NamespaceObjectKind,
+        runtime::{MetadataPermissions, MetadataTime, MetadataTimes},
     };
 
     fn path(segments: &[&str]) -> CanonicalPath {
@@ -2558,6 +2657,136 @@ mod tests {
             fs::read(directory.path().join("scoped/allowed.txt"))
                 .expect("revoked truncation must leave the backing file unchanged"),
             b"capa"
+        );
+    }
+
+    // Requirement: mode and timestamp SETATTR requests require SetMetadata,
+    // use one backing syscall per request, and reauthorize after revocation.
+    // Category: FUSE/metadata. Risk: critical.
+    #[test]
+    fn metadata_changes_require_set_metadata_and_reauthorize() {
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::only(FileEffect::WriteData),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("metadata visibility must expose the authorized parent");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("metadata visibility must expose the authorized file");
+        let initial_mode = fs::metadata(directory.path().join("scoped/allowed.txt"))
+            .expect("test backing metadata must be readable")
+            .permissions()
+            .mode();
+
+        assert_eq!(
+            filesystem.set_metadata(
+                allowed.node,
+                MetadataUpdate::Permissions(MetadataPermissions::from_requested_mode(0o4750)),
+            ),
+            Err(AdapterError::AccessDenied)
+        );
+        assert_eq!(
+            fs::metadata(directory.path().join("scoped/allowed.txt"))
+                .expect("denied metadata update must leave backing metadata readable")
+                .permissions()
+                .mode(),
+            initial_mode,
+            "a denied SetMetadata request must not reach fchmod"
+        );
+
+        let (directory, filesystem, kernel, capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::only(FileEffect::SetMetadata),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("metadata visibility must expose the authorized parent");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("metadata visibility must expose the authorized file");
+        filesystem
+            .set_metadata(
+                allowed.node,
+                MetadataUpdate::Permissions(MetadataPermissions::from_requested_mode(0o4750)),
+            )
+            .expect("SetMetadata must authorize an ordinary permission update");
+        assert_eq!(
+            fs::metadata(directory.path().join("scoped/allowed.txt"))
+                .expect("updated backing metadata must remain readable")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o750,
+            "set-ID bits must be removed before fchmod"
+        );
+
+        let timestamp = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        filesystem
+            .set_metadata(
+                allowed.node,
+                MetadataUpdate::Timestamps(
+                    MetadataTimes::new(None, Some(MetadataTime::Exact(timestamp)))
+                        .expect("a timestamp update must be non-empty"),
+                ),
+            )
+            .expect("SetMetadata must authorize an exact mtime update");
+        let object = filesystem
+            .nodes
+            .resolve(allowed.node)
+            .expect("live node must resolve to its namespace object");
+        let metadata = filesystem
+            .namespace
+            .with_object(&object, |object| {
+                filesystem.backing.runtime_metadata(object)
+            })
+            .expect("updated namespace metadata must remain valid");
+        assert_eq!(metadata.mtime, timestamp);
+
+        kernel
+            .revoke(&capability)
+            .expect("test capability must be revocable");
+        assert_eq!(
+            filesystem.set_metadata(
+                allowed.node,
+                MetadataUpdate::Permissions(MetadataPermissions::from_requested_mode(0o600)),
+            ),
+            Err(AdapterError::AccessDenied)
+        );
+        assert_eq!(
+            fs::metadata(directory.path().join("scoped/allowed.txt"))
+                .expect("revoked metadata update must leave backing metadata readable")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+    }
+
+    #[test]
+    fn setattr_accepts_one_effectful_dimension_per_request() {
+        assert!(matches!(
+            supported_setattr_mutation(Some(0), None, None, None),
+            Ok(SetattrMutation::Truncate(0))
+        ));
+        assert!(matches!(
+            supported_setattr_mutation(None, Some(0o4755), None, None),
+            Ok(SetattrMutation::Metadata(MetadataUpdate::Permissions(_)))
+        ));
+        assert!(matches!(
+            supported_setattr_mutation(None, None, Some(TimeOrNow::Now), None),
+            Ok(SetattrMutation::Metadata(MetadataUpdate::Timestamps(_)))
+        ));
+        assert_eq!(
+            supported_setattr_mutation(Some(0), Some(0o600), None, None),
+            Err(AdapterError::Unsupported),
+            "truncate and chmod have distinct linearization points"
+        );
+        assert_eq!(
+            supported_setattr_mutation(None, Some(0o600), Some(TimeOrNow::Now), None),
+            Err(AdapterError::Unsupported),
+            "chmod and timestamp changes cannot be represented as one atomic request"
         );
     }
 

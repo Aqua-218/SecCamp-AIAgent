@@ -20,7 +20,7 @@
 | [Host Egress Broker](egress-broker/README.md) | AF_VSOCK frame、session/replay、budget、公開 HTTPS、型付き GitHub adapter | fake resolver/connector/provider と module test。実 AF_VSOCK、外部 DNS/HTTPS/GitHub は未検証 |
 | [Firecracker runtime](firecracker-runtime/README.md) | pinned artifact、dm-verity/jailer command、Firecracker API 順序、snapshot/restore、identity gate | fake command/filesystem/API と local Unix socket test。実 Firecracker/jailer/dm-verity/VM は未検証 |
 | [Supervisor adapter](supervisor/README.md) | authenticated connection binding、wire protocol、subject lifecycle、Authority Core/handle 境界 | `CapabilityKernel` と `FakeResources` による mock/contract test。Linux resource と実 socket は未検証 |
-| [Session orchestrator](session-orchestrator/README.md) | session identity、backend lease binding、startup/rollback/stop の順序 | mock backend による state-machine test。production backend 統合と実 VM は未検証 |
+| [Session orchestrator](session-orchestrator/README.md) | session identity、backend lease binding、startup/rollback/stop、Authority/Broker/Firecracker/workspace adapter | production adapter composition test。外部 command/filesystem/API/listener と実 VM は未検証 |
 
 ## Authority core 文書
 

@@ -107,7 +107,7 @@ renameはsource subtree内を調べ、1件でもlive handleがあればexecutor�
 
 これにより初期実装では、rename / unlink後にpathを失ったinodeをopen fdだけで使い続ける状態を作らない。POSIX互換性より「live objectは必ず1つのcanonical pathを持つ」という認可上の単純さを優先している。
 
-Direct-I/O FUSE adapterは、fileとdirectoryのopen時にnamespace open countとAuthority coreのsubject-boundな`OpenHandle` recordを同じobjectへ登録する。片方の登録や認可に失敗すればcountをrollbackし、releaseでは両方を閉じる。adapterはlocal handle table、namespace、Capability kernelの順にlockを取得し、全経路で順序を統一している。既存fileへのread / writeはこのread-side transactionに載っており、create、remove、renameにも同じtransaction境界を適用する作業が残っている。
+Direct-I/O FUSE adapterは、fileとdirectoryのopen時にnamespace open countとAuthority coreのsubject-boundな`OpenHandle` recordを同じobjectへ登録する。片方の登録や認可に失敗すればcountをrollbackし、releaseでは両方を閉じる。adapterはlocal handle table、namespace、Capability kernelの順にlockを取得し、全経路で順序を統一している。既存fileへのread / writeと、`CREATE` / `MKDIR`の作成transactionはこの境界に載っている。removeとrenameにも同じ境界を適用する作業が残っている。
 
 ## 通常のread / listingでpathを固定する
 
@@ -127,6 +127,8 @@ executorから同じregistryへ再入するとdeadlockし得るため禁止し�
 
 directory listingでは`with_directory_children`を使う。対象directory、親、direct childを同一read guardから取り出し、childをcanonical name順へ並べたままexecutorへ渡す。FUSE adapterはこのguard中に`ListDirectory`を再認可し、各childのvisibilityを判定する。したがってrenameで名前や親が変わる途中の一覧を返さず、nested descendantをdirect childとして混ぜることもない。
 
+`create_child`はparentの`ObjectId`とchild nameを受け取り、writer lockを取った後の現在parent pathからchildをstageする。呼出し側がlockの外で`parent.path().child(name)`を作るAPIにはしていないので、親がrenameされた直後に古いpathを認可する経路を型上作れない。`create_open_child`は同じ操作に加えて、publishされるchildのopen countを最初から1にする。FUSE `CREATE`はここでAuthority handle、backing fd、local handleを同時に作るため、成功replyより前にchildをremoveできる空白区間がない。executorが失敗すれば、path、ID、open countのどれも公開されない。
+
 ## どう検証しているか
 
 [`crates/capfs/tests/namespace_registry.rs`](../../crates/capfs/tests/namespace_registry.rs) は公開APIを通して次を確認する。
@@ -134,13 +136,14 @@ directory listingでは`with_directory_children`を使う。対象directory、�
 - pathの重複、missing parent、file parentの拒否とregistry内でのID割り当て。
 - create / remove / rename executor失敗時にstateとgenerationが変わらないこと。
 - create失敗ではstaged IDが未発行のままで、remove後は発行済みIDを再利用しないこと。
+- child creationがwriter lock内の現在parent pathを使い、`CREATE`用の初期open count 1をclose前のremoveから守ること。
 - subtree renameが全descendant pathを同じsuffixのまま移すこと。
 - no-replace、root変更、source subtree内へのrenameの拒否。
 - open handleがrename / removeを止め、open / close失敗時にcountがrollbackされること。
 - read operationが終わるまで並行renameのwrite lockが進まないこと。
 - direct childだけをcanonical name順に列挙し、listing operationが終わるまで並行renameが進まないこと。
 
-module内のtestはgeneration、open count、Object ID sequenceの上限、manifest rootとparent関係、writer panic後のfail closedを確認する。namespace registryについてcontract test 10件とmodule test 5件を実行する。
+module内のtestはgeneration、open count、Object ID sequenceの上限、manifest rootとparent関係、writer panic後のfail closedを確認する。namespace registryについてcontract test 12件とmodule test 5件を実行する。
 
 capfs package全体では、backing、runtime、node table、Direct-I/O FUSEを含めて、共有importのcontract testも実行する。
 
@@ -148,12 +151,12 @@ capfs package全体では、backing、runtime、node table、Direct-I/O FUSEを�
 
 ## 現在含まないもの
 
-- write、create、remove、renameのFUSE opcodeとbacking transaction。
-- runtime backing operationのwrite系syscallと`renameat2`。
-- 変更系operationをAuthority coreのhandle registryとnamespace更新へ一体でcommitするadapter。
+- remove、renameのFUSE opcodeとbacking transaction。
+- runtime backing operationのremove系syscallと`renameat2`。
+- 複数pathを1つのoperationとしてAuthority coreのhandle registryとnamespace更新へ一体でcommitするadapter。
 - durable stateやsupervisor再起動後の復元。
 
-したがって、既存fileへのread / writeはこのregistryを通るが、create・remove・rename・metadata変更を含む隔離境界はまだ完成していない。
+したがって、既存fileへのread / writeとcreateはこのregistryを通るが、remove・rename・metadata変更を含む隔離境界はまだ完成していない。
 
 ## 関連
 

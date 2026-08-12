@@ -80,12 +80,12 @@ flowchart LR
 - nodeidはsubject mount内だけのidentityとし、VM共通のpath解決には`ObjectId`を使う。
 
 - `LOOKUP`と`GETATTR`はCapabilityの許可範囲またはその祖先だけをzero TTLで公開する。
-- `OPEN`はaccess modeを`ReadData` / `WriteData`の単一または複合認可へ変換する。writableな`O_TRUNC`には`Truncate`も同じ複合認可へ加え、sizeだけの`SETATTR`も現在pathの`Truncate`を再認可する。毎回の`READ` / `WRITE`はnamespace上の現在pathに対して対応effectを再認可する。
+- `OPEN`はaccess modeを`ReadData` / `WriteData`の単一または複合認可へ変換する。writableな`O_TRUNC`には`Truncate`も同じ複合認可へ加え、sizeだけの`SETATTR`も現在pathの`Truncate`を再認可する。`CREATE`は`CreateFile`と返却handleのaccess effectを複合認可し、`MKDIR`は`CreateDirectory`を認可してから現在のparent pathの直下へno-replace作成する。毎回の`READ` / `WRITE`はnamespace上の現在pathに対して対応effectを再認可する。
 - regular fileは`FOPEN_DIRECT_IO`で開き、revoke後のreadがpage cacheを迂回しないようにする。
 - runtime metadata/open/read/writeはroot fdから`openat2`で解決し、symlink、mount越境、hard linkの出現をfail closedで拒否する。
 - FUSE handle、namespace open count、Authority open handleを同じ`ObjectId`へ結び、`RELEASE`で一緒に閉じる。
 
-詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。`WRITE`、writable `O_TRUNC`、sizeだけの`SETATTR`まで実装済みであり、次段階はcreate、remove、no-replace renameである。
+詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。`WRITE`、writable `O_TRUNC`、sizeだけの`SETATTR`、`CREATE`、`MKDIR`まで実装済みであり、次段階はremove、no-replace renameである。
 
 ## 初期実装は workspace を木に限定する
 

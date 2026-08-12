@@ -148,7 +148,7 @@ module 内の test は mount ID の相違と、Linux が返し得る全 unsuppor
 
 supervisor は、事前検証を始める前から `capfs` の稼働終了まで、workload や他の非信頼 process が backing tree を直接変更できない配置にする必要がある。検証後の create、remove、rename は namespace registry と同じ transaction に置き、通常の read / write も root fd から `openat2` で解決する。
 
-現在は、[`runtime.rs`](../../crates/capfs/src/runtime.rs)と[`read_only.rs`](../../crates/capfs/src/read_only.rs)がroot fdからのruntime metadata、open、read、positioned writeをFUSE opcodeとCapability guardへ接続している。read / writeごとにadapterが現在pathを再認可し、runtimeはそのguardの内側でのみfd-relative I/Oを行う。実装内容は[Direct-I/O FUSE adapter](read-only-fuse.md)を参照する。
+現在は、[`runtime.rs`](../../crates/capfs/src/runtime.rs)と[`read_only.rs`](../../crates/capfs/src/read_only.rs)がroot fdからのruntime metadata、open、read、positioned write、exclusive createをFUSE opcodeとCapability guardへ接続している。createはlive parent directory fdから`openat2(O_EXCL)`または`mkdirat`を行い、`fchmod`と`statx`の再検証が終わるまでnamespaceを公開しない。read / writeごとにadapterが現在pathを再認可し、runtimeはそのguardの内側でのみfd-relative I/Oを行う。実装内容は[Direct-I/O FUSE adapter](read-only-fuse.md)を参照する。
 
 まだ実装していないのは次である。
 

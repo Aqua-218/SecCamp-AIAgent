@@ -6,7 +6,7 @@
 
 ## 何ができるようになったのか
 
-AgentはFUSE mountに対して通常の`open`、`read`、`write`、directory listingを使える。adapterはmountに固定されたsubject、Capability ID、repository IDをrequest payloadから受け取らず、trusted runtimeが構築した`MountAuthority`から使う。`ImportedRepository`もstartup時にhost-assigned `RepoId`を保持し、constructorは両者が一致しない組合せを`RepositoryMismatch`で拒否する。
+AgentはFUSE mountに対して通常の`open`、`read`、`write`、`create`、`mkdir`、directory listingを使える。adapterはmountに固定されたsubject、Capability ID、repository IDをrequest payloadから受け取らず、trusted runtimeが構築した`MountAuthority`から使う。`ImportedRepository`もstartup時にhost-assigned `RepoId`を保持し、constructorは両者が一致しない組合せを`RepositoryMismatch`で拒否する。
 
 実装済みのoperationは次である。
 
@@ -19,12 +19,14 @@ AgentはFUSE mountに対して通常の`open`、`read`、`write`、directory lis
 | `READ` | open時の判断を使い回さず、現在pathと現在時刻でもう一度`ReadData`を確認して`pread`する |
 | `WRITE` | open時の判断を使い回さず、現在pathと現在時刻でもう一度`WriteData`を確認して`pwrite`する |
 | `SETATTR` | size だけを受け付け、現在pathの`Truncate`を確認してdescriptor-relative `ftruncate`を行う。mode、owner、time、flagの変更は拒否する |
+| `CREATE` | namespace transaction内で現在のparent pathからchildをstageし、`CreateFile`と返却handleの`ReadData` / `WriteData`を複合認可してから no-replace 作成する |
+| `MKDIR` | namespace transaction内で現在のparent pathからchildをstageし、`CreateDirectory`を認可してから no-replace 作成する |
 | `RELEASE` | namespace側とAuthority側のhandleを同じobjectについて閉じ、backing fdを破棄する |
 | `OPENDIR` | read-only access mode、directory種別、現在pathの`ListDirectory`を確認してhandleを登録する |
 | `READDIR` | 現在pathの`ListDirectory`を再確認し、見えてよいdirect childだけを返す |
 | `RELEASEDIR` | namespace側とAuthority側のdirectory handleを閉じる |
 
-`O_TRUNC`は`O_WRONLY`または`O_RDWR`と組み合わせたときだけ受け付ける。`O_WRONLY | O_TRUNC`には`WriteData`と`Truncate`、`O_RDWR | O_TRUNC`には`ReadData`、`WriteData`、`Truncate`の全てが必要である。`O_RDONLY | O_TRUNC`は拒否する。`O_APPEND`、`O_CREAT`、`O_EXCL`、`O_TMPFILE`、size以外の`SETATTR`、`CREATE`、`MKDIR`、`UNLINK`、`RMDIR`、`RENAME`はまだ受け付けない。
+`O_TRUNC`は`O_WRONLY`または`O_RDWR`と組み合わせたときだけ受け付ける。`O_WRONLY | O_TRUNC`には`WriteData`と`Truncate`、`O_RDWR | O_TRUNC`には`ReadData`、`WriteData`、`Truncate`の全てが必要である。`O_RDONLY | O_TRUNC`は拒否する。FUSE `CREATE`内の`O_CREAT` / `O_EXCL`は受け付けるが、namespaceが「まだ存在しない」と確定してから`O_EXCL`で作るので、同requestの`O_TRUNC`は既存長を変更せず`Truncate`を追加要求しない。`O_APPEND`、`O_TMPFILE`、size以外の`SETATTR`、`UNLINK`、`RMDIR`、`RENAME`はまだ受け付けない。
 
 ## metadataはどこまで見せるのか
 
@@ -81,6 +83,35 @@ parentのdirectory確認、child pathの作成、`path -> ObjectId`解決、Capa
 Capability側もactive確認からmetadata取得までshared guardを保持する。revokeが先に完了していればvisibilityは失敗し、inspectionが先に始まっていればrevokeはそのinspectionが終わるまで待つ。この順序により、「失効済みCapabilityを確認したことにして後からmetadataを返す」という中間状態を作らない。
 
 この性質は並行処理でいう線形化可能性を使っている。各操作が一瞬で起きたように並べられる境界をlockで作り、revoke、rename、lookupのどれが先だったかを曖昧にしない。
+
+## CREATE と MKDIR が古い親pathを使わない理由
+
+作成requestは「親nodeをlookupした時点のpath」からchild pathを作らない。もしその間に親directoryがrenameされると、古い場所を認可して新しい場所へ書く、または逆の不一致が起こるためである。
+
+`NamespaceRegistry::create_child` と `create_open_child` は writer lockを取った後で親の`ObjectId`を現在のrecordへ解決し、そこでchild pathを組み立てる。adapterはその同じtransaction内でCapability判定とbacking syscallを実行し、成功したときだけ新しいobjectをpublishする。
+
+```mermaid
+sequenceDiagram
+    participant F as FUSE CREATE / MKDIR
+    participant N as NamespaceRegistry
+    participant K as CapabilityKernel
+    participant T as NodeTable
+    participant B as runtime.rs
+
+    F->>N: parent ObjectId + child name
+    Note over N: writer lockで現在の親pathを解決し childをstage
+    N->>K: CreateFile / CreateDirectory を認可
+    Note over K: CREATEは返却handleのReadData / WriteDataも同じ複合認可へ加える
+    K->>T: 新しいchildのLOOKUP referenceを予約
+    K->>B: parent fd 相対に O_EXCL create / mkdirat
+    B-->>K: fchmod + statx済み metadata
+    K-->>N: backing成功
+    N-->>F: objectをpublishしてnodeid（CREATEはhandleも）を返す
+```
+
+`CREATE`は返却するopen handleのため、namespace recordを初めからopen count 1でstageし、Authority `OpenHandle`、local FUSE handle、writable backing fdを同じtransactionに入れる。`CreateFile`だけでは`O_WRONLY` handleを得られず、`WriteData`も必要である。`O_RDWR`なら`ReadData`と`WriteData`の両方が必要になる。`MKDIR`はhandleを返さないので、`CreateDirectory`だけを要求する。
+
+backing側はroot fdからparent directoryを再検証して`openat2(... O_CREAT | O_EXCL | O_NOFOLLOW)`または`mkdirat`を実行する。指定modeからset-ID / sticky bitを落とし、FUSE requestのumaskを適用した値を`fchmod`で設定する。作成後のmetadata検証または権限設定に失敗したときは、parent fdからentryを削除してからnamespace transactionを失敗させる。削除にも失敗した場合はwriter lockをpoisonし、untrackedなbacking entryがあり得る状態でmountを継続しない。
 
 ## OPEN / OPENDIRからRELEASE / RELEASEDIRまで何を対応させるのか
 
@@ -144,7 +175,9 @@ RESOLVE_NO_SYMLINKS
 RESOLVE_NO_XDEV
 ```
 
-metadata用fd、read用fd、write用fdを開いた後、そのfd自身へ`statx(AT_EMPTY_PATH)`を行う。namespaceが記録したdirectory / regular fileの種別、rootと同じmount ID、regular fileのlink count 1を再確認する。write用fdは`O_RDWR | O_CLOEXEC | O_NOFOLLOW`だけで開き、append、create、truncateは指定しない。`O_TRUNC`と`SETATTR(size)`は、この検証済みfdへ`ftruncate`するため、pathをもう一度解決しない。preflight後にsymlinkやhard linkへ差し替えられていれば、対象を読まず/書かず`EIO`にする。
+metadata用fd、read用fd、write用fdを開いた後、そのfd自身へ`statx(AT_EMPTY_PATH)`を行う。namespaceが記録したdirectory / regular fileの種別、rootと同じmount ID、regular fileのlink count 1を再確認する。通常のwrite用fdは`O_RDWR | O_CLOEXEC | O_NOFOLLOW`だけで開き、append、create、truncateは指定しない。`O_TRUNC`と`SETATTR(size)`は、この検証済みfdへ`ftruncate`するため、pathをもう一度解決しない。
+
+`CREATE`だけは、上位のnamespace transactionが未占有childをstageした後に、検証済みparent fdへ`O_CREAT | O_EXCL | O_NOFOLLOW`を加える。`MKDIR`も同じparent fdへ`mkdirat`を使う。どちらも`fchmod`とfd自身の`statx`検証を通るまでnamespaceへ公開しない。preflight後にsymlinkやhard linkへ差し替えられていれば、既存対象を読まず/書かず、作成ならentryをrollbackして`EIO`にする。
 
 root fdがあるだけでbacking tree全体が凍結されるわけではない。別processが通常fileの内容を直接変更することは防げないため、supervisorがbacking treeを非信頼processから隠す前提は残る。
 
@@ -155,10 +188,11 @@ FUSE境界では内部構造を細かく漏らさず、失敗の種類を次の�
 | 状況 | errno |
 |---|---|
 | 権限外path、stale node、invalid child名 | `ENOENT` |
-| `OPEN` / `READ` / `WRITE` / `SETATTR(size)` / `OPENDIR` / `READDIR`の最終認可失敗 | `EACCES` |
-| 未対応のappend、create intent、`O_RDONLY | O_TRUNC`、size以外の`SETATTR`、cached write、suid/sgidを落とすwrite | `EPERM` |
+| `OPEN` / `CREATE` / `MKDIR` / `READ` / `WRITE` / `SETATTR(size)` / `OPENDIR` / `READDIR`の最終認可失敗 | `EACCES` |
+| `O_APPEND`、`O_TMPFILE`、`O_RDONLY | O_TRUNC`、size以外の`SETATTR`、cached write、suid/sgidを落とすwrite | `EPERM` |
+| 既に存在するchild | `EEXIST` |
 | directoryをregular fileとしてopen | `EISDIR` |
-| regular fileをdirectoryとしてopen | `ENOTDIR` |
+| regular fileをdirectoryとしてopen、fileをparentにしたcreate | `ENOTDIR` |
 | unknown / mismatched file handle、`SETATTR(size)`のreadonly / directory handle | `EBADF` |
 | oversized read / write、壊れたflag、現在の一覧範囲外のdirectory offset | `EINVAL` |
 | lock poison、registry不整合、backing差し替え | `EIO` |
@@ -167,9 +201,9 @@ FUSE境界では内部構造を細かく漏らさず、失敗の種類を次の�
 
 ## どう検証しているか
 
-`read_only.rs`のmodule testは、許可範囲と祖先だけのlookup、backingとCapabilityのrepository identity不一致、namespaceとAuthority両方のfile / directory handle count、位置指定read / write、`O_WRONLY`がreadを得ないこと、`O_RDWR`の両effect要求、`O_TRUNC`の複合認可、explicit size変更の`Truncate`再認可、directory offset cookie、exact patternによるchild filter、revoke後の既存handle read / write / truncate / readdir拒否、releaseによるcleanup、malformed FORGET後のfail closedを直接確認する。
+`read_only.rs`のmodule testは、許可範囲と祖先だけのlookup、backingとCapabilityのrepository identity不一致、namespaceとAuthority両方のfile / directory handle count、位置指定read / write、`O_WRONLY`がreadを得ないこと、`O_RDWR`の両effect要求、`O_TRUNC`の複合認可、explicit size変更の`Truncate`再認可、`CREATE`に必要な`CreateFile`とhandle effect、`MKDIR`に必要な`CreateDirectory`、creation umask、occupied childとnon-directory parent、directory offset cookie、exact patternによるchild filter、revoke後の既存handle read / write / truncate / readdir拒否、releaseによるcleanup、malformed FORGET後のfail closedを直接確認する。
 
-[`crates/capfs/tests/read_only_fuse.rs`](../../crates/capfs/tests/read_only_fuse.rs) は実際にLinux FUSEへmountする。`allowed.txt`を開いて読んだ後にCapabilityをrevokeし、同じOS file descriptorで再度readして`PermissionDenied`になることを確認する。write testは`O_TRUNC` openでfileを空にし、writeを成功させた後にCapabilityをrevokeする。同じdescriptorからの次のwriteと`set_len`はともに`PermissionDenied`になり、backingの長さも変わらない。同じmount上の権限外 siblingは`NotFound`になる。directory testでは、祖先directoryのlisting拒否、許可prefixのcanonical-name順 listingを確認する。さらに40 byteの`getdents` bufferで応答を1 entryずつに分け、1回目の`READDIR`後にrevokeして、同じdirectory fdからの2回目が`PermissionDenied`になることを確認する。
+[`crates/capfs/tests/read_only_fuse.rs`](../../crates/capfs/tests/read_only_fuse.rs) は実際にLinux FUSEへmountする。`allowed.txt`を開いて読んだ後にCapabilityをrevokeし、同じOS file descriptorで再度readして`PermissionDenied`になることを確認する。write testは`O_TRUNC` openでfileを空にし、writeを成功させた後にCapabilityをrevokeする。同じdescriptorからの次のwriteと`set_len`はともに`PermissionDenied`になり、backingの長さも変わらない。create testは`MKDIR`、writable `CREATE`、返却handleからのwriteを実mountで通し、parent directory fdを保持したままrevoke後に`mkdirat`すると`PermissionDenied`になることを確認する。同じmount上の権限外 siblingは`NotFound`になる。directory testでは、祖先directoryのlisting拒否、許可prefixのcanonical-name順 listingを確認する。さらに40 byteの`getdents` bufferで応答を1 entryずつに分け、1回目の`READDIR`後にrevokeして、同じdirectory fdからの2回目が`PermissionDenied`になることを確認する。
 
 実mount testは`/dev/fuse`が存在しない環境だけskipする。deviceが存在するのにmount設定や権限が壊れている場合はtest failureとして扱う。
 
@@ -177,7 +211,7 @@ FUSE境界では内部構造を細かく漏らさず、失敗の種類を次の�
 
 ## 次に実装するもの
 
-次は`CREATE`、`MKDIR`、`UNLINK`、`RMDIR`、no-replace `RENAME`を共有namespace transactionへ接続する。その後にmode / timestampの`SetMetadata`を別effectとして追加し、mutationとopen handle、revoke、directory streamの競合testへ進む。
+次は`UNLINK`、`RMDIR`、no-replace `RENAME`を共有namespace transactionへ接続する。その後にmode / timestampの`SetMetadata`を別effectとして追加し、mutationとopen handle、revoke、directory streamの競合testへ進む。
 
 ## 関連
 

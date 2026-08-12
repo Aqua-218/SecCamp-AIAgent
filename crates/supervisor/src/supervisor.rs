@@ -193,28 +193,70 @@ impl WorkloadHandle {
     }
 }
 
+/// Typed result of an operation that acquires an externally owned resource.
+///
+/// Adapters must not collapse a partial effect into an ordinary error. The
+/// supervisor can only retry cleanup when it knows whether ownership exists
+/// and, for token-addressed resources, which token identifies it.
+#[derive(Debug)]
+pub enum ResourceAcquisition<T, E> {
+    /// The operation completed and transferred ownership to the supervisor.
+    Acquired(T),
+    /// The operation failed before producing any externally visible effect.
+    NoEffect(E),
+    /// The operation failed after producing a resource that must be cleaned up.
+    CleanupRequired {
+        /// Resource ownership transferred despite the reported failure.
+        resource: T,
+        /// Adapter failure that accompanied the partial effect.
+        error: E,
+    },
+    /// The adapter cannot determine whether an effect occurred.
+    EffectUnknown(E),
+}
+
+/// Typed result of a resource mutation whose target identity is already known.
+#[derive(Debug)]
+pub enum ResourceMutation<E> {
+    /// The requested mutation completed.
+    Applied,
+    /// The operation failed before changing the target.
+    NoEffect(E),
+    /// The operation failed and the target still requires cleanup.
+    CleanupRequired(E),
+    /// The adapter cannot determine whether the mutation took effect.
+    EffectUnknown(E),
+}
+
 /// Resource operations required by the supervisor lifecycle.
 pub trait RuntimeResources {
     /// Resource-adapter failure type.
     type Error: Error + Send + Sync + 'static;
 
     /// Allocates the workload cgroup before any child can run.
-    fn create_cgroup(&mut self, subject: &SubjectId) -> Result<CgroupHandle, Self::Error>;
+    fn create_cgroup(
+        &mut self,
+        subject: &SubjectId,
+    ) -> ResourceAcquisition<CgroupHandle, Self::Error>;
 
     /// Removes a cgroup after its workload and mount are stopped.
-    fn remove_cgroup(&mut self, cgroup: CgroupHandle) -> Result<(), Self::Error>;
+    fn remove_cgroup(&mut self, cgroup: CgroupHandle) -> ResourceMutation<Self::Error>;
 
     /// Mounts the subject's capability filesystem.
-    fn mount_capfs(&mut self, subject: &SubjectId) -> Result<MountHandle, Self::Error>;
+    fn mount_capfs(&mut self, subject: &SubjectId)
+    -> ResourceAcquisition<MountHandle, Self::Error>;
 
     /// Unmounts the subject's capability filesystem.
-    fn unmount_capfs(&mut self, mount: MountHandle) -> Result<(), Self::Error>;
+    fn unmount_capfs(&mut self, mount: MountHandle) -> ResourceMutation<Self::Error>;
 
     /// Opens the subject's private control descriptor.
-    fn open_control_fd(&mut self, subject: &SubjectId) -> Result<ControlFdHandle, Self::Error>;
+    fn open_control_fd(
+        &mut self,
+        subject: &SubjectId,
+    ) -> ResourceAcquisition<ControlFdHandle, Self::Error>;
 
     /// Closes the subject's private control descriptor.
-    fn close_control_fd(&mut self, control: ControlFdHandle) -> Result<(), Self::Error>;
+    fn close_control_fd(&mut self, control: ControlFdHandle) -> ResourceMutation<Self::Error>;
 
     /// Starts the workload after authority registration has completed.
     fn start_workload(
@@ -223,27 +265,41 @@ pub trait RuntimeResources {
         cgroup: CgroupHandle,
         mount: MountHandle,
         control: ControlFdHandle,
-    ) -> Result<WorkloadHandle, Self::Error>;
+    ) -> ResourceAcquisition<WorkloadHandle, Self::Error>;
 
     /// Stops the workload before descriptors, handles, or mounts are closed.
     fn stop_workload(
         &mut self,
         workload: WorkloadHandle,
         cgroup: CgroupHandle,
-    ) -> Result<(), Self::Error>;
+    ) -> ResourceMutation<Self::Error>;
 
     /// Opens a runtime handle before it is registered with the authority kernel.
-    fn open_handle(&mut self, subject: &SubjectId, handle: &HandleId) -> Result<(), Self::Error>;
+    fn open_handle(
+        &mut self,
+        subject: &SubjectId,
+        handle: &HandleId,
+    ) -> ResourceMutation<Self::Error>;
 
     /// Closes a runtime handle. Implementations should make this idempotent so
     /// authority registration rollback can retry safely.
-    fn close_handle(&mut self, subject: &SubjectId, handle: &HandleId) -> Result<(), Self::Error>;
+    fn close_handle(
+        &mut self,
+        subject: &SubjectId,
+        handle: &HandleId,
+    ) -> ResourceMutation<Self::Error>;
 }
 
 /// The authority-kernel surface used by the supervisor.
 pub trait AuthorityKernel {
     /// Kernel failure type.
     type Error: Error + Send + Sync + 'static;
+
+    /// Returns whether no session authority or identity has been issued.
+    ///
+    /// Supervisor construction requires a pristine kernel because an empty
+    /// local ownership ledger cannot safely adopt pre-existing kernel state.
+    fn is_pristine(&self) -> Result<bool, Self::Error>;
 
     /// Registers a fully prepared subject as running.
     fn register_subject(&self, subject: Subject) -> Result<(), Self::Error>;
@@ -286,6 +342,10 @@ pub trait AuthorityKernel {
 
 impl AuthorityKernel for CapabilityKernel {
     type Error = authority_core::kernel::CapabilityKernelError;
+
+    fn is_pristine(&self) -> Result<bool, Self::Error> {
+        CapabilityKernel::is_pristine(self)
+    }
 
     fn register_subject(&self, subject: Subject) -> Result<(), Self::Error> {
         CapabilityKernel::register_subject(self, subject)
@@ -369,13 +429,37 @@ pub enum CleanupStep {
     FinishClose,
 }
 
+/// Effect classification retained with a resource-adapter error.
+#[derive(Debug)]
+pub enum ResourceFailure<E> {
+    /// The adapter guarantees that the failed call had no effect.
+    NoEffect(E),
+    /// A resource is known to remain owned and cleanup must be retried.
+    CleanupRequired(E),
+    /// The adapter cannot determine whether the call had an effect.
+    EffectUnknown(E),
+}
+
+/// Typed cause of a setup or cleanup failure.
+#[derive(Debug)]
+pub enum OperationFailure<KE, RE> {
+    /// The authority kernel rejected the transition.
+    Kernel(KE),
+    /// The runtime adapter reported a classified resource failure.
+    Resource(ResourceFailure<RE>),
+    /// A prior unknown acquisition effect cannot be addressed by a token.
+    UnresolvedEffect,
+    /// Internal ownership bookkeeping violated a required invariant.
+    Invariant(&'static str),
+}
+
 /// A failure retained while attempting all safe cleanup phases.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CleanupFailure {
+#[derive(Debug)]
+pub struct CleanupFailure<KE, RE> {
     /// Phase that failed.
     pub step: CleanupStep,
-    /// Full adapter error text for diagnostics.
-    pub message: String,
+    /// Typed error and effect classification for retry policy.
+    pub cause: OperationFailure<KE, RE>,
 }
 
 /// Setup phase associated with a failed creation transaction.
@@ -393,6 +477,8 @@ pub enum SetupStep {
     RegisterHandle,
     /// Workload start failed.
     StartWorkload,
+    /// Runtime handle open failed after its identity was issued.
+    OpenHandle,
 }
 
 /// A marker error for resource implementations that only need a string message.
@@ -424,11 +510,13 @@ pub enum SupervisorError<KE, RE, CE> {
     /// The authority kernel rejected a transition.
     Kernel(KE),
     /// The runtime resource adapter rejected an operation.
-    Resource(RE),
+    Resource(ResourceFailure<RE>),
     /// The wire request failed closed decoding.
     Wire(WireDecodeError),
     /// A subject identity is already owned by this supervisor.
     DuplicateSubject(SubjectId),
+    /// The supplied authority kernel already contains session state.
+    KernelNotPristine,
     /// A requested subject is not known to this supervisor.
     UnknownSubject(SubjectId),
     /// A subject is not in the Running state required by the operation.
@@ -473,21 +561,29 @@ pub enum SupervisorError<KE, RE, CE> {
         subject: SubjectId,
         /// Setup phase that failed.
         step: SetupStep,
-        /// Primary error text.
-        primary: String,
+        /// Primary typed failure.
+        primary: OperationFailure<KE, RE>,
         /// Rollback failures, if any.
-        rollback: Vec<CleanupFailure>,
+        rollback: Vec<CleanupFailure<KE, RE>>,
     },
     /// Cleanup failed; the subject remains Closing and rejects new requests.
     CleanupFailed {
         /// Subject whose cleanup remains incomplete.
         subject: SubjectId,
         /// Every cleanup phase that failed during this attempt.
-        failures: Vec<CleanupFailure>,
+        failures: Vec<CleanupFailure<KE, RE>>,
+    },
+    /// Cleanup cannot be retried because an acquisition may have taken effect
+    /// without returning the token required to address that resource.
+    CleanupBlocked {
+        /// Subject whose ownership remains unresolved.
+        subject: SubjectId,
+        /// Fail-stop phases, including every unaddressable effect.
+        failures: Vec<CleanupFailure<KE, RE>>,
     },
 }
 
-impl<KE: fmt::Display, RE: fmt::Display, CE: fmt::Display> fmt::Display
+impl<KE: fmt::Display + fmt::Debug, RE: fmt::Display + fmt::Debug, CE: fmt::Display> fmt::Display
     for SupervisorError<KE, RE, CE>
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -496,13 +592,14 @@ impl<KE: fmt::Display, RE: fmt::Display, CE: fmt::Display> fmt::Display
             Self::Kernel(error) => {
                 write!(formatter, "authority kernel rejected operation: {error}")
             }
-            Self::Resource(error) => {
-                write!(formatter, "runtime resource operation failed: {error}")
-            }
+            Self::Resource(failure) => write_resource_failure(formatter, failure),
             Self::Wire(error) => write!(formatter, "wire request rejected: {error}"),
             Self::DuplicateSubject(subject) => {
                 write!(formatter, "subject `{subject}` is already supervised")
             }
+            Self::KernelNotPristine => formatter.write_str(
+                "authority kernel is not pristine and cannot be paired with an empty ownership ledger",
+            ),
             Self::UnknownSubject(subject) => {
                 write!(formatter, "subject `{subject}` is not supervised")
             }
@@ -538,13 +635,39 @@ impl<KE: fmt::Display, RE: fmt::Display, CE: fmt::Display> fmt::Display
                 rollback,
             } => write!(
                 formatter,
-                "setup for subject `{subject}` failed at {step:?}: {primary}; rollback failures: {rollback:?}"
+                "setup for subject `{subject}` failed at {step:?}: {primary:?}; rollback failures: {rollback:?}"
             ),
             Self::CleanupFailed { subject, failures } => write!(
                 formatter,
                 "cleanup for subject `{subject}` failed and remains fail-closed: {failures:?}"
             ),
+            Self::CleanupBlocked { subject, failures } => write!(
+                formatter,
+                "cleanup for subject `{subject}` is permanently fail-stopped by an unaddressable effect: {failures:?}"
+            ),
         }
+    }
+}
+
+fn write_resource_failure<E: fmt::Display>(
+    formatter: &mut fmt::Formatter<'_>,
+    failure: &ResourceFailure<E>,
+) -> fmt::Result {
+    match failure {
+        ResourceFailure::NoEffect(error) => {
+            write!(
+                formatter,
+                "runtime resource operation had no effect: {error}"
+            )
+        }
+        ResourceFailure::CleanupRequired(error) => write!(
+            formatter,
+            "runtime resource operation requires cleanup: {error}"
+        ),
+        ResourceFailure::EffectUnknown(error) => write!(
+            formatter,
+            "runtime resource operation has an unknown effect: {error}"
+        ),
     }
 }
 
@@ -557,15 +680,32 @@ where
 }
 
 type SupervisorResult<KE, RE, CE, T> = Result<T, SupervisorError<KE, RE, CE>>;
+type CleanupFailures<KE, RE> = Vec<CleanupFailure<KE, RE>>;
+type RollbackHandleResult<KE, RE, CE> = SupervisorResult<KE, RE, CE, CleanupFailures<KE, RE>>;
+
+#[derive(Debug, Clone, Copy)]
+enum ResourceOwnership<T> {
+    Owned(T),
+    EffectUnknown,
+}
+
+impl<T: Copy> ResourceOwnership<T> {
+    const fn token(self) -> Option<T> {
+        match self {
+            Self::Owned(token) => Some(token),
+            Self::EffectUnknown => None,
+        }
+    }
+}
 
 struct SubjectRecord {
     connection: ConnectionIdentity,
     lifecycle: SubjectLifecycle,
     authority_registered: bool,
-    cgroup: Option<CgroupHandle>,
-    mount: Option<MountHandle>,
-    control: Option<ControlFdHandle>,
-    workload: Option<WorkloadHandle>,
+    cgroup: Option<ResourceOwnership<CgroupHandle>>,
+    mount: Option<ResourceOwnership<MountHandle>>,
+    control: Option<ResourceOwnership<ControlFdHandle>>,
+    workload: Option<ResourceOwnership<WorkloadHandle>>,
     /// Every runtime handle that remains open, including one awaiting
     /// authority registration.
     runtime_handles: BTreeSet<HandleId>,
@@ -573,13 +713,13 @@ struct SubjectRecord {
     handles: BTreeSet<HandleId>,
 }
 
-struct SetupRollback {
-    failures: Vec<CleanupFailure>,
+struct SetupRollback<KE, RE> {
+    failures: Vec<CleanupFailure<KE, RE>>,
     authority_registered: bool,
-    cgroup: Option<CgroupHandle>,
-    mount: Option<MountHandle>,
-    control: Option<ControlFdHandle>,
-    workload: Option<WorkloadHandle>,
+    cgroup: Option<ResourceOwnership<CgroupHandle>>,
+    mount: Option<ResourceOwnership<MountHandle>>,
+    control: Option<ResourceOwnership<ControlFdHandle>>,
+    workload: Option<ResourceOwnership<WorkloadHandle>>,
 }
 
 /// The supervisor owning all subjects in one authority session.
@@ -588,6 +728,9 @@ pub struct Supervisor<K, R, C> {
     resources: R,
     callers: C,
     subjects: BTreeMap<SubjectId, SubjectRecord>,
+    /// Subject IDs remain reserved after every setup attempt that reached an
+    /// effectful phase, even when rollback releases every resource.
+    issued_subjects: BTreeSet<SubjectId>,
     /// Session-local handle IDs are never eligible for reuse after issuance.
     issued_handles: BTreeMap<HandleId, SubjectId>,
 }
@@ -598,16 +741,30 @@ where
     R: RuntimeResources,
     C: CallerResolver,
 {
-    /// Creates an empty supervisor around an authority kernel and adapters.
-    #[must_use]
-    pub fn new(kernel: K, resources: R, callers: C) -> Self {
-        Self {
+    /// Creates an empty supervisor around a pristine authority kernel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SupervisorError::KernelNotPristine`] when the kernel already
+    /// owns session state, or [`SupervisorError::Kernel`] when its state cannot
+    /// be inspected. A pre-populated kernel requires a durable ownership
+    /// manifest and must not be paired with this empty-ledger constructor.
+    pub fn new(
+        kernel: K,
+        resources: R,
+        callers: C,
+    ) -> SupervisorResult<K::Error, R::Error, C::Error, Self> {
+        if !kernel.is_pristine().map_err(SupervisorError::Kernel)? {
+            return Err(SupervisorError::KernelNotPristine);
+        }
+        Ok(Self {
             kernel,
             resources,
             callers,
             subjects: BTreeMap::new(),
+            issued_subjects: BTreeSet::new(),
             issued_handles: BTreeMap::new(),
-        }
+        })
     }
 
     /// Returns the locally tracked lifecycle state for a subject.
@@ -640,7 +797,7 @@ where
         connection: ConnectionIdentity,
     ) -> SupervisorResult<K::Error, R::Error, C::Error, ()> {
         let subject_id = subject.id().clone();
-        if self.subjects.contains_key(&subject_id) {
+        if self.issued_subjects.contains(&subject_id) {
             return Err(SupervisorError::DuplicateSubject(subject_id));
         }
         let bound_subject = self
@@ -672,6 +829,10 @@ where
             }
         }
 
+        // Reserve before the first adapter call. A delayed completion from any
+        // later setup phase must never be rebound to a fresh local subject.
+        self.issued_subjects.insert(subject_id.clone());
+
         let mut cgroup = None;
         let mut mount = None;
         let mut control = None;
@@ -679,45 +840,39 @@ where
         let mut kernel_registered = false;
 
         let result = (|| {
-            cgroup = Some(
-                self.resources
-                    .create_cgroup(&subject_id)
-                    .map_err(|error| (SetupStep::CreateCgroup, error.to_string()))?,
-            );
-            mount = Some(
-                self.resources
-                    .mount_capfs(&subject_id)
-                    .map_err(|error| (SetupStep::Mount, error.to_string()))?,
-            );
-            control = Some(
-                self.resources
-                    .open_control_fd(&subject_id)
-                    .map_err(|error| (SetupStep::OpenControlFd, error.to_string()))?,
-            );
+            Self::record_acquisition(self.resources.create_cgroup(&subject_id), &mut cgroup)
+                .map_err(|failure| (SetupStep::CreateCgroup, failure))?;
+            Self::record_acquisition(self.resources.mount_capfs(&subject_id), &mut mount)
+                .map_err(|failure| (SetupStep::Mount, failure))?;
+            Self::record_acquisition(self.resources.open_control_fd(&subject_id), &mut control)
+                .map_err(|failure| (SetupStep::OpenControlFd, failure))?;
             self.kernel
                 .register_subject(subject.clone())
-                .map_err(|error| (SetupStep::RegisterSubject, error.to_string()))?;
+                .map_err(|error| (SetupStep::RegisterSubject, OperationFailure::Kernel(error)))?;
             kernel_registered = true;
-            workload = Some(
-                self.resources
-                    .start_workload(
-                        &subject_id,
-                        cgroup.as_ref().copied().ok_or((
-                            SetupStep::StartWorkload,
-                            "cgroup setup invariant was lost".to_owned(),
-                        ))?,
-                        mount.as_ref().copied().ok_or((
-                            SetupStep::StartWorkload,
-                            "mount setup invariant was lost".to_owned(),
-                        ))?,
-                        control.as_ref().copied().ok_or((
-                            SetupStep::StartWorkload,
-                            "control fd setup invariant was lost".to_owned(),
-                        ))?,
-                    )
-                    .map_err(|error| (SetupStep::StartWorkload, error.to_string()))?,
-            );
-            Ok::<(), (SetupStep, String)>(())
+            let cgroup_token = cgroup.and_then(ResourceOwnership::token).ok_or((
+                SetupStep::StartWorkload,
+                OperationFailure::Invariant("cgroup setup ownership is unresolved"),
+            ))?;
+            let mount_token = mount.and_then(ResourceOwnership::token).ok_or((
+                SetupStep::StartWorkload,
+                OperationFailure::Invariant("mount setup ownership is unresolved"),
+            ))?;
+            let control_token = control.and_then(ResourceOwnership::token).ok_or((
+                SetupStep::StartWorkload,
+                OperationFailure::Invariant("control fd setup ownership is unresolved"),
+            ))?;
+            Self::record_acquisition(
+                self.resources.start_workload(
+                    &subject_id,
+                    cgroup_token,
+                    mount_token,
+                    control_token,
+                ),
+                &mut workload,
+            )
+            .map_err(|failure| (SetupStep::StartWorkload, failure))?;
+            Ok::<(), (SetupStep, OperationFailure<K::Error, R::Error>)>(())
         })();
 
         if let Err((step, primary)) = result {
@@ -843,34 +998,46 @@ where
         if self.issued_handles.contains_key(&handle) {
             return Err(SupervisorError::StaleHandle(handle));
         }
-        self.resources
-            .open_handle(&caller, &handle)
-            .map_err(SupervisorError::Resource)?;
+        // The adapter has observed this ID after this point, so even a
+        // guaranteed no-effect failure consumes its session-local identity.
         self.issued_handles.insert(handle.clone(), caller.clone());
-        self.subjects
-            .get_mut(&caller)
-            .ok_or_else(|| SupervisorError::UnknownSubject(caller.clone()))?
-            .runtime_handles
-            .insert(handle.clone());
-        let authority_handle = OpenHandle::new(handle.clone(), caller.clone(), object);
-        if let Err(error) = self.kernel.register_open_handle(authority_handle) {
-            if let Err(rollback) = self.resources.close_handle(&caller, &handle) {
+        match self.resources.open_handle(&caller, &handle) {
+            ResourceMutation::Applied => {
+                self.track_runtime_handle(&caller, &handle)?;
+            }
+            ResourceMutation::NoEffect(error) => {
+                return Err(SupervisorError::Resource(ResourceFailure::NoEffect(error)));
+            }
+            ResourceMutation::CleanupRequired(error) => {
+                self.track_runtime_handle(&caller, &handle)?;
+                let rollback = self.rollback_runtime_handle(&caller, &handle)?;
                 return Err(SupervisorError::SetupFailed {
                     subject: caller,
-                    step: SetupStep::RegisterHandle,
-                    primary: error.to_string(),
-                    rollback: vec![CleanupFailure {
-                        step: CleanupStep::CloseHandle,
-                        message: rollback.to_string(),
-                    }],
+                    step: SetupStep::OpenHandle,
+                    primary: OperationFailure::Resource(ResourceFailure::CleanupRequired(error)),
+                    rollback,
                 });
             }
-            self.subjects
-                .get_mut(&caller)
-                .ok_or_else(|| SupervisorError::UnknownSubject(caller.clone()))?
-                .runtime_handles
-                .remove(&handle);
-            return Err(SupervisorError::Kernel(error));
+            ResourceMutation::EffectUnknown(error) => {
+                self.track_runtime_handle(&caller, &handle)?;
+                let rollback = self.rollback_runtime_handle(&caller, &handle)?;
+                return Err(SupervisorError::SetupFailed {
+                    subject: caller,
+                    step: SetupStep::OpenHandle,
+                    primary: OperationFailure::Resource(ResourceFailure::EffectUnknown(error)),
+                    rollback,
+                });
+            }
+        }
+        let authority_handle = OpenHandle::new(handle.clone(), caller.clone(), object);
+        if let Err(error) = self.kernel.register_open_handle(authority_handle) {
+            let rollback = self.rollback_runtime_handle(&caller, &handle)?;
+            return Err(SupervisorError::SetupFailed {
+                subject: caller,
+                step: SetupStep::RegisterHandle,
+                primary: OperationFailure::Kernel(error),
+                rollback,
+            });
         }
         self.subjects
             .get_mut(&caller)
@@ -901,9 +1068,22 @@ where
                 handle: handle.clone(),
             });
         }
-        self.resources
-            .close_handle(&caller, handle)
-            .map_err(SupervisorError::Resource)?;
+        match self.resources.close_handle(&caller, handle) {
+            ResourceMutation::Applied => {}
+            ResourceMutation::NoEffect(error) => {
+                return Err(SupervisorError::Resource(ResourceFailure::NoEffect(error)));
+            }
+            ResourceMutation::CleanupRequired(error) => {
+                return Err(SupervisorError::Resource(ResourceFailure::CleanupRequired(
+                    error,
+                )));
+            }
+            ResourceMutation::EffectUnknown(error) => {
+                return Err(SupervisorError::Resource(ResourceFailure::EffectUnknown(
+                    error,
+                )));
+            }
+        }
         match self
             .kernel
             .close_handle(&caller, handle)
@@ -948,15 +1128,24 @@ where
         if let Some(record) = self.subjects.get_mut(subject) {
             record.lifecycle = SubjectLifecycle::Closing;
         }
+        let mut failures = Vec::new();
         if authority_registered {
-            match self
-                .kernel
-                .begin_subject_close(subject)
-                .map_err(SupervisorError::Kernel)?
-            {
-                SubjectCloseStatus::Started
-                | SubjectCloseStatus::AlreadyClosing
-                | SubjectCloseStatus::AlreadyClosed => {}
+            match self.kernel.begin_subject_close(subject) {
+                Ok(
+                    SubjectCloseStatus::Started
+                    | SubjectCloseStatus::AlreadyClosing
+                    | SubjectCloseStatus::AlreadyClosed,
+                ) => {}
+                Err(error) => {
+                    failures.push(CleanupFailure {
+                        step: CleanupStep::BeginClose,
+                        cause: OperationFailure::Kernel(error),
+                    });
+                    return Err(SupervisorError::CleanupFailed {
+                        subject: subject.clone(),
+                        failures,
+                    });
+                }
             }
         }
         let (cgroup, mount, control, workload, runtime_handles) = {
@@ -972,57 +1161,63 @@ where
                 record.runtime_handles.iter().cloned().collect::<Vec<_>>(),
             )
         };
-        let mut failures = Vec::new();
         let mut workload_stopped = workload.is_none();
         let mut control_closed = control.is_none();
         let mut mount_unmounted = mount.is_none();
 
-        if let Some(workload) = workload {
-            match cgroup {
-                Some(cgroup) => match self.resources.stop_workload(workload, cgroup) {
-                    Ok(()) => {
-                        self.subjects
-                            .get_mut(subject)
-                            .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
-                            .workload = None;
-                        workload_stopped = true;
+        if let Some(workload_ownership) = workload {
+            match (
+                workload_ownership.token(),
+                cgroup.and_then(ResourceOwnership::token),
+            ) {
+                (Some(workload_token), Some(cgroup_token)) => {
+                    match self.resources.stop_workload(workload_token, cgroup_token) {
+                        ResourceMutation::Applied => {
+                            self.subjects
+                                .get_mut(subject)
+                                .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
+                                .workload = None;
+                            workload_stopped = true;
+                        }
+                        outcome => failures
+                            .push(Self::mutation_failure(CleanupStep::StopWorkload, outcome)),
                     }
-                    Err(error) => failures.push(CleanupFailure {
-                        step: CleanupStep::StopWorkload,
-                        message: error.to_string(),
-                    }),
-                },
-                None => failures.push(CleanupFailure {
+                }
+                _ => failures.push(CleanupFailure {
                     step: CleanupStep::StopWorkload,
-                    message: "workload token exists without its cgroup token".to_owned(),
+                    cause: OperationFailure::UnresolvedEffect,
                 }),
             }
         }
 
-        if let Some(control) = control {
-            match self.resources.close_control_fd(control) {
-                Ok(()) => {
-                    self.subjects
-                        .get_mut(subject)
-                        .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
-                        .control = None;
-                    control_closed = true;
-                }
-                Err(error) => failures.push(CleanupFailure {
+        if let Some(control_ownership) = control {
+            match control_ownership.token() {
+                Some(control_token) => match self.resources.close_control_fd(control_token) {
+                    ResourceMutation::Applied => {
+                        self.subjects
+                            .get_mut(subject)
+                            .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
+                            .control = None;
+                        control_closed = true;
+                    }
+                    outcome => {
+                        failures.push(Self::mutation_failure(CleanupStep::CloseControlFd, outcome));
+                    }
+                },
+                None => failures.push(CleanupFailure {
                     step: CleanupStep::CloseControlFd,
-                    message: error.to_string(),
+                    cause: OperationFailure::UnresolvedEffect,
                 }),
             }
         }
 
         for handle in runtime_handles {
-            let close_result = self.resources.close_handle(subject, &handle);
-            if let Err(error) = close_result {
-                failures.push(CleanupFailure {
-                    step: CleanupStep::CloseHandle,
-                    message: error.to_string(),
-                });
-                continue;
+            match self.resources.close_handle(subject, &handle) {
+                ResourceMutation::Applied => {}
+                outcome => {
+                    failures.push(Self::mutation_failure(CleanupStep::CloseHandle, outcome));
+                    continue;
+                }
             }
             let authority_handle = self
                 .subjects
@@ -1033,16 +1228,20 @@ where
             if authority_handle {
                 match self.kernel.close_handle(subject, &handle) {
                     Ok(HandleCloseStatus::Closed | HandleCloseStatus::AlreadyClosed) => {
-                        let record = self
-                            .subjects
+                        self.subjects
                             .get_mut(subject)
-                            .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?;
-                        record.runtime_handles.remove(&handle);
-                        record.handles.remove(&handle);
+                            .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
+                            .runtime_handles
+                            .remove(&handle);
+                        self.subjects
+                            .get_mut(subject)
+                            .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
+                            .handles
+                            .remove(&handle);
                     }
                     Err(error) => failures.push(CleanupFailure {
                         step: CleanupStep::CloseHandle,
-                        message: error.to_string(),
+                        cause: OperationFailure::Kernel(error),
                     }),
                 }
             } else {
@@ -1060,40 +1259,48 @@ where
             .runtime_handles
             .is_empty();
 
-        if let Some(mount) = mount
+        if let Some(mount_ownership) = mount
             && workload_stopped
             && control_closed
             && handles_closed
         {
-            match self.resources.unmount_capfs(mount) {
-                Ok(()) => {
-                    self.subjects
-                        .get_mut(subject)
-                        .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
-                        .mount = None;
-                    mount_unmounted = true;
-                }
-                Err(error) => failures.push(CleanupFailure {
+            match mount_ownership.token() {
+                Some(mount_token) => match self.resources.unmount_capfs(mount_token) {
+                    ResourceMutation::Applied => {
+                        self.subjects
+                            .get_mut(subject)
+                            .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
+                            .mount = None;
+                        mount_unmounted = true;
+                    }
+                    outcome => failures.push(Self::mutation_failure(CleanupStep::Unmount, outcome)),
+                },
+                None => failures.push(CleanupFailure {
                     step: CleanupStep::Unmount,
-                    message: error.to_string(),
+                    cause: OperationFailure::UnresolvedEffect,
                 }),
             }
         }
 
-        if let Some(cgroup) = cgroup
+        if let Some(cgroup_ownership) = cgroup
             && workload_stopped
             && mount_unmounted
         {
-            match self.resources.remove_cgroup(cgroup) {
-                Ok(()) => {
-                    self.subjects
-                        .get_mut(subject)
-                        .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
-                        .cgroup = None;
-                }
-                Err(error) => failures.push(CleanupFailure {
+            match cgroup_ownership.token() {
+                Some(cgroup_token) => match self.resources.remove_cgroup(cgroup_token) {
+                    ResourceMutation::Applied => {
+                        self.subjects
+                            .get_mut(subject)
+                            .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
+                            .cgroup = None;
+                    }
+                    outcome => {
+                        failures.push(Self::mutation_failure(CleanupStep::RemoveCgroup, outcome));
+                    }
+                },
+                None => failures.push(CleanupFailure {
                     step: CleanupStep::RemoveCgroup,
-                    message: error.to_string(),
+                    cause: OperationFailure::UnresolvedEffect,
                 }),
             }
         }
@@ -1112,7 +1319,7 @@ where
                     }
                     Err(error) => failures.push(CleanupFailure {
                         step: CleanupStep::FinishClose,
-                        message: error.to_string(),
+                        cause: OperationFailure::Kernel(error),
                     }),
                 }
             } else {
@@ -1125,10 +1332,20 @@ where
             }
         }
 
-        Err(SupervisorError::CleanupFailed {
-            subject: subject.clone(),
-            failures,
-        })
+        if failures
+            .iter()
+            .any(|failure| matches!(failure.cause, OperationFailure::UnresolvedEffect))
+        {
+            Err(SupervisorError::CleanupBlocked {
+                subject: subject.clone(),
+                failures,
+            })
+        } else {
+            Err(SupervisorError::CleanupFailed {
+                subject: subject.clone(),
+                failures,
+            })
+        }
     }
 
     /// Decodes and dispatches a request using only the accepted connection identity.
@@ -1188,16 +1405,109 @@ where
         }
     }
 
+    fn record_acquisition<T>(
+        outcome: ResourceAcquisition<T, R::Error>,
+        ownership: &mut Option<ResourceOwnership<T>>,
+    ) -> Result<(), OperationFailure<K::Error, R::Error>> {
+        match outcome {
+            ResourceAcquisition::Acquired(resource) => {
+                *ownership = Some(ResourceOwnership::Owned(resource));
+                Ok(())
+            }
+            ResourceAcquisition::NoEffect(error) => {
+                Err(OperationFailure::Resource(ResourceFailure::NoEffect(error)))
+            }
+            ResourceAcquisition::CleanupRequired { resource, error } => {
+                *ownership = Some(ResourceOwnership::Owned(resource));
+                Err(OperationFailure::Resource(
+                    ResourceFailure::CleanupRequired(error),
+                ))
+            }
+            ResourceAcquisition::EffectUnknown(error) => {
+                *ownership = Some(ResourceOwnership::EffectUnknown);
+                Err(OperationFailure::Resource(ResourceFailure::EffectUnknown(
+                    error,
+                )))
+            }
+        }
+    }
+
+    fn mutation_failure(
+        step: CleanupStep,
+        outcome: ResourceMutation<R::Error>,
+    ) -> CleanupFailure<K::Error, R::Error> {
+        let failure = match outcome {
+            ResourceMutation::Applied => {
+                return CleanupFailure {
+                    step,
+                    cause: OperationFailure::Invariant(
+                        "an applied resource mutation was reported as a failure",
+                    ),
+                };
+            }
+            ResourceMutation::NoEffect(error) => ResourceFailure::NoEffect(error),
+            ResourceMutation::CleanupRequired(error) => ResourceFailure::CleanupRequired(error),
+            ResourceMutation::EffectUnknown(error) => ResourceFailure::EffectUnknown(error),
+        };
+        CleanupFailure {
+            step,
+            cause: OperationFailure::Resource(failure),
+        }
+    }
+
+    fn track_runtime_handle(
+        &mut self,
+        subject: &SubjectId,
+        handle: &HandleId,
+    ) -> SupervisorResult<K::Error, R::Error, C::Error, ()> {
+        self.subjects
+            .get_mut(subject)
+            .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
+            .runtime_handles
+            .insert(handle.clone());
+        Ok(())
+    }
+
+    fn rollback_runtime_handle(
+        &mut self,
+        subject: &SubjectId,
+        handle: &HandleId,
+    ) -> RollbackHandleResult<K::Error, R::Error, C::Error> {
+        match self.resources.close_handle(subject, handle) {
+            ResourceMutation::Applied => {
+                self.subjects
+                    .get_mut(subject)
+                    .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
+                    .runtime_handles
+                    .remove(handle);
+                Ok(Vec::new())
+            }
+            outcome => {
+                // An unregistered runtime handle is cleanup-only ownership.
+                // Stop admitting new work until shutdown has retried the
+                // idempotent close and removed that ownership record.
+                self.subjects
+                    .get_mut(subject)
+                    .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?
+                    .lifecycle = SubjectLifecycle::Closing;
+                Ok(vec![Self::mutation_failure(
+                    CleanupStep::CloseHandle,
+                    outcome,
+                )])
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn rollback_setup(
         &mut self,
         subject: &SubjectId,
-        cgroup: Option<CgroupHandle>,
-        mount: Option<MountHandle>,
-        control: Option<ControlFdHandle>,
-        workload: Option<WorkloadHandle>,
+        cgroup: Option<ResourceOwnership<CgroupHandle>>,
+        mount: Option<ResourceOwnership<MountHandle>>,
+        control: Option<ResourceOwnership<ControlFdHandle>>,
+        workload: Option<ResourceOwnership<WorkloadHandle>>,
         kernel_registered: bool,
-    ) -> SetupRollback {
+    ) -> SetupRollback<K::Error, R::Error> {
         let mut failures = Vec::new();
         let mut authority_registered = kernel_registered;
         let mut close_started = !kernel_registered;
@@ -1212,7 +1522,7 @@ where
                 }
                 Err(error) => failures.push(CleanupFailure {
                     step: CleanupStep::BeginClose,
-                    message: error.to_string(),
+                    cause: OperationFailure::Kernel(error),
                 }),
             }
         }
@@ -1225,65 +1535,91 @@ where
         let mut control_closed = control.is_none();
         let mut mount_unmounted = mount.is_none();
 
-        if let Some(workload_token) = workload {
-            match cgroup {
-                Some(cgroup_token) => {
+        // Resource teardown must not race ahead of failed authority shutdown.
+        if kernel_registered && !close_started {
+            return SetupRollback {
+                failures,
+                authority_registered,
+                cgroup,
+                mount,
+                control,
+                workload,
+            };
+        }
+
+        if let Some(workload_ownership) = workload {
+            match (
+                workload_ownership.token(),
+                cgroup.and_then(ResourceOwnership::token),
+            ) {
+                (Some(workload_token), Some(cgroup_token)) => {
                     match self.resources.stop_workload(workload_token, cgroup_token) {
-                        Ok(()) => {
+                        ResourceMutation::Applied => {
                             workload = None;
                             workload_stopped = true;
                         }
-                        Err(error) => failures.push(CleanupFailure {
-                            step: CleanupStep::StopWorkload,
-                            message: error.to_string(),
-                        }),
+                        outcome => failures
+                            .push(Self::mutation_failure(CleanupStep::StopWorkload, outcome)),
                     }
                 }
-                None => failures.push(CleanupFailure {
+                _ => failures.push(CleanupFailure {
                     step: CleanupStep::StopWorkload,
-                    message: "workload token exists without its cgroup token".to_owned(),
+                    cause: OperationFailure::UnresolvedEffect,
                 }),
             }
         }
 
-        if let Some(control_token) = control {
-            match self.resources.close_control_fd(control_token) {
-                Ok(()) => {
-                    control = None;
-                    control_closed = true;
-                }
-                Err(error) => failures.push(CleanupFailure {
+        if let Some(control_ownership) = control {
+            match control_ownership.token() {
+                Some(control_token) => match self.resources.close_control_fd(control_token) {
+                    ResourceMutation::Applied => {
+                        control = None;
+                        control_closed = true;
+                    }
+                    outcome => {
+                        failures.push(Self::mutation_failure(CleanupStep::CloseControlFd, outcome));
+                    }
+                },
+                None => failures.push(CleanupFailure {
                     step: CleanupStep::CloseControlFd,
-                    message: error.to_string(),
+                    cause: OperationFailure::UnresolvedEffect,
                 }),
             }
         }
 
-        if let Some(mount_token) = mount
+        if let Some(mount_ownership) = mount
             && workload_stopped
             && control_closed
         {
-            match self.resources.unmount_capfs(mount_token) {
-                Ok(()) => {
-                    mount = None;
-                    mount_unmounted = true;
-                }
-                Err(error) => failures.push(CleanupFailure {
+            match mount_ownership.token() {
+                Some(mount_token) => match self.resources.unmount_capfs(mount_token) {
+                    ResourceMutation::Applied => {
+                        mount = None;
+                        mount_unmounted = true;
+                    }
+                    outcome => failures.push(Self::mutation_failure(CleanupStep::Unmount, outcome)),
+                },
+                None => failures.push(CleanupFailure {
                     step: CleanupStep::Unmount,
-                    message: error.to_string(),
+                    cause: OperationFailure::UnresolvedEffect,
                 }),
             }
         }
 
-        if let Some(cgroup_token) = cgroup
+        if let Some(cgroup_ownership) = cgroup
             && workload_stopped
             && mount_unmounted
         {
-            match self.resources.remove_cgroup(cgroup_token) {
-                Ok(()) => cgroup = None,
-                Err(error) => failures.push(CleanupFailure {
+            match cgroup_ownership.token() {
+                Some(cgroup_token) => match self.resources.remove_cgroup(cgroup_token) {
+                    ResourceMutation::Applied => cgroup = None,
+                    outcome => {
+                        failures.push(Self::mutation_failure(CleanupStep::RemoveCgroup, outcome));
+                    }
+                },
+                None => failures.push(CleanupFailure {
                     step: CleanupStep::RemoveCgroup,
-                    message: error.to_string(),
+                    cause: OperationFailure::UnresolvedEffect,
                 }),
             }
         }
@@ -1295,7 +1631,7 @@ where
                 }
                 Err(error) => failures.push(CleanupFailure {
                     step: CleanupStep::FinishClose,
-                    message: error.to_string(),
+                    cause: OperationFailure::Kernel(error),
                 }),
             }
         }
@@ -1313,8 +1649,176 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionIdentity, StaticCallerResolver};
-    use authority_core::capability::SubjectId;
+    use super::{
+        CgroupHandle, CleanupStep, ConnectionIdentity, ControlFdHandle, MountHandle,
+        OperationFailure, ResourceAcquisition, ResourceError, ResourceFailure, ResourceMutation,
+        RuntimeResources, SetupStep, StaticCallerResolver, Supervisor, SupervisorError,
+        WorkloadHandle,
+    };
+    use authority_core::{
+        capability::{AuthorityBody, IssuerId, SubjectId},
+        file::{FileAuthority, FileEffect, FileEffects},
+        handle::{HandleId, ObjectId},
+        kernel::CapabilityKernel,
+        path::{CanonicalPath, PathPattern},
+        repository::RepoId,
+        state::{CapabilityState, StaticAuthorityEnvelope, Subject},
+        time::{MonotonicTime, TimeWindow},
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestFault {
+        StartNoEffect,
+        CgroupEffectUnknown,
+        HandleOpenEffectUnknown,
+        HandleCloseEffectUnknown,
+    }
+
+    #[derive(Debug, Default)]
+    struct TestResources {
+        events: Vec<&'static str>,
+        faults: Vec<TestFault>,
+        next_token: u64,
+    }
+
+    impl TestResources {
+        fn token(&mut self) -> u64 {
+            self.next_token += 1;
+            self.next_token
+        }
+
+        fn take_fault(&mut self, fault: TestFault) -> bool {
+            self.faults
+                .iter()
+                .position(|candidate| *candidate == fault)
+                .is_some_and(|index| {
+                    self.faults.remove(index);
+                    true
+                })
+        }
+    }
+
+    impl RuntimeResources for TestResources {
+        type Error = ResourceError;
+
+        fn create_cgroup(
+            &mut self,
+            _subject: &SubjectId,
+        ) -> ResourceAcquisition<CgroupHandle, Self::Error> {
+            self.events.push("create_cgroup");
+            if self.take_fault(TestFault::CgroupEffectUnknown) {
+                ResourceAcquisition::EffectUnknown(ResourceError(
+                    "cgroup creation completion was not observed".to_owned(),
+                ))
+            } else {
+                ResourceAcquisition::Acquired(CgroupHandle::new(self.token()))
+            }
+        }
+
+        fn remove_cgroup(&mut self, _cgroup: CgroupHandle) -> ResourceMutation<Self::Error> {
+            self.events.push("remove_cgroup");
+            ResourceMutation::Applied
+        }
+
+        fn mount_capfs(
+            &mut self,
+            _subject: &SubjectId,
+        ) -> ResourceAcquisition<MountHandle, Self::Error> {
+            self.events.push("mount");
+            ResourceAcquisition::Acquired(MountHandle::new(self.token()))
+        }
+
+        fn unmount_capfs(&mut self, _mount: MountHandle) -> ResourceMutation<Self::Error> {
+            self.events.push("unmount");
+            ResourceMutation::Applied
+        }
+
+        fn open_control_fd(
+            &mut self,
+            _subject: &SubjectId,
+        ) -> ResourceAcquisition<ControlFdHandle, Self::Error> {
+            self.events.push("open_control");
+            ResourceAcquisition::Acquired(ControlFdHandle::new(self.token()))
+        }
+
+        fn close_control_fd(&mut self, _control: ControlFdHandle) -> ResourceMutation<Self::Error> {
+            self.events.push("close_control");
+            ResourceMutation::Applied
+        }
+
+        fn start_workload(
+            &mut self,
+            _subject: &SubjectId,
+            _cgroup: CgroupHandle,
+            _mount: MountHandle,
+            _control: ControlFdHandle,
+        ) -> ResourceAcquisition<WorkloadHandle, Self::Error> {
+            self.events.push("start_workload");
+            if self.take_fault(TestFault::StartNoEffect) {
+                ResourceAcquisition::NoEffect(ResourceError(
+                    "start failed before spawning".to_owned(),
+                ))
+            } else {
+                ResourceAcquisition::Acquired(WorkloadHandle::new(self.token()))
+            }
+        }
+
+        fn stop_workload(
+            &mut self,
+            _workload: WorkloadHandle,
+            _cgroup: CgroupHandle,
+        ) -> ResourceMutation<Self::Error> {
+            self.events.push("stop_workload");
+            ResourceMutation::Applied
+        }
+
+        fn open_handle(
+            &mut self,
+            _subject: &SubjectId,
+            _handle: &HandleId,
+        ) -> ResourceMutation<Self::Error> {
+            self.events.push("open_handle");
+            if self.take_fault(TestFault::HandleOpenEffectUnknown) {
+                ResourceMutation::EffectUnknown(ResourceError(
+                    "open completion was not observed".to_owned(),
+                ))
+            } else {
+                ResourceMutation::Applied
+            }
+        }
+
+        fn close_handle(
+            &mut self,
+            _subject: &SubjectId,
+            _handle: &HandleId,
+        ) -> ResourceMutation<Self::Error> {
+            self.events.push("close_handle");
+            if self.take_fault(TestFault::HandleCloseEffectUnknown) {
+                ResourceMutation::EffectUnknown(ResourceError(
+                    "close completion was not observed".to_owned(),
+                ))
+            } else {
+                ResourceMutation::Applied
+            }
+        }
+    }
+
+    fn envelope() -> StaticAuthorityEnvelope {
+        let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+            .expect("test validity must be non-empty");
+        StaticAuthorityEnvelope::new(
+            validity,
+            AuthorityBody::File(FileAuthority::new(
+                RepoId::new("workspace"),
+                FileEffects::only(FileEffect::ReadData),
+                PathPattern::Prefix(CanonicalPath::root()),
+            )),
+        )
+    }
+
+    fn kernel() -> CapabilityKernel {
+        CapabilityKernel::new(CapabilityState::new(IssuerId::new("test-session")))
+    }
 
     #[test]
     fn static_caller_binding_rejects_rebinding() {
@@ -1327,5 +1831,158 @@ mod tests {
             resolver.bind(identity, SubjectId::new("subject-b")),
             Err(SubjectId::new("subject-b"))
         );
+    }
+
+    #[test]
+    fn constructor_rejects_a_prepopulated_kernel() {
+        let kernel = kernel();
+        kernel
+            .register_subject(Subject::new(SubjectId::new("existing"), envelope()))
+            .expect("prepopulation must succeed");
+
+        let result = Supervisor::new(
+            kernel,
+            TestResources::default(),
+            StaticCallerResolver::new(),
+        );
+
+        assert!(matches!(result, Err(SupervisorError::KernelNotPristine)));
+    }
+
+    #[test]
+    fn registered_create_failure_permanently_reserves_subject_id() {
+        let identity = ConnectionIdentity::new(11, 111, 1000, 1000);
+        let subject_id = SubjectId::new("failed-after-registration");
+        let mut callers = StaticCallerResolver::new();
+        callers
+            .bind(identity, subject_id.clone())
+            .expect("caller binding must be unique");
+        let resources = TestResources {
+            faults: vec![TestFault::StartNoEffect],
+            ..TestResources::default()
+        };
+        let mut supervisor =
+            Supervisor::new(kernel(), resources, callers).expect("pristine kernel must initialize");
+
+        let first =
+            supervisor.create_subject(Subject::new(subject_id.clone(), envelope()), identity);
+        assert!(matches!(
+            first,
+            Err(SupervisorError::SetupFailed {
+                step: SetupStep::StartWorkload,
+                primary: OperationFailure::Resource(ResourceFailure::NoEffect(_)),
+                rollback,
+                ..
+            }) if rollback.is_empty()
+        ));
+        let events_after_rollback = supervisor.resources().events.clone();
+
+        assert!(matches!(
+            supervisor.create_subject(Subject::new(subject_id.clone(), envelope()), identity),
+            Err(SupervisorError::DuplicateSubject(duplicate)) if duplicate == subject_id
+        ));
+        assert_eq!(supervisor.resources().events, events_after_rollback);
+    }
+
+    #[test]
+    fn partial_open_cleanup_is_retained_and_retried_by_shutdown() {
+        let identity = ConnectionIdentity::new(12, 112, 1000, 1000);
+        let subject_id = SubjectId::new("partial-open-owner");
+        let mut callers = StaticCallerResolver::new();
+        callers
+            .bind(identity, subject_id.clone())
+            .expect("caller binding must be unique");
+        let resources = TestResources {
+            faults: vec![
+                TestFault::HandleOpenEffectUnknown,
+                TestFault::HandleCloseEffectUnknown,
+            ],
+            ..TestResources::default()
+        };
+        let mut supervisor =
+            Supervisor::new(kernel(), resources, callers).expect("pristine kernel must initialize");
+        supervisor
+            .create_subject(Subject::new(subject_id.clone(), envelope()), identity)
+            .expect("subject setup must succeed");
+        let handle = HandleId::new("partial-open");
+
+        let error = supervisor
+            .open_handle(&identity, handle.clone(), ObjectId::new("object"))
+            .expect_err("unknown open and rollback effects must fail closed");
+        assert!(matches!(
+            error,
+            SupervisorError::SetupFailed {
+                step: SetupStep::OpenHandle,
+                primary: OperationFailure::Resource(ResourceFailure::EffectUnknown(_)),
+                rollback,
+                ..
+            } if matches!(
+                rollback.as_slice(),
+                [super::CleanupFailure {
+                    step: CleanupStep::CloseHandle,
+                    cause: OperationFailure::Resource(ResourceFailure::EffectUnknown(_)),
+                }]
+            )
+        ));
+        assert!(matches!(
+            supervisor.open_handle(&identity, handle, ObjectId::new("replacement")),
+            Err(SupervisorError::SubjectClosing(_))
+        ));
+
+        supervisor
+            .shutdown_subject(&subject_id)
+            .expect("shutdown must retry and finish partial-open cleanup");
+        assert_eq!(
+            supervisor
+                .resources()
+                .events
+                .iter()
+                .filter(|event| **event == "close_handle")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn unknown_token_acquisition_is_explicitly_fail_stopped() {
+        let identity = ConnectionIdentity::new(13, 113, 1000, 1000);
+        let subject_id = SubjectId::new("unknown-cgroup-owner");
+        let mut callers = StaticCallerResolver::new();
+        callers
+            .bind(identity, subject_id.clone())
+            .expect("caller binding must be unique");
+        let resources = TestResources {
+            faults: vec![TestFault::CgroupEffectUnknown],
+            ..TestResources::default()
+        };
+        let mut supervisor =
+            Supervisor::new(kernel(), resources, callers).expect("pristine kernel must initialize");
+
+        let setup = supervisor
+            .create_subject(Subject::new(subject_id.clone(), envelope()), identity)
+            .expect_err("unknown acquisition effect must fail setup");
+        assert!(matches!(
+            setup,
+            SupervisorError::SetupFailed {
+                step: SetupStep::CreateCgroup,
+                primary: OperationFailure::Resource(ResourceFailure::EffectUnknown(_)),
+                rollback,
+                ..
+            } if matches!(
+                rollback.as_slice(),
+                [super::CleanupFailure {
+                    step: CleanupStep::RemoveCgroup,
+                    cause: OperationFailure::UnresolvedEffect,
+                }]
+            )
+        ));
+
+        assert!(matches!(
+            supervisor.shutdown_subject(&subject_id),
+            Err(SupervisorError::CleanupBlocked { failures, .. })
+                if failures.iter().any(|failure| {
+                    matches!(failure.cause, OperationFailure::UnresolvedEffect)
+                })
+        ));
     }
 }

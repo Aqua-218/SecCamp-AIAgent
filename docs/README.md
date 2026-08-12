@@ -8,6 +8,55 @@
 
 **mock test の成功を、実機動作の根拠にしない。** コードと API が存在すること、mock / contract test が通ること、特権操作や外部サービスを含む実機検証を行ったことは、各 crate の検証対応表で区別して書く。VM 実起動と full isolation はまだ達成していない。
 
+## 文書の地図
+
+```mermaid
+flowchart TB
+    start(["読み始める"])
+
+    subgraph cross["横断"]
+        direction LR
+        gloss["用語集"]
+        adr["決定記録"]
+        conv["文書規約"]
+    end
+
+    subgraph design["設計（なぜこの構造か）"]
+        direction LR
+        arch["全体アーキテクチャ"]
+        threat["脅威モデル"]
+        model["Capability モデル"]
+    end
+
+    subgraph impl["実装（今どうなっているか）"]
+        direction LR
+        idx["各 crate の索引"]
+        concept["概念ページ"]
+        contract["契約ページ"]
+        verif["検証対応表"]
+    end
+
+    start --> arch
+    arch --> threat
+    threat --> model
+    model --> idx
+    idx --> concept
+    idx --> contract
+    idx --> verif
+    start -.->|"語の意味が分からない"| gloss
+    start -.->|"なぜ別案を採らなかったか"| adr
+    concept -.-> adr
+    verif ==>|"動くのか を判断するときは<br/>ここの 未検証の境界 を先に読む"| start
+    conv -.->|"新しく書くとき"| impl
+
+    classDef host fill:#1565c0,color:#fff,stroke:#0d47a1;
+    classDef seam fill:#6a1b9a,color:#fff,stroke:#4a148c;
+    classDef external fill:#616161,color:#fff,stroke:#424242;
+    class arch,threat,model host;
+    class idx,concept,contract,verif seam;
+    class gloss,adr,conv external;
+```
+
 ## 横断文書
 
 | 文書 | 内容 |

@@ -26,8 +26,9 @@ use firecracker_runtime::{
     Sha256Digest, Snapshot, VsockConfig, WorkspaceConfig, sha256,
 };
 use session_orchestrator::{
-    CryptographicRandom, EntropyError, SessionOrchestrator, SnapshotDescriptor, SnapshotId,
-    SubjectId as OrchestratedSubjectId, WorkspaceTemplateId,
+    CleanupStage, CryptographicRandom, EntropyError, LifecycleState, SessionOrchestrator,
+    SnapshotDescriptor, SnapshotId, StartStage, SubjectId as OrchestratedSubjectId, VmBackend,
+    WorkspaceTemplateId,
     authority_backend::{AuthorityCoreBackend, AuthorityRootGrant},
     egress_backend::{BrokerBackend, VsockListenerFactory},
     firecracker_backend::FirecrackerBackendFactory,
@@ -71,6 +72,8 @@ impl FileSystem for TestFileSystem {
 #[derive(Default)]
 struct TestRunner {
     next_pid: u32,
+    stop_failures: VecDeque<bool>,
+    stop_attempts: Arc<AtomicUsize>,
 }
 
 impl CommandRunner for TestRunner {
@@ -88,6 +91,12 @@ impl CommandRunner for TestRunner {
     }
 
     fn stop(&mut self, _process: ProcessHandle) -> Result<(), RuntimeError> {
+        self.stop_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.stop_failures.pop_front().unwrap_or(false) {
+            return Err(RuntimeError::Command(
+                "test process stop failure".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -95,6 +104,7 @@ impl CommandRunner for TestRunner {
 #[derive(Clone, Default)]
 struct TestApi {
     requests: Arc<Mutex<Vec<ApiRequest>>>,
+    failures: Arc<Mutex<VecDeque<bool>>>,
 }
 
 impl ApiClient for TestApi {
@@ -103,6 +113,15 @@ impl ApiClient for TestApi {
             .lock()
             .expect("API log must not be poisoned")
             .push(request.clone());
+        if self
+            .failures
+            .lock()
+            .expect("API failure sequence must not be poisoned")
+            .pop_front()
+            .unwrap_or(false)
+        {
+            return Err(RuntimeError::Api("test restore API failure".to_owned()));
+        }
         Ok(ApiResponse {
             status: 200,
             body: String::new(),
@@ -157,6 +176,43 @@ impl VsockListenerFactory for ListenerFactory {
             drops: Arc::clone(&self.drops),
         })
     }
+}
+
+fn test_broker(
+    binds: &Arc<AtomicUsize>,
+    drops: &Arc<AtomicUsize>,
+) -> BrokerBackend<ListenerFactory> {
+    BrokerBackend::new(
+        ListenerFactory {
+            binds: Arc::clone(binds),
+            drops: Arc::clone(drops),
+        },
+        2,
+        3,
+        9000,
+        16,
+    )
+    .expect("test broker configuration must be valid")
+}
+
+fn cloned_workspace(fs_log: &FsLog) -> PathBuf {
+    fs_log
+        .clones
+        .lock()
+        .expect("filesystem log must not be poisoned")[0]
+        .1
+        .clone()
+}
+
+fn assert_workspace_removals(fs_log: &FsLog, expected: &[PathBuf]) {
+    assert_eq!(
+        fs_log
+            .removals
+            .lock()
+            .expect("filesystem log must not be poisoned")
+            .as_slice(),
+        expected
+    );
 }
 
 fn artifact(path: &str) -> PinnedArtifact {
@@ -300,17 +356,7 @@ fn production_adapters_preserve_exact_bindings_through_start_and_stop() {
 
     let binds = Arc::new(AtomicUsize::new(0));
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut broker = BrokerBackend::new(
-        ListenerFactory {
-            binds: Arc::clone(&binds),
-            drops: Arc::clone(&drops),
-        },
-        2,
-        3,
-        9000,
-        16,
-    )
-    .expect("test broker configuration must be valid");
+    let mut broker = test_broker(&binds, &drops);
     let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
         "host",
     ))));
@@ -371,4 +417,105 @@ fn production_adapters_preserve_exact_bindings_through_start_and_stop() {
         ))]
     );
     assert_subject_closed(&kernel, identity.subject_id());
+}
+
+#[test]
+fn failed_firecracker_restore_cleanup_is_retried_by_orchestrator_stop() {
+    let fs_log = FsLog::default();
+    let template = WorkspaceTemplateId::new("template");
+    let (mut workspace, runtime_filesystem) = new_firecracker_workspace_adapters(
+        TestFileSystem {
+            log: fs_log.clone(),
+        },
+        template.clone(),
+        "/test/source",
+        "/test/clones",
+    );
+    let stop_attempts = Arc::new(AtomicUsize::new(0));
+    let api = TestApi {
+        failures: Arc::new(Mutex::new(VecDeque::from([true]))),
+        ..TestApi::default()
+    };
+    let api_log = Arc::clone(&api.requests);
+    let config = runtime_config();
+    let runtime = Runtime::new(
+        TestRunner {
+            next_pid: 0,
+            stop_failures: VecDeque::from([true, true, false]),
+            stop_attempts: Arc::clone(&stop_attempts),
+        },
+        runtime_filesystem,
+        api.clone(),
+        api,
+        UnusedIdentitySource,
+    );
+    let snapshot_id = SnapshotId::new([0x91; 16]);
+    let snapshot = Snapshot::new(
+        "/test/snapshot",
+        "/test/memory",
+        config_fingerprint(&config),
+        Vec::new(),
+    );
+    let (mut vm, mut workload) =
+        FirecrackerBackendFactory::new(runtime, config, snapshot, snapshot_id).into_handles();
+
+    let binds = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut broker = test_broker(&binds, &drops);
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "host",
+    ))));
+    let mut capability = AuthorityCoreBackend::new(kernel);
+    let mut orchestrator = SessionOrchestrator::new(SequenceRandom {
+        values: (1_u8..=7).map(|byte| [byte; 16]).collect(),
+    });
+
+    let error = orchestrator
+        .start_session(
+            &SnapshotDescriptor::clean(snapshot_id),
+            &template,
+            &authority_grant(),
+            &mut workspace,
+            &mut broker,
+            &mut vm,
+            &mut capability,
+            &mut workload,
+        )
+        .expect_err("restore and its immediate cleanup must fail");
+
+    assert_eq!(error.stage(), StartStage::VmStart);
+    assert!(error.to_string().contains("test restore API failure"));
+    assert_eq!(error.rollback_failures().len(), 1);
+    assert_eq!(error.rollback_failures()[0].stage(), CleanupStage::VmKill);
+    assert_eq!(orchestrator.state(), LifecycleState::Stopping);
+    assert_eq!(stop_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(binds.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        api_log
+            .lock()
+            .expect("API log must not be poisoned")
+            .iter()
+            .filter(|request| request.path == "/snapshot/load")
+            .count(),
+        1
+    );
+    assert_workspace_removals(&fs_log, &[]);
+    let cloned_workspace = cloned_workspace(&fs_log);
+
+    orchestrator
+        .stop_session(&mut workspace, &mut broker, &mut vm, &mut capability)
+        .expect("stop must retry retained Firecracker startup cleanup");
+
+    assert_eq!(orchestrator.state(), LifecycleState::Closed);
+    assert_eq!(stop_attempts.load(Ordering::SeqCst), 3);
+    assert_workspace_removals(&fs_log, &[cloned_workspace]);
+
+    vm.cleanup_failed_start()
+        .expect("Runtime must have no pending cleanup after stop");
+    assert_eq!(
+        stop_attempts.load(Ordering::SeqCst),
+        3,
+        "checking completed cleanup must not retry the process stop"
+    );
 }

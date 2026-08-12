@@ -72,7 +72,7 @@ where
         frame: &ControlFrame,
         context: &DispatchContext,
     ) -> Result<BrokerResponse, DispatchError> {
-        self.dispatch_frame(&frame.encode(), context)
+        self.dispatch_control_frame(frame, context)
     }
 }
 

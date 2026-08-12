@@ -280,6 +280,26 @@ where
         context: &DispatchContext,
     ) -> Result<BrokerResponse, DispatchError> {
         let frame = ControlFrame::decode_complete(encoded_frame).map_err(DispatchError::Frame)?;
+        self.dispatch_control_frame(&frame, context)
+    }
+
+    /// Dispatches a frame the transport already bounded and validated.
+    ///
+    /// Callers that hold a [`ControlFrame`] use this rather than re-encoding it
+    /// for [`Self::dispatch_frame`]: that round trip copies up to 1 MiB twice
+    /// and routes the production path through `decode_complete`, which is meant
+    /// for buffered inputs and does not reproduce the transport's
+    /// check-before-allocate order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError`] when canonical decoding or session replay
+    /// admission fails before a cacheable outcome exists.
+    pub fn dispatch_control_frame(
+        &mut self,
+        frame: &ControlFrame,
+        context: &DispatchContext,
+    ) -> Result<BrokerResponse, DispatchError> {
         let request =
             CanonicalBrokerRequest::decode(frame.payload()).map_err(DispatchError::Cbor)?;
         let envelope = request.envelope();
@@ -340,7 +360,7 @@ where
         let frame = transport
             .read_frame()
             .map_err(TransportDispatchError::Transport)?;
-        self.dispatch_frame(&frame.encode(), context)
+        self.dispatch_control_frame(&frame, context)
             .map_err(TransportDispatchError::Dispatch)
     }
 

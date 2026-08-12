@@ -586,10 +586,15 @@ mod tests {
             {
                 return Err(RuntimeError::Api("test API failure".to_owned()));
             }
-            Ok(ApiResponse {
-                status: 200,
-                body: String::new(),
-            })
+            let body = match request.path.as_str() {
+                "/actions/inject-identity" => Some("identity-injected"),
+                "/actions/start-workload" => Some("workload-started"),
+                _ => None,
+            }
+            .map_or_else(String::new, |acknowledgement| {
+                format!("{{\"ack\":\"{acknowledgement}\",{}", &request.body[1..])
+            });
+            Ok(ApiResponse { status: 200, body })
         }
 
         fn verify_restore_resources(
@@ -874,17 +879,28 @@ mod tests {
         let injection = requests
             .iter()
             .find(|request| request.path == "/actions/inject-identity")
-            .expect("identity injection request should be sent");
+            .expect("identity injection request should follow explicit resume");
         assert_eq!(
             injection.body,
             format!(
-                "{{\"vm_id\":\"{}\",\"session_id\":\"{}\",\"request_id\":\"{}\",\"subject_id\":\"{}\",\"capability_id\":\"{}\"}}",
+                "{{\"challenge\":\"{}\",\"vm_id\":\"{}\",\"session_id\":\"{}\",\"request_id\":\"{}\",\"subject_id\":\"{}\",\"capability_id\":\"{}\"}}",
+                injection
+                    .body
+                    .split('"')
+                    .nth(3)
+                    .expect("canonical request includes a challenge"),
                 bundle.vm_id.to_hex(),
                 bundle.session_id.to_hex(),
                 bundle.request_id.to_hex(),
                 bundle.subject_id.to_hex(),
                 bundle.capability_id.to_hex(),
             )
+        );
+        assert!(
+            requests.iter().position(|request| request.path == "/vm")
+                < requests
+                    .iter()
+                    .position(|request| request.path == "/actions/inject-identity")
         );
         assert!(
             requests

@@ -134,6 +134,13 @@ pub enum DurableAuditError {
     LockPoisoned,
     /// A previous write or sync failed, so this log stays unusable.
     JournalUnavailable,
+    /// Appending this frame would push the journal past its size ceiling.
+    JournalFull {
+        /// Byte length the journal would reach.
+        length: u64,
+        /// Maximum byte length this crate will reopen.
+        max_length: u64,
+    },
     /// The file header does not identify this journal format.
     InvalidMagic,
     /// The file uses a format version this crate cannot validate.
@@ -172,6 +179,10 @@ impl fmt::Display for DurableAuditError {
                 write!(formatter, "durable audit IO error ({kind}): {message}")
             }
             Self::LockPoisoned => formatter.write_str("durable audit lock is poisoned"),
+            Self::JournalFull { length, max_length } => write!(
+                formatter,
+                "durable audit journal would reach {length} bytes, above the {max_length} byte ceiling"
+            ),
             Self::JournalUnavailable => formatter.write_str("durable audit journal is unavailable"),
             Self::InvalidMagic => {
                 formatter.write_str("durable audit journal has an invalid magic header")
@@ -256,6 +267,10 @@ struct DurableState {
     next_sequence: Option<u64>,
     attempts: BTreeMap<crate::audit::AttemptId, DurableAttemptState>,
     unusable: bool,
+    /// Bytes currently on disk. Tracked so an append can refuse to grow the
+    /// journal past the ceiling that `open` enforces; without it a running
+    /// process writes a file it can never reopen.
+    length: u64,
 }
 
 /// A process-local, single-writer WAL for authorization audit records.
@@ -291,6 +306,7 @@ impl DurableAuditLog {
                 next_sequence: Some(0),
                 attempts: BTreeMap::new(),
                 unusable: false,
+                length: 0,
             })),
             path,
         })
@@ -333,6 +349,7 @@ impl DurableAuditLog {
                 next_sequence,
                 attempts,
                 unusable: false,
+                length: file_length,
             })),
             path,
         })
@@ -491,6 +508,22 @@ fn append_frame(
     if payload.len() > MAX_RECORD_PAYLOAD {
         return Err(DurableAuditError::RecordTooLarge(payload.len()));
     }
+    let frame_length = u64::try_from(HEADER_LEN + payload.len() + CHECKSUM_LEN)
+        .map_err(|_| DurableAuditError::RecordTooLarge(payload.len()))?;
+    let new_length =
+        state
+            .length
+            .checked_add(frame_length)
+            .ok_or(DurableAuditError::JournalFull {
+                length: u64::MAX,
+                max_length: MAX_JOURNAL_BYTES,
+            })?;
+    if new_length > MAX_JOURNAL_BYTES {
+        return Err(DurableAuditError::JournalFull {
+            length: new_length,
+            max_length: MAX_JOURNAL_BYTES,
+        });
+    }
     let payload_length = u32::try_from(payload.len())
         .map_err(|_| DurableAuditError::RecordTooLarge(payload.len()))?;
     let mut frame = Vec::with_capacity(
@@ -518,6 +551,7 @@ fn append_frame(
         state.unusable = true;
         return Err(DurableAuditError::from(error));
     }
+    state.length = new_length;
     Ok(())
 }
 

@@ -578,10 +578,15 @@ where
     match (operation, capability.authority()) {
         (BrokerOperation::PublicFetch(request), AuthorityBody::HttpFetch(authority)) => {
             match public_fetch.fetch(request, authority) {
-                Ok(response) => EffectExecution::Committed {
-                    value: BrokerEffect::Public(response),
-                    receipt: None,
-                },
+                Ok(response) if response.validate_dispatch(request, authority) => {
+                    EffectExecution::Committed {
+                        value: BrokerEffect::Public(response),
+                        receipt: None,
+                    }
+                }
+                Ok(_) => EffectExecution::FailedBeforeCommit(AdapterError::Public(
+                    FetchError::InvalidResponse,
+                )),
                 Err(error) => EffectExecution::FailedBeforeCommit(AdapterError::Public(error)),
             }
         }

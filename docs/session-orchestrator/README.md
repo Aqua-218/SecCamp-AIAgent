@@ -8,6 +8,14 @@
 
 `session-orchestrator` は、隔離された一つの agent session のホスト側 lifecycle state machine である。resource の確保順序と identity binding を所有し、Authority Core、Broker listener、Firecracker runtime、workspace の production adapter を提供する。FUSE mount、provider request、特権 isolation の具体的な副作用は、それぞれの専用 adapter が所有する。
 
+## 文書一覧
+
+| 文書 | 対象ソース | 内容 |
+|---|---|---|
+| [production backend 契約](contracts.md) | [`authority_backend.rs`](../../crates/session-orchestrator/src/authority_backend.rs) ほか | adapter 実装者の義務、lease の返し方、順序 |
+
+`lib.rs` は 2,361 行あり、state machine、identity ledger、durable ledger を 1 file に持つ。以下の節はその要約で、それぞれ独立した概念ページに分ける予定。
+
 ## lifecycle
 
 startup は次の commit 順で進む。

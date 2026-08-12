@@ -1,0 +1,745 @@
+//! Firecracker runtime contract tests.
+//!
+//! Specification references: `docs/design/runtime-isolation.md` (Firecracker role and
+//! snapshot ordering), `docs/design/implementation-plan.md` (Phase 6), and the user
+//! Phase 6 completion contract.  The mocks expose observable boundary order so tests
+//! remain independent of the implementation's private data structures.
+
+use firecracker_runtime::{
+    ApiClient, ApiRequest, ApiResponse, CgroupConfig, CommandOutput, CommandRunner, CommandSpec,
+    DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, IdentityId, IdentitySource,
+    MAX_COMMAND_OUTPUT_BYTES, MAX_HTTP_BODY_BYTES, NamespaceConfig, PinnedArtifact, ProcessHandle,
+    RealCommandRunner, Runtime, RuntimeConfig, RuntimeError, RuntimeState, SeccompConfig,
+    Sha256Digest, Snapshot, VsockConfig, WorkspaceConfig, sha256,
+};
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::Duration;
+
+type Events = Rc<RefCell<Vec<String>>>;
+
+#[derive(Clone)]
+struct MockRunner {
+    events: Events,
+    next_pid: u32,
+}
+
+impl MockRunner {
+    fn new(events: Events) -> Self {
+        Self {
+            events,
+            next_pid: 100,
+        }
+    }
+}
+
+impl CommandRunner for MockRunner {
+    fn run(&mut self, command: &CommandSpec) -> Result<CommandOutput, RuntimeError> {
+        self.events.borrow_mut().push(format!(
+            "command:run:{} {}",
+            command.program.display(),
+            command.args.join(" ")
+        ));
+        Ok(CommandOutput {
+            status: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    }
+
+    fn start(&mut self, command: &CommandSpec) -> Result<ProcessHandle, RuntimeError> {
+        self.events.borrow_mut().push(format!(
+            "command:start:{} {}",
+            command.program.display(),
+            command.args.join(" ")
+        ));
+        let process = ProcessHandle { pid: self.next_pid };
+        self.next_pid += 1;
+        Ok(process)
+    }
+
+    fn stop(&mut self, process: ProcessHandle) -> Result<(), RuntimeError> {
+        self.events
+            .borrow_mut()
+            .push(format!("command:stop:{}", process.pid));
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct MockFileSystem {
+    events: Events,
+    artifacts: HashMap<PathBuf, Vec<u8>>,
+    fail_clone: bool,
+}
+
+impl FileSystem for MockFileSystem {
+    fn read(&mut self, path: &Path) -> Result<Vec<u8>, RuntimeError> {
+        self.artifacts
+            .get(path)
+            .cloned()
+            .ok_or_else(|| RuntimeError::Io(format!("missing mock artifact {}", path.display())))
+    }
+
+    fn clone_workspace(&mut self, source: &Path, destination: &Path) -> Result<(), RuntimeError> {
+        self.events.borrow_mut().push(format!(
+            "filesystem:clone:{}:{}",
+            source.display(),
+            destination.display()
+        ));
+        if self.fail_clone {
+            return Err(RuntimeError::Io(
+                "mock clone failed after destination preparation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_workspace(&mut self, path: &Path) -> Result<(), RuntimeError> {
+        self.events
+            .borrow_mut()
+            .push(format!("filesystem:remove:{}", path.display()));
+        Ok(())
+    }
+}
+
+struct MockApi {
+    events: Events,
+    statuses: VecDeque<u16>,
+}
+
+impl MockApi {
+    fn new(events: Events, statuses: impl IntoIterator<Item = u16>) -> Self {
+        Self {
+            events,
+            statuses: statuses.into_iter().collect(),
+        }
+    }
+}
+
+impl ApiClient for MockApi {
+    fn request(&mut self, request: &ApiRequest) -> Result<ApiResponse, RuntimeError> {
+        self.events
+            .borrow_mut()
+            .push(format!("api:{}:{}", request.path, request.body));
+        Ok(ApiResponse {
+            status: self.statuses.pop_front().unwrap_or(200),
+            body: String::new(),
+        })
+    }
+}
+
+struct MockIdentitySource {
+    ids: VecDeque<IdentityId>,
+}
+
+impl MockIdentitySource {
+    fn sequential() -> Self {
+        let ids = (1..=15)
+            .map(|number| {
+                IdentityId::from_hex(&format!("{number:032x}"))
+                    .expect("test identity must be non-zero and correctly encoded")
+            })
+            .collect();
+        Self { ids }
+    }
+
+    fn from_ids(ids: impl IntoIterator<Item = IdentityId>) -> Self {
+        Self {
+            ids: ids.into_iter().collect(),
+        }
+    }
+}
+
+impl IdentitySource for MockIdentitySource {
+    fn generate(&mut self) -> Result<IdentityId, RuntimeError> {
+        self.ids.pop_front().ok_or_else(|| {
+            RuntimeError::InvalidIdentity("mock identity source exhausted".to_owned())
+        })
+    }
+}
+
+fn artifact(path: &str, label: &str) -> PinnedArtifact {
+    PinnedArtifact::new(PathBuf::from(path), sha256(label.as_bytes()))
+}
+
+fn config() -> RuntimeConfig {
+    let rootfs = artifact("/artifacts/rootfs.img", "rootfs");
+    RuntimeConfig {
+        firecracker: artifact("/artifacts/firecracker", "firecracker"),
+        kernel: artifact("/artifacts/vmlinux-6.1", "kernel"),
+        rootfs: rootfs.clone(),
+        verity_hash: artifact("/artifacts/rootfs.verity", "verity-hash"),
+        dm_verity: DmVerityConfig {
+            data_device: rootfs.path.clone(),
+            hash_device: PathBuf::from("/artifacts/rootfs.verity"),
+            mapper_name: "rootfs-verity".to_owned(),
+            root_hash: sha256(b"verity-root-hash"),
+        },
+        workspace: WorkspaceConfig {
+            source: PathBuf::from("/workspace/source"),
+            clone_root: PathBuf::from("/workspace/clones"),
+            clone_id: "clone-a".to_owned(),
+        },
+        jailer: artifact("/artifacts/jailer", "jailer"),
+        api_socket: PathBuf::from("/run/luna/firecracker.sock"),
+        isolation: HostIsolationConfig {
+            namespaces: NamespaceConfig {
+                user: true,
+                pid: true,
+                mount: true,
+                network: true,
+                ipc: true,
+                uts: true,
+            },
+            cgroup: CgroupConfig {
+                path: PathBuf::from("/sys/fs/cgroup/luna/clone-a"),
+                memory_max_bytes: 256 * 1024 * 1024,
+                cpu_quota_micros: 100_000,
+            },
+            seccomp: SeccompConfig {
+                filter: artifact("/artifacts/seccomp.json", "seccomp"),
+                blocked_syscalls: [
+                    "bpf",
+                    "connect",
+                    "mount",
+                    "perf_event_open",
+                    "ptrace",
+                    "setns",
+                    "socket",
+                    "unshare",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            },
+        },
+        vsock: VsockConfig {
+            guest_cid: 42,
+            uds_path: PathBuf::from("/run/luna/vsock.sock"),
+        },
+        network_devices: Vec::new(),
+        vcpu_count: 2,
+        memory_mib: 256,
+        boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_owned(),
+    }
+}
+
+fn filesystem_for(config: &RuntimeConfig, events: Events) -> MockFileSystem {
+    let mut artifacts = HashMap::new();
+    for (path, bytes) in [
+        (&config.firecracker.path, b"firecracker".as_slice()),
+        (&config.kernel.path, b"kernel".as_slice()),
+        (&config.rootfs.path, b"rootfs".as_slice()),
+        (&config.verity_hash.path, b"verity-hash".as_slice()),
+        (&config.jailer.path, b"jailer".as_slice()),
+        (&config.isolation.seccomp.filter.path, b"seccomp".as_slice()),
+    ] {
+        artifacts.insert(path.clone(), bytes.to_vec());
+    }
+    MockFileSystem {
+        events,
+        artifacts,
+        fail_clone: false,
+    }
+}
+
+fn runtime(
+    config: &RuntimeConfig,
+    statuses: impl IntoIterator<Item = u16>,
+) -> (
+    Runtime<MockRunner, MockFileSystem, MockApi, MockApi, MockIdentitySource>,
+    Events,
+) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let filesystem = filesystem_for(config, Rc::clone(&events));
+    (
+        Runtime::new(
+            MockRunner::new(Rc::clone(&events)),
+            filesystem,
+            MockApi::new(Rc::clone(&events), statuses),
+            MockApi::new(Rc::clone(&events), std::iter::empty()),
+            MockIdentitySource::sequential(),
+        ),
+        events,
+    )
+}
+
+#[test]
+fn launch_valid_profile_configures_verity_vsock_and_jailer_without_network() {
+    // Requirement: Phase 6 must configure rootfs/workspace/vsock and never add virtio-net.
+    let config = config();
+    let (mut runtime, events) = runtime(&config, std::iter::empty());
+    let instance = runtime.launch(&config).expect("valid profile must launch");
+    assert_eq!(instance.state(), RuntimeState::WorkloadStopped);
+    let events = events.borrow();
+    assert!(events[0].starts_with("filesystem:clone:"));
+    assert!(events[1].starts_with("command:run:veritysetup open --readonly"));
+    assert!(events[2].contains("--new-user-ns"));
+    assert!(events.iter().any(|event| event.starts_with("api:/vsock:")));
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.contains("network-interface"))
+    );
+    assert!(events.iter().all(|event| !event.contains("eth0")));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.contains("/dev/mapper/rootfs-verity"))
+    );
+}
+
+#[test]
+fn digest_mismatch_is_rejected_before_any_side_effect() {
+    // Requirement: every executable and guest artifact must match its pinned digest.
+    let mut config = config();
+    config.kernel.digest = sha256(b"unexpected-kernel");
+    let (mut runtime, events) = runtime(&config, std::iter::empty());
+    let error = runtime
+        .launch(&config)
+        .expect_err("digest mismatch must fail closed");
+    assert!(
+        matches!(error, RuntimeError::ArtifactDigestMismatch { label, .. } if label == "kernel")
+    );
+    assert!(events.borrow().is_empty());
+}
+
+#[test]
+fn network_device_is_rejected_before_artifact_reads_or_launch() {
+    // Requirement: the standard profile has virtio-net disabled and rejects network config.
+    let mut config = config();
+    config.network_devices.push("eth0".to_owned());
+    let (mut runtime, events) = runtime(&config, std::iter::empty());
+    assert!(matches!(
+        runtime.launch(&config),
+        Err(RuntimeError::NetworkDeviceForbidden)
+    ));
+    assert!(events.borrow().is_empty());
+}
+
+#[test]
+fn api_error_rolls_back_process_verity_and_workspace_in_reverse_order() {
+    // Requirement: partial launch must rollback every completed side effect in reverse order.
+    let config = config();
+    let (mut runtime, events) = runtime(&config, [200, 503]);
+    let error = runtime
+        .launch(&config)
+        .expect_err("non-success API response must reject launch");
+    assert!(matches!(error, RuntimeError::ApiStatus { status: 503, .. }));
+    let events = events.borrow();
+    assert_eq!(events.len(), 8);
+    assert!(events[0].starts_with("filesystem:clone:"));
+    assert!(events[1].starts_with("command:run:veritysetup open"));
+    assert!(events[2].starts_with("command:start:"));
+    assert!(events[3].starts_with("api:/machine-config:"));
+    assert!(events[4].starts_with("api:/boot-source:"));
+    assert!(events[5].starts_with("command:stop:"));
+    assert!(events[6].starts_with("command:run:veritysetup close"));
+    assert!(events[7].starts_with("filesystem:remove:"));
+}
+
+#[test]
+fn workspace_clone_error_removes_partial_destination_without_starting_vm() {
+    // Requirement: a partially prepared clone must be removed before launch returns.
+    let config = config();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut filesystem = filesystem_for(&config, Rc::clone(&events));
+    filesystem.fail_clone = true;
+    let mut runtime = Runtime::new(
+        MockRunner::new(Rc::clone(&events)),
+        filesystem,
+        MockApi::new(Rc::clone(&events), std::iter::empty()),
+        MockApi::new(Rc::clone(&events), std::iter::empty()),
+        MockIdentitySource::sequential(),
+    );
+    let error = runtime
+        .launch(&config)
+        .expect_err("clone failure must reject launch");
+    assert!(matches!(error, RuntimeError::Io(message) if message.contains("mock clone failed")));
+    let events = events.borrow();
+    assert_eq!(events.len(), 2);
+    assert!(events[0].starts_with("filesystem:clone:"));
+    assert!(events[1].starts_with("filesystem:remove:"));
+}
+
+#[test]
+fn restore_regenerates_all_identities_and_gates_workload_until_injection() {
+    // Requirement: restore creates fresh VM/session/request/subject/capability IDs before workload start.
+    let config = config();
+    let (mut runtime, events) = runtime(&config, std::iter::empty());
+    let mut first = runtime.launch(&config).expect("baseline VM must launch");
+    let snapshot = runtime
+        .create_snapshot(&mut first, "/snapshots/state", "/snapshots/memory")
+        .expect("pre-session snapshot must succeed");
+    runtime
+        .shutdown(&mut first, &config)
+        .expect("baseline VM must clean up");
+    let mut restored = runtime
+        .restore(&config, &snapshot)
+        .expect("restore must succeed");
+    assert_eq!(restored.state(), RuntimeState::IdentityRegenerated);
+    let identities = restored
+        .identities()
+        .expect("restore must expose fresh identities");
+    let ids = [
+        identities.vm_id,
+        identities.session_id,
+        identities.request_id,
+        identities.subject_id,
+        identities.capability_id,
+    ];
+    assert_eq!(
+        ids.iter().collect::<std::collections::HashSet<_>>().len(),
+        5
+    );
+    assert_eq!(
+        runtime.start_workload(&mut restored),
+        Err(RuntimeError::InvalidState {
+            expected: "IdentityInjected".to_owned(),
+            actual: "IdentityRegenerated".to_owned(),
+        })
+    );
+    runtime
+        .inject_identity(&mut restored)
+        .expect("fresh identity injection must succeed");
+    runtime
+        .start_workload(&mut restored)
+        .expect("workload starts only after injection");
+    assert_eq!(restored.state(), RuntimeState::Running);
+    let events = events.borrow();
+    let inject_index = events
+        .iter()
+        .position(|event| event.starts_with("api:/actions/inject-identity:"))
+        .expect("identity injection API event must be present");
+    let start_index = events
+        .iter()
+        .position(|event| event.starts_with("api:/actions/start-workload:"))
+        .expect("workload start API event must be present");
+    assert!(inject_index < start_index);
+}
+
+#[test]
+fn stale_identity_is_rejected_and_restored_process_is_rolled_back() {
+    // Requirement: an identity copied from snapshot state must never be injected after restore.
+    let config = config();
+    let stale = IdentityId::from_hex("00000000000000000000000000000001")
+        .expect("test identity must be valid");
+    let snapshot = Snapshot::new(
+        "/snapshots/state",
+        "/snapshots/memory",
+        config_fingerprint(&config),
+        vec![stale],
+    );
+    let (mut runtime, events) = runtime(&config, std::iter::empty());
+    let error = runtime
+        .restore(&config, &snapshot)
+        .expect_err("stale identity must fail closed");
+    assert!(matches!(error, RuntimeError::StaleIdentity(_)));
+    let events = events.borrow();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("api:/snapshot/load:"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("command:stop:"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("command:run:veritysetup close"))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("filesystem:remove:"))
+    );
+}
+
+#[test]
+fn duplicate_identity_generation_is_rejected_as_stale() {
+    // Requirement: all five regenerated identity domains must be distinct.
+    let config = config();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let filesystem = filesystem_for(&config, Rc::clone(&events));
+    let duplicate = IdentityId::from_hex("00000000000000000000000000000001")
+        .expect("test identity must be valid");
+    let mut runtime = Runtime::new(
+        MockRunner::new(Rc::clone(&events)),
+        filesystem,
+        MockApi::new(Rc::clone(&events), std::iter::empty()),
+        MockApi::new(Rc::clone(&events), std::iter::empty()),
+        MockIdentitySource::from_ids([duplicate; 5]),
+    );
+    let snapshot = Snapshot::new(
+        "/snapshots/state",
+        "/snapshots/memory",
+        config_fingerprint(&config),
+        Vec::new(),
+    );
+    let error = runtime
+        .restore(&config, &snapshot)
+        .expect_err("duplicate IDs must fail closed");
+    assert!(matches!(error, RuntimeError::StaleIdentity(_)));
+}
+
+#[test]
+fn latest_artifact_channel_is_rejected_by_validation() {
+    // Requirement: mutable latest paths are never accepted as pinned inputs.
+    let mut config = config();
+    config.firecracker.path = PathBuf::from("/artifacts/latest/firecracker");
+    assert!(
+        matches!(config.validate(), Err(RuntimeError::LatestArtifactPath { label }) if label == "firecracker")
+    );
+}
+
+#[test]
+fn overlapping_workspace_source_and_clone_paths_are_rejected() {
+    // Requirement: clone preparation must not recurse into its own source tree.
+    let mut config = config();
+    config.workspace.clone_root = PathBuf::from("/workspace/source/clones");
+    assert!(matches!(
+        config.validate(),
+        Err(RuntimeError::InvalidConfig(message)) if message.contains("must not overlap")
+    ));
+}
+
+#[test]
+fn unix_api_client_sends_real_http_over_unix_socket() {
+    // Requirement: the production backend must perform an actual Unix API request.
+    let socket = test_socket_path("real-http");
+    let _ = fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).expect("test Unix socket must bind");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("test API server must accept");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let length = loop {
+            let count = stream.read(&mut buffer).expect("test API server must read");
+            request.extend_from_slice(&buffer[..count]);
+            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .expect("client must send content length");
+                break header_end + 4 + content_length;
+            }
+        };
+        assert!(request.len() >= length);
+        assert!(String::from_utf8_lossy(&request).starts_with("PUT /machine-config HTTP/1.1"));
+        let response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        stream
+            .write_all(response)
+            .expect("test API server must respond");
+    });
+    let mut client = firecracker_runtime::UnixApiClient::new(&socket)
+        .expect("absolute Unix socket path must validate")
+        .with_timeout(Duration::from_secs(1))
+        .expect("non-zero timeout must validate");
+    let response = client
+        .request(&ApiRequest {
+            method: HttpMethod::Put,
+            path: "/machine-config".to_owned(),
+            body: "{}".to_owned(),
+        })
+        .expect("Unix API request must succeed");
+    assert_eq!(response.status, 204);
+    server.join().expect("test API server thread must finish");
+    fs::remove_file(socket).expect("test Unix socket must be removable");
+}
+
+fn request_with_response(name: &str, response: &[u8]) -> Result<ApiResponse, RuntimeError> {
+    let socket = test_socket_path(name);
+    let _ = fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).expect("test Unix socket must bind");
+    let response = response.to_vec();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("test API server must accept");
+        stream
+            .write_all(&response)
+            .expect("test API server must respond");
+    });
+    let mut client = firecracker_runtime::UnixApiClient::new(&socket)
+        .expect("absolute Unix socket path must validate")
+        .with_timeout(Duration::from_secs(1))
+        .expect("non-zero timeout must validate");
+    let result = client.request(&ApiRequest {
+        method: HttpMethod::Get,
+        path: "/test".to_owned(),
+        body: String::new(),
+    });
+    server.join().expect("test API server thread must finish");
+    fs::remove_file(socket).expect("test Unix socket must be removable");
+    result
+}
+
+#[test]
+fn unix_api_client_accepts_a_bounded_response_body() {
+    let response = request_with_response(
+        "bounded-body",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+    )
+    .expect("valid bounded response must succeed");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, "ok");
+}
+
+#[test]
+fn unix_api_client_rejects_oversized_response_before_reading_body() {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_HTTP_BODY_BYTES + 1
+    );
+    let error = request_with_response("oversized-response", response.as_bytes())
+        .expect_err("oversized response length must fail closed");
+    assert!(matches!(error, RuntimeError::Api(message) if message.contains("body exceeds")));
+}
+
+#[test]
+fn unix_api_client_rejects_duplicate_content_lengths_and_transfer_encoding() {
+    let error = request_with_response(
+        "duplicate-content-length",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nx",
+    )
+    .expect_err("duplicate content lengths must fail closed");
+    assert!(matches!(error, RuntimeError::Api(message) if message.contains("duplicate")));
+
+    let error = request_with_response(
+        "transfer-encoding",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n",
+    )
+    .expect_err("transfer encoding must fail closed");
+    assert!(matches!(error, RuntimeError::Api(message) if message.contains("Transfer-Encoding")));
+}
+
+#[test]
+fn unix_api_client_rejects_missing_and_malformed_response_framing() {
+    let error = request_with_response(
+        "missing-content-length",
+        b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+    )
+    .expect_err("body-capable response must declare its length");
+    assert!(matches!(error, RuntimeError::Api(message) if message.contains("omitted")));
+
+    let error = request_with_response(
+        "malformed-header-name",
+        b"HTTP/1.1 200 OK\r\nBad Header: value\r\nContent-Length: 0\r\n\r\n",
+    )
+    .expect_err("malformed header name must fail closed");
+    assert!(matches!(error, RuntimeError::Api(message) if message.contains("header name")));
+
+    let error = request_with_response(
+        "malformed-header-value",
+        b"HTTP/1.1 200 OK\r\nX-Test: bad\x01value\r\nContent-Length: 0\r\n\r\n",
+    )
+    .expect_err("malformed header value must fail closed");
+    assert!(matches!(error, RuntimeError::Api(message) if message.contains("header value")));
+}
+
+#[test]
+fn unix_api_client_rejects_unsupported_and_out_of_range_status_lines() {
+    let error = request_with_response(
+        "unsupported-version",
+        b"HTTP/2 200 OK\r\nContent-Length: 0\r\n\r\n",
+    )
+    .expect_err("unsupported HTTP version must fail closed");
+    assert!(matches!(error, RuntimeError::Api(message) if message.contains("HTTP version")));
+
+    let error = request_with_response(
+        "out-of-range-status",
+        b"HTTP/1.1 600 No\r\nContent-Length: 0\r\n\r\n",
+    )
+    .expect_err("out-of-range status must fail closed");
+    assert!(matches!(error, RuntimeError::Api(message) if message.contains("valid range")));
+}
+
+#[test]
+fn unix_api_client_rejects_oversized_request_body_before_connecting() {
+    let socket = test_socket_path("no-server");
+    let mut client = firecracker_runtime::UnixApiClient::new(socket)
+        .expect("absolute Unix socket path must validate");
+    let error = client
+        .request(&ApiRequest {
+            method: HttpMethod::Post,
+            path: "/test".to_owned(),
+            body: "x".repeat(MAX_HTTP_BODY_BYTES + 1),
+        })
+        .expect_err("oversized request body must fail before connecting");
+    assert!(matches!(error, RuntimeError::Api(message) if message.contains("request body")));
+}
+
+fn shell_command(script: &str) -> CommandSpec {
+    CommandSpec {
+        program: PathBuf::from("/bin/sh"),
+        args: vec!["-c".to_owned(), script.to_owned()],
+    }
+}
+
+fn test_socket_path(name: &str) -> PathBuf {
+    let mut path = std::env::current_exe().expect("test executable path must be available");
+    path.set_file_name(format!(".firecracker-runtime-api-{name}"));
+    path
+}
+
+#[test]
+fn real_command_runner_captures_normal_output() {
+    let mut runner = RealCommandRunner::new();
+    let output = runner
+        .run(&shell_command("printf stdout; printf stderr >&2"))
+        .expect("normal command output must succeed");
+    assert_eq!(output.status, 0);
+    assert_eq!(output.stdout, b"stdout");
+    assert_eq!(output.stderr, b"stderr");
+}
+
+#[test]
+fn real_command_runner_terminates_on_oversized_stdout() {
+    let mut runner = RealCommandRunner::new();
+    let error = runner
+        .run(&CommandSpec {
+            program: PathBuf::from("yes"),
+            args: Vec::new(),
+        })
+        .expect_err("unbounded command output must be rejected");
+    assert!(
+        matches!(error, RuntimeError::Command(message) if message.contains("stdout") && message.contains(&MAX_COMMAND_OUTPUT_BYTES.to_string()))
+    );
+}
+
+#[test]
+fn real_command_runner_terminates_on_oversized_stderr() {
+    let mut runner = RealCommandRunner::new();
+    let error = runner
+        .run(&shell_command("while :; do printf x >&2; done"))
+        .expect_err("unbounded command diagnostics must be rejected");
+    assert!(
+        matches!(error, RuntimeError::Command(message) if message.contains("stderr") && message.contains(&MAX_COMMAND_OUTPUT_BYTES.to_string()))
+    );
+}
+
+fn config_fingerprint(config: &RuntimeConfig) -> Sha256Digest {
+    let mut bytes = Vec::new();
+    for artifact in [
+        &config.firecracker,
+        &config.kernel,
+        &config.rootfs,
+        &config.verity_hash,
+        &config.jailer,
+        &config.isolation.seccomp.filter,
+    ] {
+        bytes.extend_from_slice(&artifact.digest.as_bytes());
+    }
+    bytes.extend_from_slice(&config.dm_verity.root_hash.as_bytes());
+    bytes.extend_from_slice(&config.vsock.guest_cid.to_be_bytes());
+    sha256(&bytes)
+}

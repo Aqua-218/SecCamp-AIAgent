@@ -530,6 +530,126 @@ theorem CleanupSteps.flags_monotone {before after : CleanupState}
         fun closed => brokerAfter (brokerBefore closed),
         fun isolated => workspaceAfter (workspaceBefore isolated)⟩
 
+/-- Lifecycle state composed with retryable cleanup progress. -/
+structure ManagedState where
+  core : State
+  stopping : Bool
+  cleanup : CleanupState
+
+/-- Initial managed session has no active cleanup transaction. -/
+def ManagedState.initial (ledger : IdentityLedger) : ManagedState where
+  core := State.initial ledger
+  stopping := false
+  cleanup := .pending
+
+/-- Enter retryable cleanup while retaining the exact active resource chain. -/
+def ManagedState.beginStop (state : ManagedState) : ManagedState :=
+  { state with stopping := true, cleanup := .pending }
+
+/-- Commit one successful cleanup action without discarding resource leases. -/
+def ManagedState.recordCleanup (state : ManagedState)
+    (cleanup : CleanupState) : ManagedState :=
+  { state with cleanup := cleanup }
+
+/-- Publish Closed only after all cleanup dependencies have committed. -/
+def ManagedState.finishStop (state : ManagedState) : ManagedState :=
+  { core := markClosed state.core, stopping := false, cleanup := state.cleanup }
+
+/-- Core bindings, Closed gating, and Stopping resource retention agree. -/
+structure ManagedState.WellFormed (state : ManagedState) : Prop where
+  coreWellFormed : state.core.WellFormed
+  closedRequiresCleanup : state.core.phase = .closed → state.cleanup.Complete
+  stoppingRetainsRunning : state.stopping = true → state.core.phase = .running
+
+/-- The initial managed state satisfies lifecycle/cleanup coupling. -/
+theorem ManagedState.initial_wellFormed (ledger : IdentityLedger) :
+    (ManagedState.initial ledger).WellFormed := by
+  constructor
+  · exact State.initial_wellFormed ledger
+  · intro impossible
+    simp [ManagedState.initial, State.initial] at impossible
+  · intro impossible
+    simp [ManagedState.initial] at impossible
+
+/-- Startup transitions never directly publish the terminal Closed phase. -/
+theorem Step.after_ne_closed {before after : State} (transition : Step before after) :
+    after.phase ≠ .closed := by
+  cases transition <;> simp [reserveIdentities, commitWorkspace, commitBroker,
+    commitVm, commitCapability, commitWorkload, markRunning]
+
+/-- Accepted lifecycle transitions including retryable cleanup and its close gate. -/
+inductive ManagedStep : ManagedState → ManagedState → Prop
+  | startup {state : ManagedState} {core : State} :
+      state.stopping = false → Step state.core core →
+      ManagedStep state { state with core := core }
+  | beginStop {state : ManagedState} :
+      state.stopping = false → state.core.phase = .running →
+      ManagedStep state state.beginStop
+  | cleanup {state : ManagedState} {cleanup : CleanupState} :
+      state.stopping = true → CleanupStep state.cleanup cleanup →
+      ManagedStep state (state.recordCleanup cleanup)
+  | finishStop {state : ManagedState} :
+      state.stopping = true → state.cleanup.Complete →
+      ManagedStep state state.finishStop
+
+/-- Lifecycle/cleanup coupling is inductive across every accepted managed step. -/
+theorem ManagedStep.preserves_wellFormed {before after : ManagedState}
+    (transition : ManagedStep before after) (wellFormed : before.WellFormed) :
+    after.WellFormed := by
+  cases transition with
+  | startup notStopping startupStep =>
+      constructor
+      · exact startupStep.preserves_wellFormed wellFormed.coreWellFormed
+      · intro closed
+        exact False.elim (startupStep.after_ne_closed closed)
+      · intro impossible
+        simp [notStopping] at impossible
+  | beginStop notStopping running =>
+      exact ⟨wellFormed.coreWellFormed,
+        fun closed => False.elim (by
+          change before.core.phase = .closed at closed
+          rw [running] at closed
+          cases closed),
+        fun _ => running⟩
+  | cleanup stopping cleanupStep =>
+      exact ⟨wellFormed.coreWellFormed,
+        fun closed => False.elim (by
+          have running := wellFormed.stoppingRetainsRunning stopping
+          change before.core.phase = .closed at closed
+          rw [running] at closed
+          cases closed),
+        fun _ => wellFormed.stoppingRetainsRunning stopping⟩
+  | finishStop stopping complete =>
+      constructor
+      · simp [ManagedState.finishStop, markClosed, State.WellFormed,
+          Resources.empty]
+      · intro _
+        exact complete
+      · intro impossible
+        simp [ManagedState.finishStop] at impossible
+
+/-- A managed session can be Closed only after every cleanup stage committed. -/
+theorem ManagedState.closed_implies_cleanup_complete {state : ManagedState}
+    (wellFormed : state.WellFormed) (closed : state.core.phase = .closed) :
+    state.cleanup.Complete :=
+  wellFormed.closedRequiresCleanup closed
+
+/-- Finite managed lifecycle execution. -/
+inductive ManagedSteps : ManagedState → ManagedState → Prop
+  | refl (state : ManagedState) : ManagedSteps state state
+  | tail {first middle last : ManagedState} :
+      ManagedSteps first middle → ManagedStep middle last →
+      ManagedSteps first last
+
+/-- Cleanup gating and exact resource binding survive arbitrary lifecycle execution. -/
+theorem ManagedSteps.preserves_wellFormed {before after : ManagedState}
+    (transitions : ManagedSteps before after) (wellFormed : before.WellFormed) :
+    after.WellFormed := by
+  induction transitions with
+  | refl => exact wellFormed
+  | tail _ transition inductionHypothesis =>
+      exact transition.preserves_wellFormed inductionHypothesis
+
 end Orchestrator
 
 end Authority

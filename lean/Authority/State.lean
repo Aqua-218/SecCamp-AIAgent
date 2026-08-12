@@ -937,6 +937,646 @@ theorem empty_countersRepresentable (issuer : IssuerId) :
     (empty issuer).CountersRepresentable := by
   simp [CountersRepresentable, empty, FitsU64, u64Maximum]
 
+/-- Cross-map consistency required of every reachable capability state.
+
+The maps in `CapabilityState` are total functions, so this invariant constrains
+their populated keys pointwise rather than asserting that their domains are
+finite. -/
+structure StructuralWellFormed (state : CapabilityState) : Prop where
+  /-- Every stored subject has a lifecycle status. -/
+  subjectHasStatus : ∀ subjectId subject,
+    state.subjects subjectId = some subject →
+      ∃ status, state.subjectStatuses subjectId = some status
+  /-- Every lifecycle status belongs to a stored subject. -/
+  statusHasSubject : ∀ subjectId status,
+    state.subjectStatuses subjectId = some status →
+      ∃ subject, state.subjects subjectId = some subject
+  /-- A stored subject record agrees with the key used to retrieve it. -/
+  subjectKeyMatches : ∀ subjectId subject,
+    state.subjects subjectId = some subject → subject.id = subjectId
+  /-- Every immutable subject-parent pointer resolves to a stored subject. -/
+  subjectParentResolves : ∀ subjectId subject parentId,
+    state.subjects subjectId = some subject → subject.parent = some parentId →
+      ∃ parent, state.subjects parentId = some parent
+  /-- Every holding resolves to a registered subject and a capability bound to it. -/
+  holdingResolves : ∀ holder capabilityId,
+    state.HeldBy holder capabilityId →
+      ∃ subject capability,
+        state.subjects holder = some subject ∧
+        state.capabilities capabilityId = some capability ∧
+        capability.metadata.subject = holder
+  /-- Revocation bits can only name capabilities that were actually issued. -/
+  revokedWasIssued : ∀ capabilityId,
+    state.revoked capabilityId = true → state.WasIssued capabilityId
+  /-- Every live handle agrees with its key, subject, status, and permanent owner. -/
+  liveHandleResolves : ∀ handleId handle,
+    state.openHandles handleId = some handle →
+      handle.id = handleId ∧
+      ∃ subject status,
+        state.subjects handle.subject = some subject ∧
+        state.subjectStatuses handle.subject = some status ∧
+        status ≠ .closed ∧
+        state.issuedHandleOwners handleId = some handle.subject
+  /-- Permanent handle owners always name registered subjects. -/
+  handleOwnerResolves : ∀ handleId owner,
+    state.issuedHandleOwners handleId = some owner →
+      ∃ subject, state.subjects owner = some subject
+  /-- Capability records agree with their key, issuer, subject, and holding. -/
+  capabilityResolves : ∀ capabilityId capability,
+    state.capabilities capabilityId = some capability →
+      capability.metadata.id = capabilityId ∧
+      capability.metadata.issuer = state.issuer ∧
+      ∃ subject,
+        state.subjects capability.metadata.subject = some subject ∧
+        state.HeldBy capability.metadata.subject capabilityId
+  /-- Every stored capability parent resolves through a non-amplifying edge. -/
+  graphWellFormed : state.GraphWellFormed
+  /-- Machine counters remain representable by their Rust `u64` fields. -/
+  countersRepresentable : state.CountersRepresentable
+
+/-- The empty state satisfies every structural consistency clause. -/
+theorem empty_structuralWellFormed (issuer : IssuerId) :
+    (empty issuer).StructuralWellFormed := by
+  refine {
+    subjectHasStatus := ?_
+    statusHasSubject := ?_
+    subjectKeyMatches := ?_
+    subjectParentResolves := ?_
+    holdingResolves := ?_
+    revokedWasIssued := ?_
+    liveHandleResolves := ?_
+    handleOwnerResolves := ?_
+    capabilityResolves := ?_
+    graphWellFormed := empty_graphWellFormed issuer
+    countersRepresentable := empty_countersRepresentable issuer
+  }
+  all_goals simp [empty, HeldBy, WasIssued]
+
+/-- A structurally valid holding cannot name an unknown capability. -/
+theorem StructuralWellFormed.held_was_issued {state : CapabilityState}
+    (wellFormed : state.StructuralWellFormed) {holder : SubjectId}
+    {capabilityId : CapId} (held : state.HeldBy holder capabilityId) :
+    state.WasIssued capabilityId := by
+  rcases wellFormed.holdingResolves holder capabilityId held with
+    ⟨_, capability, _, capabilityLookup, _⟩
+  exact ⟨capability, capabilityLookup⟩
+
+/-- Subject records and lifecycle statuses have exactly the same populated keys. -/
+theorem StructuralWellFormed.subject_status_domain {state : CapabilityState}
+    (wellFormed : state.StructuralWellFormed) {subjectId : SubjectId} :
+    (∃ subject, state.subjects subjectId = some subject) ↔
+      ∃ status, state.subjectStatuses subjectId = some status := by
+  constructor
+  · rintro ⟨subject, subjectLookup⟩
+    exact wellFormed.subjectHasStatus subjectId subject subjectLookup
+  · rintro ⟨status, statusLookup⟩
+    exact wellFormed.statusHasSubject subjectId status statusLookup
+
+/-- A stored capability in a structurally valid state names a registered subject. -/
+theorem StructuralWellFormed.capability_subject_registered
+    {state : CapabilityState} (wellFormed : state.StructuralWellFormed)
+    {capabilityId : CapId} {capability : Capability}
+    (lookup : state.capabilities capabilityId = some capability) :
+    ∃ subject, state.subjects capability.metadata.subject = some subject := by
+  rcases wellFormed.capabilityResolves capabilityId capability lookup with
+    ⟨_, _, subject, subjectLookup, _⟩
+  exact ⟨subject, subjectLookup⟩
+
+/-- A structurally valid live handle cannot belong to a closed subject. -/
+theorem StructuralWellFormed.closed_subject_has_no_live_handle
+    {state : CapabilityState} (wellFormed : state.StructuralWellFormed)
+    {subjectId : SubjectId} (closed : state.subjectStatuses subjectId = some .closed)
+    {handleId : HandleId} {handle : OpenHandle}
+    (live : state.openHandles handleId = some handle) : handle.subject ≠ subjectId := by
+  intro sameSubject
+  subst subjectId
+  rcases wellFormed.liveHandleResolves handleId handle live with
+    ⟨_, _, status, _, statusLookup, notClosed, _⟩
+  have statusIsClosed : status = .closed := Option.some.inj (statusLookup.symm.trans closed)
+  exact notClosed statusIsClosed
+
+/-- Fresh issuance preserves all structural clauses once its graph edge is verified. -/
+theorem issue_preserves_structuralWellFormed {state : CapabilityState}
+    (wellFormed : state.StructuralWellFormed) {capabilityId : CapId}
+    {parent : Option CapId} {grant : CapabilityGrant}
+    (fresh : state.capabilities capabilityId = none)
+    (targetLookup : ∃ subject, state.subjects grant.subject = some subject)
+    (graphAfter : (state.issue capabilityId parent grant).GraphWellFormed) :
+    (state.issue capabilityId parent grant).StructuralWellFormed := by
+  refine {
+    subjectHasStatus := wellFormed.subjectHasStatus
+    statusHasSubject := wellFormed.statusHasSubject
+    subjectKeyMatches := wellFormed.subjectKeyMatches
+    subjectParentResolves := wellFormed.subjectParentResolves
+    holdingResolves := ?_
+    revokedWasIssued := ?_
+    liveHandleResolves := ?_
+    handleOwnerResolves := wellFormed.handleOwnerResolves
+    capabilityResolves := ?_
+    graphWellFormed := graphAfter
+    countersRepresentable := wellFormed.countersRepresentable
+  }
+  · intro holder queriedId heldAfter
+    by_cases newHolding : holder = grant.subject ∧ queriedId = capabilityId
+    · rcases newHolding with ⟨sameHolder, sameCapability⟩
+      subst holder
+      subst queriedId
+      rcases targetLookup with ⟨subject, subjectLookup⟩
+      exact ⟨subject, state.capabilityFromGrant capabilityId parent grant,
+        subjectLookup, issue_stores_exact_capability state capabilityId parent grant,
+        by simp [capabilityFromGrant]⟩
+    · have heldBefore : state.HeldBy holder queriedId := by
+        by_cases sameHolder : holder = grant.subject
+        · subst holder
+          have differentCapability : queriedId ≠ capabilityId := by
+            intro sameCapability
+            exact newHolding ⟨rfl, sameCapability⟩
+          simpa [issue, HeldBy, replace, differentCapability] using heldAfter
+        · simpa [issue, HeldBy, replace, sameHolder] using heldAfter
+      rcases wellFormed.holdingResolves holder queriedId heldBefore with
+        ⟨subject, capability, subjectLookup, capabilityLookup, subjectBinding⟩
+      have differentCapability : queriedId ≠ capabilityId := by
+        intro sameId
+        subst queriedId
+        rw [fresh] at capabilityLookup
+        cases capabilityLookup
+      exact ⟨subject, capability, subjectLookup,
+        by simpa [issue, replace, differentCapability] using capabilityLookup,
+        subjectBinding⟩
+  · intro queriedId revoked
+    rcases wellFormed.revokedWasIssued queriedId revoked with ⟨capability, lookup⟩
+    have differentCapability : queriedId ≠ capabilityId := by
+      intro sameId
+      subst queriedId
+      rw [fresh] at lookup
+      cases lookup
+    exact ⟨capability, by simpa [issue, replace, differentCapability] using lookup⟩
+  · intro handleId handle live
+    simpa [issue] using wellFormed.liveHandleResolves handleId handle live
+  · intro queriedId capability lookupAfter
+    by_cases isNew : queriedId = capabilityId
+    · subst queriedId
+      have exactCapability : capability =
+          state.capabilityFromGrant capabilityId parent grant := Option.some.inj
+        (lookupAfter.symm.trans
+          (issue_stores_exact_capability state capabilityId parent grant))
+      subst capability
+      rcases targetLookup with ⟨subject, subjectLookup⟩
+      exact ⟨by simp [capabilityFromGrant], by rfl,
+        subject, subjectLookup, issue_assigns_holder state capabilityId parent grant⟩
+    · have lookupBefore : state.capabilities queriedId = some capability := by
+        simpa [issue, replace, isNew] using lookupAfter
+      rcases wellFormed.capabilityResolves queriedId capability lookupBefore with
+        ⟨keyMatches, issuerMatches, subject, subjectLookup, heldBefore⟩
+      exact ⟨keyMatches, issuerMatches, subject, subjectLookup,
+        issue_preserves_holding state capabilityId parent grant heldBefore⟩
+
+/-- Fresh subject registration extends every structural map consistently. -/
+theorem MayRegisterSubject.preserves_structuralWellFormed
+    {state : CapabilityState} {subject : Subject}
+    (allowed : MayRegisterSubject state subject)
+    (wellFormed : state.StructuralWellFormed) :
+    (state.registerSubject subject).StructuralWellFormed := by
+  refine {
+    subjectHasStatus := ?_
+    statusHasSubject := ?_
+    subjectKeyMatches := ?_
+    subjectParentResolves := ?_
+    holdingResolves := ?_
+    revokedWasIssued := ?_
+    liveHandleResolves := ?_
+    handleOwnerResolves := ?_
+    capabilityResolves := ?_
+    graphWellFormed := wellFormed.graphWellFormed
+    countersRepresentable := wellFormed.countersRepresentable
+  }
+  · intro subjectId storedSubject subjectLookup
+    by_cases isNew : subjectId = subject.id
+    · subst subjectId
+      exact ⟨.running, by simp [registerSubject]⟩
+    · have lookupBefore : state.subjects subjectId = some storedSubject := by
+        simpa [registerSubject, replace, isNew] using subjectLookup
+      rcases wellFormed.subjectHasStatus subjectId storedSubject lookupBefore with
+        ⟨status, statusLookup⟩
+      exact ⟨status, by simpa [registerSubject, replace, isNew] using statusLookup⟩
+  · intro subjectId status statusLookup
+    by_cases isNew : subjectId = subject.id
+    · subst subjectId
+      exact ⟨subject, by simp [registerSubject]⟩
+    · have statusBefore : state.subjectStatuses subjectId = some status := by
+        simpa [registerSubject, replace, isNew] using statusLookup
+      rcases wellFormed.statusHasSubject subjectId status statusBefore with
+        ⟨storedSubject, subjectLookup⟩
+      exact ⟨storedSubject,
+        by simpa [registerSubject, replace, isNew] using subjectLookup⟩
+  · intro subjectId storedSubject subjectLookup
+    by_cases isNew : subjectId = subject.id
+    · subst subjectId
+      have exactSubject : storedSubject = subject := Option.some.inj
+        (subjectLookup.symm.trans (registerSubject_stores_exact_record state subject))
+      subst storedSubject
+      rfl
+    · exact wellFormed.subjectKeyMatches subjectId storedSubject
+        (by simpa [registerSubject, replace, isNew] using subjectLookup)
+  · intro subjectId storedSubject parentId subjectLookup parentPointer
+    by_cases isNew : subjectId = subject.id
+    · subst subjectId
+      have exactSubject : storedSubject = subject := Option.some.inj
+        (subjectLookup.symm.trans (registerSubject_stores_exact_record state subject))
+      subst storedSubject
+      have parentReady := allowed.parentReady parentId parentPointer
+      rcases parentReady.1 with ⟨parent, parentLookup⟩
+      have parentIsOld : parentId ≠ subject.id := by
+        intro sameParent
+        subst parentId
+        rw [allowed.subjectFresh] at parentLookup
+        cases parentLookup
+      exact ⟨parent,
+        by simpa [registerSubject, replace, parentIsOld] using parentLookup⟩
+    · have lookupBefore : state.subjects subjectId = some storedSubject := by
+        simpa [registerSubject, replace, isNew] using subjectLookup
+      rcases wellFormed.subjectParentResolves subjectId storedSubject parentId
+          lookupBefore parentPointer with ⟨parent, parentLookup⟩
+      have parentIsOld : parentId ≠ subject.id := by
+        intro sameParent
+        subst parentId
+        rw [allowed.subjectFresh] at parentLookup
+        cases parentLookup
+      exact ⟨parent,
+        by simpa [registerSubject, replace, parentIsOld] using parentLookup⟩
+  · intro holder capabilityId heldAfter
+    have differentHolder : holder ≠ subject.id := by
+      intro sameHolder
+      subst holder
+      simp [registerSubject, HeldBy] at heldAfter
+    have heldBefore : state.HeldBy holder capabilityId := by
+      simpa [registerSubject, HeldBy, replace, differentHolder] using heldAfter
+    rcases wellFormed.holdingResolves holder capabilityId heldBefore with
+      ⟨storedSubject, capability, subjectLookup, capabilityLookup, subjectBinding⟩
+    exact ⟨storedSubject, capability,
+      by simpa [registerSubject, replace, differentHolder] using subjectLookup,
+      capabilityLookup, subjectBinding⟩
+  · intro capabilityId revoked
+    exact wellFormed.revokedWasIssued capabilityId revoked
+  · intro handleId handle live
+    rcases wellFormed.liveHandleResolves handleId handle live with
+      ⟨keyMatches, storedSubject, status, subjectLookup, statusLookup, notClosed, owner⟩
+    have subjectIsOld : handle.subject ≠ subject.id := by
+      intro sameSubject
+      rw [sameSubject, allowed.subjectFresh] at subjectLookup
+      cases subjectLookup
+    exact ⟨keyMatches, storedSubject, status,
+      by simpa [registerSubject, replace, subjectIsOld] using subjectLookup,
+      by simpa [registerSubject, replace, subjectIsOld] using statusLookup,
+      notClosed, owner⟩
+  · intro handleId owner ownerLookup
+    rcases wellFormed.handleOwnerResolves handleId owner ownerLookup with
+      ⟨storedSubject, subjectLookup⟩
+    have ownerIsOld : owner ≠ subject.id := by
+      intro sameOwner
+      subst owner
+      rw [allowed.subjectFresh] at subjectLookup
+      cases subjectLookup
+    exact ⟨storedSubject,
+      by simpa [registerSubject, replace, ownerIsOld] using subjectLookup⟩
+  · intro capabilityId capability capabilityLookup
+    rcases wellFormed.capabilityResolves capabilityId capability capabilityLookup with
+      ⟨keyMatches, issuerMatches, storedSubject, subjectLookup, heldBefore⟩
+    have subjectIsOld : capability.metadata.subject ≠ subject.id := by
+      intro sameSubject
+      rw [sameSubject, allowed.subjectFresh] at subjectLookup
+      cases subjectLookup
+    exact ⟨keyMatches, issuerMatches, storedSubject,
+      by simpa [registerSubject, replace, subjectIsOld] using subjectLookup,
+      registerSubject_preserves_holding allowed heldBefore⟩
+
+/-- Registering one root subject exhibits a populated structurally valid state. -/
+theorem registerSubject_from_empty_is_nonempty {issuer : IssuerId}
+    {subject : Subject} (isRoot : subject.parent = none) :
+    let registered := (empty issuer).registerSubject subject
+    registered.StructuralWellFormed ∧
+      registered.subjects subject.id = some subject ∧
+      registered.subjectStatuses subject.id = some .running := by
+  let allowed : MayRegisterSubject (empty issuer) subject := {
+    subjectFresh := by simp [empty]
+    statusFresh := by simp [empty]
+    noExistingHoldings := by simp [empty]
+    parentReady := by
+      intro parentId hasParent
+      rw [isRoot] at hasParent
+      cases hasParent
+  }
+  exact ⟨allowed.preserves_structuralWellFormed (empty_structuralWellFormed issuer),
+    registerSubject_stores_exact_record (empty issuer) subject,
+    registerSubject_starts_running (empty issuer) subject⟩
+
+/-- Revocation preserves structure when it names an issued capability and its epoch advances safely. -/
+theorem revoke_preserves_structuralWellFormed {state : CapabilityState}
+    {capabilityId : CapId} (wellFormed : state.StructuralWellFormed)
+    (issued : state.WasIssued capabilityId)
+    (canIncrement : CanIncrementU64 state.authorizationEpoch) :
+    (state.revoke capabilityId).StructuralWellFormed := by
+  refine {
+    subjectHasStatus := wellFormed.subjectHasStatus
+    statusHasSubject := wellFormed.statusHasSubject
+    subjectKeyMatches := wellFormed.subjectKeyMatches
+    subjectParentResolves := wellFormed.subjectParentResolves
+    holdingResolves := wellFormed.holdingResolves
+    revokedWasIssued := ?_
+    liveHandleResolves := wellFormed.liveHandleResolves
+    handleOwnerResolves := wellFormed.handleOwnerResolves
+    capabilityResolves := ?_
+    graphWellFormed := wellFormed.graphWellFormed
+    countersRepresentable := ?_
+  }
+  · intro queriedId revokedAfter
+    by_cases selected : queriedId = capabilityId
+    · subst queriedId
+      exact issued
+    · apply wellFormed.revokedWasIssued queriedId
+      simpa [revoke, replace, selected] using revokedAfter
+  · intro queriedId capability lookup
+    simpa [revoke] using wellFormed.capabilityResolves queriedId capability lookup
+  · exact ⟨canIncrement.increment_fits,
+      wellFormed.countersRepresentable.2⟩
+
+/-- Beginning subject shutdown keeps every cross-map relation consistent. -/
+theorem beginSubjectClose_preserves_structuralWellFormed
+    {state : CapabilityState} {closingSubject : SubjectId}
+    (wellFormed : state.StructuralWellFormed)
+    (running : state.subjectStatuses closingSubject = some .running)
+    (canIncrement : CanIncrementU64 state.authorizationEpoch) :
+    (state.beginSubjectClose closingSubject).StructuralWellFormed := by
+  refine {
+    subjectHasStatus := ?_
+    statusHasSubject := ?_
+    subjectKeyMatches := wellFormed.subjectKeyMatches
+    subjectParentResolves := wellFormed.subjectParentResolves
+    holdingResolves := wellFormed.holdingResolves
+    revokedWasIssued := ?_
+    liveHandleResolves := ?_
+    handleOwnerResolves := wellFormed.handleOwnerResolves
+    capabilityResolves := ?_
+    graphWellFormed := wellFormed.graphWellFormed
+    countersRepresentable := ?_
+  }
+  · intro subjectId subject subjectLookup
+    by_cases selected : subjectId = closingSubject
+    · subst subjectId
+      exact ⟨.closing, by simp [beginSubjectClose]⟩
+    · rcases wellFormed.subjectHasStatus subjectId subject subjectLookup with
+        ⟨status, statusLookup⟩
+      exact ⟨status,
+        by simpa [beginSubjectClose, replace, selected] using statusLookup⟩
+  · intro subjectId status statusLookup
+    by_cases selected : subjectId = closingSubject
+    · subst subjectId
+      rcases wellFormed.statusHasSubject closingSubject .running running with
+        ⟨subject, subjectLookup⟩
+      exact ⟨subject, subjectLookup⟩
+    · have statusBefore : state.subjectStatuses subjectId = some status := by
+        simpa [beginSubjectClose, replace, selected] using statusLookup
+      exact wellFormed.statusHasSubject subjectId status statusBefore
+  · intro queriedId revokedAfter
+    simp only [beginSubjectClose, Bool.or_eq_true] at revokedAfter
+    rcases revokedAfter with revokedBefore | heldByClosing
+    · exact wellFormed.revokedWasIssued queriedId revokedBefore
+    · exact wellFormed.held_was_issued heldByClosing
+  · intro handleId handle live
+    rcases wellFormed.liveHandleResolves handleId handle live with
+      ⟨keyMatches, subject, status, subjectLookup, statusLookup, notClosed, owner⟩
+    by_cases selected : handle.subject = closingSubject
+    · subst closingSubject
+      exact ⟨keyMatches, subject, .closing, subjectLookup,
+        by simp [beginSubjectClose], by decide, owner⟩
+    · exact ⟨keyMatches, subject, status, subjectLookup,
+        by simpa [beginSubjectClose, replace, selected] using statusLookup,
+        notClosed, owner⟩
+  · intro queriedId capability lookup
+    simpa [beginSubjectClose] using
+      wellFormed.capabilityResolves queriedId capability lookup
+  · exact ⟨canIncrement.increment_fits,
+      wellFormed.countersRepresentable.2⟩
+
+/-- Completing shutdown is structurally safe once no live handle belongs to the subject. -/
+theorem finishSubjectClose_preserves_structuralWellFormed
+    {state : CapabilityState} {closingSubject : SubjectId}
+    (wellFormed : state.StructuralWellFormed)
+    (closing : state.subjectStatuses closingSubject = some .closing)
+    (noLiveHandles : ∀ handleId handle,
+      state.openHandles handleId = some handle → handle.subject ≠ closingSubject) :
+    (state.finishSubjectClose closingSubject).StructuralWellFormed := by
+  refine {
+    subjectHasStatus := ?_
+    statusHasSubject := ?_
+    subjectKeyMatches := wellFormed.subjectKeyMatches
+    subjectParentResolves := wellFormed.subjectParentResolves
+    holdingResolves := wellFormed.holdingResolves
+    revokedWasIssued := wellFormed.revokedWasIssued
+    liveHandleResolves := ?_
+    handleOwnerResolves := wellFormed.handleOwnerResolves
+    capabilityResolves := ?_
+    graphWellFormed := wellFormed.graphWellFormed
+    countersRepresentable := wellFormed.countersRepresentable
+  }
+  · intro subjectId subject subjectLookup
+    by_cases selected : subjectId = closingSubject
+    · subst subjectId
+      exact ⟨.closed, by simp [finishSubjectClose]⟩
+    · rcases wellFormed.subjectHasStatus subjectId subject subjectLookup with
+        ⟨status, statusLookup⟩
+      exact ⟨status,
+        by simpa [finishSubjectClose, replace, selected] using statusLookup⟩
+  · intro subjectId status statusLookup
+    by_cases selected : subjectId = closingSubject
+    · subst subjectId
+      rcases wellFormed.statusHasSubject closingSubject .closing closing with
+        ⟨subject, subjectLookup⟩
+      exact ⟨subject, subjectLookup⟩
+    · have statusBefore : state.subjectStatuses subjectId = some status := by
+        simpa [finishSubjectClose, replace, selected] using statusLookup
+      exact wellFormed.statusHasSubject subjectId status statusBefore
+  · intro handleId handle live
+    rcases wellFormed.liveHandleResolves handleId handle live with
+      ⟨keyMatches, subject, status, subjectLookup, statusLookup, notClosed, owner⟩
+    have differentSubject := noLiveHandles handleId handle live
+    exact ⟨keyMatches, subject, status, subjectLookup,
+      by simpa [finishSubjectClose, replace, differentSubject] using statusLookup,
+      notClosed, owner⟩
+  · intro queriedId capability lookup
+    simpa [finishSubjectClose] using
+      wellFormed.capabilityResolves queriedId capability lookup
+
+/-- Registering a fresh live handle publishes its key and permanent owner atomically. -/
+theorem registerOpenHandle_preserves_structuralWellFormed
+    {state : CapabilityState} {handle : OpenHandle}
+    (wellFormed : state.StructuralWellFormed)
+    (running : state.subjectStatuses handle.subject = some .running) :
+    (state.registerOpenHandle handle).StructuralWellFormed := by
+  refine {
+    subjectHasStatus := wellFormed.subjectHasStatus
+    statusHasSubject := wellFormed.statusHasSubject
+    subjectKeyMatches := wellFormed.subjectKeyMatches
+    subjectParentResolves := wellFormed.subjectParentResolves
+    holdingResolves := wellFormed.holdingResolves
+    revokedWasIssued := wellFormed.revokedWasIssued
+    liveHandleResolves := ?_
+    handleOwnerResolves := ?_
+    capabilityResolves := ?_
+    graphWellFormed := wellFormed.graphWellFormed
+    countersRepresentable := wellFormed.countersRepresentable
+  }
+  · intro handleId storedHandle liveAfter
+    by_cases selected : handleId = handle.id
+    · subst handleId
+      have exactHandle : storedHandle = handle := Option.some.inj
+        (liveAfter.symm.trans (registerOpenHandle_stores_exact_record state handle))
+      subst storedHandle
+      rcases wellFormed.statusHasSubject handle.subject .running running with
+        ⟨subject, subjectLookup⟩
+      exact ⟨rfl, subject, .running, subjectLookup, running, by decide,
+        registerOpenHandle_reserves_identity state handle⟩
+    · have liveBefore : state.openHandles handleId = some storedHandle := by
+        simpa [registerOpenHandle, replace, selected] using liveAfter
+      rcases wellFormed.liveHandleResolves handleId storedHandle liveBefore with
+        ⟨keyMatches, subject, status, subjectLookup, statusLookup, notClosed, owner⟩
+      exact ⟨keyMatches, subject, status, subjectLookup, statusLookup, notClosed,
+        by simpa [registerOpenHandle, replace, selected] using owner⟩
+  · intro handleId owner ownerAfter
+    by_cases selected : handleId = handle.id
+    · subst handleId
+      have exactOwner : owner = handle.subject := Option.some.inj
+        (ownerAfter.symm.trans (registerOpenHandle_reserves_identity state handle))
+      subst owner
+      exact wellFormed.statusHasSubject handle.subject .running running
+    · have ownerBefore : state.issuedHandleOwners handleId = some owner := by
+        simpa [registerOpenHandle, replace, selected] using ownerAfter
+      exact wellFormed.handleOwnerResolves handleId owner ownerBefore
+  · intro capabilityId capability lookup
+    simpa [registerOpenHandle] using
+      wellFormed.capabilityResolves capabilityId capability lookup
+
+/-- Closing a handle removes one live record without disturbing any structural binding. -/
+theorem closeHandle_preserves_structuralWellFormed
+    {state : CapabilityState} {handleId : HandleId}
+    (wellFormed : state.StructuralWellFormed) :
+    (state.closeHandle handleId).StructuralWellFormed := by
+  refine {
+    subjectHasStatus := wellFormed.subjectHasStatus
+    statusHasSubject := wellFormed.statusHasSubject
+    subjectKeyMatches := wellFormed.subjectKeyMatches
+    subjectParentResolves := wellFormed.subjectParentResolves
+    holdingResolves := wellFormed.holdingResolves
+    revokedWasIssued := wellFormed.revokedWasIssued
+    liveHandleResolves := ?_
+    handleOwnerResolves := wellFormed.handleOwnerResolves
+    capabilityResolves := ?_
+    graphWellFormed := wellFormed.graphWellFormed
+    countersRepresentable := wellFormed.countersRepresentable
+  }
+  · intro queriedId handle liveAfter
+    by_cases selected : queriedId = handleId
+    · subst queriedId
+      simp [closeHandle] at liveAfter
+    · have liveBefore : state.openHandles queriedId = some handle := by
+        simpa [closeHandle, replace, selected] using liveAfter
+      exact wellFormed.liveHandleResolves queriedId handle liveBefore
+  · intro capabilityId capability lookup
+    simpa [closeHandle] using
+      wellFormed.capabilityResolves capabilityId capability lookup
+
+/-- Checked root allocation preserves structure and advances only its allocator counter. -/
+theorem MayAllocateRoot.preserves_structuralWellFormed
+    {state : CapabilityState} {grant : CapabilityGrant}
+    (allowed : MayAllocateRoot state grant)
+    (wellFormed : state.StructuralWellFormed) :
+    (state.allocateRoot grant allowed.allocation.selectedSequence).StructuralWellFormed := by
+  let capabilityId := state.sequentialCapabilityId allowed.allocation.selectedSequence
+  have issuedWellFormed : (state.issue capabilityId none grant).StructuralWellFormed :=
+    issue_preserves_structuralWellFormed wellFormed allowed.issueAllowed.capabilityFresh
+      ⟨allowed.issueAllowed.targetSubject, allowed.issueAllowed.targetLookup⟩
+      (allowed.issueAllowed.preserves_graphWellFormed wellFormed.graphWellFormed)
+  refine {
+    subjectHasStatus := issuedWellFormed.subjectHasStatus
+    statusHasSubject := issuedWellFormed.statusHasSubject
+    subjectKeyMatches := issuedWellFormed.subjectKeyMatches
+    subjectParentResolves := issuedWellFormed.subjectParentResolves
+    holdingResolves := issuedWellFormed.holdingResolves
+    revokedWasIssued := issuedWellFormed.revokedWasIssued
+    liveHandleResolves := issuedWellFormed.liveHandleResolves
+    handleOwnerResolves := issuedWellFormed.handleOwnerResolves
+    capabilityResolves := ?_
+    graphWellFormed := issuedWellFormed.graphWellFormed
+    countersRepresentable := ?_
+  }
+  · intro queriedId capability lookup
+    simpa [allocateRoot, capabilityId] using
+      issuedWellFormed.capabilityResolves queriedId capability lookup
+  · exact ⟨wellFormed.countersRepresentable.1,
+      advanceU64_value_fits allowed.allocation.selectedRepresentable⟩
+
+/-- Checked derived allocation preserves structure and advances only its allocator counter. -/
+theorem MayAllocateDerived.preserves_structuralWellFormed
+    {state : CapabilityState} {caller : SubjectId} {parentId : CapId}
+    {grant : CapabilityGrant} {now : MonotonicTime}
+    (allowed : MayAllocateDerived state caller parentId grant now)
+    (wellFormed : state.StructuralWellFormed) :
+    (state.allocateDerived parentId grant
+      allowed.allocation.selectedSequence).StructuralWellFormed := by
+  let capabilityId := state.sequentialCapabilityId allowed.allocation.selectedSequence
+  have issuedWellFormed :
+      (state.issue capabilityId (some parentId) grant).StructuralWellFormed :=
+    issue_preserves_structuralWellFormed wellFormed allowed.allocation.fresh
+      ⟨allowed.deriveAllowed.targetSubject, allowed.deriveAllowed.targetLookup⟩
+      (allowed.deriveAllowed.preserves_graphWellFormed wellFormed.graphWellFormed)
+  refine {
+    subjectHasStatus := issuedWellFormed.subjectHasStatus
+    statusHasSubject := issuedWellFormed.statusHasSubject
+    subjectKeyMatches := issuedWellFormed.subjectKeyMatches
+    subjectParentResolves := issuedWellFormed.subjectParentResolves
+    holdingResolves := issuedWellFormed.holdingResolves
+    revokedWasIssued := issuedWellFormed.revokedWasIssued
+    liveHandleResolves := issuedWellFormed.liveHandleResolves
+    handleOwnerResolves := issuedWellFormed.handleOwnerResolves
+    capabilityResolves := ?_
+    graphWellFormed := issuedWellFormed.graphWellFormed
+    countersRepresentable := ?_
+  }
+  · intro queriedId capability lookup
+    simpa [allocateDerived, capabilityId] using
+      issuedWellFormed.capabilityResolves queriedId capability lookup
+  · exact ⟨wellFormed.countersRepresentable.1,
+      advanceU64_value_fits allowed.allocation.selectedRepresentable⟩
+
+/-- Every accepted transition preserves the complete structural invariant. -/
+theorem Step.preserves_structuralWellFormed {before after : CapabilityState}
+    (transition : Step before after)
+    (wellFormed : before.StructuralWellFormed) :
+    after.StructuralWellFormed := by
+  cases transition with
+  | registerSubject allowed =>
+      exact allowed.preserves_structuralWellFormed wellFormed
+  | issueRoot allowed =>
+      exact issue_preserves_structuralWellFormed wellFormed allowed.capabilityFresh
+        ⟨allowed.targetSubject, allowed.targetLookup⟩
+        (allowed.preserves_graphWellFormed wellFormed.graphWellFormed)
+  | issueAllocatedRoot allowed =>
+      exact allowed.preserves_structuralWellFormed wellFormed
+  | derive allowed =>
+      exact allowed.preserves_structuralWellFormed wellFormed
+  | revoke issued _ canIncrement =>
+      exact revoke_preserves_structuralWellFormed wellFormed issued canIncrement
+  | beginClose running canIncrement =>
+      exact beginSubjectClose_preserves_structuralWellFormed wellFormed running canIncrement
+  | finishClose closing noLiveHandles =>
+      exact finishSubjectClose_preserves_structuralWellFormed wellFormed closing noLiveHandles
+  | registerHandle running _ =>
+      exact registerOpenHandle_preserves_structuralWellFormed wellFormed running
+  | closeHandle _ =>
+      exact closeHandle_preserves_structuralWellFormed wellFormed
+  | successfulNoop _ =>
+      exact wellFormed
+
 /-- Checked accepted transitions cannot overflow the authorization epoch. -/
 theorem Step.preserves_countersRepresentable {before after : CapabilityState}
     (transition : Step before after)
@@ -1150,6 +1790,22 @@ inductive Steps : CapabilityState → CapabilityState → Prop
   | refl (state : CapabilityState) : Steps state state
   | tail {first middle last : CapabilityState} :
       Steps first middle → Step middle last → Steps first last
+
+/-- The complete structural invariant is inductive across arbitrary finite executions. -/
+theorem Steps.preserve_structuralWellFormed {before after : CapabilityState}
+    (transitions : Steps before after)
+    (wellFormed : before.StructuralWellFormed) :
+    after.StructuralWellFormed := by
+  induction transitions with
+  | refl => exact wellFormed
+  | tail _ transition inductionHypothesis =>
+      exact transition.preserves_structuralWellFormed inductionHypothesis
+
+/-- Every state reachable from an empty session is structurally well formed. -/
+theorem Steps.from_empty_structuralWellFormed {issuer : IssuerId}
+    {state : CapabilityState} (transitions : Steps (empty issuer) state) :
+    state.StructuralWellFormed :=
+  transitions.preserve_structuralWellFormed (empty_structuralWellFormed issuer)
 
 /-- Authorization epochs never decrease across a finite execution. -/
 theorem Steps.epoch_monotone {before after : CapabilityState}

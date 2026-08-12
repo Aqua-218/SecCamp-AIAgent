@@ -363,6 +363,23 @@ impl CapabilityKernel {
         Ok(state.object_open_handle_count(object))
     }
 
+    /// Returns whether no permanent authority identity has been issued yet.
+    ///
+    /// An adapter with an empty local manifest must establish this before it
+    /// assumes ownership of the kernel; otherwise it could forget tombstones
+    /// retained by a previously attached adapter and attempt identity reuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapabilityKernelError::LockPoisoned`] if the state lock was
+    /// poisoned by an earlier writer panic.
+    pub fn is_pristine(&self) -> Result<bool, CapabilityKernelError> {
+        self.state
+            .read()
+            .map_err(|_| CapabilityKernelError::LockPoisoned)
+            .map(|state| state.is_pristine())
+    }
+
     /// Returns snapshots of all authorization attempts in start order.
     ///
     /// # Errors

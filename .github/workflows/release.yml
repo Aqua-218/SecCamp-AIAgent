@@ -1,0 +1,123 @@
+name: Trusted Release
+run-name: Release / ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing semantic-version tag to release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Re-run quality gates
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  security:
+    name: Re-run security gates
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+  package:
+    name: Build and attest release
+    needs: [quality, security]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Validate release input
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+      - name: Check out immutable tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify checked-out tag
+        run: |
+          set -euo pipefail
+          test "$(git rev-list -n 1 "${RELEASE_TAG}")" = "$(git rev-parse HEAD)"
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Restore release tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ci-tools
+          key: ${{ runner.os }}-${{ runner.arch }}-release-tools-v3
+      - name: Install release tools
+        run: scripts/ci/install-release-tools.sh
+      - name: Build deterministic archive and SBOM
+        run: |
+          set -euo pipefail
+          scripts/ci/package-release.sh "${RELEASE_TAG}"
+          scripts/ci/finalize-release.sh
+          cat dist/release.env >> "${GITHUB_ENV}"
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/${{ env.ARCHIVE_NAME }}
+      - name: Attest archive SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/${{ env.ARCHIVE_NAME }}
+          sbom-path: dist/${{ env.SBOM_NAME }}
+      - name: Upload immutable release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ env.RELEASE_TAG }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Check out release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Download attested release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-${{ env.RELEASE_TAG }}
+          path: dist
+      - name: Verify checksums
+        run: scripts/ci/verify-release.sh
+      - name: Publish idempotently
+        run: scripts/ci/publish-github-release.sh "${RELEASE_TAG}"

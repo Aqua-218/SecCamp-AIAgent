@@ -174,6 +174,8 @@ http_matches	http-host-change-is-rejected	false	get	docs.example	prefix	/guide	4
 http_matches	http-path-escape-is-rejected	false	get	docs.example	prefix	/guide	4096	get	docs.example	/release	1024
 http_matches	http-segment-boundary-is-respected	false	get	docs.example	prefix	/guide	4096	get	docs.example	/guide-old	1024
 http_matches	http-response-cap-escalation-is-rejected	false	get	docs.example	prefix	/guide	4096	get	docs.example	/guide/start	4097
+http_matches	http-normalizes-host-at-the-boundary	true	get	DOCS.Example.	prefix	/guide	4096	get	docs.example	/guide/start	1024
+http_matches	http-accepts-maximum-u64-response-limit	true	get	docs.example	prefix	/guide	18446744073709551615	get	docs.example	/guide/start	18446744073709551615
 
 http_below	http-authority-below-itself	true	get|head	docs.example	prefix	/guide	4096	get|head	docs.example	prefix	/guide	4096
 http_below	http-authority-narrows-every-boundary	true	get	docs.example	exact	/guide/start	1024	get|head	docs.example	prefix	/guide	4096
@@ -182,6 +184,7 @@ http_below	http-child-host-change-is-rejected	false	get	api.example	exact	/guide
 http_below	http-child-path-expansion-is-rejected	false	get	docs.example	prefix	/	1024	get	docs.example	prefix	/guide	4096
 http_below	http-child-response-cap-escalation-is-rejected	false	get	docs.example	exact	/guide/start	8192	get	docs.example	prefix	/guide	4096
 http_below	http-empty-methods-do-not-bypass-structure	false	-	docs.example	prefix	/	1024	get	docs.example	prefix	/guide	4096
+http_below	http-normalizes-child-host-before-containment	true	get	DOCS.Example.	exact	/guide/start	1024	get	docs.example	prefix	/guide	4096
 
 http_capability_matches	http-capability-allows-lower-bound-request	true	10	20	get	docs.example	prefix	/guide	4096	10	get	docs.example	/guide/start	1024
 http_capability_matches	http-capability-rejects-expired-request	false	10	20	get	docs.example	prefix	/guide	4096	20	get	docs.example	/guide/start	1024

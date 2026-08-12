@@ -3,8 +3,8 @@
 #![cfg(target_os = "linux")]
 
 use std::{
-    fs::{self, File},
-    io::{self, Read, Seek, SeekFrom},
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     num::NonZeroUsize,
     path::Path,
@@ -22,7 +22,7 @@ use authority_core::{
 };
 use capfs::{
     backing::{ImportedRepository, PreflightLimits},
-    read_only::{MountAuthority, MountInstanceId, ReadOnlyFilesystem, spawn_mount},
+    filesystem::{CapabilityFilesystem, MountAuthority, MountInstanceId, spawn_mount},
 };
 use fuser::BackgroundSession;
 use rustix::fs::{Mode, OFlags, RawDir, open};
@@ -85,7 +85,7 @@ fn mount_directory_view() -> MountedDirectoryView {
             )),
         ))
         .expect("test capability issuance must succeed");
-    let filesystem = ReadOnlyFilesystem::new(
+    let filesystem = CapabilityFilesystem::new(
         imported,
         Arc::clone(&kernel),
         MountAuthority::new(
@@ -156,7 +156,7 @@ fn mounted_read_only_view_denies_read_after_revoke() {
             )),
         ))
         .expect("test capability issuance must succeed");
-    let filesystem = ReadOnlyFilesystem::new(
+    let filesystem = CapabilityFilesystem::new(
         imported,
         Arc::clone(&kernel),
         MountAuthority::new(
@@ -192,6 +192,98 @@ fn mounted_read_only_view_denies_read_after_revoke() {
     assert_eq!(
         file.read(&mut after_revoke)
             .expect_err("an existing descriptor must reauthorize every read")
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+
+    drop(file);
+    drop(session);
+}
+
+// Requirement: direct I/O must route a write on an already-open descriptor
+// back through capability authorization after revoke. Category: FUSE/security.
+// Risk: critical.
+#[test]
+fn mounted_view_denies_write_after_revoke() {
+    if !Path::new("/dev/fuse").exists() {
+        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+        return;
+    }
+
+    let backing = tempdir().expect("temporary backing directory must be creatable");
+    let mountpoint = tempdir().expect("temporary mountpoint must be creatable");
+    let backing_file = backing.path().join("allowed.txt");
+    fs::write(&backing_file, b"capability").expect("authorized backing file must be writable");
+    let repository = RepoId::new("workspace");
+    let imported = ImportedRepository::open(
+        repository.clone(),
+        backing.path(),
+        PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 1),
+    )
+    .expect("test backing must pass preflight");
+    let subject = SubjectId::new("fuse-writer-subject");
+    let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+        .expect("test validity window must be non-empty");
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "fuse-writer-session",
+    ))));
+    kernel
+        .register_subject(Subject::new(
+            subject.clone(),
+            StaticAuthorityEnvelope::new(
+                validity,
+                AuthorityBody::File(FileAuthority::new(
+                    repository.clone(),
+                    FileEffects::only(FileEffect::WriteData),
+                    PathPattern::Prefix(CanonicalPath::root()),
+                )),
+            ),
+        ))
+        .expect("test subject registration must succeed");
+    let capability = kernel
+        .issue_root(CapabilityGrant::new(
+            subject.clone(),
+            validity,
+            AuthorityBody::File(FileAuthority::new(
+                repository.clone(),
+                FileEffects::only(FileEffect::WriteData),
+                PathPattern::Exact(
+                    CanonicalPath::new(["allowed.txt"]).expect("test path must be canonical"),
+                ),
+            )),
+        ))
+        .expect("test capability issuance must succeed");
+    let filesystem = CapabilityFilesystem::new(
+        imported,
+        Arc::clone(&kernel),
+        MountAuthority::new(
+            MountInstanceId::new("fuse-write-integration"),
+            subject,
+            capability.clone(),
+            repository,
+        ),
+        Arc::new(MonotonicTime::from_ticks(5)),
+    )
+    .expect("filesystem must initialize");
+    let session = spawn_mount(filesystem, mountpoint.path()).expect("FUSE mount must succeed");
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(mountpoint.path().join("allowed.txt"))
+        .expect("authorized FUSE file must open for writing");
+    file.write_all(b"C")
+        .expect("authorized FUSE write must succeed");
+    assert_eq!(
+        fs::read(&backing_file).expect("backing file must remain readable"),
+        b"Capability"
+    );
+
+    kernel
+        .revoke(&capability)
+        .expect("test capability must be revocable");
+    assert_eq!(
+        file.write_all(b"!")
+            .expect_err("an existing descriptor must reauthorize every write")
             .kind(),
         io::ErrorKind::PermissionDenied
     );

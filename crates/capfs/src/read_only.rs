@@ -1,4 +1,4 @@
-//! Read-only FUSE adapter with per-operation capability reauthorization.
+//! Direct-I/O FUSE adapter with per-operation capability reauthorization.
 
 use std::{
     collections::BTreeMap,
@@ -16,7 +16,8 @@ use std::{
 
 use authority_core::{
     capability::{
-        AuthorityBody, AuthorityRequest, CapId, Capability, CapabilityRequest, SubjectId,
+        AuthorityBody, AuthorityRequest, CapId, Capability, CapabilityRequest,
+        CapabilityRequestSet, SubjectId,
     },
     file::{FileEffect, FileRequest},
     handle::{HandleId, ObjectId, OpenHandle},
@@ -29,7 +30,8 @@ use authority_core::{
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, SessionACL,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL,
+    WriteFlags,
 };
 use rustix::fs::OFlags;
 
@@ -45,7 +47,7 @@ use crate::{
 
 const ATTRIBUTE_TTL: Duration = Duration::ZERO;
 const NODE_GENERATION: Generation = Generation(0);
-const MAX_READ_SIZE: u32 = 1024 * 1024;
+const MAX_IO_SIZE: u32 = 1024 * 1024;
 
 /// Supplies the session-relative monotonic time used for authorization.
 ///
@@ -140,9 +142,9 @@ impl MountAuthority {
     }
 }
 
-/// Failure to construct a read-only filesystem from imported state.
+/// Failure to construct a capability-enforcing filesystem from imported state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReadOnlyFilesystemError {
+pub enum CapabilityFilesystemError {
     /// The imported namespace lock is poisoned.
     Namespace(NamespaceError),
     /// The imported manifest does not contain its required root object.
@@ -156,7 +158,7 @@ pub enum ReadOnlyFilesystemError {
     },
 }
 
-impl fmt::Display for ReadOnlyFilesystemError {
+impl fmt::Display for CapabilityFilesystemError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Namespace(error) => write!(formatter, "cannot read imported namespace: {error}"),
@@ -174,7 +176,7 @@ impl fmt::Display for ReadOnlyFilesystemError {
     }
 }
 
-impl Error for ReadOnlyFilesystemError {
+impl Error for CapabilityFilesystemError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Namespace(error) => Some(error),
@@ -183,7 +185,7 @@ impl Error for ReadOnlyFilesystemError {
     }
 }
 
-impl From<NamespaceError> for ReadOnlyFilesystemError {
+impl From<NamespaceError> for CapabilityFilesystemError {
     fn from(error: NamespaceError) -> Self {
         Self::Namespace(error)
     }
@@ -194,7 +196,40 @@ struct OpenResource {
     node: NodeId,
     object: ObjectId,
     authority_handle: HandleId,
+    access: OpenResourceAccess,
     backing: OpenBacking,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenResourceAccess {
+    File(FileAccess),
+    Directory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileAccess {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+impl FileAccess {
+    fn from_open_flags(flags: OpenFlags) -> Result<Self, AdapterError> {
+        validate_open_flags(flags)?;
+        match flags.acc_mode() {
+            OpenAccMode::O_RDONLY => Ok(Self::ReadOnly),
+            OpenAccMode::O_WRONLY => Ok(Self::WriteOnly),
+            OpenAccMode::O_RDWR => Ok(Self::ReadWrite),
+        }
+    }
+
+    const fn permits_read(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::ReadWrite)
+    }
+
+    const fn permits_write(self) -> bool {
+        matches!(self, Self::WriteOnly | Self::ReadWrite)
+    }
 }
 
 #[derive(Debug)]
@@ -205,6 +240,15 @@ enum OpenBacking {
 
 impl OpenBacking {
     const fn kind(&self) -> OpenResourceKind {
+        match self {
+            Self::File(_) => OpenResourceKind::File,
+            Self::Directory => OpenResourceKind::Directory,
+        }
+    }
+}
+
+impl OpenResourceAccess {
+    const fn kind(self) -> OpenResourceKind {
         match self {
             Self::File(_) => OpenResourceKind::File,
             Self::Directory => OpenResourceKind::Directory,
@@ -246,7 +290,7 @@ impl HandleState {
 enum AdapterError {
     NotFound,
     AccessDenied,
-    ReadOnly,
+    Unsupported,
     IsDirectory,
     NotDirectory,
     InvalidRequest,
@@ -259,7 +303,7 @@ impl AdapterError {
         match self {
             Self::NotFound => Errno::ENOENT,
             Self::AccessDenied => Errno::EACCES,
-            Self::ReadOnly => Errno::EROFS,
+            Self::Unsupported => Errno::EPERM,
             Self::IsDirectory => Errno::EISDIR,
             Self::NotDirectory => Errno::ENOTDIR,
             Self::InvalidRequest => Errno::EINVAL,
@@ -282,13 +326,13 @@ struct DirectoryEntry {
     next_offset: u64,
 }
 
-/// A subject-local, read-only FUSE view of one validated repository.
+/// A subject-local direct-I/O FUSE view of one validated repository.
 ///
 /// Metadata is visible only for the presented capability's path range and its
 /// ancestors. `OPEN` and every `READ` perform final effect authorization while
 /// the namespace path remains stable. Successful opens use direct I/O so the
 /// kernel page cache cannot bypass a later revocation check.
-pub struct ReadOnlyFilesystem {
+pub struct CapabilityFilesystem {
     backing: Arc<ValidatedRepository>,
     namespace: Arc<NamespaceRegistry>,
     nodes: NodeTable,
@@ -299,10 +343,10 @@ pub struct ReadOnlyFilesystem {
     fatal: AtomicBool,
 }
 
-impl fmt::Debug for ReadOnlyFilesystem {
+impl fmt::Debug for CapabilityFilesystem {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ReadOnlyFilesystem")
+            .debug_struct("CapabilityFilesystem")
             .field("backing", &self.backing)
             .field("namespace", &self.namespace)
             .field("nodes", &self.nodes)
@@ -315,7 +359,7 @@ impl fmt::Debug for ReadOnlyFilesystem {
     }
 }
 
-impl ReadOnlyFilesystem {
+impl CapabilityFilesystem {
     /// Creates one subject mount from a backing/namespace pair imported together.
     ///
     /// # Errors
@@ -326,9 +370,9 @@ impl ReadOnlyFilesystem {
         kernel: Arc<CapabilityKernel>,
         authority: MountAuthority,
         clock: Arc<dyn AuthorizationClock>,
-    ) -> Result<Self, ReadOnlyFilesystemError> {
+    ) -> Result<Self, CapabilityFilesystemError> {
         if imported.repository() != &authority.repository {
-            return Err(ReadOnlyFilesystemError::RepositoryMismatch {
+            return Err(CapabilityFilesystemError::RepositoryMismatch {
                 imported: imported.repository().clone(),
                 authority: authority.repository.clone(),
             });
@@ -336,7 +380,7 @@ impl ReadOnlyFilesystem {
         let (_repository, backing, namespace) = imported.into_parts();
         let root = namespace
             .object_at_path_snapshot(&CanonicalPath::root())?
-            .ok_or(ReadOnlyFilesystemError::MissingNamespaceRoot)?;
+            .ok_or(CapabilityFilesystemError::MissingNamespaceRoot)?;
         let nodes = NodeTable::new(authority.subject.clone(), root.id().clone());
 
         Ok(Self {
@@ -433,28 +477,40 @@ impl ReadOnlyFilesystem {
     }
 
     fn open_file(&self, node: NodeId, flags: OpenFlags) -> Result<u64, AdapterError> {
+        let access = FileAccess::from_open_flags(flags)?;
         self.open_resource(
             node,
-            flags,
             NamespaceObjectKind::RegularFile,
             AdapterError::IsDirectory,
-            FileEffect::ReadData,
+            OpenResourceAccess::File(access),
+            |path| self.file_open_requests(access, path.clone()),
             |object| {
-                self.backing
-                    .open_runtime_file(object)
-                    .map(OpenBacking::File)
+                let open = if access.permits_write() {
+                    self.backing.open_runtime_writable_file(object)
+                } else {
+                    self.backing.open_runtime_file(object)
+                };
+                open.map(OpenBacking::File)
                     .map_err(|_| AdapterError::Internal)
             },
         )
     }
 
     fn open_directory(&self, node: NodeId, flags: OpenFlags) -> Result<u64, AdapterError> {
+        validate_open_flags(flags)?;
+        if flags.acc_mode() != OpenAccMode::O_RDONLY {
+            return Err(AdapterError::Unsupported);
+        }
         self.open_resource(
             node,
-            flags,
             NamespaceObjectKind::Directory,
             AdapterError::NotDirectory,
-            FileEffect::ListDirectory,
+            OpenResourceAccess::Directory,
+            |path| {
+                CapabilityRequestSet::one(
+                    self.file_request(FileEffect::ListDirectory, path.clone()),
+                )
+            },
             |_| Ok(OpenBacking::Directory),
         )
     }
@@ -462,14 +518,13 @@ impl ReadOnlyFilesystem {
     fn open_resource(
         &self,
         node: NodeId,
-        flags: OpenFlags,
         expected_kind: NamespaceObjectKind,
         kind_error: AdapterError,
-        effect: FileEffect,
+        access: OpenResourceAccess,
+        authorization_requests: impl FnOnce(&CanonicalPath) -> CapabilityRequestSet,
         open_backing: impl FnOnce(&NamespaceObject) -> Result<OpenBacking, AdapterError>,
     ) -> Result<u64, AdapterError> {
         self.ensure_healthy()?;
-        validate_open_flags(flags)?;
         let object = self
             .nodes
             .resolve(node)
@@ -490,11 +545,11 @@ impl ReadOnlyFilesystem {
                 ))
                 .map_err(|_| AdapterError::Internal)?;
 
-            let request = self.file_request(effect, object.path().clone());
-            match self.kernel.authorize_and_commit(
+            let requests = authorization_requests(object.path());
+            match self.kernel.authorize_all_and_commit(
                 &self.authority.subject,
                 &self.authority.capability,
-                &request,
+                &requests,
                 |_| open_backing(object),
             ) {
                 Ok(backing) => Ok(backing),
@@ -518,6 +573,7 @@ impl ReadOnlyFilesystem {
                 node,
                 object,
                 authority_handle,
+                access,
                 backing,
             },
         );
@@ -536,7 +592,7 @@ impl ReadOnlyFilesystem {
         size: u32,
     ) -> Result<Vec<u8>, AdapterError> {
         self.ensure_healthy()?;
-        if size > MAX_READ_SIZE {
+        if size > MAX_IO_SIZE {
             return Err(AdapterError::InvalidRequest);
         }
         let handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
@@ -545,6 +601,12 @@ impl ReadOnlyFilesystem {
             .get(&handle)
             .ok_or(AdapterError::BadHandle)?;
         if resource.node != node {
+            return Err(AdapterError::BadHandle);
+        }
+        let OpenResourceAccess::File(access) = resource.access else {
+            return Err(AdapterError::BadHandle);
+        };
+        if !access.permits_read() {
             return Err(AdapterError::BadHandle);
         }
         let OpenBacking::File(backing) = &resource.backing else {
@@ -570,6 +632,57 @@ impl ReadOnlyFilesystem {
             .map_err(|error| map_namespace_operation_error(&error))
     }
 
+    fn write_file(
+        &self,
+        node: NodeId,
+        handle: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<u32, AdapterError> {
+        self.ensure_healthy()?;
+        if bytes.len() > MAX_IO_SIZE as usize {
+            return Err(AdapterError::InvalidRequest);
+        }
+        let handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+        let resource = handles
+            .resources
+            .get(&handle)
+            .ok_or(AdapterError::BadHandle)?;
+        if resource.node != node {
+            return Err(AdapterError::BadHandle);
+        }
+        let OpenResourceAccess::File(access) = resource.access else {
+            return Err(AdapterError::BadHandle);
+        };
+        if !access.permits_write() {
+            return Err(AdapterError::BadHandle);
+        }
+        let OpenBacking::File(backing) = &resource.backing else {
+            return Err(AdapterError::BadHandle);
+        };
+
+        self.namespace
+            .with_object(&resource.object, |object| {
+                let request = self.file_request(FileEffect::WriteData, object.path().clone());
+                self.kernel
+                    .authorize_and_commit(
+                        &self.authority.subject,
+                        &self.authority.capability,
+                        &request,
+                        |_| {
+                            backing
+                                .write_at(offset, bytes)
+                                .map_err(|_| AdapterError::Internal)
+                                .and_then(|written| {
+                                    u32::try_from(written).map_err(|_| AdapterError::Internal)
+                                })
+                        },
+                    )
+                    .map_err(|error| map_effect_error(&error))
+            })
+            .map_err(|error| map_namespace_operation_error(&error))
+    }
+
     fn read_directory(
         &self,
         node: NodeId,
@@ -583,7 +696,10 @@ impl ReadOnlyFilesystem {
             .resources
             .get(&handle)
             .ok_or(AdapterError::BadHandle)?;
-        if resource.node != node || resource.backing.kind() != OpenResourceKind::Directory {
+        if resource.node != node
+            || resource.access.kind() != OpenResourceKind::Directory
+            || resource.backing.kind() != OpenResourceKind::Directory
+        {
             return Err(AdapterError::BadHandle);
         }
 
@@ -671,7 +787,10 @@ impl ReadOnlyFilesystem {
             .resources
             .get(&handle)
             .ok_or(AdapterError::BadHandle)?;
-        if resource.node != node || resource.backing.kind() != expected_kind {
+        if resource.node != node
+            || resource.access.kind() != expected_kind
+            || resource.backing.kind() != expected_kind
+        {
             return Err(AdapterError::BadHandle);
         }
         let object = resource.object.clone();
@@ -704,6 +823,21 @@ impl ReadOnlyFilesystem {
                 path,
             )),
         )
+    }
+
+    fn file_open_requests(&self, access: FileAccess, path: CanonicalPath) -> CapabilityRequestSet {
+        match access {
+            FileAccess::ReadOnly => {
+                CapabilityRequestSet::one(self.file_request(FileEffect::ReadData, path))
+            }
+            FileAccess::WriteOnly => {
+                CapabilityRequestSet::one(self.file_request(FileEffect::WriteData, path))
+            }
+            FileAccess::ReadWrite => CapabilityRequestSet::new(
+                self.file_request(FileEffect::ReadData, path.clone()),
+                [self.file_request(FileEffect::WriteData, path)],
+            ),
+        }
     }
 
     fn forget_node(&self, node: NodeId, count: u64) {
@@ -763,15 +897,17 @@ impl ReadOnlyFilesystem {
     }
 }
 
-impl Filesystem for ReadOnlyFilesystem {
+impl Filesystem for CapabilityFilesystem {
     fn init(&mut self, _request: &Request, config: &mut KernelConfig) -> io::Result<()> {
         config
-            .set_max_write(MAX_READ_SIZE)
+            .set_max_write(MAX_IO_SIZE)
             .map(|_| ())
             .map_err(|limit| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("FUSE kernel rejected {MAX_READ_SIZE}-byte request bound; maximum is {limit}"),
+                    format!(
+                        "FUSE kernel rejected {MAX_IO_SIZE}-byte request bound; maximum is {limit}"
+                    ),
                 )
             })
     }
@@ -901,6 +1037,34 @@ impl Filesystem for ReadOnlyFilesystem {
         }
     }
 
+    fn write(
+        &self,
+        _request: &Request,
+        node: INodeNo,
+        handle: FileHandle,
+        offset: u64,
+        data: &[u8],
+        write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let Some(node) = NodeId::new(node.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        if write_flags
+            .intersects(WriteFlags::FUSE_WRITE_CACHE | WriteFlags::FUSE_WRITE_KILL_SUIDGID)
+        {
+            reply.error(Errno::EPERM);
+            return;
+        }
+        match self.write_file(node, handle.0, offset, data) {
+            Ok(written) => reply.written(written),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
     fn release(
         &self,
         _request: &Request,
@@ -940,12 +1104,11 @@ impl Filesystem for ReadOnlyFilesystem {
     }
 }
 
-/// Returns the hardened mount configuration for [`ReadOnlyFilesystem`].
+/// Returns the hardened direct-I/O mount configuration for [`CapabilityFilesystem`].
 #[must_use]
 pub fn mount_config() -> Config {
     let mut config = Config::default();
     config.mount_options = vec![
-        MountOption::RO,
         MountOption::NoDev,
         MountOption::NoSuid,
         MountOption::NoExec,
@@ -959,7 +1122,7 @@ pub fn mount_config() -> Config {
     config
 }
 
-/// Mounts a read-only filesystem on a background session thread.
+/// Mounts a capability-enforcing filesystem on a background session thread.
 ///
 /// Dropping the returned session unmounts the filesystem.
 ///
@@ -968,7 +1131,7 @@ pub fn mount_config() -> Config {
 /// Returns an I/O error when the mount configuration, mountpoint, FUSE device,
 /// or userspace mount helper rejects the session.
 pub fn spawn_mount(
-    filesystem: ReadOnlyFilesystem,
+    filesystem: CapabilityFilesystem,
     mountpoint: impl AsRef<Path>,
 ) -> io::Result<BackgroundSession> {
     fuser::spawn_mount(filesystem, mountpoint, &mount_config())
@@ -1002,15 +1165,12 @@ const fn namespace_file_type(kind: NamespaceObjectKind) -> FileType {
 }
 
 fn validate_open_flags(flags: OpenFlags) -> Result<(), AdapterError> {
-    if flags.acc_mode() != OpenAccMode::O_RDONLY {
-        return Err(AdapterError::ReadOnly);
-    }
     let raw = u32::try_from(flags.0).map_err(|_| AdapterError::InvalidRequest)?;
     let flags = OFlags::from_bits_retain(raw);
     if flags.intersects(OFlags::APPEND | OFlags::CREATE | OFlags::EXCL | OFlags::TRUNC)
         || flags.contains(OFlags::TMPFILE)
     {
-        return Err(AdapterError::ReadOnly);
+        return Err(AdapterError::Unsupported);
     }
     Ok(())
 }
@@ -1072,8 +1232,8 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     use super::{
-        AdapterError, MountAuthority, MountInstanceId, NodeId, ReadOnlyFilesystem,
-        ReadOnlyFilesystemError,
+        AdapterError, CapabilityFilesystem, CapabilityFilesystemError, MountAuthority,
+        MountInstanceId, NodeId,
     };
     use crate::{
         backing::{ImportedRepository, PreflightLimits},
@@ -1086,7 +1246,7 @@ mod tests {
 
     fn test_filesystem() -> (
         TempDir,
-        ReadOnlyFilesystem,
+        CapabilityFilesystem,
         Arc<CapabilityKernel>,
         authority_core::capability::CapId,
     ) {
@@ -1097,7 +1257,22 @@ mod tests {
         authority_path: PathPattern,
     ) -> (
         TempDir,
-        ReadOnlyFilesystem,
+        CapabilityFilesystem,
+        Arc<CapabilityKernel>,
+        authority_core::capability::CapId,
+    ) {
+        test_filesystem_with_effects(
+            authority_path,
+            FileEffects::from_effects([FileEffect::ReadData, FileEffect::ListDirectory]),
+        )
+    }
+
+    fn test_filesystem_with_effects(
+        authority_path: PathPattern,
+        effects: FileEffects,
+    ) -> (
+        TempDir,
+        CapabilityFilesystem,
         Arc<CapabilityKernel>,
         authority_core::capability::CapId,
     ) {
@@ -1123,7 +1298,7 @@ mod tests {
             validity,
             AuthorityBody::File(FileAuthority::new(
                 repository.clone(),
-                FileEffects::from_effects([FileEffect::ReadData, FileEffect::ListDirectory]),
+                effects,
                 PathPattern::Prefix(CanonicalPath::root()),
             )),
         );
@@ -1139,7 +1314,7 @@ mod tests {
                 validity,
                 AuthorityBody::File(FileAuthority::new(
                     repository.clone(),
-                    FileEffects::from_effects([FileEffect::ReadData, FileEffect::ListDirectory]),
+                    effects,
                     authority_path,
                 )),
             ))
@@ -1150,7 +1325,7 @@ mod tests {
             capability.clone(),
             repository,
         );
-        let filesystem = ReadOnlyFilesystem::new(
+        let filesystem = CapabilityFilesystem::new(
             imported,
             Arc::clone(&kernel),
             authority,
@@ -1190,7 +1365,7 @@ mod tests {
 
         assert_eq!(
             filesystem.open_file(allowed.node, OpenFlags(1)),
-            Err(AdapterError::ReadOnly)
+            Err(AdapterError::AccessDenied)
         );
         let handle = filesystem
             .open_file(allowed.node, OpenFlags(0))
@@ -1225,6 +1400,149 @@ mod tests {
                 .map(|value| value.map(|record| record.open_handle_count())),
             Ok(Some(0))
         );
+    }
+
+    // Requirement: each positioned write checks WriteData at the object's
+    // current path and preserves every byte outside the requested range.
+    // Category: FUSE/authorization. Risk: critical.
+    #[test]
+    fn write_uses_a_writable_handle_and_current_path_authorization() {
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::only(FileEffect::WriteData),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("write authority must make its ancestor visible");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("write authority must make its target visible");
+        let handle = filesystem
+            .open_file(allowed.node, OpenFlags(1))
+            .expect("WriteData authority must open an O_WRONLY handle");
+
+        assert_eq!(
+            filesystem
+                .write_file(allowed.node, handle, 3, b"SAFE")
+                .expect("authorized positioned write must succeed"),
+            4
+        );
+        assert_eq!(
+            fs::read(directory.path().join("scoped/allowed.txt"))
+                .expect("backing content must remain readable in the test"),
+            b"capSAFEity"
+        );
+        assert_eq!(
+            filesystem.read_file(allowed.node, handle, 0, 1),
+            Err(AdapterError::BadHandle),
+            "an O_WRONLY handle must not gain read access from its backing descriptor"
+        );
+        filesystem
+            .release_file(allowed.node, handle)
+            .expect("writable handle must release normally");
+    }
+
+    // Requirement: revocation after OPEN prevents a later WRITE on the same
+    // descriptor. Category: FUSE/revocation. Risk: critical.
+    #[test]
+    fn every_write_reauthorizes_an_existing_writable_handle() {
+        let (directory, filesystem, kernel, capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::only(FileEffect::WriteData),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("authorized directory must resolve");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("authorized file must resolve");
+        let handle = filesystem
+            .open_file(allowed.node, OpenFlags(1))
+            .expect("initial O_WRONLY open must succeed");
+
+        assert_eq!(
+            filesystem
+                .write_file(allowed.node, handle, 0, b"C")
+                .expect("write before revoke must succeed"),
+            1
+        );
+        kernel
+            .revoke(&capability)
+            .expect("test capability must be revocable");
+        assert_eq!(
+            filesystem.write_file(allowed.node, handle, 1, b"X"),
+            Err(AdapterError::AccessDenied)
+        );
+        assert_eq!(
+            fs::read(directory.path().join("scoped/allowed.txt"))
+                .expect("test backing file must remain readable"),
+            b"Capability"
+        );
+        filesystem
+            .release_file(allowed.node, handle)
+            .expect("revocation must not prevent writable handle release");
+    }
+
+    // Requirement: O_RDWR requires both effects, not merely a writable
+    // backing descriptor. Category: FUSE/least privilege. Risk: critical.
+    #[test]
+    fn read_write_open_requires_read_and_write_authority() {
+        let (_directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::only(FileEffect::WriteData),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("write authority must make its ancestor visible");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("write authority must make its target visible");
+
+        assert_eq!(
+            filesystem.open_file(allowed.node, OpenFlags(2)),
+            Err(AdapterError::AccessDenied)
+        );
+    }
+
+    // Requirement: an O_RDWR handle uses the compound OPEN authorization but
+    // still reauthorizes each later data operation. Category: FUSE/access.
+    // Risk: critical.
+    #[test]
+    fn read_write_handle_serves_both_data_operations() {
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::from_effects([FileEffect::ReadData, FileEffect::WriteData]),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("read/write authority must make its ancestor visible");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("read/write authority must make its target visible");
+        let handle = filesystem
+            .open_file(allowed.node, OpenFlags(2))
+            .expect("both effects must authorize an O_RDWR open");
+
+        assert_eq!(
+            filesystem
+                .read_file(allowed.node, handle, 0, 3)
+                .expect("O_RDWR handle must permit reads"),
+            b"cap"
+        );
+        assert_eq!(
+            filesystem
+                .write_file(allowed.node, handle, 3, b"SAFE")
+                .expect("O_RDWR handle must permit writes"),
+            4
+        );
+        assert_eq!(
+            fs::read(directory.path().join("scoped/allowed.txt"))
+                .expect("test backing file must remain readable"),
+            b"capSAFEity"
+        );
+        filesystem
+            .release_file(allowed.node, handle)
+            .expect("O_RDWR handle must release normally");
     }
 
     #[test]
@@ -1390,7 +1708,7 @@ mod tests {
         let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
             "issuer",
         ))));
-        let error = ReadOnlyFilesystem::new(
+        let error = CapabilityFilesystem::new(
             imported,
             kernel,
             MountAuthority::new(
@@ -1405,7 +1723,7 @@ mod tests {
 
         assert_eq!(
             error,
-            ReadOnlyFilesystemError::RepositoryMismatch {
+            CapabilityFilesystemError::RepositoryMismatch {
                 imported: RepoId::new("imported-repository"),
                 authority: RepoId::new("authority-repository"),
             }

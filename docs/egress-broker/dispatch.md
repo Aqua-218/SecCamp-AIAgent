@@ -90,53 +90,67 @@ if self.budget.complete(request_id, effect.response_bytes()).is_err() {
 
 計上しないと `committed_response_bytes` が増えず、`max_response_bytes` が session 合計ではなく 1 request の上限に退化する。
 
-## 既知の欠陥: `RetryableBudget` の cache が置き換わらない
+## 完全一致 retry が adapter を再実行しない仕組み
 
-**現在の実装には、外部副作用が retry のたびに再実行される経路がある。**
+`dispatch_frame` は `New` 分岐でも `Duplicate` 分岐でも、`dispatch_new` の結果を `outcomes` に書き戻す。
 
-`dispatch_frame` は `New` 分岐では必ず `outcomes` に書き戻すが、`Duplicate` 分岐では `dispatch_new` が `Some(cached)` を返したときしか書き戻さない。そして `dispatch_new` は次の 3 つで `None` を返す。
+```rust
+self.outcomes.insert(
+    envelope.request(),
+    cached.unwrap_or_else(|| CachedOutcome::Final(response.clone())),
+);
+```
 
-- 成功
-- executor の全 error
-- `AccountingInvariant`
+`dispatch_new` が `Some(CachedOutcome::RetryableBudget(_))` を返すのは、一時的な budget 拒否のときだけ。成功、executor の error、`AccountingInvariant` はいずれも `None` を返し、その場合は `Final` として確定する。
 
-したがって、いったん `CachedOutcome::RetryableBudget` が入った entry は、二度と `Final` に置き換わらない。以降の完全一致 retry はすべて `dispatch_new` に再入し、adapter を呼び直す。
+**両分岐で同じ書き戻しをすることが要点。** `Duplicate` 分岐だけ「`Some` のときだけ書き戻す」形にすると、いったん `RetryableBudget` になった entry が二度と `Final` に置き換わらず、以降の完全一致 retry がすべて adapter を再実行する。`CreatePullRequest` なら retry 1 回につき pull request 1 つになる。実際にその欠陥があり、`dispatcher_retries_transient_budget_denial_without_double_charging` が 3 回目の dispatch で cache から返ることを固定している。
 
-調査時の実測では、一時的な `ConcurrentRequestLimitReached` の後、2 回目と 3 回目の同一 frame が両方とも `Succeeded` を返し、`started_requests()` が 3 に達した。`BrokerOperation::GitHub(CreatePullRequest)` なら retry 1 回につき pull request 1 つになる。
+## 監査の失敗を認可拒否と混ぜない
 
-module doc の「完全一致 retry が adapter を再度呼ぶことはない」という記述と食い違う。修正は `New` 分岐が既に行っている書き戻しを `Duplicate` 分岐にも入れることで、2 つの分岐は同期していなければならない。
+executor の失敗は 5 種類に分かれ、そのうち 2 つは「外部副作用が起きたかどうか」が違う。
+
+| `ExecutorError` | 副作用 | budget | rejection |
+|---|---|---|---|
+| `NotAuthorized` | 起きていない | abort | `NotAuthorized` |
+| `AuditUnavailable` | 起きていない（attempt を journal できず executor を呼んでいない） | abort | `AuditUnavailable` |
+| `LockPoisoned` | 起きていない | abort | `AuditUnavailable` |
+| `CommittedButUnrecorded` | **起きた可能性がある** | 予約額を計上 | `CommittedButUnrecorded` |
+| `Adapter(_)` | 線形化点の前に失敗 | abort | adapter ごとの型付き rejection |
+
+`CommittedButUnrecorded` は kernel の `EffectCommitError::CommittedButAudit` に対応する。kernel はこれを「executor は成功したが terminal な durable receipt を永続化できなかった。外部副作用は既に存在しうるので、呼び出し側は provider の冪等性か reconciliation で解決すること」と定義している。
+
+したがって、これを `NotAuthorized` として返してはいけない。作成された pull request が「認可されなかった」と報告される。budget も abort しない。副作用が起きた分の byte を解放すると、guest が同じ量を二度使える。予約額をそのまま計上する。
+
+[server](server.md) はこの rejection でも connection を閉じる。`AccountingInvariant` と同じく、operator が provider と突き合わせる必要がある状態だから。
+
+## 時刻は request ごとに読む
+
+`serve_connection` は caller / capability の identity と clock を別々に受け取り、request ごとに `DispatchContext` を作り直す。1 connection で 1 つの時刻を使い回すと、connection の途中で `TimeWindow` が閉じた capability が最後まで認可を通る。
 
 ## その他の既知の問題
-
-**`CommittedButAudit` が `NotAuthorized` になる。** kernel は `EffectCommitError::CommittedButAudit(_)` を「executor は成功したが terminal な durable receipt を永続化できなかった。外部副作用は既に存在しうるので、呼び出し側は provider の冪等性か reconciliation で解決すること」と定義している。dispatcher はこれを `ExecutorError::LockPoisoned` に写し、`BrokerRejection::NotAuthorized` として返す。しかも `budget.abort` を呼ぶ。**作成された pull request が「認可されなかった」として報告され、その byte が計上されない。**
-
-**lock poisoning が見えない。** `ExecutorError::LockPoisoned`（kernel の writer が panic した）と `EffectCommitError::Audit(_)`（attempt すら journal できなかった）も `NotAuthorized` に潰れる。poisoned lock の後も session は動き続け、host には通常の認可拒否としか見えない。別の rejection を足すには `dispatch.rs`、`server.rs`、`egress-protocol` の `BrokerWireRejection` を同時に直す必要がある。
-
-**`context.now` が connection ごとに 1 回しか取られない。** `serve_connection` は同じ `&DispatchContext` を `max_requests` 回渡し、`dispatch_new` はそれで毎回 `CapabilityRequest` を作る。connection の途中で `TimeWindow` が切れた capability が、その connection の最後まで認可を通す。
 
 **HEAD が byte 予算を消費しない。** `BrokerEffect::response_bytes()` は public fetch で `response.body.len()` を返し、HEAD の応答は常に空。`start` で `max_response_bytes` を予約し、`complete` で 0 を計上する。HEAD は `max_requests` と並行 slot だけに縛られる。
 
 **GitHub の byte 数は adapter の自己申告。** `response.response_bytes` をそのまま使う。検証するのは `TypedGitHubAdapter` だけで、別の `GitHubAdapter` 実装は過少申告できる。trait の signature には、この field が accounting の入力であることを示すものが無い。
 
-**`dispatch_transport` が frame を 2 度触る。** `FramedTransport::read_frame` が検証した `ControlFrame` を `encode()` し直し、`decode_complete` で読み直す。1 request あたり最大 1 MiB の copy が 2 回増える。しかも `decode_complete` の doc は「buffered test input 用であり、確保順序の代わりにはならない」と述べている。`server.rs` も同じことをする。
+**`dispatch_transport` が frame を 2 度触る。** `FramedTransport::read_frame` が検証した `ControlFrame` を `encode()` し直し、`decode_complete` で読み直す。1 request あたり最大 1 MiB の copy が 2 回増える。`server.rs` も同じことをする。
 
 ## 正確な保証範囲
 
 - adapter はすべて trait 越し。fake resolver / connector / provider を注入した module test で検証している。
 - 実 `AF_VSOCK`、外部 DNS / HTTPS、実 GitHub API は未検証。
-- 上に挙げた `RetryableBudget` の再実行は実測で確認済みだが、修正されていない。
-- `CommittedButAudit` の扱いは kernel の契約と食い違っている。reconciliation の経路は無い。
+- `CommittedButUnrecorded` を返した後の reconciliation 経路は、この crate に無い。rejection として区別するところまでで、provider との突き合わせは運用側の責務。
 - GitHub の byte 自己申告を悪用する第三者 adapter 実装は、この crate では防げない。
 
 ## 変更時の確認点
 
-- `Duplicate` 分岐と `New` 分岐の cache 書き戻しを揃える。現在ずれているのが上記の欠陥。
+- `Duplicate` 分岐と `New` 分岐の cache 書き戻しを揃えたままにする。片方を「`Some` のときだけ」に戻すと、retry が adapter を再実行する。
 - `budget.complete` の失敗と直後の `abort` は必ず対で置く。`complete` が失敗しても予約は解放されない。
 - `budget.start` を `executor.execute` の後ろへ動かさない。
 - adapter の選択を tuple match 以外に変えない。arm 漏れが panic か誤 adapter になる。
 - `MAX_GITHUB_RESPONSE_BYTES` を上げるときは `SessionBudgetLimits::max_response_bytes` も上げる。上げないと全 GitHub request が `budget.start` で `ResponseBytesExhausted` になる。clamp は `dispatch.rs` と `github.rs` の 3 箇所にあり、揃えて直す。
-- `DispatchContext` に clock を持たせる変更は、`server.rs` を同時に直さないと compile が通らない。
-- rejection の種類を増やすときは `dispatch.rs`、`server.rs`、`BrokerWireRejection` の 3 箇所を同時に直す。
+- rejection の種類を増やすときは `dispatch.rs`、`server.rs`、`BrokerWireRejection` の 3 箇所を同時に直す。wire の code は追記のみで、既存の番号を再割り当てしない。
+- `CommittedButUnrecorded` の budget 処理を abort に変えない。副作用が起きた分の byte を guest が二度使える。
 
 ## 関連
 

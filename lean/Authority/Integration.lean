@@ -72,22 +72,21 @@ theorem mayRemove_excludes_live_authority_handles
   exact wellFormed.zero_count_excludes_authority_handle
     allowed.objectLookup allowed.noOpenHandles
 
-/-- A namespace rename precondition excludes every live Authority handle. -/
-theorem mayRename_excludes_all_live_authority_handles
+/-- A rename excludes live Authority handles exactly in the moved subtree. -/
+theorem mayRename_excludes_live_authority_handles_in_subtree
     {state : IntegratedHandleState} (wellFormed : state.WellFormed)
     {pathMapping : NamespaceState.PathRenaming}
     (allowed : state.namespaceState.MayRename pathMapping) :
-    ∀ handleId, state.authority.openHandles handleId = none := by
-  intro handleId
-  cases handleLookup : state.authority.openHandles handleId with
-  | none => rfl
-  | some handle =>
-      rcases wellFormed.everyHandleHasLiveObject handleId handle handleLookup with
-        ⟨object, objectLookup⟩
-      have closedCount := allowed.allHandlesClosed handle.object object objectLookup
-      have handleExcluded := wellFormed.zero_count_excludes_authority_handle
-        objectLookup closedCount handleId handle handleLookup
-      exact False.elim (handleExcluded rfl)
+    ∀ objectId object,
+      state.namespaceState.objects objectId = some object →
+      NamespaceState.AtOrBelow object.path pathMapping.source →
+      ∀ handleId handle,
+        state.authority.openHandles handleId = some handle →
+        handle.object ≠ objectId := by
+  intro objectId object objectLookup inMovedSubtree
+  have closedCount := allowed.movedHandlesClosed objectId object
+    objectLookup inMovedSubtree
+  exact wellFormed.zero_count_excludes_authority_handle objectLookup closedCount
 
 /-- A live handle forces the corresponding namespace count to be positive. -/
 theorem WellFormed.live_handle_implies_positive_count

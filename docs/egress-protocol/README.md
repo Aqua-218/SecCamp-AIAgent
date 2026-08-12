@@ -10,6 +10,48 @@
 
 purely な状態機械として書いてあるので、clock も lock も持たない。実際の I/O、outcome の cache、呼び出し順序は [egress-broker](../egress-broker/README.md) が持つ。
 
+## crate の構造
+
+```mermaid
+flowchart LR
+    guestside["guest supervisor"]
+    hostside["egress-broker"]
+
+    subgraph ep["egress-protocol（純粋な状態機械）"]
+        direction TB
+        subgraph wire["wire の形"]
+            direction LR
+            frame["frame<br/>4 bytes prefix / 1 MiB"]
+            cbor["cbor<br/>canonical v1 schema"]
+            op["operation<br/>閉じた union"]
+            resp["response<br/>型付き応答"]
+        end
+        subgraph admit["受理の判定"]
+            direction LR
+            sess["session<br/>sequence / request ID<br/>payload hash"]
+            budget["budget<br/>request 数 / byte / 並行数"]
+        end
+    end
+
+    ac["authority-core<br/>CapabilityRequest"]
+
+    guestside ==>|"encode"| frame
+    frame --> cbor
+    cbor --> op
+    op --> sess
+    sess --> budget
+    budget ==>|"認可へ"| hostside
+    hostside ==>|"型付き応答"| resp
+    op -.->|"capability_request_at"| ac
+
+    classDef host fill:#1565c0,color:#fff,stroke:#0d47a1;
+    classDef external fill:#616161,color:#fff,stroke:#424242;
+    class ep,frame,cbor,op,resp,sess,budget host;
+    class guestside,hostside,ac external;
+```
+
+socket も HTTP も credential も持たない。実際の I/O、outcome の cache、呼び出し順序は [egress-broker](../egress-broker/README.md) が持つ。
+
 ## この crate が決めること
 
 | 決めること | 対象ソース |

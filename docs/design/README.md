@@ -116,7 +116,7 @@ flowchart LR
 | `runtime-isolation` | policy validation、`LinuxBackend`、13 段階の ordered apply/rollback | mock backend test、host capability detection | privileged isolation apply、workload 実行中の escape test は未検証 |
 | `firecracker-runtime` | artifact pin、dm-verity/jailer/API 順序、workspace、snapshot/restore、identity/workload gate | fake boundary test、local Unix socket HTTP exchange | 実 Firecracker/jailer/dm-verity/guest kernel/VM は未検証 |
 | `supervisor` | connection-to-subject binding、bounded wire protocol、subject/handle lifecycle | `CapabilityKernel` + `FakeResources` による test | Linux namespace/cgroup/mount、実 socket、guest supervisor は未検証 |
-| `session-orchestrator` | 128-bit identity ledger、lease binding、startup/rollback/stop state machine | mock backend による contract/state-machine test | production backend 接続、process 外 durable identity allocator、実 VM は未検証 |
+| `session-orchestrator` | durable 128-bit identity ledger、lease binding、Authority/Broker/Firecracker/workspace production adapter | mock state-machine test、test-double 境界までの production adapter composition | 実 command/filesystem/vsock、guest capfs/isolation、実 VM は未検証 |
 
 この表の「実装済み」は、該当 crate の API と実装が repository にあることを意味する。「mock/contract 検証済み」は、特権 kernel、外部 network、provider、実 VM を通っていない test の結果である。
 

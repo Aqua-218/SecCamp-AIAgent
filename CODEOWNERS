@@ -1,0 +1,7 @@
+# Pipeline and supply-chain changes require an explicit repository-owner review.
+/.github/ @Aqua-218
+/.gitlab/ @Aqua-218
+/.gitlab-ci.yml @Aqua-218
+/scripts/ci/ @Aqua-218
+/deny.toml @Aqua-218
+/.semgrep.yml @Aqua-218

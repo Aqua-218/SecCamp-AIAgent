@@ -7,6 +7,7 @@ mod implementation {
         fs, io,
         os::fd::RawFd,
         os::unix::ffi::OsStrExt,
+        os::unix::fs::MetadataExt,
         path::{Path, PathBuf},
     };
 
@@ -74,6 +75,26 @@ mod implementation {
     const SECCOMP_DATA_MMAP_FLAGS_OFFSET: u32 = 16 + (3 * 8);
     const MAP_SHARED_FLAG: u32 = libc::MAP_SHARED as u32;
     const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const CURRENT_PID_NAMESPACE: &str = "/proc/self/ns/pid";
+    const PID_NAMESPACE_FOR_CHILDREN: &str = "/proc/self/ns/pid_for_children";
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct NamespaceIdentity {
+        device: u64,
+        inode: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct PidNamespaceObservation {
+        current: NamespaceIdentity,
+        for_children: NamespaceIdentity,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct PidNamespaceHandoff {
+        parent: NamespaceIdentity,
+        child: NamespaceIdentity,
+    }
 
     #[repr(C)]
     struct LandlockRulesetAttr {
@@ -426,6 +447,12 @@ mod implementation {
     }
 
     fn create_namespaces(step: IsolationStep) -> Result<(), BackendError> {
+        let handoff = prepare_namespaces(step)?;
+        verify_pid_namespace_child_entry(step, handoff)
+    }
+
+    fn prepare_namespaces(step: IsolationStep) -> Result<PidNamespaceHandoff, BackendError> {
+        let before = observe_pid_namespaces(step)?;
         let flags = libc::CLONE_NEWUSER
             | libc::CLONE_NEWNS
             | libc::CLONE_NEWPID
@@ -436,10 +463,65 @@ mod implementation {
         // SAFETY: `flags` is a fixed allowlisted set and no pointer crosses the FFI boundary.
         let result = unsafe { libc::unshare(flags) };
         if result == -1 {
-            Err(last_error(step, "unshare required namespaces"))
-        } else {
-            Ok(())
+            return Err(last_error(step, "unshare required namespaces"));
         }
+
+        let prepared = observe_pid_namespaces(step)?;
+        if prepared.current != before.current {
+            return Err(BackendError::new(
+                step,
+                "PID namespace preparation unexpectedly moved the calling process; terminate it",
+                None,
+            ));
+        }
+        if prepared.for_children == prepared.current {
+            return Err(BackendError::new(
+                step,
+                "PID namespace preparation did not create a distinct namespace for the next child; terminate the process",
+                None,
+            ));
+        }
+
+        Ok(PidNamespaceHandoff {
+            parent: prepared.current,
+            child: prepared.for_children,
+        })
+    }
+
+    fn verify_pid_namespace_child_entry(
+        step: IsolationStep,
+        handoff: PidNamespaceHandoff,
+    ) -> Result<(), BackendError> {
+        validate_pid_namespace_child_entry(step, handoff, observe_pid_namespaces(step)?)
+    }
+
+    fn validate_pid_namespace_child_entry(
+        step: IsolationStep,
+        handoff: PidNamespaceHandoff,
+        observed: PidNamespaceObservation,
+    ) -> Result<(), BackendError> {
+        if observed.current == handoff.parent {
+            return Err(BackendError::new(
+                step,
+                "PID namespace is prepared only for the next child, but no child handoff occurred; refusing to report namespace isolation complete",
+                None,
+            ));
+        }
+        if observed.current != handoff.child {
+            return Err(BackendError::new(
+                step,
+                "workload child entered an unexpected PID namespace; refusing to report namespace isolation complete",
+                None,
+            ));
+        }
+        if observed.for_children != observed.current {
+            return Err(BackendError::new(
+                step,
+                "workload child has a different pending PID namespace for descendants; refusing to report namespace isolation complete",
+                None,
+            ));
+        }
+        Ok(())
     }
 
     fn make_mounts_private(step: IsolationStep) -> Result<(), BackendError> {
@@ -1016,6 +1098,27 @@ mod implementation {
         unsafe { libc::access(path.as_ptr(), mode) == 0 }
     }
 
+    fn observe_pid_namespaces(
+        step: IsolationStep,
+    ) -> Result<PidNamespaceObservation, BackendError> {
+        Ok(PidNamespaceObservation {
+            current: namespace_identity(step, Path::new(CURRENT_PID_NAMESPACE))?,
+            for_children: namespace_identity(step, Path::new(PID_NAMESPACE_FOR_CHILDREN))?,
+        })
+    }
+
+    fn namespace_identity(
+        step: IsolationStep,
+        path: &Path,
+    ) -> Result<NamespaceIdentity, BackendError> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| io_error(step, "observe PID namespace identity", &error))?;
+        Ok(NamespaceIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
     fn errno() -> i32 {
         // SAFETY: libc exposes the calling thread's errno cell.
         unsafe { *libc::__errno_location() }
@@ -1097,6 +1200,92 @@ mod implementation {
                 0,
                 "workspace rename enforcement requires REFER to be handled and allowed"
             );
+        }
+
+        #[test]
+        fn pid_namespace_identity_is_observable_without_privilege() {
+            let observation = observe_pid_namespaces(IsolationStep::Namespaces)
+                .expect("procfs namespace links must be observable");
+
+            assert_ne!(observation.current.inode, 0);
+            assert_ne!(observation.for_children.inode, 0);
+            assert_eq!(
+                observation.current,
+                namespace_identity(IsolationStep::Namespaces, Path::new(CURRENT_PID_NAMESPACE))
+                    .expect("current PID namespace must remain observable")
+            );
+        }
+
+        #[test]
+        fn pid_namespace_verification_rejects_missing_child_handoff() {
+            let parent = NamespaceIdentity {
+                device: 4,
+                inode: 10,
+            };
+            let child = NamespaceIdentity {
+                device: 4,
+                inode: 11,
+            };
+            let error = validate_pid_namespace_child_entry(
+                IsolationStep::Namespaces,
+                PidNamespaceHandoff { parent, child },
+                PidNamespaceObservation {
+                    current: parent,
+                    for_children: child,
+                },
+            )
+            .expect_err("the namespace-preparing parent must not pass child verification");
+
+            assert!(error.message.contains("no child handoff occurred"));
+        }
+
+        #[test]
+        fn pid_namespace_verification_accepts_the_expected_child() {
+            let parent = NamespaceIdentity {
+                device: 4,
+                inode: 10,
+            };
+            let child = NamespaceIdentity {
+                device: 4,
+                inode: 11,
+            };
+
+            validate_pid_namespace_child_entry(
+                IsolationStep::Namespaces,
+                PidNamespaceHandoff { parent, child },
+                PidNamespaceObservation {
+                    current: child,
+                    for_children: child,
+                },
+            )
+            .expect("the expected PID namespace child must pass verification");
+        }
+
+        #[test]
+        fn pid_namespace_verification_rejects_a_nested_pending_namespace() {
+            let parent = NamespaceIdentity {
+                device: 4,
+                inode: 10,
+            };
+            let child = NamespaceIdentity {
+                device: 4,
+                inode: 11,
+            };
+            let nested = NamespaceIdentity {
+                device: 4,
+                inode: 12,
+            };
+            let error = validate_pid_namespace_child_entry(
+                IsolationStep::Namespaces,
+                PidNamespaceHandoff { parent, child },
+                PidNamespaceObservation {
+                    current: child,
+                    for_children: nested,
+                },
+            )
+            .expect_err("a second pending PID namespace must fail verification");
+
+            assert!(error.message.contains("different pending PID namespace"));
         }
     }
 }

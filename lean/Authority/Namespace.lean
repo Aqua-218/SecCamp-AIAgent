@@ -19,12 +19,105 @@ instance : DecidableEq CanonicalPath := fun first second => by
   simp only [CanonicalPath.mk.injEq]
   infer_instance
 
+private instance stringLtIrrefl : Std.Irrefl ((· < ·) : String → String → Prop) :=
+  ⟨String.lt_irrefl⟩
+
+private instance stringLtAsymm : Std.Asymm ((· < ·) : String → String → Prop) :=
+  ⟨fun _ _ => String.lt_asymm⟩
+
+private instance stringLtTrans : Trans ((· < ·) : String → String → Prop)
+    (· < ·) (· < ·) :=
+  ⟨String.lt_trans⟩
+
+private instance stringLeTotal : Std.Total (fun first second : String => ¬ second < first) :=
+  ⟨String.le_total⟩
+
+private instance stringLeTrans : Trans (fun first second : String => ¬ second < first)
+    (fun first second => ¬ second < first)
+    (fun first second => ¬ second < first) :=
+  ⟨String.le_trans⟩
+
+private instance stringLeAntisymm : Std.Antisymm
+    (fun first second : String => ¬ second < first) :=
+  ⟨fun _ _ => String.le_antisymm⟩
+
+private instance stringNotLtTotal : Std.Total (fun first second : String => ¬ first < second) :=
+  ⟨fun first second => (String.le_total first second).symm⟩
+
+private instance stringNotLtTrans : Trans (fun first second : String => ¬ first < second)
+    (fun first second => ¬ first < second)
+    (fun first second => ¬ first < second) :=
+  ⟨fun firstNotLtSecond secondNotLtThird =>
+    String.le_trans secondNotLtThird firstNotLtSecond⟩
+
+private instance stringNotLtAntisymm : Std.Antisymm
+    (fun first second : String => ¬ first < second) :=
+  ⟨fun _ _ firstNotLtSecond secondNotLtFirst =>
+    String.le_antisymm secondNotLtFirst firstNotLtSecond⟩
+
 /-- Object kinds accepted by the capability namespace. -/
 inductive NamespaceObjectKind where
   | directory
   | regularFile
   | symlink
   deriving Repr, BEq, DecidableEq
+
+/-- Rust's maximum stored symbolic-link body, matching `MAX_SYMLINK_TARGET_BYTES`. -/
+def maxSymlinkTargetBytes : Nat := 4096
+
+/-- Parse normalized target components while rejecting `..` after a named segment. -/
+private def parseSymlinkComponents : List String → Nat → List String →
+    Option (Nat × List String)
+  | [], parents, segments => some (parents, segments)
+  | component :: remaining, parents, segments =>
+      if component = "" ∨ component = "." then
+        parseSymlinkComponents remaining parents segments
+      else if component = ".." then
+        if segments.isEmpty then
+          parseSymlinkComponents remaining (parents + 1) segments
+        else
+          none
+      else if isValidPathSegment component then
+        parseSymlinkComponents remaining parents (segments ++ [component])
+      else
+        none
+
+/-- Executable parser corresponding to Rust's `SymlinkTarget::new`. -/
+def parseSymlinkTarget (literal : String) : Option (Nat × List String) :=
+  if literal = "" then
+    none
+  else if maxSymlinkTargetBytes < literal.utf8ByteSize then
+    none
+  else if literal.startsWith "/" then
+    none
+  else if literal.contains '\x00' then
+    none
+  else
+    parseSymlinkComponents (literal.splitOn "/") 0 []
+
+/-- A symbolic-link body whose cached normalization is exactly parser-derived. -/
+structure SymlinkTarget where
+  literal : String
+  parents : Nat
+  segments : List String
+  parsed : parseSymlinkTarget literal = some (parents, segments)
+  deriving DecidableEq
+
+namespace SymlinkTarget
+
+/-- A parsed target resolves from a link name to this canonical repository path. -/
+def ResolvesFrom (target : SymlinkTarget) (link resolved : CanonicalPath) : Prop :=
+  ∃ parentSegments finalName,
+    link.segments = parentSegments ++ [finalName] ∧
+      target.parents ≤ parentSegments.length ∧
+      resolved.segments =
+        parentSegments.take (parentSegments.length - target.parents) ++ target.segments
+
+/-- The link body stays inside the repository when interpreted from this name. -/
+def ContainedAt (target : SymlinkTarget) (link : CanonicalPath) : Prop :=
+  ∃ resolved, target.ResolvesFrom link resolved
+
+end SymlinkTarget
 
 /-- Current record for one live namespace object. -/
 structure NamespaceObject where
@@ -35,8 +128,8 @@ structure NamespaceObject where
   openHandleCount : Nat
   /-- Every live hard-link name, including `path`; finite by construction. -/
   aliases : List CanonicalPath := [path]
-  /-- A validated repository-relative target exists exactly for symlinks. -/
-  symlinkTarget : Option CanonicalPath := none
+  /-- A parsed repository-relative target exists exactly for symlinks. -/
+  symlinkTarget : Option SymlinkTarget := none
   deriving DecidableEq
 
 namespace NamespaceObject
@@ -54,6 +147,12 @@ def TargetWellFormed (object : NamespaceObject) : Prop :=
 /-- Complete per-object shape imported from Rust's manifest records. -/
 def ShapeWellFormed (object : NamespaceObject) : Prop :=
   object.AliasesWellFormed ∧ object.TargetWellFormed
+
+/-- Rust answers `READLINK` only when one literal remains contained from every alias. -/
+def CanReadSymlink (object : NamespaceObject) : Prop :=
+  ∃ target,
+    object.symlinkTarget = some target ∧
+      ∀ alias, alias ∈ object.aliases → target.ContainedAt alias
 
 /-- A primary-only object remains a valid singleton alias set. -/
 theorem singleton_aliases_wellFormed (object : NamespaceObject)
@@ -260,6 +359,10 @@ structure AliasWellFormed (state : NamespaceState) : Prop where
   pathToAlias : ∀ path objectId,
     state.paths path = some objectId →
       ∃ object, state.objects objectId = some object ∧ path ∈ object.aliases
+  /-- Rust selects the lexicographically least live name as the backing representative. -/
+  representativeLeast : ∀ objectId object path,
+    state.objects objectId = some object →
+      path ∈ object.aliases → object.path.segments ≤ path.segments
   liveWasIssued : ∀ objectId object,
     state.objects objectId = some object → state.issuedObjects objectId = true
 
@@ -324,7 +427,7 @@ theorem withRoot_wellFormed (rootId : ObjectId) : (withRoot rootId).WellFormed :
 /-- The singleton root indexes exactly its singleton alias set. -/
 theorem withRoot_aliasWellFormed (rootId : ObjectId) :
     (withRoot rootId).AliasWellFormed := by
-  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro objectId object objectLookup
     exact (withRoot_wellFormed rootId).objectToPath objectId object objectLookup |>.1
   · intro objectId object objectLookup
@@ -350,6 +453,15 @@ theorem withRoot_aliasWellFormed (rootId : ObjectId) :
       subst objectId
       exact ⟨rootObject rootId, by simp [withRoot, replace], by simp [rootObject]⟩
     · simp [withRoot, replace, samePath] at pathLookup
+  · intro objectId object path objectLookup pathMember
+    by_cases sameId : objectId = rootId
+    · subst objectId
+      simp [withRoot, replace] at objectLookup
+      subst object
+      simp [rootObject] at pathMember
+      subst path
+      exact List.lt_irrefl _
+    · simp [withRoot, replace, sameId] at objectLookup
   · intro objectId object objectLookup
     exact (withRoot_wellFormed rootId).liveWasIssued objectId object objectLookup
 
@@ -624,7 +736,54 @@ theorem create_preserves_treeWellFormed {state : NamespaceState}
 /-- Add one name to a live object's finite alias set. -/
 def withAddedAlias (object : NamespaceObject) (alias : CanonicalPath) :
     NamespaceObject :=
-  { object with aliases := object.aliases ++ [alias] }
+  if alias.segments < object.path.segments then
+    { object with path := alias, aliases := object.aliases ++ [alias] }
+  else
+    { object with aliases := object.aliases ++ [alias] }
+
+@[simp]
+theorem withAddedAlias_id (object : NamespaceObject) (alias : CanonicalPath) :
+    (withAddedAlias object alias).id = object.id := by
+  by_cases earlier : alias.segments < object.path.segments <;>
+    simp [withAddedAlias, earlier]
+
+@[simp]
+theorem withAddedAlias_aliases (object : NamespaceObject) (alias : CanonicalPath) :
+    (withAddedAlias object alias).aliases = object.aliases ++ [alias] := by
+  by_cases earlier : alias.segments < object.path.segments <;>
+    simp [withAddedAlias, earlier]
+
+@[simp]
+theorem withAddedAlias_kind (object : NamespaceObject) (alias : CanonicalPath) :
+    (withAddedAlias object alias).kind = object.kind := by
+  by_cases earlier : alias.segments < object.path.segments <;>
+    simp [withAddedAlias, earlier]
+
+@[simp]
+theorem withAddedAlias_openHandleCount (object : NamespaceObject)
+    (alias : CanonicalPath) :
+    (withAddedAlias object alias).openHandleCount = object.openHandleCount := by
+  by_cases earlier : alias.segments < object.path.segments <;>
+    simp [withAddedAlias, earlier]
+
+@[simp]
+theorem withAddedAlias_symlinkTarget (object : NamespaceObject)
+    (alias : CanonicalPath) :
+    (withAddedAlias object alias).symlinkTarget = object.symlinkTarget := by
+  by_cases earlier : alias.segments < object.path.segments <;>
+    simp [withAddedAlias, earlier]
+
+/-- Adding an earlier name deterministically promotes it to Rust's representative. -/
+theorem withAddedAlias_promotes_earlier (object : NamespaceObject)
+    (alias : CanonicalPath) (earlier : alias.segments < object.path.segments) :
+    (withAddedAlias object alias).path = alias := by
+  simp [withAddedAlias, earlier]
+
+/-- Adding a later name leaves Rust's existing representative unchanged. -/
+theorem withAddedAlias_retains_earlier (object : NamespaceObject)
+    (alias : CanonicalPath) (notEarlier : ¬ alias.segments < object.path.segments) :
+    (withAddedAlias object alias).path = object.path := by
+  simp [withAddedAlias, notEarlier]
 
 /-- Appending one fresh name preserves finite-set representation. -/
 private theorem nodup_append_singleton {items : List α} {item : α}
@@ -741,10 +900,11 @@ theorem addHardLink_preserves_completeWellFormed {state : NamespaceState}
             (queriedLookup.symm.trans (addHardLink_stores_object state objectId
               allowed.object alias))
           subst queriedObject
-          refine ⟨by simpa [updated, withAddedAlias] using targetIdentity, ?_⟩
-          change replace state.paths alias (some objectId) allowed.object.path =
-            some objectId
-          simp [replace, primaryNeAlias, primaryIndexed]
+          refine ⟨by simpa [updated] using targetIdentity, ?_⟩
+          by_cases earlier : alias.segments < allowed.object.path.segments
+          · simp [updated, withAddedAlias, earlier, addHardLink]
+          · simpa [updated, withAddedAlias, earlier, addHardLink, replace,
+              primaryNeAlias] using primaryIndexed
         · have oldLookup : state.objects queriedId = some queriedObject := by
             simpa [addHardLink, replace, target] using queriedLookup
           rcases allowed.complete.tree.indexes.objectToPath queriedId queriedObject
@@ -797,20 +957,27 @@ theorem addHardLink_preserves_completeWellFormed {state : NamespaceState}
           (queriedLookup.symm.trans (addHardLink_stores_object state objectId
             allowed.object alias))
         subst queriedObject
-        rcases allowed.complete.tree.parentDirectory objectId allowed.object
-          allowed.objectLookup (by simpa [updated, withAddedAlias] using notRoot) with
-          ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
-        have parentIdDiffers : parentId ≠ objectId := by
-          intro sameId
-          have sameParent : parent = allowed.object := Option.some.inj
-            (parentLookup.symm.trans (sameId ▸ allowed.objectLookup))
-          subst parent
-          exact directParent_irrefl allowed.object.path direct
-        exact ⟨parentId, parent,
-          by simpa [addHardLink, replace, parentIdDiffers] using parentLookup,
-          by simpa [addHardLink, replace,
-            allowed.ne_indexed_path parentPathLookup] using parentPathLookup,
-          parentKind, by simpa [updated, withAddedAlias] using direct⟩
+        by_cases earlier : alias.segments < allowed.object.path.segments
+        · exact ⟨allowed.parentId, allowed.parent,
+            by simpa [addHardLink, replace, parentIdNe] using allowed.parentLookup,
+            by simpa [addHardLink, replace, parentPathNeAlias] using
+              allowed.parentPathLookup,
+            allowed.parentIsDirectory,
+            by simpa [updated, withAddedAlias, earlier] using allowed.directChild⟩
+        · rcases allowed.complete.tree.parentDirectory objectId allowed.object
+            allowed.objectLookup (by simpa [updated, withAddedAlias, earlier] using notRoot) with
+            ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
+          have parentIdDiffers : parentId ≠ objectId := by
+            intro sameId
+            have sameParent : parent = allowed.object := Option.some.inj
+              (parentLookup.symm.trans (sameId ▸ allowed.objectLookup))
+            subst parent
+            exact directParent_irrefl allowed.object.path direct
+          exact ⟨parentId, parent,
+            by simpa [addHardLink, replace, parentIdDiffers] using parentLookup,
+            by simpa [addHardLink, replace,
+              allowed.ne_indexed_path parentPathLookup] using parentPathLookup,
+            parentKind, by simpa [updated, withAddedAlias, earlier] using direct⟩
       · have oldLookup : state.objects queriedId = some queriedObject := by
           simpa [addHardLink, replace, target] using queriedLookup
         rcases allowed.complete.tree.parentDirectory queriedId queriedObject
@@ -830,7 +997,7 @@ theorem addHardLink_preserves_completeWellFormed {state : NamespaceState}
             allowed.ne_indexed_path parentPathLookup] using parentPathLookup,
           parentKind, direct⟩
   · -- Exact aliases and object shape.
-    refine ⟨?_, ?_, ?_, ?_, ?_⟩
+    refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
     · intro queriedId queriedObject queriedLookup
       by_cases target : queriedId = objectId
       · subst queriedId
@@ -838,7 +1005,7 @@ theorem addHardLink_preserves_completeWellFormed {state : NamespaceState}
           (queriedLookup.symm.trans (addHardLink_stores_object state objectId
             allowed.object alias))
         subst queriedObject
-        simpa [updated, withAddedAlias] using targetIdentity
+        simpa [updated] using targetIdentity
       · exact allowed.complete.aliases.objectIdentity queriedId queriedObject
           (by simpa [addHardLink, replace, target] using queriedLookup)
     · intro queriedId queriedObject queriedLookup
@@ -850,11 +1017,17 @@ theorem addHardLink_preserves_completeWellFormed {state : NamespaceState}
         subst queriedObject
         rcases allowed.complete.aliases.objectShape objectId allowed.object
           allowed.objectLookup with ⟨⟨nodup, representative⟩, targetShape⟩
-        exact ⟨⟨by simpa [updated, withAddedAlias] using
+        exact ⟨⟨by simpa [updated] using
           nodup_append_singleton nodup aliasFresh,
-          by simpa [updated, withAddedAlias] using
-            List.mem_append_left [alias] representative⟩,
-          by simpa [updated, withAddedAlias] using targetShape⟩
+          by
+            by_cases earlier : alias.segments < allowed.object.path.segments
+            · simp [updated, withAddedAlias, earlier]
+            · simpa [updated, withAddedAlias, earlier] using
+                List.mem_append_left [alias] representative⟩,
+          by
+            by_cases earlier : alias.segments < allowed.object.path.segments <;>
+              simpa [updated, withAddedAlias, earlier,
+                NamespaceObject.TargetWellFormed] using targetShape⟩
       · exact allowed.complete.aliases.objectShape queriedId queriedObject
           (by simpa [addHardLink, replace, target] using queriedLookup)
     · intro queriedId queriedObject path queriedLookup member
@@ -864,7 +1037,7 @@ theorem addHardLink_preserves_completeWellFormed {state : NamespaceState}
           (queriedLookup.symm.trans (addHardLink_stores_object state objectId
             allowed.object alias))
         subst queriedObject
-        simp [updated, withAddedAlias] at member
+        simp [updated] at member
         rcases member with oldMember | rfl
         · have oldPath := allowed.complete.aliases.aliasToPath objectId
             allowed.object path allowed.objectLookup oldMember
@@ -883,7 +1056,7 @@ theorem addHardLink_preserves_completeWellFormed {state : NamespaceState}
             allowed.object alias))
         subst queriedId
         exact ⟨updated, addHardLink_stores_object state objectId allowed.object alias,
-          by simp [updated, withAddedAlias]⟩
+          by simp [updated]⟩
       · have oldPath : state.paths path = some queriedId := by
           simpa [addHardLink, replace, isAlias] using pathLookup
         rcases allowed.complete.aliases.pathToAlias path queriedId oldPath with
@@ -894,9 +1067,33 @@ theorem addHardLink_preserves_completeWellFormed {state : NamespaceState}
             (objectLookup.symm.trans allowed.objectLookup)
           subst object
           exact ⟨updated, addHardLink_stores_object state objectId
-            allowed.object alias, by simp [updated, withAddedAlias, member]⟩
+            allowed.object alias, by simp [updated, member]⟩
         · exact ⟨object, by simpa [addHardLink, replace, target] using objectLookup,
             member⟩
+    · intro queriedId queriedObject queriedPath queriedLookup member
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans (addHardLink_stores_object state objectId
+            allowed.object alias))
+        subst queriedObject
+        simp [updated] at member
+        rcases member with oldMember | rfl
+        · by_cases earlier : alias.segments < allowed.object.path.segments
+          · simpa [updated, withAddedAlias, earlier] using
+              List.le_trans (List.le_of_lt earlier)
+                (allowed.complete.aliases.representativeLeast objectId allowed.object
+                  queriedPath allowed.objectLookup oldMember)
+          · simpa [updated, withAddedAlias, earlier] using
+              allowed.complete.aliases.representativeLeast objectId allowed.object queriedPath
+                allowed.objectLookup oldMember
+        · by_cases earlier : queriedPath.segments < allowed.object.path.segments
+          · simp only [updated, withAddedAlias, if_pos earlier]
+            exact List.lt_irrefl _
+          · simp only [updated, withAddedAlias, if_neg earlier]
+            exact earlier
+      · exact allowed.complete.aliases.representativeLeast queriedId queriedObject queriedPath
+          (by simpa [addHardLink, replace, target] using queriedLookup) member
     · intro queriedId queriedObject queriedLookup
       by_cases target : queriedId = objectId
       · subst queriedId
@@ -912,7 +1109,7 @@ theorem addHardLink_preserves_completeWellFormed {state : NamespaceState}
           allowed.object alias))
       subst queriedObject
       have impossible : allowed.object.kind = .directory := by
-        simpa [updated, withAddedAlias] using isDirectory
+        simpa [updated] using isDirectory
       exact False.elim (allowed.sourceIsNotDirectory impossible)
     · exact allowed.complete.directorySingleton queriedId queriedObject
         (by simpa [addHardLink, replace, target] using queriedLookup) isDirectory
@@ -923,7 +1120,7 @@ theorem addHardLink_preserves_completeWellFormed {state : NamespaceState}
         (queriedLookup.symm.trans (addHardLink_stores_object state objectId
           allowed.object alias))
       subst queriedObject
-      simp [updated, withAddedAlias] at member
+      simp [updated] at member
       rcases member with oldMember | rfl
       · rcases allowed.complete.namedParentDirectory objectId allowed.object name
           allowed.objectLookup oldMember notRoot with
@@ -978,12 +1175,14 @@ structure MayUnlinkName (state : NamespaceState) (objectId : ObjectId)
   object : NamespaceObject
   objectLookup : state.objects objectId = some object
   sourceIsNotDirectory : object.kind ≠ .directory
-  noOpenHandles : object.openHandleCount = 0
   aliasIndexed : state.paths alias = some objectId
   newPrimary : CanonicalPath
   remaining : List CanonicalPath
   /-- This both selects the removed name and proves at least one name survives. -/
   partition : object.aliases.Perm (alias :: newPrimary :: remaining)
+  /-- Rust deterministically selects the least surviving name as representative. -/
+  newPrimaryLeast : ∀ path,
+    path ∈ newPrimary :: remaining → newPrimary.segments ≤ path.segments
   newPrimaryIndexed : state.paths newPrimary = some objectId
   newPrimaryNotRoot : newPrimary ≠ CanonicalPath.root
   parentId : ObjectId
@@ -1036,6 +1235,14 @@ theorem MayUnlinkName.alias_not_surviving {state : NamespaceState}
     allowed.objectLookup).1.1
   have partitionNodup := allowed.partition.nodup_iff.mp oldNodup
   exact (List.nodup_cons.mp partitionNodup).1
+
+/-- The unlink witness exposes Rust's deterministic least surviving name. -/
+theorem MayUnlinkName.newPrimary_isLeast {state : NamespaceState}
+    {objectId : ObjectId} {alias path : CanonicalPath}
+    (allowed : state.MayUnlinkName objectId alias)
+    (survives : path ∈ allowed.newPrimary :: allowed.remaining) :
+    allowed.newPrimary.segments ≤ path.segments :=
+  allowed.newPrimaryLeast path survives
 
 /-- The unlinked object cannot be its directory parent. -/
 theorem MayUnlinkName.parentId_ne {state : NamespaceState} {objectId : ObjectId}
@@ -1171,7 +1378,7 @@ theorem unlinkName_preserves_completeWellFormed {state : NamespaceState}
           by simpa [unlinkName, replace, parentIdDiffers] using parentLookup,
           by simpa [unlinkName, replace, parentPathDiffers] using parentPathLookup,
           parentKind, direct⟩
-  · refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
     · intro queriedId queriedObject queriedLookup
       by_cases target : queriedId = objectId
       · subst queriedId
@@ -1243,6 +1450,17 @@ theorem unlinkName_preserves_completeWellFormed {state : NamespaceState}
           by simpa [updated, withRemainingAliases] using surviving⟩
       · exact ⟨object, by simpa [unlinkName, replace, target] using objectLookup,
           oldMember⟩
+    · intro queriedId queriedObject path queriedLookup member
+      by_cases target : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans (unlinkName_stores_object state objectId
+            allowed.object alias allowed.newPrimary allowed.remaining))
+        subst queriedObject
+        apply allowed.newPrimaryLeast path
+        simpa [updated, withRemainingAliases] using member
+      · exact allowed.complete.aliases.representativeLeast queriedId queriedObject path
+          (by simpa [unlinkName, replace, target] using queriedLookup) member
     · intro queriedId queriedObject queriedLookup
       by_cases target : queriedId = objectId
       · subst queriedId
@@ -1324,8 +1542,20 @@ structure MayCreateSymlink (state : NamespaceState) (object : NamespaceObject) w
   creation : state.MayCreate object
   kindIsSymlink : object.kind = .symlink
   aliasesSingleton : object.aliases = [object.path]
-  target : CanonicalPath
+  target : SymlinkTarget
   targetStored : object.symlinkTarget = some target
+  targetContained : target.ContainedAt object.path
+
+/-- A newly admitted singleton symlink is immediately readable at its only name. -/
+theorem MayCreateSymlink.object_canReadSymlink {state : NamespaceState}
+    {object : NamespaceObject} (allowed : state.MayCreateSymlink object) :
+    object.CanReadSymlink := by
+  refine ⟨allowed.target, allowed.targetStored, ?_⟩
+  intro alias aliasMember
+  rw [allowed.aliasesSingleton] at aliasMember
+  have exactAlias := List.mem_singleton.mp aliasMember
+  subst alias
+  exact allowed.targetContained
 
 /-- Symlink publication is the ordinary atomic object/index publication. -/
 def createSymlink (state : NamespaceState) (object : NamespaceObject) :
@@ -1352,7 +1582,7 @@ theorem createSymlink_preserves_completeWellFormed {state : NamespaceState}
     contradiction
   refine ⟨create_preserves_treeWellFormed allowed.complete.tree allowed.creation,
     ?_, ?_, ?_⟩
-  · refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
     · intro objectId queried queriedLookup
       by_cases created : objectId = object.id
       · subst objectId
@@ -1409,6 +1639,18 @@ theorem createSymlink_preserves_completeWellFormed {state : NamespaceState}
         exact ⟨queried, by
           simpa [createSymlink, create, replace, objectIdNe] using queriedLookup,
           member⟩
+    · intro objectId queried path queriedLookup member
+      by_cases created : objectId = object.id
+      · subst objectId
+        have exactObject : queried = object := Option.some.inj
+          (queriedLookup.symm.trans (create_stores_object state object))
+        subst queried
+        rw [allowed.aliasesSingleton] at member
+        simp at member
+        subst path
+        exact List.lt_irrefl _
+      · exact allowed.complete.aliases.representativeLeast objectId queried path
+          (by simpa [createSymlink, create, replace, created] using queriedLookup) member
     · intro objectId queried queriedLookup
       by_cases created : objectId = object.id
       · subst objectId
@@ -2297,8 +2539,8 @@ theorem Step.preserves_countersRepresentable {before after : NamespaceState}
             (queriedLookup.symm.trans
               (addHardLink_stores_object before linkedId allowed.object alias))
           subst queriedObject
-          simpa [withAddedAlias] using
-            representable.2.1 linkedId allowed.object allowed.objectLookup
+          rw [withAddedAlias_openHandleCount]
+          exact representable.2.1 linkedId allowed.object allowed.objectLookup
         · exact representable.2.1 queriedId queriedObject
             (by simpa [NamespaceState.addHardLink, replace, target] using queriedLookup)
       · exact representable.2.2

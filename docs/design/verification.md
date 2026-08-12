@@ -54,7 +54,7 @@ flowchart LR
 | runtime isolation | mock backend + capability detection | ordered apply/rollback と policy validation | mock 検証済み、privileged apply は未検証 |
 | Firecracker runtime | fake command/filesystem/API + Unix socket test | artifact、jailer/API 順序、snapshot state、identity/workload gate | contract 検証済み、実 VM/jailer/dm-verity は未検証 |
 | Supervisor | protocol module test + `FakeResources` | identity binding、subject lifecycle、handle cleanup | mock/contract 検証済み、Linux resource/実 socket は未検証 |
-| Session orchestrator | mock backend state-machine test | lease binding、startup rollback、stop retry、identity reuse 拒否 | mock/contract 検証済み、production backend/実 VM は未検証 |
+| Session orchestrator | mock state-machine test + production adapter composition | lease binding、startup rollback、stop retry、durable identity、Authority/Broker/Firecracker/workspace adapter | test-double 境界まで検証済み、実 guest capfs/isolation・実 VM は未検証 |
 | VM 境界 | escape 試行 | 実際の jailer、kernel、mount、seccomp 設定 | 実機未検証 |
 | snapshot | 同一 snapshot の複数 restore | ID、workspace、Broker session の一意性 | state contract のみ、実 snapshot restore は未検証 |
 

@@ -25,6 +25,7 @@ pub mod egress_backend;
 pub mod firecracker_backend;
 pub mod firecracker_identity;
 pub mod firecracker_workspace;
+pub mod session_owner;
 
 use std::{
     collections::BTreeSet,

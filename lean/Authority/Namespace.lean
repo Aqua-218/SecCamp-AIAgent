@@ -169,6 +169,7 @@ theorem WellFormed.path_object_unique {state : NamespaceState}
 
 /-- Preconditions for publishing a fresh namespace object. -/
 structure MayCreate (state : NamespaceState) (object : NamespaceObject) where
+  generationCanIncrement : CanIncrementU64 state.generation
   objectIdFresh : state.issuedObjects object.id = false
   objectAbsent : state.objects object.id = none
   pathAbsent : state.paths object.path = none
@@ -320,6 +321,7 @@ theorem create_preserves_treeWellFormed {state : NamespaceState}
 
 /-- Preconditions for removing one live, unopened object. -/
 structure MayRemove (state : NamespaceState) (objectId : ObjectId) where
+  generationCanIncrement : CanIncrementU64 state.generation
   object : NamespaceObject
   objectLookup : state.objects objectId = some object
   identityMatches : object.id = objectId
@@ -487,6 +489,7 @@ end PathRenaming
 
 /-- Safety preconditions for one no-replace subtree rename transaction. -/
 structure MayRename (state : NamespaceState) (pathMapping : PathRenaming) : Prop where
+  generationCanIncrement : CanIncrementU64 state.generation
   sourceExists : ∃ sourceId sourceObject,
     state.objects sourceId = some sourceObject ∧
     sourceObject.path = pathMapping.source
@@ -801,6 +804,7 @@ inductive Step : NamespaceState → NamespaceState → Prop
   | openObject {state : NamespaceState} {objectId : ObjectId}
       {object : NamespaceObject} :
       state.objects objectId = some object →
+      CanIncrementU64 object.openHandleCount →
       Step state (state.openObject objectId object)
   | closeObject {state : NamespaceState} {objectId : ObjectId}
       {object : NamespaceObject} :
@@ -816,6 +820,107 @@ theorem Step.generation_monotone {before after : NamespaceState}
   | renamePaths => exact Nat.le_succ _
   | openObject => exact Nat.le_refl _
   | closeObject => exact Nat.le_refl _
+
+/-- Namespace generation and every live handle count fit Rust `u64` fields. -/
+def CountersRepresentable (state : NamespaceState) : Prop :=
+  FitsU64 state.generation ∧
+    ∀ objectId object,
+      state.objects objectId = some object → FitsU64 object.openHandleCount
+
+/-- The singleton root namespace starts with representable counters. -/
+theorem withRoot_countersRepresentable (rootId : ObjectId) :
+    (withRoot rootId).CountersRepresentable := by
+  constructor
+  · simp [withRoot, FitsU64, u64Maximum]
+  · intro objectId object objectLookup
+    by_cases sameId : objectId = rootId
+    · subst objectId
+      simp [withRoot, replace] at objectLookup
+      subst object
+      simp [rootObject, FitsU64, u64Maximum]
+    · simp [withRoot, replace, sameId] at objectLookup
+
+/-- Checked namespace transitions preserve every Rust counter bound. -/
+theorem Step.preserves_countersRepresentable {before after : NamespaceState}
+    (transition : Step before after)
+    (representable : before.CountersRepresentable) :
+    after.CountersRepresentable := by
+  cases transition with
+  | create allowed =>
+      rename_i createdObject
+      constructor
+      · exact allowed.generationCanIncrement.increment_fits
+      · intro queriedId queriedObject queriedLookup
+        by_cases sameId : queriedId = createdObject.id
+        · subst queriedId
+          have exactObject : queriedObject = createdObject := Option.some.inj
+            (queriedLookup.symm.trans (create_stores_object before createdObject))
+          subst queriedObject
+          simp [allowed.startsClosed, FitsU64, u64Maximum]
+        · have oldLookup : before.objects queriedId = some queriedObject := by
+            simpa [NamespaceState.create, replace, sameId] using queriedLookup
+          exact representable.2 queriedId queriedObject oldLookup
+  | remove allowed =>
+      rename_i removedId
+      constructor
+      · exact allowed.generationCanIncrement.increment_fits
+      · intro queriedId queriedObject queriedLookup
+        have differentId : queriedId ≠ removedId := by
+          intro sameId
+          subst queriedId
+          simp [NamespaceState.remove] at queriedLookup
+        have oldLookup : before.objects queriedId = some queriedObject := by
+          simpa [NamespaceState.remove, replace, differentId] using queriedLookup
+        exact representable.2 queriedId queriedObject oldLookup
+  | renamePaths allowed =>
+      constructor
+      · exact allowed.generationCanIncrement.increment_fits
+      · intro objectId renamedObject renamedLookup
+        simp only [NamespaceState.renamePaths] at renamedLookup
+        cases oldLookup : before.objects objectId with
+        | none =>
+            rw [oldLookup] at renamedLookup
+            simp at renamedLookup
+        | some oldObject =>
+            rw [oldLookup] at renamedLookup
+            simp at renamedLookup
+            subst renamedObject
+            exact representable.2 objectId oldObject oldLookup
+  | openObject objectLookup canIncrement =>
+      constructor
+      · exact representable.1
+      · intro queriedId queriedObject queriedLookup
+        rename_i openedId openedObject
+        by_cases sameId : queriedId = openedId
+        · subst queriedId
+          have exactObject : queriedObject =
+              withOpenHandleCount openedObject (openedObject.openHandleCount + 1) :=
+            Option.some.inj (queriedLookup.symm.trans
+              (openObject_increments_count before openedId openedObject))
+          subst queriedObject
+          exact canIncrement.increment_fits
+        · have oldLookup : before.objects queriedId = some queriedObject := by
+            simpa [NamespaceState.openObject, updateOpenHandleCount, replace, sameId]
+              using queriedLookup
+          exact representable.2 queriedId queriedObject oldLookup
+  | closeObject objectLookup _positive =>
+      constructor
+      · exact representable.1
+      · intro queriedId queriedObject queriedLookup
+        rename_i closedId closedObject
+        by_cases sameId : queriedId = closedId
+        · subst queriedId
+          have exactObject : queriedObject =
+              withOpenHandleCount closedObject (closedObject.openHandleCount - 1) :=
+            Option.some.inj (queriedLookup.symm.trans
+              (closeObject_decrements_count before closedId closedObject))
+          subst queriedObject
+          exact Nat.le_trans (Nat.sub_le _ _) <|
+            representable.2 closedId closedObject objectLookup
+        · have oldLookup : before.objects queriedId = some queriedObject := by
+            simpa [NamespaceState.closeObject, updateOpenHandleCount, replace, sameId]
+              using queriedLookup
+          exact representable.2 queriedId queriedObject oldLookup
 
 /-- Issued object identities are never released by any accepted transition. -/
 theorem Step.issued_identity_monotone {before after : NamespaceState}
@@ -887,6 +992,16 @@ theorem Steps.generation_monotone {before after : NamespaceState}
   | refl => exact Nat.le_refl _
   | tail _ transition inductionHypothesis =>
       exact Nat.le_trans inductionHypothesis transition.generation_monotone
+
+/-- Arbitrary accepted namespace executions stay within every `u64` bound. -/
+theorem Steps.preserve_countersRepresentable {before after : NamespaceState}
+    (transitions : Steps before after)
+    (representable : before.CountersRepresentable) :
+    after.CountersRepresentable := by
+  induction transitions with
+  | refl => exact representable
+  | tail _ transition inductionHypothesis =>
+      exact transition.preserves_countersRepresentable inductionHypothesis
 
 /-- Once issued, an object identity remains reserved after any finite execution. -/
 theorem Steps.issued_identity_monotone {before after : NamespaceState}

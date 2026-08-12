@@ -20,6 +20,61 @@ structure CanonicalHost where
   value : String
   deriving Repr, BEq, DecidableEq
 
+private def isAsciiAlphaNumeric (character : Char) : Bool :=
+  let code := character.toNat
+  (48 ≤ code && code ≤ 57) ||
+    (65 ≤ code && code ≤ 90) ||
+    (97 ≤ code && code ≤ 122)
+
+private def isAsciiDnsLabel (label : String) : Bool :=
+  !label.isEmpty &&
+    label.length ≤ 63 &&
+    !label.startsWith "-" &&
+    !label.endsWith "-" &&
+    label.toList.all (fun character =>
+      isAsciiAlphaNumeric character || character == '-')
+
+private def isIpv4Octet (label : String) : Bool :=
+  label.toList.all (fun character =>
+      let code := character.toNat
+      48 ≤ code && code ≤ 57) &&
+    (label == "0" || !label.startsWith "0") &&
+    match label.toNat? with
+    | some value => value ≤ 255
+    | none => false
+
+private def isIpv4Literal : List String → Bool
+  | [first, second, third, fourth] =>
+    isIpv4Octet first && isIpv4Octet second &&
+      isIpv4Octet third && isIpv4Octet fourth
+  | _ => false
+
+private def canonicalHostValue (value : String) : String :=
+  let withoutTerminalDot :=
+    if value.endsWith "." then value.dropRight 1 else value
+  withoutTerminalDot.toLower
+
+private def isValidCanonicalHost (host : String) : Bool :=
+  !host.isEmpty &&
+    host.length ≤ 253 &&
+    host.toList.all (fun character => character.toNat < 128) &&
+    let labels := host.splitOn "."
+    labels.all isAsciiDnsLabel &&
+    !isIpv4Literal labels
+
+namespace CanonicalHost
+
+/-- Canonicalizes and validates an ASCII DNS host for authority comparison. -/
+def ofString (value : String) : Option CanonicalHost :=
+  let canonical := canonicalHostValue value
+  if value.toList.all (fun character => character.toNat < 128) &&
+      isValidCanonicalHost canonical then
+    some { value := canonical }
+  else
+    none
+
+end CanonicalHost
+
 /-- A safe HTTP method supported by public fetch authorities. -/
 inductive HttpMethod where
   /-- Retrieves a response representation. -/
@@ -85,13 +140,6 @@ theorem httpMethodsBelow_trans {first second third : HttpMethods}
   intro method firstContains
   exact httpMethodsBelow_iff_subset.mp secondBelowThird method
     (httpMethodsBelow_iff_subset.mp firstBelowSecond method firstContains)
-
-/-- Returns whether a character is an ASCII letter or digit. -/
-private def isAsciiAlphaNumeric (character : Char) : Bool :=
-  let code := character.toNat
-  (48 ≤ code && code ≤ 57) ||
-    (65 ≤ code && code ≤ 90) ||
-    (97 ≤ code && code ≤ 122)
 
 /-- Returns whether a character is an unencoded RFC 3986 URL path character. -/
 private def isUnencodedUrlPathCharacter (character : Char) : Bool :=

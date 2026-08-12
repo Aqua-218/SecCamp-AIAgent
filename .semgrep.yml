@@ -1,0 +1,48 @@
+rules:
+  - id: rust-insecure-hash
+    message: Cryptographically insecure hashing is forbidden in security-sensitive code.
+    languages: [rust]
+    severity: ERROR
+    pattern-either:
+      - pattern: md2::Md2::new(...)
+      - pattern: md4::Md4::new(...)
+      - pattern: md5::Md5::new(...)
+      - pattern: sha1::Sha1::new(...)
+    metadata:
+      category: security
+      cwe: "CWE-328: Use of Weak Hash"
+
+  - id: rust-reqwest-invalid-tls
+    message: TLS certificate or hostname verification must not be disabled.
+    languages: [rust]
+    severity: ERROR
+    pattern-either:
+      - pattern: reqwest::Client::builder(). ... .danger_accept_invalid_hostnames(true)
+      - pattern: reqwest::Client::builder(). ... .danger_accept_invalid_certs(true)
+    metadata:
+      category: security
+      cwe: "CWE-295: Improper Certificate Validation"
+
+  - id: rust-rustls-dangerous-verifier
+    message: A custom rustls certificate verifier requires a dedicated security review.
+    languages: [rust]
+    severity: ERROR
+    pattern-either:
+      - pattern: rustls::client::DangerousClientConfig
+      - pattern: $CLIENT.dangerous().set_certificate_verifier(...)
+      - pattern: |
+          let $CLIENT = rustls::client::ClientConfig::dangerous(...);
+          ...
+          $CLIENT.set_certificate_verifier(...);
+    metadata:
+      category: security
+      cwe: "CWE-295: Improper Certificate Validation"
+
+  - id: rust-openssl-verification-disabled
+    message: OpenSSL peer verification must not be disabled.
+    languages: [rust]
+    severity: ERROR
+    pattern: $BUILDER.set_verify(openssl::ssl::SSL_VERIFY_NONE)
+    metadata:
+      category: security
+      cwe: "CWE-295: Improper Certificate Validation"

@@ -199,9 +199,17 @@ impl ApiClient for MockApi {
         self.events
             .borrow_mut()
             .push(format!("api:{}:{}", request.path, request.body));
+        let body = match request.path.as_str() {
+            "/actions/inject-identity" => Some("identity-injected"),
+            "/actions/start-workload" => Some("workload-started"),
+            _ => None,
+        }
+        .map_or_else(String::new, |acknowledgement| {
+            format!("{{\"ack\":\"{acknowledgement}\",{}", &request.body[1..])
+        });
         Ok(ApiResponse {
             status: self.statuses.pop_front().unwrap_or(200),
-            body: String::new(),
+            body,
         })
     }
 
@@ -604,11 +612,15 @@ fn restore_regenerates_all_identities_and_gates_workload_until_injection() {
         .iter()
         .position(|event| event.starts_with("api:/actions/inject-identity:"))
         .expect("identity injection API event must be present");
+    let resume_index = events
+        .iter()
+        .position(|event| event.starts_with("api:/vm:{\"state\":\"Resumed\"}"))
+        .expect("explicit resume API event must be present");
     let start_index = events
         .iter()
         .position(|event| event.starts_with("api:/actions/start-workload:"))
         .expect("workload start API event must be present");
-    assert!(inject_index < start_index);
+    assert!(resume_index < inject_index && inject_index < start_index);
 }
 
 #[test]

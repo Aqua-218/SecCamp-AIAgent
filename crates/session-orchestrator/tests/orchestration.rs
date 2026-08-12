@@ -159,6 +159,7 @@ struct MockVm {
 impl VmBackend for MockVm {
     fn start_vm(
         &mut self,
+        _snapshot: &SnapshotDescriptor,
         identity: &session_orchestrator::SessionIdentity,
         _workspace: &WorkspaceLease,
         _broker: &BrokerLease,

@@ -205,7 +205,7 @@ fn failed_child_creation_has_no_visible_namespace_effect() {
             &parent,
             "failed.txt",
             NamespaceObjectKind::RegularFile,
-            |_| Err::<(), _>(BackingFailure),
+            |_, _| Err::<(), _>(BackingFailure),
         ),
         Err(NamespaceOperationError::Executor(BackingFailure))
     );

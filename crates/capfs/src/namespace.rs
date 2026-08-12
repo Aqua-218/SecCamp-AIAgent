@@ -755,7 +755,7 @@ impl NamespaceRegistry {
         parent: &ObjectId,
         child_name: &str,
         kind: NamespaceObjectKind,
-        operation: impl FnOnce(&NamespaceObject) -> Result<T, E>,
+        operation: impl FnOnce(&NamespaceObject, &NamespaceObject) -> Result<T, E>,
     ) -> Result<NamespaceObjectCreation<T>, NamespaceOperationError<E>> {
         self.create_child_with_open_count(parent, child_name, kind, 0, operation)
     }
@@ -776,7 +776,7 @@ impl NamespaceRegistry {
         parent: &ObjectId,
         child_name: &str,
         kind: NamespaceObjectKind,
-        operation: impl FnOnce(&NamespaceObject) -> Result<T, E>,
+        operation: impl FnOnce(&NamespaceObject, &NamespaceObject) -> Result<T, E>,
     ) -> Result<NamespaceObjectCreation<T>, NamespaceOperationError<E>> {
         self.create_child_with_open_count(parent, child_name, kind, 1, operation)
     }
@@ -829,12 +829,13 @@ impl NamespaceRegistry {
         child_name: &str,
         kind: NamespaceObjectKind,
         open_handle_count: u64,
-        operation: impl FnOnce(&NamespaceObject) -> Result<T, E>,
+        operation: impl FnOnce(&NamespaceObject, &NamespaceObject) -> Result<T, E>,
     ) -> Result<NamespaceObjectCreation<T>, NamespaceOperationError<E>> {
         let mut state = self.write_state()?;
         let parent_record = state
             .objects
             .get(parent)
+            .cloned()
             .ok_or_else(|| NamespaceError::UnknownObject(parent.clone()))?;
         if parent_record.kind != NamespaceObjectKind::Directory {
             return Err(NamespaceError::ParentNotDirectory(parent_record.path.clone()).into());
@@ -862,7 +863,8 @@ impl NamespaceRegistry {
             .ok_or(NamespaceError::InvariantViolation)?;
         next_state.generation = next_generation;
 
-        let result = operation(&object_record).map_err(NamespaceOperationError::Executor)?;
+        let result =
+            operation(&parent_record, &object_record).map_err(NamespaceOperationError::Executor)?;
         *state = next_state;
         Ok(NamespaceObjectCreation::new(object_id, result))
     }

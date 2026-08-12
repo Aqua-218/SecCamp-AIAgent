@@ -2,6 +2,10 @@
 /target/
 *.profraw
 /coverage/
+/reports/
+/dist/
+/.ci-tools/
+/.cargo-home/
 
 # Lean build artifacts
 /lean/.lake/

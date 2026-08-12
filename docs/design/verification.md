@@ -94,7 +94,7 @@ wire module test は version、closed tag、4 KiB size、field length、body len
 
 ### Session orchestrator
 
-state-machine test は mock backend の call log と lease を使い、workspace -> Broker -> VM -> capability -> workload の commit 順、各 failure の rollback、VM kill failure 時の workspace isolation 保留、snapshot identity rejection、identity reuse、foreign lease、二重 start、stop retry を検査する。これは backend contract の検証であり、実 Firecracker、実 Broker/vsock、実 capfs、実 Authority adapter、process 外 durable identity allocator の検証ではない。詳細は [Session orchestrator](../session-orchestrator/README.md) を参照する。
+state-machine test は mock backend の call log と lease を使い、workspace -> Broker -> VM -> capability -> workload の commit 順、各 failure の rollback、VM kill failure 時の workspace isolation 保留、snapshot identity rejection、identity reuse、foreign lease、二重 start、stop retry を検査する。production adapter composition test は実 `CapabilityKernel` と Broker / Firecracker / workspace adapter を同じ経路へ接続し、外部 command、filesystem、API、listener を test double にする。したがって adapter 間の identity と cleanup 契約は検証するが、実 Firecracker、実 Broker/vsock、実 capfs mount、特権 isolation の検証ではない。詳細は [Session orchestrator](../session-orchestrator/README.md) を参照する。
 
 symlink resolver の test は初期 `capfs` の完了条件には含めない。link-free な namespace と revoke の検証を先に終え、[symlink 対応](capfs.md#symlink-は後続機能として追加する)を実装する段階で追加する。
 

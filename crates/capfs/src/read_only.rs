@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use authority_core::{
@@ -28,10 +28,10 @@ use authority_core::{
     time::MonotonicTime,
 };
 use fuser::{
-    BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, SessionACL,
-    WriteFlags,
+    BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
+    FopenFlags, Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    SessionACL, TimeOrNow, WriteFlags,
 };
 use rustix::fs::OFlags;
 
@@ -214,21 +214,37 @@ enum FileAccess {
 }
 
 impl FileAccess {
-    fn from_open_flags(flags: OpenFlags) -> Result<Self, AdapterError> {
-        validate_open_flags(flags)?;
-        match flags.acc_mode() {
-            OpenAccMode::O_RDONLY => Ok(Self::ReadOnly),
-            OpenAccMode::O_WRONLY => Ok(Self::WriteOnly),
-            OpenAccMode::O_RDWR => Ok(Self::ReadWrite),
-        }
-    }
-
     const fn permits_read(self) -> bool {
         matches!(self, Self::ReadOnly | Self::ReadWrite)
     }
 
     const fn permits_write(self) -> bool {
         matches!(self, Self::WriteOnly | Self::ReadWrite)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileOpenIntent {
+    access: FileAccess,
+    truncate: bool,
+}
+
+impl FileOpenIntent {
+    fn from_open_flags(flags: OpenFlags) -> Result<Self, AdapterError> {
+        let access = match flags.acc_mode() {
+            OpenAccMode::O_RDONLY => FileAccess::ReadOnly,
+            OpenAccMode::O_WRONLY => FileAccess::WriteOnly,
+            OpenAccMode::O_RDWR => FileAccess::ReadWrite,
+        };
+        let truncate = supported_open_flags(flags)?.contains(OFlags::TRUNC);
+        if truncate && !access.permits_write() {
+            return Err(AdapterError::Unsupported);
+        }
+        Ok(Self { access, truncate })
+    }
+
+    const fn needs_writable_backing(self) -> bool {
+        self.access.permits_write() || self.truncate
     }
 }
 
@@ -477,28 +493,31 @@ impl CapabilityFilesystem {
     }
 
     fn open_file(&self, node: NodeId, flags: OpenFlags) -> Result<u64, AdapterError> {
-        let access = FileAccess::from_open_flags(flags)?;
+        let intent = FileOpenIntent::from_open_flags(flags)?;
         self.open_resource(
             node,
             NamespaceObjectKind::RegularFile,
             AdapterError::IsDirectory,
-            OpenResourceAccess::File(access),
-            |path| self.file_open_requests(access, path.clone()),
+            OpenResourceAccess::File(intent.access),
+            |path| self.file_open_requests(intent, path.clone()),
             |object| {
-                let open = if access.permits_write() {
+                let open = if intent.needs_writable_backing() {
                     self.backing.open_runtime_writable_file(object)
                 } else {
                     self.backing.open_runtime_file(object)
                 };
-                open.map(OpenBacking::File)
-                    .map_err(|_| AdapterError::Internal)
+                let file = open.map_err(|_| AdapterError::Internal)?;
+                if intent.truncate {
+                    file.truncate_to(0).map_err(|_| AdapterError::Internal)?;
+                }
+                Ok(OpenBacking::File(file))
             },
         )
     }
 
     fn open_directory(&self, node: NodeId, flags: OpenFlags) -> Result<u64, AdapterError> {
-        validate_open_flags(flags)?;
-        if flags.acc_mode() != OpenAccMode::O_RDONLY {
+        let raw_flags = supported_open_flags(flags)?;
+        if flags.acc_mode() != OpenAccMode::O_RDONLY || raw_flags.contains(OFlags::TRUNC) {
             return Err(AdapterError::Unsupported);
         }
         self.open_resource(
@@ -683,6 +702,82 @@ impl CapabilityFilesystem {
             .map_err(|error| map_namespace_operation_error(&error))
     }
 
+    fn truncate_file(
+        &self,
+        node: NodeId,
+        handle: Option<u64>,
+        length: u64,
+    ) -> Result<BackingMetadata, AdapterError> {
+        self.ensure_healthy()?;
+        if let Some(handle) = handle {
+            let handles = self.handles.lock().map_err(|_| AdapterError::Internal)?;
+            let resource = handles
+                .resources
+                .get(&handle)
+                .ok_or(AdapterError::BadHandle)?;
+            if resource.node != node {
+                return Err(AdapterError::BadHandle);
+            }
+            let OpenResourceAccess::File(access) = resource.access else {
+                return Err(AdapterError::BadHandle);
+            };
+            if !access.permits_write() {
+                return Err(AdapterError::BadHandle);
+            }
+            let OpenBacking::File(backing) = &resource.backing else {
+                return Err(AdapterError::BadHandle);
+            };
+            self.with_authorized_truncate(&resource.object, |object| {
+                backing
+                    .truncate_to(length)
+                    .map_err(|_| AdapterError::Internal)?;
+                self.backing
+                    .runtime_metadata(object)
+                    .map_err(|_| AdapterError::Internal)
+            })
+        } else {
+            let object = self
+                .nodes
+                .resolve(node)
+                .map_err(|error| map_node_lookup_error(&error))?;
+            self.with_authorized_truncate(&object, |object| {
+                let backing = self
+                    .backing
+                    .open_runtime_writable_file(object)
+                    .map_err(|_| AdapterError::Internal)?;
+                backing
+                    .truncate_to(length)
+                    .map_err(|_| AdapterError::Internal)?;
+                self.backing
+                    .runtime_metadata(object)
+                    .map_err(|_| AdapterError::Internal)
+            })
+        }
+    }
+
+    fn with_authorized_truncate<T>(
+        &self,
+        object: &ObjectId,
+        operation: impl FnOnce(&NamespaceObject) -> Result<T, AdapterError>,
+    ) -> Result<T, AdapterError> {
+        self.namespace
+            .with_object(object, |object| {
+                if object.kind() != NamespaceObjectKind::RegularFile {
+                    return Err(AdapterError::IsDirectory);
+                }
+                let request = self.file_request(FileEffect::Truncate, object.path().clone());
+                self.kernel
+                    .authorize_and_commit(
+                        &self.authority.subject,
+                        &self.authority.capability,
+                        &request,
+                        |_| operation(object),
+                    )
+                    .map_err(|error| map_effect_error(&error))
+            })
+            .map_err(|error| map_namespace_operation_error(&error))
+    }
+
     fn read_directory(
         &self,
         node: NodeId,
@@ -825,19 +920,24 @@ impl CapabilityFilesystem {
         )
     }
 
-    fn file_open_requests(&self, access: FileAccess, path: CanonicalPath) -> CapabilityRequestSet {
-        match access {
-            FileAccess::ReadOnly => {
-                CapabilityRequestSet::one(self.file_request(FileEffect::ReadData, path))
+    fn file_open_requests(
+        &self,
+        intent: FileOpenIntent,
+        path: CanonicalPath,
+    ) -> CapabilityRequestSet {
+        let mut additional = Vec::with_capacity(2);
+        let first = match intent.access {
+            FileAccess::ReadOnly => self.file_request(FileEffect::ReadData, path.clone()),
+            FileAccess::WriteOnly => self.file_request(FileEffect::WriteData, path.clone()),
+            FileAccess::ReadWrite => {
+                additional.push(self.file_request(FileEffect::WriteData, path.clone()));
+                self.file_request(FileEffect::ReadData, path.clone())
             }
-            FileAccess::WriteOnly => {
-                CapabilityRequestSet::one(self.file_request(FileEffect::WriteData, path))
-            }
-            FileAccess::ReadWrite => CapabilityRequestSet::new(
-                self.file_request(FileEffect::ReadData, path.clone()),
-                [self.file_request(FileEffect::WriteData, path)],
-            ),
+        };
+        if intent.truncate {
+            additional.push(self.file_request(FileEffect::Truncate, path));
         }
+        CapabilityRequestSet::new(first, additional)
     }
 
     fn forget_node(&self, node: NodeId, count: u64) {
@@ -956,6 +1056,53 @@ impl Filesystem for CapabilityFilesystem {
         };
         match self.getattr_entry(node, handle.map(|value| value.0)) {
             Ok(entry) => reply.attr(&ATTRIBUTE_TTL, &file_attr(entry.node, entry.metadata)),
+            Err(error) => reply.error(error.errno()),
+        }
+    }
+
+    fn setattr(
+        &self,
+        _request: &Request,
+        node: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        changed_time: Option<SystemTime>,
+        handle: Option<FileHandle>,
+        created_time: Option<SystemTime>,
+        status_change_time: Option<SystemTime>,
+        backup_time: Option<SystemTime>,
+        flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let Some(node) = NodeId::new(node.0) else {
+            reply.error(Errno::EIO);
+            return;
+        };
+        let Some(size) = size else {
+            reply.error(Errno::EPERM);
+            return;
+        };
+        if mode.is_some()
+            || uid.is_some()
+            || gid.is_some()
+            || atime.is_some()
+            || mtime.is_some()
+            || changed_time.is_some()
+            || created_time.is_some()
+            || status_change_time.is_some()
+            || backup_time.is_some()
+            || flags.is_some()
+        {
+            reply.error(Errno::EPERM);
+            return;
+        }
+
+        match self.truncate_file(node, handle.map(|value| value.0), size) {
+            Ok(metadata) => reply.attr(&ATTRIBUTE_TTL, &file_attr(node, metadata)),
             Err(error) => reply.error(error.errno()),
         }
     }
@@ -1164,15 +1311,15 @@ const fn namespace_file_type(kind: NamespaceObjectKind) -> FileType {
     }
 }
 
-fn validate_open_flags(flags: OpenFlags) -> Result<(), AdapterError> {
+fn supported_open_flags(flags: OpenFlags) -> Result<OFlags, AdapterError> {
     let raw = u32::try_from(flags.0).map_err(|_| AdapterError::InvalidRequest)?;
     let flags = OFlags::from_bits_retain(raw);
-    if flags.intersects(OFlags::APPEND | OFlags::CREATE | OFlags::EXCL | OFlags::TRUNC)
+    if flags.intersects(OFlags::APPEND | OFlags::CREATE | OFlags::EXCL)
         || flags.contains(OFlags::TMPFILE)
     {
         return Err(AdapterError::Unsupported);
     }
-    Ok(())
+    Ok(flags)
 }
 
 const fn map_node_lookup_error(error: &NodeTableError) -> AdapterError {
@@ -1229,6 +1376,7 @@ mod tests {
         time::{MonotonicTime, TimeWindow},
     };
     use fuser::OpenFlags;
+    use rustix::fs::OFlags;
     use tempfile::{TempDir, tempdir};
 
     use super::{
@@ -1242,6 +1390,10 @@ mod tests {
 
     fn path(segments: &[&str]) -> CanonicalPath {
         CanonicalPath::new(segments).expect("test path must be canonical")
+    }
+
+    fn open_flags(flags: OFlags) -> OpenFlags {
+        OpenFlags(i32::try_from(flags.bits()).expect("test open flags must fit i32"))
     }
 
     fn test_filesystem() -> (
@@ -1543,6 +1695,104 @@ mod tests {
         filesystem
             .release_file(allowed.node, handle)
             .expect("O_RDWR handle must release normally");
+    }
+
+    // Requirement: O_TRUNC requires both the requested handle access and the
+    // separate Truncate effect. Category: FUSE/least privilege. Risk: critical.
+    #[test]
+    fn truncate_open_requires_explicit_truncate_authority() {
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::only(FileEffect::WriteData),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("write authority must make its ancestor visible");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("write authority must make its target visible");
+
+        assert_eq!(
+            filesystem.open_file(allowed.node, open_flags(OFlags::WRONLY | OFlags::TRUNC)),
+            Err(AdapterError::AccessDenied)
+        );
+        assert_eq!(
+            fs::read(directory.path().join("scoped/allowed.txt"))
+                .expect("denied truncation must leave the backing file unchanged"),
+            b"capability"
+        );
+        assert_eq!(
+            filesystem.open_file(allowed.node, open_flags(OFlags::RDONLY | OFlags::TRUNC)),
+            Err(AdapterError::Unsupported),
+            "a read-only FUSE handle cannot carry a length-changing open intent"
+        );
+    }
+
+    // Requirement: a successful O_TRUNC is performed under the same guard as
+    // its compound authorization. Category: FUSE/authorization. Risk: critical.
+    #[test]
+    fn truncate_open_changes_length_only_after_compound_authorization() {
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::from_effects([FileEffect::WriteData, FileEffect::Truncate]),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("truncate authority must make its ancestor visible");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("truncate authority must make its target visible");
+
+        let handle = filesystem
+            .open_file(allowed.node, open_flags(OFlags::WRONLY | OFlags::TRUNC))
+            .expect("WriteData and Truncate must authorize O_TRUNC together");
+        assert_eq!(
+            fs::read(directory.path().join("scoped/allowed.txt"))
+                .expect("truncated backing file must remain readable"),
+            b""
+        );
+        filesystem
+            .release_file(allowed.node, handle)
+            .expect("truncated handle must release normally");
+    }
+
+    // Requirement: SETATTR(size) checks Truncate at the object's current path
+    // on every request. Category: FUSE/revocation. Risk: critical.
+    #[test]
+    fn explicit_size_change_reauthorizes_truncate() {
+        let (directory, filesystem, kernel, capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::only(FileEffect::Truncate),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("truncate authority must make its ancestor visible");
+        let allowed = filesystem
+            .lookup_entry(scoped.node, "allowed.txt")
+            .expect("truncate authority must make its target visible");
+
+        let metadata = filesystem
+            .truncate_file(allowed.node, None, 4)
+            .expect("Truncate authority must allow an explicit size change");
+        assert_eq!(metadata.size, 4);
+        assert_eq!(
+            fs::read(directory.path().join("scoped/allowed.txt"))
+                .expect("truncated backing file must remain readable"),
+            b"capa"
+        );
+
+        kernel
+            .revoke(&capability)
+            .expect("test capability must be revocable");
+        assert_eq!(
+            filesystem.truncate_file(allowed.node, None, 0),
+            Err(AdapterError::AccessDenied)
+        );
+        assert_eq!(
+            fs::read(directory.path().join("scoped/allowed.txt"))
+                .expect("revoked truncation must leave the backing file unchanged"),
+            b"capa"
+        );
     }
 
     #[test]

@@ -12,8 +12,8 @@ use authority_core::path::CanonicalPath;
 use rustix::{
     fd::OwnedFd,
     fs::{
-        AtFlags, FileType, Mode, OFlags, ResolveFlags, Statx, StatxFlags, StatxTimestamp, openat2,
-        statx,
+        AtFlags, FileType, Mode, OFlags, ResolveFlags, Statx, StatxFlags, StatxTimestamp,
+        ftruncate, openat2, statx,
     },
     io::{pread, pwrite},
 };
@@ -152,6 +152,15 @@ impl OpenedBackingFile {
     pub(crate) fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<usize, RuntimeBackingError> {
         pwrite(&self.fd, bytes, offset)
             .map_err(|error| runtime_io_error("write", &self.path, error))
+    }
+
+    /// Changes the file length without following a path or reopening the file.
+    ///
+    /// Callers must authorize this as an explicit `Truncate` effect. Ordinary
+    /// positioned writes deliberately remain a `WriteData` effect, including
+    /// when they extend the file past its previous end.
+    pub(crate) fn truncate_to(&self, length: u64) -> Result<(), RuntimeBackingError> {
+        ftruncate(&self.fd, length).map_err(|error| runtime_io_error("truncate", &self.path, error))
     }
 }
 
@@ -494,6 +503,71 @@ mod tests {
                 );
             }
             other => panic!("expected positioned write I/O error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_writable_file_truncates_by_descriptor() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let file_path = directory.path().join("notes.txt");
+        fs::write(&file_path, b"capability").expect("test file must be writable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let path = CanonicalPath::new(["notes.txt"]).expect("test path must be canonical");
+        let object = namespace
+            .object_at_path_snapshot(&path)
+            .expect("namespace must remain readable")
+            .expect("manifest file must exist");
+
+        let file = backing
+            .open_runtime_writable_file(&object)
+            .expect("unchanged regular file must open for writing");
+        file.truncate_to(3)
+            .expect("descriptor-relative truncate must work");
+        drop(file);
+
+        assert_eq!(
+            fs::read(&file_path).expect("truncated file must remain readable"),
+            b"cap"
+        );
+    }
+
+    #[test]
+    fn runtime_read_only_file_rejects_truncate_with_path_context() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::write(directory.path().join("notes.txt"), b"safe").expect("test file must be writable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let path = CanonicalPath::new(["notes.txt"]).expect("test path must be canonical");
+        let object = namespace
+            .object_at_path_snapshot(&path)
+            .expect("namespace must remain readable")
+            .expect("manifest file must exist");
+        let file = backing
+            .open_runtime_file(&object)
+            .expect("unchanged regular file must open for reading");
+
+        let error = file
+            .truncate_to(0)
+            .expect_err("read-only backing descriptor must reject truncation");
+        match error {
+            RuntimeBackingError::Io {
+                operation,
+                path,
+                source,
+            } => {
+                assert_eq!(operation, "truncate");
+                assert_eq!(path, PathBuf::from("notes.txt"));
+                assert_eq!(
+                    source.raw_os_error(),
+                    Some(rustix::io::Errno::INVAL.raw_os_error())
+                );
+            }
+            other => panic!("expected truncate I/O error, got {other:?}"),
         }
     }
 

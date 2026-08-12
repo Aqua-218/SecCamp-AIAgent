@@ -1,7 +1,7 @@
 //! Linux backing-root validation and descriptor ownership.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     ffi::{CStr, OsString},
     fmt, fs,
@@ -13,7 +13,7 @@ use std::{
         unix::ffi::OsStringExt,
     },
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use authority_core::{
@@ -454,6 +454,15 @@ pub enum RepositoryStartupError {
     Preflight(RepositoryPreflightError),
     /// The validated manifest could not initialize the namespace registry.
     Namespace(NamespaceError),
+    /// Another live import owns this repository identity and backing root.
+    AlreadyOpen {
+        /// The host-assigned repository identity.
+        repository: RepoId,
+        /// The canonical backing root already held by the process.
+        root: PathBuf,
+    },
+    /// The process-wide repository lease registry cannot be trusted.
+    LeaseRegistryUnavailable,
 }
 
 impl fmt::Display for RepositoryStartupError {
@@ -462,6 +471,14 @@ impl fmt::Display for RepositoryStartupError {
             Self::Preflight(error) => write!(formatter, "repository preflight failed: {error}"),
             Self::Namespace(error) => {
                 write!(formatter, "repository namespace import failed: {error}")
+            }
+            Self::AlreadyOpen { repository, root } => write!(
+                formatter,
+                "repository `{repository}` at `{}` is already open in this process",
+                root.display()
+            ),
+            Self::LeaseRegistryUnavailable => {
+                formatter.write_str("process-wide repository lease registry is unavailable")
             }
         }
     }
@@ -472,6 +489,7 @@ impl Error for RepositoryStartupError {
         match self {
             Self::Preflight(error) => Some(error),
             Self::Namespace(error) => Some(error),
+            Self::AlreadyOpen { .. } | Self::LeaseRegistryUnavailable => None,
         }
     }
 }
@@ -500,6 +518,59 @@ pub struct ValidatedRepository {
     root_mount_id: u64,
     entries: Vec<RepositoryEntry>,
     materialized_aliases: Vec<MaterializedAlias>,
+    // Kept on the backing owner so `ImportedRepository::into_parts` cannot
+    // accidentally release exclusivity while an adapter still holds the fd.
+    repository_lease: Option<Arc<RepositoryLease>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RepositoryLeaseKey {
+    repository: RepoId,
+    canonical_root: PathBuf,
+}
+
+#[derive(Debug)]
+struct RepositoryLease {
+    key: RepositoryLeaseKey,
+}
+
+fn repository_leases() -> &'static Mutex<HashSet<RepositoryLeaseKey>> {
+    static LEASES: OnceLock<Mutex<HashSet<RepositoryLeaseKey>>> = OnceLock::new();
+    LEASES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+impl RepositoryLease {
+    fn acquire(
+        repository: RepoId,
+        canonical_root: PathBuf,
+    ) -> Result<Arc<Self>, RepositoryStartupError> {
+        let key = RepositoryLeaseKey {
+            repository,
+            canonical_root,
+        };
+        let mut leases = repository_leases()
+            .lock()
+            .map_err(|_| RepositoryStartupError::LeaseRegistryUnavailable)?;
+        if !leases.insert(key.clone()) {
+            return Err(RepositoryStartupError::AlreadyOpen {
+                repository: key.repository,
+                root: key.canonical_root,
+            });
+        }
+        drop(leases);
+        Ok(Arc::new(Self { key }))
+    }
+}
+
+impl Drop for RepositoryLease {
+    fn drop(&mut self) {
+        // Drop must release the exact reservation even if an unrelated panic
+        // poisoned the registry. New acquisitions still fail closed on poison.
+        let mut leases = repository_leases()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        leases.remove(&self.key);
+    }
 }
 
 /// A repository identity, validated backing root, and initialized namespace.
@@ -523,25 +594,50 @@ impl ImportedRepository {
     ///
     /// # Errors
     ///
-    /// Returns [`RepositoryStartupError`] when preflight rejects the backing
-    /// tree or the complete manifest cannot initialize one namespace registry.
+    /// Returns [`RepositoryStartupError`] when the process already owns the
+    /// same repository/root pair, preflight rejects the backing tree, or the
+    /// complete manifest cannot initialize one namespace registry.
     pub fn open(
         repository: RepoId,
         root: impl AsRef<Path>,
         limits: PreflightLimits,
     ) -> Result<Self, RepositoryStartupError> {
-        Self::from_validated(repository, ValidatedRepository::open(root, limits)?)
+        let requested_root = root.as_ref();
+        let canonical_root =
+            fs::canonicalize(requested_root).map_err(|source| RepositoryPreflightError::Io {
+                operation: "canonicalize repository root for process lease",
+                path: requested_root.to_path_buf(),
+                source,
+            })?;
+        // Reserve before preflight because materializing external hard links is
+        // itself a backing mutation. A competing import must not run that scan
+        // against the same repository concurrently.
+        let lease = RepositoryLease::acquire(repository.clone(), canonical_root)?;
+        let backing = ValidatedRepository::open(requested_root, limits)?;
+        Self::from_validated_with_lease(repository, backing, lease)
     }
 
     /// Atomically binds and imports a repository that already passed preflight.
     ///
     /// # Errors
     ///
-    /// Returns [`RepositoryStartupError::Namespace`] if the validated manifest
-    /// cannot initialize a complete namespace registry.
+    /// Returns [`RepositoryStartupError::AlreadyOpen`] when the process already
+    /// owns the same repository/root pair, or
+    /// [`RepositoryStartupError::Namespace`] if the validated manifest cannot
+    /// initialize a complete namespace registry.
     pub fn from_validated(
         repository: RepoId,
         backing: ValidatedRepository,
+    ) -> Result<Self, RepositoryStartupError> {
+        let lease =
+            RepositoryLease::acquire(repository.clone(), backing.canonical_root().to_path_buf())?;
+        Self::from_validated_with_lease(repository, backing, lease)
+    }
+
+    fn from_validated_with_lease(
+        repository: RepoId,
+        mut backing: ValidatedRepository,
+        lease: Arc<RepositoryLease>,
     ) -> Result<Self, RepositoryStartupError> {
         let namespace = NamespaceRegistry::from_manifest(backing.entries().iter().map(|entry| {
             ManifestEntry::new(
@@ -550,6 +646,7 @@ impl ImportedRepository {
                 AliasGroup::new(entry.inode()),
             )
         }))?;
+        backing.repository_lease = Some(lease);
         Ok(Self {
             repository,
             backing: Arc::new(backing),
@@ -644,6 +741,7 @@ impl ValidatedRepository {
             root_mount_id: opened_root.mount_id,
             entries,
             materialized_aliases,
+            repository_lease: None,
         })
     }
 
@@ -1312,14 +1410,16 @@ impl fmt::Display for DisplayCanonicalPath<'_> {
 
 #[cfg(test)]
 mod tests {
-    use authority_core::path::CanonicalPath;
+    use authority_core::{path::CanonicalPath, repository::RepoId};
     use rustix::fs::FileType;
+    use tempfile::tempdir;
 
-    use std::collections::HashMap;
+    use std::{collections::HashMap, num::NonZeroUsize};
 
     use super::{
-        EntryMetadata, NamespaceObjectSpec, RejectedObjectKind, RepositoryEntry,
-        RepositoryPreflightError, external_alias_inodes, validate_entry_metadata,
+        EntryMetadata, ImportedRepository, NamespaceObjectSpec, PreflightLimits,
+        RejectedObjectKind, RepositoryEntry, RepositoryPreflightError, RepositoryStartupError,
+        external_alias_inodes, validate_entry_metadata,
     };
 
     fn path(segments: &[&str]) -> CanonicalPath {
@@ -1328,6 +1428,41 @@ mod tests {
 
     fn entry(path: CanonicalPath, spec: NamespaceObjectSpec, inode: u64) -> RepositoryEntry {
         RepositoryEntry::new(path, spec, inode)
+    }
+
+    fn limits() -> PreflightLimits {
+        PreflightLimits::new(NonZeroUsize::new(8).expect("limit must be non-zero"), 2)
+    }
+
+    // Requirement: two public imports cannot create independent quarantine
+    // domains for the same repository. The backing Arc owns the reservation,
+    // and releasing its last clone makes the exact key available again.
+    #[test]
+    fn repository_import_is_process_exclusive_until_last_backing_drop() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let repository = RepoId::new("exclusive-workspace");
+        let imported = ImportedRepository::open(repository.clone(), directory.path(), limits())
+            .expect("first import must acquire the repository lease");
+        let retained_backing = imported.clone().into_parts().1;
+
+        assert!(matches!(
+            ImportedRepository::open(repository.clone(), directory.path(), limits()),
+            Err(RepositoryStartupError::AlreadyOpen {
+                repository: held_repository,
+                root: _
+            }) if held_repository == repository
+        ));
+
+        drop(imported);
+        assert!(matches!(
+            ImportedRepository::open(repository.clone(), directory.path(), limits()),
+            Err(RepositoryStartupError::AlreadyOpen { .. })
+        ));
+
+        drop(retained_backing);
+        let reopened = ImportedRepository::open(repository, directory.path(), limits())
+            .expect("dropping the final backing owner must release the exact lease");
+        drop(reopened);
     }
 
     #[test]

@@ -123,6 +123,9 @@ fn parse_effect(value: &str, label: &str) -> Result<FileEffect, String> {
         "remove_directory" => Ok(FileEffect::RemoveDirectory),
         "rename" => Ok(FileEffect::Rename),
         "set_metadata" => Ok(FileEffect::SetMetadata),
+        "read_link" => Ok(FileEffect::ReadLink),
+        "create_symlink" => Ok(FileEffect::CreateSymlink),
+        "create_hard_link" => Ok(FileEffect::CreateHardLink),
         _ => Err(format!("invalid {label} `{value}`; expected a file effect")),
     }
 }

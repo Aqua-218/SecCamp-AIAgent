@@ -7,7 +7,11 @@ use std::{
     io::{self, Read, Write},
     num::NonZeroU32,
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    time::{Duration, Instant},
 };
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{IsolationConfig, Syscall};
 
@@ -408,6 +412,10 @@ const STARTUP_READY: u8 = 1;
 const STARTUP_FAILED: u8 = 2;
 const TERMINATION_REQUIRED: u8 = 1;
 const ERRNO_UNAVAILABLE: i32 = i32::MIN;
+const DROP_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(test)]
+static FORCE_PIDFD_TERMINATION_FAILURE: AtomicBool = AtomicBool::new(false);
 
 /// A child's kernel-observed startup result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -493,6 +501,8 @@ pub enum ChildProcessError {
     InvalidChildPid,
     /// `waitpid` returned a state that was not terminal.
     InvalidWaitStatus,
+    /// The child did not become reapable before the fail-stop deadline.
+    ReapTimedOut,
     /// A kernel operation on the owned child failed.
     Io {
         /// Operation that failed.
@@ -534,6 +544,9 @@ impl fmt::Display for ChildProcessError {
             Self::InvalidChildPid => formatter.write_str("isolation child PID is invalid"),
             Self::InvalidWaitStatus => {
                 formatter.write_str("waitpid returned a non-terminal child status")
+            }
+            Self::ReapTimedOut => {
+                formatter.write_str("isolation child did not become reapable before the deadline")
             }
             Self::Io { operation, source } => {
                 write!(formatter, "{operation} failed: {source}")
@@ -763,6 +776,13 @@ fn wait_for_child(
 
 #[cfg(target_os = "linux")]
 fn terminate_child(control: &OwnedChildControl) -> Result<(), ChildProcessError> {
+    #[cfg(test)]
+    if FORCE_PIDFD_TERMINATION_FAILURE.load(Ordering::SeqCst) {
+        return Err(ChildProcessError::io(
+            "terminate isolation child through pidfd",
+            io::Error::from_raw_os_error(libc::EPERM),
+        ));
+    }
     loop {
         // SAFETY: the pidfd is owned by this handle, the signal has no payload,
         // and pidfd addressing prevents PID-reuse races.
@@ -789,6 +809,99 @@ fn terminate_child(control: &OwnedChildControl) -> Result<(), ChildProcessError>
             "terminate isolation child through pidfd",
             error,
         ));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_child_by_pid(pid: NonZeroU32) -> Result<(), ChildProcessError> {
+    let pid = libc::pid_t::try_from(pid.get()).map_err(|_| ChildProcessError::InvalidChildPid)?;
+    loop {
+        // SAFETY: the PID identifies this launcher's direct, unreaped child, so
+        // the kernel cannot reuse it until waitpid consumes the terminal state.
+        let result = unsafe { libc::kill(pid, libc::SIGKILL) };
+        if result == 0
+            || (result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+        {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(ChildProcessError::io(
+            "terminate direct isolation child by PID",
+            error,
+        ));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn terminate_child_by_pid(_pid: NonZeroU32) -> Result<(), ChildProcessError> {
+    Err(ChildProcessError::io(
+        "terminate direct isolation child by PID",
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "direct child signaling is available only on Linux",
+        ),
+    ))
+}
+
+fn terminate_owned_child(
+    pid: NonZeroU32,
+    control: &OwnedChildControl,
+) -> Result<(), ChildProcessError> {
+    match terminate_child(control) {
+        Ok(()) => Ok(()),
+        Err(_pidfd_error) => terminate_child_by_pid(pid),
+    }
+}
+
+fn reap_child_before_deadline(
+    pid: NonZeroU32,
+    control: &mut OwnedChildControl,
+) -> Result<ChildExit, ChildProcessError> {
+    let deadline = Instant::now() + DROP_REAP_TIMEOUT;
+    loop {
+        if let Some(exit) = wait_for_child(pid, libc::WNOHANG, control)? {
+            return Ok(exit);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ChildProcessError::ReapTimedOut);
+        }
+        let timeout = i32::try_from((deadline - now).as_millis()).unwrap_or(i32::MAX);
+        let mut descriptor = libc::pollfd {
+            fd: control.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to one initialized pollfd and timeout is
+        // bounded by DROP_REAP_TIMEOUT.
+        let result = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(ChildProcessError::io(
+                "poll isolation child pidfd for exit",
+                error,
+            ));
+        }
+        if result == 0 {
+            return Err(ChildProcessError::ReapTimedOut);
+        }
+    }
+}
+
+fn terminate_and_reap_or_abort(pid: NonZeroU32, control: &mut OwnedChildControl) {
+    if control.reaped {
+        return;
+    }
+    if terminate_owned_child(pid, control).is_err()
+        || reap_child_before_deadline(pid, control).is_err()
+    {
+        std::process::abort();
     }
 }
 
@@ -855,7 +968,11 @@ impl IsolatedChildProcess {
     }
 
     /// Blocks until the child reports complete isolation or a typed startup failure.
+    ///
+    /// Every failure, malformed message, or premature channel close is fail-stop:
+    /// this method terminates and reaps the still-owned child before returning.
     pub fn wait_for_startup(&mut self) -> Result<&ChildStartupStatus, ChildProcessError> {
+        let pid = self.pid;
         let control = self
             .control
             .as_mut()
@@ -869,13 +986,23 @@ impl IsolatedChildProcess {
                 .startup_reader
                 .take()
                 .ok_or(ChildProcessError::StartupAlreadyObserved)?;
-            let status = read_startup_status(reader)?;
+            let status = match read_startup_status(reader) {
+                Ok(status) => status,
+                Err(error) => {
+                    terminate_and_reap_or_abort(pid, control);
+                    return Err(error);
+                }
+            };
             if let ChildStartupStatus::Ready(ready) = &status
                 && ready.pid_namespace != self.pid_namespace
             {
+                terminate_and_reap_or_abort(pid, control);
                 return Err(ChildProcessError::InvalidStartupStatus(
                     "ready namespace did not match the namespace prepared for this child",
                 ));
+            }
+            if matches!(status, ChildStartupStatus::Failed(_)) {
+                terminate_and_reap_or_abort(pid, control);
             }
             control.startup_status = Some(status);
         }
@@ -911,7 +1038,10 @@ impl IsolatedChildProcess {
         wait_for_child(pid, 0, control)?.ok_or(ChildProcessError::InvalidWaitStatus)
     }
 
-    /// Sends `SIGKILL` through the owned pidfd and reaps the direct child.
+    /// Sends `SIGKILL` and waits for a bounded interval to reap the direct child.
+    ///
+    /// A timeout leaves the process capability owned by this handle so the
+    /// caller may retry. Dropping it later remains fail-stop.
     pub fn terminate(&mut self) -> Result<ChildExit, ChildProcessError> {
         let pid = self.pid;
         let control = self
@@ -921,8 +1051,8 @@ impl IsolatedChildProcess {
         if control.reaped {
             return Err(ChildProcessError::AlreadyReaped);
         }
-        terminate_child(control)?;
-        wait_for_child(pid, 0, control)?.ok_or(ChildProcessError::InvalidWaitStatus)
+        terminate_owned_child(pid, control)?;
+        reap_child_before_deadline(pid, control)
     }
 
     #[cfg(test)]
@@ -947,12 +1077,11 @@ impl Drop for IsolatedChildProcess {
         if control.reaped {
             return;
         }
-        // Dropping the only process capability must not detach an untrusted child.
-        if terminate_child(control).is_ok() {
-            let _ = wait_for_child(pid, 0, control);
-        } else {
-            let _ = wait_for_child(pid, libc::WNOHANG, control);
-        }
+        // Dropping the only process capability must not detach an untrusted
+        // child. PID fallback is identity-safe while this unreaped direct child
+        // still owns its kernel PID. If termination or bounded reap nevertheless
+        // fails, aborting the launcher preserves the fail-stop contract.
+        terminate_and_reap_or_abort(pid, control);
     }
 }
 
@@ -1286,10 +1415,17 @@ fn required_steps() -> [IsolationStep; 13] {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        num::NonZeroU32,
+        os::fd::{FromRawFd, OwnedFd, RawFd},
+        sync::atomic::Ordering,
+    };
+
     use super::{
-        BackendError, ChildProcessError, ChildStartupReady, ChildStartupStatus, IsolationError,
-        IsolationStep, NamespaceIdentity, REQUIRED_STEPS, STARTUP_MESSAGE_VERSION,
-        decode_startup_status, encode_startup_failure, encode_startup_ready,
+        BackendError, ChildProcessError, ChildStartupReady, ChildStartupStatus,
+        FORCE_PIDFD_TERMINATION_FAILURE, IsolatedChildProcess, IsolationError, IsolationStep,
+        NamespaceIdentity, REQUIRED_STEPS, STARTUP_MESSAGE_VERSION, decode_startup_status,
+        encode_startup_failure, encode_startup_ready,
     };
 
     #[test]
@@ -1342,6 +1478,182 @@ mod tests {
         assert!(matches!(
             decode_startup_status(message),
             Err(ChildProcessError::InvalidStartupStatus(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_falls_back_to_direct_child_pid_and_reaps() {
+        let mut pipe = [-1; 2];
+        // SAFETY: the array contains storage for both returned descriptors.
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: fork has no pointer arguments. The child calls only
+        // async-signal-safe libc operations before `_exit`.
+        let child_pid = unsafe { libc::fork() };
+        assert_ne!(child_pid, -1, "fork must create the lifecycle test child");
+        if child_pid == 0 {
+            loop {
+                // SAFETY: pause has no pointer arguments and is async-signal-safe.
+                unsafe { libc::pause() };
+            }
+        }
+
+        // SAFETY: successful pipe2 returned two descriptors owned by this process.
+        let reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        // SAFETY: the parent owns the unused writer endpoint.
+        drop(unsafe { OwnedFd::from_raw_fd(pipe[1]) });
+        // SAFETY: pidfd_open receives the live direct child PID and zero flags.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0_u32) };
+        assert_ne!(pidfd, -1, "pidfd_open must own the lifecycle test child");
+        // SAFETY: successful pidfd_open returned an owned descriptor.
+        let pidfd = RawFd::try_from(pidfd).expect("pidfd must fit the descriptor ABI");
+        // SAFETY: successful pidfd_open returned an owned descriptor.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+        let pid = NonZeroU32::new(child_pid.cast_unsigned()).expect("fork PID must be positive");
+        let child = IsolatedChildProcess::from_spawn(
+            pid,
+            NamespaceIdentity::from_kernel(4, 81),
+            pidfd,
+            reader,
+        );
+
+        FORCE_PIDFD_TERMINATION_FAILURE.store(true, Ordering::SeqCst);
+        drop(child);
+        FORCE_PIDFD_TERMINATION_FAILURE.store(false, Ordering::SeqCst);
+
+        let mut status = 0;
+        // SAFETY: this query checks that Drop already consumed the child status.
+        assert_eq!(
+            unsafe { libc::waitpid(child_pid, &raw mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_failure_is_reaped_before_parent_observes_it() {
+        let message = encode_startup_failure(&IsolationError::TerminationRequired {
+            original: BackendError::new(
+                IsolationStep::IdentityMap,
+                "injected credential failure",
+                Some(libc::EPERM),
+            ),
+            failures: Vec::new(),
+        });
+        let mut pipe = [-1; 2];
+        // SAFETY: the array contains storage for both returned descriptors.
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: the child uses only async-signal-safe libc calls before `_exit`.
+        let child_pid = unsafe { libc::fork() };
+        assert_ne!(child_pid, -1, "fork must create the startup-failure child");
+        if child_pid == 0 {
+            // SAFETY: the child owns the writer and no longer needs the reader.
+            unsafe { libc::close(pipe[0]) };
+            // SAFETY: the message is live and the pipe owns enough capacity for it.
+            let written = unsafe {
+                libc::write(
+                    pipe[1],
+                    message.as_ptr().cast::<libc::c_void>(),
+                    message.len(),
+                )
+            };
+            if written != isize::try_from(message.len()).expect("message length must fit ssize_t") {
+                // SAFETY: the fork child must never return into the test harness.
+                unsafe { libc::_exit(2) }
+            }
+            loop {
+                // SAFETY: pause has no pointer arguments and is async-signal-safe.
+                unsafe { libc::pause() };
+            }
+        }
+
+        // SAFETY: the parent owns the unused writer endpoint.
+        drop(unsafe { OwnedFd::from_raw_fd(pipe[1]) });
+        // SAFETY: the parent owns the reader endpoint.
+        let reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        // SAFETY: pidfd_open receives the live direct child PID and zero flags.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0_u32) };
+        assert_ne!(pidfd, -1, "pidfd_open must own the startup-failure child");
+        let pidfd = RawFd::try_from(pidfd).expect("pidfd must fit the descriptor ABI");
+        // SAFETY: successful pidfd_open returned an owned descriptor.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+        let pid = NonZeroU32::new(child_pid.cast_unsigned()).expect("fork PID must be positive");
+        let mut child = IsolatedChildProcess::from_spawn(
+            pid,
+            NamespaceIdentity::from_kernel(4, 81),
+            pidfd,
+            reader,
+        );
+
+        let status = child
+            .wait_for_startup()
+            .expect("typed startup failure must remain observable");
+        let ChildStartupStatus::Failed(failure) = status else {
+            panic!("failure wire message must not decode as ready");
+        };
+        assert_eq!(failure.step(), IsolationStep::IdentityMap);
+        assert!(matches!(
+            child.wait(),
+            Err(ChildProcessError::AlreadyReaped)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_terminate_reaps_once_within_the_deadline() {
+        let mut pipe = [-1; 2];
+        // SAFETY: the array contains storage for both returned descriptors.
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: the child calls only async-signal-safe libc operations.
+        let child_pid = unsafe { libc::fork() };
+        assert_ne!(child_pid, -1, "fork must create the termination test child");
+        if child_pid == 0 {
+            loop {
+                // SAFETY: pause has no pointer arguments and is async-signal-safe.
+                unsafe { libc::pause() };
+            }
+        }
+
+        // SAFETY: successful pipe2 returned two descriptors owned by this process.
+        let reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+        // SAFETY: the parent owns the unused writer endpoint.
+        drop(unsafe { OwnedFd::from_raw_fd(pipe[1]) });
+        // SAFETY: pidfd_open receives the live direct child PID and zero flags.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0_u32) };
+        assert_ne!(pidfd, -1, "pidfd_open must own the termination test child");
+        let pidfd = RawFd::try_from(pidfd).expect("pidfd must fit the descriptor ABI");
+        // SAFETY: successful pidfd_open returned an owned descriptor.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+        let pid = NonZeroU32::new(child_pid.cast_unsigned()).expect("fork PID must be positive");
+        let mut child = IsolatedChildProcess::from_spawn(
+            pid,
+            NamespaceIdentity::from_kernel(4, 81),
+            pidfd,
+            reader,
+        );
+
+        assert_eq!(
+            child
+                .terminate()
+                .expect("SIGKILL child must become reapable before the deadline"),
+            super::ChildExit::Signaled(libc::SIGKILL)
+        );
+        assert!(matches!(
+            child.terminate(),
+            Err(ChildProcessError::AlreadyReaped)
         ));
     }
 }

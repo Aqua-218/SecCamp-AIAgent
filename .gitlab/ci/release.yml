@@ -1,0 +1,74 @@
+package_release:
+  extends: .rust_job
+  stage: package
+  timeout: 25m
+  interruptible: false
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$/
+  script:
+    - scripts/ci/install-release-tools.sh
+    - scripts/ci/package-release.sh "$CI_COMMIT_TAG"
+    - SIGN_RELEASE=true scripts/ci/finalize-release.sh
+  artifacts:
+    expire_in: 30 days
+    access: developer
+    paths:
+      - dist/
+    reports:
+      dotenv: dist/release.env
+
+verify_release:
+  extends: .rust_job
+  stage: verify
+  timeout: 15m
+  interruptible: false
+  needs:
+    - job: package_release
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$/
+  script:
+    - scripts/ci/install-release-tools.sh
+    - export CERTIFICATE_IDENTITY="${CI_PROJECT_URL}//.gitlab-ci.yml@refs/tags/${CI_COMMIT_TAG}"
+    - export CERTIFICATE_OIDC_ISSUER="${CI_SERVER_URL}"
+    - VERIFY_SIGSTORE=true scripts/ci/verify-release.sh
+
+publish_release:
+  extends: .rust_job
+  stage: publish
+  timeout: 15m
+  interruptible: false
+  resource_group: authority-corpus-release
+  needs:
+    - job: package_release
+      artifacts: true
+    - job: verify_release
+  environment:
+    name: release
+    action: prepare
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$/
+      when: manual
+      allow_failure: false
+  manual_confirmation: Publish immutable authority-corpus release assets?
+  script:
+    - scripts/ci/publish-gitlab-release.sh
+
+create_release:
+  image:
+    name: registry.gitlab.com/gitlab-org/cli:v1.113.0@sha256:3cdae06e1aa0a491324db9a46561f929d0b7117ef7390c71a78a9b25a49c6543
+    entrypoint: [""]
+  stage: release
+  timeout: 10m
+  interruptible: false
+  needs:
+    - job: package_release
+      artifacts: true
+    - job: publish_release
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$/
+  script:
+    - scripts/ci/publish-gitlab-release-record.sh

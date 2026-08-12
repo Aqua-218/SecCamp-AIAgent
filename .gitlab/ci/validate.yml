@@ -6,6 +6,12 @@ pipeline_policy:
     - scripts/ci/install-pipeline-tools.sh
     - scripts/ci/validate-pipelines.sh
 
+docs_policy:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/run.sh docs-policy
+
 rust_quality:
   extends: .rust_job
   stage: validate

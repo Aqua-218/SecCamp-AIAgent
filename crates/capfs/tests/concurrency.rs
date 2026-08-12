@@ -25,7 +25,7 @@ use authority_core::{
     state::{CapabilityGrant, CapabilityState, RevocationStatus, StaticAuthorityEnvelope, Subject},
     time::{MonotonicTime, TimeWindow},
 };
-use capfs::namespace::{NamespaceObjectKind, NamespaceOperationError, NamespaceRegistry};
+use capfs::namespace::{NamespaceObjectSpec, NamespaceOperationError, NamespaceRegistry};
 
 const RACE_ROUNDS: usize = 32;
 
@@ -103,7 +103,7 @@ fn fresh_namespace() -> (NamespaceRegistry, ObjectId) {
     let object = registry
         .create_object(
             path(&["entry.txt"]),
-            NamespaceObjectKind::RegularFile,
+            NamespaceObjectSpec::RegularFile,
             |_| Ok::<_, Infallible>(()),
         )
         .expect("test file should be creatable")
@@ -178,7 +178,7 @@ impl RaceRound {
             .open_object(&object, |record| {
                 authorize_effect(
                     &fixture,
-                    record.path().clone(),
+                    record.primary_path().clone(),
                     FileEffect::ReadData,
                     || Ok(()),
                 )
@@ -208,7 +208,7 @@ impl RaceRound {
             registry.with_object(&object, |record| {
                 authorize_effect(
                     &fixture,
-                    record.path().clone(),
+                    record.primary_path().clone(),
                     FileEffect::WriteData,
                     || {
                         started.wait();
@@ -276,7 +276,7 @@ impl RaceRound {
             registry.remove_object(&object, |record| {
                 authorize_effect(
                     &fixture,
-                    record.path().clone(),
+                    record.primary_path().clone(),
                     FileEffect::RemoveFile,
                     || {
                         if revoke_returned.load(Ordering::Acquire) {
@@ -376,14 +376,14 @@ impl RaceRound {
             assert_eq!(
                 snapshot
                     .expect("a successful rename without unlink must keep the object")
-                    .path(),
+                    .primary_path(),
                 &path(&["moved.txt"])
             );
         } else {
             assert_eq!(
                 snapshot
                     .expect("a rejected mutation must leave the object live")
-                    .path(),
+                    .primary_path(),
                 &path(&["entry.txt"])
             );
         }
@@ -419,7 +419,7 @@ fn revoke_before_open_rename_and_unlink_fails_closed_without_executor_calls() {
     let open_result = registry.open_object(&object, |record| {
         authorize_effect(
             &fixture,
-            record.path().clone(),
+            record.primary_path().clone(),
             FileEffect::ReadData,
             || {
                 open_executor_calls.fetch_add(1, Ordering::AcqRel);
@@ -453,7 +453,7 @@ fn revoke_before_open_rename_and_unlink_fails_closed_without_executor_calls() {
     let unlink_result = registry.remove_object(&object, |record| {
         authorize_effect(
             &fixture,
-            record.path().clone(),
+            record.primary_path().clone(),
             FileEffect::RemoveFile,
             || {
                 unlink_executor_calls.fetch_add(1, Ordering::AcqRel);

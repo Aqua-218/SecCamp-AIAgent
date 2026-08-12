@@ -93,9 +93,9 @@ fake command/filesystem/API/identity source による contract test と local Un
 
 `supervisor` は authenticated connection identity から subject を解決し、最大 4 KiB の versioned closed wire protocol、subject setup、Authority Core transition、runtime handle registry、ordered shutdown を実装済みである。実際の namespace、cgroup、mount、descriptor syscall は `RuntimeResources` adapter の責務である。
 
-`session-orchestrator` は process 内 128-bit no-reuse ledger、snapshot identity rejection、workspace/Broker/VM/capability/workload lease binding、startup commit 順、failure rollback、stop retry を実装済みである。workspace clone、Broker connection、VM、Authority adapter、workload restriction は backend trait の責務として切り離されている。
+`session-orchestrator` は durable 128-bit no-reuse ledger、snapshot identity rejection、workspace/Broker/VM/capability/workload lease binding、startup commit 順、failure rollback、stop retry を実装済みである。Authority Core、Broker listener、Firecracker runtime、workspace の production adapter と、それらを同じ startup/stop 経路へ接続する composition test も実装している。
 
-両 crate の mock/contract test は正常順序、spoof/foreign lease、partial failure、cleanup failure、stale handle、identity reuse、二重起動を検証する。実 Linux resource、実 vsock、実 Authority/Broker/capfs/Firecracker の統合と process 外 durable identity allocator は未検証である。
+両 crate の mock/contract test は正常順序、spoof/foreign lease、partial failure、cleanup failure、stale handle、identity reuse、二重起動を検証する。adapter composition は test double の外部境界まで接続済みだが、実 Linux resource、実 vsock、実 capfs mount、実 Firecracker の統合は未検証である。
 
 ## なぜこの順番か
 

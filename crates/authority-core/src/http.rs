@@ -849,9 +849,53 @@ mod tests {
 
         assert!(get.contains(HttpFetchMethod::Get));
         assert!(!get.contains(HttpFetchMethod::Head));
+        assert!(HttpFetchMethods::empty().is_empty());
         assert!(HttpFetchMethods::empty().is_subset_of(get));
         assert!(get.is_subset_of(get_head));
         assert!(!get_head.is_subset_of(get));
+    }
+
+    #[test]
+    fn http_fetch_empty_methods_do_not_bypass_other_containment_axes() {
+        let parent = HttpFetchAuthority::new(
+            HttpFetchMethods::only(HttpFetchMethod::Get),
+            host("docs.example"),
+            UrlPathPattern::Prefix(path("/guide")),
+            u64::MAX,
+        );
+        let same_shape = HttpFetchAuthority::new(
+            HttpFetchMethods::empty(),
+            host("docs.example"),
+            UrlPathPattern::Prefix(path("/guide")),
+            u64::MAX,
+        );
+        let different_path = HttpFetchAuthority::new(
+            HttpFetchMethods::empty(),
+            host("docs.example"),
+            UrlPathPattern::Prefix(path("/other")),
+            u64::MAX,
+        );
+
+        assert!(http_fetch_body_below(&same_shape, &parent));
+        assert!(!http_fetch_body_below(&different_path, &parent));
+    }
+
+    #[test]
+    fn http_fetch_matching_accepts_the_full_u64_response_limit() {
+        let authority = HttpFetchAuthority::new(
+            HttpFetchMethods::only(HttpFetchMethod::Get),
+            host("docs.example"),
+            UrlPathPattern::Prefix(path("/guide")),
+            u64::MAX,
+        );
+        let request = HttpFetchRequest::new(
+            HttpFetchMethod::Get,
+            host("docs.example"),
+            path("/guide/start"),
+            u64::MAX,
+        );
+
+        assert!(http_fetch_matches(&authority, &request));
     }
 
     #[test]

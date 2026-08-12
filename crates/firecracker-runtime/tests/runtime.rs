@@ -7,26 +7,33 @@
 
 use firecracker_runtime::{
     ApiClient, ApiRequest, ApiResponse, CgroupConfig, CommandOutput, CommandRunner, CommandSpec,
-    DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, IdentityId, IdentitySource,
-    MAX_COMMAND_OUTPUT_BYTES, MAX_HTTP_BODY_BYTES, NamespaceConfig, PinnedArtifact, ProcessHandle,
-    RealCommandRunner, Runtime, RuntimeConfig, RuntimeError, RuntimeState, SeccompConfig,
+    DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, IdentityBundle, IdentityId,
+    IdentitySource, MAX_COMMAND_OUTPUT_BYTES, MAX_HTTP_BODY_BYTES, MAX_WORKSPACE_BYTES,
+    MAX_WORKSPACE_DEPTH, NamespaceConfig, PinnedArtifact, ProcessHandle, RealCommandRunner,
+    RealFileSystem, Runtime, RuntimeConfig, RuntimeError, RuntimeState, SeccompConfig,
     Sha256Digest, Snapshot, VsockConfig, WorkspaceConfig, sha256,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::fs::symlink;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type Events = Rc<RefCell<Vec<String>>>;
+
+static UNIX_API_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
 struct MockRunner {
     events: Events,
     next_pid: u32,
+    stop_failures: VecDeque<bool>,
+    run_failures: VecDeque<bool>,
 }
 
 impl MockRunner {
@@ -34,6 +41,21 @@ impl MockRunner {
         Self {
             events,
             next_pid: 100,
+            stop_failures: VecDeque::new(),
+            run_failures: VecDeque::new(),
+        }
+    }
+
+    fn with_failures(
+        events: Events,
+        stop_failures: impl IntoIterator<Item = bool>,
+        run_failures: impl IntoIterator<Item = bool>,
+    ) -> Self {
+        Self {
+            events,
+            next_pid: 100,
+            stop_failures: stop_failures.into_iter().collect(),
+            run_failures: run_failures.into_iter().collect(),
         }
     }
 }
@@ -45,6 +67,9 @@ impl CommandRunner for MockRunner {
             command.program.display(),
             command.args.join(" ")
         ));
+        if self.run_failures.pop_front().unwrap_or(false) {
+            return Err(RuntimeError::Command("mock command failure".to_owned()));
+        }
         Ok(CommandOutput {
             status: 0,
             stdout: Vec::new(),
@@ -67,6 +92,9 @@ impl CommandRunner for MockRunner {
         self.events
             .borrow_mut()
             .push(format!("command:stop:{}", process.pid));
+        if self.stop_failures.pop_front().unwrap_or(false) {
+            return Err(RuntimeError::Command("mock stop failure".to_owned()));
+        }
         Ok(())
     }
 }
@@ -76,6 +104,7 @@ struct MockFileSystem {
     events: Events,
     artifacts: HashMap<PathBuf, Vec<u8>>,
     fail_clone: bool,
+    remove_failures: VecDeque<bool>,
 }
 
 impl FileSystem for MockFileSystem {
@@ -104,6 +133,9 @@ impl FileSystem for MockFileSystem {
         self.events
             .borrow_mut()
             .push(format!("filesystem:remove:{}", path.display()));
+        if self.remove_failures.pop_front().unwrap_or(false) {
+            return Err(RuntimeError::Io("mock remove failure".to_owned()));
+        }
         Ok(())
     }
 }
@@ -246,6 +278,7 @@ fn filesystem_for(config: &RuntimeConfig, events: Events) -> MockFileSystem {
         events,
         artifacts,
         fail_clone: false,
+        remove_failures: VecDeque::new(),
     }
 }
 
@@ -268,6 +301,47 @@ fn runtime(
         ),
         events,
     )
+}
+
+fn runtime_with_cleanup_failures(
+    config: &RuntimeConfig,
+    stop_failures: impl IntoIterator<Item = bool>,
+    run_failures: impl IntoIterator<Item = bool>,
+    remove_failures: impl IntoIterator<Item = bool>,
+) -> (
+    Runtime<MockRunner, MockFileSystem, MockApi, MockApi, MockIdentitySource>,
+    Events,
+) {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut filesystem = filesystem_for(config, Rc::clone(&events));
+    filesystem.remove_failures = remove_failures.into_iter().collect();
+    (
+        Runtime::new(
+            MockRunner::with_failures(Rc::clone(&events), stop_failures, run_failures),
+            filesystem,
+            MockApi::new(Rc::clone(&events), std::iter::empty()),
+            MockApi::new(Rc::clone(&events), std::iter::empty()),
+            MockIdentitySource::sequential(),
+        ),
+        events,
+    )
+}
+
+fn identity(number: u8) -> IdentityId {
+    IdentityId::from_hex(&format!("{number:032x}")).expect("test identity must be valid")
+}
+
+fn temporary_workspace(name: &str) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after Unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "firecracker-runtime-{name}-{}-{timestamp}",
+        std::process::id()
+    ));
+    fs::create_dir(&path).expect("temporary workspace root must be creatable");
+    path
 }
 
 #[test]
@@ -368,6 +442,39 @@ fn workspace_clone_error_removes_partial_destination_without_starting_vm() {
     assert!(events[1].starts_with("filesystem:remove:"));
 }
 
+fn assert_shutdown_retry(stop_failures: &[bool], run_failures: &[bool], remove_failures: &[bool]) {
+    let config = config();
+    let (mut runtime, events) = runtime_with_cleanup_failures(
+        &config,
+        stop_failures.iter().copied(),
+        run_failures.iter().copied(),
+        remove_failures.iter().copied(),
+    );
+    let mut instance = runtime.launch(&config).expect("runtime must launch");
+    assert!(matches!(
+        runtime.shutdown(&mut instance, &config),
+        Err(RuntimeError::Cleanup(_))
+    ));
+    assert_ne!(instance.state(), RuntimeState::Stopped);
+    runtime
+        .shutdown(&mut instance, &config)
+        .expect("pending cleanup must be retryable");
+    assert_eq!(instance.state(), RuntimeState::Stopped);
+    let completed_event_count = events.borrow().len();
+    runtime
+        .shutdown(&mut instance, &config)
+        .expect("completed shutdown must be idempotent");
+    assert_eq!(events.borrow().len(), completed_event_count);
+}
+
+#[test]
+fn shutdown_retries_each_pending_cleanup_without_repeating_successes() {
+    // Every cleanup stage can fail independently; dependent stages wait for its retry.
+    assert_shutdown_retry(&[true, false], &[], &[]);
+    assert_shutdown_retry(&[false], &[false, true], &[]);
+    assert_shutdown_retry(&[false], &[false], &[true, false]);
+}
+
 #[test]
 fn restore_regenerates_all_identities_and_gates_workload_until_injection() {
     // Requirement: restore creates fresh VM/session/request/subject/capability IDs before workload start.
@@ -422,6 +529,61 @@ fn restore_regenerates_all_identities_and_gates_workload_until_injection() {
         .position(|event| event.starts_with("api:/actions/start-workload:"))
         .expect("workload start API event must be present");
     assert!(inject_index < start_index);
+}
+
+#[test]
+fn restore_accepts_exact_host_allocated_identities() {
+    let config = config();
+    let snapshot = Snapshot::new(
+        "/snapshots/state",
+        "/snapshots/memory",
+        config_fingerprint(&config),
+        Vec::new(),
+    );
+    let bundle = IdentityBundle::new(
+        identity(101),
+        identity(102),
+        identity(103),
+        identity(104),
+        identity(105),
+    )
+    .expect("host identity bundle must validate");
+    let (mut runtime, events) = runtime(&config, std::iter::empty());
+    let restored = runtime
+        .restore_with_identities(&config, &snapshot, bundle.clone())
+        .expect("host identities must be authoritative during restore");
+    assert_eq!(restored.identities(), Some(&bundle));
+    assert!(
+        events
+            .borrow()
+            .iter()
+            .any(|event| event.starts_with("api:/snapshot/load:"))
+    );
+}
+
+#[test]
+fn restore_rejects_host_identity_reuse_before_side_effects() {
+    let config = config();
+    let reused = identity(201);
+    let snapshot = Snapshot::new(
+        "/snapshots/state",
+        "/snapshots/memory",
+        config_fingerprint(&config),
+        vec![reused],
+    );
+    let bundle = IdentityBundle {
+        vm_id: reused,
+        session_id: identity(202),
+        request_id: identity(203),
+        subject_id: identity(204),
+        capability_id: identity(205),
+    };
+    let (mut runtime, events) = runtime(&config, std::iter::empty());
+    assert!(matches!(
+        runtime.restore_with_identities(&config, &snapshot, bundle),
+        Err(RuntimeError::StaleIdentity(_))
+    ));
+    assert!(events.borrow().is_empty());
 }
 
 #[test]
@@ -515,6 +677,9 @@ fn overlapping_workspace_source_and_clone_paths_are_rejected() {
 #[test]
 fn unix_api_client_sends_real_http_over_unix_socket() {
     // Requirement: the production backend must perform an actual Unix API request.
+    let _lock = UNIX_API_TEST_LOCK
+        .lock()
+        .expect("Unix API test lock must not be poisoned");
     let socket = test_socket_path("real-http");
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).expect("test Unix socket must bind");
@@ -559,6 +724,9 @@ fn unix_api_client_sends_real_http_over_unix_socket() {
 }
 
 fn request_with_response(name: &str, response: &[u8]) -> Result<ApiResponse, RuntimeError> {
+    let _lock = UNIX_API_TEST_LOCK
+        .lock()
+        .expect("Unix API test lock must not be poisoned");
     let socket = test_socket_path(name);
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).expect("test Unix socket must bind");
@@ -678,6 +846,98 @@ fn unix_api_client_rejects_oversized_request_body_before_connecting() {
     assert!(matches!(error, RuntimeError::Api(message) if message.contains("request body")));
 }
 
+#[test]
+fn real_filesystem_publishes_and_removes_only_owned_complete_clones() {
+    let root = temporary_workspace("ownership");
+    let source = root.join("source");
+    let destination = root.join("clone");
+    let outside = root.join("outside");
+    fs::create_dir(&source).expect("source directory must be creatable");
+    fs::create_dir(&outside).expect("outside directory must be creatable");
+    fs::create_dir(source.join("nested")).expect("nested directory must be creatable");
+    fs::write(source.join("nested/file"), b"owned").expect("source file must be writable");
+    fs::write(outside.join("sentinel"), b"must survive").expect("sentinel must be writable");
+
+    let mut filesystem = RealFileSystem::new();
+    filesystem
+        .clone_workspace(&source, &destination)
+        .expect("complete workspace must publish");
+    assert_eq!(
+        fs::read(destination.join("nested/file")).expect("published file must be readable"),
+        b"owned"
+    );
+
+    let saved_clone = root.join("saved-clone");
+    fs::rename(&destination, &saved_clone)
+        .expect("owned clone must be movable for replacement test");
+    symlink(&outside, &destination).expect("replacement symlink must be creatable");
+    assert!(filesystem.remove_workspace(&destination).is_err());
+    assert_eq!(
+        fs::read(outside.join("sentinel")).expect("unowned sentinel must remain"),
+        b"must survive"
+    );
+    fs::remove_file(&destination).expect("replacement symlink must be removable");
+    fs::rename(saved_clone, &destination).expect("owned clone must be restorable");
+    filesystem
+        .remove_workspace(&destination)
+        .expect("restored owned clone must be removable");
+    assert!(!destination.exists());
+
+    fs::remove_dir_all(root).expect("test workspace must be removable");
+}
+
+#[test]
+fn real_filesystem_rejects_source_aliases_symlinks_hardlinks_and_bounds() {
+    let root = temporary_workspace("rejection");
+    let source = root.join("source");
+    let destination = root.join("clone");
+    fs::create_dir(&source).expect("source directory must be creatable");
+    fs::write(root.join("outside-file"), b"outside").expect("outside file must be writable");
+    symlink(root.join("outside-file"), source.join("symlink"))
+        .expect("source symlink must be creatable");
+    let mut filesystem = RealFileSystem::new();
+    assert!(filesystem.clone_workspace(&source, &destination).is_err());
+    assert!(!destination.exists());
+    fs::remove_file(source.join("symlink")).expect("source symlink must be removable");
+
+    fs::write(source.join("file"), b"hardlinked").expect("source file must be writable");
+    fs::hard_link(source.join("file"), source.join("hardlink"))
+        .expect("source hardlink must be creatable");
+    assert!(filesystem.clone_workspace(&source, &destination).is_err());
+    fs::remove_file(source.join("hardlink")).expect("source hardlink must be removable");
+    fs::remove_file(source.join("file")).expect("source file must be removable");
+
+    let nested_destination = source.join("inside-source");
+    assert!(
+        filesystem
+            .clone_workspace(&source, &nested_destination)
+            .is_err()
+    );
+
+    let mut deep = source.clone();
+    for index in 0..=MAX_WORKSPACE_DEPTH {
+        deep.push(format!("depth-{index}"));
+        fs::create_dir(&deep).expect("bounded-depth source directory must be creatable");
+    }
+    assert!(filesystem.clone_workspace(&source, &destination).is_err());
+
+    let bytes_source = root.join("bytes-source");
+    fs::create_dir(&bytes_source).expect("byte-bound source directory must be creatable");
+    let large = bytes_source.join("large");
+    let file = fs::File::create(&large).expect("sparse source file must be creatable");
+    file.set_len(MAX_WORKSPACE_BYTES + 1)
+        .expect("sparse source file must support the bound test");
+    let byte_destination = root.join("bytes-clone");
+    assert!(
+        filesystem
+            .clone_workspace(&bytes_source, &byte_destination)
+            .is_err()
+    );
+    assert!(!byte_destination.exists());
+
+    fs::remove_dir_all(root).expect("test workspace must be removable");
+}
+
 fn shell_command(script: &str) -> CommandSpec {
     CommandSpec {
         program: PathBuf::from("/bin/sh"),
@@ -686,9 +946,10 @@ fn shell_command(script: &str) -> CommandSpec {
 }
 
 fn test_socket_path(name: &str) -> PathBuf {
-    let mut path = std::env::current_exe().expect("test executable path must be available");
-    path.set_file_name(format!(".firecracker-runtime-api-{name}"));
-    path
+    std::env::temp_dir().join(format!(
+        ".firecracker-runtime-api-{name}-{}",
+        std::process::id()
+    ))
 }
 
 #[test]
@@ -725,6 +986,29 @@ fn real_command_runner_terminates_on_oversized_stderr() {
     assert!(
         matches!(error, RuntimeError::Command(message) if message.contains("stderr") && message.contains(&MAX_COMMAND_OUTPUT_BYTES.to_string()))
     );
+}
+
+#[test]
+fn real_command_runner_reaps_an_already_exited_owned_child() {
+    let mut runner = RealCommandRunner::new();
+    let process = runner
+        .start(&shell_command("exit 0"))
+        .expect("owned child must start");
+    std::thread::sleep(Duration::from_millis(20));
+    runner
+        .stop(process)
+        .expect("already-exited owned child must be a successful stop");
+}
+
+#[test]
+fn real_command_runner_rejects_unowned_pid_without_signalling_it() {
+    let mut runner = RealCommandRunner::new();
+    let error = runner
+        .stop(ProcessHandle {
+            pid: std::process::id(),
+        })
+        .expect_err("unowned PID must be rejected");
+    assert!(matches!(error, RuntimeError::Command(message) if message.contains("unknown process")));
 }
 
 fn config_fingerprint(config: &RuntimeConfig) -> Sha256Digest {

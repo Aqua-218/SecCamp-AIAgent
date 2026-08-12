@@ -108,6 +108,8 @@ def HasEffect (state : AuditState) (attemptId : AttemptId) : Prop :=
 structure MayBegin (state : AuditState) (attemptId : AttemptId) where
   fresh : state.attempts attemptId = none
   allocatedIdentity : attemptId.value = state.nextAttemptId
+  sequenceCanIncrement : CanIncrementU64 state.nextSequence
+  identityCanIncrement : CanIncrementU64 state.nextAttemptId
 
 /-- Receipt policy for a terminal record. -/
 def ValidReceipt (attemptId : AttemptId) (outcome : AttemptOutcome)
@@ -128,6 +130,7 @@ structure MayFinish (state : AuditState) (attemptId : AttemptId)
   currentLookup : state.attempts attemptId = some currentRecord
   stillStarted : currentRecord.outcome = .started
   receiptValid : ValidReceipt attemptId outcome receipt
+  sequenceCanIncrement : CanIncrementU64 state.nextSequence
 
 /-- Recover the attempt identity indexed by validated finish evidence. -/
 def MayFinish.attemptId {state : AuditState} {attemptId : AttemptId}
@@ -288,6 +291,26 @@ theorem Step.nextAttemptId_monotone {before after : AuditState}
   | begin => exact Nat.le_succ _
   | finish => exact Nat.le_refl _
 
+/-- Both append sequence and attempt allocator fit their Rust `u64` fields. -/
+def CountersRepresentable (state : AuditState) : Prop :=
+  FitsU64 state.nextSequence ∧ FitsU64 state.nextAttemptId
+
+/-- The empty audit journal starts with representable counters. -/
+theorem empty_countersRepresentable : empty.CountersRepresentable := by
+  simp [CountersRepresentable, empty, FitsU64, u64Maximum]
+
+/-- Checked audit appends preserve both `u64` representation bounds. -/
+theorem Step.preserves_countersRepresentable {before after : AuditState}
+    (transition : Step before after)
+    (representable : before.CountersRepresentable) :
+    after.CountersRepresentable := by
+  cases transition with
+  | begin allowed =>
+      exact ⟨allowed.sequenceCanIncrement.increment_fits,
+        allowed.identityCanIncrement.increment_fits⟩
+  | finish allowed =>
+      exact ⟨allowed.sequenceCanIncrement.increment_fits, representable.2⟩
+
 /-- Once started, an attempt identity remains permanently reserved. -/
 theorem Step.started_attempt_persists {before after : AuditState}
     (transition : Step before after) {attemptId : AttemptId}
@@ -397,6 +420,17 @@ theorem Steps.nextAttemptId_monotone {before after : AuditState} {length : Nat}
   | refl => exact Nat.le_refl _
   | next firstStep _ inductionResult =>
       exact Nat.le_trans firstStep.nextAttemptId_monotone inductionResult
+
+/-- Arbitrarily long accepted audit executions remain within both `u64` bounds. -/
+theorem Steps.preserve_countersRepresentable {before after : AuditState}
+    {length : Nat} (execution : Steps before after length)
+    (representable : before.CountersRepresentable) :
+    after.CountersRepresentable := by
+  induction execution with
+  | refl => exact representable
+  | next firstStep _ inductionResult =>
+      exact inductionResult
+        (firstStep.preserves_countersRepresentable representable)
 
 /-- Terminal records remain immutable across an arbitrary accepted execution. -/
 theorem Steps.terminal_attempt_immutable {before after : AuditState} {length : Nat}

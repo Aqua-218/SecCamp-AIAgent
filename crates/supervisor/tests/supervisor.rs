@@ -13,8 +13,9 @@ use authority_core::{
     time::{MonotonicTime, TimeWindow},
 };
 use supervisor::{
-    CgroupHandle, CleanupStep, ConnectionIdentity, ControlFdHandle, MountHandle, RuntimeResources,
-    SetupStep, StaticCallerResolver, SubjectLifecycle, Supervisor, SupervisorError, WorkloadHandle,
+    CgroupHandle, CleanupStep, ConnectionIdentity, ControlFdHandle, MountHandle,
+    ResourceAcquisition, ResourceMutation, RuntimeResources, SetupStep, StaticCallerResolver,
+    SubjectLifecycle, Supervisor, SupervisorError, WorkloadHandle,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,31 +64,55 @@ impl FakeResources {
 impl RuntimeResources for FakeResources {
     type Error = FakeError;
 
-    fn create_cgroup(&mut self, _subject: &SubjectId) -> Result<CgroupHandle, Self::Error> {
-        self.record("create_cgroup")?;
-        Ok(CgroupHandle::new(self.token()))
+    fn create_cgroup(
+        &mut self,
+        _subject: &SubjectId,
+    ) -> ResourceAcquisition<CgroupHandle, Self::Error> {
+        match self.record("create_cgroup") {
+            Ok(()) => ResourceAcquisition::Acquired(CgroupHandle::new(self.token())),
+            Err(error) => ResourceAcquisition::NoEffect(error),
+        }
     }
 
-    fn remove_cgroup(&mut self, _cgroup: CgroupHandle) -> Result<(), Self::Error> {
-        self.record("remove_cgroup")
+    fn remove_cgroup(&mut self, _cgroup: CgroupHandle) -> ResourceMutation<Self::Error> {
+        match self.record("remove_cgroup") {
+            Ok(()) => ResourceMutation::Applied,
+            Err(error) => ResourceMutation::CleanupRequired(error),
+        }
     }
 
-    fn mount_capfs(&mut self, _subject: &SubjectId) -> Result<MountHandle, Self::Error> {
-        self.record("mount")?;
-        Ok(MountHandle::new(self.token()))
+    fn mount_capfs(
+        &mut self,
+        _subject: &SubjectId,
+    ) -> ResourceAcquisition<MountHandle, Self::Error> {
+        match self.record("mount") {
+            Ok(()) => ResourceAcquisition::Acquired(MountHandle::new(self.token())),
+            Err(error) => ResourceAcquisition::NoEffect(error),
+        }
     }
 
-    fn unmount_capfs(&mut self, _mount: MountHandle) -> Result<(), Self::Error> {
-        self.record("unmount")
+    fn unmount_capfs(&mut self, _mount: MountHandle) -> ResourceMutation<Self::Error> {
+        match self.record("unmount") {
+            Ok(()) => ResourceMutation::Applied,
+            Err(error) => ResourceMutation::CleanupRequired(error),
+        }
     }
 
-    fn open_control_fd(&mut self, _subject: &SubjectId) -> Result<ControlFdHandle, Self::Error> {
-        self.record("open_control")?;
-        Ok(ControlFdHandle::new(self.token()))
+    fn open_control_fd(
+        &mut self,
+        _subject: &SubjectId,
+    ) -> ResourceAcquisition<ControlFdHandle, Self::Error> {
+        match self.record("open_control") {
+            Ok(()) => ResourceAcquisition::Acquired(ControlFdHandle::new(self.token())),
+            Err(error) => ResourceAcquisition::NoEffect(error),
+        }
     }
 
-    fn close_control_fd(&mut self, _control: ControlFdHandle) -> Result<(), Self::Error> {
-        self.record("close_control")
+    fn close_control_fd(&mut self, _control: ControlFdHandle) -> ResourceMutation<Self::Error> {
+        match self.record("close_control") {
+            Ok(()) => ResourceMutation::Applied,
+            Err(error) => ResourceMutation::CleanupRequired(error),
+        }
     }
 
     fn start_workload(
@@ -96,29 +121,44 @@ impl RuntimeResources for FakeResources {
         _cgroup: CgroupHandle,
         _mount: MountHandle,
         _control: ControlFdHandle,
-    ) -> Result<WorkloadHandle, Self::Error> {
-        self.record("start_workload")?;
-        Ok(WorkloadHandle::new(self.token()))
+    ) -> ResourceAcquisition<WorkloadHandle, Self::Error> {
+        match self.record("start_workload") {
+            Ok(()) => ResourceAcquisition::Acquired(WorkloadHandle::new(self.token())),
+            Err(error) => ResourceAcquisition::NoEffect(error),
+        }
     }
 
     fn stop_workload(
         &mut self,
         _workload: WorkloadHandle,
         _cgroup: CgroupHandle,
-    ) -> Result<(), Self::Error> {
-        self.record("stop_workload")
+    ) -> ResourceMutation<Self::Error> {
+        match self.record("stop_workload") {
+            Ok(()) => ResourceMutation::Applied,
+            Err(error) => ResourceMutation::CleanupRequired(error),
+        }
     }
 
-    fn open_handle(&mut self, _subject: &SubjectId, _handle: &HandleId) -> Result<(), Self::Error> {
-        self.record("open_handle")
+    fn open_handle(
+        &mut self,
+        _subject: &SubjectId,
+        _handle: &HandleId,
+    ) -> ResourceMutation<Self::Error> {
+        match self.record("open_handle") {
+            Ok(()) => ResourceMutation::Applied,
+            Err(error) => ResourceMutation::NoEffect(error),
+        }
     }
 
     fn close_handle(
         &mut self,
         _subject: &SubjectId,
         _handle: &HandleId,
-    ) -> Result<(), Self::Error> {
-        self.record("close_handle")
+    ) -> ResourceMutation<Self::Error> {
+        match self.record("close_handle") {
+            Ok(()) => ResourceMutation::Applied,
+            Err(error) => ResourceMutation::CleanupRequired(error),
+        }
     }
 }
 

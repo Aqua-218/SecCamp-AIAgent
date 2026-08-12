@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     error::Error,
     fmt,
+    ops::{Deref, DerefMut},
     sync::{
         RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, Ordering},
@@ -1040,8 +1041,47 @@ impl NamespaceState {
 /// I/O.
 #[derive(Debug)]
 pub struct NamespaceRegistry {
+    // This outer gate makes repository health and backing effects one atomic
+    // publication domain. Namespace reads share it; every mutation excludes
+    // both readers and other mutations until its terminal outcome (including
+    // quarantine) has been published.
+    operation_gate: RwLock<()>,
     state: RwLock<NamespaceState>,
     repository_in_doubt: AtomicBool,
+}
+
+struct NamespaceReadGuard<'a> {
+    // State is declared first so it is released before the outer operation
+    // guard. This preserves the global operation-gate -> namespace-state order.
+    state: RwLockReadGuard<'a, NamespaceState>,
+    _operation: RwLockReadGuard<'a, ()>,
+}
+
+impl Deref for NamespaceReadGuard<'_> {
+    type Target = NamespaceState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+struct NamespaceWriteGuard<'a> {
+    state: RwLockWriteGuard<'a, NamespaceState>,
+    _operation: RwLockWriteGuard<'a, ()>,
+}
+
+impl Deref for NamespaceWriteGuard<'_> {
+    type Target = NamespaceState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl DerefMut for NamespaceWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
 }
 
 impl Default for NamespaceRegistry {
@@ -1055,6 +1095,7 @@ impl NamespaceRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            operation_gate: RwLock::new(()),
             state: RwLock::new(NamespaceState::with_root()),
             repository_in_doubt: AtomicBool::new(false),
         }
@@ -1097,6 +1138,7 @@ impl NamespaceRegistry {
             }
         }
         Ok(Self {
+            operation_gate: RwLock::new(()),
             state: RwLock::new(state),
             repository_in_doubt: AtomicBool::new(false),
         })
@@ -1203,6 +1245,26 @@ impl NamespaceRegistry {
         operation: impl FnOnce(&NamespaceObject) -> Result<T, E>,
     ) -> Result<T, NamespaceOperationError<E>> {
         let state = self.read_operational_state()?;
+        let object = state
+            .objects
+            .get(object)
+            .ok_or_else(|| NamespaceError::UnknownObject(object.clone()))?;
+        operation(object).map_err(NamespaceOperationError::Executor)
+    }
+
+    /// Executes a backing mutation while excluding every repository read and
+    /// mutation from the final health check through outcome publication.
+    ///
+    /// Unlike namespace transitions, this operation does not stage a path
+    /// change. It exists for writes, truncates, and metadata effects whose
+    /// backing result and possible quarantine still need repository-wide
+    /// serialization.
+    pub(crate) fn with_object_mutation<T, E>(
+        &self,
+        object: &ObjectId,
+        operation: impl FnOnce(&NamespaceObject) -> Result<T, E>,
+    ) -> Result<T, NamespaceOperationError<E>> {
+        let state = self.write_operational_state()?;
         let object = state
             .objects
             .get(object)
@@ -1990,25 +2052,43 @@ impl NamespaceRegistry {
         )
     }
 
-    fn read_state(&self) -> Result<RwLockReadGuard<'_, NamespaceState>, NamespaceError> {
-        self.state.read().map_err(|_| NamespaceError::LockPoisoned)
+    fn read_state(&self) -> Result<NamespaceReadGuard<'_>, NamespaceError> {
+        let operation = self
+            .operation_gate
+            .read()
+            .map_err(|_| NamespaceError::LockPoisoned)?;
+        let state = self
+            .state
+            .read()
+            .map_err(|_| NamespaceError::LockPoisoned)?;
+        Ok(NamespaceReadGuard {
+            state,
+            _operation: operation,
+        })
     }
 
-    fn read_operational_state(
-        &self,
-    ) -> Result<RwLockReadGuard<'_, NamespaceState>, NamespaceError> {
+    fn read_operational_state(&self) -> Result<NamespaceReadGuard<'_>, NamespaceError> {
         let state = self.read_state()?;
         self.ensure_operational()?;
         Ok(state)
     }
 
-    fn write_state(&self) -> Result<RwLockWriteGuard<'_, NamespaceState>, NamespaceError> {
-        self.state.write().map_err(|_| NamespaceError::LockPoisoned)
+    fn write_state(&self) -> Result<NamespaceWriteGuard<'_>, NamespaceError> {
+        let operation = self
+            .operation_gate
+            .write()
+            .map_err(|_| NamespaceError::LockPoisoned)?;
+        let state = self
+            .state
+            .write()
+            .map_err(|_| NamespaceError::LockPoisoned)?;
+        Ok(NamespaceWriteGuard {
+            state,
+            _operation: operation,
+        })
     }
 
-    fn write_operational_state(
-        &self,
-    ) -> Result<RwLockWriteGuard<'_, NamespaceState>, NamespaceError> {
+    fn write_operational_state(&self) -> Result<NamespaceWriteGuard<'_>, NamespaceError> {
         let state = self.write_state()?;
         self.ensure_operational()?;
         Ok(state)
@@ -2225,7 +2305,9 @@ mod tests {
     use std::{
         convert::Infallible,
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::Arc,
+        sync::{Arc, Barrier, mpsc},
+        thread,
+        time::Duration,
     };
 
     use authority_core::path::CanonicalPath;
@@ -2255,6 +2337,72 @@ mod tests {
             .get(object_path)
             .and_then(|object| state.objects.get(object))
             .cloned()
+    }
+
+    // Requirement: the repository mutation gate spans the final health check,
+    // the backing executor, and quarantine publication. A reader may share the
+    // gate with other readers, but it cannot observe the pre-quarantine state
+    // after a mutation has begun.
+    #[test]
+    fn mutation_gate_holds_readers_until_quarantine_is_published() {
+        let registry = Arc::new(NamespaceRegistry::new());
+        let object = registry
+            .create_object(path(&["file"]), NamespaceObjectSpec::RegularFile, |_| {
+                Ok::<_, Infallible>(())
+            })
+            .expect("test object must be created")
+            .object()
+            .clone();
+        let mutation_entered = Arc::new(Barrier::new(2));
+        let publish_quarantine = Arc::new(Barrier::new(2));
+
+        let writer_registry = Arc::clone(&registry);
+        let quarantine_registry = Arc::clone(&registry);
+        let writer_object = object.clone();
+        let writer_entered = Arc::clone(&mutation_entered);
+        let writer_publish = Arc::clone(&publish_quarantine);
+        let writer = thread::spawn(move || {
+            writer_registry.with_object_mutation(&writer_object, |_| {
+                writer_entered.wait();
+                writer_publish.wait();
+                quarantine_registry.mark_in_doubt();
+                Ok::<_, Infallible>(())
+            })
+        });
+        mutation_entered.wait();
+
+        let reader_registry = Arc::clone(&registry);
+        let reader_started = Arc::new(Barrier::new(2));
+        let spawned_reader_started = Arc::clone(&reader_started);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            spawned_reader_started.wait();
+            let result = reader_registry.with_object(&object, |_| Ok::<_, Infallible>(()));
+            result_sender
+                .send(result)
+                .expect("test result receiver must remain live");
+        });
+        reader_started.wait();
+        assert_eq!(
+            result_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "reader must remain behind the in-flight mutation"
+        );
+
+        publish_quarantine.wait();
+        assert_eq!(
+            writer.join().expect("mutation thread must not panic"),
+            Ok(())
+        );
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("reader must finish after mutation publication"),
+            Err(NamespaceOperationError::Namespace(
+                NamespaceError::RepositoryInDoubt
+            ))
+        );
+        reader.join().expect("reader thread must not panic");
     }
 
     #[cfg(target_os = "linux")]

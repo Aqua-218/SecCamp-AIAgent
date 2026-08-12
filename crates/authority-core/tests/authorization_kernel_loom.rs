@@ -17,12 +17,14 @@ use authority_core::{
         SubjectId,
     },
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
-    kernel::{CapabilityKernel, EffectCommitError},
+    handle::{HandleId, ObjectId, OpenHandle},
+    kernel::{CapabilityKernel, CapabilityKernelError, EffectCommitError},
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     state::{
-        AuthorizationEpoch, CapabilityGrant, CapabilityState, RevocationStatus,
-        StaticAuthorityEnvelope, Subject,
+        AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
+        HandleCloseStatus, RevocationStatus, StaticAuthorityEnvelope, Subject, SubjectCloseStatus,
+        SubjectFinishStatus,
     },
     time::{MonotonicTime, TimeWindow},
 };
@@ -478,6 +480,158 @@ fn two_guarded_effects_remain_consistent_with_one_revoke_order() {
             committed
         );
         assert_eq!(effects.len(), committed);
+    });
+}
+
+// Requirement: open-handle registration and subject shutdown have one
+// linearization order; a closing subject cannot retain a handle that was
+// registered after shutdown returned. Category: bounded concurrency/security.
+// Risk: critical.
+#[test]
+fn open_handle_registration_and_shutdown_are_linearized() {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(2);
+    model.check(|| {
+        let (state, _) = initialized_state();
+        let kernel = Arc::new(CapabilityKernel::new(state));
+        let handle_id = HandleId::new("loom-handle");
+        let handle = OpenHandle::new(
+            handle_id.clone(),
+            subject_id(),
+            ObjectId::new("loom-object"),
+        );
+
+        let register_kernel = Arc::clone(&kernel);
+        let register_handle = handle.clone();
+        let register = thread::spawn(move || register_kernel.register_open_handle(register_handle));
+        let close_kernel = Arc::clone(&kernel);
+        let close = thread::spawn(move || close_kernel.begin_subject_close(&subject_id()));
+
+        let register_result = register
+            .join()
+            .expect("handle registration thread must not panic");
+        let close_result = close
+            .join()
+            .expect("subject shutdown thread must not panic");
+        assert!(matches!(
+            close_result,
+            Ok(SubjectCloseStatus::Started | SubjectCloseStatus::AlreadyClosing)
+        ));
+        assert!(matches!(
+            register_result,
+            Ok(())
+                | Err(CapabilityKernelError::StateTransition(
+                    CapabilityStateError::SubjectNotRunning(_)
+                ))
+        ));
+
+        let has_live_handle = kernel
+            .open_handle(&handle_id)
+            .expect("handle lookup must remain readable")
+            .is_some();
+        if has_live_handle {
+            assert_eq!(
+                kernel.finish_subject_close(&subject_id()),
+                Err(CapabilityKernelError::StateTransition(
+                    CapabilityStateError::SubjectHasOpenHandles(subject_id()),
+                ))
+            );
+            assert_eq!(
+                kernel.close_handle(&subject_id(), &handle_id),
+                Ok(HandleCloseStatus::Closed)
+            );
+        }
+        assert_eq!(
+            kernel.finish_subject_close(&subject_id()),
+            Ok(SubjectFinishStatus::Closed)
+        );
+        assert_eq!(
+            kernel.open_handle(&handle_id),
+            Ok(None),
+            "a closed subject must not retain a live handle"
+        );
+    });
+}
+
+// Requirement: two distinct revokes are both monotone and a descendant
+// effect is ordered before both completed revokes or denied after the first
+// one. Category: bounded concurrency/security. Risk: critical.
+#[test]
+fn multiple_direct_and_ancestor_revokes_preserve_effect_order() {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(2);
+    model.check(|| {
+        let (state, root_id, child_id) = initialized_delegated_state();
+        let kernel = Arc::new(CapabilityKernel::new(state));
+        let completed_revokes = Arc::new(AtomicUsize::new(0));
+
+        let effect_kernel = Arc::clone(&kernel);
+        let effect_child_id = child_id.clone();
+        let effect_completed_revokes = Arc::clone(&completed_revokes);
+        let effect = thread::spawn(move || {
+            effect_kernel.authorize_and_commit(
+                &child_subject_id(),
+                &effect_child_id,
+                &request(),
+                |_| {
+                    assert_eq!(
+                        effect_completed_revokes.load(Ordering::Acquire),
+                        0,
+                        "an effect cannot commit after either revoke returned"
+                    );
+                    Ok::<_, Infallible>(())
+                },
+            )
+        });
+
+        let child_revoke_kernel = Arc::clone(&kernel);
+        let child_revoke_completed = Arc::clone(&completed_revokes);
+        let child_revoke_id = child_id.clone();
+        let child_revoke = thread::spawn(move || {
+            let result = child_revoke_kernel.revoke(&child_revoke_id);
+            assert_eq!(result, Ok(RevocationStatus::NewlyRevoked));
+            child_revoke_completed.fetch_add(1, Ordering::AcqRel);
+        });
+
+        let root_revoke_kernel = Arc::clone(&kernel);
+        let root_revoke_completed = Arc::clone(&completed_revokes);
+        let root_revoke = thread::spawn(move || {
+            let result = root_revoke_kernel.revoke(&root_id);
+            assert_eq!(result, Ok(RevocationStatus::NewlyRevoked));
+            root_revoke_completed.fetch_add(1, Ordering::AcqRel);
+        });
+
+        let effect_result = effect.join().expect("effect thread must not panic");
+        child_revoke
+            .join()
+            .expect("child revoke thread must not panic");
+        root_revoke
+            .join()
+            .expect("root revoke thread must not panic");
+        assert!(matches!(
+            effect_result,
+            Ok(()) | Err(EffectCommitError::NotAuthorized)
+        ));
+        assert_eq!(completed_revokes.load(Ordering::Acquire), 2);
+        assert_eq!(
+            kernel
+                .authorization_epoch()
+                .expect("epoch must be readable")
+                .as_u64(),
+            2
+        );
+        let attempts = kernel
+            .attempt_records()
+            .expect("audit records must remain readable");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].outcome(),
+            if effect_result.is_ok() {
+                AttemptOutcome::Committed
+            } else {
+                AttemptOutcome::Denied
+            }
+        );
     });
 }
 

@@ -72,6 +72,8 @@ mod tests {
         calls: Vec<IsolationStep>,
         rollbacks: Vec<IsolationStep>,
         fail_at: Option<IsolationStep>,
+        fail_errno: Option<i32>,
+        rollback_fail_at: Option<IsolationStep>,
         report: CapabilityReport,
         spawn_role: MockSpawnRole,
         namespace_prepares: usize,
@@ -87,6 +89,8 @@ mod tests {
                 calls: Vec::new(),
                 rollbacks: Vec::new(),
                 fail_at: None,
+                fail_errno: None,
+                rollback_fail_at: None,
                 report: CapabilityReport::supported(3),
                 spawn_role: MockSpawnRole::Child,
                 namespace_prepares: 0,
@@ -187,7 +191,7 @@ mod tests {
             self.events.push(MockEvent::Apply(step));
             self.calls.push(step);
             if self.fail_at == Some(step) {
-                return Err(BackendError::new(step, "injected failure", None));
+                return Err(BackendError::new(step, "injected failure", self.fail_errno));
             }
             Ok(())
         }
@@ -199,6 +203,13 @@ mod tests {
             _config: &IsolationConfig,
         ) -> Result<(), BackendError> {
             self.rollbacks.push(step);
+            if self.rollback_fail_at == Some(step) {
+                return Err(BackendError::new(
+                    step,
+                    "injected rollback failure",
+                    Some(libc::EBUSY),
+                ));
+            }
             Ok(())
         }
     }
@@ -478,6 +489,31 @@ mod tests {
         );
         assert_eq!(backend.startup_messages.len(), 1);
         assert_failure_message(&backend.startup_messages[0], 9, None, 0);
+    }
+
+    #[test]
+    fn child_failure_message_preserves_errno_and_rollback_failure_count() {
+        let mut backend = MockBackend::new();
+        backend.fail_at = Some(IsolationStep::Landlock);
+        backend.fail_errno = Some(libc::EACCES);
+        backend.rollback_fail_at = Some(IsolationStep::Workspace);
+
+        let error =
+            RuntimeIsolation::spawn_isolated_transaction(&mut backend, &test_config(), |_| ())
+                .expect_err("child isolation failure must propagate");
+
+        assert!(matches!(
+            error,
+            IsolationError::TerminationRequired {
+                original,
+                failures,
+            } if original.errno == Some(libc::EACCES)
+                && failures.len() == 1
+                && failures[0].step == IsolationStep::Workspace
+                && failures[0].errno == Some(libc::EBUSY)
+        ));
+        assert_eq!(backend.startup_messages.len(), 1);
+        assert_failure_message(&backend.startup_messages[0], 9, Some(libc::EACCES), 1);
     }
 
     #[test]

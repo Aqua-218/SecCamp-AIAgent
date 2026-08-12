@@ -1045,6 +1045,8 @@ fn prepare_firecracker(
             "Firecracker factory returned a proof for another session request",
         ));
     }
+    let backend_template =
+        verified_backend_template(&state.base_config, identity, &prepared.runtime_config)?;
     let filesystem = state.filesystem.take().ok_or_else(|| {
         BackendError::new("session Runtime filesystem was already consumed by another preparation")
     })?;
@@ -1057,7 +1059,7 @@ fn prepare_firecracker(
     );
     let (vm, workload) = new_firecracker_backends(
         runtime,
-        prepared.runtime_config,
+        backend_template,
         prepared.snapshot,
         prepared.snapshot_id,
     );
@@ -1065,6 +1067,22 @@ fn prepare_firecracker(
     state.vm = Some(vm);
     state.workload = Some(workload);
     Ok(())
+}
+
+fn verified_backend_template(
+    template: &RuntimeConfig,
+    identity: SessionIdentity,
+    prepared: &RuntimeConfig,
+) -> Result<RuntimeConfig, BackendError> {
+    let execution_config = rebind_runtime_config(template, identity)?;
+    if execution_config != *prepared {
+        return Err(BackendError::new(
+            "prepared Firecracker config does not equal the backend's exact execution config",
+        ));
+    }
+    // FirecrackerVmBackend performs the one session rebind immediately before restore. Passing
+    // `prepared` here would append session-scoped fields such as the dm-verity mapper twice.
+    Ok(template.clone())
 }
 
 struct ProductionBrokerRuntimeFactory {
@@ -1151,6 +1169,7 @@ fn validate_production_config(
             "identity ledger and authority audit WAL must use distinct paths".to_owned(),
         ));
     }
+    validate_durability_path_separation(config)?;
     let broker_root_metadata =
         fs::symlink_metadata(&config.durability.broker_wal_root).map_err(|error| {
             ProductionBuildError::InvalidConfig(format!(
@@ -1195,6 +1214,197 @@ fn validate_production_config(
         ));
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct ComparedPath {
+    label: &'static str,
+    lexical: PathBuf,
+    resolved: PathBuf,
+}
+
+impl ComparedPath {
+    fn new(label: &'static str, path: &Path) -> Result<Self, ProductionBuildError> {
+        let lexical = normalize_absolute_path(label, path)?;
+        let resolved = resolve_from_existing_ancestor(label, &lexical)?;
+        Ok(Self {
+            label,
+            lexical,
+            resolved,
+        })
+    }
+}
+
+fn validate_durability_path_separation(
+    config: &ProductionSessionConfig,
+) -> Result<(), ProductionBuildError> {
+    let durability = [
+        ComparedPath::new("identity ledger", &config.durability.identity_ledger_path)?,
+        ComparedPath::new(
+            "authority audit WAL",
+            config.durability.authority_audit.path(),
+        )?,
+        ComparedPath::new("Broker WAL root", &config.durability.broker_wal_root)?,
+    ];
+    for (index, left) in durability.iter().enumerate() {
+        for right in durability.iter().skip(index + 1) {
+            require_disjoint(left, right)?;
+        }
+    }
+
+    let runtime_paths = [
+        ComparedPath::new(
+            "workspace template source",
+            &config.firecracker.workspace.source,
+        )?,
+        ComparedPath::new(
+            "workspace clone tree",
+            &config.firecracker.workspace.clone_root,
+        )?,
+        ComparedPath::new(
+            "Firecracker jail tree",
+            &config.firecracker.jailer_config.chroot_base_dir,
+        )?,
+        ComparedPath::new(
+            "Firecracker executable",
+            &config.firecracker.firecracker.path,
+        )?,
+        ComparedPath::new("kernel artifact", &config.firecracker.kernel.path)?,
+        ComparedPath::new("rootfs artifact", &config.firecracker.rootfs.path)?,
+        ComparedPath::new(
+            "dm-verity hash artifact",
+            &config.firecracker.verity_hash.path,
+        )?,
+        ComparedPath::new("jailer executable", &config.firecracker.jailer.path)?,
+        ComparedPath::new(
+            "seccomp filter artifact",
+            &config.firecracker.isolation.seccomp.filter.path,
+        )?,
+        ComparedPath::new("Firecracker API socket", &config.firecracker.api_socket)?,
+        ComparedPath::new(
+            "Firecracker vsock socket",
+            &config.firecracker.vsock.uds_path,
+        )?,
+        ComparedPath::new(
+            "jailed dm-verity device",
+            &config.firecracker.dm_verity.jailed_device_path,
+        )?,
+        ComparedPath::new(
+            "Firecracker cgroup",
+            &config.firecracker.isolation.cgroup.path,
+        )?,
+    ];
+    for durable in &durability {
+        for runtime in &runtime_paths {
+            require_disjoint(durable, runtime)?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_absolute_path(
+    label: &'static str,
+    path: &Path,
+) -> Result<PathBuf, ProductionBuildError> {
+    if !path.is_absolute() {
+        return Err(ProductionBuildError::InvalidConfig(format!(
+            "{label} path must be absolute: {}",
+            path.display()
+        )));
+    }
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(component) => normalized.push(component),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(ProductionBuildError::InvalidConfig(format!(
+                    "{label} path contains a non-normal component: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn resolve_from_existing_ancestor(
+    label: &'static str,
+    path: &Path,
+) -> Result<PathBuf, ProductionBuildError> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let mut resolved = fs::canonicalize(ancestor).map_err(|error| {
+                    ProductionBuildError::InvalidConfig(format!(
+                        "{label} existing ancestor cannot be canonicalized: {}: {error}",
+                        ancestor.display()
+                    ))
+                })?;
+                if !missing.is_empty()
+                    && !fs::metadata(&resolved)
+                        .map_err(|error| {
+                            ProductionBuildError::InvalidConfig(format!(
+                                "{label} resolved ancestor cannot be inspected: {}: {error}",
+                                resolved.display()
+                            ))
+                        })?
+                        .is_dir()
+                {
+                    return Err(ProductionBuildError::InvalidConfig(format!(
+                        "{label} path descends from a non-directory: {}",
+                        resolved.display()
+                    )));
+                }
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = ancestor.file_name().ok_or_else(|| {
+                    ProductionBuildError::InvalidConfig(format!(
+                        "{label} path has no canonicalizable existing ancestor: {}",
+                        path.display()
+                    ))
+                })?;
+                missing.push(component.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    ProductionBuildError::InvalidConfig(format!(
+                        "{label} path has no parent: {}",
+                        path.display()
+                    ))
+                })?;
+            }
+            Err(error) => {
+                return Err(ProductionBuildError::InvalidConfig(format!(
+                    "{label} path ancestor cannot be inspected: {}: {error}",
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+}
+
+fn require_disjoint(left: &ComparedPath, right: &ComparedPath) -> Result<(), ProductionBuildError> {
+    let lexical_overlap = paths_overlap(&left.lexical, &right.lexical);
+    let resolved_overlap = paths_overlap(&left.resolved, &right.resolved);
+    if lexical_overlap || resolved_overlap {
+        return Err(ProductionBuildError::InvalidConfig(format!(
+            "{} and {} paths must be disjoint: {} and {}",
+            left.label,
+            right.label,
+            left.lexical.display(),
+            right.lexical.display()
+        )));
+    }
+    Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 fn validate_owned_absolute_path(label: &str, path: &Path) -> Result<(), ProductionBuildError> {
@@ -1350,8 +1560,9 @@ mod tests {
     use egress_broker::dispatch::{BrokerResponse, DispatchError};
     use egress_protocol::frame::ControlFrame;
     use firecracker_runtime::{
-        ApiResponse, CgroupConfig, CgroupVersion, DmVerityConfig, HostIsolationConfig, HttpMethod,
-        JailerConfig, NamespaceConfig, PinnedArtifact, SeccompConfig, Sha256Digest, VsockConfig,
+        ApiResponse, CgroupConfig, CgroupVersion, CommandOutput, CommandRunner, CommandSpec,
+        DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, JailerConfig, NamespaceConfig,
+        PinnedArtifact, ProcessHandle, ProcessOwnership, SeccompConfig, Sha256Digest, VsockConfig,
         WorkspaceConfig, sha256,
     };
 
@@ -1366,6 +1577,122 @@ mod tests {
                 status: 204,
                 body: String::new(),
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct ExecutionCapture {
+        block_binding: Option<(PathBuf, PathBuf)>,
+        cloned_workspace: Option<(PathBuf, PathBuf)>,
+        ownership: Option<ProcessOwnership>,
+        restored_resources: Option<(PathBuf, PathBuf, u32)>,
+    }
+
+    struct ExecutionRunner {
+        capture: Arc<Mutex<ExecutionCapture>>,
+    }
+
+    impl CommandRunner for ExecutionRunner {
+        fn run(&mut self, _command: &CommandSpec) -> Result<CommandOutput, RuntimeError> {
+            Ok(CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+
+        fn start(&mut self, _command: &CommandSpec) -> Result<ProcessHandle, RuntimeError> {
+            Err(RuntimeError::Command(
+                "test requires owned Firecracker startup".to_owned(),
+            ))
+        }
+
+        fn start_owned(
+            &mut self,
+            _command: &CommandSpec,
+            ownership: &ProcessOwnership,
+        ) -> Result<ProcessHandle, RuntimeError> {
+            self.capture
+                .lock()
+                .expect("execution capture must not be poisoned")
+                .ownership = Some(ownership.clone());
+            Ok(ProcessHandle { pid: 41 })
+        }
+
+        fn verify_running(&mut self, _process: ProcessHandle) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn stop(&mut self, _process: ProcessHandle) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    struct ExecutionFileSystem {
+        capture: Arc<Mutex<ExecutionCapture>>,
+    }
+
+    impl FileSystem for ExecutionFileSystem {
+        fn read(&mut self, _path: &Path) -> Result<Vec<u8>, RuntimeError> {
+            Ok(b"pinned".to_vec())
+        }
+
+        fn verify_block_device_binding(
+            &mut self,
+            source: &Path,
+            jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            self.capture
+                .lock()
+                .expect("execution capture must not be poisoned")
+                .block_binding = Some((source.to_owned(), jailed_device.to_owned()));
+            Ok(())
+        }
+
+        fn clone_workspace(
+            &mut self,
+            source: &Path,
+            destination: &Path,
+        ) -> Result<(), RuntimeError> {
+            self.capture
+                .lock()
+                .expect("execution capture must not be poisoned")
+                .cloned_workspace = Some((source.to_owned(), destination.to_owned()));
+            Ok(())
+        }
+
+        fn remove_workspace(&mut self, _path: &Path) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    struct ExecutionApi {
+        capture: Arc<Mutex<ExecutionCapture>>,
+    }
+
+    impl ApiClient for ExecutionApi {
+        fn request(&mut self, _request: &ApiRequest) -> Result<ApiResponse, RuntimeError> {
+            Ok(ApiResponse {
+                status: 204,
+                body: String::new(),
+            })
+        }
+
+        fn verify_restore_resources(
+            &mut self,
+            workspace_path: &Path,
+            vsock_uds_path: &Path,
+            guest_cid: u32,
+        ) -> Result<(), RuntimeError> {
+            self.capture
+                .lock()
+                .expect("execution capture must not be poisoned")
+                .restored_resources = Some((
+                workspace_path.to_owned(),
+                vsock_uds_path.to_owned(),
+                guest_cid,
+            ));
+            Ok(())
         }
     }
 
@@ -1739,6 +2066,163 @@ mod tests {
                 TestApi,
             ),
             Err(SessionPreparationError::RuntimeConfigMismatch)
+        ));
+    }
+
+    #[test]
+    fn firecracker_backend_executes_the_exact_once_rebound_proven_config() {
+        let root = TestDirectory::new();
+        let template = runtime_config(&root.0);
+        let session = identity(0x21);
+        let prepared = rebind_runtime_config(&template, session)
+            .expect("the factory request must contain one session rebind");
+        let backend_template = verified_backend_template(&template, session, &prepared)
+            .expect("the exact prepared config must pass the execution gate");
+        let workspace_id = session.workspace_id().to_string();
+        let jail_root = session_jail_root(&prepared).expect("session jail root must resolve");
+        let expected_mapper = format!("session-root-{workspace_id}");
+        let expected_cgroup = PathBuf::from("/sys/fs/cgroup/session-runtime").join(&workspace_id);
+        let expected_workspace = jail_root.join("workspace").join(&workspace_id);
+
+        assert_eq!(prepared.dm_verity.mapper_name, expected_mapper);
+        assert_eq!(prepared.isolation.cgroup.path, expected_cgroup);
+        assert_eq!(prepared.workspace.clone_path(), expected_workspace);
+        assert_eq!(
+            prepared.dm_verity.jailed_device_path,
+            jail_root.join("dev/rootfs")
+        );
+
+        let snapshot_id = SnapshotId::new([0x72; crate::ID_BYTES]);
+        let snapshot = Snapshot::new(
+            jail_root.join("snapshots/state"),
+            jail_root.join("snapshots/memory"),
+            prepared.snapshot_fingerprint(),
+            sha256(b"pinned"),
+            sha256(b"pinned"),
+            Vec::new(),
+        );
+        let capture = Arc::new(Mutex::new(ExecutionCapture::default()));
+        let runtime = Runtime::new(
+            ExecutionRunner {
+                capture: Arc::clone(&capture),
+            },
+            ExecutionFileSystem {
+                capture: Arc::clone(&capture),
+            },
+            ExecutionApi {
+                capture: Arc::clone(&capture),
+            },
+            TestApi,
+            SystemIdentitySource,
+        );
+        let (mut vm, _workload) =
+            new_firecracker_backends(runtime, backend_template, snapshot, snapshot_id);
+        vm.start_vm(
+            &SnapshotDescriptor::clean(snapshot_id),
+            &session,
+            &WorkspaceLease::new(session.session_id(), session.workspace_id()),
+            &BrokerLease::new(session.session_id(), session.broker_session_id()),
+        )
+        .expect("the exact once-rebound config must restore");
+
+        let capture = capture
+            .lock()
+            .expect("execution capture must not be poisoned");
+        assert_eq!(
+            capture.block_binding,
+            Some((
+                Path::new("/dev/mapper").join(&expected_mapper),
+                jail_root.join("dev/rootfs"),
+            ))
+        );
+        assert_eq!(
+            capture.cloned_workspace,
+            Some((template.workspace.source.clone(), expected_workspace))
+        );
+        assert_eq!(
+            capture
+                .ownership
+                .as_ref()
+                .map(|ownership| ownership.cgroup_path.as_path()),
+            Some(expected_cgroup.as_path())
+        );
+        assert_eq!(
+            capture.restored_resources,
+            Some((
+                Path::new("/workspace").join(&workspace_id),
+                PathBuf::from("/run/vsock.sock"),
+                prepared.vsock.guest_cid,
+            ))
+        );
+
+        let mut foreign = prepared;
+        foreign.dm_verity.mapper_name.push_str("-foreign");
+        assert!(verified_backend_template(&template, session, &foreign).is_err());
+    }
+
+    #[test]
+    fn durability_paths_inside_the_cloned_workspace_fail_closed() {
+        let root = TestDirectory::new();
+        let workspace = root.0.join("workspace-source");
+        fs::create_dir(&workspace).expect("workspace source must be creatable");
+
+        let mut identity_config = production_config(
+            &root.0,
+            AuthorityAuditMode::CreateNew(root.0.join("authority.wal")),
+        );
+        identity_config.durability.identity_ledger_path = workspace.join("identity.ledger");
+        assert!(matches!(
+            validate_production_config(&identity_config),
+            Err(ProductionBuildError::InvalidConfig(message))
+                if message.contains("identity ledger")
+                    && message.contains("workspace template source")
+        ));
+
+        let mut audit_config = production_config(
+            &root.0,
+            AuthorityAuditMode::CreateNew(workspace.join("authority.wal")),
+        );
+        assert!(matches!(
+            validate_production_config(&audit_config),
+            Err(ProductionBuildError::InvalidConfig(message))
+                if message.contains("authority audit WAL")
+                    && message.contains("workspace template source")
+        ));
+
+        let broker_root = workspace.join("broker-wal");
+        fs::create_dir(&broker_root).expect("nested Broker WAL root must be creatable");
+        audit_config.durability.authority_audit =
+            AuthorityAuditMode::CreateNew(root.0.join("authority.wal"));
+        audit_config.durability.broker_wal_root = broker_root;
+        assert!(matches!(
+            validate_production_config(&audit_config),
+            Err(ProductionBuildError::InvalidConfig(message))
+                if message.contains("Broker WAL root")
+                    && message.contains("workspace template source")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durability_symlink_alias_into_the_cloned_workspace_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new();
+        let workspace = root.0.join("workspace-source");
+        fs::create_dir(&workspace).expect("workspace source must be creatable");
+        let alias = root.0.join("durability-alias");
+        symlink(&workspace, &alias).expect("test alias must be creatable");
+        let mut config = production_config(
+            &root.0,
+            AuthorityAuditMode::CreateNew(root.0.join("authority.wal")),
+        );
+        config.durability.identity_ledger_path = alias.join("identity.ledger");
+
+        assert!(matches!(
+            validate_production_config(&config),
+            Err(ProductionBuildError::InvalidConfig(message))
+                if message.contains("identity ledger")
+                    && message.contains("workspace template source")
         ));
     }
 

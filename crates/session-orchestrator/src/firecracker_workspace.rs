@@ -370,16 +370,20 @@ fn validate_jail_root(path: &Path) -> Result<(), &'static str> {
     if !path.is_absolute() {
         return Err("jail root must be absolute");
     }
-    if path == Path::new("/") {
-        return Err("jail root cannot be the host root");
+    let mut has_normal_component = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(_) => has_normal_component = true,
+            Component::ParentDir | Component::CurDir | Component::Prefix(_) => {
+                return Err(
+                    "jail root must contain only an absolute root and normal path components",
+                );
+            }
+        }
     }
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::CurDir | Component::Prefix(_)
-        )
-    }) {
-        return Err("jail root must contain only an absolute root and normal path components");
+    if !has_normal_component {
+        return Err("jail root cannot be the host root");
     }
     Ok(())
 }
@@ -402,7 +406,7 @@ fn runtime_workspace_error(message: &str) -> RuntimeError {
 mod tests {
     use super::*;
     use crate::{
-        BrokerSessionId, CapabilityId, ID_BYTES, RequestId, SessionId, SubjectId, VmId, WorkspaceId,
+        BrokerSessionId, CapabilityId, RequestId, SessionId, SubjectId, VmId, WorkspaceId, ID_BYTES,
     };
     use std::{collections::VecDeque, sync::Mutex};
 
@@ -555,11 +559,9 @@ mod tests {
         let (mut backend, mut runtime_filesystem) = adapters(Arc::clone(&state));
         let session = identity(0x11, 0xab);
 
-        assert!(
-            backend
-                .clone_workspace(&session, &WorkspaceTemplateId::new("template-b"))
-                .is_err()
-        );
+        assert!(backend
+            .clone_workspace(&session, &WorkspaceTemplateId::new("template-b"))
+            .is_err());
         let lease = backend
             .clone_workspace(&session, &WorkspaceTemplateId::new("template-a"))
             .expect("orchestrator clone must succeed");
@@ -567,14 +569,12 @@ mod tests {
             WorkspaceLease::new(SessionId::new([0x99; ID_BYTES]), lease.workspace_id());
 
         assert!(backend.isolate_workspace(&foreign_lease).is_err());
-        assert!(
-            runtime_filesystem
-                .clone_workspace(
-                    Path::new("/workspace/source"),
-                    Path::new("/workspace/other")
-                )
-                .is_err()
-        );
+        assert!(runtime_filesystem
+            .clone_workspace(
+                Path::new("/workspace/source"),
+                Path::new("/workspace/other")
+            )
+            .is_err());
 
         let recorded = state.lock().expect("fake state must not be poisoned");
         assert_eq!(recorded.clones.len(), 1);
@@ -583,7 +583,12 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_jail_roots_before_clone_side_effects() {
-        for jail_root in ["relative/jailer/firecracker", "/", "/srv/jailer/../escape"] {
+        for jail_root in [
+            "relative/jailer/firecracker",
+            "/",
+            "//",
+            "/srv/jailer/../escape",
+        ] {
             let state = Arc::new(Mutex::new(FakeState::default()));
             let (mut backend, _) = new_firecracker_workspace_adapters(
                 FakeFileSystem::new(Arc::clone(&state)),
@@ -601,13 +606,11 @@ mod tests {
                     .is_err(),
                 "unsafe jail root must fail closed: {jail_root}"
             );
-            assert!(
-                state
-                    .lock()
-                    .expect("fake state must not be poisoned")
-                    .clones
-                    .is_empty()
-            );
+            assert!(state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .clones
+                .is_empty());
         }
     }
 
@@ -636,19 +639,15 @@ mod tests {
             "/srv/jailer/firecracker/{foreign_id}/root/dev/rootfs"
         ));
 
-        assert!(
-            runtime_filesystem
-                .verify_block_device_binding(&mapper, &foreign_device)
-                .is_err()
-        );
-        assert!(
-            runtime_filesystem
-                .verify_block_device_binding(
-                    Path::new("/dev/mapper/rootfs-verity-foreign"),
-                    &jailed_device
-                )
-                .is_err()
-        );
+        assert!(runtime_filesystem
+            .verify_block_device_binding(&mapper, &foreign_device)
+            .is_err());
+        assert!(runtime_filesystem
+            .verify_block_device_binding(
+                Path::new("/dev/mapper/rootfs-verity-foreign"),
+                &jailed_device
+            )
+            .is_err());
         assert!(
             state
                 .lock()
@@ -695,13 +694,11 @@ mod tests {
                 "/srv/jailer/firecracker/abababababababababababababababab/root/workspace/abababababababababababababababab",
             ))
             .expect("runtime release must only mark the record");
-        assert!(
-            state
-                .lock()
-                .expect("fake state must not be poisoned")
-                .removals
-                .is_empty()
-        );
+        assert!(state
+            .lock()
+            .expect("fake state must not be poisoned")
+            .removals
+            .is_empty());
 
         assert!(backend.isolate_workspace(&lease).is_err());
         assert!(backend.isolate_workspace(&lease).is_ok());

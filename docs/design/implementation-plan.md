@@ -32,7 +32,7 @@ Rust で typed Capability、正規化型、`Matches`、`PathBelow`、`WeakerThan
 
 **完了条件:** repository、host、path、time、response size の境界値まで Rust と Lean が一致する。
 
-現在は file-only slice として repository、path、file effect、time、typed Capability、`Matches`、`WeakerThan` の Rust/Lean 実装、Lean の包含証明、71件の共通 corpus による自動差分テストまで完了している。host/response size を持つ authority variant と、それらに対応する corpus case は未実装である。
+現在は file-only slice として repository、path、file effect、time、typed Capability、`Matches`、`WeakerThan` の Rust/Lean 実装、Lean の包含証明、101件の共通 corpus による自動差分テストまで完了している。host/response size を持つ authority variant と、それらに対応する corpus case は未実装である。
 
 ## 2. 状態機械
 
@@ -42,7 +42,7 @@ subject tree、held、revoke、open handle、attempt、effect、authorization gu
 
 並行境界では、最終認可から executor の線形化点と audit outcome 確定まで shared guard を保持し、revoke、subject shutdown、発行 transition を exclusive guard に置いた。全 attempt と commit 済み effect は caller、Capability、typed request、epoch とともに in-memory journal へ記録する。
 
-Loom は direct revoke / 1 effect、ancestor revoke / descendant effect の全 interleaving と、preemption bound 2 の 2 effects / 1 revoke を検査する。guard を認可直後に外す negative control も反例を出す。これにより次の完了条件は現在の Authority core model について満たした。
+Loom は direct / ancestor revokeに対する単一・compound effectの全 interleavingと、preemption bound 2 の 2 effects / 1 revokeを検査する。compound modelはexecutorが全段階まで進むか、全く入らないか、また1件のauditがrequest set全体を持つかも確認する。guard を認可直後に外す negative control も反例を出す。これにより次の完了条件は現在の Authority core model について満たした。
 
 状態機械 phase に残るのは、durable audit backend、supervisor / filesystem / Broker adapter、および open handle・rename・unlink・複数 revoke を含む競合 model である。global namespace registry は capfs crate へ移り、path/object 対応と mutation lock を実装済みである。詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)、[Authorization guard](../authority-core/authorization-guard.md)、[Subject lifecycle と open handle](../authority-core/subject-lifecycle-and-handles.md)、[Attempt / effect audit](../authority-core/audit-records.md)、[共有 namespace registry](../capfs/namespace-registry.md)を参照する。
 
@@ -64,9 +64,7 @@ flowchart LR
 
 初期完了時点では symlink と hard link を含む repository を拒否し、`SYMLINK` と `LINK` も `EPERM` にする。これにより、namespace と revoke の基本 invariant を link 解決から独立して検証する。
 
-現在はVM共通のlink-free namespace registry、repository preflight、`RepoId`とbacking root / namespaceのbinding、manifestの原子的なstartup import、subject-local node tableに加え、Direct-I/O FUSE adapterまで実装している。`ImportedRepository`をcloneした複数mountは同じbacking rootとnamespaceを共有し、node / local handle / authorityだけを分離する。`LOOKUP` / `GETATTR` / `FORGET` / `OPEN` / `READ` / `WRITE` / sizeだけの`SETATTR` / `CREATE` / `MKDIR` / `RELEASE` / `OPENDIR` / `READDIR` / `RELEASEDIR`をroot fd、node table、namespace registry、Authority kernelへ接続し、zero TTLとdirect I/Oを使う。`OPEN`は`O_RDONLY`、`O_WRONLY`、`O_RDWR`を対応する`ReadData` / `WriteData`の単一または複合認可へ変換し、writableな`O_TRUNC`には`Truncate`も同じ複合認可へ加える。`CREATE`は`CreateFile`と返却handleのaccess effectを同じ複合認可で確認し、`MKDIR`は`CreateDirectory`を確認する。両方ともwriter lock内で現在の親pathを確定し、root fd相対のexclusive backing create後にだけnamespaceをpublishする。`WRITE`と`SETATTR(size)`はopen済みdescriptorでも現在pathを再確認する。`READDIR`は`ListDirectory`を通常のpath patternで確認したうえで、同一namespace guard内のdirect childだけをvisibility filterへ通す。実mount上で権限外siblingが`ENOENT`になり、open済みfile descriptorのread / write / size変更と既存directory streamの次のlisting、既存parent directory fdに対する`mkdirat`がrevoke後は`EACCES`になることを確認した。詳しい境界は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。
-
-次はremove、no-replace renameを共有namespace transactionへ接続する。その後にmode / timestampの`SetMetadata`を追加する。
+現在はVM共通のlink-free namespace registry、repository preflight、`RepoId`とbacking root / namespaceのbinding、manifestの原子的なstartup import、subject-local node tableに加え、Direct-I/O FUSE adapterまで実装している。`ImportedRepository`をcloneした複数mountは同じbacking rootとnamespaceを共有し、node / local handle / authorityだけを分離する。`LOOKUP` / `GETATTR` / `FORGET` / `OPEN` / `READ` / `WRITE` / `SETATTR` / `CREATE` / `MKDIR` / `UNLINK` / `RMDIR` / `RENAME` / `RELEASE` / `OPENDIR` / `READDIR` / `RELEASEDIR`をroot fd、node table、namespace registry、Authority kernelへ接続し、zero TTLとdirect I/Oを使う。`OPEN`は`O_RDONLY`、`O_WRONLY`、`O_RDWR`を対応する`ReadData` / `WriteData`の単一または複合認可へ変換し、writableな`O_TRUNC`には`Truncate`も同じ複合認可へ加える。`SETATTR`のsizeは`Truncate`、ordinary modeまたはatime/mtimeは`SetMetadata`を要求する。`CREATE`は`CreateFile`と返却handleのaccess effectを同じ複合認可で確認し、`MKDIR`、`UNLINK`、`RMDIR`、`RENAME`も対応effectを現在pathで確認する。変更はwriter lock内の現在parent pathへroot fd相対のbacking syscallが成功した後だけnamespaceへpublishする。`READDIR`は`ListDirectory`を通常のpath patternで確認したうえで、同一namespace guard内のdirect childだけをvisibility filterへ通す。directory handleはopen時のgenerationを保持し、途中でcreate / remove / renameが成功したstreamを`EAGAIN`でrestartさせる。実mount上で権限外siblingが`ENOENT`になり、open済みfile descriptorのread / write / size変更 / mode変更と既存directory streamの次のlisting、既存parent directory fdに対する`mkdirat`がrevoke後は`EACCES`になることを確認した。詳しい境界は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。
 
 その後、repository 内で完結する symlink を[後続機能](capfs.md#symlink-は後続機能として追加する)として追加する。hard link は同じ inode に複数 path を与えるため、symlink と同時には有効化せず、import 時の分離または alias-aware な認可モデルを設計してから扱う。
 

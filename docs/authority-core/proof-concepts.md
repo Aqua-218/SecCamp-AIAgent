@@ -221,9 +221,9 @@ effect を1つも持たない file authority は、どの request にも match �
 
 一方、次はこの証明だけでは言えない。
 
-- Rust 実装が Lean と全入力で一致すること。現在の共通 corpus は71件の具体例を自動比較する回帰 test であり、任意の入力に対する同値証明ではない。
+- Rust 実装が Lean と全入力で一致すること。現在の共通 corpus は101件の具体例を自動比較する回帰 test であり、任意の入力に対する同値証明ではない。
 - symlink、hard link、rename、open handle、OS path 解決が安全であること。これは `capfs` と統合・並行性テストの範囲である。
-- Capability の subject binding、保持、発行、祖先失効、revoke を含む Rust 状態機械全体の安全性が、数学的に証明済みであるとは言えない。逐次 transition は参照モデルとの property test、1 effect と 1 revoke の競合は loom で検査するが、Lean の定理でも実システム全体の証明でもない。
+- Capability の subject binding、保持、発行、祖先失効、revoke を含む Rust 状態機械全体の安全性が、数学的に証明済みであるとは言えない。逐次 transition は参照モデルとの property test、単一・compound effect と 1 revoke の競合は loom で検査するが、Lean の定理でも実システム全体の証明でもない。
 - Lean の外にあるコンパイラ、OS、ホストの identity 発行規則まで正しいこと。
 
 したがって、「数学的に不可能」と表現するときは、**Lean で定義したモデルと前提の範囲内で**という条件を付けるのが正確である。

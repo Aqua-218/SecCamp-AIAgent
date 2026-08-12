@@ -62,7 +62,7 @@ flowchart LR
     end
 
     subgraph differential["共有 fixture による差分テスト"]
-        corpus["authority-core.tsv<br/>71 oracle cases"]
+        corpus["authority-core.tsv<br/>101 oracle cases"]
         rustRunner["Rust corpus runner"]
         leanRunner["Lean corpus runner"]
         compare["normalized output diff"]
@@ -140,9 +140,9 @@ flowchart LR
 
 実装済みなのは repository identity、repository-relative path、file effect と request、file authority body、単調時刻の有効期間、typed metadata と file-only Capability、matching、`weakerThan` である。Rust 側にはさらに、subject と静的 envelope の登録、root 発行、保持、逐次 Derive、revoke、祖先失効、`auth_epoch`、subject lifecycle、open-handle registry、attempt/effect audit と、effect commit を revoke と線形化する `CapabilityKernel` がある。
 
-未実装なのは、File以外のauthority variant、durable audit backend、supervisor / Broker adapter、FUSEのcreate・remove・rename・mode / timestamp metadata変更である。Direct-I/O [`capfs` adapter](../capfs/read-only-fuse.md)がglobal namespace registry、Authority handle registry、実backing syscallを接続し、実mount上のread-after-revoke、write-after-revoke、truncate-after-revoke、readdir-after-revokeまで検査している。create、rename、unlinkを含むtransactionと競合検証はまだない。
+未実装なのは、File以外のauthority variant、durable audit backend、supervisor / Broker adapterである。Direct-I/O [`capfs` adapter](../capfs/read-only-fuse.md)はglobal namespace registry、Authority handle registry、実backing syscallを接続し、全10 `FileEffect`をFUSEへ対応付けている。実mountではread / write / truncate / metadata / readdir-after-revoke、create / remove / rename transaction、directory stream mutation後のrestartを検査している。全thread scheduleのrename / write競合と、隔離基盤を含むend-to-end検証は別の境界である。
 
-現在の file-only slice には、71件の共通 corpus を両言語の production 判定へ流す自動差分テストがある。各 runner は期待値を個別に検査し、その後に出力同士も比較する。ただしこれは選んだ具体例についての回帰検査であり、Rust と Lean が全入力で等しいという証明ではない。
+現在の file-only slice には、101件の共通 corpus を両言語の production 判定へ流す自動差分テストがある。各runnerは全10 `FileEffect`のmatching / containmentを含む期待値を個別に検査し、その後に出力同士も比較する。ただしこれは選んだ具体例についての回帰検査であり、Rust と Lean が全入力で等しいという証明ではない。
 
 ## 関連
 

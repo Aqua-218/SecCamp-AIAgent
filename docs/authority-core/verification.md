@@ -23,10 +23,10 @@ unit test、Lean example・theorem、共通 corpus は現在の file-only slice 
 flowchart LR
     examples["具体例<br/>境界値・失敗例"] --> rust["Rust unit test"]
     sequences["生成した Derive / revoke 列"] --> property["stateful property test"]
-    races["direct / ancestor revoke<br/>1〜2 effects"] --> loom["loom model<br/>production + negative control"]
+    races["direct / ancestor revoke<br/>single / compound effects"] --> loom["loom model<br/>production + negative control"]
     examples --> leanExample["Lean example"]
     spec["全入力に対する仕様"] --> theorem["Lean theorem"]
-    corpus["共通 corpus<br/>71件 + 期待値"] --> rustRunner["Rust corpus runner"]
+    corpus["共通 corpus<br/>101件 + 期待値"] --> rustRunner["Rust corpus runner"]
     corpus --> leanRunner["Lean corpus runner"]
 
     rust --> confidence["Rust の具体的な挙動"]
@@ -72,11 +72,11 @@ test は、実際の関数を動かし、API の接続、error の内容、内�
 
 Lean theorem が `pathBelow` の性質を証明しても、Rust の `path_below` に同じ変更が入っているとは限らない。両言語で同じ入力を読み、結果を比較する差分テストがこの隙間を埋める。
 
-[`tests/fixtures/authority-core.tsv`](../../tests/fixtures/authority-core.tsv) は、判定種別、case 名、期待する `Bool`、判定に必要な入力を持つ versioned TSV である。現在は path、time、file、Capability の10種類の判定を71件で検査する。
+[`tests/fixtures/authority-core.tsv`](../../tests/fixtures/authority-core.tsv) は、判定種別、case 名、期待する `Bool`、判定に必要な入力を持つ versioned TSV である。現在は path、time、file、Capability の10種類の判定を101件で検査する。
 
 Rust と Lean の runner は同じ fixture を別々に parse し、それぞれ production 判定を呼ぶ。各 runner は自分の結果が期待値と違えば失敗し、成功時だけ `case名<TAB>実結果` を出力する。[`scripts/check-authority-corpus.sh`](../../scripts/check-authority-corpus.sh) はその正規化出力も比較する。このため、両実装が同じ誤答を返した場合も、両出力が食い違った場合も検出できる。
 
-ただし差分テストは71件の具体例に対する回帰検査である。corpus にない任意の入力について Rust と Lean の一致を証明するものではない。
+ただし差分テストは101件の具体例に対する回帰検査である。corpus にない任意の入力について Rust と Lean の一致を証明するものではない。
 
 ## 「権限漏えいしない」と何を根拠に言えるのか
 
@@ -120,12 +120,12 @@ file body containment では、false allow を防ぐ `fileBodyBelow_sound` は�
 | [`authority-corpus.rs`](../../crates/authority-core/src/bin/authority-corpus.rs) | 7 | header/schema、未知の判定、必須 field、u64 上限、期待値不一致、case 名重複の拒否 |
 | [`capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 11 | 発行・Derive・revoke、atomicity、subject lifecycle、handle ID 非再利用 |
 | [`capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) | 1 | 1〜63操作の Derive/revoke 列を1,000 case 生成し、参照モデルと各 transition を比較 |
-| [`authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | 10 | synchronized API、active inspection、inspection中のrevoke待機、最終認可、lifecycle、handle、audit、祖先 revoke |
-| [`authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | 4 | direct / ancestor revoke、1〜2 effects、audit consistency、negative control |
+| [`authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | 11 | synchronized API、active inspection、inspection中のrevoke待機、最終認可、lifecycle、handle、audit、祖先 revoke |
+| [`authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | 6 | direct / ancestor revokeの単一・compound effect、2 effects、audit consistency、negative control |
 
-Authority core packageではproduction moduleの32 test、corpus runnerの7 test、公開APIの状態遷移test 11件、authorization guardのcontract test 11件、property test 1件の合計62 testを実行する。capfs packageはmodule testとnamespace / node / preflight / 実mount integration testを合わせて64 testを実行する。現在のworkspace全体では合計126 testを`cargo test --workspace`で実行する。property testは内部で1,000本の操作列を生成する。これとは別に、runnerは共有fixtureの71件を実行時に評価する。
+Authority core packageではproduction moduleの32 test、corpus runnerの7 test、公開APIの状態遷移test 11件、authorization guardのcontract test 11件、property test 1件の合計62 testを実行する。capfs packageはmodule testとnamespace / node / preflight / 実mount integration testを合わせて107 testを実行する。現在のworkspace全体では合計169 testを`cargo test --workspace`で実行する。property testは内部で1,000本の操作列を生成する。これとは別に、runnerは共有fixtureの101件を実行時に評価する。
 
-loom の4件は `cfg(loom)` 専用なので、通常の `cargo test --workspace` では実行されない。専用コマンドでは production と同じ `CapabilityKernel` の同期 primitive を loom 版に差し替え、direct revoke、ancestor revoke、2 effects の bounded model を探索する。negative control は意図どおり反例を発見して panic することを `#[should_panic]` で成功条件にしている。
+loom の6件は `cfg(loom)` 専用なので、通常の `cargo test --workspace` では実行されない。専用コマンドでは production と同じ `CapabilityKernel` の同期 primitive を loom 版に差し替え、direct / ancestor revokeの単一・compound effectと、2 effects の bounded model を探索する。compound modelはexecutorの全段階実行または未実行、attempt / effectがrequest set全体を持つことまで確認する。negative control は意図どおり反例を発見して panic することを `#[should_panic]` で成功条件にしている。
 
 ここで特に test が助けるのは、Lean の抽象モデルに出にくい Rust 固有の部分である。
 
@@ -167,7 +167,7 @@ Lean example が役立つ点は、定理だけでは見えにくい「この具�
 
 parser 自体についても6個の executable example があり、header 欠落、未知の判定種別、必須 field 欠落、`u64` を越える tick、期待値不一致、case 名重複を拒否する。Lean の `Nat` は `u64` より広いため、tick 上限を runner で明示的に揃えている。
 
-`lake test` は `AuthorityTests` を import したこの runner を test driver として構築し、標準の共有 fixture 71件を評価する。そのため、独立した40個の境界 example と、共通入力による両実装の比較を併用できる。
+`lake test` は `AuthorityTests` を import したこの runner を test driver として構築し、標準の共有 fixture 101件を評価する。そのため、独立した40個の境界 example と、共通入力による両実装の比較を併用できる。
 
 ## Production theorem は何を確認するか
 
@@ -197,7 +197,7 @@ theorem を production 定義の隣に置くことで、判定を変更して証
 | Rust API の具体的挙動 | ✓ |  |  | ✓ | 確認済み |
 | Lean 判定の具体的挙動 |  | ✓ |  | ✓ | 確認済み |
 | Lean モデルの全入力での性質 |  |  | ✓ |  | 証明済み |
-| 共有した71入力で両言語が期待値どおりか |  |  |  | ✓ | 自動比較済み |
+| 共有した101入力で両言語が期待値どおりか |  |  |  | ✓ | 自動比較済み |
 | 生成した逐次操作列で state と参照モデルが一致するか | ✓ |  |  |  | 1,000 case 検査済み |
 | 全入力で Rust と Lean が同値か |  |  |  |  | 未証明 |
 | direct / ancestor revoke と 1 effect の全 bounded interleaving | ✓ |  |  |  | production model と negative control を loom で検査済み |
@@ -234,7 +234,7 @@ repository root から両実装の共通 corpus を比較する。
 scripts/check-authority-corpus.sh
 ```
 
-[`lean/lakefile.toml`](../../lean/lakefile.toml) は `authority_corpus` executable を `testDriver` に設定する。この executable は `AuthorityTests` を import するため、`lake check-test` では既存40個と parser 6個の executable example が一緒に型検査される。`lake test` はそれに加えて標準の共有 fixture 71件を実行する。
+[`lean/lakefile.toml`](../../lean/lakefile.toml) は `authority_corpus` executable を `testDriver` に設定する。この executable は `AuthorityTests` を import するため、`lake check-test` では既存40個と parser 6個の executable example が一緒に型検査される。`lake test` はそれに加えて標準の共有 fixture 101件を実行する。
 
 ## 現在の限界と次に埋めるもの
 
@@ -252,7 +252,7 @@ scripts/check-authority-corpus.sh
 
 残る限界は、corpus が有限であることと、schema v1 が現在の file-only authority だけを表すことである。File 以外の authority variant を追加するときは、両 runner と corpus を同じ変更で拡張する。互換性のない schema 変更では header の version も上げる。
 
-なお、共通corpus自体はrevokeを検証しない。逐次revokeと祖先失効はstateful test、1〜2 effectsとdirect / ancestor revokeの同期境界はloomで検査している。現在のloom modelはopen handle、rename、unlink、複数revoke、4 thread以上を含まない。read-only filesystem adapterは実mountのread-after-revokeとreaddir-after-revoke testで`OPEN` / `READ`、`OPENDIR` / `READDIR`の線形化点を検査しているが、変更系operationは今後の統合・攻撃testで別に閉じる必要がある。
+なお、共通corpus自体はrevokeを検証しない。逐次revokeと祖先失効はstateful test、単一・compound effectとdirect / ancestor revokeの同期境界はloomで検査している。現在のloom modelはopen handle、rename、unlink、複数revoke、4 thread以上を含まない。Direct-I/O filesystem adapterは実mountでread / write / truncate / metadata / readdir-after-revokeに加え、create / remove / renameとdirectory stream restartを検査する。変更系operationとrevokeを同時に競合させる統合・攻撃testは今後の境界である。
 
 ## 変更時の確認点
 

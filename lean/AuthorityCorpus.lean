@@ -153,6 +153,11 @@ def parseUrlPath (encoded label : String) : Except String CanonicalUrlPath :=
     | some path => .ok path
     | none => .error s!"invalid {label} `{encoded}`; expected a canonical origin path"
 
+def parseHost (encoded label : String) : Except String CanonicalHost :=
+  match CanonicalHost.ofString encoded with
+  | some host => .ok host
+  | none => .error s!"invalid {label} `{encoded}`; expected a canonical DNS host"
+
 def parseUrlPattern (fields : Fields) (role : String) : Except String (UrlPathPattern × Fields) := do
   let (kind, fields) ← fields.take s!"{role} URL path pattern kind"
   let (encodedPath, fields) ← fields.take s!"{role} URL path pattern"
@@ -175,22 +180,24 @@ def parseHttpAuthority (fields : Fields) (role : String) :
     Except String (HttpFetchAuthority × Fields) := do
   let (encodedMethods, fields) ← fields.take s!"{role} HTTP methods"
   let methods ← parseHttpMethods encodedMethods s!"{role} HTTP methods"
-  let (host, fields) ← fields.take s!"{role} HTTP host"
+  let (encodedHost, fields) ← fields.take s!"{role} HTTP host"
+  let host ← parseHost encodedHost s!"{role} HTTP host"
   let (path, fields) ← parseUrlPattern fields role
   let (encodedMaxResponseBytes, fields) ← fields.take s!"{role} HTTP maximum response bytes"
   let maxResponseBytes ← parseUInt64 encodedMaxResponseBytes s!"{role} HTTP maximum response bytes"
-  .ok ({ methods, host := { value := host }, path, maxResponseBytes }, fields)
+  .ok ({ methods, host, path, maxResponseBytes }, fields)
 
 def parseHttpRequest (fields : Fields) (role : String) :
     Except String (HttpFetchRequest × Fields) := do
   let (encodedMethod, fields) ← fields.take s!"{role} HTTP method"
   let method ← parseHttpMethod encodedMethod s!"{role} HTTP method"
-  let (host, fields) ← fields.take s!"{role} HTTP host"
+  let (encodedHost, fields) ← fields.take s!"{role} HTTP host"
+  let host ← parseHost encodedHost s!"{role} HTTP host"
   let (encodedPath, fields) ← fields.take s!"{role} HTTP URL path"
   let path ← parseUrlPath encodedPath s!"{role} HTTP URL path"
   let (encodedMaxResponseBytes, fields) ← fields.take s!"{role} HTTP maximum response bytes"
   let maxResponseBytes ← parseUInt64 encodedMaxResponseBytes s!"{role} HTTP maximum response bytes"
-  .ok ({ method, host := { value := host }, path, maxResponseBytes }, fields)
+  .ok ({ method, host, path, maxResponseBytes }, fields)
 
 def parseGitHubOperation (value label : String) : Except String GitHubOperation :=
   match value with

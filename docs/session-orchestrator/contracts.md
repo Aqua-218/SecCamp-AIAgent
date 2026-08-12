@@ -8,6 +8,17 @@
 
 この文書は `session-orchestrator` の backend trait へ接続するための統合契約である。orchestrator 自身は trait を呼び出す以外の副作用を持たない。backend は effect が commit point に到達した後だけ lease を返し、要求と異なる session/resource identity の lease を返してはならない。
 
+## 対象ソース
+
+| trait | 実装を置く場所 |
+|---|---|
+| `WorkspaceBackend` | [`firecracker_workspace.rs`](../../crates/session-orchestrator/src/firecracker_workspace.rs) |
+| `BrokerBackend` | [`egress_backend.rs`](../../crates/session-orchestrator/src/egress_backend.rs) |
+| `VmBackend` / `WorkloadBackend` | [`firecracker_backend.rs`](../../crates/session-orchestrator/src/firecracker_backend.rs) |
+| `CapabilityBackend` / `CapabilityRevocationBackend` | [`authority_backend.rs`](../../crates/session-orchestrator/src/authority_backend.rs) |
+| identity 割り当て | [`firecracker_identity.rs`](../../crates/session-orchestrator/src/firecracker_identity.rs) |
+| state machine と ledger | [`lib.rs`](../../crates/session-orchestrator/src/lib.rs) |
+
 ## trait の対応
 
 | trait | production の所有者 | commit の責務 |
@@ -121,6 +132,16 @@ orchestrator は前段の cleanup が失敗しても、後段の safe な cleanu
 ## 検証状態
 
 この契約の state machine test に加え、production adapter composition test は実 `CapabilityKernel`、Broker / Firecracker / workspace adapter を同じ startup/stop 経路へ接続する。外部 command、filesystem、API、listener は test double であり、実 capfs mount、実 `AF_VSOCK`、実 Firecracker、特権 guest isolation の end-to-end test はまだない。
+
+## 保証範囲外
+
+adapter 実装者がこの契約から得られないもの。
+
+- backend が返した lease の identity が正しいことは、orchestrator が照合するが、backend 自身が正しい値を作ることまでは強制できない。foreign session の lease は次の stage で拒否されるが、それは検出であって防止ではない。
+- effect が commit されたという申告の真偽。lease は commit point 到達後にだけ返す約束だが、破っても型では検出できない。
+- 冪等性。同じ stage を 2 回呼んだときの挙動は adapter 側が決める。orchestrator は完了した stage を再実行しない前提で書かれている。
+- 外部 resource の実解放。stop 経路が返す成功は adapter の申告に基づく。
+- 並行呼び出し。1 つの `SessionOrchestrator` で active session は 1 つだけなので、同じ adapter が並行に呼ばれることは想定していない。
 
 ## 関連
 

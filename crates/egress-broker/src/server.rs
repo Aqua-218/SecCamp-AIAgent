@@ -9,8 +9,7 @@ use std::{error::Error, fmt, io, io::Read, io::Write, num::NonZeroUsize};
 use egress_protocol::{
     frame::ControlFrame,
     response::{
-        BrokerWireOutcome, BrokerWireRejection, CanonicalBrokerResponse, GitHubWireResponse,
-        PublicWireResponse, ResponseCborError,
+        BrokerWireOutcome, BrokerWireRejection, CanonicalBrokerResponse, ResponseCborError,
     },
 };
 
@@ -213,16 +212,11 @@ fn response_to_wire(
     response: BrokerResponse,
 ) -> Result<CanonicalBrokerResponse, ResponseCborError> {
     let outcome = match response.outcome {
-        BrokerOutcome::Succeeded(BrokerEffect::Public(public)) => BrokerWireOutcome::Public(
-            PublicWireResponse::new(public.status, public.host, public.path, public.body)?,
-        ),
+        BrokerOutcome::Succeeded(BrokerEffect::Public(public)) => {
+            BrokerWireOutcome::Public(public.into_wire())
+        }
         BrokerOutcome::Succeeded(BrokerEffect::GitHub(github)) => {
-            BrokerWireOutcome::GitHub(GitHubWireResponse::new(
-                github.operation,
-                github.response_bytes,
-                github.number,
-                github.object.map(|object| object.as_str().to_owned()),
-            )?)
+            BrokerWireOutcome::GitHub(github.into_wire()?)
         }
         BrokerOutcome::Rejected(rejection) => BrokerWireOutcome::Rejected(match rejection {
             BrokerRejection::NotAuthorized => BrokerWireRejection::NotAuthorized,

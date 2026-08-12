@@ -8,4 +8,5 @@
 
 pub mod budget;
 pub mod frame;
+pub mod operation;
 pub mod session;

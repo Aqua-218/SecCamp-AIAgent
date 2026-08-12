@@ -9,4 +9,5 @@ publish = false
 workspace = true
 
 [dependencies]
+authority-core = { path = "../authority-core" }
 sha2 = "0.10.9"

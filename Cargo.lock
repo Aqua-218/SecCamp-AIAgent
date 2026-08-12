@@ -120,6 +120,7 @@ dependencies = [
 name = "egress-protocol"
 version = "0.1.0"
 dependencies = [
+ "authority-core",
  "sha2",
 ]
 

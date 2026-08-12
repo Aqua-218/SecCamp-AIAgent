@@ -4,6 +4,8 @@
 
 全部を1つの形式手法で証明しようとはしない。純粋関数、状態遷移、並行処理、Linux kernel との接続では、効く道具が違うからである。
 
+この文書の「実装済み」は repository に code/API があること、「mock/contract 検証済み」は fake、mock、module test、local contract test の結果、「実機未検証」は特権 kernel、実 VM、実 `AF_VSOCK`、外部 DNS/HTTPS/provider、guest-to-host end-to-end をまだ実行していないことを表す。後者を実施していない段階で、full isolation や VM 境界を完成と判定しない。
+
 ## どの道具を、どこに当てるか
 
 ```mermaid
@@ -38,20 +40,25 @@ flowchart LR
     class lean,differential,proptest,loom,integration method;
 ```
 
-| 対象 | 手段 | そこで言えること |
-|---|---|---|
-| `PathBelow` / `WeakerThan` | Lean 4 | 包含判定の健全性と推移性 |
-| Lean と Rust | 共通 corpus の差分テスト | parse、正規化、判定結果の一致 |
-| 逐次状態機械 | stateful proptest | 生成した操作列で不変条件を破れないこと |
-| revoke / commit | loom | 小さく切った model 内の全 interleaving |
-| FUSE operation | 実 mount の統合テスト | syscall が正しい effect へ変換されること |
-| namespace race | loom + stress test | rename、unlink、open handle の競合 |
-| symlink resolver（後続機能） | stateful proptest + 実 mount の攻撃テスト | 解決後 path での認可、root 脱出・cycle・stale resolution の拒否 |
-| SSRF | resolver / redirect test | 非公開宛先と rebinding の拒否 |
-| VM 境界 | escape 試行 | 実際の jailer、kernel、mount、seccomp 設定 |
-| snapshot | 同一 snapshot の複数 restore | ID、workspace、Broker session の一意性 |
+| 対象 | 手段 | そこで言えること | 現在の状態 |
+|---|---|---|---|
+| `PathBelow` / `WeakerThan` | Lean 4 | 包含判定の健全性と推移性 | 実装済み、Lean test |
+| Lean と Rust | 共通 corpus の差分テスト | parse、正規化、判定結果の一致 | 150件の差分 test |
+| 逐次状態機械 | stateful proptest | 生成した操作列で不変条件を破れないこと | 1,000 case の mock/reference 比較 |
+| revoke / commit | loom | 小さく切った model 内の全 interleaving | bounded model は検証済み、実 adapter は未検証 |
+| FUSE operation | 実 mount の統合テスト | syscall が正しい effect へ変換されること | 条件付き実 mount、全 kernel lifecycle は未検証 |
+| namespace race | loom + stress test | rename、unlink、open handle の競合 | 限定的 test、全 interleaving は未検証 |
+| symlink resolver（後続機能） | stateful proptest + 実 mount の攻撃テスト | 解決後 path での認可、root 脱出・cycle・stale resolution の拒否 | 初期 link-free 境界、未実装範囲 |
+| SSRF | resolver / redirect test | 非公開宛先と rebinding の拒否 | fake resolver/connector、実 DNS は未検証 |
+| Host Egress Broker | module/contract test | frame、replay、budget、typed dispatch、公開 HTTPS、GitHub plan | mock/contract 検証済み、実 `AF_VSOCK`/外部 provider は未検証 |
+| runtime isolation | mock backend + capability detection | ordered apply/rollback と policy validation | mock 検証済み、privileged apply は未検証 |
+| Firecracker runtime | fake command/filesystem/API + Unix socket test | artifact、jailer/API 順序、snapshot state、identity/workload gate | contract 検証済み、実 VM/jailer/dm-verity は未検証 |
+| Supervisor | protocol module test + `FakeResources` | identity binding、subject lifecycle、handle cleanup | mock/contract 検証済み、Linux resource/実 socket は未検証 |
+| Session orchestrator | mock backend state-machine test | lease binding、startup rollback、stop retry、identity reuse 拒否 | mock/contract 検証済み、production backend/実 VM は未検証 |
+| VM 境界 | escape 試行 | 実際の jailer、kernel、mount、seccomp 設定 | 実機未検証 |
+| snapshot | 同一 snapshot の複数 restore | ID、workspace、Broker session の一意性 | state contract のみ、実 snapshot restore は未検証 |
 
-Authority core では、versioned TSV の147件を Rust と Lean の production 判定へ流す。file に加え HTTP の method / host / path / response size、GitHub の installation / repository / operation / base/head branch を個別に壊す境界も含む。各 runner が fixture の期待値を検査したうえで、正規化した全出力も比較する。これは現在の具体的な境界のずれを自動検出する手段であり、両実装が全入力で同値だという証明ではない。
+Authority core では、versioned TSV の150件を Rust と Lean の production 判定へ流す。file に加え HTTP の method / host / path / response size、GitHub の installation / repository / operation / base/head branch を個別に壊す境界も含む。各 runner が fixture の期待値を検査したうえで、正規化した全出力も比較する。これは現在の具体的な境界のずれを自動検出する手段であり、両実装が全入力で同値だという証明ではない。
 
 逐次状態機械では、1〜63操作の Derive/revoke 列を1,000 case 生成し、production state と独立した参照モデルを各 transition 後に比較する。subject binding、ID 非再利用、親以下の authority、静的 envelope、祖先失効をまとめて検査するが、これは生成した有限の操作列に対する test であり、状態機械全体の数学的証明ではない。[Capability state の検証範囲](../authority-core/capability-state.md#どう検証しているか)
 
@@ -66,6 +73,28 @@ backing repository の contract test は実 directory tree に対して、root f
 subject-local node table の contract test は、root nodeの固定、同一objectへの反復LOOKUP、READDIR用の非加算live-node参照、最終FORGET後のnodeid非再利用、stale nodeと過剰FORGETの拒否、mount間の数値identity分離、32 threadの同時LOOKUPを検査する。module testはnode sequenceとlookup countの最終値・枯渇、writer panic後のfail closedを検査する。これはmemory内tableの並行性であり、kernelが発行する実FORGETやmount teardownを含むFUSE統合testではない。詳しい境界は[mount ごとの node table](../capfs/node-tables.md)を参照する。
 
 Direct-I/O FUSE adapterのmodule testは、許可範囲と祖先だけのmetadata visibility、backingとCapabilityのrepository identity不一致、namespace / Authorityのfile・directory handle対応、位置指定read / write、`O_WRONLY`でのread拒否、`O_RDWR`と`O_TRUNC`に必要な複合認可、sizeの`Truncate`、mode / timestampの`SetMetadata`再認可、`CREATE` / `MKDIR` / `UNLINK` / `RMDIR` / subtree `RENAME`のeffectとtransaction、generation付きdirectory offset cookie、exact patternのentry filter、revoke後の既存handle read / write / truncate / metadata / readdir拒否、malformed FORGET後のfail closedを検査する。Linux統合testは実際にFUSEへmountし、権限外siblingが見えないこと、許可prefixだけがcanonical name順で列挙されること、`O_TRUNC` open、`MKDIR`、writable `CREATE`、`UNLINK`、`RMDIR`、no-replace `RENAME`、`chmod`を確認する。同じOS file descriptorによる2回目のread / write / size変更 / mode変更がrevoke後に`PermissionDenied`になることも確認する。create testはrevoke前に開いたparent directory fdに`mkdirat`を送り、作成effectもrevoke後に再認可されることを固定する。directory streamは40 byteの`getdents` bufferで2回のkernel requestへ分け、1回目と2回目の間でrevokeした後者が`PermissionDenied`、またはnamespace mutation後の後者が`EAGAIN`になることを固定する。`/dev/fuse`が存在しない環境だけskipする。実kernelのFORGET全lifecycle、mount中の敵対的backing差し替え、rename / write競合、複数thread sessionはまだ含まない。詳しい境界は[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。
+
+## Cycle 2 adapter の検証境界
+
+### Host Egress Broker
+
+`egress-broker` は deterministic fake で bounded transport、canonical CBOR dispatch、session/replay binding、budget、最終 `CapabilityKernel` 認可、DNS answer の全体検査、redirect ごとの再解決、response streaming cap、GitHub の expected-old plan、typed rate-limit metadata を検査する。`FramedTransport` は `Cursor` を使い、`PublicFetcher` は fake resolver/connector、GitHub adapter は fake provider を使うため、これらは mock/contract 検証である。実 `AF_VSOCK`、実 DNS、外部 HTTPS、実 GitHub API、guest-to-host の end-to-end は未検証である。詳細は [Host Egress Broker](../egress-broker/README.md) と [検証対応表](../egress-broker/verification.md) を参照する。
+
+### runtime isolation
+
+`runtime-isolation` は `IsolationConfig::validate` の path/limit/syscall 検査、13 段階の apply 順序、failure 時の completed step 逆順 rollback、capability 不足と Landlock ABI 不足の事前拒否を mock backend で検査する。`LinuxBackend` の capability detection test は host の namespace、cgroup v2、seccomp、Landlock 状態を読むが、十分な環境で privileged apply を実行する test ではない。workload の実行、escape 試行、Firecracker 内の isolation は未検証である。
+
+### Firecracker runtime
+
+`firecracker-runtime` の test は artifact digest、mutable `latest` path、network device、workspace overlap、jailer/verity/API の順序、API error rollback、snapshot fingerprint、stale/duplicate identity、identity injection 前の workload gate を fake boundary で検査する。`UnixApiClient` には local Unix socket の HTTP exchange test があるが、Firecracker の Unix API socket そのものではない。実 Firecracker、jailer、dm-verity device、guest kernel、snapshot/restore、VM escape は未検証である。詳細は [Firecracker runtime](../firecracker-runtime/README.md) を参照する。
+
+### Supervisor
+
+wire module test は version、closed tag、4 KiB size、field length、body length、trailing bytes を検査する。supervisor test は `CapabilityKernel`、`StaticCallerResolver`、`FakeResources` を使い、resource setup 順、partial rollback、connection identity 優先、root/derive/revoke、stale handle、cleanup failure と `Closing` の fail-closed retry を検査する。Linux namespace/cgroup/mount、実 socket credential、実 workload、guest supervisor control channel は未検証である。詳細は [Supervisor adapter](../supervisor/README.md) を参照する。
+
+### Session orchestrator
+
+state-machine test は mock backend の call log と lease を使い、workspace -> Broker -> VM -> capability -> workload の commit 順、各 failure の rollback、VM kill failure 時の workspace isolation 保留、snapshot identity rejection、identity reuse、foreign lease、二重 start、stop retry を検査する。これは backend contract の検証であり、実 Firecracker、実 Broker/vsock、実 capfs、実 Authority adapter、process 外 durable identity allocator の検証ではない。詳細は [Session orchestrator](../session-orchestrator/README.md) を参照する。
 
 symlink resolver の test は初期 `capfs` の完了条件には含めない。link-free な namespace と revoke の検証を先に終え、[symlink 対応](capfs.md#symlink-は後続機能として追加する)を実装する段階で追加する。
 
@@ -131,3 +160,7 @@ TLA+ は使わない。分散 revoke、複数ホスト間の Capability 移送�
 - [Capability モデル](capability-model.md)
 - [状態機械と revoke](state-and-revocation.md)
 - [実装順序](implementation-plan.md)
+- [Host Egress Broker](../egress-broker/README.md)
+- [Firecracker runtime](../firecracker-runtime/README.md)
+- [Supervisor adapter](../supervisor/README.md)
+- [Session orchestrator](../session-orchestrator/README.md)

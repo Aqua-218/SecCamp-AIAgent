@@ -18,6 +18,55 @@ bounded frame -> canonical CBOR -> session/replay guard -> session budget
              -> 最終 CapabilityKernel 認可 -> 型付き adapter
 ```
 
+## crate の構造
+
+```mermaid
+flowchart TB
+    guestvm["guest VM"]
+
+    subgraph eb["egress-broker（host 側）"]
+        direction TB
+        tr["transport<br/>AF_VSOCK listener<br/>bounded frame I/O"]
+        srv["server<br/>peer CID 照合<br/>1 request 1 response"]
+        disp["dispatch<br/>replay / budget /<br/>authorize_and_commit"]
+        pf["public_fetch<br/>GET / HEAD"]
+        ip["ip_policy<br/>DNS 応答の全数検査"]
+        gha["github<br/>型付き 2 操作"]
+    end
+
+    kernel["authority-core<br/>CapabilityKernel"]
+    resolver{{"Resolver"}}
+    connector{{"HttpsConnector"}}
+    provider{{"GitHubProvider"}}
+    cred[("host-only credential")]
+    net["公開 HTTPS / GitHub API"]
+
+    guestvm ==>|"AF_VSOCK"| tr
+    tr --> srv
+    srv --> disp
+    disp ==>|"最終認可"| kernel
+    disp --> pf
+    disp --> gha
+    pf --> ip
+    ip --> resolver
+    pf --> connector
+    gha --> provider
+    cred --> provider
+    connector ==>|"TLS"| net
+    provider ==>|"TLS"| net
+
+    classDef host fill:#1565c0,color:#fff,stroke:#0d47a1;
+    classDef seam fill:#6a1b9a,color:#fff,stroke:#4a148c;
+    classDef data fill:#ef6c00,color:#fff,stroke:#e65100;
+    classDef external fill:#616161,color:#fff,stroke:#424242;
+    class eb,tr,srv,disp,pf,ip,gha host;
+    class resolver,connector,provider seam;
+    class kernel,guestvm,net external;
+    class cred data;
+```
+
+紫の 3 つが trait の継ぎ目で、test はここに fake を挿す。credential は `provider` の内側から出ず、guest の request にも outcome にも現れない。
+
 ## 実装済みの境界
 
 | モジュール | 現在の責務 |

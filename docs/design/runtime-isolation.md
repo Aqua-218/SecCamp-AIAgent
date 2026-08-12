@@ -10,28 +10,64 @@
 
 ## 6つの防御レイヤ
 
+レイヤは 1 列に並んでいない。**閉じ込め**は入れ子で、**判定**は経路の上に乗る。workload が起こせることは 2 種類しかなく、file 操作と外部副作用で通る門が違う。
+
 ```mermaid
 flowchart TB
-    effect["外部サービスの副作用"]
-    broker["Host Egress Broker<br/>API と公開 Web の上限"]
-    vm["Firecracker<br/>セッション全体の境界"]
-    container["namespace + cgroup v2<br/>process と resource の分離"]
-    landlock["Landlock<br/>subject の静的 file envelope"]
-    seccomp["seccomp<br/>syscall の入口を削る"]
-    capfs["capfs<br/>現在の細粒度 file authority"]
-    workload["Agent / Tool"]
+    subgraph hostside["host"]
+        broker["Host Egress Broker<br/>型付き 2 操作だけ<br/>現在の Capability を見る"]
+        ext["公開 Web / GitHub API"]
+        cred[("credential<br/>host から出ない")]
+    end
 
-    workload --> capfs --> seccomp --> landlock --> container --> vm --> broker --> effect
+    subgraph vm["Firecracker + jailer — session 全体の境界"]
+        direction TB
+        sup["supervisor"]
+        capfs["capfs<br/>操作ごとに現在の Capability を見る"]
+        ws[("subject 専用 workspace")]
 
-    classDef dynamic fill:#2e7d32,color:#fff;
-    classDef static fill:#1565c0,color:#fff;
-    classDef boundary fill:#6a1b9a,color:#fff;
+        subgraph ns["namespace + cgroup v2 — process と resource の分離"]
+            direction TB
+            subgraph limits["exec 前に固定した上限"]
+                direction LR
+                sec{{"seccomp<br/>syscall の入口を削る"}}
+                ll{{"Landlock<br/>path 単位の envelope"}}
+            end
+            wl["Agent / Tool"]
+        end
+    end
+
+    wl ==>|"file syscall"| sec
+    sec ==>|"allowlist を通った syscall だけ"| ll
+    ll ==>|"envelope 内の path だけ"| capfs
+    capfs ==> ws
+
+    wl ==>|"外部への要求"| sup
+    sup ==>|"AF_VSOCK"| broker
+    cred --> broker
+    broker ==>|"TLS"| ext
+
+    classDef dynamic fill:#2e7d32,color:#fff,stroke:#1b5e20;
+    classDef static fill:#1565c0,color:#fff,stroke:#0d47a1;
+    classDef boundary fill:#6a1b9a,color:#fff,stroke:#4a148c;
+    classDef untrusted fill:#b71c1c,color:#fff,stroke:#7f0000;
+    classDef data fill:#ef6c00,color:#fff,stroke:#e65100;
     class capfs,broker dynamic;
-    class seccomp,landlock,container static;
-    class vm boundary;
+    class sec,ll static;
+    class vm,ns boundary;
+    class wl untrusted;
+    class ws,cred,ext data;
 ```
 
-`capfs` と Broker は現在の Capability を見る。Landlock 以下は、起動時に決めた上限を後から広げない。
+図の読み方は 3 つ。
+
+**枠は閉じ込め、矢印は判定。** `Firecracker` と `namespace + cgroup v2` は経路上の 1 段ではなく、内側で起きたことの被害範囲を決める入れ子の枠である。破られたときに何が漏れるかは、その枠が何を囲っているかで決まる。
+
+**file syscall と外部要求は別の門を通る。** file 操作は seccomp → Landlock → capfs の順に 3 回判定される。順序は kernel が決めるもので、seccomp が「その syscall を呼べるか」、Landlock が「その path に触れてよいか」、capfs が「今この Capability で許されるか」を見る。一方、外部への要求は file syscall を 1 度も通らない。supervisor 経由で vsock に出て、host 側の Broker が型付き操作として判定する。**Broker に file 操作は届かないし、capfs に外部要求は届かない。**
+
+**緑と青で判定の性質が違う。** 緑（`capfs` と Broker）は現在の Capability を毎回見るので、revoke がその場で効く。青（seccomp と Landlock）は exec 前に固定した上限で、後から広げられない。狭い方に倒すのが青、追随するのが緑という分担になっている。
+
+credential が host 側の枠から出ていないことも図に含めてある。guest はどの経路でも token に触れない。
 
 ## コンテナを起動する順番
 

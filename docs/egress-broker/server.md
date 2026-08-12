@@ -28,11 +28,12 @@ flowchart TB
     cid -->|no| drop["UnexpectedPeer<br/>1 byte も読まずに切断"]
     cid --> loop["max_requests 回まで"]
     loop --> rd["read_frame"]
-    rd --> disp["dispatch_request"]
+    rd --> ctx["clock を読んで<br/>DispatchContext を作り直す"]
+    ctx --> disp["dispatch_request"]
     disp --> wire["response_to_wire<br/>内側の error を捨てる"]
     wire --> enc["encode → ControlFrame::new<br/>1 MiB を再検査"]
     enc --> wr["write_frame"]
-    wr --> ai{"AccountingInvariant?"}
+    wr --> ai{"AccountingInvariant か<br/>CommittedButUnrecorded?"}
     ai -->|yes| close["応答は書いて切断"]
     ai -->|no| loop
 ```
@@ -58,18 +59,22 @@ BrokerRejection::GitHub(_) => BrokerWireRejection::GitHub,
 
 同じ方針が [`IpPolicyError`](network-policy.md#エラーが解決結果を返さない) にもある。
 
-## `AccountingInvariant` で connection を閉じる
+## 2 つの rejection で connection を閉じる
 
 ```rust
 let close_after_response = matches!(
     response.outcome,
-    BrokerOutcome::Rejected(BrokerRejection::AccountingInvariant)
+    BrokerOutcome::Rejected(
+        BrokerRejection::AccountingInvariant | BrokerRejection::CommittedButUnrecorded
+    )
 );
 ```
 
-この rejection は、外部副作用が既に走った後で `budget.complete` が失敗し、予約が abort された状態を意味する。予約と実消費の対応が壊れている。
+`AccountingInvariant` は、外部副作用が走った後で `budget.complete` が失敗し、予約が abort された状態。予約と実消費の対応が壊れている。壊れた会計のまま新しい予約を出し続けると、`max_response_bytes` が guest の引き出せる byte 量を縛らなくなる。
 
-応答は書くが、その connection ではもう読まない。壊れた会計のまま新しい予約を出し続けると、`max_response_bytes` が guest の引き出せる byte 量を縛らなくなる。
+`CommittedButUnrecorded` は、外部副作用が線形化点を越えたのに terminal な audit record が残らなかった状態。provider 側に効果が存在しうるので、operator が突き合わせるまで同じ session で取引を続けさせない。詳細は [dispatch](dispatch.md#監査の失敗を認可拒否と混ぜない)。
+
+どちらも応答は書いてから閉じる。guest は理由 code を受け取れる。
 
 ## 失敗したら復旧しない
 
@@ -95,7 +100,7 @@ connection 単位の責務が 1 関数に収まっている。何回読むか、
 - peer CID の照合は `accept_peer` が返す値に依存する。kernel から正しく取れることは、この crate では確認していない。
 - `ConnectionReport` は `requests_served` と `accounting_invariant_closed` を返すが、これを使った運用側の処理は無い。
 - timeout も idle 検出も無い。`max_requests` 回読み切るか、失敗するまで connection は開いたまま。
-- `DispatchContext` は connection ごとに 1 回作られ、`now` もそこで固定される。connection 途中で有効期間が切れた capability が最後まで認可を通る。詳細は [dispatch](dispatch.md#その他の既知の問題)。
+- `serve_connection` は caller / capability の identity と clock を別々に受け取り、request ごとに `DispatchContext` を作り直す。clock の実装が実時刻を返すことは、この crate では検証していない。
 
 ## 変更時の確認点
 
@@ -103,7 +108,8 @@ connection 単位の責務が 1 関数に収まっている。何回読むか、
 - `response_to_wire` で内側の error を渡すようにしない。host の network 状態が guest へ漏れる。rejection の種類を増やすときは `dispatch.rs`、この file、`BrokerWireRejection` の 3 箇所を同時に直す。
 - 失敗後に stream を再利用しない。frame 境界の同期が取れていない。
 - `max_requests` を `usize` に変えない。0 を表現できることが型として問題になる。
-- `AccountingInvariant` で閉じる挙動を外さない。壊れた会計のまま session が続く。
+- `AccountingInvariant` と `CommittedButUnrecorded` で閉じる挙動を外さない。前者は壊れた会計のまま session が続き、後者は未突合の外部副作用を抱えたまま取引が続く。
+- clock を identity に畳み込まない。1 connection で 1 つの時刻を使い回すと、有効期間の切れた capability が認可を通り続ける。
 
 ## 関連
 

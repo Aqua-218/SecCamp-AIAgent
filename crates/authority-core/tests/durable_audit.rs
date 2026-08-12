@@ -95,7 +95,7 @@ fn issue_root(kernel: &CapabilityKernel) -> CapId {
 }
 
 #[test]
-fn kernel_durable_audit_survives_reopen_and_continues_attempt_ids() {
+fn kernel_durable_audit_reopens_for_inspection_but_requires_state_recovery() {
     let journal = TestJournal::new();
     let backend = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
     let kernel = CapabilityKernel::try_new_with_durable_audit(initial_state(), backend)
@@ -136,24 +136,11 @@ fn kernel_durable_audit_survives_reopen_and_continues_attempt_ids() {
         b"kernel-executor-returned-success"
     );
 
-    let next_kernel = CapabilityKernel::try_new_with_durable_audit(initial_state(), reopened)
-        .expect("reopened backend must construct a new kernel");
-    let next_capability_id = issue_root(&next_kernel);
-    next_kernel
-        .authorize_and_execute_classified(
-            &SubjectId::new("subject"),
-            &next_capability_id,
-            &request(),
-            |_| EffectExecution::<_, std::convert::Infallible>::Committed {
-                value: (),
-                receipt: None,
-            },
-        )
-        .expect("the reopened session must accept a new effect");
-    let records = next_kernel
-        .attempt_records()
-        .expect("in-memory audit must remain readable");
-    assert_eq!(records[0].id(), AttemptId::from_u64(1));
+    assert!(matches!(
+        CapabilityKernel::try_new_with_durable_audit(initial_state(), reopened),
+        Err(AuditError::StateRecoveryRequired { attempts })
+            if attempts == vec![AttemptId::from_u64(0)]
+    ));
 }
 
 #[test]
@@ -206,12 +193,18 @@ fn durable_wal_preserves_unknown_completion_after_crash_window() {
             receipt: Some(vec![0_u8; 8 * 1024 * 1024]),
         },
     );
-    assert!(matches!(
-        result,
-        Err(EffectCommitError::CommittedButAudit(AuditError::Durable(
-            DurableAuditError::RecordTooLarge(_)
-        )))
-    ));
+    let Err(EffectCommitError::CommittedButAudit {
+        attempt_id,
+        receipt,
+        source: AuditError::Durable(DurableAuditError::RecordTooLarge(_)),
+    }) = result
+    else {
+        panic!("oversized receipt must preserve exact recovery evidence");
+    };
+    assert_eq!(attempt_id, AttemptId::from_u64(0));
+    assert_eq!(receipt.attempt_id(), attempt_id);
+    assert_eq!(receipt.token().len(), 8 * 1024 * 1024);
+    assert!(receipt.token().iter().all(|byte| *byte == 0));
     drop(kernel);
 
     let reopened = DurableAuditView::open(&journal.path)
@@ -225,7 +218,8 @@ fn durable_wal_preserves_unknown_completion_after_crash_window() {
         .expect("the unresolved journal must remain inspectable by its recovery owner");
     assert!(matches!(
         CapabilityKernel::try_new_with_durable_audit(initial_state(), writer),
-        Err(AuditError::UnresolvedRecovery { attempts: 1 })
+        Err(AuditError::StateRecoveryRequired { attempts })
+            if attempts == vec![AttemptId::from_u64(0)]
     ));
 }
 
@@ -245,14 +239,20 @@ fn durable_kernel_rejects_recovered_commit_unknown() {
             evidence: b"provider completion was not observable".to_vec(),
         },
     );
-    assert!(matches!(result, Err(EffectCommitError::CommitUnknown)));
+    assert!(matches!(
+        result,
+        Err(EffectCommitError::CommitUnknown { attempt_id, evidence })
+            if attempt_id == AttemptId::from_u64(0)
+                && evidence == b"provider completion was not observable"
+    ));
     drop(kernel);
 
     let writer = DurableAuditLog::open(&journal.path)
         .expect("the commit-unknown journal must remain inspectable by its recovery owner");
     assert!(matches!(
         CapabilityKernel::try_new_with_durable_audit(initial_state(), writer),
-        Err(AuditError::UnresolvedRecovery { attempts: 1 })
+        Err(AuditError::StateRecoveryRequired { attempts })
+            if attempts == vec![AttemptId::from_u64(0)]
     ));
 }
 
@@ -273,12 +273,18 @@ fn terminal_receipt_failure_reports_possible_external_commit() {
         },
     );
 
-    assert!(matches!(
-        result,
-        Err(EffectCommitError::CommittedButAudit(AuditError::Durable(
-            DurableAuditError::RecordTooLarge(_)
-        )))
-    ));
+    let Err(EffectCommitError::CommittedButAudit {
+        attempt_id,
+        receipt,
+        source: AuditError::Durable(DurableAuditError::RecordTooLarge(_)),
+    }) = result
+    else {
+        panic!("oversized receipt must retain exact reconciliation data");
+    };
+    assert_eq!(attempt_id, AttemptId::from_u64(0));
+    assert_eq!(receipt.attempt_id(), attempt_id);
+    assert_eq!(receipt.token().len(), 8 * 1024 * 1024);
+    assert!(receipt.token().iter().all(|byte| *byte == 0));
     assert_eq!(
         kernel
             .attempt_records()

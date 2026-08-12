@@ -1,0 +1,208 @@
+name: Security Assurance
+run-name: Security / ${{ github.event_name }} / ${{ github.ref_name }}
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 2 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  codeql:
+    name: CodeQL / Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        with:
+          languages: rust
+          build-mode: none
+          queries: security-extended
+      - name: Analyze Rust data flows
+        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        with:
+          category: /language:rust
+
+  dependency_audit:
+    name: RustSec audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up security tooling
+        uses: ./.github/actions/setup-rust
+        with:
+          tool-groups: security
+      - name: Audit dependency advisories
+        run: scripts/ci/run.sh audit
+      - name: Upload audit report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cargo-audit
+          path: reports/cargo-audit.json
+          if-no-files-found: error
+          retention-days: 30
+
+  dependency_policy:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up security tooling
+        uses: ./.github/actions/setup-rust
+        with:
+          tool-groups: security
+      - name: Enforce licenses and sources
+        run: scripts/ci/run.sh deny
+      - name: Upload dependency policy report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cargo-deny
+          path: reports/cargo-deny.json
+          if-no-files-found: error
+          retention-days: 30
+
+  sast:
+    name: Semgrep SAST
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Scan Rust security invariants
+        run: |
+          set -euo pipefail
+          mkdir -p -- reports
+          docker run --rm \
+            --volume "${PWD}:/src" \
+            --workdir /src \
+            docker.io/semgrep/semgrep:1.172.0@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b \
+            semgrep scan --config .semgrep.yml --error --metrics off \
+            --exclude target --exclude lean/.lake \
+            --json-output reports/semgrep.json crates
+      - name: Upload SAST report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: semgrep-sast
+          path: reports/semgrep.json
+          if-no-files-found: error
+          retention-days: 30
+
+  secrets:
+    name: Secret detection
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Scan Git history
+        run: |
+          set -euo pipefail
+          mkdir -p -- reports
+          docker run --rm \
+            --volume "${PWD}:/repo" \
+            --workdir /repo \
+            docker.io/zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git --redact --report-format sarif \
+            --report-path reports/gitleaks.sarif .
+      - name: Upload secret detection report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gitleaks
+          path: reports/gitleaks.sarif
+          if-no-files-found: error
+          retention-days: 30
+
+  scorecard:
+    name: OpenSSF Scorecard
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Prepare report directory
+        run: mkdir -p -- reports
+      - name: Analyze repository supply-chain posture
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: reports/scorecard.sarif
+          results_format: sarif
+          publish_results: false
+      - name: Upload Scorecard report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openssf-scorecard
+          path: reports/scorecard.sarif
+          if-no-files-found: error
+          retention-days: 30
+
+  security_complete:
+    name: Security complete
+    if: ${{ always() }}
+    needs:
+      - codeql
+      - dependency_audit
+      - dependency_policy
+      - sast
+      - secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Enforce all security gates
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -e 'all(.[]; .result == "success")' <<< "${NEEDS_JSON}"

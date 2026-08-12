@@ -6,7 +6,9 @@ import Authority.Orchestrator
 import Authority.Refinement.Observation
 import Authority.Refinement.CapabilityState
 import Authority.Refinement.Broker
+import Authority.Refinement.Capfs
 import Authority.Refinement.OrchestratorRuntime
+import Authority.Refinement.RuntimeCorpus
 import Authority.SupervisorRefinement
 
 /-!

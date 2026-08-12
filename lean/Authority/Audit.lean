@@ -38,6 +38,7 @@ inductive AttemptOutcome where
   | denied
   | failedBeforeCommit
   | committed
+  | commitUnknown
   deriving Repr, BEq, DecidableEq
 
 namespace AttemptOutcome
@@ -48,6 +49,7 @@ def Terminal : AttemptOutcome → Prop
   | .denied => True
   | .failedBeforeCommit => True
   | .committed => True
+  | .commitUnknown => True
 
 /-- No terminal outcome is `started`. -/
 theorem terminal_ne_started {outcome : AttemptOutcome}
@@ -61,6 +63,17 @@ structure CommitReceipt where
   attemptId : AttemptId
   token : List UInt8
   deriving Repr, DecidableEq
+
+/-- Rust's durable journal caps opaque ambiguity evidence at 64 KiB. -/
+def commitUnknownEvidenceMaximumBytes : Nat := 64 * 1024
+
+/-- Nonempty bounded ambiguity evidence tied to one exact attempt. -/
+structure CommitUnknownEvidence where
+  attemptId : AttemptId
+  token : List UInt8
+  tokenNonempty : token ≠ []
+  tokenBounded : token.length ≤ commitUnknownEvidenceMaximumBytes
+  deriving Repr
 
 /-- Immutable metadata recorded before the executor is invoked. -/
 structure AttemptMetadata where
@@ -85,6 +98,7 @@ structure AuditState where
   nextAttemptId : Nat
   attemptIdExhausted : Bool
   attempts : AttemptId → Option AttemptRecord
+  commitUnknownEvidence : AttemptId → Option CommitUnknownEvidence := fun _ => none
 
 namespace AuditState
 
@@ -95,6 +109,7 @@ def empty : AuditState where
   nextAttemptId := 0
   attemptIdExhausted := false
   attempts := fun _ => none
+  commitUnknownEvidence := fun _ => none
 
 /-- An attempt identity is permanently reserved after its start record. -/
 def WasStarted (state : AuditState) (attemptId : AttemptId) : Prop :=
@@ -126,6 +141,7 @@ def ValidReceipt (attemptId : AttemptId) (outcome : AttemptOutcome)
   | .started, _ => False
   | .denied, none => True
   | .failedBeforeCommit, none => True
+  | .commitUnknown, _ => False
   | .denied, some _ => False
   | .failedBeforeCommit, some _ => False
 
@@ -139,10 +155,25 @@ structure MayFinish (state : AuditState) (attemptId : AttemptId)
   sequenceAvailable : state.sequenceExhausted = false
   sequenceRepresentable : FitsU64 state.nextSequence
 
+/-- Preconditions for durably recording an ambiguous external completion. -/
+structure MayFinishCommitUnknown (state : AuditState) (attemptId : AttemptId)
+    (evidence : CommitUnknownEvidence) where
+  currentRecord : AttemptRecord
+  currentLookup : state.attempts attemptId = some currentRecord
+  stillStarted : currentRecord.outcome = .started
+  evidenceMatches : evidence.attemptId = attemptId
+  sequenceAvailable : state.sequenceExhausted = false
+  sequenceRepresentable : FitsU64 state.nextSequence
+
 /-- Recover the attempt identity indexed by validated finish evidence. -/
 def MayFinish.attemptId {state : AuditState} {attemptId : AttemptId}
     {outcome : AttemptOutcome} {receipt : Option CommitReceipt}
     (_ : MayFinish state attemptId outcome receipt) : AttemptId := attemptId
+
+/-- Recover the attempt identity indexed by validated ambiguity evidence. -/
+def MayFinishCommitUnknown.attemptId {state : AuditState} {attemptId : AttemptId}
+    {evidence : CommitUnknownEvidence}
+    (_ : MayFinishCommitUnknown state attemptId evidence) : AttemptId := attemptId
 
 /-- Construct the exact record written by an accepted begin transition. -/
 def startedRecord (state : AuditState) (attemptId : AttemptId)
@@ -162,7 +193,8 @@ def beginAttempt (state : AuditState) (attemptId : AttemptId)
     nextAttemptId := (advanceU64 state.nextAttemptId).1
     attemptIdExhausted := (advanceU64 state.nextAttemptId).2
     attempts := replace state.attempts attemptId
-      (some (state.startedRecord attemptId metadata)) }
+      (some (state.startedRecord attemptId metadata))
+    commitUnknownEvidence := state.commitUnknownEvidence }
 
 /-- Construct a terminal record without changing immutable start metadata. -/
 def terminalRecord (state : AuditState) (current : AttemptRecord)
@@ -181,7 +213,19 @@ def finishAttempt (state : AuditState) (attemptId : AttemptId)
     nextAttemptId := state.nextAttemptId
     attemptIdExhausted := state.attemptIdExhausted
     attempts := replace state.attempts attemptId
-      (some (state.terminalRecord current outcome receipt)) }
+      (some (state.terminalRecord current outcome receipt))
+    commitUnknownEvidence := state.commitUnknownEvidence }
+
+/-- Append a `CommitUnknown` terminal and its exact bounded evidence atomically. -/
+def finishCommitUnknownAttempt (state : AuditState) (attemptId : AttemptId)
+    (current : AttemptRecord) (evidence : CommitUnknownEvidence) : AuditState :=
+  { nextSequence := (advanceU64 state.nextSequence).1
+    sequenceExhausted := (advanceU64 state.nextSequence).2
+    nextAttemptId := state.nextAttemptId
+    attemptIdExhausted := state.attemptIdExhausted
+    attempts := replace state.attempts attemptId
+      (some (state.terminalRecord current .commitUnknown none))
+    commitUnknownEvidence := replace state.commitUnknownEvidence attemptId (some evidence) }
 
 /-- A begin transition stores its exact start record. -/
 theorem beginAttempt_stores_exact_record (state : AuditState)
@@ -233,6 +277,18 @@ theorem finishAttempt_stores_exact_record {state : AuditState}
       some (state.terminalRecord allowed.currentRecord outcome receipt) := by
   simp [finishAttempt]
 
+/-- An ambiguous finish stores the exact terminal record and bound evidence. -/
+theorem finishCommitUnknown_stores_exact {state : AuditState}
+    {attemptId : AttemptId} {evidence : CommitUnknownEvidence}
+    (allowed : MayFinishCommitUnknown state attemptId evidence) :
+    (state.finishCommitUnknownAttempt attemptId allowed.currentRecord evidence).attempts
+        attemptId =
+      some (state.terminalRecord allowed.currentRecord .commitUnknown none) ∧
+    AuditState.commitUnknownEvidence
+      (state.finishCommitUnknownAttempt attemptId allowed.currentRecord evidence)
+        attemptId = some evidence := by
+  simp [finishCommitUnknownAttempt]
+
 /-- Finishing an attempt preserves its start identity, sequence, and metadata. -/
 theorem terminalRecord_preserves_start_fields (state : AuditState)
     (current : AttemptRecord) (outcome : AttemptOutcome)
@@ -250,6 +306,15 @@ theorem finishAttempt_preserves_other (state : AuditState)
     (state.finishAttempt finishedAttempt current outcome receipt).attempts existingAttempt =
       state.attempts existingAttempt := by
   simp [finishAttempt, replace, differentAttempts]
+
+/-- Finishing an ambiguous attempt preserves every other attempt record. -/
+theorem finishCommitUnknown_preserves_other (state : AuditState)
+    (finishedAttempt : AttemptId) (current : AttemptRecord)
+    (evidence : CommitUnknownEvidence) {existingAttempt : AttemptId}
+    (differentAttempts : existingAttempt ≠ finishedAttempt) :
+    (state.finishCommitUnknownAttempt finishedAttempt current evidence).attempts
+        existingAttempt = state.attempts existingAttempt := by
+  simp [finishCommitUnknownAttempt, replace, differentAttempts]
 
 /-- A valid committed terminal record must carry a matching receipt. -/
 theorem validReceipt_committed_iff {attemptId : AttemptId}
@@ -287,6 +352,11 @@ inductive Step : AuditState → AuditState → Prop
       {outcome : AttemptOutcome} {receipt : Option CommitReceipt} :
       (allowed : MayFinish state attemptId outcome receipt) →
       Step state (state.finishAttempt attemptId allowed.currentRecord outcome receipt)
+  | finishCommitUnknown {state : AuditState} {attemptId : AttemptId}
+      {evidence : CommitUnknownEvidence} :
+      (allowed : MayFinishCommitUnknown state attemptId evidence) →
+      Step state
+        (state.finishCommitUnknownAttempt attemptId allowed.currentRecord evidence)
 
 /-- Every accepted append advances or consumes the final `u64` sequence. -/
 theorem Step.nextSequence_monotone {before after : AuditState}
@@ -301,6 +371,7 @@ theorem Step.nextAttemptId_monotone {before after : AuditState}
   cases transition with
   | begin => exact advanceU64_value_monotone _
   | finish => exact Nat.le_refl _
+  | finishCommitUnknown => exact Nat.le_refl _
 
 /-- Once the append sequence is exhausted, no later audit append is accepted. -/
 theorem exhausted_sequence_rejects_step {state after : AuditState}
@@ -312,6 +383,10 @@ theorem exhausted_sequence_rejects_step {state after : AuditState}
       rw [exhausted] at available
       contradiction
   | finish allowed =>
+      have available := allowed.sequenceAvailable
+      rw [exhausted] at available
+      contradiction
+  | finishCommitUnknown allowed =>
       have available := allowed.sequenceAvailable
       rw [exhausted] at available
       contradiction
@@ -355,6 +430,8 @@ theorem Step.preserves_countersRepresentable {before after : AuditState}
         advanceU64_value_fits allowed.identityRepresentable⟩
   | finish allowed =>
       exact ⟨advanceU64_value_fits allowed.sequenceRepresentable, representable.2⟩
+  | finishCommitUnknown allowed =>
+      exact ⟨advanceU64_value_fits allowed.sequenceRepresentable, representable.2⟩
 
 /-- Once started, an attempt identity remains permanently reserved. -/
 theorem Step.started_attempt_persists {before after : AuditState}
@@ -371,6 +448,12 @@ theorem Step.started_attempt_persists {before after : AuditState}
         exact ⟨_, finishAttempt_stores_exact_record allowed⟩
       · exact ⟨existingRecord,
           (finishAttempt_preserves_other _ _ _ _ _ sameAttempt).trans existingLookup⟩
+  | finishCommitUnknown allowed =>
+      by_cases sameAttempt : attemptId = allowed.attemptId
+      · subst attemptId
+        exact ⟨_, (finishCommitUnknown_stores_exact allowed).1⟩
+      · exact ⟨existingRecord,
+          (finishCommitUnknown_preserves_other _ _ _ _ sameAttempt).trans existingLookup⟩
 
 /-- A terminal attempt is immutable under all later accepted appends. -/
 theorem Step.terminal_attempt_immutable {before after : AuditState}
@@ -391,6 +474,16 @@ theorem Step.terminal_attempt_immutable {before after : AuditState}
         rw [terminalWasStarted] at terminal
         simp [AttemptOutcome.Terminal] at terminal
       · exact (finishAttempt_preserves_other _ _ _ _ _ sameAttempt).trans terminalLookup
+  | finishCommitUnknown allowed =>
+      by_cases sameAttempt : attemptId = allowed.attemptId
+      · subst attemptId
+        have sameRecord : terminalRecord = allowed.currentRecord :=
+          Option.some.inj (terminalLookup.symm.trans allowed.currentLookup)
+        subst terminalRecord
+        have terminalWasStarted := allowed.stillStarted
+        rw [terminalWasStarted] at terminal
+        simp [AttemptOutcome.Terminal] at terminal
+      · exact (finishCommitUnknown_preserves_other _ _ _ _ sameAttempt).trans terminalLookup
 
 /-- A committed finish creates one effect with a receipt bound to the attempt. -/
 theorem finish_committed_creates_effect {state : AuditState}
@@ -426,6 +519,21 @@ theorem finish_noncommitted_has_no_effect {state : AuditState}
     simp [terminalRecord] at committedOutcome
   · subst outcome
     simp [terminalRecord] at committedOutcome
+
+/-- A `CommitUnknown` terminal retains evidence but never creates an effect snapshot. -/
+theorem finish_commitUnknown_has_no_effect {state : AuditState}
+    {attemptId : AttemptId} {evidence : CommitUnknownEvidence}
+    (allowed : MayFinishCommitUnknown state attemptId evidence) :
+    ¬ AuditState.HasEffect
+      (state.finishCommitUnknownAttempt attemptId allowed.currentRecord evidence) attemptId := by
+  intro effect
+  rcases effect with ⟨effectRecord, _, effectLookup, committedOutcome, _, _⟩
+  have storedRecordIsUnknown :
+      effectRecord = state.terminalRecord allowed.currentRecord .commitUnknown none :=
+    Option.some.inj
+      (effectLookup.symm.trans (finishCommitUnknown_stores_exact allowed).1)
+  subst effectRecord
+  simp [terminalRecord] at committedOutcome
 
 /-- Every effect snapshot refers to a started record and a matching receipt. -/
 theorem hasEffect_implies_started_and_matching_receipt {state : AuditState}

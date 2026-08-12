@@ -34,7 +34,7 @@ flowchart LR
 
 Rust の `CanonicalHost::new` は ASCII DNS host を小文字化し、末尾の root dot を除去する。port、userinfo、IP literal、空 label、非 ASCII input は authority の host として受け付けない。国際化 domain は境界側で ASCII A-label にしてから渡す。
 
-`CanonicalUrlPath::new` は origin-form の `/` 始まり path だけを受け取り、dot segment、重複 slash、末尾 slash、percent encoding、query、fragment、backslash を拒否する。`Prefix(/guide)` は `/guide/start` を含むが `/guide-old` は含まない。文字列 prefix ではなく segment の列で比較するからである。
+`CanonicalUrlPath::new` は origin-form の `/` 始まり path だけを受け取り、dot segment、重複 slash、末尾 slash、percent encoding、query、fragment、backslash を拒否する。`Prefix(/guide)` は `/guide/start` を含むが `/guide-old` は含まない。文字列 prefix ではなく segment の列で比較するからである。Lean の corpus 入口も `CanonicalHost.ofString` を通し、Rust と同じ ASCII lowercase、末尾 root dot 除去、DNS label、IP literal の境界を適用する。
 
 Lean の `CanonicalHost` と `CanonicalUrlPath` は、HTTP boundary がこの正規化を済ませた後に authority 判定へ渡す値を表す。Lean が証明する包含はこの型付き・正規化済みの領域についてのものであり、URL parser、redirect、DNS 解決そのものを証明するものではない。
 

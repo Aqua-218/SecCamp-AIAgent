@@ -64,7 +64,7 @@ flowchart LR
 - root を symlink follow なしで開き、mount ID と inode の再照合後に directory fd を保持する。
 - `statx` と `openat2` による fd-relative scan で symlink、hard link、special file、nested mount を拒否する。
 - UTF-8・canonical segment、entry 数、depth を検査し、path 順の初期 manifest を作る。
-- manifest全件へpath非依存の`ObjectId`を割り当て、root fdと完成したregistryを`ImportedRepository`で一緒に所有する。
+- manifest全件へpath非依存の`ObjectId`を割り当て、root fdと完成したregistryを`ImportedRepository`で一緒に所有する。cloneしたmountは同じshared stateを参照する。
 - host-assigned `RepoId`も`ImportedRepository`へ束ね、mount authorityとidentityが違うbacking接続をconstructorで拒否する。
 
 - `ObjectId -> NamespaceObject` と `CanonicalPath -> ObjectId` を同じ lock 内で管理する。

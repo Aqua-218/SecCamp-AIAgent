@@ -49,7 +49,7 @@ generation  : namespace変更ごとに増える単調なversion
 
 ## 初期 manifest と `ObjectId` をどう対応させるのか
 
-[`ImportedRepository`](../../crates/capfs/src/backing.rs) は、事前検証済み manifest と backing root fd を受け取り、完全な registry を構築してから両方を1つの所有型として返す。途中の entry だけが登録された registry は外へ出ない。
+[`ImportedRepository`](../../crates/capfs/src/backing.rs) は、事前検証済み manifest と backing root fd を受け取り、完全な registry を構築してから両方を1つの共有所有型として返す。途中の entry だけが登録された registry は外へ出ない。subject mountを増やすときはこの値をcloneし、cloneごとにregistryを作り直さない。
 
 manifest は canonical path 順なので、root を `object-0`、以後を `object-1`、`object-2` と単調に割り当てる。これは永続 ID ではなくVM session内だけの identity である。同じ repositoryでも別sessionでは対応が変わってよく、外部入力がIDを指定することはできない。
 
@@ -62,7 +62,7 @@ manifest は canonical path 順なので、root を `object-0`、以後を `obje
 
 IDにpathを埋め込まないため、`/src/lib.rs` がrenameされても `ObjectId` は変わらない。runtime createでもregistryが次のsequenceを割り当てる。executorがcommit前に失敗したIDは発行されず、removeまで成功したIDはsequenceを巻き戻さないため再利用されない。`u64::MAX`を割り当てた後は`ObjectIdExhausted`としてfail closedになる。
 
-backing root fdとregistryを同じ`ImportedRepository`が所有するのは、別repositoryから作ったregistryを誤って別fdへ接続する事故を型の境界で減らすためである。
+backing root fdとregistryを同じ`ImportedRepository`が所有するのは、別repositoryから作ったregistryを誤って別fdへ接続する事故を型の境界で減らすためである。clone後も2つは同じ共有ownerを指すため、mount Aとmount Bが異なるcurrent pathやopen countを持つことはない。
 
 ## Generation は何に使うのか
 
@@ -142,7 +142,7 @@ directory listingでは`with_directory_children`を使う。対象directory、�
 
 module内のtestはgeneration、open count、Object ID sequenceの上限、manifest rootとparent関係、writer panic後のfail closedを確認する。namespace registryについてcontract test 10件とmodule test 5件を実行する。
 
-capfs package全体では、backing、runtime、node table、read-only FUSEを含めて48件を実行する。
+capfs package全体では、backing、runtime、node table、read-only FUSEを含めて、共有importのcontract testも実行する。
 
 ここで確認できるのはRust APIの具体的な境界と1つのthread競合である。実FUSE mountではread / readdir後のrevokeを検査しているが、rename、open、close、revokeを組み合わせた全bounded interleavingのLoom modelは次段階に残る。
 

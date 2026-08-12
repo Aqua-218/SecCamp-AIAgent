@@ -78,7 +78,16 @@ flowchart LR
 
 `ObjectId`はmanifestのpath順にregistryが割り当て、path文字列そのものからは作らない。このためrename後も同じobject identityを使える。初期registry全体がgeneration 0であり、entryごとに途中のgenerationを外から観測することはできない。
 
-`ImportedRepository::open`はhostが割り当てた`RepoId`も受け取る。`ImportedRepository`がidentity、backing root、registryを同時に所有するため、adapterはあるrepository向けCapabilityを別repositoryのroot fdやnamespaceへ接続できない。必要な段階では`into_parts`で3値へ分離できるが、それまでは対応関係を1つの値として保つ。read-only adapterは分離前に`MountAuthority`の`RepoId`とのexact equalityを確認する。
+`ImportedRepository::open`はhostが割り当てた`RepoId`も受け取る。`ImportedRepository`がidentity、backing root、registryを同時に所有するため、adapterはあるrepository向けCapabilityを別repositoryのroot fdやnamespaceへ接続できない。mountを増やすときはこの値を`clone`する。cloneは新しいscanや別registryを作らず、同じroot fd ownerと同じ`NamespaceRegistry`を参照する。
+
+```text
+ImportedRepository.clone()
+  ├─ same RepoId
+  ├─ same validated backing root fd owner
+  └─ same namespace registry
+```
+
+したがってsubjectごとのFUSE mountはnode table、local handle table、固定authorityだけを別に持ち、rename・create・open countなどのVM共通状態は必ず1つになる。`into_parts`もownershipを複製せず、この共有ownerへの参照をadapterへ移す。adapterはconstructor内で`MountAuthority`の`RepoId`とのexact equalityを確認する。
 
 ## 何が数学的に扱いやすくなるのか
 
@@ -127,6 +136,7 @@ root や child directory の再照合には、time-of-check to time-of-use race 
 - special file、非 UTF-8 名、canonical 規則違反を拒否する。
 - entry 数と深さの上限を越えた木を拒否する。
 - host-assigned `RepoId`、backing root、manifest由来registryを同じownerへ取り込む。
+- 同じ`ImportedRepository`をcloneした複数mountが、同じroot fdを保持し、片方のopen countをもう片方から観測・closeできる。
 - manifest全件を同じregistryへ取り込み、path順にstableな`ObjectId`を割り当てる。
 - preflight失敗時に部分的なnamespace所有型を返さない。
 
@@ -138,11 +148,10 @@ module 内の test は mount ID の相違と、Linux が返し得る全 unsuppor
 
 supervisor は、事前検証を始める前から `capfs` の稼働終了まで、workload や他の非信頼 process が backing tree を直接変更できない配置にする必要がある。検証後の create、remove、rename は namespace registry と同じ transaction に置き、通常の read / write も root fd から `openat2` で解決する。
 
-read-only範囲では、[`runtime.rs`](../../crates/capfs/src/runtime.rs)と[`read_only.rs`](../../crates/capfs/src/read_only.rs)がroot fdからのruntime metadata、open、readをFUSE opcodeとCapability guardへ接続している。実装内容は[read-only FUSE adapter](read-only-fuse.md)を参照する。
+read-only範囲では、[`runtime.rs`](../../crates/capfs/src/runtime.rs)と[`read_only.rs`](../../crates/capfs/src/read_only.rs)がroot fdからのruntime metadata、open、readをFUSE opcodeとCapability guardへ接続している。`runtime.rs`には、同じfd-relative検証を通るpositioned writeの低層APIもあるが、FUSEのwrite認可はadapter側の次段階で接続する。実装内容は[read-only FUSE adapter](read-only-fuse.md)を参照する。
 
 まだ実装していないのは次である。
 
-- `READDIR`のdirectory streamとvisibility filter。
 - write、create、remove、renameを`openat2` / `renameat2`で実行する処理。
 - 実 FUSE mount 上のrename race、mount越境、敵対的な差し替えtest。
 

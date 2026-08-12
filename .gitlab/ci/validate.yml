@@ -1,0 +1,17 @@
+pipeline_policy:
+  extends: .rust_job
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/install-pipeline-tools.sh
+    - scripts/ci/validate-pipelines.sh
+
+rust_quality:
+  extends: .rust_job
+  stage: validate
+  timeout: 20m
+  script:
+    - scripts/ci/run.sh format
+    - scripts/ci/run.sh check
+    - scripts/ci/run.sh clippy
+    - scripts/ci/run.sh docs

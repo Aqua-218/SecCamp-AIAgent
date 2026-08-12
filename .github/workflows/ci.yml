@@ -4,6 +4,8 @@ run-name: CI / ${{ github.event_name }} / ${{ github.ref_name }}
 on:
   workflow_call:
   workflow_dispatch:
+  merge_group:
+    types: [checks_requested]
   pull_request:
     branches: [main]
   push:
@@ -16,7 +18,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 env:
   CARGO_INCREMENTAL: "0"

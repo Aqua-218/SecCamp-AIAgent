@@ -2,7 +2,7 @@
 
 [Authority core 実装ガイド](README.md) / Attempt / effect audit
 
-このページは [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs) と [`CapabilityKernel::authorize_and_commit`](../../crates/authority-core/src/kernel.rs) が、認可の試行と実際に commit した effect をどう区別して記録するか説明する。
+このページは [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs) と [`CapabilityKernel::authorize_and_commit`](../../crates/authority-core/src/kernel.rs) / `authorize_all_and_commit` が、認可の試行と実際に commit した effect をどう区別して記録するか説明する。
 
 ## 拒否された request と成立した effect は同じではない
 
@@ -43,17 +43,17 @@ executor が panic した場合、stack unwind により通常の terminal updat
 - session 内で単調な `AttemptId`。
 - trusted transport が決めた caller `SubjectId`。
 - caller が提示した `CapId`。
-- 時刻と typed authority request を含む `CapabilityRequest`。
+- 時刻とtyped authority requestを含む、1件以上の`CapabilityRequestSet`。1件操作では従来どおり1件だけ、`O_RDWR`やrenameのような複合operationでは必要な全requestを順序どおり持つ。
 - final authorization が観測した `AuthorizationEpoch`。
 - attempt の場合は outcome。
 
-これにより、「誰が」「どの Capability を使い」「何を」「どの revoke generation で」要求したかを後から対応付けられる。
+これにより、「誰が」「どの Capability を使い」「何を」「どの revoke generation で」要求したかを後から対応付けられる。`request()`は既存のsingle-request consumer向けに先頭requestを返し、new codeは`requests()`で全条件を読む。複合operationを先頭pathだけで監査してはいけない。
 
 ## Commit 後に log failure を起こさない仕組み
 
 外部 effect が成立した後で `Vec::push` や audit lock 取得に失敗すると、effect は起きたのに `EffectRecord` が残らない。
 
-この実装は executor を呼ぶ前に journal entry を1件作る。caller、Capability、request、epoch はこの時点で固定し、executor の後では事前作成済み entry の outcome を atomic に1回確定するだけにする。
+この実装は executor を呼ぶ前に journal entry を1件作る。caller、Capability、request set、epoch はこの時点で固定し、executor の後では事前作成済み entry の outcome を atomic に1回確定するだけにする。
 
 ```text
 state shared guard
@@ -90,6 +90,7 @@ Denied attempt    → revoke 後の epoch
 現在実装済みなのは次の範囲である。
 
 - final authorization へ到達した request の append-only identity。
+- 1つの外部operationに必要な複数requestの原子的な最終認可と、complete request setの監査記録。
 - `Denied`、`FailedBeforeCommit`、`Committed` の区別。
 - commit した attempt だけから作る effect snapshot。
 - caller、Capability、typed request、`auth_epoch` の保存。

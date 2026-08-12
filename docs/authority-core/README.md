@@ -95,14 +95,14 @@ Rust は実際の認可経路から呼ぶ純粋な `bool` 判定を担当する�
 | [`lean/Authority/File.lean`](../../lean/Authority/File.lean) | file authority の意味論、実行可能判定、包含定理 | [File authority](file-authorities.md) |
 | [`crates/authority-core/src/time.rs`](../../crates/authority-core/src/time.rs) | session-local monotonic time、有効な半開区間、membership と containment | [有効期間](validity-windows.md) |
 | [`lean/Authority/Time.lean`](../../lean/Authority/Time.lean) | 時刻窓の集合意味論、端点判定の健全性・完全性・推移性 | [有効期間](validity-windows.md) |
-| [`crates/authority-core/src/capability.rs`](../../crates/authority-core/src/capability.rs) | typed ID、metadata、file-only tagged body、時刻付き matching、`weaker_than` | [Capability](capabilities.md) |
+| [`crates/authority-core/src/capability.rs`](../../crates/authority-core/src/capability.rs) | typed ID、metadata、file-only tagged body、時刻付き matching、`weaker_than`、複合effect用の非空 request set | [Capability](capabilities.md) / [Authorization guard](authorization-guard.md) |
 | [`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) | Capability の集合意味論、matching 同値、`weakerThan` の健全性・完全性・推移性 | [Capability](capabilities.md) |
 | [`crates/authority-core/src/state.rs`](../../crates/authority-core/src/state.rs) | subject 登録、静的 envelope、root 発行、保持、逐次 Derive、revoke、epoch、lifecycle、handle registry | [Capability state](capability-state.md) / [Subject lifecycle と open handle](subject-lifecycle-and-handles.md) |
 | [`crates/authority-core/tests/capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 状態遷移の成功・拒否条件と失敗時の atomicity | [Capability state](capability-state.md) |
 | [`crates/authority-core/tests/capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) | 生成した操作列を独立した参照モデルと比較する stateful property test | [Capability state](capability-state.md) |
 | [`crates/authority-core/src/handle.rs`](../../crates/authority-core/src/handle.rs) | `HandleId`、`ObjectId`、subject-bound `OpenHandle` | [Subject lifecycle と open handle](subject-lifecycle-and-handles.md) |
-| [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs) | attempt journal、terminal outcome、commit 済み effect snapshot | [Attempt / effect audit](audit-records.md) |
-| [`crates/authority-core/src/kernel.rs`](../../crates/authority-core/src/kernel.rs) | shared/exclusive guard、active authority inspection、commit 時の最終認可、同期 transition、audit integration | [Authorization guard](authorization-guard.md) / [Attempt / effect audit](audit-records.md) |
+| [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs) | attempt journal、terminal outcome、単一/複合requestを含むcommit済み effect snapshot | [Attempt / effect audit](audit-records.md) |
+| [`crates/authority-core/src/kernel.rs`](../../crates/authority-core/src/kernel.rs) | shared/exclusive guard、active authority inspection、単一/複合effectの最終認可、同期 transition、audit integration | [Authorization guard](authorization-guard.md) / [Attempt / effect audit](audit-records.md) |
 | [`crates/authority-core/tests/authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | guard 公開 API の成功・拒否・error契約、inspection中のrevoke待機 | [Authorization guard](authorization-guard.md) |
 | [`crates/authority-core/tests/authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | revoke/commit interleaving と unlocked negative control | [Authorization guard](authorization-guard.md) |
 | [`crates/authority-core/src/lib.rs`](../../crates/authority-core/src/lib.rs) | Rust module の公開と `unsafe` 禁止 | 各 Rust ページ |

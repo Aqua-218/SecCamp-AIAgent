@@ -50,14 +50,19 @@ flowchart LR
 
 `register_subject`、`issue_root`、`derive`、`revoke` は exclusive guard の内側で既存の逐次 transition を呼ぶ。逐次状態機械の検査条件を複製せず、同期だけを外側に追加している。
 
-## `authorize_and_commit`
+## 1件と複数条件の effect をどう扱うか
 
-`authorize_and_commit` は次の順序を1回の呼び出しに閉じ込める。
+`authorize_and_commit` は、1件の`CapabilityRequest`を持つ通常のoperation用の入口である。
+`READ`、単純な`WRITE`、1 pathの`UNLINK`などはこれでよい。
+
+一方、`O_RDWR`、`O_TRUNC`、`RENAME`、複合`SETATTR`のように、1回の外部操作が複数の権限境界をまたぐことがある。これを`authorize_and_commit`へ順番に渡すと、前半だけがcommit済みと監査される、checksの間にrevokeが完了する、といった中間状態を作ってしまう。
+
+`CapabilityRequestSet`は必ず1件以上のrequestを持つ型である。`CapabilityKernel::authorize_all_and_commit`は、このset全件を次の1回の呼び出しに閉じ込める。
 
 ```text
 shared guard を取得
 → `Started` audit entry を作成
-→ caller / held / ancestor / time / request を最終確認
+→ caller / held / ancestor / time / request set全件を最終確認
 → 認可に使った Capability の参照を executor へ渡す
 → executor が線形化点まで進む
 → outcome を `Committed` に確定
@@ -66,7 +71,20 @@ shared guard を取得
 
 Capability の参照は read guard 内の `CapabilityState` を借用している。この参照を executor 呼び出しへ渡すことで、lock の寿命が認可判定だけで終わらずexecutor完了まで続く。
 
-認可が失敗した場合、executor は呼ばれず `EffectCommitError::NotAuthorized` を返す。executor が線形化点より前に失敗した場合は `EffectCommitError::Effect(error)` となる。executor 前に audit entry を作れない場合は `EffectCommitError::Audit(error)` で fail closed にする。記録の仕組みは[Attempt / effect audit](audit-records.md)を参照する。
+set内の1件でも認可が失敗した場合、executor は一度も呼ばれず `EffectCommitError::NotAuthorized` を返す。executor が線形化点より前に失敗した場合は `EffectCommitError::Effect(error)` となる。executor 前に audit entry を作れない場合は `EffectCommitError::Audit(error)` で fail closed にする。記録の仕組みは[Attempt / effect audit](audit-records.md)を参照する。
+
+現在のsetは1つの`CapId`に対して使う。複数Capabilityを合成して権限を足し合わせない。mountへ固定したCapabilityが、操作に必要な全requestを単独で許可しなければならない。この制限により、どのCapabilityが副作用を許可したかをaudit recordから一意に追える。
+
+### 具体例: `O_RDWR`
+
+```text
+CapabilityRequestSet {
+  ReadData(workspace, /src/main.rs, now),
+  WriteData(workspace, /src/main.rs, now),
+}
+```
+
+両方が許可されたときだけ、read/write両用のbacking descriptorを開く。recordは2つの独立effectではなく、2つの条件を持つ1つのopen operationとして残る。以後の`READ`と`WRITE`は、それぞれ現在pathに対して改めて単一requestを認可するため、open時の結果を失効後まで使い回さない。
 
 ## effectを起こさないauthority inspection
 
@@ -90,7 +108,7 @@ lock は外部 syscall がどこで成立したかを自動判定できない。
 - 処理を別 thread へ投げただけで成功を返さない。
 - closure 内から同じ `CapabilityKernel` の `revoke`、`derive`、発行 API を呼ばない。shared guard を持ったまま exclusive guard を要求するとdeadlockし得る。
 
-そのため `authorize_and_commit` が保証するのは、closureがこの契約を守る場合の認可とrevokeの順序である。filesystem adapter や Broker adapter が間違った線形化点でreturnすれば、その外部処理まで自動的に安全にはならない。
+そのため `authorize_and_commit` / `authorize_all_and_commit` が保証するのは、closureがこの契約を守る場合の認可とrevokeの順序である。filesystem adapter や Broker adapter が間違った線形化点でreturnすれば、その外部処理まで自動的に安全にはならない。
 
 ## Revoke と effect の2つの順序
 

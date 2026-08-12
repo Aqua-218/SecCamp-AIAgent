@@ -16,7 +16,7 @@ mod supervisor;
 pub use protocol::{MAX_WIRE_REQUEST_BYTES, WireDecodeError, WireEncodeError, WireRequest};
 pub use supervisor::{
     AuthorityKernel, CallerBindingError, CallerResolver, CgroupHandle, CleanupFailure, CleanupStep,
-    ConnectionIdentity, ControlFdHandle, DispatchResponse, MountHandle, ResourceError,
-    RuntimeResources, SetupStep, StaticCallerResolver, SubjectLifecycle, Supervisor,
-    SupervisorError, WorkloadHandle,
+    ConnectionIdentity, ControlFdHandle, DispatchResponse, MountHandle, OperationFailure,
+    ResourceAcquisition, ResourceError, ResourceFailure, ResourceMutation, RuntimeResources,
+    SetupStep, StaticCallerResolver, SubjectLifecycle, Supervisor, SupervisorError, WorkloadHandle,
 };

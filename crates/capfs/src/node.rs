@@ -354,6 +354,25 @@ impl NodeTable {
         Ok(self.read_state()?.nodes.len())
     }
 
+    /// Returns every node identity this mount has handed to the FUSE kernel.
+    ///
+    /// A returned identity is one the kernel may still hold cached metadata or
+    /// cached file content for, which makes this the set that a revocation has
+    /// to invalidate. Retired identities are absent because `FORGET` means the
+    /// kernel has already dropped them, and identities are never reused.
+    ///
+    /// The snapshot is collected under one read guard and returned by value.
+    /// Invalidating a kernel cache can block until the operating system drains
+    /// an in-flight request from this mount, and that request may need this
+    /// same table, so the caller must not hold the guard while doing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeTableError::LockPoisoned`] after a writer panic.
+    pub fn live_nodes(&self) -> Result<Vec<NodeId>, NodeTableError> {
+        Ok(self.read_state()?.nodes.keys().copied().collect())
+    }
+
     fn read_state(&self) -> Result<RwLockReadGuard<'_, NodeState>, NodeTableError> {
         self.state.read().map_err(|_| NodeTableError::LockPoisoned)
     }

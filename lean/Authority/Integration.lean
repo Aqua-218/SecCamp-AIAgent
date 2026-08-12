@@ -38,6 +38,255 @@ structure WellFormed (state : IntegratedHandleState) : Prop where
       state.authority.issuedHandleOwners handleId = some handle.subject
   namespaceWellFormed : state.namespaceState.TreeWellFormed
 
+/-- A startup manifest enumerates exactly the live namespace object records. -/
+def ManifestExact (namespaceState : NamespaceState)
+    (manifest : List NamespaceObject) : Prop :=
+  (manifest.map NamespaceObject.id).Nodup ∧
+    ∀ objectId object,
+      namespaceState.objects objectId = some object ↔
+        object ∈ manifest ∧ object.id = objectId
+
+/-- Evidence that a published startup snapshot ties its manifest and both components. -/
+structure Initialization (state : IntegratedHandleState) where
+  manifest : List NamespaceObject
+  manifestExact : ManifestExact state.namespaceState manifest
+  accountedHandlesNodup : ∀ objectId, (state.accountedHandles objectId).Nodup
+  authorityHandlesExact : ∀ objectId handleId,
+    handleId ∈ state.accountedHandles objectId ↔
+      ∃ handle,
+        state.authority.openHandles handleId = some handle ∧
+        handle.object = objectId
+  manifestCountsExact : ∀ object,
+    object ∈ manifest →
+      (state.accountedHandles object.id).length = object.openHandleCount
+  everyHandleTargetsManifest : ∀ handleId handle,
+    state.authority.openHandles handleId = some handle →
+      ∃ object, object ∈ manifest ∧ object.id = handle.object
+  liveHandleOwnerExact : ∀ handleId handle,
+    state.authority.openHandles handleId = some handle →
+      state.authority.issuedHandleOwners handleId = some handle.subject
+  namespaceWellFormed : state.namespaceState.TreeWellFormed
+
+/-- A state is initial when it has concrete manifest-backed initialization evidence. -/
+def Initial (state : IntegratedHandleState) : Prop :=
+  Nonempty (Initialization state)
+
+/-- Every admitted startup snapshot establishes the integration invariant. -/
+theorem Initial.wellFormed {state : IntegratedHandleState}
+    (initial : state.Initial) : state.WellFormed := by
+  rcases initial with ⟨initial⟩
+  constructor
+  · exact initial.accountedHandlesNodup
+  · exact initial.authorityHandlesExact
+  · intro objectId object objectLookup
+    have inManifest := (initial.manifestExact.2 objectId object).1 objectLookup
+    simpa [inManifest.2] using initial.manifestCountsExact object inManifest.1
+  · intro handleId handle handleLookup
+    rcases initial.everyHandleTargetsManifest handleId handle handleLookup with
+      ⟨object, objectInManifest, objectIdentity⟩
+    exact ⟨object, (initial.manifestExact.2 handle.object object).2
+      ⟨objectInManifest, objectIdentity⟩⟩
+  · exact initial.liveHandleOwnerExact
+  · exact initial.namespaceWellFormed
+
+/-- A well-formed state with an exact finite live-object manifest may be restored. -/
+theorem Initial.ofWellFormedManifest {state : IntegratedHandleState}
+    {manifest : List NamespaceObject}
+    (manifestExact : ManifestExact state.namespaceState manifest)
+    (wellFormed : state.WellFormed) : state.Initial := by
+  refine ⟨{
+    manifest := manifest
+    manifestExact := manifestExact
+    accountedHandlesNodup := wellFormed.accountedHandlesNodup
+    authorityHandlesExact := wellFormed.authorityHandlesExact
+    manifestCountsExact := ?_
+    everyHandleTargetsManifest := ?_
+    liveHandleOwnerExact := wellFormed.liveHandleOwnerExact
+    namespaceWellFormed := wellFormed.namespaceWellFormed
+  }⟩
+  · intro object objectInManifest
+    have objectLookup := (manifestExact.2 object.id object).2
+      ⟨objectInManifest, rfl⟩
+    exact wellFormed.namespaceCountsExact object.id object objectLookup
+  · intro handleId handle handleLookup
+    rcases wellFormed.everyHandleHasLiveObject handleId handle handleLookup with
+      ⟨object, objectLookup⟩
+    have objectInManifest := (manifestExact.2 handle.object object).1 objectLookup
+    exact ⟨object, objectInManifest.1, objectInManifest.2⟩
+
+/-- Build a startup snapshot whose imported manifest has no open handles. -/
+def initializeClosed (authority : CapabilityState)
+    (namespaceState : NamespaceState) : IntegratedHandleState where
+  authority := authority
+  namespaceState := namespaceState
+  accountedHandles := fun _ => []
+
+/-- A closed exact manifest and an Authority state with no live handles initialize safely. -/
+theorem Initial.ofClosedManifest {authority : CapabilityState}
+    {namespaceState : NamespaceState} {manifest : List NamespaceObject}
+    (manifestExact : ManifestExact namespaceState manifest)
+    (allObjectsClosed : ∀ object, object ∈ manifest → object.openHandleCount = 0)
+    (noAuthorityHandles : ∀ handleId, authority.openHandles handleId = none)
+    (namespaceWellFormed : namespaceState.TreeWellFormed) :
+    (initializeClosed authority namespaceState).Initial := by
+  refine ⟨{
+    manifest := manifest
+    manifestExact := manifestExact
+    accountedHandlesNodup := by simp [initializeClosed]
+    authorityHandlesExact := ?_
+    manifestCountsExact := ?_
+    everyHandleTargetsManifest := ?_
+    liveHandleOwnerExact := ?_
+    namespaceWellFormed := namespaceWellFormed
+  }⟩
+  · intro objectId handleId
+    constructor
+    · intro accounted
+      simp [initializeClosed] at accounted
+    · rintro ⟨handle, handleLookup, _⟩
+      change authority.openHandles handleId = some handle at handleLookup
+      rw [noAuthorityHandles handleId] at handleLookup
+      cases handleLookup
+  · intro object objectInManifest
+    simp [initializeClosed, allObjectsClosed object objectInManifest]
+  · intro handleId handle handleLookup
+    change authority.openHandles handleId = some handle at handleLookup
+    rw [noAuthorityHandles handleId] at handleLookup
+    cases handleLookup
+  · intro handleId handle handleLookup
+    change authority.openHandles handleId = some handle at handleLookup
+    rw [noAuthorityHandles handleId] at handleLookup
+    cases handleLookup
+
+/-- The singleton runtime namespace is exactly its one-object startup manifest. -/
+theorem runtimeInitial_manifestExact :
+    ManifestExact NamespaceState.runtimeInitial
+      [NamespaceState.rootObject (NamespaceState.allocatedObjectId 0)] := by
+  constructor
+  · simp
+  · intro objectId object
+    by_cases sameObject : objectId = NamespaceState.allocatedObjectId 0
+    · subst objectId
+      constructor
+      · intro objectLookup
+        have rootLookup :
+            some (NamespaceState.rootObject (NamespaceState.allocatedObjectId 0)) =
+              some object := by
+          simpa [NamespaceState.runtimeInitial, NamespaceState.withRoot,
+            replace] using objectLookup
+        have exactObject : object = NamespaceState.rootObject
+            (NamespaceState.allocatedObjectId 0) := Option.some.inj
+          rootLookup.symm
+        subst object
+        simp [NamespaceState.rootObject]
+      · rintro ⟨objectInManifest, _⟩
+        have exactObject := List.mem_singleton.mp objectInManifest
+        subst object
+        simp [NamespaceState.runtimeInitial, NamespaceState.withRoot, replace]
+    · constructor
+      · intro objectLookup
+        simp [NamespaceState.runtimeInitial, NamespaceState.withRoot,
+          replace, sameObject] at objectLookup
+      · rintro ⟨objectInManifest, objectIdentity⟩
+        have exactObject := List.mem_singleton.mp objectInManifest
+        subst object
+        exact False.elim (sameObject objectIdentity.symm)
+
+/-- Incrementing the runtime root yields an exact one-object open manifest. -/
+theorem runtimeInitialOpen_manifestExact :
+    ManifestExact
+      (NamespaceState.runtimeInitial.openObject
+        (NamespaceState.allocatedObjectId 0)
+        (NamespaceState.rootObject (NamespaceState.allocatedObjectId 0)))
+      [NamespaceState.withOpenHandleCount
+        (NamespaceState.rootObject (NamespaceState.allocatedObjectId 0)) 1] := by
+  constructor
+  · simp
+  · intro objectId object
+    by_cases sameObject : objectId = NamespaceState.allocatedObjectId 0
+    · subst objectId
+      constructor
+      · intro objectLookup
+        have rootLookup :
+            some (NamespaceState.withOpenHandleCount
+              (NamespaceState.rootObject (NamespaceState.allocatedObjectId 0)) 1) =
+              some object := by
+          simpa [NamespaceState.runtimeInitial, NamespaceState.withRoot,
+            NamespaceState.openObject, NamespaceState.updateOpenHandleCount,
+            NamespaceState.rootObject, replace] using objectLookup
+        have exactObject : object = NamespaceState.withOpenHandleCount
+            (NamespaceState.rootObject (NamespaceState.allocatedObjectId 0)) 1 :=
+          Option.some.inj rootLookup.symm
+        subst object
+        simp [NamespaceState.withOpenHandleCount, NamespaceState.rootObject]
+      · rintro ⟨objectInManifest, _⟩
+        have exactObject := List.mem_singleton.mp objectInManifest
+        subst object
+        simp [NamespaceState.runtimeInitial, NamespaceState.withRoot,
+          NamespaceState.openObject, NamespaceState.updateOpenHandleCount,
+          NamespaceState.rootObject, replace]
+    · constructor
+      · intro objectLookup
+        simp [NamespaceState.runtimeInitial, NamespaceState.withRoot,
+          NamespaceState.openObject, NamespaceState.updateOpenHandleCount,
+          replace, sameObject] at objectLookup
+      · rintro ⟨objectInManifest, objectIdentity⟩
+        have exactObject := List.mem_singleton.mp objectInManifest
+        subst object
+        exact False.elim (sameObject objectIdentity.symm)
+
+/-- Concrete runtime startup: empty Authority handles and one closed manifest root. -/
+def initial (issuer : IssuerId) : IntegratedHandleState :=
+  initializeClosed (CapabilityState.empty issuer) NamespaceState.runtimeInitial
+
+/-- The concrete runtime startup is admitted by the initialization relation. -/
+theorem initial_isInitial (issuer : IssuerId) : (initial issuer).Initial := by
+  apply Initial.ofClosedManifest runtimeInitial_manifestExact
+  · intro object objectInManifest
+    have exactObject := List.mem_singleton.mp objectInManifest
+    subst object
+    rfl
+  · intro handleId
+    rfl
+  · exact NamespaceState.withRoot_treeWellFormed
+      (NamespaceState.allocatedObjectId 0)
+
+/-- The concrete runtime startup satisfies exact cross-component agreement. -/
+theorem initial_wellFormed (issuer : IssuerId) : (initial issuer).WellFormed :=
+  (initial_isInitial issuer).wellFormed
+
+/-- The startup relation is constructively inhabited for every issuer. -/
+theorem initial_nonempty (issuer : IssuerId) :
+    ∃ state : IntegratedHandleState, state.Initial :=
+  ⟨initial issuer, initial_isInitial issuer⟩
+
+/-- A closed startup whose selected subject may immediately open a root handle. -/
+def readyInitial (issuer : IssuerId) (subject : SubjectId) :
+    IntegratedHandleState :=
+  initializeClosed
+    { CapabilityState.empty issuer with
+      subjectStatuses := replace (fun _ => none) subject (some .running) }
+    NamespaceState.runtimeInitial
+
+/-- The ready startup remains a genuine closed-manifest initialization. -/
+theorem readyInitial_isInitial (issuer : IssuerId) (subject : SubjectId) :
+    (readyInitial issuer subject).Initial := by
+  apply Initial.ofClosedManifest runtimeInitial_manifestExact
+  · intro object objectInManifest
+    have exactObject := List.mem_singleton.mp objectInManifest
+    subst object
+    rfl
+  · intro handleId
+    rfl
+  · exact NamespaceState.withRoot_treeWellFormed
+      (NamespaceState.allocatedObjectId 0)
+
+/-- Concrete handle used to witness a reachable nonempty accounting snapshot. -/
+def startupRootHandle (subject : SubjectId) (handleId : HandleId) : OpenHandle where
+  id := handleId
+  subject := subject
+  object := NamespaceState.allocatedObjectId 0
+
 /-- A live Authority handle is represented in the finite accounting set. -/
 theorem WellFormed.live_handle_is_accounted {state : IntegratedHandleState}
     (wellFormed : state.WellFormed) {handleId : HandleId} {handle : OpenHandle}
@@ -124,6 +373,40 @@ def openHandle (state : IntegratedHandleState) (handle : OpenHandle)
   namespaceState := state.namespaceState.openObject handle.object object
   accountedHandles := replace state.accountedHandles handle.object
     (handle.id :: state.accountedHandles handle.object)
+
+/-- Opening the runtime root from a ready startup is an admitted atomic step. -/
+def readyInitialMayOpen (issuer : IssuerId) (subject : SubjectId)
+    (handleId : HandleId) :
+    (readyInitial issuer subject).MayOpen (startupRootHandle subject handleId) := by
+  refine {
+    subjectRunning := ?_
+    handleFresh := ?_
+    object := NamespaceState.rootObject (NamespaceState.allocatedObjectId 0)
+    objectLookup := ?_
+    countCanIncrement := ?_
+  }
+  · simp [readyInitial, initializeClosed, startupRootHandle,
+      CapabilityState.empty, replace]
+  · rfl
+  · simp [readyInitial, initializeClosed, startupRootHandle,
+      NamespaceState.runtimeInitial, NamespaceState.withRoot, replace]
+  · simp [NamespaceState.rootObject, CanIncrementU64, u64Maximum]
+
+/-- The first concrete reachable state with one exact root handle. -/
+def openedInitial (issuer : IssuerId) (subject : SubjectId)
+    (handleId : HandleId) : IntegratedHandleState :=
+  (readyInitial issuer subject).openHandle
+    (startupRootHandle subject handleId)
+    (NamespaceState.rootObject (NamespaceState.allocatedObjectId 0))
+
+/-- The opened witness still has one exact live-object manifest. -/
+theorem openedInitial_manifestExact (issuer : IssuerId) (subject : SubjectId)
+    (handleId : HandleId) :
+    ManifestExact (openedInitial issuer subject handleId).namespaceState
+      [NamespaceState.withOpenHandleCount
+        (NamespaceState.rootObject (NamespaceState.allocatedObjectId 0)) 1] := by
+  simpa [openedInitial, IntegratedHandleState.openHandle, readyInitial,
+    initializeClosed, startupRootHandle] using runtimeInitialOpen_manifestExact
 
 /-- Preconditions for one atomic Authority close and namespace count release. -/
 structure MayClose (state : IntegratedHandleState) (caller : SubjectId)
@@ -525,6 +808,79 @@ theorem Steps.preserves_wellFormed {before after : IntegratedHandleState}
   | refl => exact wellFormed
   | tail _ transition inductionHypothesis =>
       exact transition.preserves_wellFormed inductionHypothesis
+
+/-- Reachable states start from a concrete manifest-backed initialization. -/
+def Reachable (state : IntegratedHandleState) : Prop :=
+  ∃ initialState, initialState.Initial ∧ Steps initialState state
+
+/-- Every state reachable from an admitted initialization is well formed. -/
+theorem Reachable.wellFormed {state : IntegratedHandleState}
+    (reachable : state.Reachable) : state.WellFormed := by
+  rcases reachable with ⟨initialState, initialStateIsInitial, transitions⟩
+  exact transitions.preserves_wellFormed initialStateIsInitial.wellFormed
+
+/-- The concrete runtime startup is itself reachable. -/
+theorem initial_reachable (issuer : IssuerId) : (initial issuer).Reachable :=
+  ⟨initial issuer, initial_isInitial issuer, Steps.refl (initial issuer)⟩
+
+/-- One atomic root open produces a reachable state with an existing handle. -/
+theorem openedInitial_reachable (issuer : IssuerId) (subject : SubjectId)
+    (handleId : HandleId) :
+    (openedInitial issuer subject handleId).Reachable := by
+  refine ⟨readyInitial issuer subject, readyInitial_isInitial issuer subject, ?_⟩
+  simpa [openedInitial] using Steps.tail (Steps.refl (readyInitial issuer subject))
+    (Step.openAtomic (readyInitialMayOpen issuer subject handleId))
+
+/-- Existing exact handles are also admitted as restorable initial snapshots. -/
+theorem openedInitial_isInitial (issuer : IssuerId) (subject : SubjectId)
+    (handleId : HandleId) :
+    (openedInitial issuer subject handleId).Initial :=
+  Initial.ofWellFormedManifest
+    (openedInitial_manifestExact issuer subject handleId)
+    (openedInitial_reachable issuer subject handleId).wellFormed
+
+/-- The reachable open witness is exact in Authority, namespace, and accounting. -/
+theorem openedInitial_has_exact_handle (issuer : IssuerId) (subject : SubjectId)
+    (handleId : HandleId) :
+    let state := openedInitial issuer subject handleId
+    let handle := startupRootHandle subject handleId
+    let object := NamespaceState.withOpenHandleCount
+      (NamespaceState.rootObject (NamespaceState.allocatedObjectId 0)) 1
+    state.authority.openHandles handleId = some handle ∧
+      state.namespaceState.objects handle.object = some object ∧
+      state.accountedHandles handle.object = [handleId] ∧
+      state.Reachable ∧ state.WellFormed := by
+  dsimp only
+  refine ⟨?_, ?_, ?_, openedInitial_reachable issuer subject handleId,
+    (openedInitial_reachable issuer subject handleId).wellFormed⟩
+  · simp [openedInitial, IntegratedHandleState.openHandle, readyInitial,
+      initializeClosed, startupRootHandle, CapabilityState.registerOpenHandle,
+      CapabilityState.empty, replace]
+  · simp [openedInitial, IntegratedHandleState.openHandle, readyInitial,
+      initializeClosed, startupRootHandle, NamespaceState.runtimeInitial,
+      NamespaceState.withRoot, NamespaceState.openObject,
+      NamespaceState.updateOpenHandleCount, NamespaceState.rootObject, replace]
+  · simp [openedInitial, IntegratedHandleState.openHandle, readyInitial,
+      initializeClosed, startupRootHandle, replace]
+
+/-- Reachability with an existing exact handle is constructively non-vacuous. -/
+theorem reachable_with_existing_handle_nonempty (issuer : IssuerId)
+    (subject : SubjectId) (handleId : HandleId) :
+    ∃ (state : IntegratedHandleState) (handle : OpenHandle)
+        (object : NamespaceObject),
+      state.Reachable ∧ state.WellFormed ∧
+      state.Initial ∧
+      state.authority.openHandles handleId = some handle ∧
+      state.namespaceState.objects handle.object = some object ∧
+      state.accountedHandles handle.object = [handleId] := by
+  refine ⟨openedInitial issuer subject handleId,
+    startupRootHandle subject handleId,
+    NamespaceState.withOpenHandleCount
+      (NamespaceState.rootObject (NamespaceState.allocatedObjectId 0)) 1, ?_⟩
+  have exactHandle := openedInitial_has_exact_handle issuer subject handleId
+  exact ⟨exactHandle.2.2.2.1, exactHandle.2.2.2.2,
+    openedInitial_isInitial issuer subject handleId,
+    exactHandle.1, exactHandle.2.1, exactHandle.2.2.1⟩
 
 /-- An accounted live handle refutes the finish-close premise for its owner. -/
 theorem WellFormed.accounted_handle_blocks_subject_finish

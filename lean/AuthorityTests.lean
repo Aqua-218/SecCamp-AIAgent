@@ -353,17 +353,45 @@ example : httpFetchMatches httpParent
 example : httpFetchBodyBelow httpChild httpParent = true := by
   native_decide
 
+example :
+    (CanonicalHost.ofString "DOCS.Example.").map (fun host => host.value) =
+      some "docs.example" ∧
+    (CanonicalHost.ofString "127.0.0.1").isSome = false := by
+  native_decide
+
+example :
+    httpFetchMatches
+      { methods := HttpMethods.only .get
+        host := docsHost
+        path := .prefix guidePath
+        maxResponseBytes := UInt64.ofNat 18446744073709551615 }
+      { method := .get
+        host := docsHost
+        path := guideStartPath
+        maxResponseBytes := UInt64.ofNat 18446744073709551615 } = true := by
+  native_decide
+
 private def gitMain : BranchName :=
   { segments := ["main"]
-    isValid := by decide }
+    isValid := by native_decide }
 
 private def gitAgents : BranchName :=
   { segments := ["agents"]
-    isValid := by decide }
+    isValid := by native_decide }
 
 private def gitAgentFix : BranchName :=
   { segments := ["agents", "fix"]
-    isValid := by decide }
+    isValid := by native_decide }
+
+example :
+    (BranchName.ofSegments ["refs", "heads", "main"]).isSome = false ∧
+    (BranchName.ofSegments ["-topic"]).isSome = false ∧
+    (BranchName.ofSegments ["main..old"]).isSome = false ∧
+    (BranchName.ofSegments ["main."]).isSome = false ∧
+    (BranchName.ofSegments ["main@{1}"]).isSome = false ∧
+    (BranchName.ofSegments ["topic", "@"]).isSome = true ∧
+    (BranchName.ofSegments ["topic", "{literal}"]).isSome = true := by
+  native_decide
 
 private def gitHubParent : GitHubAuthority :=
   { installation := { value := "installation-a" }
@@ -392,7 +420,7 @@ example : gitHubMatches gitHubParent
       repository := { value := "github.example/acme/workspace" }
       operation := .createPullRequest
       base := gitMain
-      head := { segments := ["agents-evil"], isValid := by decide } } = false := by
+      head := { segments := ["agents-evil"], isValid := by native_decide } } = false := by
   native_decide
 
 example : gitHubBodyBelow gitHubChild gitHubParent = true := by

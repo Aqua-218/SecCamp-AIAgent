@@ -7,6 +7,8 @@
 
 #![warn(clippy::all)]
 
+pub mod recovery;
+
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsStr;

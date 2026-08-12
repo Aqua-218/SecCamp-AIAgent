@@ -66,10 +66,10 @@ def publish (_state : State) (staged : IntegratedHandleState)
   backingNamespace := staged.namespaceState
   unresolvedAttempts := unresolved
 
-/-- An unknown commit retains the old registry and quarantines either backing view. -/
+/-- An unknown commit publishes the staged registry and quarantines either backing view. -/
 def publishUnknown (state : State) (staged : IntegratedHandleState)
     (attemptId : AttemptId) (backing : UnknownBacking) : State where
-  integrated := { state.integrated with repositoryHealth := .inDoubt }
+  integrated := { staged with repositoryHealth := .inDoubt }
   backingNamespace := match backing with
     | .before => state.backingNamespace
     | .staged => staged.namespaceState
@@ -190,7 +190,7 @@ theorem OrdinaryStep.preserves_wellFormed {before after : State}
       have stagedComplete := proposed.execution.preserves_completeWellFormed
         proposed.beforeWellFormed.integratedComplete
       refine ⟨integratedComplete_withHealth _
-          proposed.beforeWellFormed.integratedComplete .inDoubt, ?_, ?_, ?_⟩
+          stagedComplete .inDoubt, ?_, ?_, ?_⟩
       · cases backing with
         | before => exact proposed.beforeWellFormed.backingComplete
         | staged => exact stagedComplete.namespaceComplete
@@ -555,15 +555,15 @@ theorem CheckedObservation.hardLink_precondition {before : State}
   exact effect.hardLink_exact
 
 private def aliasPrimary : CanonicalPath :=
-  { segments := ["primary"]
+  { segments := ["a"]
     isValid := by decide }
 
 private def aliasSecondary : CanonicalPath :=
-  { segments := ["secondary"]
+  { segments := ["b"]
     isValid := by decide }
 
 private def symlinkName : CanonicalPath :=
-  { segments := ["shortcut"]
+  { segments := ["a"]
     isValid := by decide }
 
 private def symlinkResolved : CanonicalPath :=
@@ -750,7 +750,7 @@ private def traceMayCreate : traceInitial.MayCreate traceObject := by
   · simp [traceInitial, NamespaceState.withRoot, replace]
   · simp [traceInitial, NamespaceState.withRoot,
       NamespaceState.rootObject, replace]
-  · exact ⟨"shortcut", by rfl⟩
+  · exact ⟨"a", by rfl⟩
 
 private def traceMayCreateSymlink :
     traceInitial.MayCreateSymlink traceObject := {
@@ -761,7 +761,7 @@ private def traceMayCreateSymlink :
   target := symlinkTarget
   targetStored := rfl
   targetContained := by
-    refine ⟨symlinkResolved, [], "shortcut", rfl, ?_, ?_⟩
+    refine ⟨symlinkResolved, [], "a", rfl, ?_, ?_⟩
     · simp [symlinkTarget]
     · rfl }
 
@@ -799,7 +799,7 @@ private def traceMayLink :
       NamespaceState.create, NamespaceState.withRoot,
       NamespaceState.rootObject, replace, traceObject, symlinkName_ne_root,
       symlinkName_ne_root.symm]
-  · exact ⟨"secondary", by rfl⟩
+  · exact ⟨"b", by rfl⟩
 
 private def traceLinked : NamespaceState :=
   traceCreated.addHardLink traceObject.id traceObject aliasSecondary
@@ -851,7 +851,7 @@ private def traceMayUnlink :
       NamespaceState.rootObject, replace, traceObject, aliasSecondary_ne_root,
       aliasSecondary_ne_root.symm, symlinkName_ne_root,
       symlinkName_ne_root.symm]
-  · exact ⟨"secondary", by rfl⟩
+  · exact ⟨"b", by rfl⟩
 
 private def traceFinal : NamespaceState :=
   traceLinked.unlinkName traceObject.id
@@ -958,26 +958,128 @@ theorem concrete_symlink_observation_nonreflexive :
   · exact NamespaceState.create_stores_object
       operationWitnessState.integrated.namespaceState traceObject
 
-private def unknownWitnessState : State :=
-  State.ofIntegrated (IntegratedHandleState.initial ⟨"capfs-issuer"⟩)
+private theorem operationWitnessStaged_complete :
+    operationWitnessStaged.CompleteWellFormed := by
+  exact (IntegratedHandleState.CompleteStep.createSymlinkAtomic
+    operationWitnessCandidate.beforeWellFormed.integratedComplete
+    operationWitnessAllowed).preserves_completeWellFormed
 
-private def unknownWitnessProposed :
-    ProposedEffect unknownWitnessState unknownWitnessState.integrated := {
+private def unknownLinkState : State :=
+  State.ofIntegrated operationWitnessStaged
+
+private def unknownLinkAllowed :
+    unknownLinkState.integrated.namespaceState.MayAddHardLink
+      traceObject.id aliasSecondary := by
+  simpa [unknownLinkState, State.ofIntegrated, operationWitnessStaged,
+    operationWitnessState, IntegratedHandleState.initial,
+    IntegratedHandleState.initializeClosed, traceCreated, traceInitial,
+    traceRootId] using traceMayLink
+
+private def unknownLinkStaged : IntegratedHandleState :=
+  unknownLinkState.integrated.addHardLink traceObject.id traceObject aliasSecondary
+
+private def unknownLinkEffect :
+    OperationEffect unknownLinkState
+      (.hardLink traceObject.id aliasSecondary) unknownLinkStaged :=
+  .hardLink unknownLinkAllowed
+
+private def unknownLinkProposed :
+    ProposedEffect unknownLinkState unknownLinkStaged :=
+  unknownLinkEffect.proposed rfl rfl
+    (State.ofIntegrated_wellFormed operationWitnessStaged_complete)
+
+private def unknownLinkAttempt : AttemptId := ⟨0⟩
+
+private def unknownLinkBeforeBacking : State :=
+  unknownLinkState.publishUnknown unknownLinkStaged unknownLinkAttempt .before
+
+private def unknownLinkStagedBacking : State :=
+  unknownLinkState.publishUnknown unknownLinkStaged unknownLinkAttempt .staged
+
+private def unknownLinkObservation (backing : UnknownBacking) : Observation := {
+  schemaVersion := observationSchemaVersion
+  operation := .hardLink traceObject.id aliasSecondary
+  outcome := .commitUnknown unknownLinkAttempt backing }
+
+private def unknownLinkCandidate (backing : UnknownBacking) :
+    Candidate unknownLinkState (unknownLinkObservation backing) := {
+  staged := unknownLinkStaged
   operational := rfl
   noUnresolved := rfl
-  beforeWellFormed := State.ofIntegrated_wellFormed
-    (IntegratedHandleState.initial_completeWellFormed ⟨"capfs-issuer"⟩)
-  execution := .refl unknownWitnessState.integrated }
+  beforeWellFormed := State.ofIntegrated_wellFormed operationWitnessStaged_complete
+  effect := unknownLinkEffect }
 
-/-- A concrete indeterminate syscall retains a durable attempt and quarantines. -/
+private def unknownLinkChecked (backing : UnknownBacking) :
+    CheckedObservation unknownLinkState (unknownLinkObservation backing) := {
+  after := outcomeState unknownLinkState unknownLinkStaged
+    (.commitUnknown unknownLinkAttempt backing)
+  staged := unknownLinkStaged
+  effect := unknownLinkEffect
+  proposed := unknownLinkProposed
+  exactOutcome := rfl }
+
+/-- Both backing choices pass the checker and forward-simulate the same registry. -/
+theorem concrete_hardLink_commitUnknown_refines_both :
+    checkObservation unknownLinkState (unknownLinkObservation .before)
+        (unknownLinkCandidate .before) = some (unknownLinkChecked .before) ∧
+      checkObservation unknownLinkState (unknownLinkObservation .staged)
+        (unknownLinkCandidate .staged) = some (unknownLinkChecked .staged) ∧
+      Steps unknownLinkState (unknownLinkChecked .before).after ∧
+      Steps unknownLinkState (unknownLinkChecked .staged).after ∧
+      (unknownLinkChecked .before).after = unknownLinkBeforeBacking ∧
+      (unknownLinkChecked .staged).after = unknownLinkStagedBacking := by
+  refine ⟨rfl, rfl, ?_, ?_, rfl, rfl⟩
+  · exact rustNamespaceOutcome_refines_step
+      (candidate := unknownLinkCandidate .before)
+      (checked := unknownLinkChecked .before) rfl
+  · exact rustNamespaceOutcome_refines_step
+      (candidate := unknownLinkCandidate .staged)
+      (checked := unknownLinkChecked .staged) rfl
+
+/--
+A hard link from `/a` to `/b` publishes `/b` in the quarantined registry for
+both unknown backing choices. Only the backing snapshot remains nondeterministic.
+-/
+theorem concrete_hardLink_commitUnknown_witness :
+    OrdinaryStep unknownLinkState unknownLinkBeforeBacking ∧
+      OrdinaryStep unknownLinkState unknownLinkStagedBacking ∧
+      unknownLinkBeforeBacking.repositoryHealth = .inDoubt ∧
+      unknownLinkStagedBacking.repositoryHealth = .inDoubt ∧
+      unknownLinkBeforeBacking.integrated.namespaceState.paths aliasSecondary =
+        some traceObject.id ∧
+      unknownLinkStagedBacking.integrated.namespaceState.paths aliasSecondary =
+        some traceObject.id ∧
+      unknownLinkBeforeBacking.integrated.namespaceState.objects traceObject.id =
+        some (NamespaceState.withAddedAlias traceObject aliasSecondary) ∧
+      unknownLinkStagedBacking.integrated.namespaceState.objects traceObject.id =
+        some (NamespaceState.withAddedAlias traceObject aliasSecondary) ∧
+      aliasSecondary ∈
+        (NamespaceState.withAddedAlias traceObject aliasSecondary).aliases ∧
+      unknownLinkBeforeBacking.backingNamespace =
+        unknownLinkState.backingNamespace ∧
+      unknownLinkStagedBacking.backingNamespace =
+        unknownLinkStaged.namespaceState := by
+  refine ⟨.commitUnknown unknownLinkProposed,
+    .commitUnknown unknownLinkProposed, rfl, rfl, ?_, ?_, ?_, ?_, ?_, rfl, rfl⟩
+  · exact NamespaceState.addHardLink_stores_path
+      unknownLinkState.integrated.namespaceState traceObject.id traceObject
+        aliasSecondary
+  · exact NamespaceState.addHardLink_stores_path
+      unknownLinkState.integrated.namespaceState traceObject.id traceObject
+        aliasSecondary
+  · exact NamespaceState.addHardLink_stores_object
+      unknownLinkState.integrated.namespaceState traceObject.id traceObject
+        aliasSecondary
+  · exact NamespaceState.addHardLink_stores_object
+      unknownLinkState.integrated.namespaceState traceObject.id traceObject
+        aliasSecondary
+  · simp
+
+/-- A concrete indeterminate hard link retains its durable attempt identity. -/
 theorem concrete_commitUnknown_witness :
-    ∃ after,
-      OrdinaryStep unknownWitnessState after ∧
-      after.repositoryHealth = .inDoubt ∧
-      (⟨0⟩ : AttemptId) ∈ after.unresolvedAttempts := by
-  exact ⟨unknownWitnessState.publishUnknown unknownWitnessState.integrated ⟨0⟩
-      .staged,
-    .commitUnknown unknownWitnessProposed,
-    rfl, by simp [State.publishUnknown]⟩
+    unknownLinkAttempt ∈ unknownLinkBeforeBacking.unresolvedAttempts ∧
+      unknownLinkAttempt ∈ unknownLinkStagedBacking.unresolvedAttempts := by
+  simp [unknownLinkBeforeBacking, unknownLinkStagedBacking,
+    unknownLinkAttempt, State.publishUnknown]
 
 end Authority.Refinement.Capfs

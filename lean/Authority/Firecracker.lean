@@ -320,6 +320,11 @@ def CleanupState.Safe (state : CleanupState) : Prop :=
   state.workspaceRemoved = true →
     state.processStopped = true ∧ state.verityOpened = false
 
+/-- All runtime resources have reached their terminal cleanup state. -/
+def CleanupState.Complete (state : CleanupState) : Prop :=
+  state.processStopped = true ∧ state.verityOpened = false ∧
+    state.workspaceRemoved = true
+
 /-- Initial live resources satisfy dependency safety. -/
 theorem CleanupState.live_safe : CleanupState.live.Safe := by
   simp [CleanupState.live, CleanupState.Safe]
@@ -360,6 +365,17 @@ theorem CleanupStep.preserves_safety {before after : CleanupState}
       intro _
       exact ⟨processStopped, verityClosed⟩
   | retryNoop => exact safe
+
+/-- Once complete, no accepted cleanup retry can recreate a resource. -/
+theorem CleanupStep.preserves_complete {before after : CleanupState}
+    (transition : CleanupStep before after) (complete : before.Complete) :
+    after.Complete := by
+  rcases complete with ⟨processStopped, verityClosed, workspaceRemoved⟩
+  cases transition with
+  | stopProcess => exact ⟨rfl, verityClosed, workspaceRemoved⟩
+  | closeVerity => exact ⟨processStopped, rfl, workspaceRemoved⟩
+  | removeWorkspace => exact ⟨processStopped, verityClosed, rfl⟩
+  | retryNoop => exact ⟨processStopped, verityClosed, workspaceRemoved⟩
 
 /-- Finite retry execution of dependency-gated cleanup. -/
 inductive CleanupSteps : CleanupState → CleanupState → Prop
@@ -437,6 +453,92 @@ theorem unsafe_rollback_is_not_a_cleanup_step :
   intro transition
   have violatesSafety := rollback_stop_failure_can_violate_dependency_safety
   exact violatesSafety (transition.preserves_safety CleanupState.live_safe)
+
+/-- Runtime lifecycle composed with the retryable, dependency-gated cleanup state. -/
+structure ManagedState where
+  core : State
+  cleanup : CleanupState
+
+/-- A newly launched runtime owns all three live resources. -/
+def ManagedState.launched (config : RuntimeConfig) : ManagedState where
+  core := State.launched config
+  cleanup := .live
+
+/-- Publish Stopped only after all owned resources are gone. -/
+def ManagedState.finishShutdown (state : ManagedState) : ManagedState :=
+  { core := { state.core with phase := .stopped }, cleanup := state.cleanup }
+
+/-- Identity refinement and the Stopped/cleanup gate agree. -/
+structure ManagedState.WellFormed (state : ManagedState) : Prop where
+  coreWellFormed : state.core.WellFormed
+  stoppedRequiresCleanup : state.core.phase = .stopped → state.cleanup.Complete
+  cleanupSafe : state.cleanup.Safe
+
+/-- A newly launched runtime satisfies lifecycle/cleanup coupling. -/
+theorem ManagedState.launched_wellFormed (config : RuntimeConfig) :
+    (ManagedState.launched config).WellFormed := by
+  constructor
+  · exact State.launched_wellFormed config
+  · intro impossible
+    simp [ManagedState.launched, State.launched] at impossible
+  · exact CleanupState.live_safe
+
+/-- Successful runtime protocol transitions never directly publish Stopped. -/
+theorem Step.after_ne_stopped {before after : State} (transition : Step before after) :
+    after.phase ≠ .stopped := by
+  cases transition <;> simp [State.markSnapshotted, State.restore,
+    State.markIdentityInjected, State.markRunning]
+
+/-- Accepted lifecycle steps, cleanup commits, and the terminal shutdown gate. -/
+inductive ManagedStep : ManagedState → ManagedState → Prop
+  | runtime {state : ManagedState} {core : State} :
+      Step state.core core → ManagedStep state { state with core := core }
+  | cleanup {state : ManagedState} {cleanup : CleanupState} :
+      CleanupStep state.cleanup cleanup →
+      ManagedStep state { state with cleanup := cleanup }
+  | finishShutdown {state : ManagedState} :
+      state.cleanup.Complete → ManagedStep state state.finishShutdown
+
+/-- Lifecycle/cleanup coupling survives every managed runtime transition. -/
+theorem ManagedStep.preserves_wellFormed {before after : ManagedState}
+    (transition : ManagedStep before after) (wellFormed : before.WellFormed) :
+    after.WellFormed := by
+  cases transition with
+  | runtime runtimeStep =>
+      exact ⟨runtimeStep.preserves_wellFormed wellFormed.coreWellFormed,
+        fun stopped => False.elim (runtimeStep.after_ne_stopped stopped),
+        wellFormed.cleanupSafe⟩
+  | cleanup cleanupStep =>
+      constructor
+      · exact wellFormed.coreWellFormed
+      · intro stopped
+        have completeBefore := wellFormed.stoppedRequiresCleanup stopped
+        exact cleanupStep.preserves_complete completeBefore
+      · exact cleanupStep.preserves_safety wellFormed.cleanupSafe
+  | finishShutdown complete =>
+      exact ⟨by simp [ManagedState.finishShutdown, State.WellFormed],
+        fun _ => complete, wellFormed.cleanupSafe⟩
+
+/-- A Stopped runtime has no live process, dm-verity mapping, or workspace. -/
+theorem ManagedState.stopped_implies_cleanup_complete {state : ManagedState}
+    (wellFormed : state.WellFormed) (stopped : state.core.phase = .stopped) :
+    state.cleanup.Complete :=
+  wellFormed.stoppedRequiresCleanup stopped
+
+/-- Finite managed Firecracker execution. -/
+inductive ManagedSteps : ManagedState → ManagedState → Prop
+  | refl (state : ManagedState) : ManagedSteps state state
+  | tail {first middle last : ManagedState} :
+      ManagedSteps first middle → ManagedStep middle last → ManagedSteps first last
+
+/-- Cleanup gating and identity refinement survive arbitrary runtime execution. -/
+theorem ManagedSteps.preserves_wellFormed {before after : ManagedState}
+    (transitions : ManagedSteps before after) (wellFormed : before.WellFormed) :
+    after.WellFormed := by
+  induction transitions with
+  | refl => exact wellFormed
+  | tail _ transition inductionHypothesis =>
+      exact transition.preserves_wellFormed inductionHypothesis
 
 end Firecracker
 

@@ -497,4 +497,39 @@ example :
     }) [] :=
   SessionBudget.empty_accounting _
 
+private def maximumSequenceEnvelope : BrokerEnvelope := {
+  session := { value := 11 }
+  sequence := u64Maximum
+  request := { value := 19 }
+  payloadHash := { value := 23 }
+}
+
+example :
+    ((ReplayState.empty maximumSequenceEnvelope.session 4).acceptNew
+      maximumSequenceEnvelope).nextSequence = none := by
+  exact ReplayState.acceptMaximum_exhausts_sequence _ _ rfl
+
+example : AuditState.empty.CountersRepresentable :=
+  AuditState.empty_countersRepresentable
+
+example :
+    (NamespaceState.withRoot { value := "root-object" }).CountersRepresentable :=
+  NamespaceState.withRoot_countersRepresentable _
+
+example :
+    (NamespaceState.withRoot { value := "root-object" }).TreeWellFormed :=
+  NamespaceState.withRoot_treeWellFormed _
+
+example :
+    (SessionBudget.empty {
+      maxRequests := 8
+      maxResponseBytes := 4096
+      maxConcurrentRequests := 2
+    }).CountersRepresentable := by
+  apply SessionBudget.empty_countersRepresentable
+  simp [SessionBudget.LimitsRepresentable, FitsU64, u64Maximum]
+
+example : ¬ ValidCapabilityId { value := "" } := by
+  simp [ValidCapabilityId]
+
 end AuthorityTests

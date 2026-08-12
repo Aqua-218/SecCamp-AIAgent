@@ -235,7 +235,15 @@ FUSE境界では内部構造を細かく漏らさず、失敗の種類を次の�
 
 実mount testは`/dev/fuse`が存在しない環境だけskipする。deviceが存在するのにmount設定や権限が壊れている場合はtest failureとして扱う。
 
-まだ検査していないのは、実kernelが送るFORGETの全lifecycle、mount中の敵対的backing差し替え、rename / writeとの競合、複数thread FUSE sessionである。
+`crates/capfs/tests/concurrency.rs` のbounded contractは、実backing syscallを抽象化した
+namespace / Capability境界で、write中のrevokeとopen / close / rename / unlinkの競合を
+32 round検査する。成功したwriteはrevoke returnより後へ越境せず、revoke完了後のmutationは
+executorへ入らず、open countとauthority handle countはcloseでゼロへ戻る。
+
+実kernelが送るFORGETの全lifecycle、mount中の敵対的backing差し替え、実syscallを含む
+rename / writeの物理的な競合、複数thread FUSE sessionはこのunit contractの対象外である。
+実FUSE mount testは`/dev/fuse`がない環境では実行不能理由を標準エラーへ記録して終了し、
+deviceが存在するのにmount設定または権限が壊れている場合は失敗として扱う。
 
 ## 現在対象外のoperation
 

@@ -2248,6 +2248,42 @@ theorem closeObject_preserves_wellFormed {state : NamespaceState}
     · exact wellFormed.liveWasIssued queriedId queriedObject
         (by simpa [closeObject, updateOpenHandleCount, replace, sameId] using queriedLookup)
 
+/-- Replacing only one live object's count preserves reciprocal indexes. -/
+theorem updateOpenHandleCount_preserves_wellFormed {state : NamespaceState}
+    {objectId : ObjectId} {object : NamespaceObject} {count : Nat}
+    (wellFormed : state.WellFormed)
+    (objectLookup : state.objects objectId = some object) :
+    (state.updateOpenHandleCount objectId object count).WellFormed := by
+  constructor
+  · intro queriedId queriedObject queriedLookup
+    by_cases sameId : queriedId = objectId
+    · subst queriedId
+      have exactObject : queriedObject = withOpenHandleCount object count :=
+        Option.some.inj (queriedLookup.symm.trans (by
+          simp [updateOpenHandleCount]))
+      subst queriedObject
+      simpa [withOpenHandleCount] using
+        wellFormed.objectToPath objectId object objectLookup
+    · exact wellFormed.objectToPath queriedId queriedObject
+        (by simpa [updateOpenHandleCount, replace, sameId] using queriedLookup)
+  · intro path queriedId pathLookup
+    rcases wellFormed.pathToObject path queriedId pathLookup with
+      ⟨queriedObject, oldLookup⟩
+    by_cases sameId : queriedId = objectId
+    · subst queriedId
+      have exactObject : queriedObject = object := Option.some.inj
+        (oldLookup.symm.trans objectLookup)
+      subst queriedObject
+      exact ⟨withOpenHandleCount object count, by simp [updateOpenHandleCount]⟩
+    · exact ⟨queriedObject,
+        by simpa [updateOpenHandleCount, replace, sameId] using oldLookup⟩
+  · intro queriedId queriedObject queriedLookup
+    by_cases sameId : queriedId = objectId
+    · subst queriedId
+      exact wellFormed.liveWasIssued objectId object objectLookup
+    · exact wellFormed.liveWasIssued queriedId queriedObject
+        (by simpa [updateOpenHandleCount, replace, sameId] using queriedLookup)
+
 /-- Changing only one object's handle count preserves the rooted tree shape. -/
 theorem updateOpenHandleCount_preserves_treeWellFormed {state : NamespaceState}
     {objectId : ObjectId} {object : NamespaceObject} {count : Nat}
@@ -2307,6 +2343,145 @@ theorem updateOpenHandleCount_preserves_treeWellFormed {state : NamespaceState}
     · exact ⟨parentId, parent,
         by simpa [updateOpenHandleCount, replace, parentIsUpdated] using parentLookup,
         parentPathLookup, parentKind, directParent⟩
+
+/-- Changing only one open count preserves exact aliases and every named parent edge. -/
+theorem updateOpenHandleCount_preserves_completeWellFormed {state : NamespaceState}
+    {objectId : ObjectId} {object : NamespaceObject} {count : Nat}
+    (complete : state.CompleteWellFormed)
+    (objectLookup : state.objects objectId = some object) :
+    (state.updateOpenHandleCount objectId object count).CompleteWellFormed := by
+  let updated := withOpenHandleCount object count
+  have updatedLookup :
+      (state.updateOpenHandleCount objectId object count).objects objectId =
+        some updated := by
+    simp [updateOpenHandleCount, updated]
+  refine ⟨updateOpenHandleCount_preserves_treeWellFormed complete.tree objectLookup
+      (updateOpenHandleCount_preserves_wellFormed complete.tree.indexes objectLookup),
+    ?_, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+    · intro queriedId queriedObject queriedLookup
+      by_cases selected : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans updatedLookup)
+        subst queriedObject
+        simpa [updated, withOpenHandleCount] using
+          complete.aliases.objectIdentity objectId object objectLookup
+      · exact complete.aliases.objectIdentity queriedId queriedObject
+          (by simpa [updateOpenHandleCount, replace, selected] using queriedLookup)
+    · intro queriedId queriedObject queriedLookup
+      by_cases selected : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans updatedLookup)
+        subst queriedObject
+        simpa [updated, withOpenHandleCount] using
+          complete.aliases.objectShape objectId object objectLookup
+      · exact complete.aliases.objectShape queriedId queriedObject
+          (by simpa [updateOpenHandleCount, replace, selected] using queriedLookup)
+    · intro queriedId queriedObject path queriedLookup member
+      by_cases selected : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans updatedLookup)
+        subst queriedObject
+        apply complete.aliases.aliasToPath objectId object path objectLookup
+        simpa [updated, withOpenHandleCount] using member
+      · exact complete.aliases.aliasToPath queriedId queriedObject path
+          (by simpa [updateOpenHandleCount, replace, selected] using queriedLookup) member
+    · intro path queriedId pathLookup
+      rcases complete.aliases.pathToAlias path queriedId pathLookup with
+        ⟨queriedObject, queriedLookup, member⟩
+      by_cases selected : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = object := Option.some.inj
+          (queriedLookup.symm.trans objectLookup)
+        subst queriedObject
+        exact ⟨updated, updatedLookup, by simpa [updated, withOpenHandleCount] using member⟩
+      · exact ⟨queriedObject,
+          by simpa [updateOpenHandleCount, replace, selected] using queriedLookup,
+          member⟩
+    · intro queriedId queriedObject path queriedLookup member
+      by_cases selected : queriedId = objectId
+      · subst queriedId
+        have exactObject : queriedObject = updated := Option.some.inj
+          (queriedLookup.symm.trans updatedLookup)
+        subst queriedObject
+        apply complete.aliases.representativeLeast objectId object path objectLookup
+        simpa [updated, withOpenHandleCount] using member
+      · exact complete.aliases.representativeLeast queriedId queriedObject path
+          (by simpa [updateOpenHandleCount, replace, selected] using queriedLookup) member
+    · intro queriedId queriedObject queriedLookup
+      by_cases selected : queriedId = objectId
+      · subst queriedId
+        exact complete.aliases.liveWasIssued objectId object objectLookup
+      · exact complete.aliases.liveWasIssued queriedId queriedObject
+          (by simpa [updateOpenHandleCount, replace, selected] using queriedLookup)
+  · intro queriedId queriedObject queriedLookup isDirectory
+    by_cases selected : queriedId = objectId
+    · subst queriedId
+      have exactObject : queriedObject = updated := Option.some.inj
+        (queriedLookup.symm.trans updatedLookup)
+      subst queriedObject
+      apply complete.directorySingleton objectId object objectLookup
+      simpa [updated, withOpenHandleCount] using isDirectory
+    · exact complete.directorySingleton queriedId queriedObject
+        (by simpa [updateOpenHandleCount, replace, selected] using queriedLookup)
+        isDirectory
+  · intro queriedId queriedObject name queriedLookup member notRoot
+    by_cases selected : queriedId = objectId
+    · subst queriedId
+      have exactObject : queriedObject = updated := Option.some.inj
+        (queriedLookup.symm.trans updatedLookup)
+      subst queriedObject
+      rcases complete.namedParentDirectory objectId object name objectLookup
+          (by simpa [updated, withOpenHandleCount] using member) notRoot with
+        ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
+      by_cases parentSelected : parentId = objectId
+      · have sameParent : parent = object := Option.some.inj
+          (parentLookup.symm.trans (parentSelected ▸ objectLookup))
+        subst parent
+        exact ⟨parentId, updated,
+          by simpa [parentSelected] using updatedLookup,
+          parentPathLookup,
+          by simpa [updated, withOpenHandleCount] using parentKind,
+          by simpa [updated, withOpenHandleCount] using direct⟩
+      · exact ⟨parentId, parent,
+          by simpa [updateOpenHandleCount, replace, parentSelected] using parentLookup,
+          parentPathLookup, parentKind, direct⟩
+    · have oldLookup : state.objects queriedId = some queriedObject := by
+        simpa [updateOpenHandleCount, replace, selected] using queriedLookup
+      rcases complete.namedParentDirectory queriedId queriedObject name oldLookup member
+          notRoot with
+        ⟨parentId, parent, parentLookup, parentPathLookup, parentKind, direct⟩
+      by_cases parentSelected : parentId = objectId
+      · have sameParent : parent = object := Option.some.inj
+          (parentLookup.symm.trans (parentSelected ▸ objectLookup))
+        subst parent
+        exact ⟨parentId, updated,
+          by simpa [parentSelected] using updatedLookup,
+          parentPathLookup,
+          by simpa [updated, withOpenHandleCount] using parentKind,
+          by simpa [updated, withOpenHandleCount] using direct⟩
+      · exact ⟨parentId, parent,
+          by simpa [updateOpenHandleCount, replace, parentSelected] using parentLookup,
+          parentPathLookup, parentKind, direct⟩
+
+/-- Opening a live object preserves the complete namespace invariant. -/
+theorem openObject_preserves_completeWellFormed {state : NamespaceState}
+    {objectId : ObjectId} {object : NamespaceObject}
+    (complete : state.CompleteWellFormed)
+    (objectLookup : state.objects objectId = some object) :
+    (state.openObject objectId object).CompleteWellFormed := by
+  exact updateOpenHandleCount_preserves_completeWellFormed complete objectLookup
+
+/-- Closing a live object preserves the complete namespace invariant. -/
+theorem closeObject_preserves_completeWellFormed {state : NamespaceState}
+    {objectId : ObjectId} {object : NamespaceObject}
+    (complete : state.CompleteWellFormed)
+    (objectLookup : state.objects objectId = some object) :
+    (state.closeObject objectId object).CompleteWellFormed := by
+  exact updateOpenHandleCount_preserves_completeWellFormed complete objectLookup
 
 /-- Opening a handle preserves both reciprocal indexes and directory-tree shape. -/
 theorem openObject_preserves_treeWellFormed {state : NamespaceState}

@@ -20,15 +20,16 @@ use authority_core::{
     time::{MonotonicTime, TimeWindow},
 };
 use firecracker_runtime::{
-    ApiClient, ApiRequest, ApiResponse, CgroupConfig, CommandOutput, CommandRunner, CommandSpec,
-    DmVerityConfig, FileSystem, HostIsolationConfig, IdentityId, IdentitySource, NamespaceConfig,
-    PinnedArtifact, ProcessHandle, Runtime, RuntimeConfig, RuntimeError, SeccompConfig, Snapshot,
-    VsockConfig, WorkspaceConfig, sha256,
+    ApiClient, ApiRequest, ApiResponse, CgroupConfig, CgroupVersion, CommandOutput, CommandRunner,
+    CommandSpec, DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, IdentityId,
+    IdentitySource, JailerConfig, NamespaceConfig, PinnedArtifact, ProcessHandle, ProcessOwnership,
+    Runtime, RuntimeConfig, RuntimeError, SeccompConfig, Snapshot, VsockConfig, WorkspaceConfig,
+    sha256,
 };
 use session_orchestrator::{
     CleanupStage, CryptographicRandom, EntropyError, LifecycleState, SessionOrchestrator,
     SnapshotDescriptor, SnapshotId, StartStage, SubjectId as OrchestratedSubjectId, VmBackend,
-    WorkspaceTemplateId,
+    WorkspaceId, WorkspaceTemplateId,
     authority_backend::{AuthorityCoreBackend, AuthorityRootGrant},
     egress_backend::{BrokerBackend, VsockListenerFactory},
     firecracker_backend::FirecrackerBackendFactory,
@@ -37,8 +38,10 @@ use session_orchestrator::{
 
 #[derive(Clone, Default)]
 struct FsLog {
+    reads: Arc<Mutex<Vec<PathBuf>>>,
     clones: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
     removals: Arc<Mutex<Vec<PathBuf>>>,
+    device_bindings: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
 }
 
 struct TestFileSystem {
@@ -46,11 +49,64 @@ struct TestFileSystem {
 }
 
 impl FileSystem for TestFileSystem {
-    fn read(&mut self, _path: &Path) -> Result<Vec<u8>, RuntimeError> {
+    fn read(&mut self, path: &Path) -> Result<Vec<u8>, RuntimeError> {
+        let jail_root = session_jail_root();
+        let allowed = [
+            PathBuf::from("/test/firecracker"),
+            PathBuf::from("/test/rootfs"),
+            PathBuf::from("/test/verity"),
+            PathBuf::from("/test/jailer"),
+            jail_root.join("artifacts/kernel"),
+            jail_root.join("artifacts/seccomp"),
+            jail_root.join("snapshots/state"),
+            jail_root.join("snapshots/memory"),
+        ];
+        if !allowed.iter().any(|allowed_path| allowed_path == path) {
+            return Err(RuntimeError::Io(format!(
+                "test filesystem rejected unexpected read from '{}'",
+                path.display()
+            )));
+        }
+        self.log
+            .reads
+            .lock()
+            .expect("filesystem read log must not be poisoned")
+            .push(path.to_owned());
         Ok(Vec::new())
     }
 
+    fn verify_block_device_binding(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        let expected_source = PathBuf::from(format!(
+            "/dev/mapper/composition-verity-{}",
+            expected_workspace_id()
+        ));
+        let expected_device = session_jail_root().join("dev/rootfs");
+        if source != expected_source || jailed_device != expected_device {
+            return Err(RuntimeError::Io(
+                "test filesystem rejected inexact jailed block-device binding".to_owned(),
+            ));
+        }
+        self.log
+            .device_bindings
+            .lock()
+            .expect("device-binding log must not be poisoned")
+            .push((source.to_owned(), jailed_device.to_owned()));
+        Ok(())
+    }
+
     fn clone_workspace(&mut self, source: &Path, destination: &Path) -> Result<(), RuntimeError> {
+        let expected_destination = session_jail_root()
+            .join("workspace")
+            .join(expected_workspace_id().to_string());
+        if source != Path::new("/test/source") || destination != expected_destination {
+            return Err(RuntimeError::Io(
+                "test filesystem rejected inexact workspace clone".to_owned(),
+            ));
+        }
         self.log
             .clones
             .lock()
@@ -60,6 +116,14 @@ impl FileSystem for TestFileSystem {
     }
 
     fn remove_workspace(&mut self, path: &Path) -> Result<(), RuntimeError> {
+        let expected_path = session_jail_root()
+            .join("workspace")
+            .join(expected_workspace_id().to_string());
+        if path != expected_path {
+            return Err(RuntimeError::Io(
+                "test filesystem rejected inexact workspace removal".to_owned(),
+            ));
+        }
         self.log
             .removals
             .lock()
@@ -69,11 +133,18 @@ impl FileSystem for TestFileSystem {
     }
 }
 
+#[derive(Clone, Default)]
+struct RunnerLog {
+    stop_attempts: Arc<AtomicUsize>,
+    owned_starts: Arc<Mutex<Vec<ProcessOwnership>>>,
+    running_verifications: Arc<Mutex<Vec<ProcessHandle>>>,
+}
+
 #[derive(Default)]
 struct TestRunner {
     next_pid: u32,
     stop_failures: VecDeque<bool>,
-    stop_attempts: Arc<AtomicUsize>,
+    log: RunnerLog,
 }
 
 impl CommandRunner for TestRunner {
@@ -90,8 +161,77 @@ impl CommandRunner for TestRunner {
         Ok(ProcessHandle { pid: self.next_pid })
     }
 
+    fn start_owned(
+        &mut self,
+        command: &CommandSpec,
+        ownership: &ProcessOwnership,
+    ) -> Result<ProcessHandle, RuntimeError> {
+        let workspace = expected_workspace_id().to_string();
+        let expected_args = vec![
+            "--id".to_owned(),
+            workspace.clone(),
+            "--exec-file".to_owned(),
+            "/test/firecracker".to_owned(),
+            "--uid".to_owned(),
+            "1000".to_owned(),
+            "--gid".to_owned(),
+            "1000".to_owned(),
+            "--cgroup-version".to_owned(),
+            "2".to_owned(),
+            "--parent-cgroup".to_owned(),
+            "test".to_owned(),
+            "--cgroup".to_owned(),
+            "memory.max=1".to_owned(),
+            "--cgroup".to_owned(),
+            "cpu.max=1 1".to_owned(),
+            "--chroot-base-dir".to_owned(),
+            "/test/jailer".to_owned(),
+            "--new-pid-ns".to_owned(),
+            "--".to_owned(),
+            "--api-sock".to_owned(),
+            "/run/firecracker.sock".to_owned(),
+            "--seccomp-filter".to_owned(),
+            "/artifacts/seccomp".to_owned(),
+        ];
+        if command.program != Path::new("/test/jailer")
+            || command.args != expected_args
+            || ownership.cgroup_path.parent() != Some(Path::new("/sys/fs/cgroup/test"))
+            || ownership
+                .cgroup_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some(workspace.as_str())
+            || ownership.firecracker_executable != Path::new("/test/firecracker")
+            || ownership.firecracker_digest != sha256(&[])
+        {
+            return Err(RuntimeError::Command(
+                "test runner rejected inexact Firecracker ownership".to_owned(),
+            ));
+        }
+        self.log
+            .owned_starts
+            .lock()
+            .expect("owned-start log must not be poisoned")
+            .push(ownership.clone());
+        self.start(command)
+    }
+
+    fn verify_running(&mut self, process: ProcessHandle) -> Result<(), RuntimeError> {
+        if process.pid == 0 || process.pid > self.next_pid {
+            return Err(RuntimeError::Command(
+                "test runner cannot verify an unknown process".to_owned(),
+            ));
+        }
+        self.log
+            .running_verifications
+            .lock()
+            .expect("running-verification log must not be poisoned")
+            .push(process);
+        Ok(())
+    }
+
     fn stop(&mut self, _process: ProcessHandle) -> Result<(), RuntimeError> {
-        self.stop_attempts.fetch_add(1, Ordering::SeqCst);
+        self.log.stop_attempts.fetch_add(1, Ordering::SeqCst);
         if self.stop_failures.pop_front().unwrap_or(false) {
             return Err(RuntimeError::Command(
                 "test process stop failure".to_owned(),
@@ -105,6 +245,7 @@ impl CommandRunner for TestRunner {
 struct TestApi {
     requests: Arc<Mutex<Vec<ApiRequest>>>,
     failures: Arc<Mutex<VecDeque<bool>>>,
+    restore_verifications: Arc<Mutex<Vec<(PathBuf, PathBuf, u32)>>>,
 }
 
 impl ApiClient for TestApi {
@@ -126,6 +267,40 @@ impl ApiClient for TestApi {
             status: 200,
             body: String::new(),
         })
+    }
+
+    fn verify_restore_resources(
+        &mut self,
+        workspace_path: &Path,
+        vsock_uds_path: &Path,
+        guest_cid: u32,
+    ) -> Result<(), RuntimeError> {
+        let expected_workspace = PathBuf::from(format!("/workspace/{}", expected_workspace_id()));
+        if workspace_path != expected_workspace
+            || vsock_uds_path != Path::new("/run/vsock.sock")
+            || guest_cid != 3
+        {
+            return Err(RuntimeError::StaleSnapshot(
+                "test API rejected inexact restored resource binding".to_owned(),
+            ));
+        }
+        self.requests
+            .lock()
+            .expect("API log must not be poisoned")
+            .push(ApiRequest {
+                method: HttpMethod::Get,
+                path: "/vm/config".to_owned(),
+                body: String::new(),
+            });
+        self.restore_verifications
+            .lock()
+            .expect("restore-verification log must not be poisoned")
+            .push((
+                workspace_path.to_owned(),
+                vsock_uds_path.to_owned(),
+                guest_cid,
+            ));
+        Ok(())
     }
 }
 
@@ -215,15 +390,158 @@ fn assert_workspace_removals(fs_log: &FsLog, expected: &[PathBuf]) {
     );
 }
 
+fn assert_snapshot_reverified(fs_log: &FsLog) {
+    let jail_root = session_jail_root();
+    let state_path = jail_root.join("snapshots/state");
+    let memory_path = jail_root.join("snapshots/memory");
+    let reads = fs_log
+        .reads
+        .lock()
+        .expect("filesystem read log must not be poisoned");
+    assert_eq!(reads.iter().filter(|path| **path == state_path).count(), 3);
+    assert_eq!(reads.iter().filter(|path| **path == memory_path).count(), 3);
+}
+
+fn assert_successful_restore_observations(
+    fs_log: &FsLog,
+    runner_log: &RunnerLog,
+    api: &TestApi,
+    workspace_id: WorkspaceId,
+) {
+    assert_eq!(
+        fs_log
+            .clones
+            .lock()
+            .expect("filesystem log must not be poisoned")
+            .as_slice(),
+        [(
+            PathBuf::from("/test/source"),
+            session_jail_root()
+                .join("workspace")
+                .join(workspace_id.to_string()),
+        )]
+    );
+    assert_snapshot_reverified(fs_log);
+    assert_eq!(
+        runner_log
+            .owned_starts
+            .lock()
+            .expect("owned-start log must not be poisoned")
+            .len(),
+        1
+    );
+    assert_eq!(
+        runner_log
+            .running_verifications
+            .lock()
+            .expect("running-verification log must not be poisoned")
+            .as_slice(),
+        [
+            ProcessHandle { pid: 1 },
+            ProcessHandle { pid: 1 },
+            ProcessHandle { pid: 1 },
+        ]
+    );
+    assert_eq!(
+        api.restore_verifications
+            .lock()
+            .expect("restore-verification log must not be poisoned")
+            .as_slice(),
+        [(
+            PathBuf::from(format!("/workspace/{workspace_id}")),
+            PathBuf::from("/run/vsock.sock"),
+            3,
+        )]
+    );
+    assert_eq!(
+        fs_log
+            .device_bindings
+            .lock()
+            .expect("device-binding log must not be poisoned")
+            .as_slice(),
+        [(
+            PathBuf::from(format!("/dev/mapper/composition-verity-{workspace_id}")),
+            session_jail_root().join("dev/rootfs"),
+        )]
+    );
+    assert!(
+        api.requests
+            .lock()
+            .expect("API log must not be poisoned")
+            .iter()
+            .any(|request| request.path == "/actions/inject-identity")
+    );
+}
+
+fn assert_failed_restore_observations(
+    fs_log: &FsLog,
+    runner_log: &RunnerLog,
+    api: &TestApi,
+    binds: &AtomicUsize,
+    drops: &AtomicUsize,
+) {
+    assert_eq!(runner_log.stop_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        runner_log
+            .owned_starts
+            .lock()
+            .expect("owned-start log must not be poisoned")
+            .len(),
+        1
+    );
+    assert_eq!(
+        runner_log
+            .running_verifications
+            .lock()
+            .expect("running-verification log must not be poisoned")
+            .as_slice(),
+        [ProcessHandle { pid: 1 }]
+    );
+    assert_eq!(binds.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        api.requests
+            .lock()
+            .expect("API log must not be poisoned")
+            .iter()
+            .filter(|request| request.path == "/snapshot/load")
+            .count(),
+        1
+    );
+    assert!(
+        api.restore_verifications
+            .lock()
+            .expect("restore-verification log must not be poisoned")
+            .is_empty(),
+        "failed snapshot load must not claim restore-resource verification"
+    );
+    assert_snapshot_reverified(fs_log);
+    assert_eq!(
+        fs_log
+            .device_bindings
+            .lock()
+            .expect("device-binding log must not be poisoned")
+            .len(),
+        1
+    );
+    assert_workspace_removals(fs_log, &[]);
+}
+
 fn artifact(path: &str) -> PinnedArtifact {
     PinnedArtifact::new(path, sha256(&[]))
 }
 
 fn runtime_config() -> RuntimeConfig {
+    let jail_root = Path::new("/test/jailer/firecracker/unbound/root");
     let rootfs = artifact("/test/rootfs");
     RuntimeConfig {
         firecracker: artifact("/test/firecracker"),
-        kernel: artifact("/test/kernel"),
+        kernel: artifact(
+            jail_root
+                .join("artifacts/kernel")
+                .to_str()
+                .expect("test kernel path must be UTF-8"),
+        ),
         rootfs: rootfs.clone(),
         verity_hash: artifact("/test/verity"),
         dm_verity: DmVerityConfig {
@@ -231,30 +549,43 @@ fn runtime_config() -> RuntimeConfig {
             hash_device: PathBuf::from("/test/verity"),
             mapper_name: "composition-verity".to_owned(),
             root_hash: sha256(b"composition root hash"),
+            jailed_device_path: jail_root.join("dev/rootfs"),
         },
         workspace: WorkspaceConfig {
             source: PathBuf::from("/test/source"),
-            clone_root: PathBuf::from("/test/clones"),
+            clone_root: jail_root.join("workspace"),
             clone_id: "unbound".to_owned(),
         },
         jailer: artifact("/test/jailer"),
-        api_socket: PathBuf::from("/test/firecracker.sock"),
+        jailer_config: JailerConfig {
+            uid: 1000,
+            gid: 1000,
+            chroot_base_dir: PathBuf::from("/test/jailer"),
+            cgroup_version: CgroupVersion::V2,
+        },
+        api_socket: jail_root.join("run/firecracker.sock"),
         isolation: HostIsolationConfig {
             namespaces: NamespaceConfig {
-                user: true,
+                user: false,
                 pid: true,
                 mount: true,
-                network: true,
-                ipc: true,
-                uts: true,
+                network: false,
+                ipc: false,
+                uts: false,
             },
             cgroup: CgroupConfig {
-                path: PathBuf::from("/test/cgroup"),
+                path: PathBuf::from("/sys/fs/cgroup/test/unbound"),
                 memory_max_bytes: 1,
                 cpu_quota_micros: 1,
+                cpu_period_micros: 1,
             },
             seccomp: SeccompConfig {
-                filter: artifact("/test/seccomp"),
+                filter: artifact(
+                    jail_root
+                        .join("artifacts/seccomp")
+                        .to_str()
+                        .expect("test seccomp path must be UTF-8"),
+                ),
                 blocked_syscalls: [
                     "bpf",
                     "connect",
@@ -272,13 +603,36 @@ fn runtime_config() -> RuntimeConfig {
         },
         vsock: VsockConfig {
             guest_cid: 3,
-            uds_path: PathBuf::from("/test/vsock.sock"),
+            uds_path: jail_root.join("run/vsock.sock"),
         },
         network_devices: Vec::new(),
         vcpu_count: 1,
         memory_mib: 128,
         boot_args: "console=ttyS0".to_owned(),
     }
+}
+
+fn expected_workspace_id() -> WorkspaceId {
+    WorkspaceId::new([5; 16])
+}
+
+fn session_jail_root() -> PathBuf {
+    PathBuf::from(format!(
+        "/test/jailer/firecracker/{}/root",
+        expected_workspace_id()
+    ))
+}
+
+fn snapshot(config: &RuntimeConfig) -> Snapshot {
+    let jail_root = session_jail_root();
+    Snapshot::new(
+        jail_root.join("snapshots/state"),
+        jail_root.join("snapshots/memory"),
+        config.snapshot_fingerprint(),
+        sha256(&[]),
+        sha256(&[]),
+        Vec::new(),
+    )
 }
 
 fn authority_grant() -> AuthorityRootGrant {
@@ -315,25 +669,24 @@ fn production_adapters_preserve_exact_bindings_through_start_and_stop() {
         },
         template.clone(),
         "/test/source",
-        "/test/clones",
+        "/test/jailer/firecracker",
     );
     let config = runtime_config();
     let api = TestApi::default();
-    let api_log = Arc::clone(&api.requests);
+    let api_observer = api.clone();
+    let runner_log = RunnerLog::default();
     let runtime = Runtime::new(
-        TestRunner::default(),
+        TestRunner {
+            log: runner_log.clone(),
+            ..TestRunner::default()
+        },
         runtime_filesystem,
         api.clone(),
         api,
         UnusedIdentitySource,
     );
     let snapshot_id = SnapshotId::new([0x90; 16]);
-    let snapshot = Snapshot::new(
-        "/test/snapshot",
-        "/test/memory",
-        config.snapshot_fingerprint(),
-        Vec::new(),
-    );
+    let snapshot = snapshot(&config);
     let (mut vm, mut workload) =
         FirecrackerBackendFactory::new(runtime, config, snapshot, snapshot_id).into_handles();
 
@@ -364,23 +717,12 @@ fn production_adapters_preserve_exact_bindings_through_start_and_stop() {
     let identity = info.identity();
     assert_eq!(binds.load(Ordering::SeqCst), 1);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        fs_log
-            .clones
-            .lock()
-            .expect("filesystem log must not be poisoned")
-            .as_slice(),
-        [(
-            PathBuf::from("/test/source"),
-            PathBuf::from(format!("/test/clones/{}", identity.workspace_id())),
-        )]
-    );
-    assert!(
-        api_log
-            .lock()
-            .expect("API log must not be poisoned")
-            .iter()
-            .any(|request| request.path == "/actions/inject-identity")
+    assert_eq!(identity.workspace_id(), expected_workspace_id());
+    assert_successful_restore_observations(
+        &fs_log,
+        &runner_log,
+        &api_observer,
+        identity.workspace_id(),
     );
 
     orchestrator
@@ -394,10 +736,9 @@ fn production_adapters_preserve_exact_bindings_through_start_and_stop() {
             .lock()
             .expect("filesystem log must not be poisoned")
             .as_slice(),
-        [PathBuf::from(format!(
-            "/test/clones/{}",
-            identity.workspace_id()
-        ))]
+        [session_jail_root()
+            .join("workspace")
+            .join(identity.workspace_id().to_string())]
     );
     assert_subject_closed(&kernel, identity.subject_id());
 }
@@ -412,20 +753,20 @@ fn failed_firecracker_restore_cleanup_is_retried_by_orchestrator_stop() {
         },
         template.clone(),
         "/test/source",
-        "/test/clones",
+        "/test/jailer/firecracker",
     );
-    let stop_attempts = Arc::new(AtomicUsize::new(0));
     let api = TestApi {
         failures: Arc::new(Mutex::new(VecDeque::from([true]))),
         ..TestApi::default()
     };
-    let api_log = Arc::clone(&api.requests);
+    let api_observer = api.clone();
     let config = runtime_config();
+    let runner_log = RunnerLog::default();
     let runtime = Runtime::new(
         TestRunner {
-            next_pid: 0,
             stop_failures: VecDeque::from([true, true, false]),
-            stop_attempts: Arc::clone(&stop_attempts),
+            log: runner_log.clone(),
+            ..TestRunner::default()
         },
         runtime_filesystem,
         api.clone(),
@@ -433,12 +774,7 @@ fn failed_firecracker_restore_cleanup_is_retried_by_orchestrator_stop() {
         UnusedIdentitySource,
     );
     let snapshot_id = SnapshotId::new([0x91; 16]);
-    let snapshot = Snapshot::new(
-        "/test/snapshot",
-        "/test/memory",
-        config.snapshot_fingerprint(),
-        Vec::new(),
-    );
+    let snapshot = snapshot(&config);
     let (mut vm, mut workload) =
         FirecrackerBackendFactory::new(runtime, config, snapshot, snapshot_id).into_handles();
 
@@ -471,19 +807,7 @@ fn failed_firecracker_restore_cleanup_is_retried_by_orchestrator_stop() {
     assert_eq!(error.rollback_failures().len(), 1);
     assert_eq!(error.rollback_failures()[0].stage(), CleanupStage::VmKill);
     assert_eq!(orchestrator.state(), LifecycleState::Stopping);
-    assert_eq!(stop_attempts.load(Ordering::SeqCst), 2);
-    assert_eq!(binds.load(Ordering::SeqCst), 1);
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        api_log
-            .lock()
-            .expect("API log must not be poisoned")
-            .iter()
-            .filter(|request| request.path == "/snapshot/load")
-            .count(),
-        1
-    );
-    assert_workspace_removals(&fs_log, &[]);
+    assert_failed_restore_observations(&fs_log, &runner_log, &api_observer, &binds, &drops);
     let cloned_workspace = cloned_workspace(&fs_log);
 
     orchestrator
@@ -491,13 +815,13 @@ fn failed_firecracker_restore_cleanup_is_retried_by_orchestrator_stop() {
         .expect("stop must retry retained Firecracker startup cleanup");
 
     assert_eq!(orchestrator.state(), LifecycleState::Closed);
-    assert_eq!(stop_attempts.load(Ordering::SeqCst), 3);
+    assert_eq!(runner_log.stop_attempts.load(Ordering::SeqCst), 3);
     assert_workspace_removals(&fs_log, &[cloned_workspace]);
 
     vm.cleanup_failed_start()
         .expect("Runtime must have no pending cleanup after stop");
     assert_eq!(
-        stop_attempts.load(Ordering::SeqCst),
+        runner_log.stop_attempts.load(Ordering::SeqCst),
         3,
         "checking completed cleanup must not retry the process stop"
     );

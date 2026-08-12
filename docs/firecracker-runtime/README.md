@@ -10,6 +10,56 @@
 
 VM の中で workload を閉じ込める部分は [runtime-isolation](../runtime-isolation/README.md)、複数 backend をまたぐ session の lifecycle は [session-orchestrator](../session-orchestrator/README.md) の担当。この crate は「VM が 1 台立ち上がって、正しい identity を持っている」ところまでを見る。
 
+## crate の構造
+
+```mermaid
+flowchart TB
+    orch["session-orchestrator"]
+
+    subgraph fr["firecracker-runtime（host 側）"]
+        direction TB
+        cfg["RuntimeConfig::validate<br/>純粋。副作用の前"]
+        verify["verify_artifacts<br/>SHA-256 × 6"]
+        rt["Runtime<br/>8 状態の lifecycle<br/>launch / snapshot / restore / stop"]
+        ids["IdentityBundle<br/>restore 後に 5 値を再生成"]
+    end
+
+    cmd{{"CommandRunner"}}
+    fs{{"FileSystem"}}
+    api{{"ApiClient"}}
+    ent{{"IdentitySource"}}
+
+    jailer["jailer + firecracker<br/>veritysetup"]
+    sock[("Firecracker API socket")]
+    ws[("workspace clone<br/>dm-verity rootfs")]
+    guest["guest VM"]
+
+    orch ==>|"start_vm / kill_vm"| rt
+    cfg --> verify
+    verify --> rt
+    rt --> ids
+    rt --> cmd
+    rt --> fs
+    rt --> api
+    ids --> ent
+    cmd ==> jailer
+    fs ==> ws
+    api ==> sock
+    jailer ==>|"boot"| guest
+    sock -.->|"設定と snapshot"| guest
+
+    classDef host fill:#1565c0,color:#fff,stroke:#0d47a1;
+    classDef seam fill:#6a1b9a,color:#fff,stroke:#4a148c;
+    classDef data fill:#ef6c00,color:#fff,stroke:#e65100;
+    classDef external fill:#616161,color:#fff,stroke:#424242;
+    class fr,cfg,verify,rt,ids host;
+    class cmd,fs,api,ent seam;
+    class orch,jailer,guest external;
+    class ws,sock data;
+```
+
+紫の 4 つが唯一の副作用境界。test はここに fake を挿すので、実 Firecracker も実 jailer も実 dm-verity も一度も動いていない。
+
 ## この crate が絶対にやらないこと
 
 - guest に network device を与えない。`RuntimeConfig::validate` は `network_devices` が空でなければ `NetworkDeviceForbidden` を返す。外部通信は vsock 越しの [Host Egress Broker](../egress-broker/README.md) 経由だけ。

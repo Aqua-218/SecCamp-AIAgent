@@ -1586,6 +1586,10 @@ name = "supervisor"
 version = "0.1.0"
 dependencies = [
  "authority-core",
+ "capfs",
+ "fuser",
+ "rustix",
+ "tempfile",
 ]
 
 [[package]]

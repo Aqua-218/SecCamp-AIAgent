@@ -1,0 +1,62 @@
+rust_tests:
+  extends: .rust_job
+  stage: test
+  timeout: 25m
+  parallel:
+    matrix:
+      - SHARD: ["1", "2", "3", "4"]
+  script:
+    - scripts/ci/install-cargo-tools.sh nextest
+    - scripts/ci/run.sh test "$SHARD"
+  artifacts:
+    when: always
+    expire_in: 14 days
+    access: developer
+    paths:
+      - target/nextest/ci/junit.xml
+    reports:
+      junit: target/nextest/ci/junit.xml
+
+rust_doctests:
+  extends: .rust_job
+  stage: test
+  timeout: 15m
+  script:
+    - scripts/ci/run.sh doctest
+
+loom:
+  extends: .rust_job
+  stage: test
+  timeout: 30m
+  script:
+    - scripts/ci/run.sh loom
+
+lean:
+  extends:
+    - .rust_job
+    - .lean_cache
+  stage: test
+  timeout: 30m
+  script:
+    - scripts/ci/install-lean.sh
+    - scripts/ci/run.sh lean
+    - scripts/ci/run.sh differential
+
+coverage:
+  extends: .rust_job
+  stage: analyze
+  timeout: 35m
+  script:
+    - scripts/ci/install-cargo-tools.sh coverage
+    - scripts/ci/run.sh coverage
+  coverage: '/TOTAL.*\s+([0-9]+\.[0-9]+%)/'
+  artifacts:
+    when: always
+    expire_in: 14 days
+    access: developer
+    paths:
+      - coverage/
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura.xml

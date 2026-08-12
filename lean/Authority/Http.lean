@@ -8,18 +8,6 @@ sound with respect to their request-set semantics.
 
 namespace Authority
 
-/--
-An HTTP host that the boundary has already canonicalized.
-
-Host parsing, case folding, IDNA processing, and default-port handling belong
-to the HTTP boundary. This type makes the resulting exact host identity
-explicit in authority checks.
--/
-structure CanonicalHost where
-  /-- The boundary-produced canonical host identity. -/
-  value : String
-  deriving Repr, BEq, DecidableEq
-
 private def isAsciiAlphaNumeric (character : Char) : Bool :=
   let code := character.toNat
   (48 ≤ code && code ≤ 57) ||
@@ -62,16 +50,40 @@ private def isValidCanonicalHost (host : String) : Bool :=
     labels.all isAsciiDnsLabel &&
     !isIpv4Literal labels
 
+/-- Returns whether a host value is both canonical and valid for authority comparison. -/
+def isCanonicalHostValue (host : String) : Bool :=
+  canonicalHostValue host == host && isValidCanonicalHost host
+
+/--
+An HTTP host that the boundary has already canonicalized.
+
+Host parsing, case folding, IDNA processing, and default-port handling belong
+to the HTTP boundary. The proof field prevents callers from constructing a
+value that bypasses the same canonicality check used by `ofString`.
+-/
+structure CanonicalHost where
+  /-- The boundary-produced canonical host identity. -/
+  value : String
+  /-- Evidence that `value` has the sole valid canonical host spelling. -/
+  isCanonical : isCanonicalHostValue value = true
+  deriving Repr, BEq, DecidableEq
+
 namespace CanonicalHost
 
 /-- Canonicalizes and validates an ASCII DNS host for authority comparison. -/
 def ofString (value : String) : Option CanonicalHost :=
   let canonical := canonicalHostValue value
-  if value.toList.all (fun character => character.toNat < 128) &&
-      isValidCanonicalHost canonical then
-    some { value := canonical }
+  if value.toList.all (fun character => character.toNat < 128) then
+    if isCanonical : isCanonicalHostValue canonical = true then
+      some { value := canonical, isCanonical }
+    else
+      none
   else
     none
+
+/-- Canonical host construction is inhabited by a concrete valid DNS name. -/
+theorem nonempty : Nonempty CanonicalHost := by
+  exact ⟨{ value := "example.com", isCanonical := by native_decide }⟩
 
 end CanonicalHost
 

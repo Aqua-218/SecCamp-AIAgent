@@ -10,8 +10,8 @@ use firecracker_runtime::{
     DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, IdentityBundle, IdentityId,
     IdentitySource, MAX_COMMAND_OUTPUT_BYTES, MAX_HTTP_BODY_BYTES, MAX_WORKSPACE_BYTES,
     MAX_WORKSPACE_DEPTH, NamespaceConfig, PinnedArtifact, ProcessHandle, RealCommandRunner,
-    RealFileSystem, Runtime, RuntimeConfig, RuntimeError, RuntimeState, SeccompConfig,
-    Sha256Digest, Snapshot, VsockConfig, WorkspaceConfig, sha256,
+    RealFileSystem, Runtime, RuntimeConfig, RuntimeError, RuntimeState, SeccompConfig, Snapshot,
+    VsockConfig, WorkspaceConfig, sha256,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -537,7 +537,7 @@ fn restore_accepts_exact_host_allocated_identities() {
     let snapshot = Snapshot::new(
         "/snapshots/state",
         "/snapshots/memory",
-        config_fingerprint(&config),
+        config.snapshot_fingerprint(),
         Vec::new(),
     );
     let bundle = IdentityBundle::new(
@@ -568,7 +568,7 @@ fn restore_rejects_host_identity_reuse_before_side_effects() {
     let snapshot = Snapshot::new(
         "/snapshots/state",
         "/snapshots/memory",
-        config_fingerprint(&config),
+        config.snapshot_fingerprint(),
         vec![reused],
     );
     let bundle = IdentityBundle {
@@ -595,7 +595,7 @@ fn stale_identity_is_rejected_and_restored_process_is_rolled_back() {
     let snapshot = Snapshot::new(
         "/snapshots/state",
         "/snapshots/memory",
-        config_fingerprint(&config),
+        config.snapshot_fingerprint(),
         vec![stale],
     );
     let (mut runtime, events) = runtime(&config, std::iter::empty());
@@ -644,7 +644,7 @@ fn duplicate_identity_generation_is_rejected_as_stale() {
     let snapshot = Snapshot::new(
         "/snapshots/state",
         "/snapshots/memory",
-        config_fingerprint(&config),
+        config.snapshot_fingerprint(),
         Vec::new(),
     );
     let error = runtime
@@ -1009,21 +1009,4 @@ fn real_command_runner_rejects_unowned_pid_without_signalling_it() {
         })
         .expect_err("unowned PID must be rejected");
     assert!(matches!(error, RuntimeError::Command(message) if message.contains("unknown process")));
-}
-
-fn config_fingerprint(config: &RuntimeConfig) -> Sha256Digest {
-    let mut bytes = Vec::new();
-    for artifact in [
-        &config.firecracker,
-        &config.kernel,
-        &config.rootfs,
-        &config.verity_hash,
-        &config.jailer,
-        &config.isolation.seccomp.filter,
-    ] {
-        bytes.extend_from_slice(&artifact.digest.as_bytes());
-    }
-    bytes.extend_from_slice(&config.dm_verity.root_hash.as_bytes());
-    bytes.extend_from_slice(&config.vsock.guest_cid.to_be_bytes());
-    sha256(&bytes)
 }

@@ -153,6 +153,23 @@ replay、receipt grammar の拒否を確認する。
 
 これらは有限の Rust test と bounded concurrency model であり、audit storage 全体の数学的証明ではない。
 
+## 正確な保証範囲
+
+この module が扱うのは、認可試行と commit 済み effect を別々の record として残すこと、および記録に失敗したときに拒否側へ倒すことだけ。
+
+- record の内容が真実であることは保証しない。呼び出し側が渡した値をそのまま残す。
+- 記録が host の外へ届くことは扱わない。durable WAL は local file までで、転送と保管は運用側の責務。
+- record から攻撃を検出する仕組みは無い。ここにあるのは材料だけ。
+- in-memory journal は process の生存期間しか残らない。restart をまたぐのは durable WAL のほう。
+- `auth_epoch` は record の順序付けに使えるが、実時刻ではない。時刻との対応はここでは持たない。
+
+## 変更時の確認点
+
+- attempt と effect の record を 1 種類に統合しない。拒否された試行と成立した副作用を同じ表に混ぜると、後から区別できない。
+- 記録失敗時の挙動を「記録を諦めて続行」に変えない。fail closed はこの module の中心。
+- record に field を足すときは、in-memory journal と durable WAL の両方の形式を同時に直す。片方だけだと restart の前後で record の形が変わる。
+- commit receipt を返す時点を effect の前に動かさない。commit していない effect の receipt ができる。
+
 ## 関連
 
 - [Effect commit と revoke の authorization guard](authorization-guard.md)

@@ -74,25 +74,94 @@ Components make prefix delegation segment-aware, so a prefix such as
 structure BranchName where
   /-- Validated slash-separated branch-name components in order. -/
   segments : List String
-  /-- Evidence that every component satisfies `isValidBranchSegment`. -/
-  isValid : segments.all isValidBranchSegment = true
+  /-- Evidence that the complete branch shorthand satisfies every validation rule. -/
+  isValid : isValidBranchName segments = true
 
 namespace BranchName
+
+private def childSuffix : BranchName :=
+  { segments := ["child"]
+    isValid := by native_decide }
+
+private theorem childSuffixIsValid :
+    childSuffix.segments.all isValidBranchSegment = true := by
+  native_decide
 
 /-- Creates a branch name when every supplied component is valid. -/
 def ofSegments (segments : List String) : Option BranchName :=
   if isValid : isValidBranchName segments = true then
-    have segmentsAreValid : segments.all isValidBranchSegment = true := by
-      simp only [isValidBranchName, Bool.and_eq_true] at isValid
-      exact isValid.1
-    some ⟨segments, segmentsAreValid⟩
+    some ⟨segments, isValid⟩
   else
     none
 
-/-- Concatenates branch-name components while preserving their validation. -/
-def append (branch suffix : BranchName) : BranchName :=
-  { segments := branch.segments ++ suffix.segments
-    isValid := by simp [List.all_append, branch.isValid, suffix.isValid] }
+/-- Concatenates branch-name components and revalidates the complete shorthand. -/
+def append (branch suffix : BranchName) : Option BranchName :=
+  ofSegments (branch.segments ++ suffix.segments)
+
+private def refsBranch : BranchName :=
+  { segments := ["refs"]
+    isValid := by native_decide }
+
+private def headsBranch : BranchName :=
+  { segments := ["heads"]
+    isValid := by native_decide }
+
+/-- The append rejection example uses two independently constructible branch names. -/
+theorem refsHeadsComponents_nonempty :
+    (ofSegments ["refs"]).isSome = true ∧
+      (ofSegments ["heads"]).isSome = true := by
+  native_decide
+
+/-- The full branch validator rejects the reserved `refs/heads` spelling. -/
+theorem refsHeads_rejected : (ofSegments ["refs", "heads"]).isNone = true := by
+  native_decide
+
+/-- Revalidation rejects composing valid `refs` and `heads` values into `refs/heads`. -/
+theorem append_refs_heads_rejected : (append refsBranch headsBranch).isNone = true := by
+  native_decide
+
+/-- A valid shorthand below `refs` can only be the one-level branch `refs` itself. -/
+theorem eq_refs_of_refs_prefix (branch : BranchName)
+    (hasRefsPrefix : ["refs"] <+: branch.segments) : branch.segments = ["refs"] := by
+  rcases hasRefsPrefix with ⟨suffix, segmentsEq⟩
+  have branchIsValid := branch.isValid
+  rw [← segmentsEq] at branchIsValid ⊢
+  cases suffix with
+  | nil => rfl
+  | cons first remaining =>
+      simp [isValidBranchName, isRefsNamespace] at branchIsValid
+
+/-- Appending the fixed child segment preserves validity except under reserved `refs`. -/
+theorem childAppendValid (branch : BranchName)
+    (isNotRefs : branch.segments ≠ ["refs"]) :
+    isValidBranchName (branch.segments ++ childSuffix.segments) = true := by
+  have branchIsValid := branch.isValid
+  simp only [isValidBranchName, Bool.and_eq_true] at branchIsValid ⊢
+  refine ⟨?_, ?_⟩
+  · simpa [List.all_append] using
+      And.intro branchIsValid.1 childSuffixIsValid
+  · cases segmentsEq : branch.segments with
+    | nil => simp [segmentsEq] at branchIsValid
+    | cons first remaining =>
+      simp only [segmentsEq, List.cons_append, firstSegmentStartsWithDash]
+      simp only [segmentsEq, firstSegmentStartsWithDash] at branchIsValid
+      refine ⟨⟨⟨by simp, branchIsValid.2.1.1.2⟩, ?_⟩, by simp [childSuffix]⟩
+      by_cases firstIsRefs : first = "refs"
+      · subst first
+        cases remaining with
+        | nil => exact False.elim (isNotRefs (by simp [segmentsEq]))
+        | cons second rest =>
+            simp [isRefsNamespace] at branchIsValid
+      · simp [isRefsNamespace, firstIsRefs]
+
+/-- Any valid shorthand other than `refs` remains valid after a `/child` suffix. -/
+theorem append_child_is_some (branch : BranchName)
+    (isNotRefs : branch.segments ≠ ["refs"]) :
+    append branch childSuffix =
+      some
+        { segments := branch.segments ++ childSuffix.segments
+          isValid := childAppendValid branch isNotRefs } := by
+  simp [append, ofSegments, childAppendValid branch isNotRefs]
 
 end BranchName
 
@@ -130,7 +199,8 @@ def branchPatternBelow (child parent : BranchPattern) : Bool :=
   | .exact child, .exact parent => child.segments == parent.segments
   | .exact child, .prefix parent => parent.segments.isPrefixOf child.segments
   | .prefix child, .prefix parent => parent.segments.isPrefixOf child.segments
-  | .prefix _, .exact _ => false
+  | .prefix child, .exact parent =>
+      child.segments == ["refs"] && parent.segments == ["refs"]
 
 /-- Branch-pattern containment is reflexive. -/
 theorem branchPatternBelow_refl (pattern : BranchPattern) :
@@ -142,13 +212,49 @@ theorem branchPatternBelow_trans {first second third : BranchPattern}
     (firstBelowSecond : branchPatternBelow first second = true)
     (secondBelowThird : branchPatternBelow second third = true) :
     branchPatternBelow first third = true := by
-  cases first <;> cases second <;> cases third <;>
-    simp [branchPatternBelow] at firstBelowSecond secondBelowThird ⊢
-  · exact firstBelowSecond.trans secondBelowThird
-  · rw [firstBelowSecond]
-    exact secondBelowThird
-  · exact secondBelowThird.trans firstBelowSecond
-  · exact secondBelowThird.trans firstBelowSecond
+  cases first with
+  | exact firstBranch =>
+      cases second with
+      | exact secondBranch =>
+          cases third with
+          | exact thirdBranch =>
+              simp [branchPatternBelow] at firstBelowSecond secondBelowThird ⊢
+              exact firstBelowSecond.trans secondBelowThird
+          | «prefix» thirdBranch =>
+              simp [branchPatternBelow] at firstBelowSecond secondBelowThird ⊢
+              rw [firstBelowSecond]
+              exact secondBelowThird
+      | «prefix» secondBranch =>
+          cases third with
+          | exact thirdBranch =>
+              simp [branchPatternBelow] at firstBelowSecond secondBelowThird ⊢
+              have firstIsRefs := BranchName.eq_refs_of_refs_prefix firstBranch
+                (secondBelowThird.1 ▸ firstBelowSecond)
+              exact firstIsRefs.trans secondBelowThird.2.symm
+          | «prefix» thirdBranch =>
+              simp [branchPatternBelow] at firstBelowSecond secondBelowThird ⊢
+              exact secondBelowThird.trans firstBelowSecond
+  | «prefix» firstBranch =>
+      cases second with
+      | exact secondBranch =>
+          cases third with
+          | exact thirdBranch =>
+              simp [branchPatternBelow] at firstBelowSecond secondBelowThird ⊢
+              exact ⟨firstBelowSecond.1, secondBelowThird ▸ firstBelowSecond.2⟩
+          | «prefix» thirdBranch =>
+              simp [branchPatternBelow] at firstBelowSecond secondBelowThird ⊢
+              rw [firstBelowSecond.1]
+              exact firstBelowSecond.2 ▸ secondBelowThird
+      | «prefix» secondBranch =>
+          cases third with
+          | exact thirdBranch =>
+              simp [branchPatternBelow] at firstBelowSecond secondBelowThird ⊢
+              have firstIsRefs := BranchName.eq_refs_of_refs_prefix firstBranch
+                (secondBelowThird.1 ▸ firstBelowSecond)
+              exact ⟨firstIsRefs, secondBelowThird.2⟩
+          | «prefix» thirdBranch =>
+              simp [branchPatternBelow] at firstBelowSecond secondBelowThird ⊢
+              exact secondBelowThird.trans firstBelowSecond
 
 /-- A successful branch-pattern decision implies semantic set inclusion. -/
 theorem branchPatternBelow_sound {child parent : BranchPattern}
@@ -161,12 +267,9 @@ theorem branchPatternBelow_sound {child parent : BranchPattern}
   · exact isBelow.symm.trans childMatches
   · rw [← childMatches]
     exact isBelow
+  · rw [isBelow.2]
+    exact (BranchName.eq_refs_of_refs_prefix branch (isBelow.1 ▸ childMatches)).symm
   · exact isBelow.trans childMatches
-
-private def strictBranchSuffix : BranchName :=
-  { segments := ["child"]
-    isValid := by
-      native_decide }
 
 /-- Semantic branch-set inclusion implies a successful containment decision. -/
 theorem branchPatternBelow_complete {child parent : BranchPattern}
@@ -178,11 +281,30 @@ theorem branchPatternBelow_complete {child parent : BranchPattern}
   · exact isSubset _ rfl
   · rename_i childBranch parentBranch
     have parentMatchesChild := isSubset childBranch List.prefix_rfl
-    have parentMatchesDescendant :=
-      isSubset
-        (BranchName.append childBranch strictBranchSuffix)
-        (by simp [BranchName.append])
-    simp [BranchName.append, strictBranchSuffix, parentMatchesChild] at parentMatchesDescendant
+    cases childIsRefs : childBranch.segments == ["refs"] with
+    | false =>
+        have childIsNotRefs : childBranch.segments ≠ ["refs"] := by
+          simpa using childIsRefs
+        let descendant : BranchName :=
+          { segments := childBranch.segments ++ BranchName.childSuffix.segments
+            isValid := BranchName.childAppendValid childBranch childIsNotRefs }
+        have parentMatchesDescendant : parentBranch.segments = descendant.segments :=
+          isSubset descendant ⟨BranchName.childSuffix.segments, rfl⟩
+        have : False := by
+          have suffixMustBeEmpty : BranchName.childSuffix.segments = [] := by
+            apply List.append_cancel_left
+            calc
+              childBranch.segments ++ BranchName.childSuffix.segments
+                  = descendant.segments := rfl
+              _ = parentBranch.segments := parentMatchesDescendant.symm
+              _ = childBranch.segments := parentMatchesChild
+              _ = childBranch.segments ++ [] := by simp
+          simp [BranchName.childSuffix] at suffixMustBeEmpty
+        exact False.elim this
+    | true =>
+        have childIsRefs : childBranch.segments = ["refs"] := by
+          simpa using childIsRefs
+        exact ⟨childIsRefs, parentMatchesChild.trans childIsRefs⟩
   · exact isSubset _ List.prefix_rfl
 
 /-- The executable decision exactly characterizes semantic branch-set inclusion. -/

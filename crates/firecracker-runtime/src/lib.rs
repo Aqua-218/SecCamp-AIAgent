@@ -4239,8 +4239,8 @@ where
                 "open".to_owned(),
                 "--readonly".to_owned(),
                 config.dm_verity.data_device.display().to_string(),
-                config.dm_verity.hash_device.display().to_string(),
                 config.dm_verity.mapper_name.clone(),
+                config.dm_verity.hash_device.display().to_string(),
                 config.dm_verity.root_hash.to_hex(),
             ],
         );
@@ -5199,6 +5199,27 @@ mod tests {
             memory_mib: 256,
             boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_owned(),
         }
+    }
+
+    #[test]
+    fn verity_open_uses_the_action_specific_argument_order() {
+        let config = test_config();
+        let mut runtime = cleanup_runtime([], []);
+
+        runtime
+            .open_verity(&config)
+            .expect("the mock command runner must accept dm-verity setup");
+
+        assert_eq!(
+            runtime.command_runner.events,
+            [format!(
+                "run:veritysetup open --readonly {} {} {} {}",
+                config.dm_verity.data_device.display(),
+                config.dm_verity.mapper_name,
+                config.dm_verity.hash_device.display(),
+                config.dm_verity.root_hash.to_hex()
+            )]
+        );
     }
 
     #[derive(Default)]

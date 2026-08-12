@@ -1,7 +1,7 @@
 //! Fail-closed host composition for one production session owner.
 //!
 //! This module composes the production-owned lifecycle pieces that already
-//! exist in this crate. It deliberately does not pretend that guest control,
+//! exist in this crate. It deliberately does not pretend that the guest-side supervisor,
 //! session-jail provisioning, snapshot provenance, or host egress secrets can
 //! be inferred safely before [`SessionIdentity`] allocation. Callers must
 //! provide proof-carrying factories for those per-session boundaries.
@@ -31,9 +31,12 @@ use egress_protocol::{
     budget::SessionBudgetLimits, session::BrokerSessionId as WireBrokerSessionId,
 };
 use firecracker_runtime::{
-    ApiClient, ApiRequest, ApiResponse, RealCommandRunner, RealFileSystem, Runtime, RuntimeConfig,
-    RuntimeError, Snapshot, SystemIdentitySource,
+    FirecrackerVsockApiClient, RealCommandRunner, RealFileSystem, Runtime, RuntimeConfig,
+    RuntimeError, Snapshot, SystemIdentitySource, UnixApiClient,
 };
+
+#[cfg(test)]
+use firecracker_runtime::{ApiClient, ApiRequest};
 
 use crate::{
     BackendError, BrokerLease, CapabilityLease, DurableIdentityLedger, LedgerError, LifecycleState,
@@ -106,6 +109,20 @@ pub struct ProductionBrokerEndpoint {
     expected_guest_cid: u32,
     port: u32,
     backlog: i32,
+}
+
+/// Fixed guest-supervisor endpoint on the session's verified Firecracker vsock device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProductionGuestControlEndpoint {
+    port: u32,
+}
+
+impl ProductionGuestControlEndpoint {
+    /// Creates a mandatory fixed port. Validation happens before owner construction.
+    #[must_use]
+    pub const fn new(port: u32) -> Self {
+        Self { port }
+    }
 }
 
 impl ProductionBrokerEndpoint {
@@ -199,6 +216,7 @@ pub struct ProductionSessionConfig {
     firecracker: RuntimeConfig,
     workspace_template: WorkspaceTemplateId,
     broker_endpoint: ProductionBrokerEndpoint,
+    guest_control_endpoint: ProductionGuestControlEndpoint,
     broker_limits: ProductionBrokerLimits,
 }
 
@@ -211,6 +229,7 @@ impl ProductionSessionConfig {
         firecracker: RuntimeConfig,
         workspace_template: WorkspaceTemplateId,
         broker_endpoint: ProductionBrokerEndpoint,
+        guest_control_endpoint: ProductionGuestControlEndpoint,
         broker_limits: ProductionBrokerLimits,
     ) -> Self {
         Self {
@@ -219,6 +238,7 @@ impl ProductionSessionConfig {
             firecracker,
             workspace_template,
             broker_endpoint,
+            guest_control_endpoint,
             broker_limits,
         }
     }
@@ -231,6 +251,7 @@ pub struct SessionFirecrackerRequest {
     snapshot_id: SnapshotId,
     snapshot_path: PathBuf,
     memory_path: PathBuf,
+    guest_control_port: u32,
 }
 
 impl SessionFirecrackerRequest {
@@ -263,38 +284,24 @@ impl SessionFirecrackerRequest {
     pub fn memory_path(&self) -> &Path {
         &self.memory_path
     }
-}
 
-struct BoxedApiClient(Box<dyn ApiClient + Send>);
-
-impl ApiClient for BoxedApiClient {
-    fn request(&mut self, request: &ApiRequest) -> Result<ApiResponse, RuntimeError> {
-        self.0.request(request)
-    }
-
-    fn verify_restore_resources(
-        &mut self,
-        workspace_path: &Path,
-        vsock_uds_path: &Path,
-        guest_cid: u32,
-    ) -> Result<(), RuntimeError> {
-        self.0
-            .verify_restore_resources(workspace_path, vsock_uds_path, guest_cid)
+    /// Returns the fixed guest-supervisor vsock port the snapshot must serve.
+    #[must_use]
+    pub const fn guest_control_port(&self) -> u32 {
+        self.guest_control_port
     }
 }
 
 /// Verified output of one identity-bound Firecracker preparation.
 ///
 /// Construction rechecks the exact config, snapshot identity, paths, and compatibility
-/// fingerprint supplied by the runtime. The guest client remains a mandatory external seam;
-/// this crate provides no dummy guest control implementation.
+/// fingerprint supplied by the runtime. The runtime owns Firecracker API and guest-control
+/// transport construction from the exact session-bound socket configuration.
 pub struct PreparedFirecrackerSession {
     identity: SessionIdentity,
     runtime_config: RuntimeConfig,
     snapshot: Snapshot,
     snapshot_id: SnapshotId,
-    firecracker_api: BoxedApiClient,
-    guest_control_api: BoxedApiClient,
 }
 
 impl PreparedFirecrackerSession {
@@ -305,18 +312,12 @@ impl PreparedFirecrackerSession {
     /// Returns [`SessionPreparationError`] unless every restore-relevant value is bound to
     /// `request`. The Firecracker runtime repeats file digest and exported-resource checks at
     /// restore time.
-    pub fn verify<A, G>(
+    pub fn verify(
         request: &SessionFirecrackerRequest,
         runtime_config: RuntimeConfig,
         snapshot: Snapshot,
         snapshot_id: SnapshotId,
-        firecracker_api: A,
-        guest_control_api: G,
-    ) -> Result<Self, SessionPreparationError>
-    where
-        A: ApiClient + Send + 'static,
-        G: ApiClient + Send + 'static,
-    {
+    ) -> Result<Self, SessionPreparationError> {
         runtime_config
             .validate()
             .map_err(SessionPreparationError::RuntimeConfig)?;
@@ -344,26 +345,25 @@ impl PreparedFirecrackerSession {
             runtime_config,
             snapshot,
             snapshot_id,
-            firecracker_api: BoxedApiClient(Box::new(firecracker_api)),
-            guest_control_api: BoxedApiClient(Box::new(guest_control_api)),
         })
     }
 }
 
-/// Mandatory session-aware provisioning boundary for Firecracker and guest control.
+/// Mandatory session-aware provisioning boundary for Firecracker artifacts and its session jail.
 pub trait PerSessionFirecrackerFactory: Send + 'static {
     /// Returns the provisioned snapshot identity whose image contains no live session identity.
     fn snapshot_id(&self) -> SnapshotId;
 
-    /// Prepares the exact session jail and returns verified API clients and snapshot provenance.
+    /// Prepares the exact session jail and snapshot provenance.
     ///
     /// An error must leave no unowned process or mount behind. A successful result transfers all
     /// later VM cleanup responsibility into the returned Firecracker runtime backends.
     ///
     /// # Errors
     ///
-    /// Returns [`BackendError`] if the exact session jail, snapshot, Firecracker API, or guest
-    /// control channel cannot be prepared and sealed into [`PreparedFirecrackerSession`].
+    /// Returns [`BackendError`] if the exact session jail and snapshot cannot be prepared and
+    /// sealed into [`PreparedFirecrackerSession`]. Neither API transport is supplied by this
+    /// factory; the runtime constructs both from the verified config.
     fn prepare(
         &mut self,
         request: &SessionFirecrackerRequest,
@@ -671,8 +671,9 @@ impl ProductionSessionRuntimeBuilder {
     /// actual [`SessionOwner`] with production workspace, Broker, Firecracker, and authority
     /// backends.
     ///
-    /// This does not start a VM or claim the guest control seam is implemented. Per-session
-    /// provisioning happens only after the orchestrator durably allocates [`SessionIdentity`].
+    /// This does not start a VM. Per-session provisioning and construction of the exact
+    /// Firecracker API and guest-control vsock clients happen only after the orchestrator durably
+    /// allocates [`SessionIdentity`].
     ///
     /// # Errors
     ///
@@ -726,6 +727,7 @@ impl ProductionSessionRuntimeBuilder {
             runtime_filesystem,
             self.config.firecracker,
             snapshot_id,
+            self.config.guest_control_endpoint,
         );
         let (vm, workload) = deferred.into_handles();
 
@@ -868,22 +870,22 @@ impl OwnedSession for ConcreteOwnedSession {
 type OwnedRuntime = Runtime<
     RealCommandRunner,
     FirecrackerFileSystem<RealFileSystem>,
-    BoxedApiClient,
-    BoxedApiClient,
+    UnixApiClient,
+    FirecrackerVsockApiClient,
     SystemIdentitySource,
 >;
 type OwnedFirecrackerVm = FirecrackerVmBackend<
     RealCommandRunner,
     FirecrackerFileSystem<RealFileSystem>,
-    BoxedApiClient,
-    BoxedApiClient,
+    UnixApiClient,
+    FirecrackerVsockApiClient,
     SystemIdentitySource,
 >;
 type OwnedFirecrackerWorkload = FirecrackerWorkloadBackend<
     RealCommandRunner,
     FirecrackerFileSystem<RealFileSystem>,
-    BoxedApiClient,
-    BoxedApiClient,
+    UnixApiClient,
+    FirecrackerVsockApiClient,
     SystemIdentitySource,
 >;
 
@@ -892,6 +894,7 @@ struct DeferredFirecrackerState {
     filesystem: Option<FirecrackerFileSystem<RealFileSystem>>,
     base_config: RuntimeConfig,
     snapshot_id: SnapshotId,
+    guest_control_endpoint: ProductionGuestControlEndpoint,
     prepared_identity: Option<SessionIdentity>,
     vm: Option<OwnedFirecrackerVm>,
     workload: Option<OwnedFirecrackerWorkload>,
@@ -907,6 +910,7 @@ impl DeferredFirecrackerFactory {
         filesystem: FirecrackerFileSystem<RealFileSystem>,
         base_config: RuntimeConfig,
         snapshot_id: SnapshotId,
+        guest_control_endpoint: ProductionGuestControlEndpoint,
     ) -> Self {
         Self {
             shared: Arc::new(Mutex::new(DeferredFirecrackerState {
@@ -914,6 +918,7 @@ impl DeferredFirecrackerFactory {
                 filesystem: Some(filesystem),
                 base_config,
                 snapshot_id,
+                guest_control_endpoint,
                 prepared_identity: None,
                 vm: None,
                 workload: None,
@@ -1029,6 +1034,7 @@ fn prepare_firecracker(
         snapshot_id: state.snapshot_id,
         snapshot_path: jail_root.join("snapshots/state"),
         memory_path: jail_root.join("snapshots/memory"),
+        guest_control_port: state.guest_control_endpoint.port,
     };
     let prepared = state.factory.prepare(&request)?;
     if prepared.identity != identity
@@ -1041,14 +1047,16 @@ fn prepare_firecracker(
     }
     let backend_template =
         verified_backend_template(&state.base_config, identity, &prepared.runtime_config)?;
+    let firecracker_api = firecracker_api_for(&prepared.runtime_config)?;
+    let guest_control = guest_control_for(&prepared.runtime_config, state.guest_control_endpoint)?;
     let filesystem = state.filesystem.take().ok_or_else(|| {
         BackendError::new("session Runtime filesystem was already consumed by another preparation")
     })?;
     let runtime: OwnedRuntime = Runtime::new(
         RealCommandRunner::new(),
         filesystem,
-        prepared.firecracker_api,
-        prepared.guest_control_api,
+        firecracker_api,
+        guest_control,
         SystemIdentitySource,
     );
     let (vm, workload) = new_firecracker_backends(
@@ -1061,6 +1069,30 @@ fn prepare_firecracker(
     state.vm = Some(vm);
     state.workload = Some(workload);
     Ok(())
+}
+
+fn firecracker_api_for(config: &RuntimeConfig) -> Result<UnixApiClient, BackendError> {
+    UnixApiClient::new(config.api_socket.clone()).map_err(|error| {
+        BackendError::new(format!(
+            "verified Firecracker API socket is not usable: {error}"
+        ))
+    })
+}
+
+fn guest_control_for(
+    config: &RuntimeConfig,
+    endpoint: ProductionGuestControlEndpoint,
+) -> Result<FirecrackerVsockApiClient, BackendError> {
+    FirecrackerVsockApiClient::new(
+        config.vsock.uds_path.clone(),
+        config.vsock.guest_cid,
+        endpoint.port,
+    )
+    .map_err(|error| {
+        BackendError::new(format!(
+            "verified guest-control vsock endpoint is not usable: {error}"
+        ))
+    })
 }
 
 fn verified_backend_template(
@@ -1199,6 +1231,11 @@ fn validate_production_config(
     if config.broker_endpoint.expected_guest_cid != config.firecracker.vsock.guest_cid {
         return Err(ProductionBuildError::InvalidConfig(
             "Broker guest CID must equal the Firecracker vsock guest CID".to_owned(),
+        ));
+    }
+    if config.guest_control_endpoint.port == 0 || config.guest_control_endpoint.port == u32::MAX {
+        return Err(ProductionBuildError::InvalidConfig(
+            "guest-control vsock port must be explicit, non-zero, and non-wildcard".to_owned(),
         ));
     }
     if config.broker_limits.budget_response_bytes == 0
@@ -1555,7 +1592,7 @@ mod tests {
     use egress_broker::durable::DurableBrokerView;
     use firecracker_runtime::{
         ApiResponse, CgroupConfig, CgroupVersion, CommandOutput, CommandRunner, CommandSpec,
-        DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, JailerConfig, NamespaceConfig,
+        DmVerityConfig, FileSystem, HostIsolationConfig, JailerConfig, NamespaceConfig,
         PinnedArtifact, ProcessHandle, ProcessOwnership, SeccompConfig, Sha256Digest, VsockConfig,
         WorkspaceConfig, sha256,
     };
@@ -1931,6 +1968,7 @@ mod tests {
             runtime_config(root),
             WorkspaceTemplateId::new("workspace-template-v1"),
             ProductionBrokerEndpoint::new(2, 7, 19_001, 16),
+            ProductionGuestControlEndpoint::new(19_002),
             broker_limits(),
         )
     }
@@ -2041,6 +2079,7 @@ mod tests {
             snapshot_id: SnapshotId::new([0x77; crate::ID_BYTES]),
             snapshot_path: jail_root.join("snapshots/state"),
             memory_path: jail_root.join("snapshots/memory"),
+            guest_control_port: 19_002,
         };
         let snapshot = Snapshot::new(
             request.snapshot_path.clone(),
@@ -2055,8 +2094,6 @@ mod tests {
             exact.clone(),
             snapshot,
             request.snapshot_id,
-            TestApi,
-            TestApi,
         )
         .err()
         .expect("foreign memory path must be rejected");
@@ -2078,14 +2115,7 @@ mod tests {
             Vec::new(),
         );
         assert!(matches!(
-            PreparedFirecrackerSession::verify(
-                &request,
-                changed,
-                snapshot,
-                request.snapshot_id,
-                TestApi,
-                TestApi,
-            ),
+            PreparedFirecrackerSession::verify(&request, changed, snapshot, request.snapshot_id,),
             Err(SessionPreparationError::RuntimeConfigMismatch)
         ));
     }
@@ -2270,6 +2300,34 @@ mod tests {
     }
 
     #[test]
+    fn guest_control_rejects_wildcard_port_before_owner_construction() {
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
+        let mut config = production_config(
+            &root.0,
+            AuthorityAuditMode::CreateNew(root.0.join("authority.wal")),
+        );
+        config.guest_control_endpoint = ProductionGuestControlEndpoint::new(u32::MAX);
+
+        let error = ProductionSessionRuntimeBuilder::new(
+            config,
+            TestFirecrackerFactory {
+                snapshot_id: SnapshotId::new([0x91; crate::ID_BYTES]),
+            },
+            TestEgressFactory,
+        )
+        .build()
+        .err()
+        .expect("wildcard guest-control port must fail closed");
+
+        assert!(matches!(
+            error,
+            ProductionBuildError::InvalidConfig(message)
+                if message.contains("guest-control vsock port")
+        ));
+    }
+
+    #[test]
     fn broker_runtime_factory_owns_the_exact_kernel_wal_and_limits() {
         let root = TestDirectory::new();
         let wal_root = root.0.join("broker-wal");
@@ -2359,25 +2417,31 @@ mod tests {
     }
 
     #[test]
-    fn boxed_api_delegates_restore_resource_observation() {
-        struct ObservingApi(Arc<Mutex<bool>>);
-        impl ApiClient for ObservingApi {
-            fn request(&mut self, request: &ApiRequest) -> Result<ApiResponse, RuntimeError> {
-                if request.method == HttpMethod::Get && request.path == "/vm/config" {
-                    *self.0.lock().expect("observation lock must be healthy") = true;
-                }
-                Ok(ApiResponse {
-                    status: 200,
-                    body: r#"{"drives":[{"drive_id":"workspace","path_on_host":"/workspace/id"}],"vsock":{"guest_cid":7,"uds_path":"/run/vsock.sock"}}"#.to_owned(),
-                })
-            }
-        }
-        let observed = Arc::new(Mutex::new(false));
-        let mut client = BoxedApiClient(Box::new(ObservingApi(Arc::clone(&observed))));
-        client
-            .verify_restore_resources(Path::new("/workspace/id"), Path::new("/run/vsock.sock"), 7)
-            .expect("boxed API must delegate resource observation");
-        assert!(*observed.lock().expect("observation lock must be healthy"));
+    fn production_firecracker_api_uses_the_exact_verified_socket() {
+        let root = TestDirectory::new();
+        let template = runtime_config(&root.0);
+        let config =
+            rebind_runtime_config(&template, identity(0x41)).expect("session config must rebind");
+        let client = firecracker_api_for(&config)
+            .expect("an absolute verified API socket must construct a client");
+
+        assert_eq!(client.socket_path(), config.api_socket);
+    }
+
+    #[test]
+    fn production_guest_control_uses_the_exact_session_vsock_endpoint() {
+        let root = TestDirectory::new();
+        let template = runtime_config(&root.0);
+        let config =
+            rebind_runtime_config(&template, identity(0x42)).expect("session config must rebind");
+        let endpoint = ProductionGuestControlEndpoint::new(19_002);
+        let client = guest_control_for(&config, endpoint)
+            .expect("the verified session endpoint must construct a client");
+
+        assert_eq!(client.uds_path(), config.vsock.uds_path);
+        assert_eq!(client.guest_cid(), config.vsock.guest_cid);
+        assert_eq!(client.guest_port(), endpoint.port);
+        assert_ne!(client.uds_path(), template.vsock.uds_path);
     }
 
     #[test]

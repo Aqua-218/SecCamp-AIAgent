@@ -25,6 +25,7 @@ use egress_protocol::{
     cbor::{CanonicalBrokerRequest, CborError},
     frame::{ControlFrame, FrameError},
     operation::BrokerOperation,
+    response::MAX_PUBLIC_WIRE_BODY_BYTES,
     session::{
         BrokerRequestId, BrokerSessionId, EnvelopeAcceptance, EnvelopeError, SessionReplayGuard,
     },
@@ -62,6 +63,10 @@ impl BrokerEffect {
             Self::Public(response) => u64::try_from(response.body.len()).unwrap_or(u64::MAX),
             Self::GitHub(response) => response.response_bytes,
         }
+    }
+
+    fn is_commit_unknown(&self) -> bool {
+        matches!(self, Self::GitHub(response) if response.is_commit_unknown())
     }
 }
 
@@ -376,6 +381,18 @@ where
         operation: &BrokerOperation,
         context: &DispatchContext,
     ) -> (BrokerResponse, Option<CachedOutcome>) {
+        if operation
+            .public_response_byte_limit()
+            .is_some_and(|limit| limit > MAX_PUBLIC_WIRE_BODY_BYTES)
+        {
+            return (
+                Self::rejected(
+                    request_id,
+                    BrokerRejection::PublicFetch(FetchError::OperationRejected),
+                ),
+                None,
+            );
+        }
         let response_cap = operation
             .public_response_byte_limit()
             .unwrap_or(self.github_response_cap);
@@ -407,6 +424,9 @@ where
             .execute(context, &capability_request, &mut effect);
         match result {
             Ok(effect) => {
+                if effect.is_commit_unknown() {
+                    return self.settle_committed_but_unrecorded(request_id, response_cap);
+                }
                 if self
                     .budget
                     .complete(request_id, effect.response_bytes())
@@ -428,17 +448,7 @@ where
                 }
             }
             Err(ExecutorError::CommittedButUnrecorded) => {
-                // The executor crossed its linearization point, so the external
-                // effect may exist at the provider. Charging the reservation
-                // keeps the session total honest; aborting it would let the
-                // guest spend those bytes twice.
-                if self.budget.complete(request_id, response_cap).is_err() {
-                    let _ = self.budget.abort(request_id);
-                }
-                (
-                    Self::rejected(request_id, BrokerRejection::CommittedButUnrecorded),
-                    None,
-                )
+                self.settle_committed_but_unrecorded(request_id, response_cap)
             }
             Err(error) => {
                 let _ = self.budget.abort(request_id);
@@ -470,6 +480,23 @@ where
         }
     }
 
+    fn settle_committed_but_unrecorded(
+        &mut self,
+        request_id: BrokerRequestId,
+        response_cap: u64,
+    ) -> (BrokerResponse, Option<CachedOutcome>) {
+        // The executor crossed its linearization point, so the external effect
+        // may exist at the provider. Charging the complete reservation keeps
+        // the session honest and prevents those bytes from being spent twice.
+        if self.budget.complete(request_id, response_cap).is_err() {
+            let _ = self.budget.abort(request_id);
+        }
+        (
+            Self::rejected(request_id, BrokerRejection::CommittedButUnrecorded),
+            None,
+        )
+    }
+
     fn rejected(request: BrokerRequestId, rejection: BrokerRejection) -> BrokerResponse {
         BrokerResponse {
             request,
@@ -499,6 +526,12 @@ where
         }
         (BrokerOperation::GitHub(request), AuthorityBody::GitHub(authority)) => github
             .execute(request_id, request, authority, github_response_cap)
+            .or_else(|error| match error {
+                GitHubAdapterError::CommitUnknown(unknown) => {
+                    Ok(GitHubResponse::commit_unknown(unknown))
+                }
+                error => Err(error),
+            })
             .map(BrokerEffect::GitHub)
             .map_err(AdapterError::GitHub),
         _ => Err(AdapterError::OperationMismatch),
@@ -567,12 +600,16 @@ mod tests {
 
     use authority_core::{
         capability::{AuthorityBody, CapId, Capability, CapabilityRequest, IssuerId, SubjectId},
-        github::{GitHubAuthority, GitHubOperation, GitHubRequest},
+        github::{
+            BranchName, BranchPattern, GitHubAuthority, GitHubOperation, GitHubOperations,
+            GitHubRequest, InstallationId,
+        },
         http::{
             CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethod, HttpFetchMethods,
             HttpFetchRequest, UrlPathPattern,
         },
         kernel::CapabilityKernel,
+        repository::RepoId,
         state::{CapabilityGrant, CapabilityState, StaticAuthorityEnvelope, Subject},
         time::{MonotonicTime, TimeWindow},
     };
@@ -581,6 +618,7 @@ mod tests {
         cbor::{CanonicalBrokerRequest, CborError},
         frame::ControlFrame,
         operation::BrokerOperation,
+        response::MAX_PUBLIC_WIRE_BODY_BYTES,
         session::{BrokerRequestId, BrokerSessionId, EnvelopeError},
     };
 
@@ -590,11 +628,15 @@ mod tests {
         default_github_response_cap,
     };
     use crate::{
-        github::{GitHubAdapter, GitHubAdapterError, GitHubResponse},
+        github::{
+            CreatePullRequestInput, CredentialHandle, GitHubAdapter, GitHubAdapterError,
+            GitHubProvider, GitHubProviderError, GitHubResponse, PublishBranchInput,
+            StaticCredentialProvider, StaticPublishPlanProvider, TypedGitHubAdapter,
+        },
         ip_policy::IpPolicy,
         public_fetch::{
-            ConnectorError, ConnectorResponse, FetchPolicy, FetchTarget, HttpsConnector,
-            PublicFetcher, Resolver,
+            ConnectorError, ConnectorResponse, FetchError, FetchPolicy, FetchTarget,
+            HttpsConnector, PublicFetcher, Resolver,
         },
         transport::FramedTransport,
     };
@@ -641,23 +683,58 @@ mod tests {
             if self.failure {
                 Err(GitHubAdapterError::ProviderRejected)
             } else {
-                Ok(GitHubResponse {
-                    response_bytes: 3,
-                    operation: GitHubOperation::CreatePullRequest,
-                    number: Some(7),
-                    object: None,
-                })
+                Ok(GitHubResponse::committed(
+                    3,
+                    GitHubOperation::CreatePullRequest,
+                    Some(7),
+                    None,
+                ))
             }
         }
     }
 
     fn kernel_and_capability() -> (CapabilityKernel, SubjectId, CapId) {
+        kernel_and_capability_with_public_limit(32)
+    }
+
+    fn kernel_and_capability_with_public_limit(
+        max_response_bytes: u64,
+    ) -> (CapabilityKernel, SubjectId, CapId) {
         let subject = SubjectId::new("guest");
         let operation = AuthorityBody::HttpFetch(HttpFetchAuthority::new(
             HttpFetchMethods::only(HttpFetchMethod::Get),
             CanonicalHost::new("public.example").expect("fixture host is valid"),
             UrlPathPattern::Prefix(CanonicalUrlPath::new("/").expect("fixture path is valid")),
-            32,
+            max_response_bytes,
+        ));
+        let envelope = StaticAuthorityEnvelope::new(
+            TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+                .expect("fixture window is valid"),
+            operation.clone(),
+        );
+        let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("broker")));
+        kernel
+            .register_subject(Subject::new(subject.clone(), envelope))
+            .expect("fixture subject registration succeeds");
+        let capability = kernel
+            .issue_root(CapabilityGrant::new(
+                subject.clone(),
+                TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+                    .expect("fixture window is valid"),
+                operation,
+            ))
+            .expect("fixture capability issuance succeeds");
+        (kernel, subject, CapId::new(capability.as_str()))
+    }
+
+    fn github_kernel_and_capability() -> (CapabilityKernel, SubjectId, CapId) {
+        let subject = SubjectId::new("guest");
+        let operation = AuthorityBody::GitHub(GitHubAuthority::new(
+            InstallationId::new("install-a"),
+            RepoId::new("owner/repo"),
+            GitHubOperations::only(GitHubOperation::CreatePullRequest),
+            BranchPattern::Exact(BranchName::new("main").expect("fixture branch is valid")),
+            BranchPattern::Prefix(BranchName::new("agents").expect("fixture branch is valid")),
         ));
         let envelope = StaticAuthorityEnvelope::new(
             TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
@@ -700,12 +777,52 @@ mod tests {
     }
 
     fn public_operation() -> BrokerOperation {
+        public_operation_with_limit(32)
+    }
+
+    fn public_operation_with_limit(max_response_bytes: u64) -> BrokerOperation {
         BrokerOperation::PublicFetch(HttpFetchRequest::new(
             HttpFetchMethod::Get,
             CanonicalHost::new("public.example").expect("fixture host is valid"),
             CanonicalUrlPath::new("/guide").expect("fixture path is valid"),
-            32,
+            max_response_bytes,
         ))
+    }
+
+    fn github_operation() -> BrokerOperation {
+        BrokerOperation::GitHub(GitHubRequest::new(
+            InstallationId::new("install-a"),
+            RepoId::new("owner/repo"),
+            GitHubOperation::CreatePullRequest,
+            BranchName::new("main").expect("fixture branch is valid"),
+            BranchName::new("agents/fix").expect("fixture branch is valid"),
+        ))
+    }
+
+    struct CommitUnknownProvider {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    impl GitHubProvider for CommitUnknownProvider {
+        fn publish_branch(
+            &mut self,
+            _input: &PublishBranchInput,
+            _credential: CredentialHandle,
+            _max_response_bytes: u64,
+        ) -> Result<GitHubResponse, GitHubProviderError> {
+            *self.calls.lock().expect("call mutex is not poisoned") += 1;
+            Err(GitHubProviderError::CommitUnknown)
+        }
+
+        fn create_pull_request(
+            &mut self,
+            _input: &CreatePullRequestInput,
+            _credential: CredentialHandle,
+            _max_response_bytes: u64,
+        ) -> Result<GitHubResponse, GitHubProviderError> {
+            *self.calls.lock().expect("call mutex is not poisoned") += 1;
+            Err(GitHubProviderError::CommitUnknown)
+        }
     }
 
     /// Reports a fixed executor failure so the post-executor budget and
@@ -785,6 +902,83 @@ mod tests {
             0,
             "bytes for a committed effect must stay charged to the session"
         );
+    }
+
+    // Requirement: a post-send GitHub ambiguity is committed in the kernel but never returned as success.
+    // Category: integration/security/idempotency. Risk: critical.
+    #[test]
+    fn github_commit_unknown_is_terminal_charged_and_exact_retry_does_not_reexecute() {
+        let (kernel, subject, capability) = github_kernel_and_capability();
+        let calls = Arc::new(Mutex::new(0));
+        let github = TypedGitHubAdapter::new(
+            CommitUnknownProvider {
+                calls: calls.clone(),
+            },
+            StaticCredentialProvider::new(
+                InstallationId::new("install-a"),
+                CredentialHandle::from_host_id(1),
+            ),
+            StaticPublishPlanProvider::new([]),
+        );
+        let github_response_cap = 64;
+        let mut dispatcher = BrokerDispatcher::new(
+            kernel,
+            PublicFetcher::new(
+                ResolverFixture,
+                ConnectorFixture,
+                IpPolicy::default(),
+                FetchPolicy::default(),
+            ),
+            github,
+            BrokerSessionId::new([1; 16]),
+            NonZeroUsize::new(8).expect("fixture capacity is non-zero"),
+            SessionBudgetLimits::new(
+                NonZeroU64::new(4).expect("fixture request limit is non-zero"),
+                128,
+                NonZeroUsize::new(1).expect("fixture concurrency limit is non-zero"),
+            ),
+            github_response_cap,
+        );
+        let context = DispatchContext {
+            caller: subject,
+            capability,
+            now: MonotonicTime::from_ticks(1),
+        };
+        let encoded = frame(BrokerSessionId::new([1; 16]), 0, 10, github_operation());
+
+        let first = dispatcher
+            .dispatch_frame(&encoded, &context)
+            .expect("commit-unknown is a retained terminal response");
+        assert_eq!(
+            first.outcome,
+            BrokerOutcome::Rejected(BrokerRejection::CommittedButUnrecorded)
+        );
+        assert_eq!(*calls.lock().expect("call mutex is not poisoned"), 1);
+        assert_eq!(
+            dispatcher.budget_usage().committed_response_bytes(),
+            github_response_cap,
+            "an uncertain mutation charges its complete reservation"
+        );
+        assert_eq!(
+            dispatcher
+                .executor
+                .effect_records()
+                .expect("kernel audit should remain readable")
+                .len(),
+            1,
+            "the sentinel must make the kernel record a committed effect"
+        );
+
+        let retry = dispatcher
+            .dispatch_frame(&encoded, &context)
+            .expect("exact retry should return the retained terminal response");
+        assert_eq!(retry, first);
+        assert_eq!(
+            *calls.lock().expect("call mutex is not poisoned"),
+            1,
+            "an exact retry must not send the GitHub mutation again"
+        );
+        assert_eq!(dispatcher.budget_usage().started_requests(), 1);
     }
 
     // Requirement: an unjournalable attempt is not indistinguishable from an authorization denial.
@@ -888,6 +1082,80 @@ mod tests {
             BrokerOutcome::Succeeded(BrokerEffect::Public(_))
         ));
         assert_eq!(dispatcher.budget_usage().started_requests(), 1);
+    }
+
+    // Requirement: the largest encodable public response cap is admitted before adapter execution.
+    // Category: boundary/resource. Risk: critical.
+    #[test]
+    fn dispatcher_admits_exact_public_wire_body_limit() {
+        let (kernel, subject, capability) =
+            kernel_and_capability_with_public_limit(MAX_PUBLIC_WIRE_BODY_BYTES);
+        let mut dispatcher = dispatcher_with_response_budget(kernel, MAX_PUBLIC_WIRE_BODY_BYTES);
+        let context = DispatchContext {
+            caller: subject,
+            capability,
+            now: MonotonicTime::from_ticks(1),
+        };
+        let encoded = frame(
+            BrokerSessionId::new([1; 16]),
+            0,
+            11,
+            public_operation_with_limit(MAX_PUBLIC_WIRE_BODY_BYTES),
+        );
+
+        let response = dispatcher
+            .dispatch_frame(&encoded, &context)
+            .expect("the exact wire body limit should be admitted");
+
+        assert!(matches!(
+            response.outcome,
+            BrokerOutcome::Succeeded(BrokerEffect::Public(_))
+        ));
+        assert_eq!(dispatcher.budget_usage().started_requests(), 1);
+    }
+
+    // Requirement: an unencodable public response cap is rejected and cached before any effect.
+    // Category: boundary/security/resource. Risk: critical.
+    #[test]
+    fn dispatcher_rejects_public_wire_body_limit_plus_one_before_effect() {
+        let oversized = MAX_PUBLIC_WIRE_BODY_BYTES + 1;
+        let (kernel, subject, capability) = kernel_and_capability_with_public_limit(oversized);
+        let mut dispatcher = dispatcher_with_response_budget(kernel, oversized);
+        let context = DispatchContext {
+            caller: subject,
+            capability,
+            now: MonotonicTime::from_ticks(1),
+        };
+        let encoded = frame(
+            BrokerSessionId::new([1; 16]),
+            0,
+            12,
+            public_operation_with_limit(oversized),
+        );
+
+        let first = dispatcher
+            .dispatch_frame(&encoded, &context)
+            .expect("wire admission rejection should be a cacheable outcome");
+        assert_eq!(
+            first.outcome,
+            BrokerOutcome::Rejected(BrokerRejection::PublicFetch(FetchError::OperationRejected))
+        );
+        assert_eq!(dispatcher.budget_usage().started_requests(), 0);
+        assert!(
+            dispatcher
+                .executor
+                .effect_records()
+                .expect("kernel audit should remain readable")
+                .is_empty(),
+            "wire admission must reject before kernel effect execution"
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch_frame(&encoded, &context)
+                .expect("exact retry should use the admission rejection cache"),
+            first
+        );
+        assert_eq!(dispatcher.budget_usage().started_requests(), 0);
     }
 
     // Requirement: canonical CBOR rejection happens before replay, budget, or adapter access.

@@ -54,7 +54,7 @@ mod linux {
             AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId,
         },
         file::{FileAuthority, FileEffect, FileEffects, FileRequest},
-        kernel::CapabilityKernel,
+        kernel::{CapabilityKernel, EffectExecution},
         path::{CanonicalPath, PathPattern},
         repository::RepoId,
         state::{CapabilityGrant, CapabilityState, StaticAuthorityEnvelope, Subject},
@@ -880,11 +880,14 @@ mod linux {
                 let request = authority.request(FileEffect::ReadData, &path);
                 let start = std::time::Instant::now();
                 for _ in 0..iterations {
-                    let outcome = authority.kernel.authorize_and_commit(
+                    let outcome = authority.kernel.authorize_and_execute_classified(
                         &authority.subject,
                         &authority.capability,
                         &request,
-                        |_| Ok::<(), ()>(()),
+                        |_| EffectExecution::<(), ()>::Committed {
+                            value: (),
+                            receipt: None,
+                        },
                     );
                     black_box(outcome).expect("benchmark authorization must succeed");
                 }

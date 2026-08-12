@@ -42,6 +42,19 @@ jobs:
       - name: Validate pipeline policy
         run: scripts/ci/validate-pipelines.sh
 
+  docs_policy:
+    name: Documentation policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Check documentation policy
+        run: scripts/ci/run.sh docs-policy
+
   rust_quality:
     name: Rust quality gate
     runs-on: ubuntu-24.04

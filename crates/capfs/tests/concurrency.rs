@@ -19,7 +19,7 @@ use authority_core::{
     capability::{AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId},
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
     handle::{HandleId, ObjectId, OpenHandle},
-    kernel::{CapabilityKernel, EffectCommitError},
+    kernel::{CapabilityKernel, EffectCommitError, EffectExecution},
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     state::{CapabilityGrant, CapabilityState, RevocationStatus, StaticAuthorityEnvelope, Subject},
@@ -91,11 +91,18 @@ fn authorize_effect(
     commit: impl FnOnce() -> Result<(), Infallible>,
 ) -> Result<(), EffectCommitError<Infallible>> {
     let request = request(&fixture.repository, effect, capability_path);
-    fixture
-        .kernel
-        .authorize_and_commit(&fixture.subject, &fixture.capability, &request, |_| {
-            commit()
-        })
+    fixture.kernel.authorize_and_execute_classified(
+        &fixture.subject,
+        &fixture.capability,
+        &request,
+        |_| match commit() {
+            Ok(value) => EffectExecution::Committed {
+                value,
+                receipt: None,
+            },
+            Err(error) => EffectExecution::FailedBeforeCommit(error),
+        },
+    )
 }
 
 fn fresh_namespace() -> (NamespaceRegistry, ObjectId) {
@@ -298,7 +305,7 @@ impl RaceRound {
             ready.wait();
             let result = fixture
                 .kernel
-                .revoke(&fixture.capability)
+                .revoke_held_by(&fixture.subject, &fixture.capability)
                 .expect("test capability revoke must succeed");
             returned.store(true, Ordering::Release);
             result
@@ -412,7 +419,7 @@ fn revoke_before_open_rename_and_unlink_fails_closed_without_executor_calls() {
     let rename_path = path(&["moved.txt"]);
     fixture
         .kernel
-        .revoke(&fixture.capability)
+        .revoke_held_by(&fixture.subject, &fixture.capability)
         .expect("test capability revoke must succeed");
 
     let open_executor_calls = AtomicUsize::new(0);

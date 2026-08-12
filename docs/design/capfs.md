@@ -80,12 +80,12 @@ flowchart LR
 - nodeidはsubject mount内だけのidentityとし、VM共通のpath解決には`ObjectId`を使う。
 
 - `LOOKUP`と`GETATTR`はCapabilityの許可範囲またはその祖先だけをzero TTLで公開する。
-- `OPEN`はaccess modeを`ReadData` / `WriteData`の単一または複合認可へ変換する。writableな`O_TRUNC`には`Truncate`も同じ複合認可へ加え、sizeだけの`SETATTR`も現在pathの`Truncate`を再認可する。`CREATE`は`CreateFile`と返却handleのaccess effectを複合認可し、`MKDIR`は`CreateDirectory`を認可してから現在のparent pathの直下へno-replace作成する。毎回の`READ` / `WRITE`はnamespace上の現在pathに対して対応effectを再認可する。
+- `OPEN`はaccess modeを`ReadData` / `WriteData`の単一または複合認可へ変換する。writableな`O_TRUNC`には`Truncate`も同じ複合認可へ加える。`SETATTR`のsizeは`Truncate`、ordinary modeまたはatime/mtimeは`SetMetadata`を現在pathで再認可する。`CREATE`は`CreateFile`と返却handleのaccess effectを複合認可し、`MKDIR`は`CreateDirectory`を認可してから現在のparent pathの直下へno-replace作成する。`UNLINK`、`RMDIR`、`RENAME`も現在のchild / subtree全pathに対応effectを要求する。毎回の`READ` / `WRITE`はnamespace上の現在pathに対して対応effectを再認可する。
 - regular fileは`FOPEN_DIRECT_IO`で開き、revoke後のreadがpage cacheを迂回しないようにする。
 - runtime metadata/open/read/writeはroot fdから`openat2`で解決し、symlink、mount越境、hard linkの出現をfail closedで拒否する。
 - FUSE handle、namespace open count、Authority open handleを同じ`ObjectId`へ結び、`RELEASE`で一緒に閉じる。
 
-詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。`WRITE`、writable `O_TRUNC`、sizeだけの`SETATTR`、`CREATE`、`MKDIR`まで実装済みであり、次段階はremove、no-replace renameである。
+詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。initial link-free file modelの全10 `FileEffect`はFUSE operationへ接続済みである。directory streamはopen時のgenerationを保持し、途中でnamespaceが変われば`EAGAIN`を返してcookieの再利用を止める。
 
 ## 初期実装は workspace を木に限定する
 
@@ -178,13 +178,13 @@ negative_timeout = 0
 | FUSE operation | 判断 |
 |---|---|
 | `LOOKUP`, `GETATTR` | 許可範囲またはその祖先だけ見せる。その他は `ENOENT` |
-| `READDIR` | `ListDirectory` を確認し、見えてよい entry だけ返す |
+| `READDIR` | `ListDirectory` を確認し、見えてよい entry だけ返す。open後のnamespace変更時は `EAGAIN` でstream再開を要求する |
 | `OPEN` | access mode を確認。`O_TRUNC` は open 前に別途認可 |
 | `READ`, `WRITE` | object の現在パスに対して毎回再認可 |
 | `CREATE`, `MKDIR` | これから作る子パスを認可 |
 | `UNLINK`, `RMDIR` | 対象を認可。open 中なら拒否 |
 | `RENAME` | source / destination を認可し、VM 共通 lock で更新 |
-| `SETATTR` | size は `Truncate`、mode / time は `SetMetadata`。owner 変更は拒否 |
+| `SETATTR` | size は `Truncate`、ordinary mode または atime/mtime は `SetMetadata`。owner・flag・複合metadata変更は拒否 |
 | symlink / hard link、device、xattr、ioctl、fallocate、copy-range | 初期実装では `EPERM` |
 | 未実装 opcode | backing に触れず fail closed |
 

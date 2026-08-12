@@ -33,7 +33,7 @@
 | [Backing repository の事前検証](capfs/backing-preflight.md) | root fd、link-free tree、mount・inode identity、startup import |
 | [共有 namespace registry](capfs/namespace-registry.md) | `ObjectId`割り当て、現在path、generation、open handle、namespace lock契約 |
 | [mount ごとの node table](capfs/node-tables.md) | subject-local `nodeid -> ObjectId`、LOOKUP / FORGET、nodeid非再利用 |
-| [Direct-I/O FUSE adapter](capfs/read-only-fuse.md) | LOOKUP / GETATTR / OPEN / READ / WRITE / CREATE / MKDIR / RELEASE、runtime backing I/O、revoke後の再認可 |
+| [Direct-I/O FUSE adapter](capfs/read-only-fuse.md) | LOOKUP / GETATTR / OPEN / READ / WRITE / SETATTR / CREATE / MKDIR / UNLINK / RMDIR / RENAME / READDIR / RELEASE、runtime backing I/O、revoke後の再認可 |
 
 ## 文書の使い分け
 

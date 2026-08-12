@@ -77,6 +77,8 @@ revokeは`auth_epoch`を変え、renameは`namespace_generation`を変える。�
 
 generationはwraparoundしない。`u64::MAX`の次が必要になった時点でbacking executorを呼ばず、`NamespaceGenerationExhausted`としてfail closedにする。
 
+`OPENDIR`はこのgenerationをdirectory handleへ記録する。後続の`READDIR`は`with_directory_children_at_generation`で、generation比較とchild列挙を同じread lock内で行う。値が変わっていればclosureを呼ばず`DirectoryGenerationChanged`を返し、FUSE adapterは`EAGAIN`へ写像する。古いcookieを新しい一覧へ当てないためのrestart contractであり、callerは新しいdirectory handleを開いてoffset 0から再開する。
+
 ## Backing操作とregistry更新の順序
 
 create、remove、renameは、registryだけ先に変更してもbacking syscallだけ先に実行しても安全ではない。片方が失敗すると、認可に使うpathと実filesystemが食い違うためである。
@@ -107,7 +109,7 @@ renameはsource subtree内を調べ、1件でもlive handleがあればexecutor�
 
 これにより初期実装では、rename / unlink後にpathを失ったinodeをopen fdだけで使い続ける状態を作らない。POSIX互換性より「live objectは必ず1つのcanonical pathを持つ」という認可上の単純さを優先している。
 
-Direct-I/O FUSE adapterは、fileとdirectoryのopen時にnamespace open countとAuthority coreのsubject-boundな`OpenHandle` recordを同じobjectへ登録する。片方の登録や認可に失敗すればcountをrollbackし、releaseでは両方を閉じる。adapterはlocal handle table、namespace、Capability kernelの順にlockを取得し、全経路で順序を統一している。既存fileへのread / writeと、`CREATE` / `MKDIR`の作成transactionはこの境界に載っている。removeとrenameにも同じ境界を適用する作業が残っている。
+Direct-I/O FUSE adapterは、fileとdirectoryのopen時にnamespace open countとAuthority coreのsubject-boundな`OpenHandle` recordを同じobjectへ登録する。片方の登録や認可に失敗すればcountをrollbackし、releaseでは両方を閉じる。adapterはlocal handle table、namespace、Capability kernelの順にlockを取得し、全経路で順序を統一している。既存fileへのread / write / metadata変更、`CREATE` / `MKDIR`、`UNLINK` / `RMDIR`、no-replace `RENAME`はこの境界に載っている。
 
 ## 通常のread / listingでpathを固定する
 
@@ -125,9 +127,13 @@ unlock
 
 executorから同じregistryへ再入するとdeadlockし得るため禁止している。lock順は常に`namespace -> Capability kernel`であり、逆順の経路をadapterへ作らない。
 
-directory listingでは`with_directory_children`を使う。対象directory、親、direct childを同一read guardから取り出し、childをcanonical name順へ並べたままexecutorへ渡す。FUSE adapterはこのguard中に`ListDirectory`を再認可し、各childのvisibilityを判定する。したがってrenameで名前や親が変わる途中の一覧を返さず、nested descendantをdirect childとして混ぜることもない。
+directory listingでは`with_directory_children_at_generation`を使う。対象directory、親、direct childとopen時に捕捉したgenerationを同一read guardで照合し、childをcanonical name順へ並べたままexecutorへ渡す。FUSE adapterはこのguard中に`ListDirectory`を再認可し、各childのvisibilityを判定する。したがってrenameで名前や親が変わる途中の一覧を返さず、nested descendantをdirect childとして混ぜることもない。create / remove / renameでgenerationが変わったstreamは`EAGAIN`となり、古いindex cookieを解釈しない。
 
 `create_child`はparentの`ObjectId`とchild nameを受け取り、writer lockを取った後の現在parent pathからchildをstageする。呼出し側がlockの外で`parent.path().child(name)`を作るAPIにはしていないので、親がrenameされた直後に古いpathを認可する経路を型上作れない。`create_open_child`は同じ操作に加えて、publishされるchildのopen countを最初から1にする。FUSE `CREATE`はここでAuthority handle、backing fd、local handleを同時に作るため、成功replyより前にchildをremoveできる空白区間がない。executorが失敗すれば、path、ID、open countのどれも公開されない。
+
+削除には`remove_child`を使う。親identityとchild nameをwriter lock内で解決し、live parentとchildをexecutorへ渡すため、親を別directoryへrenameした後に古い名前でchildを消すことはない。childまたはdirectory subtreeにopen handleがあればexecutorは呼ばれず、emptyでないdirectoryも同様に止まる。backing `unlinkat`が成功したときだけ`path -> ObjectId`対応を外し、generationを進める。
+
+renameには`rename_child`を使う。source parent / nameとdestination parent / nameの両方をwriter lock内で現在pathへ変換し、`RenamePlan`へ全subtreeの`ObjectId`、source、destination、kindを詰める。runtimeはこのplanを使って全source objectを再検証する。adapterは全source / destinationに`Rename`を要求するので、directory rootだけの権限で権限外のdescendantを移動することはできない。
 
 ## どう検証しているか
 
@@ -137,13 +143,15 @@ directory listingでは`with_directory_children`を使う。対象directory、�
 - create / remove / rename executor失敗時にstateとgenerationが変わらないこと。
 - create失敗ではstaged IDが未発行のままで、remove後は発行済みIDを再利用しないこと。
 - child creationがwriter lock内の現在parent pathを使い、`CREATE`用の初期open count 1をclose前のremoveから守ること。
+- child removalとrenameが両parentの現在pathを使い、rename planがobject kindを保つこと。
 - subtree renameが全descendant pathを同じsuffixのまま移すこと。
 - no-replace、root変更、source subtree内へのrenameの拒否。
 - open handleがrename / removeを止め、open / close失敗時にcountがrollbackされること。
 - read operationが終わるまで並行renameのwrite lockが進まないこと。
 - direct childだけをcanonical name順に列挙し、listing operationが終わるまで並行renameが進まないこと。
+- stale generationのlistingではexecutorが呼ばれず、callerがstreamをrestartしなければならないこと。
 
-module内のtestはgeneration、open count、Object ID sequenceの上限、manifest rootとparent関係、writer panic後のfail closedを確認する。namespace registryについてcontract test 12件とmodule test 5件を実行する。
+module内のtestはgeneration、open count、Object ID sequenceの上限、manifest rootとparent関係、writer panic後のfail closedを確認する。namespace registryについてcontract test 15件とmodule test 5件を実行する。
 
 capfs package全体では、backing、runtime、node table、Direct-I/O FUSEを含めて、共有importのcontract testも実行する。
 
@@ -151,12 +159,10 @@ capfs package全体では、backing、runtime、node table、Direct-I/O FUSEを�
 
 ## 現在含まないもの
 
-- remove、renameのFUSE opcodeとbacking transaction。
-- runtime backing operationのremove系syscallと`renameat2`。
-- 複数pathを1つのoperationとしてAuthority coreのhandle registryとnamespace更新へ一体でcommitするadapter。
+- modeとtimestampを同時に求めるmetadata requestの原子性契約。
 - durable stateやsupervisor再起動後の復元。
 
-したがって、既存fileへのread / writeとcreateはこのregistryを通るが、remove・rename・metadata変更を含む隔離境界はまだ完成していない。
+したがって、initial file modelのread / write / truncate / metadata、create、remove、renameとdirectory streamはこのregistryを通る。残る複合metadataの原子性とdurable stateは、別途明示的な意味論を追加してから接続する。
 
 ## 関連
 

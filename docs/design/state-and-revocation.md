@@ -77,8 +77,8 @@ flowchart LR
 | `WeakerThan`、target envelope、逐次 revoke、祖先 chain、`auth_epoch` | durable audit backend と commit receipt |
 | Running→Closing→Closed、held revoke、open-handle registry、ID 非再利用 | 実 fd lifecycle と capfs registry を一体化する adapter |
 | shared effect / exclusive transition、executor の線形化点までの guard、attempt/effect audit | open handle、rename、unlink を含む capfs 競合 model |
-| capfs の path/object 対応、generation、open count、no-replace subtree rename | FUSE opcode と backing syscall の end-to-end 接続 |
-| direct / ancestor revoke、1〜2 effects、negative control の Loom model | 4 thread 以上・複数 revoke / Capability tree の model |
+| capfs の path/object 対応、generation、open count、全file mutationのFUSE / backing接続 | revokeとrename / unlinkを同時に含むbounded競合 model |
+| direct / ancestor revokeの単一・compound effect、2 effects、negative control の Loom model | 4 thread 以上・複数 revoke / Capability tree の model |
 
 詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)と[Effect commit と revoke の authorization guard](../authority-core/authorization-guard.md)を参照する。
 
@@ -136,7 +136,7 @@ CommitEffect(subject, effect):
 | 操作 | ここを越えたら commit 済みとする |
 |---|---|
 | file read / write | `capfs` が backing read / write を発行した瞬間 |
-| create / remove / rename / truncate | 対応する backing syscall を発行した瞬間 |
+| create / remove / rename / truncate / metadata | 対応する backing syscall を発行した瞬間 |
 | 公開 Web 取得 | Host Broker が検証済み outbound request を受理した瞬間 |
 | 認証 API | Host Broker が idempotency key 付き request を永続的に受理した瞬間 |
 

@@ -31,6 +31,7 @@ if [[ "${release_tag#v}" != "${workspace_version}" ]]; then
 fi
 
 readonly target_triple="x86_64-unknown-linux-gnu"
+readonly host_triple="$(rustc -vV | awk '/^host:/ { print $2 }')"
 readonly artifact_stem="authority-corpus-${release_tag}-${target_triple}"
 readonly archive_name="${artifact_stem}.tar.gz"
 readonly source_revision="$(git rev-parse HEAD)"
@@ -43,10 +44,17 @@ if [[ ! "${source_revision}" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'source revision is not a full commit SHA\n' >&2
   exit 1
 fi
+if [[ "${host_triple}" != "${target_triple}" ]]; then
+  printf 'release runner host %s does not match artifact target %s\n' \
+    "${host_triple}" "${target_triple}" >&2
+  exit 1
+fi
 
 mkdir -p -- dist "${package_root}/bin"
-cargo build --release --locked --package authority-core --bin authority-corpus
-install -m 0755 target/release/authority-corpus "${package_root}/bin/authority-corpus"
+cargo build --release --locked --target "${target_triple}" \
+  --package authority-core --bin authority-corpus
+install -m 0755 "target/${target_triple}/release/authority-corpus" \
+  "${package_root}/bin/authority-corpus"
 
 cat > "${package_root}/BUILD-METADATA.json" <<EOF
 {

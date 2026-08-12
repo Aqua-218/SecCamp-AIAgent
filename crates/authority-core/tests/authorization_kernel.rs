@@ -16,7 +16,7 @@ use std::{
 };
 
 use authority_core::{
-    audit::AttemptOutcome,
+    audit::{AttemptId, AttemptOutcome},
     capability::{
         AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, CapabilityRequestSet, IssuerId,
         SubjectId,
@@ -478,7 +478,13 @@ fn commit_unknown_is_terminal_without_creating_an_effect_record() {
         )
         .expect_err("unknown completion must require reconciliation");
 
-    assert_eq!(error, EffectCommitError::CommitUnknown);
+    assert_eq!(
+        error,
+        EffectCommitError::CommitUnknown {
+            attempt_id: AttemptId::from_u64(0),
+            evidence: b"provider-request-id:unknown".to_vec(),
+        }
+    );
     let attempts = kernel
         .attempt_records()
         .expect("audit records must remain readable");

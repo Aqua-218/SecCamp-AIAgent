@@ -10,6 +10,48 @@
 
 **syscall を 1 つも呼ばない。** namespace、cgroup、mount、descriptor の操作はすべて `RuntimeResources` trait に委ね、権限判定はすべて `AuthorityKernel` trait に委ねる。この crate が持つのは、どの subject として動くかを決めることと、resource を確保・解放する順序だけ。
 
+## crate の構造
+
+```mermaid
+flowchart TB
+    peer["Agent / Tool の control connection"]
+
+    subgraph sv["supervisor（guest 側）"]
+        direction TB
+        proto["protocol<br/>4 KiB bounded datagram<br/>tag は 2 種だけ"]
+        resolve["resolve_caller + ensure_running<br/>connection から subject を決める"]
+        life["subject setup / shutdown<br/>rollback 可能な transaction"]
+        hnd["handle の登録と close<br/>所有権は kernel から読む"]
+    end
+
+    caller{{"CallerResolver"}}
+    res{{"RuntimeResources"}}
+    ak{{"AuthorityKernel"}}
+
+    kernel["authority-core<br/>CapabilityKernel"]
+    osres["cgroup / capfs mount /<br/>control fd / workload"]
+
+    peer ==>|"datagram"| proto
+    proto ==>|"claimed_subject は捨てる"| resolve
+    resolve --> caller
+    resolve --> life
+    resolve --> hnd
+    life --> res
+    hnd --> res
+    life --> ak
+    hnd --> ak
+    ak --> kernel
+    res ==> osres
+    classDef guest fill:#2e7d32,color:#fff,stroke:#1b5e20;
+    classDef seam fill:#6a1b9a,color:#fff,stroke:#4a148c;
+    classDef external fill:#616161,color:#fff,stroke:#424242;
+    class sv,proto,resolve,life,hnd guest;
+    class caller,res,ak seam;
+    class peer,kernel,osres external;
+```
+
+syscall は 1 つも呼ばない。namespace も cgroup も mount も `RuntimeResources` に委ね、権限判定は `AuthorityKernel` に委ねる。この crate が決めるのは「誰の要求か」と「どの順で確保・解放するか」だけ。
+
 ## この crate が決めること
 
 | 決めること | どこで |

@@ -8,6 +8,20 @@
 
 このページは、Rust の unit・状態遷移・property test、loom model、Lean executable example、Lean theorem、共通 corpus の差分テストがそれぞれ何を確認し、組み合わせると何が分かるかを説明する。プロジェクト全体の検証方針は[検証戦略](../design/verification.md)を参照する。
 
+## local test で確認したこと
+
+詳細は下の節ごとに書く。全体像は次のとおり。
+
+| 対象 | 検証手段 | どこまで |
+|---|---|---|
+| path、file、有効期間、Capability、HTTP、GitHub の判定 | Rust unit test + Lean example + 共通 corpus | 実装済み。3 者が同じ境界入力を通る |
+| 委譲判定の健全性・完全性・反射律・推移律 | Lean theorem | 実装済み。Lean モデル内の全型付き入力 |
+| 逐次 Capability state の遷移 | Rust transition test + stateful property test | 実装済み。生成した操作列で参照モデルと一致 |
+| effect commit と revoke の順序 | loom model（production と negative control） | 実装済み。bounded interleaving |
+| Rust と Lean の判定一致 | 共通 corpus 150 件の差分テスト | 実装済み。corpus に含まれる入力のみ |
+
+「実装済み」は各手段が答える問いに答えたという意味で、手段ごとに保証範囲が違う。次の節でその差を書く。
+
 ## 検証方法ごとの役割
 
 Authority core では、1つの手段ですべてを保証しようとせず、違う問いに違う検証を当てる。
@@ -246,7 +260,7 @@ scripts/check-authority-corpus.sh
 
 [`lean/lakefile.toml`](../../lean/lakefile.toml) は `authority_corpus` executable を `testDriver` に設定する。この executable は `AuthorityTests` を import するため、`lake check-test` では51個と parser 6個の executable example が一緒に型検査される。`lake test` はそれに加えて標準の共有 fixture 150件を実行する。
 
-## 現在の限界と次に埋めるもの
+## 未検証の境界
 
 現在の共通 corpus は、次の境界を同じ fixture から両言語へ流す。
 

@@ -1,26 +1,100 @@
-//! Host-side Broker backend for one session-scoped `AF_VSOCK` listener.
+//! Host-owned Broker service lifecycle for one session-scoped `AF_VSOCK` endpoint.
 //!
-//! The backend owns the listener from Broker establishment until the matching
-//! close. It deliberately keeps the listener and lease together so a server
-//! owner cannot obtain a listener for a different session or Broker identity.
+//! A successful lease means that the listener is bound, the session runtime is
+//! built, and its worker thread is owned by this backend. The listener and
+//! accepted stream are never lent to callers. Closing an exact lease cancels
+//! accept, shuts down an accepted stream, and joins the worker before the
+//! resource is considered closed.
 
-use std::io;
+use std::{
+    io::{self, Read, Write},
+    num::NonZeroUsize,
+    panic::{self, AssertUnwindSafe},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
-use egress_broker::transport::AfVsockListener;
+use authority_core::time::MonotonicTime;
+use egress_broker::{
+    dispatch::DispatchContext,
+    server::{ConnectionCloseReason, RequestDispatcher, ServerError, serve_connection},
+    transport::{AfVsockListener, TransportError, VsockShutdownHandle, VsockStream},
+};
 
 use crate::{
     BackendError, BrokerBackend as OrchestratorBrokerBackend, BrokerLease, SessionIdentity,
+    session_owner::{BrokerRuntimeStatus, BrokerStatusBackend},
 };
 
 const MIN_HOST_CID: u32 = 2;
 const MIN_GUEST_CID: u32 = 3;
 const VMADDR_CID_ANY: u32 = u32::MAX;
 const VMADDR_PORT_ANY: u32 = u32::MAX;
+const DEFAULT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Creates one host-bound listener for a Broker session.
+/// Interrupts both directions of one accepted Broker stream.
+pub trait BrokerStreamShutdown: Send + 'static {
+    /// Shuts down the associated stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport error when the stream cannot be interrupted.
+    fn shutdown(&self) -> io::Result<()>;
+}
+
+impl BrokerStreamShutdown for VsockShutdownHandle {
+    fn shutdown(&self) -> io::Result<()> {
+        self.shutdown()
+    }
+}
+
+/// Nonblocking listener operations required by the owned service worker.
+pub trait BrokerServiceListener: Send + 'static {
+    /// Accepted stream type.
+    type Stream: Read + Write + Send + 'static;
+    /// Owner-only shutdown capability for an accepted stream.
+    type Shutdown: BrokerStreamShutdown;
+
+    /// Attempts to accept one kernel-authenticated peer without blocking.
+    ///
+    /// `Ok(None)` means no peer is currently pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying accept or peer-address error.
+    fn try_accept_peer(&self) -> io::Result<Option<(u32, Self::Stream)>>;
+
+    /// Creates the owner-only cancellation capability for `stream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying descriptor-clone error.
+    fn shutdown_handle(stream: &Self::Stream) -> io::Result<Self::Shutdown>;
+}
+
+impl BrokerServiceListener for AfVsockListener {
+    type Stream = VsockStream;
+    type Shutdown = VsockShutdownHandle;
+
+    fn try_accept_peer(&self) -> io::Result<Option<(u32, Self::Stream)>> {
+        self.try_accept_peer()
+    }
+
+    fn shutdown_handle(stream: &Self::Stream) -> io::Result<Self::Shutdown> {
+        stream.shutdown_handle()
+    }
+}
+
+/// Creates one nonblocking host-bound listener for a Broker service.
 pub trait VsockListenerFactory {
     /// Listener type returned after a successful bind.
-    type Listener: Send + Sync + 'static;
+    type Listener: BrokerServiceListener;
 
     /// Binds a listener to the exact host CID, port, and backlog supplied by
     /// the backend.
@@ -31,7 +105,7 @@ pub trait VsockListenerFactory {
     fn bind(&self, host_cid: u32, port: u32, backlog: i32) -> io::Result<Self::Listener>;
 }
 
-/// Production listener factory backed by the egress broker's Linux transport.
+/// Production listener factory backed by a nonblocking Linux `AF_VSOCK` socket.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AfVsockListenerFactory;
 
@@ -39,152 +113,425 @@ impl VsockListenerFactory for AfVsockListenerFactory {
     type Listener = AfVsockListener;
 
     fn bind(&self, host_cid: u32, port: u32, backlog: i32) -> io::Result<Self::Listener> {
-        AfVsockListener::bind(host_cid, port, backlog)
+        AfVsockListener::bind_nonblocking(host_cid, port, backlog)
     }
 }
 
-/// A Broker backend using the production `AF_VSOCK` listener factory.
-pub type ProductionBrokerBackend = BrokerBackend<AfVsockListenerFactory>;
-
-struct ActiveBroker<L> {
-    lease: BrokerLease,
-    listener: L,
+/// Cooperative cancellation observed by a session Broker runtime.
+#[derive(Debug, Clone)]
+pub struct BrokerCancellation {
+    requested: Arc<AtomicBool>,
 }
 
-/// Establishes one host `AF_VSOCK` listener for an exact Broker lease.
-pub struct BrokerBackend<F: VsockListenerFactory = AfVsockListenerFactory> {
-    factory: F,
+impl BrokerCancellation {
+    fn new() -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn cancel(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    /// Reports whether the service owner requested cancellation.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
+/// Typed terminal reason returned by one Broker connection runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerConnectionExit {
+    /// The authenticated peer cleanly ended its request stream.
+    EndOfStream,
+    /// The configured per-connection request maximum was reached.
+    RequestLimitReached {
+        /// Number of complete request/response exchanges.
+        requests_served: usize,
+    },
+    /// Broken byte accounting forced fail-closed termination.
+    AccountingInvariant {
+        /// Number of complete request/response exchanges before termination.
+        requests_served: usize,
+    },
+    /// An external effect committed without its terminal audit record.
+    CommittedButUnrecorded {
+        /// Number of complete request/response exchanges before fail-closed termination.
+        requests_served: usize,
+    },
+    /// Owner cancellation interrupted the connection.
+    Cancelled,
+    /// Serving failed before a typed normal terminal condition.
+    Failed {
+        /// Stable operator-facing failure context.
+        message: String,
+    },
+}
+
+/// Runs the policy and protocol loop for one already CID-authenticated stream.
+pub trait BrokerRuntime<S>: Send + 'static {
+    /// Owns and serves `stream` until a typed terminal condition is reached.
+    fn serve(self, stream: S, cancellation: &BrokerCancellation) -> BrokerConnectionExit;
+}
+
+/// Production connection runtime built from the Broker dispatch dependencies.
+pub struct BuiltBrokerRuntime<C> {
+    dispatcher: Box<dyn RequestDispatcher + Send>,
+    identity: DispatchContext,
+    clock: C,
+    max_requests: NonZeroUsize,
+}
+
+impl<C> BuiltBrokerRuntime<C> {
+    /// Captures one session's dispatcher, immutable identity, clock, and bound.
+    #[must_use]
+    pub fn new(
+        dispatcher: Box<dyn RequestDispatcher + Send>,
+        identity: DispatchContext,
+        clock: C,
+        max_requests: NonZeroUsize,
+    ) -> Self {
+        Self {
+            dispatcher,
+            identity,
+            clock,
+            max_requests,
+        }
+    }
+}
+
+impl<S, C> BrokerRuntime<S> for BuiltBrokerRuntime<C>
+where
+    S: Read + Write + Send + 'static,
+    C: FnMut() -> MonotonicTime + Send + 'static,
+{
+    fn serve(mut self, stream: S, cancellation: &BrokerCancellation) -> BrokerConnectionExit {
+        match serve_connection(
+            stream,
+            self.dispatcher.as_mut(),
+            &self.identity,
+            &mut self.clock,
+            self.max_requests,
+        ) {
+            Ok(report) => match report.close_reason() {
+                ConnectionCloseReason::RequestLimitReached => {
+                    BrokerConnectionExit::RequestLimitReached {
+                        requests_served: report.requests_served(),
+                    }
+                }
+                ConnectionCloseReason::AccountingInvariant => {
+                    BrokerConnectionExit::AccountingInvariant {
+                        requests_served: report.requests_served(),
+                    }
+                }
+                ConnectionCloseReason::CommittedButUnrecorded => {
+                    BrokerConnectionExit::CommittedButUnrecorded {
+                        requests_served: report.requests_served(),
+                    }
+                }
+            },
+            Err(_) if cancellation.is_cancelled() => BrokerConnectionExit::Cancelled,
+            Err(ServerError::Transport(TransportError::Io(error)))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                BrokerConnectionExit::EndOfStream
+            }
+            Err(error) => BrokerConnectionExit::Failed {
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
+/// Builds the exact runtime state for one fresh Broker session identity.
+pub trait BrokerRuntimeFactory<S>: Send + Sync + 'static {
+    /// Per-session runtime moved into the owned worker.
+    type Runtime: BrokerRuntime<S>;
+
+    /// Builds dispatch, clock, and accounting state for `identity`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the runtime cannot be built completely.
+    fn build(&self, identity: &SessionIdentity) -> Result<Self::Runtime, BackendError>;
+}
+
+/// Typed terminal reason for the backend-owned Broker worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerWorkerExit {
+    /// Close cancelled the worker before any peer was accepted.
+    Cancelled,
+    /// The authenticated connection reached a runtime terminal condition.
+    Connection(BrokerConnectionExit),
+    /// Accepting the first peer failed.
+    AcceptFailed {
+        /// Original transport failure.
+        message: String,
+    },
+    /// The kernel-reported peer CID did not match the host-selected CID.
+    UnexpectedPeer {
+        /// Host-selected CID.
+        expected: u32,
+        /// Kernel-reported CID.
+        received: u32,
+    },
+    /// The accepted stream could not produce an owner-only shutdown handle.
+    ShutdownHandleFailed {
+        /// Original descriptor-clone failure.
+        message: String,
+    },
+    /// The runtime panicked; the worker caught the unwind and failed closed.
+    Panicked,
+    /// The worker ended without publishing its typed terminal reason.
+    ExitChannelLost,
+}
+
+/// Parent-observable state of one exact Broker lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrokerWorkerStatus {
+    /// The worker has not published a terminal reason.
+    Running,
+    /// The worker has terminated with the enclosed typed reason.
+    Exited(BrokerWorkerExit),
+}
+
+/// A Broker backend using the production `AF_VSOCK` listener factory.
+pub type ProductionBrokerBackend<R> = BrokerBackend<AfVsockListenerFactory, R>;
+
+type StreamShutdownSlot<F> =
+    Arc<Mutex<Option<<<F as VsockListenerFactory>::Listener as BrokerServiceListener>::Shutdown>>>;
+
+struct ActiveBroker<F>
+where
+    F: VsockListenerFactory,
+{
+    lease: BrokerLease,
+    cancellation: BrokerCancellation,
+    stream_shutdown: StreamShutdownSlot<F>,
+    exit_receiver: Receiver<BrokerWorkerExit>,
+    worker: Option<JoinHandle<()>>,
+    exit: Option<BrokerWorkerExit>,
+}
+
+impl<F> ActiveBroker<F>
+where
+    F: VsockListenerFactory,
+{
+    fn request_cancel(&self) -> Option<String> {
+        self.cancellation.cancel();
+        if let Some(worker) = self.worker.as_ref() {
+            worker.thread().unpark();
+        }
+        let shutdown = self
+            .stream_shutdown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shutdown
+            .as_ref()
+            .and_then(|handle| handle.shutdown().err())
+            .map(|error| error.to_string())
+    }
+
+    fn publish_received_exit(&mut self, exit: BrokerWorkerExit) {
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            self.exit = Some(BrokerWorkerExit::Panicked);
+            return;
+        }
+        self.exit = Some(exit);
+    }
+
+    fn refresh_exit(&mut self) {
+        if self.exit.is_some() {
+            return;
+        }
+        match self.exit_receiver.try_recv() {
+            Ok(exit) => self.publish_received_exit(exit),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.exit = Some(self.disconnected_exit());
+            }
+        }
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+        self.refresh_exit();
+        if self.exit.is_some() {
+            return true;
+        }
+        match self.exit_receiver.recv_timeout(timeout) {
+            Ok(exit) => self.publish_received_exit(exit),
+            Err(RecvTimeoutError::Timeout) => return false,
+            Err(RecvTimeoutError::Disconnected) => {
+                self.exit = Some(self.disconnected_exit());
+            }
+        }
+        true
+    }
+
+    fn disconnected_exit(&mut self) -> BrokerWorkerExit {
+        let Some(worker) = self.worker.take() else {
+            return BrokerWorkerExit::ExitChannelLost;
+        };
+        if worker.join().is_err() {
+            BrokerWorkerExit::Panicked
+        } else {
+            BrokerWorkerExit::ExitChannelLost
+        }
+    }
+}
+
+impl<F> Drop for ActiveBroker<F>
+where
+    F: VsockListenerFactory,
+{
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            let _ = self.request_cancel();
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+struct ClosedBroker {
+    lease: BrokerLease,
+    exit: BrokerWorkerExit,
+}
+
+/// Owns one complete Broker service and its exact lifecycle lease.
+pub struct BrokerBackend<F, R>
+where
+    F: VsockListenerFactory,
+    R: BrokerRuntimeFactory<
+        <<F as VsockListenerFactory>::Listener as BrokerServiceListener>::Stream,
+    >,
+{
+    listener_factory: F,
+    runtime_factory: R,
     host_cid: u32,
     expected_guest_cid: u32,
     port: u32,
     backlog: i32,
-    active: Option<ActiveBroker<F::Listener>>,
-    last_closed: Option<BrokerLease>,
+    accept_poll_interval: Duration,
+    join_timeout: Duration,
+    active: Option<ActiveBroker<F>>,
+    last_closed: Option<ClosedBroker>,
 }
 
-impl<F: VsockListenerFactory> BrokerBackend<F> {
-    /// Creates a backend with explicit host and guest transport identities.
-    ///
-    /// The host CID is constrained to explicit host values beginning at 2 so
-    /// the commonly used host CID 2 remains valid. Guest CIDs begin at 3;
-    /// wildcard CID and port values are rejected before a factory is called.
+impl<F, R> BrokerBackend<F, R>
+where
+    F: VsockListenerFactory,
+    R: BrokerRuntimeFactory<
+        <<F as VsockListenerFactory>::Listener as BrokerServiceListener>::Stream,
+    >,
+{
+    /// Creates a backend with bounded default accept polling and join timing.
     ///
     /// # Errors
     ///
-    /// Returns [`BackendError`] when a CID, port, or backlog violates the
-    /// transport boundary.
+    /// Returns [`BackendError`] when transport configuration is invalid.
     pub fn new(
-        factory: F,
+        listener_factory: F,
+        runtime_factory: R,
         host_cid: u32,
         expected_guest_cid: u32,
         port: u32,
         backlog: i32,
+    ) -> Result<Self, BackendError> {
+        Self::with_timeouts(
+            listener_factory,
+            runtime_factory,
+            host_cid,
+            expected_guest_cid,
+            port,
+            backlog,
+            DEFAULT_ACCEPT_POLL_INTERVAL,
+            DEFAULT_JOIN_TIMEOUT,
+        )
+    }
+
+    /// Creates a backend with explicit cancellation-poll and close-join bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when transport configuration or either timeout
+    /// is invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_timeouts(
+        listener_factory: F,
+        runtime_factory: R,
+        host_cid: u32,
+        expected_guest_cid: u32,
+        port: u32,
+        backlog: i32,
+        accept_poll_interval: Duration,
+        join_timeout: Duration,
     ) -> Result<Self, BackendError> {
         validate_host_cid(host_cid)?;
         validate_guest_cid(expected_guest_cid)?;
         validate_port(port)?;
         validate_backlog(backlog)?;
+        validate_duration("accept poll interval", accept_poll_interval)?;
+        validate_duration("worker join timeout", join_timeout)?;
 
         Ok(Self {
-            factory,
+            listener_factory,
+            runtime_factory,
             host_cid,
             expected_guest_cid,
             port,
             backlog,
+            accept_poll_interval,
+            join_timeout,
             active: None,
             last_closed: None,
         })
     }
 
-    /// Returns the guest CID that the server owner must pass to
-    /// `serve_expected_peer`.
+    /// Returns the kernel-authenticated guest CID required by the worker.
     #[must_use]
     pub const fn expected_guest_cid(&self) -> u32 {
         self.expected_guest_cid
     }
 
-    /// Borrows the listener for the exact currently active lease.
-    ///
-    /// A previously closed lease and every foreign lease are rejected. The
-    /// The borrow is tied to this backend, so a successful exact close cannot
-    /// leave a separately owned listener alive.
+    /// Polls the exact active or most recently closed lease without blocking.
     ///
     /// # Errors
     ///
-    /// Returns [`BackendError`] unless `lease` is the exact active lease.
-    pub fn listener_for(&self, lease: &BrokerLease) -> Result<&F::Listener, BackendError> {
-        let Some(active) = self.active.as_ref() else {
-            return Err(unknown_lease_error("listener lookup"));
-        };
-        if !active.lease.eq(lease) {
-            return Err(unknown_lease_error("listener lookup"));
-        }
-        Ok(&active.listener)
-    }
-
-    /// Borrows the listener for the exact currently active lease.
-    ///
-    /// This name makes the lease check explicit for callers that pass the
-    /// returned listener to the egress broker server.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BackendError`] unless `lease` is the exact active lease.
-    pub fn listener_for_lease(&self, lease: &BrokerLease) -> Result<&F::Listener, BackendError> {
-        self.listener_for(lease)
-    }
-
-    /// Creates a production backend using `AfVsockListener::bind`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BackendError`] when the transport configuration is invalid.
-    pub fn new_production(
-        host_cid: u32,
-        expected_guest_cid: u32,
-        port: u32,
-        backlog: i32,
-    ) -> Result<Self, BackendError>
-    where
-        F: From<AfVsockListenerFactory>,
-    {
-        Self::new(
-            AfVsockListenerFactory.into(),
-            host_cid,
-            expected_guest_cid,
-            port,
-            backlog,
-        )
-    }
-}
-
-impl BrokerBackend<AfVsockListenerFactory> {
-    /// Creates a production backend using `AfVsockListener::bind`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BackendError`] when the transport configuration is invalid.
-    pub fn production(
-        host_cid: u32,
-        expected_guest_cid: u32,
-        port: u32,
-        backlog: i32,
-    ) -> Result<Self, BackendError> {
-        Self::new(
-            AfVsockListenerFactory,
-            host_cid,
-            expected_guest_cid,
-            port,
-            backlog,
-        )
-    }
-}
-
-impl<F: VsockListenerFactory> OrchestratorBrokerBackend for BrokerBackend<F> {
-    fn establish_broker_session(
+    /// Returns [`BackendError`] for every foreign or stale lease.
+    pub fn poll_broker_status(
         &mut self,
-        identity: &SessionIdentity,
-    ) -> Result<BrokerLease, BackendError> {
+        lease: &BrokerLease,
+    ) -> Result<BrokerWorkerStatus, BackendError> {
+        if let Some(active) = self.active.as_mut() {
+            if !active.lease.eq(lease) {
+                return Err(unknown_lease_error("status poll"));
+            }
+            active.refresh_exit();
+            return Ok(match active.exit.as_ref() {
+                Some(exit) => BrokerWorkerStatus::Exited(exit.clone()),
+                None => BrokerWorkerStatus::Running,
+            });
+        }
+        match self.last_closed.as_ref() {
+            Some(closed) if closed.lease.eq(lease) => {
+                Ok(BrokerWorkerStatus::Exited(closed.exit.clone()))
+            }
+            _ => Err(unknown_lease_error("status poll")),
+        }
+    }
+
+    fn establish(&mut self, identity: &SessionIdentity) -> Result<BrokerLease, BackendError> {
         if self.active.is_some() {
             return Err(BackendError::new(
                 "Broker establishment rejected: one exact lease is already active",
@@ -195,7 +542,7 @@ impl<F: VsockListenerFactory> OrchestratorBrokerBackend for BrokerBackend<F> {
         if self
             .last_closed
             .as_ref()
-            .is_some_and(|closed| closed.eq(&lease))
+            .is_some_and(|closed| closed.lease.eq(&lease))
         {
             return Err(BackendError::new(
                 "Broker establishment rejected: the exact lease was already closed",
@@ -203,39 +550,206 @@ impl<F: VsockListenerFactory> OrchestratorBrokerBackend for BrokerBackend<F> {
         }
 
         let listener = self
-            .factory
+            .listener_factory
             .bind(self.host_cid, self.port, self.backlog)
             .map_err(|error| {
                 BackendError::new(format!("host AF_VSOCK listener bind failed: {error}"))
             })?;
+        let runtime = self.runtime_factory.build(identity)?;
+        let cancellation = BrokerCancellation::new();
+        let stream_shutdown = Arc::new(Mutex::new(None));
+        let (exit_sender, exit_receiver) = mpsc::sync_channel(1);
+        let worker_cancellation = cancellation.clone();
+        let worker_shutdown = Arc::clone(&stream_shutdown);
+        let expected_guest_cid = self.expected_guest_cid;
+        let accept_poll_interval = self.accept_poll_interval;
+        let worker = thread::Builder::new()
+            .name("session-egress-broker".to_owned())
+            .spawn(move || {
+                let exit = panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_worker(
+                        &listener,
+                        runtime,
+                        expected_guest_cid,
+                        &worker_cancellation,
+                        &worker_shutdown,
+                        accept_poll_interval,
+                    )
+                }))
+                .unwrap_or(BrokerWorkerExit::Panicked);
+                let _ = exit_sender.send(exit);
+            })
+            .map_err(|error| BackendError::new(format!("Broker worker spawn failed: {error}")))?;
+
         self.active = Some(ActiveBroker {
             lease: lease.clone(),
-            listener,
+            cancellation,
+            stream_shutdown,
+            exit_receiver,
+            worker: Some(worker),
+            exit: None,
         });
         Ok(lease)
     }
 
+    fn close(&mut self, lease: &BrokerLease) -> Result<(), BackendError> {
+        let Some(mut active) = self.active.take() else {
+            return match self.last_closed.as_ref() {
+                Some(closed) if closed.lease.eq(lease) => Ok(()),
+                _ => Err(unknown_lease_error("close")),
+            };
+        };
+        if !active.lease.eq(lease) {
+            self.active = Some(active);
+            return Err(unknown_lease_error("close"));
+        }
+
+        let shutdown_error = active.request_cancel();
+        if !active.wait_for_exit(self.join_timeout) {
+            self.active = Some(active);
+            let shutdown_context = shutdown_error
+                .map(|message| format!("; stream shutdown also failed: {message}"))
+                .unwrap_or_default();
+            return Err(BackendError::new(format!(
+                "Broker close timed out after {:?}; worker ownership retained for retry{shutdown_context}",
+                self.join_timeout,
+            )));
+        }
+
+        let exit = active
+            .exit
+            .take()
+            .unwrap_or(BrokerWorkerExit::ExitChannelLost);
+        self.last_closed = Some(ClosedBroker {
+            lease: active.lease.clone(),
+            exit,
+        });
+        Ok(())
+    }
+}
+
+impl<R> BrokerBackend<AfVsockListenerFactory, R>
+where
+    R: BrokerRuntimeFactory<VsockStream>,
+{
+    /// Creates a production transport backend with a caller-supplied runtime factory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when transport configuration is invalid.
+    pub fn production(
+        runtime_factory: R,
+        host_cid: u32,
+        expected_guest_cid: u32,
+        port: u32,
+        backlog: i32,
+    ) -> Result<Self, BackendError> {
+        Self::new(
+            AfVsockListenerFactory,
+            runtime_factory,
+            host_cid,
+            expected_guest_cid,
+            port,
+            backlog,
+        )
+    }
+}
+
+impl<F, R> OrchestratorBrokerBackend for BrokerBackend<F, R>
+where
+    F: VsockListenerFactory,
+    R: BrokerRuntimeFactory<
+        <<F as VsockListenerFactory>::Listener as BrokerServiceListener>::Stream,
+    >,
+{
+    fn establish_broker_session(
+        &mut self,
+        identity: &SessionIdentity,
+    ) -> Result<BrokerLease, BackendError> {
+        self.establish(identity)
+    }
+
     fn close_broker_session(&mut self, lease: &BrokerLease) -> Result<(), BackendError> {
-        match self.active.take() {
-            Some(active) if active.lease.eq(lease) => {
-                self.last_closed = Some(active.lease.clone());
-                drop(active);
-                Ok(())
-            }
-            Some(active) => {
-                self.active = Some(active);
-                Err(unknown_lease_error("close"))
-            }
-            None if self
-                .last_closed
-                .as_ref()
-                .is_some_and(|closed| closed.eq(lease)) =>
-            {
-                Ok(())
-            }
-            None => Err(unknown_lease_error("close")),
+        self.close(lease)
+    }
+
+    fn ensure_broker_session_running(&mut self, lease: &BrokerLease) -> Result<(), BackendError> {
+        match BrokerBackend::poll_broker_status(self, lease)? {
+            BrokerWorkerStatus::Running => Ok(()),
+            BrokerWorkerStatus::Exited(exit) => Err(BackendError::new(format!(
+                "Broker worker exited before workload release: {exit:?}",
+            ))),
         }
     }
+}
+
+impl<F, R> BrokerStatusBackend for BrokerBackend<F, R>
+where
+    F: VsockListenerFactory,
+    R: BrokerRuntimeFactory<
+        <<F as VsockListenerFactory>::Listener as BrokerServiceListener>::Stream,
+    >,
+{
+    fn poll_broker_status(
+        &mut self,
+        lease: &BrokerLease,
+    ) -> Result<BrokerRuntimeStatus, BackendError> {
+        BrokerBackend::poll_broker_status(self, lease).map(|status| match status {
+            BrokerWorkerStatus::Running => BrokerRuntimeStatus::Running,
+            BrokerWorkerStatus::Exited(_) => BrokerRuntimeStatus::Exited,
+        })
+    }
+}
+
+fn run_worker<L, R>(
+    listener: &L,
+    runtime: R,
+    expected_guest_cid: u32,
+    cancellation: &BrokerCancellation,
+    stream_shutdown: &Arc<Mutex<Option<L::Shutdown>>>,
+    accept_poll_interval: Duration,
+) -> BrokerWorkerExit
+where
+    L: BrokerServiceListener,
+    R: BrokerRuntime<L::Stream>,
+{
+    let (peer_cid, stream) = loop {
+        if cancellation.is_cancelled() {
+            return BrokerWorkerExit::Cancelled;
+        }
+        match listener.try_accept_peer() {
+            Ok(Some(accepted)) => break accepted,
+            Ok(None) => thread::park_timeout(accept_poll_interval),
+            Err(error) => {
+                return BrokerWorkerExit::AcceptFailed {
+                    message: error.to_string(),
+                };
+            }
+        }
+    };
+
+    if peer_cid != expected_guest_cid {
+        return BrokerWorkerExit::UnexpectedPeer {
+            expected: expected_guest_cid,
+            received: peer_cid,
+        };
+    }
+    let shutdown = match L::shutdown_handle(&stream) {
+        Ok(shutdown) => shutdown,
+        Err(error) => {
+            return BrokerWorkerExit::ShutdownHandleFailed {
+                message: error.to_string(),
+            };
+        }
+    };
+    stream_shutdown
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace(shutdown);
+    if cancellation.is_cancelled() {
+        return BrokerWorkerExit::Cancelled;
+    }
+    BrokerWorkerExit::Connection(runtime.serve(stream, cancellation))
 }
 
 fn validate_host_cid(host_cid: u32) -> Result<(), BackendError> {
@@ -276,6 +790,15 @@ fn validate_backlog(backlog: i32) -> Result<(), BackendError> {
     Ok(())
 }
 
+fn validate_duration(name: &str, duration: Duration) -> Result<(), BackendError> {
+    if duration.is_zero() {
+        return Err(BackendError::new(format!(
+            "invalid Broker {name}: expected a positive duration",
+        )));
+    }
+    Ok(())
+}
+
 fn unknown_lease_error(operation: &str) -> BackendError {
     BackendError::new(format!(
         "Broker {operation} rejected: lease is not the exact active or previously closed lease",
@@ -287,17 +810,21 @@ mod tests {
     use std::{
         io::{self, Cursor},
         sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            Arc, Condvar, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        thread,
+        time::{Duration, Instant},
     };
 
-    use egress_broker::transport::PeerBoundListener;
-
-    use super::{BrokerBackend, VsockListenerFactory};
+    use super::{
+        BrokerBackend, BrokerCancellation, BrokerConnectionExit, BrokerRuntime,
+        BrokerRuntimeFactory, BrokerServiceListener, BrokerStreamShutdown, BrokerWorkerExit,
+        BrokerWorkerStatus, VsockListenerFactory,
+    };
     use crate::{
-        BrokerBackend as OrchestratorBrokerBackend, BrokerLease, BrokerSessionId, CapabilityId,
-        RequestId, SessionId, SessionIdentity, SubjectId, VmId, WorkspaceId,
+        BackendError, BrokerBackend as OrchestratorBrokerBackend, BrokerLease, BrokerSessionId,
+        CapabilityId, RequestId, SessionId, SessionIdentity, SubjectId, VmId, WorkspaceId,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,33 +835,72 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakeFactory {
+    struct FakeListenerFactory {
         calls: Arc<Mutex<Vec<BindCall>>>,
-        drops: Arc<AtomicUsize>,
+        peer_cid: u32,
+        accepted: Arc<AtomicBool>,
+        shutdowns: Arc<AtomicUsize>,
     }
 
     struct FakeListener {
-        drops: Arc<AtomicUsize>,
+        peer_cid: u32,
+        accepted: Arc<AtomicBool>,
+        shutdowns: Arc<AtomicUsize>,
     }
 
-    impl Drop for FakeListener {
-        fn drop(&mut self) {
-            self.drops.fetch_add(1, Ordering::SeqCst);
+    struct FakeStream {
+        bytes: Cursor<Vec<u8>>,
+        shutdowns: Arc<AtomicUsize>,
+    }
+
+    impl io::Read for FakeStream {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.bytes.read(buffer)
         }
     }
 
-    impl PeerBoundListener for FakeListener {
-        type Stream = Cursor<Vec<u8>>;
+    impl io::Write for FakeStream {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.write(buffer)
+        }
 
-        fn accept_peer(&self) -> io::Result<(u32, Self::Stream)> {
-            Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "fake listener has no peer",
-            ))
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
-    impl VsockListenerFactory for FakeFactory {
+    struct FakeShutdown(Arc<AtomicUsize>);
+
+    impl BrokerStreamShutdown for FakeShutdown {
+        fn shutdown(&self) -> io::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl BrokerServiceListener for FakeListener {
+        type Stream = FakeStream;
+        type Shutdown = FakeShutdown;
+
+        fn try_accept_peer(&self) -> io::Result<Option<(u32, Self::Stream)>> {
+            if self.accepted.swap(true, Ordering::SeqCst) {
+                return Ok(None);
+            }
+            Ok(Some((
+                self.peer_cid,
+                FakeStream {
+                    bytes: Cursor::new(Vec::new()),
+                    shutdowns: Arc::clone(&self.shutdowns),
+                },
+            )))
+        }
+
+        fn shutdown_handle(stream: &Self::Stream) -> io::Result<Self::Shutdown> {
+            Ok(FakeShutdown(Arc::clone(&stream.shutdowns)))
+        }
+    }
+
+    impl VsockListenerFactory for FakeListenerFactory {
         type Listener = FakeListener;
 
         fn bind(&self, host_cid: u32, port: u32, backlog: i32) -> io::Result<Self::Listener> {
@@ -347,8 +913,69 @@ mod tests {
                     backlog,
                 });
             Ok(FakeListener {
-                drops: Arc::clone(&self.drops),
+                peer_cid: self.peer_cid,
+                accepted: Arc::clone(&self.accepted),
+                shutdowns: Arc::clone(&self.shutdowns),
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct RuntimeFactory {
+        builds: Arc<AtomicUsize>,
+        behavior: RuntimeBehavior,
+    }
+
+    #[derive(Clone)]
+    enum RuntimeBehavior {
+        Exit(BrokerConnectionExit),
+        Block(Arc<(Mutex<BlockState>, Condvar)>),
+        Panic,
+    }
+
+    #[derive(Default)]
+    struct BlockState {
+        entered: bool,
+        released: bool,
+    }
+
+    struct TestRuntime(RuntimeBehavior);
+
+    impl BrokerRuntime<FakeStream> for TestRuntime {
+        fn serve(
+            self,
+            _stream: FakeStream,
+            cancellation: &BrokerCancellation,
+        ) -> BrokerConnectionExit {
+            match self.0 {
+                RuntimeBehavior::Exit(exit) => exit,
+                RuntimeBehavior::Block(gate) => {
+                    let (state, condvar) = &*gate;
+                    let mut state = state.lock().expect("gate lock must not be poisoned");
+                    state.entered = true;
+                    condvar.notify_all();
+                    while !state.released {
+                        state = condvar
+                            .wait_timeout(state, Duration::from_millis(2))
+                            .expect("gate wait must not be poisoned")
+                            .0;
+                        if cancellation.is_cancelled() && state.released {
+                            break;
+                        }
+                    }
+                    BrokerConnectionExit::Cancelled
+                }
+                RuntimeBehavior::Panic => panic!("scripted Broker runtime panic"),
+            }
+        }
+    }
+
+    impl BrokerRuntimeFactory<FakeStream> for RuntimeFactory {
+        type Runtime = TestRuntime;
+
+        fn build(&self, _identity: &SessionIdentity) -> Result<Self::Runtime, BackendError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(TestRuntime(self.behavior.clone()))
         }
     }
 
@@ -364,114 +991,261 @@ mod tests {
         }
     }
 
-    fn backend() -> (
-        BrokerBackend<FakeFactory>,
+    fn backend(
+        behavior: RuntimeBehavior,
+        join_timeout: Duration,
+    ) -> (
+        BrokerBackend<FakeListenerFactory, RuntimeFactory>,
         Arc<Mutex<Vec<BindCall>>>,
+        Arc<AtomicUsize>,
         Arc<AtomicUsize>,
     ) {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let drops = Arc::new(AtomicUsize::new(0));
-        let factory = FakeFactory {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let listener_factory = FakeListenerFactory {
             calls: Arc::clone(&calls),
-            drops: Arc::clone(&drops),
+            peer_cid: 7,
+            accepted: Arc::new(AtomicBool::new(false)),
+            shutdowns: Arc::clone(&shutdowns),
         };
-        let backend = BrokerBackend::new(factory, 2, 7, 9000, 16)
-            .expect("test transport configuration must be valid");
-        (backend, calls, drops)
+        let runtime_factory = RuntimeFactory {
+            builds: Arc::clone(&builds),
+            behavior,
+        };
+        let backend = BrokerBackend::with_timeouts(
+            listener_factory,
+            runtime_factory,
+            2,
+            7,
+            9000,
+            16,
+            Duration::from_millis(1),
+            join_timeout,
+        )
+        .expect("test transport configuration must be valid");
+        (backend, calls, builds, shutdowns)
+    }
+
+    fn wait_for_exit(
+        backend: &mut BrokerBackend<FakeListenerFactory, RuntimeFactory>,
+        lease: &BrokerLease,
+    ) -> BrokerWorkerExit {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match backend
+                .poll_broker_status(lease)
+                .expect("exact lease status poll must succeed")
+            {
+                BrokerWorkerStatus::Running if Instant::now() < deadline => thread::yield_now(),
+                BrokerWorkerStatus::Running => panic!("Broker worker did not exit before deadline"),
+                BrokerWorkerStatus::Exited(exit) => return exit,
+            }
+        }
+    }
+
+    fn wait_until_runtime_entered(gate: &Arc<(Mutex<BlockState>, Condvar)>) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (state, condvar) = &**gate;
+        let mut state = state.lock().expect("gate lock must not be poisoned");
+        while !state.entered {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "Broker runtime did not start before deadline"
+            );
+            state = condvar
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .expect("gate wait must not be poisoned")
+                .0;
+        }
+    }
+
+    fn release_runtime(gate: &Arc<(Mutex<BlockState>, Condvar)>) {
+        let (state, condvar) = &**gate;
+        state
+            .lock()
+            .expect("gate lock must not be poisoned")
+            .released = true;
+        condvar.notify_all();
     }
 
     #[test]
-    fn establish_binds_exact_transport_and_identity() {
-        let (mut backend, calls, _) = backend();
-        let identity = identity(1);
+    fn establish_binds_builds_spawns_then_returns_exact_lease() {
+        let (mut backend, calls, builds, _) = backend(
+            RuntimeBehavior::Exit(BrokerConnectionExit::RequestLimitReached { requests_served: 8 }),
+            Duration::from_secs(1),
+        );
+        let session = identity(1);
 
         let lease = backend
-            .establish_broker_session(&identity)
+            .establish_broker_session(&session)
             .expect("first Broker establishment must succeed");
 
-        assert_eq!(lease.session_id(), identity.session_id());
-        assert_eq!(lease.broker_session_id(), identity.broker_session_id());
-        assert_eq!(backend.expected_guest_cid(), 7);
+        assert_eq!(lease.session_id(), session.session_id());
+        assert_eq!(lease.broker_session_id(), session.broker_session_id());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
         assert_eq!(
-            *calls
-                .lock()
-                .expect("fake bind call lock must not be poisoned"),
+            *calls.lock().expect("bind log must not be poisoned"),
             vec![BindCall {
                 host_cid: 2,
                 port: 9000,
                 backlog: 16,
             }]
         );
-        assert!(backend.listener_for(&lease).is_ok());
-    }
-
-    #[test]
-    fn duplicate_establish_is_rejected_without_another_bind() {
-        let (mut backend, calls, _) = backend();
-        let first = identity(10);
-        backend
-            .establish_broker_session(&first)
-            .expect("first Broker establishment must succeed");
-
-        assert!(backend.establish_broker_session(&identity(20)).is_err());
         assert_eq!(
-            calls
-                .lock()
-                .expect("fake bind call lock must not be poisoned")
-                .len(),
-            1
+            wait_for_exit(&mut backend, &lease),
+            BrokerWorkerExit::Connection(BrokerConnectionExit::RequestLimitReached {
+                requests_served: 8,
+            })
         );
     }
 
     #[test]
-    fn mismatched_close_and_listener_lookup_fail_closed() {
-        let (mut backend, _, _) = backend();
-        let identity = identity(30);
+    fn exact_close_shuts_down_and_preserves_typed_exit_for_idempotent_poll() {
+        let gate = Arc::new((Mutex::new(BlockState::default()), Condvar::new()));
+        let (mut backend, _, _, shutdowns) = backend(
+            RuntimeBehavior::Block(Arc::clone(&gate)),
+            Duration::from_secs(1),
+        );
         let lease = backend
-            .establish_broker_session(&identity)
+            .establish_broker_session(&identity(10))
             .expect("Broker establishment must succeed");
-        let foreign = BrokerLease::new(SessionId::new([31; 16]), BrokerSessionId::new([32; 16]));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while shutdowns.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            if let Some(active) = backend.active.as_ref()
+                && active
+                    .stream_shutdown
+                    .lock()
+                    .expect("shutdown slot must not be poisoned")
+                    .is_some()
+            {
+                break;
+            }
+            thread::yield_now();
+        }
+        release_runtime(&gate);
 
-        assert!(backend.listener_for(&foreign).is_err());
-        assert!(backend.close_broker_session(&foreign).is_err());
-        assert!(backend.listener_for(&lease).is_ok());
+        backend
+            .close_broker_session(&lease)
+            .expect("exact close must join the worker");
+
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        assert!(backend.close_broker_session(&lease).is_ok());
+        assert_eq!(
+            backend
+                .poll_broker_status(&lease)
+                .expect("closed exact lease remains observable"),
+            BrokerWorkerStatus::Exited(BrokerWorkerExit::Connection(
+                BrokerConnectionExit::Cancelled
+            ))
+        );
     }
 
     #[test]
-    fn exact_close_is_idempotent_but_unknown_close_is_not_success() {
-        let (mut backend, _, drops) = backend();
+    fn close_timeout_retains_worker_for_exact_retry() {
+        let gate = Arc::new((Mutex::new(BlockState::default()), Condvar::new()));
+        let (mut backend, _, _, _) = backend(
+            RuntimeBehavior::Block(Arc::clone(&gate)),
+            Duration::from_millis(5),
+        );
+        let lease = backend
+            .establish_broker_session(&identity(20))
+            .expect("Broker establishment must succeed");
+        wait_until_runtime_entered(&gate);
+
+        let error = backend
+            .close_broker_session(&lease)
+            .expect_err("uncooperative worker must time out");
+        assert!(error.message().contains("ownership retained for retry"));
+        assert!(backend.active.is_some());
+
+        release_runtime(&gate);
+        backend
+            .close_broker_session(&lease)
+            .expect("same exact lease must be retryable");
+        assert!(backend.active.is_none());
+    }
+
+    #[test]
+    fn worker_panic_is_caught_as_typed_exit() {
+        let (mut backend, _, _, _) = backend(RuntimeBehavior::Panic, Duration::from_secs(1));
+        let lease = backend
+            .establish_broker_session(&identity(30))
+            .expect("Broker establishment must succeed");
+
+        assert_eq!(
+            wait_for_exit(&mut backend, &lease),
+            BrokerWorkerExit::Panicked
+        );
+        backend
+            .close_broker_session(&lease)
+            .expect("caught panic leaves a joinable worker");
+    }
+
+    #[test]
+    fn workload_release_check_requires_the_exact_worker_to_be_running() {
+        let gate = Arc::new((Mutex::new(BlockState::default()), Condvar::new()));
+        let (mut backend, _, _, _) = backend(
+            RuntimeBehavior::Block(Arc::clone(&gate)),
+            Duration::from_secs(1),
+        );
+        let lease = backend
+            .establish_broker_session(&identity(35))
+            .expect("Broker establishment must succeed");
+        wait_until_runtime_entered(&gate);
+
+        backend
+            .ensure_broker_session_running(&lease)
+            .expect("an observed running exact worker permits workload release");
+        release_runtime(&gate);
+        assert_eq!(
+            wait_for_exit(&mut backend, &lease),
+            BrokerWorkerExit::Connection(BrokerConnectionExit::Cancelled)
+        );
+        assert!(backend.ensure_broker_session_running(&lease).is_err());
+        backend
+            .close_broker_session(&lease)
+            .expect("test cleanup must succeed");
+    }
+
+    #[test]
+    fn foreign_close_and_status_poll_do_not_disturb_exact_owner() {
+        let (mut backend, _, _, _) = backend(
+            RuntimeBehavior::Exit(BrokerConnectionExit::EndOfStream),
+            Duration::from_secs(1),
+        );
         let lease = backend
             .establish_broker_session(&identity(40))
             .expect("Broker establishment must succeed");
+        let foreign = BrokerLease::new(SessionId::new([41; 16]), BrokerSessionId::new([42; 16]));
 
-        backend
-            .close_broker_session(&lease)
-            .expect("exact close must succeed");
-        assert!(backend.close_broker_session(&lease).is_ok());
-        assert!(backend.listener_for(&lease).is_err());
-        assert!(
-            backend
-                .close_broker_session(&BrokerLease::new(
-                    SessionId::new([41; 16]),
-                    BrokerSessionId::new([42; 16]),
-                ))
-                .is_err()
-        );
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(backend.poll_broker_status(&foreign).is_err());
+        assert!(backend.close_broker_session(&foreign).is_err());
+        assert!(backend.poll_broker_status(&lease).is_ok());
     }
 
     #[test]
-    fn exact_close_drops_the_active_listener() {
-        let (mut backend, _, drops) = backend();
+    fn duplicate_establish_is_rejected_without_another_bind_or_build() {
+        let gate = Arc::new((Mutex::new(BlockState::default()), Condvar::new()));
+        let (mut backend, calls, builds, _) = backend(
+            RuntimeBehavior::Block(Arc::clone(&gate)),
+            Duration::from_secs(1),
+        );
         let lease = backend
             .establish_broker_session(&identity(50))
-            .expect("Broker establishment must succeed");
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
+            .expect("first Broker establishment must succeed");
 
+        assert!(backend.establish_broker_session(&identity(51)).is_err());
+        assert_eq!(
+            calls.lock().expect("bind log must not be poisoned").len(),
+            1
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        release_runtime(&gate);
         backend
             .close_broker_session(&lease)
-            .expect("exact close must succeed");
-
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
+            .expect("test cleanup must succeed");
     }
 }

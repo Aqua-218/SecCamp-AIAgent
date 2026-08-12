@@ -17,7 +17,7 @@ use std::{
 
 use authority_core::{
     capability::{AuthorityBody, CapId, Capability, CapabilityRequest, SubjectId},
-    kernel::{CapabilityKernel, EffectCommitError},
+    kernel::{CapabilityKernel, EffectCommitError, EffectExecution},
     time::MonotonicTime,
 };
 use egress_protocol::{
@@ -27,7 +27,8 @@ use egress_protocol::{
     operation::BrokerOperation,
     response::MAX_PUBLIC_WIRE_BODY_BYTES,
     session::{
-        BrokerRequestId, BrokerSessionId, EnvelopeAcceptance, EnvelopeError, SessionReplayGuard,
+        BrokerRequestId, BrokerSessionId, EnvelopeAcceptance, EnvelopeError, PayloadHash,
+        SessionReplayGuard,
     },
 };
 
@@ -60,13 +61,9 @@ pub enum BrokerEffect {
 impl BrokerEffect {
     fn response_bytes(&self) -> u64 {
         match self {
-            Self::Public(response) => u64::try_from(response.body.len()).unwrap_or(u64::MAX),
-            Self::GitHub(response) => response.response_bytes,
+            Self::Public(response) => u64::try_from(response.body().len()).unwrap_or(u64::MAX),
+            Self::GitHub(response) => response.response_bytes(),
         }
-    }
-
-    fn is_commit_unknown(&self) -> bool {
-        matches!(self, Self::GitHub(response) if response.is_commit_unknown())
     }
 }
 
@@ -170,7 +167,7 @@ pub trait CapabilityExecutor {
         &self,
         context: &DispatchContext,
         request: &CapabilityRequest,
-        effect: &mut dyn FnMut(&Capability) -> Result<BrokerEffect, AdapterError>,
+        effect: &mut dyn FnMut(&Capability) -> EffectExecution<BrokerEffect, AdapterError>,
     ) -> Result<BrokerEffect, ExecutorError>;
 }
 
@@ -206,9 +203,9 @@ impl CapabilityExecutor for CapabilityKernel {
         &self,
         context: &DispatchContext,
         request: &CapabilityRequest,
-        effect: &mut dyn FnMut(&Capability) -> Result<BrokerEffect, AdapterError>,
+        effect: &mut dyn FnMut(&Capability) -> EffectExecution<BrokerEffect, AdapterError>,
     ) -> Result<BrokerEffect, ExecutorError> {
-        self.authorize_and_commit(
+        self.authorize_and_execute_classified(
             &context.caller,
             &context.capability,
             request,
@@ -220,6 +217,9 @@ impl CapabilityExecutor for CapabilityKernel {
             EffectCommitError::Effect(error) => ExecutorError::Adapter(error),
             EffectCommitError::Audit(_) => ExecutorError::AuditUnavailable,
             EffectCommitError::CommittedButAudit(_) => ExecutorError::CommittedButUnrecorded,
+            EffectCommitError::CommitUnknown | EffectCommitError::CommitUnknownAndAudit(_) => {
+                ExecutorError::CommittedButUnrecorded
+            }
         })
     }
 }
@@ -237,9 +237,14 @@ pub struct BrokerDispatcher<E, P, G> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CachedOutcome {
-    AcceptedPending { response_cap: u64 },
+    AcceptedPending {
+        response_cap: u64,
+    },
     Final(BrokerResponse),
-    RetryableBudget(BrokerOperation),
+    RetryableBudget {
+        operation: BrokerOperation,
+        payload_hash: PayloadHash,
+    },
 }
 
 impl<E, P, G> BrokerDispatcher<E, P, G>
@@ -341,8 +346,12 @@ where
                         Ok(self.recover_accepted_pending(request_id, response_cap))
                     }
                     Some(CachedOutcome::Final(response)) => Ok(response),
-                    Some(CachedOutcome::RetryableBudget(operation)) => {
-                        let (response, cached) = self.dispatch_new(request_id, &operation, context);
+                    Some(CachedOutcome::RetryableBudget {
+                        operation,
+                        payload_hash,
+                    }) => {
+                        let (response, cached) =
+                            self.dispatch_new(request_id, &operation, payload_hash, context);
                         // The same write-back as the `New` arm below. Storing
                         // only when `dispatch_new` returns `Some` would leave
                         // the entry `RetryableBudget` forever, so every later
@@ -357,8 +366,12 @@ where
                 }
             }
             EnvelopeAcceptance::New => {
-                let (response, cached) =
-                    self.dispatch_new(request_id, request.operation(), context);
+                let (response, cached) = self.dispatch_new(
+                    request_id,
+                    request.operation(),
+                    envelope.payload_hash(),
+                    context,
+                );
                 self.outcomes.insert(
                     request_id,
                     cached.unwrap_or_else(|| CachedOutcome::Final(response.clone())),
@@ -403,6 +416,7 @@ where
         &mut self,
         request_id: BrokerRequestId,
         operation: &BrokerOperation,
+        payload_hash: PayloadHash,
         context: &DispatchContext,
     ) -> (BrokerResponse, Option<CachedOutcome>) {
         if operation
@@ -421,7 +435,10 @@ where
         if let Err(error) = self.budget.start(request_id, response_cap) {
             let response = Self::rejected(request_id, BrokerRejection::Budget);
             let cached = if is_retryable_budget_error(error, self.budget.usage()) {
-                Some(CachedOutcome::RetryableBudget(operation.clone()))
+                Some(CachedOutcome::RetryableBudget {
+                    operation: operation.clone(),
+                    payload_hash,
+                })
             } else {
                 Some(CachedOutcome::Final(response.clone()))
             };
@@ -438,6 +455,7 @@ where
                 operation,
                 capability,
                 request_id,
+                payload_hash,
                 github_response_cap,
             )
         };
@@ -446,9 +464,6 @@ where
             .execute(context, &capability_request, &mut effect);
         match result {
             Ok(effect) => {
-                if effect.is_commit_unknown() {
-                    return self.settle_committed_but_unrecorded(request_id, response_cap);
-                }
                 if self
                     .budget
                     .complete(request_id, effect.response_bytes())
@@ -553,30 +568,44 @@ fn dispatch_adapter<P, G>(
     operation: &BrokerOperation,
     capability: &Capability,
     request_id: BrokerRequestId,
+    payload_hash: PayloadHash,
     github_response_cap: u64,
-) -> Result<BrokerEffect, AdapterError>
+) -> EffectExecution<BrokerEffect, AdapterError>
 where
     P: PublicDispatchAdapter,
     G: GitHubAdapter,
 {
     match (operation, capability.authority()) {
         (BrokerOperation::PublicFetch(request), AuthorityBody::HttpFetch(authority)) => {
-            public_fetch
-                .fetch(request, authority)
-                .map(BrokerEffect::Public)
-                .map_err(AdapterError::Public)
+            match public_fetch.fetch(request, authority) {
+                Ok(response) => EffectExecution::Committed {
+                    value: BrokerEffect::Public(response),
+                    receipt: None,
+                },
+                Err(error) => EffectExecution::FailedBeforeCommit(AdapterError::Public(error)),
+            }
         }
-        (BrokerOperation::GitHub(request), AuthorityBody::GitHub(authority)) => github
-            .execute(request_id, request, authority, github_response_cap)
-            .or_else(|error| match error {
-                GitHubAdapterError::CommitUnknown(unknown) => {
-                    Ok(GitHubResponse::commit_unknown(unknown))
+        (BrokerOperation::GitHub(request), AuthorityBody::GitHub(authority)) => {
+            match github
+                .execute(request_id, request, authority, github_response_cap)
+                .and_then(|response| {
+                    response.validate_dispatch_binding(request_id, request, github_response_cap)
+                }) {
+                Ok(response) => EffectExecution::Committed {
+                    value: BrokerEffect::GitHub(response),
+                    receipt: None,
+                },
+                Err(GitHubAdapterError::CommitUnknown(_)) => {
+                    let mut evidence = Vec::with_capacity(1 + 16 + 32);
+                    evidence.push(1);
+                    evidence.extend_from_slice(request_id.as_bytes());
+                    evidence.extend_from_slice(payload_hash.as_bytes());
+                    EffectExecution::CommitUnknown { evidence }
                 }
-                error => Err(error),
-            })
-            .map(BrokerEffect::GitHub)
-            .map_err(AdapterError::GitHub),
-        _ => Err(AdapterError::OperationMismatch),
+                Err(error) => EffectExecution::FailedBeforeCommit(AdapterError::GitHub(error)),
+            }
+        }
+        _ => EffectExecution::FailedBeforeCommit(AdapterError::OperationMismatch),
     }
 }
 
@@ -653,7 +682,7 @@ mod tests {
             CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethod, HttpFetchMethods,
             HttpFetchRequest, UrlPathPattern,
         },
-        kernel::CapabilityKernel,
+        kernel::{CapabilityKernel, EffectExecution},
         repository::RepoId,
         state::{CapabilityGrant, CapabilityState, StaticAuthorityEnvelope, Subject},
         time::{MonotonicTime, TimeWindow},
@@ -719,8 +748,8 @@ mod tests {
     impl GitHubAdapter for MockGithub {
         fn execute(
             &mut self,
-            _request_id: BrokerRequestId,
-            _request: &GitHubRequest,
+            request_id: BrokerRequestId,
+            request: &GitHubRequest,
             _authority: &GitHubAuthority,
             _max_response_bytes: u64,
         ) -> Result<GitHubResponse, GitHubAdapterError> {
@@ -728,13 +757,28 @@ mod tests {
             if self.failure {
                 Err(GitHubAdapterError::ProviderRejected)
             } else {
-                Ok(GitHubResponse::committed(
-                    3,
-                    GitHubOperation::CreatePullRequest,
-                    Some(7),
-                    None,
-                ))
+                GitHubResponse::committed(3, GitHubOperation::CreatePullRequest, Some(7), None)
+                    .map(|response| response.bind(request_id, request))
+                    .map_err(|_| GitHubAdapterError::InvalidProviderResponse)
             }
+        }
+    }
+
+    struct UnboundGithub {
+        calls: Arc<Mutex<u32>>,
+    }
+
+    impl GitHubAdapter for UnboundGithub {
+        fn execute(
+            &mut self,
+            _request_id: BrokerRequestId,
+            _request: &GitHubRequest,
+            _authority: &GitHubAuthority,
+            _max_response_bytes: u64,
+        ) -> Result<GitHubResponse, GitHubAdapterError> {
+            *self.calls.lock().expect("call mutex is not poisoned") += 1;
+            GitHubResponse::committed(3, GitHubOperation::CreatePullRequest, Some(7), None)
+                .map_err(|_| GitHubAdapterError::InvalidProviderResponse)
         }
     }
 
@@ -878,7 +922,7 @@ mod tests {
             &self,
             _context: &DispatchContext,
             _request: &CapabilityRequest,
-            _effect: &mut dyn FnMut(&Capability) -> Result<BrokerEffect, AdapterError>,
+            _effect: &mut dyn FnMut(&Capability) -> EffectExecution<BrokerEffect, AdapterError>,
         ) -> Result<BrokerEffect, ExecutorError> {
             Err((self.0)())
         }
@@ -893,7 +937,7 @@ mod tests {
             &self,
             _context: &DispatchContext,
             _request: &CapabilityRequest,
-            _effect: &mut dyn FnMut(&Capability) -> Result<BrokerEffect, AdapterError>,
+            _effect: &mut dyn FnMut(&Capability) -> EffectExecution<BrokerEffect, AdapterError>,
         ) -> Result<BrokerEffect, ExecutorError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             panic!("injected executor panic");
@@ -1071,8 +1115,17 @@ mod tests {
                 .effect_records()
                 .expect("kernel audit should remain readable")
                 .len(),
-            1,
-            "the sentinel must make the kernel record a committed effect"
+            0,
+            "an unknown provider result must never be recorded as committed"
+        );
+        let attempts = dispatcher
+            .executor
+            .attempt_records()
+            .expect("kernel audit should remain readable");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].outcome(),
+            authority_core::audit::AttemptOutcome::CommitUnknown
         );
 
         let retry = dispatcher
@@ -1085,6 +1138,67 @@ mod tests {
             "an exact retry must not send the GitHub mutation again"
         );
         assert_eq!(dispatcher.budget_usage().started_requests(), 1);
+    }
+
+    // Requirement: a dispatcher extension cannot report success without binding the result to
+    // the complete request that crossed the provider mutation boundary.
+    // Category: integration/security/accounting. Risk: critical.
+    #[test]
+    fn unbound_github_adapter_success_is_terminal_and_charged_at_the_full_cap() {
+        let (kernel, subject, capability) = github_kernel_and_capability();
+        let calls = Arc::new(Mutex::new(0));
+        let github_response_cap = 64;
+        let mut dispatcher = BrokerDispatcher::new(
+            kernel,
+            PublicFetcher::new(
+                ResolverFixture,
+                ConnectorFixture,
+                IpPolicy::default(),
+                FetchPolicy::default(),
+            ),
+            UnboundGithub {
+                calls: calls.clone(),
+            },
+            BrokerSessionId::new([1; 16]),
+            NonZeroUsize::new(8).expect("fixture capacity is non-zero"),
+            SessionBudgetLimits::new(
+                NonZeroU64::new(4).expect("fixture request limit is non-zero"),
+                128,
+                NonZeroUsize::new(1).expect("fixture concurrency limit is non-zero"),
+            ),
+            github_response_cap,
+        );
+        let context = DispatchContext {
+            caller: subject,
+            capability,
+            now: MonotonicTime::from_ticks(1),
+        };
+        let encoded = frame(BrokerSessionId::new([1; 16]), 0, 11, github_operation());
+
+        let first = dispatcher
+            .dispatch_frame(&encoded, &context)
+            .expect("an unbound post-mutation response must fail closed");
+        assert_eq!(
+            first.outcome,
+            BrokerOutcome::Rejected(BrokerRejection::CommittedButUnrecorded)
+        );
+        assert_eq!(*calls.lock().expect("call mutex is not poisoned"), 1);
+        assert_eq!(
+            dispatcher.budget_usage().committed_response_bytes(),
+            github_response_cap
+        );
+
+        assert_eq!(
+            dispatcher
+                .dispatch_frame(&encoded, &context)
+                .expect("the exact retry must return the retained terminal outcome"),
+            first
+        );
+        assert_eq!(
+            *calls.lock().expect("call mutex is not poisoned"),
+            1,
+            "binding rejection must never reopen the provider mutation"
+        );
     }
 
     // Requirement: an unjournalable attempt is not indistinguishable from an authorization denial.

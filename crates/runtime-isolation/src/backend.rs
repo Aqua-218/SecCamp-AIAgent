@@ -1,6 +1,6 @@
 //! Backend-independent isolation orchestration and failure handling.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, num::NonZeroU32};
 
 use crate::{IsolationConfig, Syscall};
 
@@ -174,6 +174,8 @@ pub enum IsolationError {
     InvalidConfig(String),
     /// Host capability detection refused to start the workload.
     CapabilityUnavailable(CapabilityReport),
+    /// The legacy in-process API cannot perform the required PID child handoff.
+    ChildHandoffRequired,
     /// A privileged operation failed.
     Backend(BackendError),
     /// A rollback operation failed after an earlier operation failed.
@@ -185,9 +187,9 @@ pub enum IsolationError {
     },
     /// Applying an irreversible step may have partially changed process state.
     ///
-    /// [`RuntimeIsolation::apply`] enforces this obligation by aborting the
-    /// current process. Code using the crate-internal non-enforcing transaction
-    /// path must not allow the process to continue.
+    /// [`RuntimeIsolation::spawn_isolated`] enforces this obligation by aborting
+    /// the current process. Code using the crate-internal non-enforcing
+    /// transaction path must not allow the process to continue.
     TerminationRequired {
         /// The operation that caused the transaction to stop.
         original: BackendError,
@@ -210,6 +212,9 @@ impl fmt::Display for IsolationError {
                 formatter,
                 "isolation capability detection failed: {}",
                 report.reasons.join("; ")
+            ),
+            Self::ChildHandoffRequired => formatter.write_str(
+                "isolation requires spawn_isolated so namespace preparation can hand off to a PID namespace child",
             ),
             Self::Backend(error) => error.fmt(formatter),
             Self::Rollback { original, failures } => write!(
@@ -242,16 +247,135 @@ impl fmt::Display for IsolationError {
 
 impl Error for IsolationError {}
 
-/// Proof that every isolation step completed in the required order.
-#[derive(Clone, Debug)]
+/// Stable kernel identity of one namespace inode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamespaceIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl NamespaceIdentity {
+    /// Records the device and inode returned by a namespace link observation.
+    pub const fn from_kernel(device: u64, inode: u64) -> Self {
+        Self { device, inode }
+    }
+
+    /// Returns the namespace filesystem device number.
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    /// Returns the namespace inode number.
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+}
+
+/// Linear proof that the backend prepared a distinct PID namespace for a child.
+#[derive(Debug, Eq, PartialEq)]
+pub struct NamespacePreparation {
+    parent: NamespaceIdentity,
+    child: NamespaceIdentity,
+}
+
+impl NamespacePreparation {
+    /// Creates a preparation attestation from kernel-observed namespace identities.
+    ///
+    /// Backend implementations are trusted to call this only after preparing all
+    /// required namespaces and observing a child PID namespace distinct from the
+    /// current process PID namespace.
+    pub const fn attest(parent: NamespaceIdentity, child: NamespaceIdentity) -> Self {
+        Self { parent, child }
+    }
+
+    /// Returns the PID namespace occupied by the preparing parent.
+    pub const fn parent(&self) -> NamespaceIdentity {
+        self.parent
+    }
+
+    /// Returns the PID namespace reserved for the spawned workload child.
+    pub const fn child(&self) -> NamespaceIdentity {
+        self.child
+    }
+}
+
+/// Linear proof that kernel observation placed this process in the prepared namespace.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PidNamespaceChild {
+    namespace: NamespaceIdentity,
+}
+
+impl PidNamespaceChild {
+    /// Creates a child-entry attestation after backend kernel verification.
+    ///
+    /// Backend implementations are trusted to compare the current PID namespace
+    /// to [`NamespacePreparation::child`] before constructing this value.
+    pub const fn attest(namespace: NamespaceIdentity) -> Self {
+        Self { namespace }
+    }
+
+    /// Returns the verified workload PID namespace.
+    pub const fn namespace(&self) -> NamespaceIdentity {
+        self.namespace
+    }
+}
+
+/// Namespace-launcher ownership of a successfully spawned isolation child.
+///
+/// This handle is returned in the process that prepared namespaces. That
+/// launcher may already have irreversible process-global namespace changes and
+/// must not resume trusted supervisor work.
+#[derive(Debug, Eq, PartialEq)]
+pub struct IsolatedChildProcess {
+    pid: NonZeroU32,
+    pid_namespace: NamespaceIdentity,
+}
+
+impl IsolatedChildProcess {
+    /// Creates a parent handle from a positive child PID and prepared namespace.
+    ///
+    /// Backend implementations are trusted to use the PID returned by the spawn
+    /// operation that consumed the corresponding [`NamespacePreparation`].
+    pub const fn attest(pid: NonZeroU32, pid_namespace: NamespaceIdentity) -> Self {
+        Self { pid, pid_namespace }
+    }
+
+    /// Returns the child PID as seen by the preparing parent.
+    pub const fn pid(&self) -> NonZeroU32 {
+        self.pid
+    }
+
+    /// Returns the PID namespace prepared for the child.
+    pub const fn pid_namespace(&self) -> NamespaceIdentity {
+        self.pid_namespace
+    }
+}
+
+/// Process role returned by an explicit isolation spawn.
+#[derive(Debug, Eq, PartialEq)]
+pub enum SpawnOutcome<T> {
+    /// The preparing launcher owns the spawned child and never receives a receipt.
+    Parent(IsolatedChildProcess),
+    /// The verified PID namespace child completed isolation and ran the entry point.
+    Child(T),
+}
+
+/// Child-owned proof that every isolation step completed in the required order.
+#[derive(Debug)]
 pub struct IsolationReceipt {
     steps: Vec<IsolationStep>,
+    pid_namespace_child: PidNamespaceChild,
 }
 
 impl IsolationReceipt {
     /// Returns the completed steps in execution order.
     pub fn steps(&self) -> &[IsolationStep] {
         &self.steps
+    }
+
+    /// Returns the kernel-observed PID namespace entered by this child.
+    pub const fn pid_namespace(&self) -> NamespaceIdentity {
+        self.pid_namespace_child.namespace()
     }
 }
 
@@ -260,7 +384,62 @@ pub trait IsolationBackend {
     /// Detects host capabilities without mutating the process.
     fn detect_capabilities(&mut self, config: &IsolationConfig) -> CapabilityReport;
 
-    /// Executes one named setup operation.
+    /// Prepares all required namespaces and returns a linear child-handoff token.
+    ///
+    /// This operation may irreversibly mutate the calling launcher process. It
+    /// must run only in an expendable process dedicated to this isolation spawn.
+    ///
+    /// The default rejects before mutation. A production backend must override
+    /// this together with [`Self::spawn_isolated`] and
+    /// [`Self::verify_pid_namespace_child`].
+    fn prepare_namespaces(
+        &mut self,
+        _config: &IsolationConfig,
+    ) -> Result<NamespacePreparation, BackendError> {
+        Err(BackendError::new(
+            IsolationStep::Namespaces,
+            "backend does not implement explicit namespace preparation",
+            None,
+        ))
+    }
+
+    /// Consumes prepared namespaces, spawning a child that invokes `child_entry`.
+    ///
+    /// The parent must return [`SpawnOutcome::Parent`] without invoking the entry
+    /// point. Only the spawned child may invoke it and return
+    /// [`SpawnOutcome::Child`]. A production implementation must arrange for the
+    /// child to execute in `preparation.child()`.
+    fn spawn_isolated<T, F>(
+        &mut self,
+        _preparation: NamespacePreparation,
+        _child_entry: F,
+    ) -> Result<SpawnOutcome<T>, BackendError>
+    where
+        Self: Sized,
+        F: FnOnce(&mut Self, NamespacePreparation) -> T,
+    {
+        Err(BackendError::new(
+            IsolationStep::Namespaces,
+            "backend does not implement explicit PID namespace child handoff",
+            None,
+        ))
+    }
+
+    /// Verifies that the current process entered the prepared child PID namespace.
+    fn verify_pid_namespace_child(
+        &mut self,
+        _preparation: NamespacePreparation,
+    ) -> Result<PidNamespaceChild, BackendError> {
+        Err(BackendError::new(
+            IsolationStep::Namespaces,
+            "backend does not implement PID namespace child verification",
+            None,
+        ))
+    }
+
+    /// Executes one post-handoff setup operation.
+    ///
+    /// Coordinators never pass [`IsolationStep::Namespaces`] through this method.
     fn apply_step(
         &mut self,
         step: IsolationStep,
@@ -279,67 +458,158 @@ pub trait IsolationBackend {
 pub struct RuntimeIsolation;
 
 impl RuntimeIsolation {
-    /// Applies a policy, rolling back reversible operations on failure.
+    /// Rejects the legacy in-process API before namespace mutation.
     ///
-    /// This function aborts the current process if an irreversible operation
-    /// may have been partially applied. It must therefore run only in the
-    /// expendable child process that will execute the workload.
+    /// PID namespaces apply to the next child, not the process calling
+    /// `unshare`. Call [`Self::spawn_isolated`] with an explicit workload entry
+    /// point instead.
     pub fn apply<B: IsolationBackend>(
         backend: &mut B,
         config: &IsolationConfig,
     ) -> Result<IsolationReceipt, IsolationError> {
-        match Self::apply_transaction(backend, config) {
+        Self::preflight(backend, config)?;
+        Err(IsolationError::ChildHandoffRequired)
+    }
+
+    /// Spawns an explicitly isolated process and runs `workload_entry` only in its child.
+    ///
+    /// Call this only in an expendable namespace-launcher process. Its parent
+    /// branch may already have irreversible namespace changes; it returns an
+    /// [`IsolatedChildProcess`] but cannot receive an [`IsolationReceipt`]. The
+    /// child verifies PID namespace entry, applies the remaining isolation
+    /// stages, then supplies the receipt to the workload entry point. An
+    /// irreversible failure aborts whichever process observed it.
+    pub fn spawn_isolated<B, F, T>(
+        backend: &mut B,
+        config: &IsolationConfig,
+        workload_entry: F,
+    ) -> Result<SpawnOutcome<T>, IsolationError>
+    where
+        B: IsolationBackend,
+        F: FnOnce(IsolationReceipt) -> T,
+    {
+        match Self::spawn_isolated_transaction(backend, config, workload_entry) {
             Err(IsolationError::TerminationRequired { .. }) => std::process::abort(),
             outcome => outcome,
         }
     }
 
-    /// Runs the isolation transaction without enforcing required termination.
+    /// Runs explicit spawn orchestration without enforcing required termination.
     ///
     /// This is crate-visible only so tests can inspect the typed obligation
-    /// without aborting the test process. Production callers must use
-    /// [`Self::apply`].
-    pub(crate) fn apply_transaction<B: IsolationBackend>(
+    /// without aborting the test process. Production callers must use the
+    /// enforcing [`Self::spawn_isolated`] entry point.
+    pub(crate) fn spawn_isolated_transaction<B, F, T>(
         backend: &mut B,
         config: &IsolationConfig,
-    ) -> Result<IsolationReceipt, IsolationError> {
+        workload_entry: F,
+    ) -> Result<SpawnOutcome<T>, IsolationError>
+    where
+        B: IsolationBackend,
+        F: FnOnce(IsolationReceipt) -> T,
+    {
+        Self::preflight(backend, config)?;
+
+        let preparation = backend.prepare_namespaces(config).map_err(|original| {
+            IsolationError::TerminationRequired {
+                original,
+                failures: Vec::new(),
+            }
+        })?;
+        let spawned = backend
+            .spawn_isolated(preparation, |child_backend, child_preparation| {
+                Self::enter_isolated_child(child_backend, config, child_preparation)
+                    .map(workload_entry)
+            })
+            .map_err(|original| IsolationError::TerminationRequired {
+                original,
+                failures: Vec::new(),
+            })?;
+
+        match spawned {
+            SpawnOutcome::Parent(child) => Ok(SpawnOutcome::Parent(child)),
+            SpawnOutcome::Child(result) => result.map(SpawnOutcome::Child),
+        }
+    }
+
+    fn preflight<B: IsolationBackend>(
+        backend: &mut B,
+        config: &IsolationConfig,
+    ) -> Result<(), IsolationError> {
         config.validate()?;
         let report = backend.detect_capabilities(config);
         if !report.is_sufficient(config) {
             return Err(IsolationError::CapabilityUnavailable(report));
         }
+        Ok(())
+    }
 
-        let mut completed = Vec::new();
-        for step in required_steps() {
+    fn enter_isolated_child<B: IsolationBackend>(
+        backend: &mut B,
+        config: &IsolationConfig,
+        preparation: NamespacePreparation,
+    ) -> Result<IsolationReceipt, IsolationError> {
+        let pid_namespace_child = match backend.verify_pid_namespace_child(preparation) {
+            Ok(child) => child,
+            Err(original) => {
+                return Err(Self::failure_after_steps(
+                    backend,
+                    config,
+                    &[IsolationStep::Namespaces],
+                    original,
+                ));
+            }
+        };
+        Self::apply_child_transaction(backend, config, pid_namespace_child)
+    }
+
+    fn apply_child_transaction<B: IsolationBackend>(
+        backend: &mut B,
+        config: &IsolationConfig,
+        pid_namespace_child: PidNamespaceChild,
+    ) -> Result<IsolationReceipt, IsolationError> {
+        let mut completed = vec![IsolationStep::Namespaces];
+        for step in required_steps().into_iter().skip(1) {
             match backend.apply_step(step, config) {
                 Ok(()) => completed.push(step),
                 Err(original) => {
-                    // A failed backend call may have applied only part of its
-                    // operation, so attempting an irreversible step is enough
-                    // to make reuse of this process unsafe.
-                    let termination_required = step.is_irreversible()
-                        || completed
-                            .iter()
-                            .copied()
-                            .any(IsolationStep::is_irreversible);
-                    let failures = completed
-                        .iter()
-                        .rev()
-                        .filter_map(|completed_step| {
-                            backend.rollback_step(*completed_step, config).err()
-                        })
-                        .collect::<Vec<_>>();
-                    return if termination_required {
-                        Err(IsolationError::TerminationRequired { original, failures })
-                    } else if failures.is_empty() {
-                        Err(IsolationError::Backend(original))
-                    } else {
-                        Err(IsolationError::Rollback { original, failures })
-                    };
+                    return Err(Self::failure_after_steps(
+                        backend, config, &completed, original,
+                    ));
                 }
             }
         }
-        Ok(IsolationReceipt { steps: completed })
+        Ok(IsolationReceipt {
+            steps: completed,
+            pid_namespace_child,
+        })
+    }
+
+    fn failure_after_steps<B: IsolationBackend>(
+        backend: &mut B,
+        config: &IsolationConfig,
+        completed: &[IsolationStep],
+        original: BackendError,
+    ) -> IsolationError {
+        // A failed backend call may have applied only part of its operation, so
+        // attempting an irreversible step is enough to make process reuse unsafe.
+        let termination_required = original.step.is_irreversible()
+            || completed
+                .iter()
+                .copied()
+                .any(IsolationStep::is_irreversible);
+        let failures = completed
+            .iter()
+            .rev()
+            .filter_map(|completed_step| backend.rollback_step(*completed_step, config).err())
+            .collect::<Vec<_>>();
+        if termination_required {
+            IsolationError::TerminationRequired { original, failures }
+        } else if failures.is_empty() {
+            IsolationError::Backend(original)
+        } else {
+            IsolationError::Rollback { original, failures }
+        }
     }
 }
 
@@ -352,6 +622,22 @@ pub fn apply<B: IsolationBackend>(
     config: &IsolationConfig,
 ) -> Result<IsolationReceipt, IsolationError> {
     RuntimeIsolation::apply(backend, config)
+}
+
+/// Spawns an isolated child and invokes `workload_entry` only after verified setup.
+///
+/// Call this only in an expendable namespace-launcher process. An irreversible
+/// isolation failure aborts the process that observes it.
+pub fn spawn_isolated<B, F, T>(
+    backend: &mut B,
+    config: &IsolationConfig,
+    workload_entry: F,
+) -> Result<SpawnOutcome<T>, IsolationError>
+where
+    B: IsolationBackend,
+    F: FnOnce(IsolationReceipt) -> T,
+{
+    RuntimeIsolation::spawn_isolated(backend, config, workload_entry)
 }
 
 fn required_steps() -> [IsolationStep; 13] {

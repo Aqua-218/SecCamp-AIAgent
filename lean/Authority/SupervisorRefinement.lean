@@ -87,13 +87,13 @@ inductive Failure where
   | finishShutdown
   deriving Repr, BEq, DecidableEq
 
-/-- Only known no-effect or cleanup-required mutations remain safely addressable. -/
+/-- A mutation target is known even when the call's effect is not. -/
 def ResourceMutation.Addressable : ResourceMutation → Prop
   | .noEffect => True
   | .cleanupRequired => True
-  | .effectUnknown => False
+  | .effectUnknown => True
 
-/-- An error is retry-addressable when it did not make resource ownership unknown. -/
+/-- A cleanup mutation error is retry-addressable because its token remains owned. -/
 def Failure.Addressable : Failure → Prop
   | .cleanupWorkload outcome
   | .cleanupControl outcome
@@ -328,11 +328,11 @@ def failOpenRetained (state : State) (handle : OpenHandle) : State :=
     lifecycle := .closing
     pendingOpen := none }
 
-/-- Unknown compensation effect is terminal without external reconciliation. -/
+/-- Unknown compensation retains the known descriptor for cleanup retry. -/
 def failOpenUnknown (state : State) (handle : OpenHandle) : State :=
   { state with
     integrated := state.integrated.failOpenAfterRegistration handle
-    lifecycle := .cleanupBlocked
+    lifecycle := .closing
     pendingOpen := none }
 
 end State
@@ -909,7 +909,7 @@ theorem failOpenRetained_blocks_open {state : State} {handle : OpenHandle} :
   rintro ⟨result, after, transition⟩
   cases transition <;> simp [State.failOpenRetained] at *
 
-/-- Unknown compensation is terminal for later open requests. -/
+/-- Retained compensation ambiguity blocks later opens until cleanup completes. -/
 theorem failOpenUnknown_blocks_open {state : State} {handle : OpenHandle} :
     ¬ ∃ result after, OpenStep (state.failOpenUnknown handle) result after := by
   rintro ⟨result, after, transition⟩
@@ -923,11 +923,11 @@ theorem failOpenRetained_owns_cleanup {state : State} {handle : OpenHandle}
   exact ⟨rfl, by simpa [State.failOpenRetained] using
     invariant.pendingRuntimeOwned handle pending⟩
 
-/-- Unknown compensation retains the descriptor but blocks modeled cleanup. -/
-theorem failOpenUnknown_owns_unresolved_cleanup {state : State}
+/-- Unknown compensation retains an addressable descriptor for cleanup retry. -/
+theorem failOpenUnknown_owns_retryable_cleanup {state : State}
     {handle : OpenHandle} (invariant : state.Invariant)
     (pending : state.pendingOpen = some handle) :
-    (state.failOpenUnknown handle).lifecycle = .cleanupBlocked ∧
+    (state.failOpenUnknown handle).lifecycle = .closing ∧
       (state.failOpenUnknown handle).RuntimeOwns handle.id := by
   exact ⟨rfl, by simpa [State.failOpenUnknown] using
     invariant.pendingRuntimeOwned handle pending⟩
@@ -989,47 +989,31 @@ def unmount (state : State) : State := { state with ownsMount := .none }
 /-- Release the cgroup only after workload and mount cleanup. -/
 def removeCgroup (state : State) : State := { state with ownsCgroup := .none }
 
-/-- Record an error-returning cleanup mutation without guessing its effect. -/
-def failMutation (state : State) (resource : ResourceKind)
+/-- Record a cleanup error while retaining its known target token for retry. -/
+def failMutation (state : State) (_resource : ResourceKind)
     (outcome : ResourceMutation) : State :=
   match outcome with
   | .noEffect => state
   | .cleanupRequired => state
-  | .effectUnknown =>
-      { state.setResource resource .unresolved with lifecycle := .cleanupBlocked }
+  | .effectUnknown => { state with lifecycle := .closing }
 
-/-- A descriptor mutation with unknown effect also enters terminal reconciliation. -/
+/-- A descriptor mutation with unknown effect retains its known token for retry. -/
 def failHandleMutation (state : State) (outcome : ResourceMutation) : State :=
   match outcome with
   | .noEffect => state
   | .cleanupRequired => state
-  | .effectUnknown => { state with lifecycle := .cleanupBlocked }
+  | .effectUnknown => { state with lifecycle := .closing }
 
-/-- Unknown cleanup evidence changes ownership metadata, not scoped refinement. -/
+/-- Cleanup error bookkeeping preserves owned tokens and scoped refinement. -/
 theorem Invariant.failMutation {state : State} (invariant : state.Invariant)
     (resource : ResourceKind) (outcome : ResourceMutation) :
     (state.failMutation resource outcome).Invariant := by
-  cases resource <;> cases outcome
+  cases outcome
   · exact invariant
   · exact invariant
-  · simpa [failMutation, setResource] using invariant.updateCleanupFlags
-      .cleanupBlocked .unresolved state.ownsMount state.ownsControl
-        state.ownsWorkload
-  · exact invariant
-  · exact invariant
-  · simpa [failMutation, setResource] using invariant.updateCleanupFlags
-      .cleanupBlocked state.ownsCgroup .unresolved state.ownsControl
-        state.ownsWorkload
-  · exact invariant
-  · exact invariant
-  · simpa [failMutation, setResource] using invariant.updateCleanupFlags
-      .cleanupBlocked state.ownsCgroup state.ownsMount .unresolved
-        state.ownsWorkload
-  · exact invariant
-  · exact invariant
-  · simpa [failMutation, setResource] using invariant.updateCleanupFlags
-      .cleanupBlocked state.ownsCgroup state.ownsMount state.ownsControl
-        .unresolved
+  · simpa [failMutation] using (invariant.updateCleanupFlags
+      .closing state.ownsCgroup state.ownsMount state.ownsControl
+        state.ownsWorkload)
 
 /-- Descriptor effect uncertainty changes lifecycle, not scoped refinement facts. -/
 theorem Invariant.failHandleMutation {state : State} (invariant : state.Invariant)
@@ -1038,7 +1022,7 @@ theorem Invariant.failHandleMutation {state : State} (invariant : state.Invarian
   · exact invariant
   · exact invariant
   · simpa [failHandleMutation] using invariant.updateCleanupFlags
-      .cleanupBlocked state.ownsCgroup state.ownsMount state.ownsControl
+      .closing state.ownsCgroup state.ownsMount state.ownsControl
         state.ownsWorkload
 
 /-- Error bookkeeping leaves both permanent local tombstone maps unchanged. -/
@@ -1206,12 +1190,25 @@ inductive CleanupStep : State → ResultLabel → State → Prop
       state.pendingOpen = none →
       CleanupStep state (.ok .finishShutdown) state.finishUnregisteredShutdown
 
-/-- Unknown external effects require reconciliation outside modeled cleanup. -/
+/-- Tokenless acquisition ambiguity requires reconciliation outside modeled cleanup. -/
 theorem cleanupBlocked_is_terminal {state : State}
     (blocked : state.lifecycle = .cleanupBlocked) :
     ¬ ∃ result after, CleanupStep state result after := by
   rintro ⟨result, after, transition⟩
   cases transition <;> simp_all
+
+/-- A partial-open mutation with a known descriptor can immediately resume cleanup. -/
+theorem failOpenUnknown_cleanup_retriable {state : State} {handle : OpenHandle}
+    (invariant : state.Invariant) (pending : state.pendingOpen = some handle)
+    (notAuthority : ¬ state.AuthorityOwns handle.id) :
+    CleanupStep (state.failOpenUnknown handle) (.ok .closeRuntimeHandle)
+      ((state.failOpenUnknown handle).closeRuntimeOnly handle.id) := by
+  apply CleanupStep.closeRuntimeOnly
+  · rfl
+  · simpa [State.failOpenUnknown] using
+      invariant.pendingRuntimeOwned handle pending
+  · simpa [State.failOpenUnknown] using notAuthority
+  · rfl
 
 /-- Cleanup-required acquisition failure retains an addressable token. -/
 theorem acquisition_cleanupRequired_retains (state : State)
@@ -1340,31 +1337,41 @@ theorem CleanupStep.error_retriable {before after : State} {failure : Failure}
       cases outcome
       · exact CleanupStep.stopWorkloadFailed closing owned
       · exact CleanupStep.stopWorkloadFailed closing owned
-      · simp [Failure.Addressable, ResourceMutation.Addressable] at addressable
+      · apply CleanupStep.stopWorkloadFailed
+        · simp [State.failMutation]
+        · simpa [State.failMutation] using owned
   | closeControlFailed closing owned =>
       rename_i outcome
       cases outcome
       · exact CleanupStep.closeControlFailed closing owned
       · exact CleanupStep.closeControlFailed closing owned
-      · simp [Failure.Addressable, ResourceMutation.Addressable] at addressable
+      · apply CleanupStep.closeControlFailed
+        · simp [State.failMutation]
+        · simpa [State.failMutation] using owned
   | closeHandleFailed closing owned =>
       rename_i handleId outcome
       cases outcome
       · exact CleanupStep.closeHandleFailed closing owned
       · exact CleanupStep.closeHandleFailed closing owned
-      · simp [Failure.Addressable, ResourceMutation.Addressable] at addressable
+      · apply CleanupStep.closeHandleFailed
+        · simp [State.failHandleMutation]
+        · simpa [State.failHandleMutation] using owned
   | unmountFailed closing owned =>
       rename_i outcome
       cases outcome
       · exact CleanupStep.unmountFailed closing owned
       · exact CleanupStep.unmountFailed closing owned
-      · simp [Failure.Addressable, ResourceMutation.Addressable] at addressable
+      · apply CleanupStep.unmountFailed
+        · simp [State.failMutation]
+        · simpa [State.failMutation] using owned
   | removeCgroupFailed closing owned =>
       rename_i outcome
       cases outcome
       · exact CleanupStep.removeCgroupFailed closing owned
       · exact CleanupStep.removeCgroupFailed closing owned
-      · simp [Failure.Addressable, ResourceMutation.Addressable] at addressable
+      · apply CleanupStep.removeCgroupFailed
+        · simp [State.failMutation]
+        · simpa [State.failMutation] using owned
   | finishRejected closing =>
       exact CleanupStep.finishRejected closing
 
@@ -1380,31 +1387,41 @@ theorem CleanupStep.error_preserves_ownership {before after : State}
       cases outcome
       · intro asset; rfl
       · intro asset; rfl
-      · simp [Failure.Addressable, ResourceMutation.Addressable] at addressable
+      · intro asset
+        cases asset <;> simp [State.failMutation, State.OwnsAsset,
+          State.RuntimeOwns, State.AuthorityOwns]
   | closeControlFailed closing owned =>
       rename_i outcome
       cases outcome
       · intro asset; rfl
       · intro asset; rfl
-      · simp [Failure.Addressable, ResourceMutation.Addressable] at addressable
+      · intro asset
+        cases asset <;> simp [State.failMutation, State.OwnsAsset,
+          State.RuntimeOwns, State.AuthorityOwns]
   | closeHandleFailed closing owned =>
       rename_i handleId outcome
       cases outcome
       · intro asset; rfl
       · intro asset; rfl
-      · simp [Failure.Addressable, ResourceMutation.Addressable] at addressable
+      · intro asset
+        cases asset <;> simp [State.failHandleMutation, State.OwnsAsset,
+          State.RuntimeOwns, State.AuthorityOwns]
   | unmountFailed closing owned =>
       rename_i outcome
       cases outcome
       · intro asset; rfl
       · intro asset; rfl
-      · simp [Failure.Addressable, ResourceMutation.Addressable] at addressable
+      · intro asset
+        cases asset <;> simp [State.failMutation, State.OwnsAsset,
+          State.RuntimeOwns, State.AuthorityOwns]
   | removeCgroupFailed closing owned =>
       rename_i outcome
       cases outcome
       · intro asset; rfl
       · intro asset; rfl
-      · simp [Failure.Addressable, ResourceMutation.Addressable] at addressable
+      · intro asset
+        cases asset <;> simp [State.failMutation, State.OwnsAsset,
+          State.RuntimeOwns, State.AuthorityOwns]
   | finishRejected => intro asset; rfl
 
 /-- Every cleanup-only transition preserves the conditional refinement invariant. -/
@@ -1755,7 +1772,7 @@ theorem failed_open_retained_tombstone_persists {state : State}
   exact suffix.tombstones_extend.2 handle.id (by
     simpa [State.failOpenRetained] using issued)
 
-/-- Even terminal unknown compensation keeps the consumed handle permanent. -/
+/-- Retryable unknown compensation keeps the consumed handle permanent. -/
 theorem failed_open_unknown_tombstone_persists {state : State}
     {handle : OpenHandle} (invariant : state.Invariant)
     (pending : state.pendingOpen = some handle) {after : State}

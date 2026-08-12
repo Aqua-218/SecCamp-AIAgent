@@ -12,56 +12,19 @@
 
 | 文書 | 対象ソース | 内容 |
 |---|---|---|
-| [production backend 契約](contracts.md) | [`authority_backend.rs`](../../crates/session-orchestrator/src/authority_backend.rs) ほか | adapter 実装者の義務、lease の返し方、順序 |
+| [session の commit 順序と cleanup](lifecycle.md) | [`lib.rs`](../../crates/session-orchestrator/src/lib.rs) | 5 stage の取得順、逆順の解放、`Stopping` に留まる条件 |
+| [identity と ledger](identity-ledger.md) | [`lib.rs`](../../crates/session-orchestrator/src/lib.rs) | 7 つの identity、on-disk format、durability 順序、排他所有 |
+| [lease の binding](lease-binding.md) | [`lib.rs`](../../crates/session-orchestrator/src/lib.rs) | backend が返す lease の照合、型で守る順序 |
+| [production backend 契約](contracts.md) | [`authority_backend.rs`](../../crates/session-orchestrator/src/authority_backend.rs) ほか | adapter 実装者の義務 |
+| [検証対応表](verification.md) | — | mock で見た範囲と、実機・並行性で未検証の範囲 |
 
-`lib.rs` は 2,361 行あり、state machine、identity ledger、durable ledger を 1 file に持つ。以下の節はその要約で、それぞれ独立した概念ページに分ける予定。
+## 特に注意する点
 
-## lifecycle
-
-startup は次の commit 順で進む。
-
-```text
-session-scoped identity のない snapshot descriptor
-  -> 7つの 128-bit identity を割り当て
-  -> session 専用 workspace を clone
-  -> restore 後の新しい Broker session を確立
-  -> 一つの Firecracker VM を起動
-  -> 一つの subject へ root capability を注入
-  -> 制限を適用済みの workload を release
-  -> Running
-```
-
-実際の公開 state は `Ready`、`WorkspaceCloned`、`BrokerEstablished`、`VmStarted`、`RootCapabilityInjected`、`WorkloadReleased`、`Running`、`Stopping`、`Closed` である。各 backend は effect が commit point に到達した後だけ、対応する lease を返す。lease の session/resource identity が要求と一致しなければ、次の stage へ進まず失敗する。
-
-startup failure は commit 済み resource だけを依存関係の逆順で rollback する。workload release 後の rollback は root capability revoke、VM kill、Broker close、workspace isolation の順である。VM kill が失敗した場合は、live VM が workspace を保持したまま別用途へ回らないよう workspace isolation を実行しない。
-
-stop も同じ containment order を使い、root revoke、VM kill、Broker close、workspace isolation を試みる。どれかが失敗した場合は `Stopping` を保持し、次回は未完了 stage だけを retry する。cleanup が全て commit したときだけ `Closed` になる。startup rollback が失敗した場合も `Ready` に戻らず、未解決の host resource がある間は新しい session を受け付けない。
-
-## identity と isolation の不変条件
-
-- VM、session、subject、workspace、capability、request、Broker session の identity はそれぞれ 128-bit で、`CryptographicRandom` から得る。
-- no-reuse ledger は、全 identity domain をまたいで過去に使用した byte value を拒否する。失敗した startup で割り当てた値も予約済みのまま残る。
-- `SnapshotDescriptor` に session-scoped identity が含まれていれば restore を拒否する。snapshot source を再利用する場合も、新しい session は全ての identity を再生成する。
-- 各 backend lease は session identity と、workspace、Broker、VM、capability、workload の対応 identity を保持する。foreign session または foreign resource の lease は次の stage の前に拒否する。
-- 同じ `SessionOrchestrator` で active session は一つだけであり、二つ目の start は backend を呼ぶ前に拒否する。
-
-`SessionOrchestrator::new` の process-local ledger は test と組み込み用途向けであり、restart をまたがない。production host は `SessionOrchestrator::new_durable` と永続 ledger file を使う。durable ledger は exclusive ownership、version/checksum 検証、append 後の `sync_data` を要求し、過去の identity を restart 後も再利用させない。
-
-## 検証状態
-
-state machine は mock backend を使う test で検証済みである。正常 startup/stop、各 stage failure の rollback、rollback failure、VM kill failure 時の workspace 保持、inherited identity と reused identity、active session の二重起動、foreign lease、stop retry を対象にする。
-
-production adapter composition test は、実 `CapabilityKernel` と session adapter 群を使い、workspace clone、listener ownership、snapshot binding、Firecracker identity injection、Authority subject closure を一つの startup/stop 経路で検査する。command、filesystem、API、listener は test double であり、実 Firecracker、実 Broker/vsock、実 capfs、特権 workload restrictions は未検証である。mock test が pass したことを VM 実起動済みや full isolation 完成の根拠にはしない。
-
-adapter の義務と、既存 crate へ接続するときの型・順序は [production backend 契約](contracts.md) を参照する。
-
-focused test は次のとおりである。
-
-```bash
-cargo fmt --manifest-path crates/session-orchestrator/Cargo.toml -- --check
-cargo test --manifest-path crates/session-orchestrator/Cargo.toml
-cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-targets -- -D warnings
-```
+- lease を保存する行と cleanup flag を落とす行は別の文になっている。flag 側を忘れても compile が通り、`stop_session` は成功を返しながら VM が動き続ける。
+- `CleanupProgress` の `true` は「実行した」ではなく「対象が無かった」の場合がある。監査記録として読まない。
+- `SessionOrchestrator::new` は default type parameter で process-local ledger を選ぶ。production が `new_durable` を忘れても contract test は全部通る。
+- `LifecycleState` の 9 値のうち、`state()` が返しうるのは 4 つだけ。残り 5 つに match するコードは到達しない。
+- identity の `Display` は on-disk path と Authority Core の subject 名を作る。hex の書式を変えると両方が黙って変わる。
 
 ## 関連
 
@@ -69,5 +32,7 @@ cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-target
 - [Firecracker runtime](../firecracker-runtime/README.md)
 - [Supervisor adapter](../supervisor/README.md)
 - [Host Egress Broker](../egress-broker/README.md)
+- [決定記録](../decisions/README.md)
 - [実装順序](../design/implementation-plan.md)
 - [検証戦略](../design/verification.md)
+- [用語集](../glossary.md)

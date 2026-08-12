@@ -8,6 +8,60 @@
 
 この文書群は、現在実装されている Authority core について「各ファイルが何を担当するか」だけでなく、「何を証明し、それが実運用で何を防ぐか」まで説明する。設計理由そのものは[Capability モデル](../design/capability-model.md)と[検証戦略](../design/verification.md)を正とする。
 
+## crate の構造
+
+`authority-core` は host と guest の両方に置かれ、どちらでも同じ判定を行う。副作用を持たず、認可の判定と記録だけを担当する。
+
+```mermaid
+flowchart TB
+    subgraph hostside["host 側"]
+        direction LR
+        eb["egress-broker"]
+        so["session-orchestrator"]
+    end
+
+    subgraph guestside["guest 側"]
+        direction LR
+        cf["capfs"]
+        sv["supervisor"]
+    end
+
+    subgraph ac["authority-core（両側に 1 instance ずつ）"]
+        direction TB
+        pure["純粋な判定<br/>path / repository / time /<br/>file / http / github / capability"]
+        state["state<br/>subject / 発行 / 委譲 / revoke"]
+        kernel["kernel<br/>唯一の並行境界<br/>authorize_and_commit"]
+        audit["audit + durable_audit<br/>attempt と effect の記録"]
+    end
+
+    lean["lean/Authority/*.lean"]
+    corpus["共通 corpus 150 件"]
+    journal[("audit journal file")]
+
+    eb ==>|"最終認可"| kernel
+    so ==>|"root 発行 / revoke"| kernel
+    cf ==>|"操作ごとの認可"| kernel
+    sv ==>|"subject lifecycle"| kernel
+    kernel --> state
+    state --> pure
+    kernel --> audit
+    audit ==> journal
+    corpus -.->|"同じ入力"| pure
+    corpus -.-> lean
+    lean -.->|"同じ判定をモデル化し定理を証明"| pure
+
+    classDef host fill:#1565c0,color:#fff,stroke:#0d47a1;
+    classDef data fill:#ef6c00,color:#fff,stroke:#e65100;
+    classDef external fill:#616161,color:#fff,stroke:#424242;
+    class ac,pure,state,kernel,audit host;
+    class eb,so external;
+    class cf,sv external;
+    class lean,corpus external;
+    class journal data;
+```
+
+`kernel` の内側で認可と外部副作用が線形化される。それより下は全部純粋関数で、Lean 側の定理と共通 corpus が同じ入力を通る。**Lean が証明するのはモデルであって、Rust の machine code ではない。**
+
 ## 現在証明している範囲
 
 現在の中心は、file、公開 HTTP fetch、閉じた GitHub 操作の Capability が、委譲されても親より強くならないことを確認する純粋な判定である。

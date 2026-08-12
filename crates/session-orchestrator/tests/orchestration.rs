@@ -1040,7 +1040,12 @@ fn foreign_broker_session_cannot_be_attached_to_workspace() {
     ));
     assert_eq!(
         log.values(),
-        vec!["workspace.clone", "broker.establish", "workspace.isolate"]
+        vec![
+            "workspace.clone",
+            "broker.establish",
+            "broker.close",
+            "workspace.isolate"
+        ]
     );
 }
 
@@ -1094,6 +1099,7 @@ fn foreign_workspace_binding_is_rejected_before_capability_injection() {
             "workspace.clone",
             "broker.establish",
             "vm.start",
+            "vm.kill",
             "broker.close",
             "workspace.isolate"
         ]

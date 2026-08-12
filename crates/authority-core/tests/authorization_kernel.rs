@@ -17,7 +17,10 @@ use std::{
 
 use authority_core::{
     audit::AttemptOutcome,
-    capability::{AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId},
+    capability::{
+        AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, CapabilityRequestSet, IssuerId,
+        SubjectId,
+    },
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
     handle::{HandleId, ObjectId, OpenHandle},
     kernel::{
@@ -194,6 +197,33 @@ fn kernel_derives_and_commits_with_the_exact_authorizing_capability() {
         .expect("the child must authorize a read inside its scope");
 
     assert_eq!(committed_id, child_id);
+}
+
+// Requirement: one external operation with multiple authority boundaries is
+// authorized and audited atomically. Category: authorization/audit. Risk: critical.
+#[test]
+fn compound_commit_requires_every_request_and_records_the_complete_set() {
+    let (kernel, root_id) = kernel_with_root();
+    let read = read_request(30, &["src", "main.rs"]);
+    let write = file_request(30, FileEffect::WriteData, &["src", "main.rs"]);
+    let requests = CapabilityRequestSet::new(read.clone(), [write.clone()]);
+
+    kernel
+        .authorize_all_and_commit(&root_subject_id(), &root_id, &requests, |_| {
+            Ok::<_, Infallible>(())
+        })
+        .expect("the root capability must authorize both requested effects");
+
+    let attempts = kernel
+        .attempt_records()
+        .expect("the audit trail must remain readable");
+    let effects = kernel
+        .effect_records()
+        .expect("the audit trail must remain readable");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(effects.len(), 1);
+    assert_eq!(attempts[0].requests().collect::<Vec<_>>(), [&read, &write]);
+    assert_eq!(effects[0].requests().collect::<Vec<_>>(), [&read, &write]);
 }
 
 // Requirement: metadata policy may inspect only an active capability held by

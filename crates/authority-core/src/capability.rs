@@ -234,6 +234,60 @@ impl CapabilityRequest {
     }
 }
 
+/// A non-empty group of requests that must authorize one external operation.
+///
+/// Some operations have more than one independently meaningful authority
+/// boundary. For example, opening a file for both reading and writing needs
+/// `ReadData` and `WriteData`; a no-replace rename needs authorization for its
+/// source and destination paths. This type keeps every required request
+/// together so the concurrent kernel can check and audit them as one effect.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CapabilityRequestSet {
+    first: CapabilityRequest,
+    additional: Vec<CapabilityRequest>,
+}
+
+impl CapabilityRequestSet {
+    /// Creates a one-request set for an ordinary single-boundary operation.
+    #[must_use]
+    pub const fn one(request: CapabilityRequest) -> Self {
+        Self {
+            first: request,
+            additional: Vec::new(),
+        }
+    }
+
+    /// Creates a set containing `first` and every additional required request.
+    #[must_use]
+    pub fn new(
+        first: CapabilityRequest,
+        additional: impl IntoIterator<Item = CapabilityRequest>,
+    ) -> Self {
+        Self {
+            first,
+            additional: additional.into_iter().collect(),
+        }
+    }
+
+    /// Returns the first request, retained for single-request compatibility.
+    #[must_use]
+    pub const fn first(&self) -> &CapabilityRequest {
+        &self.first
+    }
+
+    /// Returns the requests after [`Self::first`].
+    #[must_use]
+    pub fn additional(&self) -> &[CapabilityRequest] {
+        self.additional.as_slice()
+    }
+
+    /// Returns every request in the set in stable audit order.
+    #[must_use]
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &CapabilityRequest> {
+        std::iter::once(&self.first).chain(self.additional.iter())
+    }
+}
+
 /// Returns whether a typed authority body permits a typed request.
 #[must_use]
 pub fn authority_matches(authority: &AuthorityBody, request: &AuthorityRequest) -> bool {

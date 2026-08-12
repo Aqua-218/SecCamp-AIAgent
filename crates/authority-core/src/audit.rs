@@ -14,7 +14,7 @@ use std::sync::{
 };
 
 use crate::{
-    capability::{CapId, CapabilityRequest, SubjectId},
+    capability::{CapId, CapabilityRequest, CapabilityRequestSet, SubjectId},
     state::AuthorizationEpoch,
 };
 
@@ -75,6 +75,7 @@ pub struct AttemptRecord {
     caller: SubjectId,
     capability_id: CapId,
     request: CapabilityRequest,
+    additional_requests: Vec<CapabilityRequest>,
     authorization_epoch: AuthorizationEpoch,
     outcome: AttemptOutcome,
 }
@@ -104,6 +105,15 @@ impl AttemptRecord {
         &self.request
     }
 
+    /// Returns every request that was required for this external operation.
+    ///
+    /// The first item is also available through [`Self::request`] for
+    /// single-request compatibility.
+    #[must_use]
+    pub fn requests(&self) -> impl DoubleEndedIterator<Item = &CapabilityRequest> {
+        std::iter::once(&self.request).chain(self.additional_requests.iter())
+    }
+
     /// Returns the authorization epoch observed during the final check.
     #[must_use]
     pub const fn authorization_epoch(&self) -> AuthorizationEpoch {
@@ -124,6 +134,7 @@ pub struct EffectRecord {
     caller: SubjectId,
     capability_id: CapId,
     request: CapabilityRequest,
+    additional_requests: Vec<CapabilityRequest>,
     authorization_epoch: AuthorizationEpoch,
 }
 
@@ -150,6 +161,15 @@ impl EffectRecord {
     #[must_use]
     pub const fn request(&self) -> &CapabilityRequest {
         &self.request
+    }
+
+    /// Returns every request that authorized this committed external effect.
+    ///
+    /// The first item is also available through [`Self::request`] for
+    /// single-request compatibility.
+    #[must_use]
+    pub fn requests(&self) -> impl DoubleEndedIterator<Item = &CapabilityRequest> {
+        std::iter::once(&self.request).chain(self.additional_requests.iter())
     }
 
     /// Returns the authorization epoch observed during commit.
@@ -187,6 +207,7 @@ struct AttemptJournal {
     caller: SubjectId,
     capability_id: CapId,
     request: CapabilityRequest,
+    additional_requests: Vec<CapabilityRequest>,
     authorization_epoch: AuthorizationEpoch,
     outcome: AtomicU8,
 }
@@ -198,6 +219,7 @@ impl AttemptJournal {
             caller: self.caller.clone(),
             capability_id: self.capability_id.clone(),
             request: self.request.clone(),
+            additional_requests: self.additional_requests.clone(),
             authorization_epoch: self.authorization_epoch,
             outcome: AttemptOutcome::from_code(self.outcome.load(Ordering::Acquire)),
         }
@@ -209,6 +231,7 @@ impl AttemptJournal {
             caller: self.caller.clone(),
             capability_id: self.capability_id.clone(),
             request: self.request.clone(),
+            additional_requests: self.additional_requests.clone(),
             authorization_epoch: self.authorization_epoch,
         })
     }
@@ -245,11 +268,28 @@ impl AuditTrail {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn start_attempt(
         &self,
         caller: SubjectId,
         capability_id: CapId,
         request: CapabilityRequest,
+        authorization_epoch: AuthorizationEpoch,
+    ) -> Result<AttemptGuard, AuditError> {
+        self.start_request_set(
+            caller,
+            capability_id,
+            &CapabilityRequestSet::one(request),
+            authorization_epoch,
+        )
+    }
+
+    /// Records a non-empty set of requests before their shared final check.
+    pub(crate) fn start_request_set(
+        &self,
+        caller: SubjectId,
+        capability_id: CapId,
+        requests: &CapabilityRequestSet,
         authorization_epoch: AuthorizationEpoch,
     ) -> Result<AttemptGuard, AuditError> {
         let mut state = self.state.lock().map_err(|_| AuditError::LockPoisoned)?;
@@ -262,7 +302,8 @@ impl AuditTrail {
             id: AttemptId(sequence),
             caller,
             capability_id,
-            request,
+            request: requests.first().clone(),
+            additional_requests: requests.additional().to_vec(),
             authorization_epoch,
             outcome: AtomicU8::new(OUTCOME_STARTED),
         });

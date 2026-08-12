@@ -9,7 +9,7 @@ use std::sync::RwLock;
 
 use crate::{
     audit::{AttemptRecord, AuditError, AuditTrail, EffectRecord},
-    capability::{CapId, Capability, CapabilityRequest, SubjectId},
+    capability::{CapId, Capability, CapabilityRequest, CapabilityRequestSet, SubjectId},
     handle::{HandleId, ObjectId, OpenHandle},
     state::{
         AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
@@ -392,6 +392,40 @@ impl CapabilityKernel {
         request: &CapabilityRequest,
         commit_to_linearization: impl FnOnce(&Capability) -> Result<T, E>,
     ) -> Result<T, EffectCommitError<E>> {
+        self.authorize_all_and_commit(
+            caller,
+            capability_id,
+            &CapabilityRequestSet::one(request.clone()),
+            commit_to_linearization,
+        )
+    }
+
+    /// Reauthorizes every request in one non-empty external operation and
+    /// executes it through its linearization point.
+    ///
+    /// The kernel holds one shared state guard across all final checks and the
+    /// executor. A revoke that returns therefore excludes the whole compound
+    /// operation, not merely its first request. One audit attempt records the
+    /// complete request set and becomes a committed effect only when the
+    /// executor reaches its documented linearization point.
+    ///
+    /// The executor must not re-enter this kernel. It must return an error
+    /// unless the operation either failed before its linearization point or
+    /// reached that point for the whole request set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectCommitError::LockPoisoned`] if a writer previously
+    /// panicked, [`EffectCommitError::NotAuthorized`] without invoking the
+    /// executor when any request is denied, or [`EffectCommitError::Effect`]
+    /// when the executor reports a pre-commit failure.
+    pub fn authorize_all_and_commit<T, E>(
+        &self,
+        caller: &SubjectId,
+        capability_id: &CapId,
+        requests: &CapabilityRequestSet,
+        commit_to_linearization: impl FnOnce(&Capability) -> Result<T, E>,
+    ) -> Result<T, EffectCommitError<E>> {
         let state = self
             .state
             .read()
@@ -399,15 +433,18 @@ impl CapabilityKernel {
 
         let attempt = self
             .audit
-            .start_attempt(
+            .start_request_set(
                 caller.clone(),
                 capability_id.clone(),
-                request.clone(),
+                requests,
                 state.authorization_epoch(),
             )
             .map_err(EffectCommitError::Audit)?;
 
-        if !state.authorizes(caller, capability_id, request) {
+        if !requests
+            .iter()
+            .all(|request| state.authorizes(caller, capability_id, request))
+        {
             attempt.deny();
             drop(state);
             return Err(EffectCommitError::NotAuthorized);

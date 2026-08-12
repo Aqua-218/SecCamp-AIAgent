@@ -9,11 +9,11 @@
 | [Backing repository の事前検証](backing-preflight.md) | [`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) | root fd、link検査、resource bound、manifestの原子的なstartup import |
 | [共有 namespace registry](namespace-registry.md) | [`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) | `ObjectId`割り当て、現在path、generation、open count、namespace変更の原子性 |
 | [mount ごとの node table](node-tables.md) | [`crates/capfs/src/node.rs`](../../crates/capfs/src/node.rs) | subject-local `nodeid -> ObjectId`、LOOKUP / FORGET参照数、nodeid非再利用 |
-| [Direct-I/O FUSE adapter](read-only-fuse.md) | [`crates/capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs)、[`runtime.rs`](../../crates/capfs/src/runtime.rs) | metadata visibility、fd-relative I/O、file / directory handle lifecycle、毎READ / WRITE / READDIRの再認可、実mount test |
+| [Direct-I/O FUSE adapter](read-only-fuse.md) | [`crates/capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs)、[`runtime.rs`](../../crates/capfs/src/runtime.rs) | metadata visibility、fd-relative I/O、file / directory handle lifecycle、毎READ / WRITE / READDIR / size変更の再認可、実mount test |
 
-現在は、link-freeなworkspaceの検査、`RepoId`とroot directory fd・namespaceのbinding、初期manifestの原子的なregistry import、VM共通namespace registry、subject-local node tableに加え、Direct-I/O FUSE adapterまで実装している。`LOOKUP`、`GETATTR`、`FORGET`、`OPEN`、`READ`、`WRITE`、`RELEASE`、`OPENDIR`、`READDIR`、`RELEASEDIR`がroot fd、namespace、node table、Capability kernelへ接続されている。実mount上でも、revoke後の既存file descriptorからのread / writeと、既存directory streamからの次のlistingを拒否する。
+現在は、link-freeなworkspaceの検査、`RepoId`とroot directory fd・namespaceのbinding、初期manifestの原子的なregistry import、VM共通namespace registry、subject-local node tableに加え、Direct-I/O FUSE adapterまで実装している。`LOOKUP`、`GETATTR`、`FORGET`、`OPEN`、`READ`、`WRITE`、sizeだけの`SETATTR`、`RELEASE`、`OPENDIR`、`READDIR`、`RELEASEDIR`がroot fd、namespace、node table、Capability kernelへ接続されている。`O_TRUNC`と`SETATTR(size)`は`Truncate`を独立して要求する。実mount上でも、revoke後の既存file descriptorからのread / write / size変更と、既存directory streamからの次のlistingを拒否する。
 
-次の実装対象は`Truncate`を伴うopen / setattrである。その後にcreate、remove、no-replace renameを追加する。
+次の実装対象はcreate、remove、no-replace renameである。その後にmode / timestampの`SetMetadata`を追加する。
 
 ## 関連
 

@@ -86,6 +86,8 @@ CapabilityRequestSet {
 
 両方が許可されたときだけ、read/write両用のbacking descriptorを開く。recordは2つの独立effectではなく、2つの条件を持つ1つのopen operationとして残る。以後の`READ`と`WRITE`は、それぞれ現在pathに対して改めて単一requestを認可するため、open時の結果を失効後まで使い回さない。
 
+`O_WRONLY | O_TRUNC`は同じ形で`WriteData`と`Truncate`をsetへ入れる。`O_RDWR | O_TRUNC`なら`ReadData`、`WriteData`、`Truncate`の3件になる。全件を満たすCapabilityだけがopenとdescriptor-relative `ftruncate`を同じshared guard内で進められるため、`WriteData`だけを持つCapabilityが長さ変更を副作用として紛れ込ませることはない。
+
 ## effectを起こさないauthority inspection
 
 filesystemのpath walkでは、file内容を読む前に「このpathのmetadataを見せてよいか」をCapabilityのpath patternから導く必要がある。この判定を`ReadData`のeffectとして記録すると、実data readが起きていないのにeffect auditが作られる。

@@ -15,15 +15,16 @@ AgentはFUSE mountに対して通常の`open`、`read`、`write`、directory lis
 | `LOOKUP` | parent nodeとchild名を共有namespaceで解決し、見えてよいobjectだけnode tableへ登録する |
 | `GETATTR` | nodeまたはopen handleからobjectを得て、現在のCapabilityでmetadataを見せてよいか確認する |
 | `FORGET` | mount-local lookup countを減らし、0になったnodeをretireする |
-| `OPEN` | access modeを確認する。`O_RDONLY`は`ReadData`、`O_WRONLY`は`WriteData`、`O_RDWR`は両方を1つの複合認可として確認してhandleを登録する |
+| `OPEN` | access modeを確認する。`O_RDONLY`は`ReadData`、`O_WRONLY`は`WriteData`、`O_RDWR`は両方を1つの複合認可として確認する。writable openの`O_TRUNC`にはさらに`Truncate`を同じ認可へ加えてからhandleを登録する |
 | `READ` | open時の判断を使い回さず、現在pathと現在時刻でもう一度`ReadData`を確認して`pread`する |
 | `WRITE` | open時の判断を使い回さず、現在pathと現在時刻でもう一度`WriteData`を確認して`pwrite`する |
+| `SETATTR` | size だけを受け付け、現在pathの`Truncate`を確認してdescriptor-relative `ftruncate`を行う。mode、owner、time、flagの変更は拒否する |
 | `RELEASE` | namespace側とAuthority側のhandleを同じobjectについて閉じ、backing fdを破棄する |
 | `OPENDIR` | read-only access mode、directory種別、現在pathの`ListDirectory`を確認してhandleを登録する |
 | `READDIR` | 現在pathの`ListDirectory`を再確認し、見えてよいdirect childだけを返す |
 | `RELEASEDIR` | namespace側とAuthority側のdirectory handleを閉じる |
 
-通常writeは実装済みだが、`O_APPEND`、`O_TRUNC`、`O_CREAT`、`O_EXCL`、`O_TMPFILE`はまだ受け付けない。append・truncate・createは、別effectと線形化点を明示してから追加する。`CREATE`、`MKDIR`、`UNLINK`、`RMDIR`、`RENAME`、`SETATTR`も未実装である。
+`O_TRUNC`は`O_WRONLY`または`O_RDWR`と組み合わせたときだけ受け付ける。`O_WRONLY | O_TRUNC`には`WriteData`と`Truncate`、`O_RDWR | O_TRUNC`には`ReadData`、`WriteData`、`Truncate`の全てが必要である。`O_RDONLY | O_TRUNC`は拒否する。`O_APPEND`、`O_CREAT`、`O_EXCL`、`O_TMPFILE`、size以外の`SETATTR`、`CREATE`、`MKDIR`、`UNLINK`、`RMDIR`、`RENAME`はまだ受け付けない。
 
 ## metadataはどこまで見せるのか
 
@@ -37,7 +38,7 @@ Visible(Capability) = 許可patternが選ぶpath ∪ そのpathへ至る祖先di
 
 たとえば`Prefix(/src/private)`なら、`/`、`/src`、`/src/private`以下は見える。`/src/public`や`/docs`は`ENOENT`になる。`Exact(/src/private/key.txt)`なら、そのfileと祖先だけが見える。
 
-これはdata readの認可ではない。metadata visibilityはactiveなCapabilityのauthorityを検査するだけで、外部effectのaudit recordを作らない。`OPEN`、`READ`、`WRITE`は別に対応するeffectを要求し、通常のattempt / effect auditへ記録する。
+これはdata readの認可ではない。metadata visibilityはactiveなCapabilityのauthorityを検査するだけで、外部effectのaudit recordを作らない。`OPEN`、`READ`、`WRITE`、size変更の`SETATTR`は別に対応するeffectを要求し、通常のattempt / effect auditへ記録する。
 
 同様に、祖先directoryがmetadataとして見えることは`ListDirectory`の許可を意味しない。`READDIR`はdirectory自身の現在pathがCapabilityのpath patternに一致する場合だけ成功する。そのうえで各childを`Visible(Capability)`へ通す。たとえば`Prefix(/src/private)`なら`/src/private`以下を列挙できるが、祖先`/`や`/src`の一覧を取得して兄弟名を見ることはできない。`Exact(/src/private)`でdirectory自身だけを許可した場合、一覧は`.`と`..`だけになり、child名は漏れない。
 
@@ -126,7 +127,9 @@ revokeが先: revoke完了 -> authorization denied -> backing I/Oを発行しな
 
 さらに`OPEN` replyへ`FOPEN_DIRECT_IO`を付け、entry/attribute TTLを0にする。Linux page cacheだけでreadが完了するとadapterへrequestが戻らず再認可できないため、direct I/Oはrevokeの意味を実syscallまで届けるために必要である。
 
-`O_RDWR`はopen時に`ReadData`と`WriteData`の両方を同じshared guardで確認する。Capability kernelの複合認可は、2つを片方ずつ監査・commitするのではなく、全requestを1つのattempt/effect recordとして残す。open後の個々のread/writeは再び単独で認可するため、open時のallowがrevoke後のI/Oを許可し続けることはない。
+`O_RDWR`はopen時に`ReadData`と`WriteData`の両方を同じshared guardで確認する。`O_TRUNC`があれば`Truncate`も同じrequest setへ加える。Capability kernelの複合認可は、これらを片方ずつ監査・commitするのではなく、全requestを1つのattempt/effect recordとして残す。open後の個々のread/writeは再び単独で認可するため、open時のallowがrevoke後のI/Oを許可し続けることはない。
+
+sizeだけの`SETATTR`は`Truncate`を現在pathに対して単独で認可する。writable file handleが渡されればそのfdへ`ftruncate`し、handleがなければ同じroot fd検証を通した一時的なwrite fdを開く。いずれも認可shared guardとnamespace read guardを保持したまま長さ変更と返却metadataの取得まで進める。readonly handle、別nodeのhandle、directory handleは`EBADF`で拒否する。modeや時刻も同時に届いた場合は、size変更を実行せず`EPERM`で拒否する。
 
 directory streamもopen時の判断を再利用しない。`READDIR`ごとにhandleから`ObjectId`を得て、現在pathの`ListDirectory`を確認する。entry bufferが小さく複数requestへ分かれた場合、revoke後の次requestは`EACCES`となる。
 
@@ -141,7 +144,7 @@ RESOLVE_NO_SYMLINKS
 RESOLVE_NO_XDEV
 ```
 
-metadata用fd、read用fd、write用fdを開いた後、そのfd自身へ`statx(AT_EMPTY_PATH)`を行う。namespaceが記録したdirectory / regular fileの種別、rootと同じmount ID、regular fileのlink count 1を再確認する。write用fdは`O_RDWR | O_CLOEXEC | O_NOFOLLOW`だけで開き、append、create、truncateは指定しない。preflight後にsymlinkやhard linkへ差し替えられていれば、対象を読まず/書かず`EIO`にする。
+metadata用fd、read用fd、write用fdを開いた後、そのfd自身へ`statx(AT_EMPTY_PATH)`を行う。namespaceが記録したdirectory / regular fileの種別、rootと同じmount ID、regular fileのlink count 1を再確認する。write用fdは`O_RDWR | O_CLOEXEC | O_NOFOLLOW`だけで開き、append、create、truncateは指定しない。`O_TRUNC`と`SETATTR(size)`は、この検証済みfdへ`ftruncate`するため、pathをもう一度解決しない。preflight後にsymlinkやhard linkへ差し替えられていれば、対象を読まず/書かず`EIO`にする。
 
 root fdがあるだけでbacking tree全体が凍結されるわけではない。別processが通常fileの内容を直接変更することは防げないため、supervisorがbacking treeを非信頼processから隠す前提は残る。
 
@@ -152,11 +155,11 @@ FUSE境界では内部構造を細かく漏らさず、失敗の種類を次の�
 | 状況 | errno |
 |---|---|
 | 権限外path、stale node、invalid child名 | `ENOENT` |
-| `OPEN` / `READ` / `WRITE` / `OPENDIR` / `READDIR`の最終認可失敗 | `EACCES` |
-| 未対応のappend、truncate、create intent、cached write、suid/sgidを落とすwrite | `EPERM` |
+| `OPEN` / `READ` / `WRITE` / `SETATTR(size)` / `OPENDIR` / `READDIR`の最終認可失敗 | `EACCES` |
+| 未対応のappend、create intent、`O_RDONLY | O_TRUNC`、size以外の`SETATTR`、cached write、suid/sgidを落とすwrite | `EPERM` |
 | directoryをregular fileとしてopen | `EISDIR` |
 | regular fileをdirectoryとしてopen | `ENOTDIR` |
-| unknown / mismatched file handle | `EBADF` |
+| unknown / mismatched file handle、`SETATTR(size)`のreadonly / directory handle | `EBADF` |
 | oversized read / write、壊れたflag、現在の一覧範囲外のdirectory offset | `EINVAL` |
 | lock poison、registry不整合、backing差し替え | `EIO` |
 
@@ -164,9 +167,9 @@ FUSE境界では内部構造を細かく漏らさず、失敗の種類を次の�
 
 ## どう検証しているか
 
-`read_only.rs`のmodule testは、許可範囲と祖先だけのlookup、backingとCapabilityのrepository identity不一致、namespaceとAuthority両方のfile / directory handle count、位置指定read / write、`O_WRONLY`がreadを得ないこと、`O_RDWR`の両effect要求、directory offset cookie、exact patternによるchild filter、revoke後の既存handle read / write / readdir拒否、releaseによるcleanup、malformed FORGET後のfail closedを直接確認する。
+`read_only.rs`のmodule testは、許可範囲と祖先だけのlookup、backingとCapabilityのrepository identity不一致、namespaceとAuthority両方のfile / directory handle count、位置指定read / write、`O_WRONLY`がreadを得ないこと、`O_RDWR`の両effect要求、`O_TRUNC`の複合認可、explicit size変更の`Truncate`再認可、directory offset cookie、exact patternによるchild filter、revoke後の既存handle read / write / truncate / readdir拒否、releaseによるcleanup、malformed FORGET後のfail closedを直接確認する。
 
-[`crates/capfs/tests/read_only_fuse.rs`](../../crates/capfs/tests/read_only_fuse.rs) は実際にLinux FUSEへmountする。`allowed.txt`を開いて読んだ後にCapabilityをrevokeし、同じOS file descriptorで再度readして`PermissionDenied`になることを確認する。write testも同じdescriptorで最初のpositioned writeを成功させ、revoke後の次のwriteが`PermissionDenied`になることを確認する。同じmount上の権限外 siblingは`NotFound`になる。directory testでは、祖先directoryのlisting拒否、許可prefixのcanonical-name順 listingを確認する。さらに40 byteの`getdents` bufferで応答を1 entryずつに分け、1回目の`READDIR`後にrevokeして、同じdirectory fdからの2回目が`PermissionDenied`になることを確認する。
+[`crates/capfs/tests/read_only_fuse.rs`](../../crates/capfs/tests/read_only_fuse.rs) は実際にLinux FUSEへmountする。`allowed.txt`を開いて読んだ後にCapabilityをrevokeし、同じOS file descriptorで再度readして`PermissionDenied`になることを確認する。write testは`O_TRUNC` openでfileを空にし、writeを成功させた後にCapabilityをrevokeする。同じdescriptorからの次のwriteと`set_len`はともに`PermissionDenied`になり、backingの長さも変わらない。同じmount上の権限外 siblingは`NotFound`になる。directory testでは、祖先directoryのlisting拒否、許可prefixのcanonical-name順 listingを確認する。さらに40 byteの`getdents` bufferで応答を1 entryずつに分け、1回目の`READDIR`後にrevokeして、同じdirectory fdからの2回目が`PermissionDenied`になることを確認する。
 
 実mount testは`/dev/fuse`が存在しない環境だけskipする。deviceが存在するのにmount設定や権限が壊れている場合はtest failureとして扱う。
 
@@ -174,7 +177,7 @@ FUSE境界では内部構造を細かく漏らさず、失敗の種類を次の�
 
 ## 次に実装するもの
 
-次は`O_TRUNC`とexplicit size変更を`Truncate`へ接続する。その後に`CREATE`、`MKDIR`、`UNLINK`、`RMDIR`、no-replace `RENAME`、`SETATTR`を追加し、open handleとrevokeを含む競合testへ進む。
+次は`CREATE`、`MKDIR`、`UNLINK`、`RMDIR`、no-replace `RENAME`を共有namespace transactionへ接続する。その後にmode / timestampの`SetMetadata`を別effectとして追加し、mutationとopen handle、revoke、directory streamの競合testへ進む。
 
 ## 関連
 

@@ -19,7 +19,8 @@ test は 3 系統ある。mock backend による state machine test、durable le
 | snapshot に継承 identity がある場合の拒否 | mock backend |
 | 同じ identity の再利用の拒否 | mock backend + failing ledger stub |
 | active session の二重起動の拒否 | mock backend |
-| foreign lease（Broker と VM）の拒否 | mock backend |
+| foreign lease（workspace、Broker、VM）の拒否 | mock backend |
+| workspace lease が別 session のとき、clone を解放してから返す | mock backend |
 | stop の retry が未完了 stage だけを実行する | mock backend |
 | ledger の header / record checksum、truncation、sequence 連続性 | 実 file を使う直接 test |
 | 同一 process からの二重 open が拒否される | 実 file を使う直接 test |
@@ -52,7 +53,7 @@ cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-target
 
 | 対象 | 何が未検証か |
 |---|---|
-| `validate_workspace` | `MockWorkspace.foreign_session` を設定する test が 1 つも無い。`CrossSessionLease` と `LeaseIdentityMismatch` の両分岐、およびそこで生じる clone directory の漏れ |
+| `validate_workspace` | `CrossSessionLease` 経路と、その clone 解放は `foreign_workspace_lease_isolates_the_clone_before_returning` で検証済み。`LeaseIdentityMismatch` 側の分岐は未検証 |
 | `SessionOrchestrator::new_durable` | どの test からも呼ばれていない。durable ledger を orchestrator 経由で動かす経路が皆無 |
 | ledger の crash consistency | record の sync と header の write の間で落とす fault injection が無い。「header の commit 範囲外に trailing bytes」の分岐は未到達（既存 test は `set_len` で `Truncated` に当たる） |
 | `poisoned` 経路 | 実 `DurableIdentityLedger` で起こす test が無い。mock が `WriteFailed` / `SyncFailed` を返すだけ |

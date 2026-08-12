@@ -1437,6 +1437,18 @@ pub trait BrokerBackend {
         identity: &SessionIdentity,
     ) -> Result<BrokerLease, BackendError>;
 
+    /// Verifies that the exact Broker service is still running.
+    ///
+    /// This check is performed after capability injection and immediately
+    /// before workload release. Implementations must reject foreign, closed,
+    /// and already-exited leases; returning success without observing the
+    /// owned service is not permitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] unless `lease` names the exact live service.
+    fn ensure_broker_session_running(&mut self, lease: &BrokerLease) -> Result<(), BackendError>;
+
     /// Closes one Broker connection. The operation must be idempotent.
     ///
     /// # Errors
@@ -2141,6 +2153,22 @@ where
             }
         };
 
+        if let Err(error) = broker_backend.ensure_broker_session_running(&broker) {
+            let rollback = cleanup_active(
+                &mut active,
+                workspace_backend,
+                broker_backend,
+                vm_backend,
+                capability_backend,
+            );
+            self.finish_failed_start(active, &rollback);
+            return Err(StartError::with_rollback(
+                StartStage::WorkloadRelease,
+                StartFailure::Backend(error),
+                rollback,
+            ));
+        }
+
         match workload_backend.release_workload(&identity, &vm, &capability) {
             Ok(lease) => {
                 if let Some(error) = validate_workload(&identity, &lease) {
@@ -2504,6 +2532,13 @@ mod tests {
                 },
                 identity.broker_session_id(),
             ))
+        }
+
+        fn ensure_broker_session_running(
+            &mut self,
+            _lease: &BrokerLease,
+        ) -> Result<(), BackendError> {
+            Ok(())
         }
 
         fn close_broker_session(&mut self, lease: &BrokerLease) -> Result<(), BackendError> {

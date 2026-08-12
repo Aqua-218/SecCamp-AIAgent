@@ -10,6 +10,7 @@
 use std::{
     collections::BTreeMap,
     error::Error,
+    ffi::{OsStr, OsString},
     fmt,
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -17,11 +18,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
 use egress_protocol::{
     budget::{SessionBudget, SessionBudgetError, SessionBudgetLimits},
     response::{
         CanonicalBrokerResponse, CanonicalResponseChunk, MAX_EXPANDED_CANONICAL_RESPONSE_BYTES,
-        ResponseCborError, ResponseChunkError,
+        MAX_RESPONSE_CHUNK_BYTES, ResponseCborError, ResponseChunkError,
     },
     session::{BrokerEnvelope, BrokerRequestId, BrokerSessionId},
 };
@@ -40,6 +46,16 @@ const ACCEPT_PAYLOAD_LEN: usize = 8 + 16 + 32 + 8;
 const REQUEST_PAYLOAD_LEN: usize = 16;
 const FINAL_PREFIX_LEN: usize = 16 + 1 + 7 + 8 + 4;
 const MAX_RECORD_PAYLOAD_BYTES: usize = MAX_EXPANDED_CANONICAL_RESPONSE_BYTES + 64 * 1024;
+const MAX_FINAL_WIRE_PAYLOADS: usize =
+    MAX_EXPANDED_CANONICAL_RESPONSE_BYTES.div_ceil(MAX_RESPONSE_CHUNK_BYTES);
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0o400_000;
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
+const WRITE_BY_GROUP_OR_OTHER: u32 = 0o022;
+const ACCESS_BY_GROUP_OR_OTHER: u32 = 0o077;
+const STICKY_DIRECTORY: u32 = 0o1000;
 
 /// Maximum on-disk size accepted for one broker WAL.
 pub const MAX_DURABLE_BROKER_WAL_BYTES: u64 = 128 * 1024 * 1024;
@@ -313,6 +329,22 @@ pub enum DurableWalError {
     Symlink,
     /// The WAL path is not a regular file.
     NotRegularFile,
+    /// A path component changed after its directory or file descriptor was opened.
+    PathIdentityChanged,
+    /// The WAL or lock file is not owned by the process effective user.
+    WrongOwner {
+        /// Effective user required to own the file.
+        expected: u32,
+        /// Owner observed on the file.
+        actual: u32,
+    },
+    /// The WAL or lock file grants access to group or other principals.
+    UnsafePermissions {
+        /// Observed Unix permission bits.
+        mode: u32,
+    },
+    /// The containing directory can be replaced by an untrusted local principal.
+    UnsafeParentDirectory,
     /// The complete WAL exceeds its fixed recovery bound.
     WalTooLarge {
         /// Observed file length.
@@ -397,6 +429,19 @@ impl fmt::Display for DurableWalError {
             Self::NotRegularFile => {
                 formatter.write_str("durable broker WAL path is not a regular file")
             }
+            Self::PathIdentityChanged => {
+                formatter.write_str("durable broker WAL path identity changed")
+            }
+            Self::WrongOwner { expected, actual } => write!(
+                formatter,
+                "durable broker WAL owner {actual} does not match effective user {expected}"
+            ),
+            Self::UnsafePermissions { mode } => write!(
+                formatter,
+                "durable broker WAL permissions {mode:o} grant group or other access"
+            ),
+            Self::UnsafeParentDirectory => formatter
+                .write_str("durable broker WAL parent directory is not a trusted namespace"),
             Self::WalTooLarge { length, maximum } => write!(
                 formatter,
                 "durable broker WAL length {length} exceeds maximum {maximum}"
@@ -858,6 +903,76 @@ impl RecoveredState {
     }
 }
 
+#[derive(Debug)]
+struct DurableDirectory {
+    file: File,
+    path: PathBuf,
+    wal_name: OsString,
+    lock_name: OsString,
+    effective_uid: u32,
+}
+
+impl DurableDirectory {
+    fn open(wal_path: &Path) -> Result<Self, DurableWalError> {
+        let wal_name = wal_path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or(DurableWalError::UnsafeParentDirectory)?
+            .to_os_string();
+        let path = wal_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let effective_uid = effective_uid()?;
+        let expected = validate_parent_path(&path, effective_uid)?;
+        let file = File::open(&path)?;
+        validate_directory_metadata(&file.metadata()?, effective_uid)?;
+        let actual = file_identity(&file.metadata()?);
+        if expected != actual {
+            return Err(DurableWalError::PathIdentityChanged);
+        }
+        validate_parent_path_identity(&path, &file, effective_uid)?;
+        let lock_name = durable_lock_name(&wal_name);
+        Ok(Self {
+            file,
+            path,
+            wal_name,
+            lock_name,
+            effective_uid,
+        })
+    }
+
+    fn wal_path(&self) -> PathBuf {
+        self.child_path(&self.wal_name)
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.child_path(&self.lock_name)
+    }
+
+    fn child_path(&self, name: &OsStr) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            let mut path = PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+            path.push(name);
+            path
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.path.join(name)
+        }
+    }
+
+    fn validate(&self) -> Result<(), DurableWalError> {
+        validate_parent_path_identity(&self.path, &self.file, self.effective_uid)
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
 /// Immutable, fully validated state reconstructed from a broker WAL.
 #[derive(Debug, Clone)]
 pub struct DurableBrokerView {
@@ -874,11 +989,15 @@ impl DurableBrokerView {
     /// truncation, unsupported versions, or invalid state transitions.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DurableWalError> {
         let path = path.as_ref().to_path_buf();
-        validate_existing_path(&path)?;
-        let mut file = File::open(&path)?;
+        let directory = DurableDirectory::open(&path)?;
+        let lock_file = open_session_lock(&directory, false)?;
+        validate_existing_path(&directory)?;
+        let mut file = open_existing_file(&directory.wal_path(), false)?;
         acquire_shared_lock(&file)?;
-        validate_open_file(&path, &file)?;
+        validate_open_file(&directory, &file)?;
         let (state, _) = read_and_parse(&mut file)?;
+        validate_open_file(&directory, &file)?;
+        validate_open_lock(&directory, &lock_file)?;
         Ok(Self { path, state })
     }
 
@@ -951,6 +1070,8 @@ impl DurableBrokerView {
 #[derive(Debug)]
 pub struct DurableBrokerWal {
     path: PathBuf,
+    directory: DurableDirectory,
+    lock_file: File,
     file: File,
     state: RecoveredState,
     length: u64,
@@ -969,25 +1090,27 @@ impl DurableBrokerWal {
         config: DurableSessionConfig,
     ) -> Result<Self, DurableWalError> {
         let path = path.as_ref().to_path_buf();
-        validate_new_path(&path)?;
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
+        let directory = DurableDirectory::open(&path)?;
+        let lock_file = open_session_lock(&directory, true)?;
+        validate_new_path(&directory)?;
+        let mut file = create_private_file(&directory.wal_path())?;
         acquire_exclusive_lock(&file)?;
-        validate_open_file(&path, &file)?;
+        validate_open_file(&directory, &file)?;
         let payload = encode_init(config)?;
         let frame = encode_frame(0, INIT_KIND, &payload)?;
         if let Err(error) = file
             .write_all(&frame)
             .and_then(|()| file.sync_all())
-            .and_then(|()| sync_parent_directory(&path))
+            .and_then(|()| directory.sync())
         {
             return Err(DurableWalError::DurabilityUncertain(error));
         }
+        validate_open_file(&directory, &file)?;
+        validate_open_lock(&directory, &lock_file)?;
         Ok(Self {
             path,
+            directory,
+            lock_file,
             file,
             state: RecoveredState::new(config),
             length: u64::try_from(frame.len())
@@ -1007,11 +1130,15 @@ impl DurableBrokerWal {
         expected: DurableSessionConfig,
     ) -> Result<Self, DurableWalError> {
         let path = path.as_ref().to_path_buf();
-        validate_existing_path(&path)?;
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let directory = DurableDirectory::open(&path)?;
+        let lock_file = open_session_lock(&directory, true)?;
+        validate_existing_path(&directory)?;
+        let mut file = open_existing_file(&directory.wal_path(), true)?;
         acquire_exclusive_lock(&file)?;
-        validate_open_file(&path, &file)?;
+        validate_open_file(&directory, &file)?;
         let (state, length) = read_and_parse(&mut file)?;
+        validate_open_file(&directory, &file)?;
+        validate_open_lock(&directory, &lock_file)?;
         if state.config != expected {
             return Err(DurableWalError::ConfigurationMismatch {
                 expected,
@@ -1021,6 +1148,8 @@ impl DurableBrokerWal {
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
             path,
+            directory,
+            lock_file,
             file,
             state,
             length,
@@ -1190,6 +1319,10 @@ impl DurableBrokerWal {
     }
 
     fn append(&mut self, kind: u8, payload: &[u8]) -> Result<(), DurableWalError> {
+        if let Err(error) = self.validate_append_target() {
+            self.sealed = true;
+            return Err(error);
+        }
         let sequence = self
             .state
             .next_wal_sequence
@@ -1218,9 +1351,19 @@ impl DurableBrokerWal {
             self.sealed = true;
             return Err(DurableWalError::DurabilityUncertain(error));
         }
+        if let Err(error) = self.validate_append_target() {
+            self.sealed = true;
+            return Err(error);
+        }
         self.length = next_length;
         self.state.next_wal_sequence = sequence.checked_add(1);
         Ok(())
+    }
+
+    fn validate_append_target(&self) -> Result<(), DurableWalError> {
+        self.directory.validate()?;
+        validate_open_lock(&self.directory, &self.lock_file)?;
+        validate_open_file(&self.directory, &self.file)
     }
 }
 
@@ -1365,7 +1508,14 @@ fn decode_final(
             ));
         }
     };
-    let mut wire_payloads = Vec::with_capacity(wire_payload_count);
+    let remaining = payload.len().saturating_sub(cursor);
+    if wire_payload_count > MAX_FINAL_WIRE_PAYLOADS || wire_payload_count > remaining / 4 {
+        return Err(DurableWalError::RecordTooLarge(wire_payload_count));
+    }
+    let mut wire_payloads = Vec::new();
+    wire_payloads
+        .try_reserve_exact(wire_payload_count)
+        .map_err(|_| DurableWalError::RecordTooLarge(wire_payload_count))?;
     for _ in 0..wire_payload_count {
         let length = usize::try_from(read_u32(payload, &mut cursor)?)
             .map_err(|_| DurableWalError::RecordTooLarge(usize::MAX))?;
@@ -1459,9 +1609,22 @@ fn read_and_parse(file: &mut File) -> Result<(RecoveredState, u64), DurableWalEr
         maximum: MAX_DURABLE_BROKER_WAL_BYTES,
     })?;
     let mut bytes = Vec::with_capacity(capacity);
-    file.read_to_end(&mut bytes)?;
+    file.take(MAX_DURABLE_BROKER_WAL_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let observed_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if observed_length > MAX_DURABLE_BROKER_WAL_BYTES {
+        return Err(DurableWalError::WalTooLarge {
+            length: observed_length,
+            maximum: MAX_DURABLE_BROKER_WAL_BYTES,
+        });
+    }
+    if file.metadata()?.len() != observed_length {
+        return Err(DurableWalError::InvalidRecord(
+            "WAL length changed during recovery".to_owned(),
+        ));
+    }
     let state = parse_wal(&bytes)?;
-    Ok((state, length))
+    Ok((state, observed_length))
 }
 
 fn parse_wal(bytes: &[u8]) -> Result<RecoveredState, DurableWalError> {
@@ -1630,8 +1793,15 @@ fn checksum(bytes: &[u8]) -> u64 {
     state
 }
 
-fn validate_new_path(path: &Path) -> Result<(), DurableWalError> {
-    match fs::symlink_metadata(path) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn validate_new_path(directory: &DurableDirectory) -> Result<(), DurableWalError> {
+    directory.validate()?;
+    match fs::symlink_metadata(directory.wal_path()) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(DurableWalError::Symlink),
         Ok(_) => Err(DurableWalError::Io(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -1642,8 +1812,9 @@ fn validate_new_path(path: &Path) -> Result<(), DurableWalError> {
     }
 }
 
-fn validate_existing_path(path: &Path) -> Result<(), DurableWalError> {
-    let metadata = fs::symlink_metadata(path)?;
+fn validate_existing_path(directory: &DurableDirectory) -> Result<(), DurableWalError> {
+    directory.validate()?;
+    let metadata = fs::symlink_metadata(directory.wal_path())?;
     if metadata.file_type().is_symlink() {
         return Err(DurableWalError::Symlink);
     }
@@ -1656,11 +1827,37 @@ fn validate_existing_path(path: &Path) -> Result<(), DurableWalError> {
             maximum: MAX_DURABLE_BROKER_WAL_BYTES,
         });
     }
+    validate_file_metadata(&metadata, directory.effective_uid)?;
     Ok(())
 }
 
-fn validate_open_file(path: &Path, file: &File) -> Result<(), DurableWalError> {
-    let path_metadata = fs::symlink_metadata(path)?;
+fn validate_open_file(directory: &DurableDirectory, file: &File) -> Result<(), DurableWalError> {
+    validate_open_named_file(
+        directory,
+        &directory.wal_name,
+        file,
+        Some(MAX_DURABLE_BROKER_WAL_BYTES),
+    )
+}
+
+fn validate_open_lock(directory: &DurableDirectory, file: &File) -> Result<(), DurableWalError> {
+    validate_open_named_file(directory, &directory.lock_name, file, Some(0))
+}
+
+fn validate_open_named_file(
+    directory: &DurableDirectory,
+    name: &OsStr,
+    file: &File,
+    maximum_length: Option<u64>,
+) -> Result<(), DurableWalError> {
+    directory.validate()?;
+    let path_metadata = fs::symlink_metadata(directory.child_path(name)).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            DurableWalError::PathIdentityChanged
+        } else {
+            DurableWalError::Io(error)
+        }
+    })?;
     if path_metadata.file_type().is_symlink() {
         return Err(DurableWalError::Symlink);
     }
@@ -1668,13 +1865,215 @@ fn validate_open_file(path: &Path, file: &File) -> Result<(), DurableWalError> {
     if !metadata.is_file() || !path_metadata.is_file() {
         return Err(DurableWalError::NotRegularFile);
     }
-    if metadata.len() > MAX_DURABLE_BROKER_WAL_BYTES {
+    if file_identity(&metadata) != file_identity(&path_metadata) {
+        return Err(DurableWalError::PathIdentityChanged);
+    }
+    validate_file_metadata(&metadata, directory.effective_uid)?;
+    if let Some(maximum) = maximum_length
+        && metadata.len() > maximum
+    {
         return Err(DurableWalError::WalTooLarge {
             length: metadata.len(),
-            maximum: MAX_DURABLE_BROKER_WAL_BYTES,
+            maximum,
         });
     }
     Ok(())
+}
+
+fn open_session_lock(
+    directory: &DurableDirectory,
+    exclusive: bool,
+) -> Result<File, DurableWalError> {
+    directory.validate()?;
+    let path = directory.lock_path();
+    let (file, created) = match create_private_file(&path) {
+        Ok(file) => (file, true),
+        Err(DurableWalError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {
+            (open_existing_file(&path, exclusive)?, false)
+        }
+        Err(error) => return Err(error),
+    };
+    if exclusive {
+        acquire_exclusive_lock(&file)?;
+    } else {
+        acquire_shared_lock(&file)?;
+    }
+    validate_open_lock(directory, &file)?;
+    if created {
+        file.sync_all()?;
+        directory.sync()?;
+    }
+    Ok(file)
+}
+
+fn create_private_file(path: &Path) -> Result<File, DurableWalError> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).read(true).write(true);
+    configure_secure_open(&mut options);
+    let file = options.open(path)?;
+    set_private_permissions(&file)?;
+    Ok(file)
+}
+
+fn open_existing_file(path: &Path, write: bool) -> Result<File, DurableWalError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(write);
+    configure_secure_open(&mut options);
+    Ok(options.open(path)?)
+}
+
+fn configure_secure_open(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    options.mode(PRIVATE_FILE_MODE);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(O_NOFOLLOW);
+}
+
+fn set_private_permissions(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    Ok(())
+}
+
+fn validate_parent_path(path: &Path, effective_uid: u32) -> Result<FileIdentity, DurableWalError> {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        PathBuf::from(".")
+    };
+    let mut final_identity = None;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => current.push(Path::new("/")),
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => current.push(name),
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                return Err(DurableWalError::UnsafeParentDirectory);
+            }
+        }
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() {
+            return Err(DurableWalError::Symlink);
+        }
+        validate_directory_metadata(&metadata, effective_uid)?;
+        final_identity = Some(file_identity(&metadata));
+    }
+    if final_identity.is_none() {
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() {
+            return Err(DurableWalError::Symlink);
+        }
+        validate_directory_metadata(&metadata, effective_uid)?;
+        final_identity = Some(file_identity(&metadata));
+    }
+    final_identity.ok_or(DurableWalError::UnsafeParentDirectory)
+}
+
+fn validate_parent_path_identity(
+    path: &Path,
+    directory: &File,
+    effective_uid: u32,
+) -> Result<(), DurableWalError> {
+    let path_identity = validate_parent_path(path, effective_uid)?;
+    let metadata = directory.metadata()?;
+    validate_directory_metadata(&metadata, effective_uid)?;
+    if path_identity != file_identity(&metadata) {
+        return Err(DurableWalError::PathIdentityChanged);
+    }
+    Ok(())
+}
+
+fn validate_directory_metadata(
+    metadata: &fs::Metadata,
+    effective_uid: u32,
+) -> Result<(), DurableWalError> {
+    if !metadata.is_dir() {
+        return Err(DurableWalError::UnsafeParentDirectory);
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.mode();
+        let owner = metadata.uid();
+        if mode & WRITE_BY_GROUP_OR_OTHER != 0
+            && (mode & STICKY_DIRECTORY == 0 || (owner != 0 && owner != effective_uid))
+        {
+            return Err(DurableWalError::UnsafeParentDirectory);
+        }
+    }
+    Ok(())
+}
+
+fn validate_file_metadata(
+    metadata: &fs::Metadata,
+    effective_uid: u32,
+) -> Result<(), DurableWalError> {
+    #[cfg(unix)]
+    validate_owner_and_permissions(metadata.uid(), metadata.mode(), effective_uid)?;
+    Ok(())
+}
+
+fn validate_owner_and_permissions(
+    owner: u32,
+    mode: u32,
+    effective_uid: u32,
+) -> Result<(), DurableWalError> {
+    if owner != effective_uid {
+        return Err(DurableWalError::WrongOwner {
+            expected: effective_uid,
+            actual: owner,
+        });
+    }
+    if mode & ACCESS_BY_GROUP_OR_OTHER != 0 {
+        return Err(DurableWalError::UnsafePermissions { mode: mode & 0o777 });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: 0,
+        inode: 0,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn effective_uid() -> Result<u32, DurableWalError> {
+    let status = fs::read_to_string("/proc/self/status")?;
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .ok_or_else(|| io::Error::other("/proc/self/status has no effective uid"))?;
+    line.split_ascii_whitespace()
+        .nth(2)
+        .ok_or_else(|| io::Error::other("/proc/self/status effective uid is missing"))?
+        .parse::<u32>()
+        .map_err(|_| io::Error::other("/proc/self/status effective uid is invalid"))
+        .map_err(DurableWalError::Io)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn effective_uid() -> Result<u32, DurableWalError> {
+    Err(DurableWalError::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable broker WAL ownership validation requires Linux",
+    )))
+}
+
+fn durable_lock_name(wal_name: &OsStr) -> OsString {
+    #[cfg(unix)]
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(wal_name);
+    #[cfg(not(unix))]
+    let bytes = wal_name.to_string_lossy().as_bytes();
+    OsString::from(format!(".egress-broker-{:016x}.lock", checksum(bytes)))
 }
 
 fn acquire_exclusive_lock(file: &File) -> Result<(), DurableWalError> {
@@ -1693,19 +2092,13 @@ fn acquire_shared_lock(file: &File) -> Result<(), DurableWalError> {
     }
 }
 
-fn sync_parent_directory(path: &Path) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    File::open(parent.unwrap_or_else(|| Path::new(".")))?.sync_all()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         fs::{self, OpenOptions},
         io::{Seek, SeekFrom, Write},
         num::{NonZeroU64, NonZeroUsize},
+        os::unix::fs::PermissionsExt,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -1718,7 +2111,8 @@ mod tests {
 
     use super::{
         BudgetSettlement, DurableAcceptance, DurableBrokerView, DurableBrokerWal,
-        DurableRequestPhase, DurableSessionConfig, DurableWalError,
+        DurableRequestPhase, DurableSessionConfig, DurableWalError, FINAL_KIND, PRIVATE_FILE_MODE,
+        durable_lock_name, encode_frame, validate_owner_and_permissions,
     };
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
@@ -1738,6 +2132,9 @@ mod tests {
     impl Drop for TestPath {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
+            if let (Some(parent), Some(name)) = (self.0.parent(), self.0.file_name()) {
+                let _ = fs::remove_file(parent.join(durable_lock_name(name)));
+            }
         }
     }
 
@@ -1964,6 +2361,135 @@ mod tests {
         assert!(matches!(
             DurableBrokerView::open(&corrupt_path.0),
             Err(DurableWalError::ChecksumMismatch)
+        ));
+    }
+
+    #[test]
+    fn path_replacement_preserves_lock_exclusion_and_seals_writer() {
+        let path = TestPath::new("path-replacement");
+        let moved = path.0.with_extension("moved");
+        let mut wal = DurableBrokerWal::create(&path.0, config()).expect("create WAL");
+        fs::rename(&path.0, &moved).expect("move locked WAL inode");
+        fs::copy(&moved, &path.0).expect("replace WAL pathname");
+
+        assert!(matches!(
+            DurableBrokerWal::open(&path.0, config()),
+            Err(DurableWalError::Locked)
+        ));
+        assert!(matches!(
+            wal.accept(envelope(0, 1), 10),
+            Err(DurableWalError::PathIdentityChanged)
+        ));
+        assert!(wal.is_sealed());
+        assert!(matches!(
+            wal.accept(envelope(0, 1), 10),
+            Err(DurableWalError::Sealed)
+        ));
+
+        drop(wal);
+        fs::remove_file(moved).expect("remove moved WAL");
+    }
+
+    #[test]
+    fn private_permissions_are_created_and_enforced_on_reopen() {
+        let path = TestPath::new("permissions");
+        let wal = DurableBrokerWal::create(&path.0, config()).expect("create WAL");
+        let lock_path = path.0.parent().expect("WAL parent").join(durable_lock_name(
+            path.0.file_name().expect("WAL file name"),
+        ));
+        assert_eq!(
+            fs::metadata(&path.0)
+                .expect("WAL metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            PRIVATE_FILE_MODE
+        );
+        assert_eq!(
+            fs::metadata(&lock_path)
+                .expect("lock metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            PRIVATE_FILE_MODE
+        );
+        drop(wal);
+
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o640))
+            .expect("make lock group-readable");
+        assert!(matches!(
+            DurableBrokerWal::open(&path.0, config()),
+            Err(DurableWalError::UnsafePermissions { .. })
+        ));
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("restore private lock mode");
+        fs::set_permissions(&path.0, fs::Permissions::from_mode(0o640))
+            .expect("make WAL group-readable");
+        assert!(matches!(
+            DurableBrokerWal::open(&path.0, config()),
+            Err(DurableWalError::UnsafePermissions { .. })
+        ));
+        assert!(matches!(
+            validate_owner_and_permissions(1_001, PRIVATE_FILE_MODE, 1_000),
+            Err(DurableWalError::WrongOwner {
+                expected: 1_000,
+                actual: 1_001
+            })
+        ));
+    }
+
+    #[test]
+    fn unsafe_parent_and_parent_symlink_are_rejected() {
+        let target = TestPath::new("symlink-target");
+        let link = target.0.with_extension("link");
+        let target_directory = target.0.with_extension("directory");
+        fs::create_dir(&target_directory).expect("create target directory");
+        std::os::unix::fs::symlink(&target_directory, &link).expect("create parent symlink");
+        let wal_path = link.join("broker.wal");
+
+        assert!(matches!(
+            DurableBrokerWal::create(&wal_path, config()),
+            Err(DurableWalError::Symlink)
+        ));
+
+        fs::remove_file(link).expect("remove parent symlink");
+        fs::set_permissions(&target_directory, fs::Permissions::from_mode(0o777))
+            .expect("make target directory untrusted");
+        assert!(matches!(
+            DurableBrokerWal::create(target_directory.join("broker.wal"), config()),
+            Err(DurableWalError::UnsafeParentDirectory)
+        ));
+        fs::set_permissions(&target_directory, fs::Permissions::from_mode(0o700))
+            .expect("restore target directory permissions");
+        fs::remove_dir(target_directory).expect("remove target directory");
+    }
+
+    #[test]
+    fn excessive_final_payload_count_is_rejected_before_allocation() {
+        let path = TestPath::new("final-count");
+        let first = envelope(0, 1);
+        {
+            let mut wal = DurableBrokerWal::create(&path.0, config()).expect("create WAL");
+            wal.accept(first, 10).expect("accept request");
+        }
+        let mut payload = Vec::new();
+        payload.extend_from_slice(first.request().as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&[0; 7]);
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        let frame = encode_frame(2, FINAL_KIND, &payload).expect("encode corrupt final frame");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path.0)
+            .expect("open WAL for corruption fixture");
+        file.write_all(&frame).expect("append corrupt final frame");
+        file.sync_all().expect("sync corrupt final frame");
+        drop(file);
+
+        assert!(matches!(
+            DurableBrokerView::open(&path.0),
+            Err(DurableWalError::RecordTooLarge(length)) if length == u32::MAX as usize
         ));
     }
 

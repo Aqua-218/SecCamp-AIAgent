@@ -170,7 +170,7 @@ leaf ≤ root
 
 この property test は多くの操作列を探索するが、数学的な全状態証明ではない。失敗時には proptest が短い反例へ shrink する。
 
-## 現在の境界
+## 正確な保証範囲
 
 このページの `CapabilityState` が実装するのは、1 thread 上で順番が確定した subject 登録、root 発行、Derive、保持確認、authorization、revoke と祖先失効、`auth_epoch`、subject lifecycle、open-handle registry である。並行利用では、この state を[Authorization guard](authorization-guard.md)の `CapabilityKernel` に入れる。attempt/effect の durable WAL は `authority-core` の durable audit module が state machine の外側で journalize する。
 
@@ -182,6 +182,14 @@ leaf ≤ root
 - HTTP redirect / DNS / response streaming と GitHub API call を実際に強制する Broker adapter。
 
 `CapabilityKernel` は executor closure と revoke の順序を線形化する。ただし closure が実際の filesystem や外部 effect の正しい線形化点まで進んでから return する責任は adapter 側にあり、現在は実 mount や Broker との end-to-end 検証まではない。
+
+## 変更時の確認点
+
+- Derive の判定を並行実行できるようにするときは、親の revoke との線形化を先に決める。現在は逐次実行が前提で、[Authorization guard](authorization-guard.md) の順序保証がその上に乗っている。
+- `CapId` の払い出しを再利用可能にしない。revoke 済みの ID が再び有効になる。
+- revoke の伝播を子孫の探索から親への遡りに変えるときは、探索の途中に挿入される Derive をどう扱うかを決める。
+- 静的 envelope の内容を後から変更できるようにしない。subject 登録時に固定されている前提で、以降の判定が組まれている。
+- state の遷移を増やすときは、[検証とテスト](verification.md)の状態遷移 test に対応する case を足す。
 
 ## 関連
 

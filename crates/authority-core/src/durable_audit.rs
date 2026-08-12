@@ -9,12 +9,18 @@
 use std::{
     collections::BTreeMap,
     error::Error,
+    ffi::{OsStr, OsString},
     fmt,
-    fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    fs::{self, File, OpenOptions, TryLockError},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
+
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use crate::{
     audit::AttemptOutcome,
@@ -31,6 +37,14 @@ const CHECKSUM_LEN: usize = 8;
 const MAX_RECORD_PAYLOAD: usize = 8 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
 const ATTEMPT_PAYLOAD_VERSION: u8 = 1;
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0o400_000;
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
+const WRITE_BY_GROUP_OR_OTHER: u32 = 0o022;
+const PERMISSION_MODE_BITS: u32 = 0o7777;
+const STICKY_DIRECTORY: u32 = 0o1000;
 /// Maximum opaque evidence retained for one `CommitUnknown` terminal outcome.
 pub const MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES: usize = 64 * 1024;
 
@@ -179,6 +193,28 @@ pub enum DurableAuditError {
         /// A context string retained without storing a non-cloneable IO error.
         message: String,
     },
+    /// Another process or handle currently owns the journal writer lock.
+    Locked,
+    /// The journal, lock, or parent path contains a symbolic link.
+    Symlink,
+    /// The journal or lock path does not name a regular file.
+    NotRegularFile,
+    /// A pathname no longer resolves to the opened directory or file identity.
+    PathIdentityChanged,
+    /// The journal or lock file is not owned by the effective user.
+    WrongOwner {
+        /// Effective user required to own the file.
+        expected: u32,
+        /// Owner observed on the file.
+        actual: u32,
+    },
+    /// The journal or lock file does not have exact mode `0600`.
+    UnsafePermissions {
+        /// Observed Unix permission and special mode bits.
+        mode: u32,
+    },
+    /// The containing directory is not a stable trusted namespace.
+    UnsafeParentDirectory,
     /// The journal mutex was poisoned by a writer panic.
     LockPoisoned,
     /// A previous write or sync failed, so this log stays unusable.
@@ -226,6 +262,21 @@ impl fmt::Display for DurableAuditError {
         match self {
             Self::Io { kind, message } => {
                 write!(formatter, "durable audit IO error ({kind}): {message}")
+            }
+            Self::Locked => formatter.write_str("durable audit journal already has a writer"),
+            Self::Symlink => formatter.write_str("durable audit path contains a symbolic link"),
+            Self::NotRegularFile => formatter.write_str("durable audit path is not a regular file"),
+            Self::PathIdentityChanged => formatter.write_str("durable audit path identity changed"),
+            Self::WrongOwner { expected, actual } => write!(
+                formatter,
+                "durable audit file owner {actual} does not match effective user {expected}"
+            ),
+            Self::UnsafePermissions { mode } => write!(
+                formatter,
+                "durable audit file permissions {mode:o} are not exact mode 600"
+            ),
+            Self::UnsafeParentDirectory => {
+                formatter.write_str("durable audit parent directory is not a trusted namespace")
             }
             Self::LockPoisoned => formatter.write_str("durable audit lock is poisoned"),
             Self::JournalFull { length, max_length } => write!(
@@ -312,8 +363,88 @@ impl DurableAttemptState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug)]
+struct DurableDirectory {
+    file: File,
+    path: PathBuf,
+    journal_name: OsString,
+    lock_name: OsString,
+    effective_uid: u32,
+}
+
+impl DurableDirectory {
+    fn open(journal_path: &Path) -> Result<Self, DurableAuditError> {
+        let journal_name = journal_path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or(DurableAuditError::UnsafeParentDirectory)?
+            .to_os_string();
+        let path = journal_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let effective_uid = effective_uid()?;
+        let expected = validate_parent_path(&path, effective_uid)?;
+        let file = File::open(&path).map_err(DurableAuditError::from)?;
+        validate_directory_metadata(
+            &file.metadata().map_err(DurableAuditError::from)?,
+            effective_uid,
+        )?;
+        if expected != file_identity(&file.metadata().map_err(DurableAuditError::from)?) {
+            return Err(DurableAuditError::PathIdentityChanged);
+        }
+        validate_parent_path_identity(&path, &file, effective_uid)?;
+        let lock_name = durable_lock_name(&journal_name);
+        Ok(Self {
+            file,
+            path,
+            journal_name,
+            lock_name,
+            effective_uid,
+        })
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.child_path(&self.journal_name)
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.child_path(&self.lock_name)
+    }
+
+    fn child_path(&self, name: &OsStr) -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            let mut path = PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()));
+            path.push(name);
+            path
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.path.join(name)
+        }
+    }
+
+    fn validate(&self) -> Result<(), DurableAuditError> {
+        validate_parent_path_identity(&self.path, &self.file, self.effective_uid)
+    }
+
+    fn sync(&self) -> Result<(), DurableAuditError> {
+        self.file.sync_all().map_err(DurableAuditError::from)
+    }
+}
+
 #[derive(Debug)]
 struct DurableState {
+    directory: DurableDirectory,
+    lock_file: File,
     file: File,
     next_sequence: Option<u64>,
     attempts: BTreeMap<crate::audit::AttemptId, DurableAttemptState>,
@@ -324,11 +455,12 @@ struct DurableState {
     length: u64,
 }
 
-/// A process-local, single-writer WAL for authorization audit records.
+/// An exclusively owned WAL for authorization audit records.
 ///
-/// The mutex protects one open handle in one process. Cross-process writer
-/// coordination is intentionally outside authority-core; callers must assign
-/// one journal owner. Reopening validates the complete prefix and rejects all
+/// The writer holds process- and cross-process locks for its lifetime. Every
+/// append revalidates the held parent directory plus the lock and journal file
+/// identities, and permanently seals the writer after any mismatch or
+/// uncertain write. Reopening validates the complete prefix and rejects all
 /// malformed or ambiguous suffixes instead of silently truncating them.
 #[derive(Debug)]
 pub struct DurableAuditLog {
@@ -358,17 +490,12 @@ impl DurableAuditView {
     /// an invalid, truncated, replayed, or checksum-invalid frame.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DurableAuditError> {
         let path = path.as_ref().to_owned();
-        let mut file = File::open(&path).map_err(DurableAuditError::from)?;
-        let file_length = file.metadata().map_err(DurableAuditError::from)?.len();
-        if file_length > MAX_JOURNAL_BYTES {
-            return Err(DurableAuditError::RecordTooLarge(
-                usize::try_from(file_length).unwrap_or(usize::MAX),
-            ));
-        }
-
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(DurableAuditError::from)?;
+        let directory = DurableDirectory::open(&path)?;
+        validate_existing_path(&directory)?;
+        let mut file = open_existing_file(&directory.journal_path(), false)?;
+        validate_open_journal(&directory, &file)?;
+        let bytes = read_bounded_journal(&mut file)?;
+        validate_open_journal_length(&directory, &file, bytes.len())?;
         let (_, attempts) = parse_journal(&bytes)?;
         Ok(Self::from_attempts(path, &attempts))
     }
@@ -416,15 +543,20 @@ impl DurableAuditLog {
     /// Returns an IO error when the path already exists or cannot be synced.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, DurableAuditError> {
         let path = path.as_ref().to_owned();
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(DurableAuditError::from)?;
+        let directory = DurableDirectory::open(&path)?;
+        let lock_file = open_writer_lock(&directory)?;
+        validate_new_path(&directory)?;
+        let file = create_private_file(&directory.journal_path())?;
+        acquire_exclusive_lock(&file)?;
+        validate_open_journal(&directory, &file)?;
         file.sync_all().map_err(DurableAuditError::from)?;
+        directory.sync()?;
+        validate_open_journal_length(&directory, &file, 0)?;
+        validate_open_lock(&directory, &lock_file)?;
         Ok(Self {
             state: Arc::new(Mutex::new(DurableState {
+                directory,
+                lock_file,
                 file,
                 next_sequence: Some(0),
                 attempts: BTreeMap::new(),
@@ -448,26 +580,22 @@ impl DurableAuditLog {
     /// an invalid, truncated, replayed, or checksum-invalid frame.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DurableAuditError> {
         let path = path.as_ref().to_owned();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(DurableAuditError::from)?;
-        let file_length = file.metadata().map_err(DurableAuditError::from)?.len();
-        if file_length > MAX_JOURNAL_BYTES {
-            return Err(DurableAuditError::RecordTooLarge(
-                usize::try_from(file_length).unwrap_or(usize::MAX),
-            ));
-        }
-
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(DurableAuditError::from)?;
+        let directory = DurableDirectory::open(&path)?;
+        let lock_file = open_writer_lock(&directory)?;
+        validate_existing_path(&directory)?;
+        let mut file = open_existing_file(&directory.journal_path(), true)?;
+        acquire_exclusive_lock(&file)?;
+        validate_open_journal(&directory, &file)?;
+        let bytes = read_bounded_journal(&mut file)?;
+        validate_open_journal_length(&directory, &file, bytes.len())?;
         let (next_sequence, attempts) = parse_journal(&bytes)?;
-        file.seek(SeekFrom::End(0))
-            .map_err(DurableAuditError::from)?;
+        let file_length = u64::try_from(bytes.len())
+            .map_err(|_| DurableAuditError::RecordTooLarge(bytes.len()))?;
+        validate_open_lock(&directory, &lock_file)?;
         Ok(Self {
             state: Arc::new(Mutex::new(DurableState {
+                directory,
+                lock_file,
                 file,
                 next_sequence,
                 attempts,
@@ -650,6 +778,10 @@ fn append_frame(
     attempt_id: crate::audit::AttemptId,
     payload: &[u8],
 ) -> Result<(), DurableAuditError> {
+    if let Err(error) = validate_append_target(state, state.length) {
+        state.unusable = true;
+        return Err(error);
+    }
     if payload.len() > MAX_RECORD_PAYLOAD {
         return Err(DurableAuditError::RecordTooLarge(payload.len()));
     }
@@ -696,8 +828,353 @@ fn append_frame(
         state.unusable = true;
         return Err(DurableAuditError::from(error));
     }
+    if let Err(error) = validate_append_target(state, new_length) {
+        state.unusable = true;
+        return Err(error);
+    }
     state.length = new_length;
     Ok(())
+}
+
+fn validate_append_target(
+    state: &DurableState,
+    expected_length: u64,
+) -> Result<(), DurableAuditError> {
+    state.directory.validate()?;
+    validate_open_lock(&state.directory, &state.lock_file)?;
+    let actual_length = validate_open_journal(&state.directory, &state.file)?;
+    if actual_length != expected_length {
+        return Err(DurableAuditError::InvalidRecord(format!(
+            "journal length changed outside the exclusive writer: expected {expected_length}, got {actual_length}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_new_path(directory: &DurableDirectory) -> Result<(), DurableAuditError> {
+    directory.validate()?;
+    match fs::symlink_metadata(directory.journal_path()) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(DurableAuditError::Symlink),
+        Ok(_) => Err(DurableAuditError::Io {
+            kind: io::ErrorKind::AlreadyExists,
+            message: "durable audit journal already exists".to_owned(),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DurableAuditError::from(error)),
+    }
+}
+
+fn validate_existing_path(directory: &DurableDirectory) -> Result<(), DurableAuditError> {
+    validate_existing_named_path(directory, &directory.journal_name, Some(MAX_JOURNAL_BYTES))
+}
+
+fn validate_existing_named_path(
+    directory: &DurableDirectory,
+    name: &OsStr,
+    maximum_length: Option<u64>,
+) -> Result<(), DurableAuditError> {
+    directory.validate()?;
+    let metadata =
+        fs::symlink_metadata(directory.child_path(name)).map_err(DurableAuditError::from)?;
+    if metadata.file_type().is_symlink() {
+        return Err(DurableAuditError::Symlink);
+    }
+    if !metadata.is_file() {
+        return Err(DurableAuditError::NotRegularFile);
+    }
+    validate_file_metadata(&metadata, directory.effective_uid)?;
+    if let Some(maximum_length) = maximum_length
+        && metadata.len() > maximum_length
+    {
+        return Err(DurableAuditError::RecordTooLarge(
+            usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_open_journal(
+    directory: &DurableDirectory,
+    file: &File,
+) -> Result<u64, DurableAuditError> {
+    validate_open_named_file(
+        directory,
+        &directory.journal_name,
+        file,
+        Some(MAX_JOURNAL_BYTES),
+    )
+}
+
+fn validate_open_lock(directory: &DurableDirectory, file: &File) -> Result<u64, DurableAuditError> {
+    validate_open_named_file(directory, &directory.lock_name, file, Some(0))
+}
+
+fn validate_open_named_file(
+    directory: &DurableDirectory,
+    name: &OsStr,
+    file: &File,
+    maximum_length: Option<u64>,
+) -> Result<u64, DurableAuditError> {
+    directory.validate()?;
+    let path_metadata = fs::symlink_metadata(directory.child_path(name)).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            DurableAuditError::PathIdentityChanged
+        } else {
+            DurableAuditError::from(error)
+        }
+    })?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(DurableAuditError::Symlink);
+    }
+    let metadata = file.metadata().map_err(DurableAuditError::from)?;
+    if !metadata.is_file() || !path_metadata.is_file() {
+        return Err(DurableAuditError::NotRegularFile);
+    }
+    if file_identity(&metadata) != file_identity(&path_metadata) {
+        return Err(DurableAuditError::PathIdentityChanged);
+    }
+    validate_file_metadata(&metadata, directory.effective_uid)?;
+    if let Some(maximum_length) = maximum_length
+        && metadata.len() > maximum_length
+    {
+        return Err(DurableAuditError::RecordTooLarge(
+            usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(metadata.len())
+}
+
+fn validate_open_journal_length(
+    directory: &DurableDirectory,
+    file: &File,
+    expected_length: usize,
+) -> Result<(), DurableAuditError> {
+    let expected_length = u64::try_from(expected_length)
+        .map_err(|_| DurableAuditError::RecordTooLarge(expected_length))?;
+    let actual_length = validate_open_journal(directory, file)?;
+    if actual_length != expected_length {
+        return Err(DurableAuditError::InvalidRecord(format!(
+            "journal length changed while it was read: expected {expected_length}, got {actual_length}"
+        )));
+    }
+    Ok(())
+}
+
+fn open_writer_lock(directory: &DurableDirectory) -> Result<File, DurableAuditError> {
+    directory.validate()?;
+    let path = directory.lock_path();
+    let (file, created) = match create_private_file(&path) {
+        Ok(file) => (file, true),
+        Err(DurableAuditError::Io {
+            kind: io::ErrorKind::AlreadyExists,
+            ..
+        }) => {
+            validate_existing_named_path(directory, &directory.lock_name, Some(0))?;
+            (open_existing_file(&path, true)?, false)
+        }
+        Err(error) => return Err(error),
+    };
+    acquire_exclusive_lock(&file)?;
+    validate_open_lock(directory, &file)?;
+    if created {
+        file.sync_all().map_err(DurableAuditError::from)?;
+        directory.sync()?;
+    }
+    Ok(file)
+}
+
+fn create_private_file(path: &Path) -> Result<File, DurableAuditError> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).read(true).append(true);
+    configure_secure_open(&mut options);
+    let file = options.open(path).map_err(DurableAuditError::from)?;
+    set_private_permissions(&file)?;
+    Ok(file)
+}
+
+fn open_existing_file(path: &Path, write: bool) -> Result<File, DurableAuditError> {
+    let mut options = OpenOptions::new();
+    options.read(true).append(write);
+    configure_secure_open(&mut options);
+    options.open(path).map_err(DurableAuditError::from)
+}
+
+fn configure_secure_open(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    options.mode(PRIVATE_FILE_MODE);
+    #[cfg(target_os = "linux")]
+    options.custom_flags(O_NOFOLLOW);
+}
+
+fn set_private_permissions(file: &File) -> Result<(), DurableAuditError> {
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+        .map_err(DurableAuditError::from)?;
+    Ok(())
+}
+
+fn validate_parent_path(
+    path: &Path,
+    effective_uid: u32,
+) -> Result<FileIdentity, DurableAuditError> {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        PathBuf::from(".")
+    };
+    let mut final_identity = None;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => current.push(Path::new("/")),
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => current.push(name),
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
+                return Err(DurableAuditError::UnsafeParentDirectory);
+            }
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(DurableAuditError::from)?;
+        if metadata.file_type().is_symlink() {
+            return Err(DurableAuditError::Symlink);
+        }
+        validate_directory_metadata(&metadata, effective_uid)?;
+        final_identity = Some(file_identity(&metadata));
+    }
+    if final_identity.is_none() {
+        let metadata = fs::symlink_metadata(&current).map_err(DurableAuditError::from)?;
+        if metadata.file_type().is_symlink() {
+            return Err(DurableAuditError::Symlink);
+        }
+        validate_directory_metadata(&metadata, effective_uid)?;
+        final_identity = Some(file_identity(&metadata));
+    }
+    final_identity.ok_or(DurableAuditError::UnsafeParentDirectory)
+}
+
+fn validate_parent_path_identity(
+    path: &Path,
+    directory: &File,
+    effective_uid: u32,
+) -> Result<(), DurableAuditError> {
+    let path_identity = validate_parent_path(path, effective_uid)?;
+    let metadata = directory.metadata().map_err(DurableAuditError::from)?;
+    validate_directory_metadata(&metadata, effective_uid)?;
+    if path_identity != file_identity(&metadata) {
+        return Err(DurableAuditError::PathIdentityChanged);
+    }
+    Ok(())
+}
+
+fn validate_directory_metadata(
+    metadata: &fs::Metadata,
+    effective_uid: u32,
+) -> Result<(), DurableAuditError> {
+    if !metadata.is_dir() {
+        return Err(DurableAuditError::UnsafeParentDirectory);
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.mode();
+        let owner = metadata.uid();
+        if mode & WRITE_BY_GROUP_OR_OTHER != 0
+            && (mode & STICKY_DIRECTORY == 0 || (owner != 0 && owner != effective_uid))
+        {
+            return Err(DurableAuditError::UnsafeParentDirectory);
+        }
+    }
+    Ok(())
+}
+
+fn validate_file_metadata(
+    metadata: &fs::Metadata,
+    effective_uid: u32,
+) -> Result<(), DurableAuditError> {
+    #[cfg(unix)]
+    validate_owner_and_permissions(metadata.uid(), metadata.mode(), effective_uid)?;
+    Ok(())
+}
+
+fn validate_owner_and_permissions(
+    owner: u32,
+    mode: u32,
+    effective_uid: u32,
+) -> Result<(), DurableAuditError> {
+    if owner != effective_uid {
+        return Err(DurableAuditError::WrongOwner {
+            expected: effective_uid,
+            actual: owner,
+        });
+    }
+    let access_mode = mode & PERMISSION_MODE_BITS;
+    if access_mode != PRIVATE_FILE_MODE {
+        return Err(DurableAuditError::UnsafePermissions { mode: access_mode });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: 0,
+        inode: 0,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn effective_uid() -> Result<u32, DurableAuditError> {
+    let status = fs::read_to_string("/proc/self/status").map_err(DurableAuditError::from)?;
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .ok_or_else(|| io::Error::other("/proc/self/status has no effective uid"))?;
+    line.split_ascii_whitespace()
+        .nth(2)
+        .ok_or_else(|| io::Error::other("/proc/self/status effective uid is missing"))?
+        .parse::<u32>()
+        .map_err(|_| io::Error::other("/proc/self/status effective uid is invalid"))
+        .map_err(DurableAuditError::from)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn effective_uid() -> Result<u32, DurableAuditError> {
+    Err(DurableAuditError::from(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable audit ownership validation requires Linux",
+    )))
+}
+
+fn durable_lock_name(journal_name: &OsStr) -> OsString {
+    #[cfg(unix)]
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(journal_name);
+    #[cfg(not(unix))]
+    let bytes = journal_name.to_string_lossy().as_bytes();
+    OsString::from(format!(".authority-audit-{:016x}.lock", checksum(bytes)))
+}
+
+fn acquire_exclusive_lock(file: &File) -> Result<(), DurableAuditError> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(DurableAuditError::Locked),
+        Err(TryLockError::Error(error)) => Err(DurableAuditError::from(error)),
+    }
+}
+
+fn read_bounded_journal(file: &mut File) -> Result<Vec<u8>, DurableAuditError> {
+    let mut bytes = Vec::new();
+    file.take(MAX_JOURNAL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(DurableAuditError::from)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_JOURNAL_BYTES {
+        return Err(DurableAuditError::RecordTooLarge(bytes.len()));
+    }
+    Ok(bytes)
 }
 
 fn parse_journal(
@@ -1147,6 +1624,10 @@ fn encode_authority_request(
 mod tests {
     use std::{
         fs::{self, OpenOptions},
+        io::{Seek, SeekFrom},
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        process::Command,
         sync::Arc,
         sync::atomic::{AtomicU64, Ordering},
         thread,
@@ -1154,7 +1635,8 @@ mod tests {
 
     use super::{
         CommitReceipt, CommitUnknownEvidence, DurableAuditError, DurableAuditLog, DurableAuditView,
-        MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES,
+        MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES, MAX_JOURNAL_BYTES, PRIVATE_FILE_MODE, durable_lock_name,
+        validate_owner_and_permissions,
     };
     use crate::{
         audit::{AttemptId, AttemptOutcome},
@@ -1167,9 +1649,10 @@ mod tests {
     };
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+    const CROSS_PROCESS_LOCK_PATH: &str = "AUTHORITY_CORE_TEST_AUDIT_LOCK_PATH";
 
     struct TestJournal {
-        path: std::path::PathBuf,
+        path: PathBuf,
     }
 
     impl TestJournal {
@@ -1180,13 +1663,28 @@ mod tests {
                 std::process::id()
             ));
             let _ = fs::remove_file(&path);
+            if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                let _ = fs::remove_file(parent.join(durable_lock_name(name)));
+            }
             Self { path }
+        }
+
+        fn lock_path(&self) -> PathBuf {
+            self.path
+                .parent()
+                .expect("test journal must have a parent")
+                .join(durable_lock_name(
+                    self.path
+                        .file_name()
+                        .expect("test journal must have a file name"),
+                ))
         }
     }
 
     impl Drop for TestJournal {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(self.lock_path());
         }
     }
 
@@ -1277,6 +1775,9 @@ mod tests {
         let live_view = log
             .read_only_view()
             .expect("a healthy writer must produce a read-only snapshot");
+        let concurrent_view = DurableAuditView::open(&journal.path)
+            .expect("read-only recovery must not acquire the writer lock");
+        assert_eq!(live_view, concurrent_view);
         drop(log);
 
         let recovered = DurableAuditView::open(&journal.path)
@@ -1285,6 +1786,262 @@ mod tests {
         assert_eq!(recovered.path(), journal.path);
         assert_eq!(recovered.next_attempt_sequence(), Some(1));
         assert_eq!(recovered.attempts()[0].outcome(), AttemptOutcome::Started);
+    }
+
+    #[test]
+    fn second_writer_is_rejected_until_the_first_writer_drops() {
+        let journal = TestJournal::new();
+        let first = DurableAuditLog::create(&journal.path).expect("first writer must create WAL");
+
+        assert!(matches!(
+            DurableAuditLog::open(&journal.path),
+            Err(DurableAuditError::Locked)
+        ));
+        begin(&first, 0);
+        drop(first);
+
+        let reopened = DurableAuditLog::open(&journal.path)
+            .expect("dropping the sole writer must release both locks");
+        assert_eq!(reopened.next_attempt_sequence(), Ok(Some(1)));
+    }
+
+    #[test]
+    fn writer_lock_is_exclusive_across_processes() {
+        if let Some(path) = std::env::var_os(CROSS_PROCESS_LOCK_PATH) {
+            assert!(matches!(
+                DurableAuditLog::open(PathBuf::from(path)),
+                Err(DurableAuditError::Locked)
+            ));
+            return;
+        }
+
+        let journal = TestJournal::new();
+        let writer = DurableAuditLog::create(&journal.path).expect("parent must own the WAL");
+        let status = Command::new(std::env::current_exe().expect("locate test executable"))
+            .arg("--exact")
+            .arg("durable_audit::tests::writer_lock_is_exclusive_across_processes")
+            .arg("--nocapture")
+            .env(CROSS_PROCESS_LOCK_PATH, &journal.path)
+            .status()
+            .expect("start lock contender process");
+        assert!(status.success(), "child must observe the writer lock");
+        drop(writer);
+    }
+
+    #[test]
+    fn append_mode_does_not_depend_on_the_file_cursor() {
+        let journal = TestJournal::new();
+        let log = DurableAuditLog::create(&journal.path).expect("writer must create WAL");
+        begin(&log, 0);
+        log.state
+            .lock()
+            .expect("writer state must remain healthy")
+            .file
+            .seek(SeekFrom::Start(0))
+            .expect("test must move the read cursor");
+
+        begin(&log, 1);
+        drop(log);
+
+        let recovered = DurableAuditView::open(&journal.path)
+            .expect("O_APPEND must preserve both complete frames");
+        assert_eq!(recovered.attempts().len(), 2);
+        assert_eq!(recovered.next_attempt_sequence(), Some(2));
+    }
+
+    #[test]
+    fn path_replacement_seals_the_original_writer() {
+        let journal = TestJournal::new();
+        let moved = journal.path.with_extension("moved");
+        let _ = fs::remove_file(&moved);
+        let log = DurableAuditLog::create(&journal.path).expect("writer must create WAL");
+        begin(&log, 0);
+        fs::rename(&journal.path, &moved).expect("move the locked WAL inode");
+        fs::copy(&moved, &journal.path).expect("replace the WAL pathname with another inode");
+
+        assert!(matches!(
+            log.begin_attempt(
+                AttemptId::from_u64(1),
+                &SubjectId::new("subject"),
+                &CapId::new("capability"),
+                &request_set(),
+                AuthorizationEpoch::default(),
+            ),
+            Err(DurableAuditError::PathIdentityChanged)
+        ));
+        assert_eq!(
+            log.next_attempt_sequence(),
+            Err(DurableAuditError::JournalUnavailable)
+        );
+        assert!(matches!(
+            DurableAuditLog::open(&journal.path),
+            Err(DurableAuditError::Locked)
+        ));
+
+        drop(log);
+        fs::remove_file(moved).expect("remove moved WAL fixture");
+    }
+
+    #[test]
+    fn private_wal_and_lock_modes_are_created_and_enforced() {
+        let journal = TestJournal::new();
+        let log = DurableAuditLog::create(&journal.path).expect("writer must create WAL");
+        assert_eq!(
+            fs::metadata(&journal.path)
+                .expect("WAL metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            PRIVATE_FILE_MODE
+        );
+        assert_eq!(
+            fs::metadata(journal.lock_path())
+                .expect("lock metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            PRIVATE_FILE_MODE
+        );
+        drop(log);
+
+        fs::set_permissions(
+            journal.lock_path(),
+            fs::Permissions::from_mode(PRIVATE_FILE_MODE | 0o040),
+        )
+        .expect("make lock group-readable");
+        assert!(matches!(
+            DurableAuditLog::open(&journal.path),
+            Err(DurableAuditError::UnsafePermissions { .. })
+        ));
+        fs::set_permissions(
+            journal.lock_path(),
+            fs::Permissions::from_mode(PRIVATE_FILE_MODE),
+        )
+        .expect("restore lock mode");
+        fs::set_permissions(
+            &journal.path,
+            fs::Permissions::from_mode(PRIVATE_FILE_MODE | 0o040),
+        )
+        .expect("make WAL group-readable");
+        assert!(matches!(
+            DurableAuditLog::open(&journal.path),
+            Err(DurableAuditError::UnsafePermissions { .. })
+        ));
+        assert!(matches!(
+            DurableAuditView::open(&journal.path),
+            Err(DurableAuditError::UnsafePermissions { .. })
+        ));
+        fs::set_permissions(
+            &journal.path,
+            fs::Permissions::from_mode(PRIVATE_FILE_MODE | 0o4000),
+        )
+        .expect("add a set-user-ID bit");
+        assert!(matches!(
+            DurableAuditLog::open(&journal.path),
+            Err(DurableAuditError::UnsafePermissions { .. })
+        ));
+        assert!(matches!(
+            validate_owner_and_permissions(1_001, PRIVATE_FILE_MODE, 1_000),
+            Err(DurableAuditError::WrongOwner {
+                expected: 1_000,
+                actual: 1_001
+            })
+        ));
+    }
+
+    #[test]
+    fn journal_and_parent_symlinks_are_rejected() {
+        let target = TestJournal::new();
+        let target_log =
+            DurableAuditLog::create(&target.path).expect("target WAL must be created securely");
+        drop(target_log);
+        let journal_link = target.path.with_extension("symlink");
+        let journal_link_lock =
+            journal_link
+                .parent()
+                .expect("journal link parent")
+                .join(durable_lock_name(
+                    journal_link.file_name().expect("journal link name"),
+                ));
+        let _ = fs::remove_file(&journal_link);
+        let _ = fs::remove_file(&journal_link_lock);
+        std::os::unix::fs::symlink(&target.path, &journal_link)
+            .expect("create journal symlink fixture");
+
+        assert!(matches!(
+            DurableAuditView::open(&journal_link),
+            Err(DurableAuditError::Symlink)
+        ));
+        assert!(matches!(
+            DurableAuditLog::open(&journal_link),
+            Err(DurableAuditError::Symlink)
+        ));
+        fs::remove_file(&journal_link).expect("remove journal symlink fixture");
+        let _ = fs::remove_file(journal_link_lock);
+
+        let parent_target = target.path.with_extension("directory");
+        let parent_link = target.path.with_extension("directory-link");
+        let _ = fs::remove_file(&parent_link);
+        let _ = fs::remove_dir(&parent_target);
+        fs::create_dir(&parent_target).expect("create parent target");
+        fs::set_permissions(
+            &parent_target,
+            fs::Permissions::from_mode(PRIVATE_FILE_MODE | 0o100),
+        )
+        .expect("make parent private");
+        std::os::unix::fs::symlink(&parent_target, &parent_link)
+            .expect("create parent symlink fixture");
+        assert!(matches!(
+            DurableAuditLog::create(parent_link.join("audit.wal")),
+            Err(DurableAuditError::Symlink)
+        ));
+        fs::remove_file(parent_link).expect("remove parent symlink fixture");
+        fs::remove_dir(parent_target).expect("remove parent target fixture");
+    }
+
+    #[test]
+    fn group_writable_non_sticky_parent_is_rejected() {
+        let journal = TestJournal::new();
+        let parent = journal.path.with_extension("unsafe-directory");
+        let _ = fs::remove_dir(&parent);
+        fs::create_dir(&parent).expect("create unsafe parent fixture");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o770))
+            .expect("make parent group-writable");
+
+        assert!(matches!(
+            DurableAuditLog::create(parent.join("audit.wal")),
+            Err(DurableAuditError::UnsafeParentDirectory)
+        ));
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+            .expect("restore parent mode for cleanup");
+        fs::remove_dir(parent).expect("remove unsafe parent fixture");
+    }
+
+    #[test]
+    fn read_only_and_writer_open_bound_sparse_journal_length() {
+        let journal = TestJournal::new();
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&journal.path)
+            .expect("create oversized fixture");
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+            .expect("make oversized fixture private");
+        file.set_len(MAX_JOURNAL_BYTES + 1)
+            .expect("create sparse oversized fixture");
+        file.sync_all().expect("sync oversized fixture metadata");
+        drop(file);
+
+        assert!(matches!(
+            DurableAuditView::open(&journal.path),
+            Err(DurableAuditError::RecordTooLarge(_))
+        ));
+        assert!(matches!(
+            DurableAuditLog::open(&journal.path),
+            Err(DurableAuditError::RecordTooLarge(_))
+        ));
     }
 
     #[test]

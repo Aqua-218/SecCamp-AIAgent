@@ -30,12 +30,12 @@ stop も同じ containment order を使い、root revoke、VM kill、Broker clos
 ## identity と isolation の不変条件
 
 - VM、session、subject、workspace、capability、request、Broker session の identity はそれぞれ 128-bit で、`CryptographicRandom` から得る。
-- process 内の no-reuse ledger は、全 identity domain をまたいで過去に使用した byte value を拒否する。失敗した startup で割り当てた値も予約済みのまま残る。
+- no-reuse ledger は、全 identity domain をまたいで過去に使用した byte value を拒否する。失敗した startup で割り当てた値も予約済みのまま残る。
 - `SnapshotDescriptor` に session-scoped identity が含まれていれば restore を拒否する。snapshot source を再利用する場合も、新しい session は全ての identity を再生成する。
 - 各 backend lease は session identity と、workspace、Broker、VM、capability、workload の対応 identity を保持する。foreign session または foreign resource の lease は次の stage の前に拒否する。
 - 同じ `SessionOrchestrator` で active session は一つだけであり、二つ目の start は backend を呼ぶ前に拒否する。
 
-process 内 ledger は process restart をまたいで永続化されない。複数 supervisor process、snapshot restore、host restart をまたぐ no-reuse を保証するには、production host が durable allocator または同等の調整機構を別途提供しなければならない。
+`SessionOrchestrator::new` の process-local ledger は test と組み込み用途向けであり、restart をまたがない。production host は `SessionOrchestrator::new_durable` と永続 ledger file を使う。durable ledger は exclusive ownership、version/checksum 検証、append 後の `sync_data` を要求し、過去の identity を restart 後も再利用させない。
 
 ## 検証状態
 

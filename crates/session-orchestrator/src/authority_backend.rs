@@ -242,7 +242,7 @@ impl CapabilityRevocationBackend for AuthorityCoreBackend {
         }
 
         self.kernel
-            .revoke(&binding.capability)
+            .revoke_held_by(&binding.subject, &binding.capability)
             .map_err(|error| revoke_error(&binding, "revoke", &error))?;
         self.kernel
             .begin_subject_close(&binding.subject)
@@ -267,7 +267,7 @@ impl AuthorityCoreBackend {
     ) -> BackendError {
         let revoke_detail = match issued {
             None => "not required".to_owned(),
-            Some(capability) => match self.kernel.revoke(capability) {
+            Some(capability) => match self.kernel.revoke_held_by(subject, capability) {
                 Ok(status) => format!("attempted ({status:?})"),
                 Err(error) => format!("failed ({error})"),
             },
@@ -434,9 +434,15 @@ mod tests {
         let binding = backend.broker_binding(&identity);
         backend
             .kernel()
-            .authorize_and_commit(&binding.caller, &binding.capability, &request(), |_| {
-                Ok::<_, Infallible>(())
-            })
+            .authorize_and_execute_classified(
+                &binding.caller,
+                &binding.capability,
+                &request(),
+                |_| authority_core::kernel::EffectExecution::<(), Infallible>::Committed {
+                    value: (),
+                    receipt: None,
+                },
+            )
             .expect("a request inside the root grant must authorize");
     }
 

@@ -12,14 +12,12 @@ use std::{
 use authority_core::{
     audit::{AttemptId, AttemptOutcome, AuditError},
     capability::{AuthorityBody, AuthorityRequest, CapId, CapabilityRequest, IssuerId, SubjectId},
-    durable_audit::{CommitReceipt, DurableAuditError, DurableAuditLog},
+    durable_audit::{DurableAuditError, DurableAuditLog, DurableAuditView},
     file::{FileAuthority, FileEffect, FileEffects, FileRequest},
     kernel::{CapabilityKernel, EffectCommitError},
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
-    state::{
-        AuthorizationEpoch, CapabilityGrant, CapabilityState, StaticAuthorityEnvelope, Subject,
-    },
+    state::{CapabilityGrant, CapabilityState, StaticAuthorityEnvelope, Subject},
     time::{MonotonicTime, TimeWindow},
 };
 
@@ -177,39 +175,29 @@ fn durable_kernel_preserves_external_root_identity_and_skips_it_sequentially() {
 fn durable_wal_preserves_unknown_completion_after_crash_window() {
     let journal = TestJournal::new();
     let backend = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
-    let requests = authority_core::capability::CapabilityRequestSet::one(request());
-    backend
-        .begin_attempt(
-            AttemptId::from_u64(0),
-            &SubjectId::new("subject"),
-            &CapId::new("capability"),
-            &requests,
-            AuthorizationEpoch::default(),
-        )
-        .expect("attempt start must be synced before external work");
-    drop(backend);
+    let kernel = CapabilityKernel::try_new_with_durable_audit(initial_state(), backend)
+        .expect("a healthy backend must construct a kernel");
+    let capability_id = issue_root(&kernel);
+    let result = kernel.authorize_and_commit_with_receipt(
+        &SubjectId::new("subject"),
+        &capability_id,
+        &request(),
+        |_| Ok::<_, std::convert::Infallible>(((), vec![0_u8; 8 * 1024 * 1024])),
+    );
+    assert!(matches!(
+        result,
+        Err(EffectCommitError::CommittedButAudit(AuditError::Durable(
+            DurableAuditError::RecordTooLarge(_)
+        )))
+    ));
+    drop(kernel);
 
-    let reopened = DurableAuditLog::open(&journal.path).expect("the synced start must reopen");
-    let attempts = reopened
-        .attempts()
-        .expect("recovered attempts must be readable");
+    let reopened = DurableAuditView::open(&journal.path)
+        .expect("the synced unresolved start must reopen read-only");
+    let attempts = reopened.attempts();
     assert_eq!(attempts[0].outcome(), AttemptOutcome::Started);
     assert!(attempts[0].receipt().is_none());
-
-    reopened
-        .finish_attempt(
-            AttemptId::from_u64(0),
-            AttemptOutcome::Committed,
-            Some(&CommitReceipt::new(
-                AttemptId::from_u64(0),
-                b"reconciled-provider-receipt".to_vec(),
-            )),
-        )
-        .expect("an explicit reconciliation receipt may close the started attempt");
-    assert_eq!(
-        reopened.attempts().expect("records must remain readable")[0].outcome(),
-        AttemptOutcome::Committed
-    );
+    assert_eq!(reopened.next_attempt_sequence(), Some(1));
 }
 
 #[test]
@@ -243,39 +231,34 @@ fn terminal_receipt_failure_reports_possible_external_commit() {
 }
 
 #[test]
-fn pre_executor_journal_replay_fails_closed_without_invoking_executor() {
+fn retained_recovery_view_cannot_mutate_the_kernel_writer() {
     let journal = TestJournal::new();
     let backend = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
-    let kernel = CapabilityKernel::try_new_with_durable_audit(initial_state(), backend.clone())
+    let recovery = backend
+        .read_only_view()
+        .expect("a healthy writer must expose an immutable recovery view");
+    let kernel = CapabilityKernel::try_new_with_durable_audit(initial_state(), backend)
         .expect("a healthy backend must construct a kernel");
-    let requests = authority_core::capability::CapabilityRequestSet::one(request());
-    backend
-        .begin_attempt(
-            AttemptId::from_u64(0),
-            &SubjectId::new("other-subject"),
-            &CapId::new("other-capability"),
-            &requests,
-            AuthorizationEpoch::default(),
-        )
-        .expect("the replay fixture start must be durable");
     let capability_id = issue_root(&kernel);
     let executor_called = AtomicBool::new(false);
 
-    let result = kernel.authorize_and_commit(
-        &SubjectId::new("subject"),
-        &capability_id,
-        &request(),
-        |_| {
-            executor_called.store(true, Ordering::Release);
-            Ok::<_, std::convert::Infallible>(())
-        },
-    );
+    kernel
+        .authorize_and_commit(
+            &SubjectId::new("subject"),
+            &capability_id,
+            &request(),
+            |_| {
+                executor_called.store(true, Ordering::Release);
+                Ok::<_, std::convert::Infallible>(())
+            },
+        )
+        .expect("the sole writer must commit normally");
 
-    assert!(matches!(
-        result,
-        Err(EffectCommitError::Audit(AuditError::Durable(
-            DurableAuditError::ReplayDetected { .. }
-        )))
-    ));
-    assert!(!executor_called.load(Ordering::Acquire));
+    assert!(executor_called.load(Ordering::Acquire));
+    assert!(recovery.attempts().is_empty());
+    assert_eq!(recovery.next_attempt_sequence(), Some(0));
+    let current = DurableAuditView::open(&journal.path)
+        .expect("the completed writer state must remain recoverable");
+    assert_eq!(current.attempts().len(), 1);
+    assert_eq!(current.attempts()[0].outcome(), AttemptOutcome::Committed);
 }

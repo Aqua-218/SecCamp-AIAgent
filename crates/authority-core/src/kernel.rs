@@ -73,6 +73,14 @@ pub enum EffectCommitError<E> {
     /// not be persisted. The external effect may already exist; callers must
     /// resolve this with the provider's idempotency or reconciliation path.
     CommittedButAudit(AuditError),
+    /// The executor crossed a boundary whose external result cannot be
+    /// determined. The durable audit records this as `CommitUnknown`, never as
+    /// a committed effect.
+    CommitUnknown,
+    /// The external result is unknown and its terminal evidence could not be
+    /// persisted. Recovery must treat the original started attempt as
+    /// unresolved and must not infer either success or failure.
+    CommitUnknownAndAudit(AuditError),
 }
 
 impl<E: fmt::Display> fmt::Display for EffectCommitError<E> {
@@ -91,6 +99,13 @@ impl<E: fmt::Display> fmt::Display for EffectCommitError<E> {
                 formatter,
                 "effect may be committed but its audit receipt failed: {error}"
             ),
+            Self::CommitUnknown => {
+                formatter.write_str("effect completion is unknown and requires reconciliation")
+            }
+            Self::CommitUnknownAndAudit(error) => write!(
+                formatter,
+                "effect completion is unknown and its evidence could not be persisted: {error}"
+            ),
         }
     }
 }
@@ -99,10 +114,36 @@ impl<E: Error + 'static> Error for EffectCommitError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Effect(error) => Some(error),
-            Self::Audit(error) | Self::CommittedButAudit(error) => Some(error),
-            Self::LockPoisoned | Self::NotAuthorized => None,
+            Self::Audit(error)
+            | Self::CommittedButAudit(error)
+            | Self::CommitUnknownAndAudit(error) => Some(error),
+            Self::LockPoisoned | Self::NotAuthorized | Self::CommitUnknown => None,
         }
     }
+}
+
+/// The executor's typed observation at its external linearization boundary.
+///
+/// Unlike `Result`, this type cannot collapse an ambiguous provider outcome
+/// into either pre-commit failure or committed success. `CommitUnknown`
+/// evidence is appended to the durable attempt but never creates an
+/// [`EffectRecord`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectExecution<T, E> {
+    /// The operation failed before its documented linearization point.
+    FailedBeforeCommit(E),
+    /// The operation reached its documented linearization point.
+    Committed {
+        /// Successful adapter value.
+        value: T,
+        /// Optional provider acceptance token persisted in the commit receipt.
+        receipt: Option<Vec<u8>>,
+    },
+    /// The provider may or may not have accepted the operation.
+    CommitUnknown {
+        /// Non-empty bounded evidence used by the reconciliation path.
+        evidence: Vec<u8>,
+    },
 }
 
 /// A failed inspection of active capability authority.
@@ -517,7 +558,13 @@ impl CapabilityKernel {
         commit_to_linearization: impl FnOnce(&Capability) -> Result<T, E>,
     ) -> Result<T, EffectCommitError<E>> {
         self.authorize_all_and_commit_inner(caller, capability_id, requests, |capability| {
-            commit_to_linearization(capability).map(|value| (value, None))
+            match commit_to_linearization(capability) {
+                Ok(value) => EffectExecution::Committed {
+                    value,
+                    receipt: None,
+                },
+                Err(error) => EffectExecution::FailedBeforeCommit(error),
+            }
         })
     }
 
@@ -542,8 +589,55 @@ impl CapabilityKernel {
         commit_to_linearization: impl FnOnce(&Capability) -> Result<(T, Vec<u8>), E>,
     ) -> Result<T, EffectCommitError<E>> {
         self.authorize_all_and_commit_inner(caller, capability_id, requests, |capability| {
-            commit_to_linearization(capability).map(|(value, token)| (value, Some(token)))
+            match commit_to_linearization(capability) {
+                Ok((value, token)) => EffectExecution::Committed {
+                    value,
+                    receipt: Some(token),
+                },
+                Err(error) => EffectExecution::FailedBeforeCommit(error),
+            }
         })
+    }
+
+    /// Reauthorizes one request and preserves an executor's explicit
+    /// pre-commit, committed, or commit-unknown classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectCommitError::CommitUnknown`] only after the unknown
+    /// evidence is durably terminal. Returns
+    /// [`EffectCommitError::CommitUnknownAndAudit`] when that terminal write
+    /// fails.
+    pub fn authorize_and_execute_classified<T, E>(
+        &self,
+        caller: &SubjectId,
+        capability_id: &CapId,
+        request: &CapabilityRequest,
+        execute: impl FnOnce(&Capability) -> EffectExecution<T, E>,
+    ) -> Result<T, EffectCommitError<E>> {
+        self.authorize_all_and_execute_classified(
+            caller,
+            capability_id,
+            &CapabilityRequestSet::one(request.clone()),
+            execute,
+        )
+    }
+
+    /// Reauthorizes a non-empty request set and preserves the executor's
+    /// explicit external-outcome classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed authorization, audit, and execution failures as
+    /// [`Self::authorize_and_execute_classified`].
+    pub fn authorize_all_and_execute_classified<T, E>(
+        &self,
+        caller: &SubjectId,
+        capability_id: &CapId,
+        requests: &CapabilityRequestSet,
+        execute: impl FnOnce(&Capability) -> EffectExecution<T, E>,
+    ) -> Result<T, EffectCommitError<E>> {
+        self.authorize_all_and_commit_inner(caller, capability_id, requests, execute)
     }
 
     fn authorize_all_and_commit_inner<T, E>(
@@ -551,7 +645,7 @@ impl CapabilityKernel {
         caller: &SubjectId,
         capability_id: &CapId,
         requests: &CapabilityRequestSet,
-        commit_to_linearization: impl FnOnce(&Capability) -> Result<(T, Option<Vec<u8>>), E>,
+        commit_to_linearization: impl FnOnce(&Capability) -> EffectExecution<T, E>,
     ) -> Result<T, EffectCommitError<E>> {
         let state = self
             .state
@@ -596,7 +690,7 @@ impl CapabilityKernel {
         let attempt_id = attempt.id();
         let result = commit_to_linearization(capability);
         match result {
-            Ok((value, receipt)) => {
+            EffectExecution::Committed { value, receipt } => {
                 let receipt = receipt.map_or_else(
                     || CommitReceipt::kernel_success(attempt_id),
                     |token| CommitReceipt::new(attempt_id, token),
@@ -608,12 +702,20 @@ impl CapabilityKernel {
                     Err(error) => Err(EffectCommitError::CommittedButAudit(error)),
                 }
             }
-            Err(error) => {
+            EffectExecution::FailedBeforeCommit(error) => {
                 let audit_result = attempt.fail_before_commit();
                 drop(state);
                 match audit_result {
                     Ok(()) => Err(EffectCommitError::Effect(error)),
                     Err(audit_error) => Err(EffectCommitError::Audit(audit_error)),
+                }
+            }
+            EffectExecution::CommitUnknown { evidence } => {
+                let audit_result = attempt.commit_unknown(evidence);
+                drop(state);
+                match audit_result {
+                    Ok(()) => Err(EffectCommitError::CommitUnknown),
+                    Err(audit_error) => Err(EffectCommitError::CommitUnknownAndAudit(audit_error)),
                 }
             }
         }

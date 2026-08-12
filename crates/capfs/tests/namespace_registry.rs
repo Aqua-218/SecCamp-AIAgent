@@ -163,7 +163,7 @@ fn child_creation_uses_the_current_parent_path_and_can_start_open() {
             &source,
             "created.txt",
             NamespaceObjectKind::RegularFile,
-            |object| {
+            |_parent, object| {
                 assert_eq!(object.path(), &path(&["renamed", "created.txt"]));
                 assert_eq!(object.open_handle_count(), 1);
                 Ok::<_, Infallible>("backing file created")

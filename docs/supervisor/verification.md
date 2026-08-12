@@ -21,6 +21,7 @@
 | 同じ handle の 2 回目の close が `StaleHandle`、shutdown 後の要求が `SubjectClosed` | `stale_handle_and_post_close_requests_are_rejected` |
 | 閉じた `HandleId` の再 open が、adapter を呼ぶ前に `StaleHandle` になる | `closed_handle_id_cannot_be_reused` |
 | kernel 登録失敗と補償失敗が重なっても、ID が予約され、shutdown が runtime close を retry する | `failed_handle_registration_retains_runtime_cleanup_and_reserves_id` |
+| 未 bind の connection と非 Running の subject が revoke できない | `revoke_requires_a_bound_running_connection` |
 
 spoof の test には注意点がある。詐称した `CloseHandle` は**拒否されるのではなく、caller 自身の handle を閉じる**。claim が捨てられることを示しているのであって、詐称に対する error 経路が存在するわけではない。
 
@@ -56,6 +57,7 @@ event の順序 assertion が示すのは呼び出し順だけ。副作用は示
 | `DuplicateSubject` | 同じ `SubjectId` で 2 回 `create_subject` を呼ぶ経路 |
 | 親の gate | `Creating` / `Closing` / `Closed` / 未知の親。Running の成功経路しか通っていない |
 | `derive` | 拒否経路が 1 つも無い。`Closing` の caller、親を持たない caller、grant の対象検査が無いことの影響 |
+| `revoke` の所有権 | caller と lifecycle は test 済み。対象 capability を caller が保持しているかは検査も test も無い |
 | `CleanupStep::BeginClose` / `FinishClose` | kernel が `finish_subject_close` を拒否する経路、および `begin_subject_close` の `?` で subject が非 Running のまま止まる経路 |
 | cleanup 失敗の形 | `stop_workload` 失敗、`remove_cgroup` 失敗、shutdown 中の `close_handle` 失敗、複数 phase の同時失敗 |
 | `CloseSubject` の spoof | wire 経路で別 subject を落とせないことを直接示す test が無い。spoof の test は `CloseHandle` のみ |

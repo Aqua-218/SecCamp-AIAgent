@@ -39,7 +39,7 @@ lifecycle、順序、rollback、handle の所有権はすべて `CapabilityKerne
 
 ## 特に注意する点
 
-- `revoke` は `ConnectionIdentity` を取らず、lifecycle も見ない。guest から到達できないのは `WireRequest` に revoke tag が無いからにすぎない。tag を足す変更は caller 検査と同時に入れる。
+- `revoke` は caller と lifecycle を検査するが、その caller が対象 capability を保持していることまでは検査しない。wire tag を足すときは所有権検査を先に足す。
 - `issue_root` は grant の対象 subject を確認するが、`derive` は確認しない。この非対称は意図された契約である。
 - `resources_mut()` は無制限の `&mut R` を返し、この crate の gate を全部迂回する。test での failure 注入用で、production から呼ばない。
 - `DispatchResponse` に wire encoder が無い。返信の形式はまだ決まっていない。

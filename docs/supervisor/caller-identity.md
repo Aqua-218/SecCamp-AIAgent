@@ -97,11 +97,11 @@ if bound_subject != subject_id {
 | `issue_root` | 無し | `ensure_running` のみ |
 | `derive` | 無し | `ensure_running` のみ |
 | `open_handle` | 無し | `ensure_running` のみ |
-| `revoke` | 無し | **無し** |
+| `revoke` | 無し | `resolve_caller` + `ensure_running` |
 
-`revoke` は `ConnectionIdentity` を取らず、lifecycle も見ない。`&Supervisor` を持つコードなら session 内の任意の `CapId` を revoke できる。guest から到達できないのは、`WireRequest` に revoke tag が無いからにすぎない。
+`revoke` も他の authority 操作と同じく `ConnectionIdentity` を取り、`resolve_caller` と `ensure_running` を通る。以前は identity を取らず lifecycle も見ていなかったため、`&Supervisor` を持つコードなら session 内の任意の `CapId` を revoke できた。guest から到達できないのは `WireRequest` に revoke tag が無いからにすぎず、`protocol.rs` に 3 つ目の tag を足して `dispatch_wire` に match arm を書けば compile が通る状態だった。
 
-**`protocol.rs` に 3 つ目の tag を足し、`dispatch_wire` に match arm を書けば compile は通る。** その時点で、接続した全 subject が global な revocation primitive を手にする。tag を足すときは caller 検査を同じ変更で入れる。
+**tag を足すときは、その操作が caller 検査を通ることを確認する。** 現在は `revoke` を wire に出しても、caller 自身の connection と Running 状態が要求される。ただし「その capability の所有者であること」は依然として検査していない。
 
 `derive` にも非対称がある。`issue_root` は `grant.subject()` が引数の subject と一致することを確認するが、`derive` は確認しない。親を持つ caller は、その grant が対象 subject の静的 envelope に収まる限り、別 subject が保持する capability を発行できる。Authority Core の derive は対象が caller の子孫であることを要求しないので、この非対称が実際の契約になっている。
 
@@ -118,13 +118,14 @@ if bound_subject != subject_id {
 - `ConnectionNotBoundToSubject` に test が無い。2 つの `ConnectionIdentity` を 1 subject に bind して誤った channel から呼ぶ経路は未検証。
 - `CallerBindingError` にも supervisor level の test が無い。未 bind の connection から `dispatch_wire` / `derive` / `open_handle` / `close_handle` を呼ぶ経路は未検証。
 - `GrantSubjectMismatch` と `DuplicateSubject` にも test が無い。
+- `revoke` は caller と lifecycle を検査するが、その caller が対象 capability を保持していることは検査しない。wire から到達できないことが現在の防御。
 - spoof の test は `CloseHandle` だけを扱う。`CloseSubject` の wire 経路が別 subject を落とせないことを直接確認する test は無い。
 - `derive` の非対称が実際に悪用可能かは検証していない。
 
 ## 変更時の確認点
 
 - `claimed_subject` を `_` 以外に束縛しない。認可に使う値が 2 系統になる。
-- `protocol.rs` に tag を足すときは、`dispatch_wire` の match arm と caller 検査を同じ変更で書く。特に `revoke` を wire に出す場合は、lifecycle 検査と所有権検査を先に足す。
+- `protocol.rs` に tag を足すときは、`dispatch_wire` の match arm と caller 検査を同じ変更で書く。`revoke` を wire に出す場合は、caller と lifecycle の検査だけでは足りない。capability の所有権検査を先に足す。
 - caller を解決する新しい経路を書くときは、必ず `ensure_running` を通す。`resolve_caller` の `is_some_and` は、追跡していない subject を通す。
 - `derive` に `grant.subject()` の検査を足す場合、[Capability state](../authority-core/capability-state.md) の derive 契約と矛盾しないかを先に確認する。現在の非対称は意図された契約である。
 - `resources_mut()` は無制限の `&mut R` を返す。lifecycle の gate を全部迂回するので、production host から呼ばない。test での failure 注入用。

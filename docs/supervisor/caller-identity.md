@@ -1,0 +1,141 @@
+<!-- doc-type: concept -->
+
+# 誰の要求として扱うか
+
+[Supervisor adapter](README.md) / 誰の要求として扱うか
+
+> **対象読者:** supervisor を触る実装者、認可の入口をレビューする人
+
+[`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) が最初に決めるのは「この bytes は誰からの要求か」である。答えは受理済み connection から取る。request の中身は見ない。
+
+## 何を防ぎたいのか
+
+wire の `WireRequest` は subject を表す field を持つ。guest が組み立てる bytes の一部なので、値は guest が決められる。
+
+```text
+guest が送れる CloseSubject:
+  claimed_subject = "attacker-selected-subject"
+```
+
+これを認可に使えば、guest は任意の subject を閉じられる。閉じられた subject は workload を止められ、capfs を unmount される。**信用しない側が書いた 1 field が、cross-subject の shutdown primitive になる。**
+
+だから `dispatch_wire` は claim を束縛しない。
+
+```rust
+WireRequest::CloseSubject { claimed_subject: _ } => { ... }
+WireRequest::CloseHandle { claimed_subject: _, handle } => { ... }
+```
+
+`_` で捨てている。値は decode されるが、以降のどの経路にも渡らない。
+
+```mermaid
+flowchart TB
+    bytes["guest からの datagram"] --> dec["WireRequest::decode<br/>4 KiB 上限、閉じた tag"]
+    dec --> claim["claimed_subject を decode"]
+    claim -.->|使わない| trash["_ に束縛して破棄"]
+    dec --> conn["ConnectionIdentity"]
+    conn --> res["CallerResolver::resolve"]
+    res --> caller["SubjectId（認可に使う）"]
+    caller --> bind{"record.connection が<br/>この identity と一致?"}
+    bind -->|no| deny["ConnectionNotBoundToSubject"]
+    bind --> run{"lifecycle == Running?"}
+    run -->|no| deny2["SubjectNotRunning / Closing / Closed"]
+    run --> act["操作を実行"]
+```
+
+決定の背景は [ADR 0013](../decisions/0013-resolve-caller-identity-from-the-connection.md)。
+
+## 3 段の照合
+
+connection から subject を引くだけでは足りない。3 つの検査が重なっている。
+
+**1. resolver の binding。** `CallerResolver::resolve(&identity)` が `SubjectId` を返す。`StaticCallerResolver::bind` は 1 つの `ConnectionIdentity` を 1 つの subject にしか bind できない。既に埋まっていれば `Err` を返す。host 側の設定ミスで、稼働中の channel の権限が黙って変わることを防ぐ。
+
+**2. record との一致。** `resolve_caller` は、解決した subject の record が持つ `connection` が、今の identity と一致することを確認する。
+
+```rust
+if self.subjects.get(&caller).is_some_and(|record| record.connection != *identity) {
+    return Err(SupervisorError::ConnectionNotBoundToSubject { .. });
+}
+```
+
+resolver が 2 つ目の connection を同じ subject に bind した場合、この検査で落ちる。subject を作ったときの connection でしか、その subject を操作できない。
+
+**3. lifecycle。** `ensure_running` が `Creating` / `Closing` / `Closed` を拒否する。`Closing` の subject は既に capability を revoke されているので、新しい handle を登録させると `finish_subject_close` が永久に失敗する。
+
+`is_some_and` に注意点がある。supervisor が追跡していない subject は検査 2 を通過する。その場合の拒否は `ensure_running` の `UnknownSubject` が担う。**caller を解決してから `ensure_running` を呼ばない経路を新しく書くと、resolver は知っているが supervisor は追跡していない subject からの要求を受け付ける。**
+
+## `create_subject` でも binding を確認する
+
+subject を作るとき、渡された `connection` が resolver 上で本当にその `subject_id` に bind されているかを確認する。
+
+```rust
+let bound_subject = self.callers.resolve(&connection)?;
+if bound_subject != subject_id {
+    return Err(SupervisorError::ConnectionSubjectMismatch { requested: subject_id, bound: bound_subject });
+}
+```
+
+これが無いと、record の `connection` field が別の subject に解決される channel を指すことになる。検査 2 の等号比較が「間違った対応」を検証してしまい、その channel からの要求が record の subject として動く。
+
+## `ConnectionIdentity` の強さ
+
+`ConnectionIdentity` は 4 field を持ち、比較と hash はその全部を使う。identity の強度は host の socket ID 割り当てと peer credential の質で決まる。
+
+**connection を閉じた後に同じ socket ID が再利用されると、`StaticCallerResolver` の古い binding が黙って復活する。** socket ID の非再利用は host 側の責務で、この crate では保証していない。
+
+`WireRequest` の bytes から `ConnectionIdentity` を組み立ててはならない、という制約は doc comment にしか書かれていない。型としては構築を止めていない。
+
+## 認可経路に無い操作
+
+`Supervisor` の public method のうち、wire から到達できないものがある。
+
+| method | wire tag | caller 検査 |
+|---|---|---|
+| `dispatch_wire` → `CloseSubject` | 1 | あり |
+| `dispatch_wire` → `CloseHandle` | 2 | あり |
+| `issue_root` | 無し | `ensure_running` のみ |
+| `derive` | 無し | `ensure_running` のみ |
+| `open_handle` | 無し | `ensure_running` のみ |
+| `revoke` | 無し | **無し** |
+
+`revoke` は `ConnectionIdentity` を取らず、lifecycle も見ない。`&Supervisor` を持つコードなら session 内の任意の `CapId` を revoke できる。guest から到達できないのは、`WireRequest` に revoke tag が無いからにすぎない。
+
+**`protocol.rs` に 3 つ目の tag を足し、`dispatch_wire` に match arm を書けば compile は通る。** その時点で、接続した全 subject が global な revocation primitive を手にする。tag を足すときは caller 検査を同じ変更で入れる。
+
+`derive` にも非対称がある。`issue_root` は `grant.subject()` が引数の subject と一致することを確認するが、`derive` は確認しない。親を持つ caller は、その grant が対象 subject の静的 envelope に収まる限り、別 subject が保持する capability を発行できる。Authority Core の derive は対象が caller の子孫であることを要求しないので、この非対称が実際の契約になっている。
+
+## 何が助かるのか
+
+認可に使う値の出所が 1 つに絞られている。「この要求は誰のものか」を調べるとき、`ConnectionIdentity` からの経路だけを追えばよい。
+
+`claimed_subject` を `_` で捨てているので、後から誤って使う変更は目に付く。field を読む行を書けば、レビューで見える。
+
+## 正確な保証範囲
+
+- `StaticCallerResolver` は in-memory の map で、実 socket の peer credential を読まない。production の caller resolver は実装されていない。
+- `SOCK_PEERCRED` / `SCM_CREDENTIALS` の取得、socket ID の非再利用、`SOCK_SEQPACKET` の使用はいずれも host 側の責務で、この crate では検証していない。
+- `ConnectionNotBoundToSubject` に test が無い。2 つの `ConnectionIdentity` を 1 subject に bind して誤った channel から呼ぶ経路は未検証。
+- `CallerBindingError` にも supervisor level の test が無い。未 bind の connection から `dispatch_wire` / `derive` / `open_handle` / `close_handle` を呼ぶ経路は未検証。
+- `GrantSubjectMismatch` と `DuplicateSubject` にも test が無い。
+- spoof の test は `CloseHandle` だけを扱う。`CloseSubject` の wire 経路が別 subject を落とせないことを直接確認する test は無い。
+- `derive` の非対称が実際に悪用可能かは検証していない。
+
+## 変更時の確認点
+
+- `claimed_subject` を `_` 以外に束縛しない。認可に使う値が 2 系統になる。
+- `protocol.rs` に tag を足すときは、`dispatch_wire` の match arm と caller 検査を同じ変更で書く。特に `revoke` を wire に出す場合は、lifecycle 検査と所有権検査を先に足す。
+- caller を解決する新しい経路を書くときは、必ず `ensure_running` を通す。`resolve_caller` の `is_some_and` は、追跡していない subject を通す。
+- `derive` に `grant.subject()` の検査を足す場合、[Capability state](../authority-core/capability-state.md) の derive 契約と矛盾しないかを先に確認する。現在の非対称は意図された契約である。
+- `resources_mut()` は無制限の `&mut R` を返す。lifecycle の gate を全部迂回するので、production host から呼ばない。test での failure 注入用。
+
+## 関連
+
+- [Supervisor adapter](README.md)
+- [wire protocol](wire-protocol.md)
+- [subject lifecycle](subject-lifecycle.md)
+- [handle の lifecycle](handle-lifecycle.md)
+- [検証対応表](verification.md)
+- [0013](../decisions/0013-resolve-caller-identity-from-the-connection.md)
+- [Capability state](../authority-core/capability-state.md)
+- [用語集](../glossary.md)

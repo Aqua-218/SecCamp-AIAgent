@@ -10,15 +10,18 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rustix::fs::{CWD, RenameFlags, renameat_with};
 use sha2::{Digest, Sha256};
 
 const REQUIRED_BLOCKED_SYSCALLS: [&str; 8] = [
@@ -36,6 +39,12 @@ const HTTP_HEADER_LIMIT: usize = 64 * 1024;
 pub const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 /// Maximum number of bytes retained from either command output stream.
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+/// Maximum number of source filesystem entries copied into one workspace.
+pub const MAX_WORKSPACE_ENTRIES: usize = 100_000;
+/// Maximum source directory depth accepted during workspace cloning.
+pub const MAX_WORKSPACE_DEPTH: usize = 64;
+/// Maximum aggregate regular-file bytes copied into one workspace.
+pub const MAX_WORKSPACE_BYTES: u64 = 1 << 30;
 const ID_LENGTH: usize = 16;
 
 /// A SHA-256 digest used to pin every executable and guest artifact.
@@ -1013,48 +1022,822 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn stop(&mut self, process: ProcessHandle) -> Result<(), RuntimeError> {
-        let mut child = self
+        let child = self
             .children
-            .remove(&process.pid)
+            .get_mut(&process.pid)
             .ok_or_else(|| RuntimeError::Command(format!("unknown process {}", process.pid)))?;
-        child.kill().map_err(RuntimeError::from)?;
-        child.wait().map_err(RuntimeError::from)?;
-        Ok(())
+
+        // Poll before signalling so a child that exited between start and stop is
+        // reaped as a successful stop. The table entry is retained until that
+        // reap succeeds, which makes a later retry safe after any wait error.
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                self.children.remove(&process.pid);
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(RuntimeError::Command(format!(
+                    "checking process {} failed: {error}",
+                    process.pid
+                )));
+            }
+        }
+
+        if let Err(kill_error) = child.kill() {
+            return match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.children.remove(&process.pid);
+                    Ok(())
+                }
+                Ok(None) => Err(RuntimeError::Command(format!(
+                    "killing process {} failed: {kill_error}",
+                    process.pid
+                ))),
+                Err(wait_error) => Err(RuntimeError::Command(format!(
+                    "killing process {} failed: {kill_error}; checking exit state failed: {wait_error}",
+                    process.pid
+                ))),
+            };
+        }
+
+        match child.wait() {
+            Ok(_) => {
+                self.children.remove(&process.pid);
+                Ok(())
+            }
+            Err(wait_error) => Err(RuntimeError::Command(format!(
+                "waiting for process {} failed: {wait_error}",
+                process.pid
+            ))),
+        }
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ObjectIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl ObjectIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceNodeKind {
+    Directory,
+    File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnedWorkspaceNode {
+    identity: ObjectIdentity,
+    kind: WorkspaceNodeKind,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceOwnership {
+    parent: ObjectIdentity,
+    root: ObjectIdentity,
+    marker: PathBuf,
+    marker_token: String,
+    nodes: HashMap<PathBuf, OwnedWorkspaceNode>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceSnapshot {
+    identity: ObjectIdentity,
+    kind: WorkspaceNodeKind,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanos: i64,
+    links: u64,
+}
+
+impl SourceSnapshot {
+    fn from_metadata(path: &Path, metadata: &fs::Metadata) -> Result<Self, RuntimeError> {
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_symlink() {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "workspace contains forbidden symlink: {}",
+                path.display()
+            )));
+        } else if metadata.is_dir() {
+            WorkspaceNodeKind::Directory
+        } else if metadata.is_file() {
+            if metadata.nlink() > 1 {
+                return Err(RuntimeError::InvalidConfig(format!(
+                    "workspace contains forbidden hardlink: {}",
+                    path.display()
+                )));
+            }
+            WorkspaceNodeKind::File
+        } else {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "workspace contains unsupported filesystem object: {}",
+                path.display()
+            )));
+        };
+        Ok(Self {
+            identity: ObjectIdentity::from_metadata(metadata),
+            kind,
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
+            links: metadata.nlink(),
+        })
+    }
+
+    fn matches(&self, metadata: &fs::Metadata) -> bool {
+        self.identity == ObjectIdentity::from_metadata(metadata)
+            && self.kind
+                == if metadata.is_dir() {
+                    WorkspaceNodeKind::Directory
+                } else if metadata.is_file() {
+                    WorkspaceNodeKind::File
+                } else {
+                    return false;
+                }
+            && self.length == metadata.len()
+            && self.modified_seconds == metadata.mtime()
+            && self.modified_nanos == metadata.mtime_nsec()
+            && self.links == metadata.nlink()
+    }
+}
+
+fn workspace_error(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::InvalidConfig(message.into())
+}
+
+fn metadata_at(path: &Path) -> Result<fs::Metadata, RuntimeError> {
+    fs::symlink_metadata(path).map_err(RuntimeError::from)
+}
+
+fn ensure_directory_path(
+    path: &Path,
+    create_missing: bool,
+) -> Result<ObjectIdentity, RuntimeError> {
+    if !path.is_absolute() {
+        return Err(workspace_error(format!(
+            "workspace path must be absolute: {}",
+            path.display()
+        )));
+    }
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        if component == Component::ParentDir {
+            return Err(workspace_error(format!(
+                "workspace path cannot contain '..': {}",
+                path.display()
+            )));
+        }
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(workspace_error(format!(
+                        "workspace path component is not a real directory: {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && create_missing => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(create_error) if create_error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(create_error) => return Err(create_error.into()),
+                }
+                let metadata = metadata_at(&current)?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(workspace_error(format!(
+                        "workspace path component was replaced: {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(ObjectIdentity::from_metadata(&metadata_at(path)?))
+}
+
+fn source_snapshot(path: &Path) -> Result<SourceSnapshot, RuntimeError> {
+    SourceSnapshot::from_metadata(path, &metadata_at(path)?)
+}
+
+fn validate_destination_absence(path: &Path) -> Result<(), RuntimeError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(RuntimeError::WorkspaceAlreadyExists(path.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn unique_staging_name(destination: &Path) -> PathBuf {
+    static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+        });
+    let name = destination.file_name().map_or_else(
+        || "workspace".to_owned(),
+        |value| value.to_string_lossy().into_owned(),
+    );
+    destination.with_file_name(format!(
+        ".{name}.staging-{}-{timestamp}-{counter}",
+        std::process::id()
+    ))
+}
+
+fn sort_workspace_paths(nodes: &HashMap<PathBuf, OwnedWorkspaceNode>) -> Vec<PathBuf> {
+    let mut paths = nodes.keys().cloned().collect::<Vec<_>>();
+    paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    paths
+}
+
 /// Production filesystem adapter with symlink-safe recursive workspace copying.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RealFileSystem;
+#[derive(Debug, Default)]
+pub struct RealFileSystem {
+    owned_workspaces: HashMap<PathBuf, WorkspaceOwnership>,
+}
+
+struct CloneContext {
+    entries: usize,
+    bytes: u64,
+    nodes: HashMap<PathBuf, OwnedWorkspaceNode>,
+}
+
+struct PreparedClone {
+    parent_identity: ObjectIdentity,
+    stage: PathBuf,
+    stage_identity: ObjectIdentity,
+}
 
 impl RealFileSystem {
     /// Creates a filesystem adapter.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn copy_entry(source: &Path, destination: &Path) -> Result<(), RuntimeError> {
-        let metadata = fs::symlink_metadata(source).map_err(RuntimeError::from)?;
-        if metadata.file_type().is_symlink() {
-            return Err(RuntimeError::InvalidConfig(format!(
-                "workspace contains forbidden symlink: {}",
+    fn prepare_clone(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<PreparedClone, RuntimeError> {
+        if !source.is_absolute() || !destination.is_absolute() {
+            return Err(workspace_error(
+                "workspace source and destination must be absolute",
+            ));
+        }
+        if source
+            .components()
+            .any(|component| component == Component::ParentDir)
+            || destination
+                .components()
+                .any(|component| component == Component::ParentDir)
+        {
+            return Err(workspace_error(
+                "workspace source and destination cannot contain '..'",
+            ));
+        }
+        if source == destination
+            || destination.starts_with(source)
+            || source.starts_with(destination)
+        {
+            return Err(workspace_error(
+                "workspace source and destination must not overlap",
+            ));
+        }
+        ensure_directory_path(source, false)?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| workspace_error("workspace clone has no parent directory"))?;
+        let parent_identity = ensure_directory_path(parent, true)?;
+        let source_root = source_snapshot(source)?;
+        if source_root.kind != WorkspaceNodeKind::Directory {
+            return Err(workspace_error("workspace source must be a directory"));
+        }
+        validate_destination_absence(destination)?;
+        if self.owned_workspaces.contains_key(destination) {
+            return Err(RuntimeError::WorkspaceAlreadyExists(
+                destination.to_path_buf(),
+            ));
+        }
+
+        let source_canonical = fs::canonicalize(source).map_err(RuntimeError::from)?;
+        let parent_canonical = fs::canonicalize(parent).map_err(RuntimeError::from)?;
+        let canonical_destination = parent_canonical.join(
+            destination
+                .file_name()
+                .ok_or_else(|| workspace_error("workspace destination has no final component"))?,
+        );
+        if canonical_destination == source_canonical
+            || canonical_destination.starts_with(&source_canonical)
+            || source_canonical.starts_with(&canonical_destination)
+        {
+            return Err(workspace_error(
+                "workspace source and destination must not alias or overlap",
+            ));
+        }
+
+        let stage = loop {
+            let candidate = unique_staging_name(destination);
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let stage_identity = ObjectIdentity::from_metadata(&metadata_at(&stage)?);
+        Ok(PreparedClone {
+            parent_identity,
+            stage,
+            stage_identity,
+        })
+    }
+
+    fn build_clone(
+        source: &Path,
+        prepared: &PreparedClone,
+    ) -> Result<WorkspaceOwnership, RuntimeError> {
+        let mut context = CloneContext {
+            entries: 0,
+            bytes: 0,
+            nodes: HashMap::new(),
+        };
+        let result = (|| {
+            Self::copy_entry(
+                source,
+                &prepared.stage,
+                Path::new("."),
+                0,
+                true,
+                &mut context,
+            )?;
+            let (marker, marker_token) = Self::create_marker(&prepared.stage, &mut context)?;
+            let root_metadata = metadata_at(&prepared.stage)?;
+            if ObjectIdentity::from_metadata(&root_metadata) != prepared.stage_identity {
+                return Err(workspace_error("staging root was replaced before publish"));
+            }
+            Ok(WorkspaceOwnership {
+                parent: prepared.parent_identity,
+                root: prepared.stage_identity,
+                marker,
+                marker_token,
+                nodes: context.nodes.clone(),
+            })
+        })();
+        match result {
+            Ok(ownership) => Ok(ownership),
+            Err(error) => {
+                let cleanup = Self::cleanup_known_tree(
+                    &prepared.stage,
+                    prepared.stage_identity,
+                    &mut context.nodes,
+                )
+                .err()
+                .map_or_else(Vec::new, |cleanup_error| vec![cleanup_error.to_string()]);
+                Err(with_cleanup(error, &cleanup))
+            }
+        }
+    }
+
+    fn publish_clone(
+        &mut self,
+        destination: &Path,
+        prepared: PreparedClone,
+        ownership: WorkspaceOwnership,
+    ) -> Result<(), RuntimeError> {
+        let stage = prepared.stage;
+        let stage_identity = prepared.stage_identity;
+        let mut nodes = ownership.nodes.clone();
+        if let Err(error) = validate_destination_absence(destination) {
+            let cleanup = Self::cleanup_known_tree(&stage, stage_identity, &mut nodes)
+                .err()
+                .map_or_else(Vec::new, |cleanup_error| vec![cleanup_error.to_string()]);
+            return Err(with_cleanup(error, &cleanup));
+        }
+        renameat_with(CWD, &stage, CWD, destination, RenameFlags::NOREPLACE).map_err(|error| {
+            let cleanup = Self::cleanup_known_tree(&stage, stage_identity, &mut nodes)
+                .err()
+                .map_or_else(Vec::new, |cleanup_error| vec![cleanup_error.to_string()]);
+            with_cleanup(
+                workspace_error(format!(
+                    "publishing workspace without replacement failed: {error}"
+                )),
+                &cleanup,
+            )
+        })?;
+        self.owned_workspaces
+            .insert(destination.to_path_buf(), ownership);
+        let published = match metadata_at(destination) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let cleanup = self
+                    .remove_workspace(destination)
+                    .err()
+                    .map_or_else(Vec::new, |cleanup_error| vec![cleanup_error.to_string()]);
+                return Err(with_cleanup(error, &cleanup));
+            }
+        };
+        let published_is_owned = self
+            .owned_workspaces
+            .get(destination)
+            .is_some_and(|ownership| ObjectIdentity::from_metadata(&published) == ownership.root);
+        if published.file_type().is_symlink() || !published.is_dir() || !published_is_owned {
+            let error = workspace_error("workspace destination changed during atomic publish");
+            let cleanup = self
+                .remove_workspace(destination)
+                .err()
+                .map_or_else(Vec::new, |cleanup_error| vec![cleanup_error.to_string()]);
+            return Err(with_cleanup(error, &cleanup));
+        }
+        Ok(())
+    }
+
+    fn copy_entry(
+        source: &Path,
+        destination: &Path,
+        relative: &Path,
+        depth: usize,
+        root: bool,
+        context: &mut CloneContext,
+    ) -> Result<(), RuntimeError> {
+        if depth > MAX_WORKSPACE_DEPTH {
+            return Err(workspace_error(format!(
+                "workspace traversal exceeds {MAX_WORKSPACE_DEPTH}-level depth limit"
+            )));
+        }
+        context.entries = context
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| workspace_error("workspace entry count overflow"))?;
+        if context.entries > MAX_WORKSPACE_ENTRIES {
+            return Err(workspace_error(format!(
+                "workspace contains more than {MAX_WORKSPACE_ENTRIES} entries"
+            )));
+        }
+
+        let snapshot = source_snapshot(source)?;
+        match snapshot.kind {
+            WorkspaceNodeKind::Directory => Self::copy_directory(
+                source,
+                destination,
+                relative,
+                depth,
+                root,
+                snapshot,
+                context,
+            )?,
+            WorkspaceNodeKind::File => {
+                Self::copy_file(source, destination, relative, snapshot, context)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_directory(
+        source: &Path,
+        destination: &Path,
+        relative: &Path,
+        depth: usize,
+        root: bool,
+        snapshot: SourceSnapshot,
+        context: &mut CloneContext,
+    ) -> Result<(), RuntimeError> {
+        if root {
+            let destination_metadata = metadata_at(destination)?;
+            if destination_metadata.file_type().is_symlink() || !destination_metadata.is_dir() {
+                return Err(workspace_error(format!(
+                    "staging root is not a real directory: {}",
+                    destination.display()
+                )));
+            }
+        } else {
+            fs::create_dir(destination).map_err(RuntimeError::from)?;
+        }
+        context.nodes.insert(
+            relative.to_path_buf(),
+            OwnedWorkspaceNode {
+                identity: ObjectIdentity::from_metadata(&metadata_at(destination)?),
+                kind: WorkspaceNodeKind::Directory,
+            },
+        );
+        for entry in fs::read_dir(source).map_err(RuntimeError::from)? {
+            let entry = entry.map_err(RuntimeError::from)?;
+            let child_relative = if relative == Path::new(".") {
+                PathBuf::from(entry.file_name())
+            } else {
+                relative.join(entry.file_name())
+            };
+            Self::copy_entry(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                &child_relative,
+                depth + 1,
+                false,
+                context,
+            )?;
+        }
+        let current = metadata_at(source)?;
+        if !snapshot.matches(&current) {
+            return Err(workspace_error(format!(
+                "workspace source changed while cloning: {}",
                 source.display()
             )));
         }
-        if metadata.is_dir() {
-            fs::create_dir(destination).map_err(RuntimeError::from)?;
-            for entry in fs::read_dir(source).map_err(RuntimeError::from)? {
-                let entry = entry.map_err(RuntimeError::from)?;
-                Self::copy_entry(&entry.path(), &destination.join(entry.file_name()))?;
-            }
-        } else if metadata.is_file() {
-            fs::copy(source, destination).map_err(RuntimeError::from)?;
-        } else {
-            return Err(RuntimeError::InvalidConfig(format!(
-                "workspace contains unsupported filesystem object: {}",
+        Ok(())
+    }
+
+    fn copy_file(
+        source: &Path,
+        destination: &Path,
+        relative: &Path,
+        snapshot: SourceSnapshot,
+        context: &mut CloneContext,
+    ) -> Result<(), RuntimeError> {
+        context.bytes = context
+            .bytes
+            .checked_add(snapshot.length)
+            .ok_or_else(|| workspace_error("workspace byte count overflow"))?;
+        if context.bytes > MAX_WORKSPACE_BYTES {
+            return Err(workspace_error(format!(
+                "workspace exceeds {MAX_WORKSPACE_BYTES}-byte size limit"
+            )));
+        }
+        let mut input = File::open(source).map_err(RuntimeError::from)?;
+        let input_metadata = input.metadata().map_err(RuntimeError::from)?;
+        if !snapshot.matches(&input_metadata) {
+            return Err(workspace_error(format!(
+                "workspace source changed before reading: {}",
                 source.display()
             )));
+        }
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(RuntimeError::from)?;
+        let created_metadata = output.metadata().map_err(RuntimeError::from)?;
+        if !created_metadata.is_file() || created_metadata.nlink() != 1 {
+            return Err(workspace_error(format!(
+                "staged workspace file is not exclusively owned: {}",
+                destination.display()
+            )));
+        }
+        let created_identity = ObjectIdentity::from_metadata(&created_metadata);
+        context.nodes.insert(
+            relative.to_path_buf(),
+            OwnedWorkspaceNode {
+                identity: created_identity,
+                kind: WorkspaceNodeKind::File,
+            },
+        );
+        let copied = io::copy(&mut input, &mut output).map_err(RuntimeError::from)?;
+        output.flush().map_err(RuntimeError::from)?;
+        output.sync_all().map_err(RuntimeError::from)?;
+        if copied != snapshot.length {
+            return Err(workspace_error(format!(
+                "workspace source changed while reading: {}",
+                source.display()
+            )));
+        }
+        let current = metadata_at(source)?;
+        if !snapshot.matches(&current) {
+            return Err(workspace_error(format!(
+                "workspace source changed while cloning: {}",
+                source.display()
+            )));
+        }
+        let destination_metadata = metadata_at(destination)?;
+        if destination_metadata.file_type().is_symlink()
+            || !destination_metadata.is_file()
+            || destination_metadata.nlink() != 1
+            || destination_metadata.len() != copied
+            || ObjectIdentity::from_metadata(&destination_metadata) != created_identity
+        {
+            return Err(workspace_error(format!(
+                "staged workspace file was replaced: {}",
+                destination.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn cleanup_known_tree(
+        root: &Path,
+        root_identity: ObjectIdentity,
+        nodes: &mut HashMap<PathBuf, OwnedWorkspaceNode>,
+    ) -> Result<(), RuntimeError> {
+        let root_metadata = match fs::symlink_metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if root_metadata.file_type().is_symlink()
+            || !root_metadata.is_dir()
+            || ObjectIdentity::from_metadata(&root_metadata) != root_identity
+        {
+            return Err(workspace_error(format!(
+                "staging path was replaced and will not be removed: {}",
+                root.display()
+            )));
+        }
+        for relative in sort_workspace_paths(nodes) {
+            if relative == Path::new(".") {
+                continue;
+            }
+            let path = root.join(&relative);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    nodes.remove(&relative);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let Some(expected) = nodes.get(&relative) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink()
+                || ObjectIdentity::from_metadata(&metadata) != expected.identity
+                || (expected.kind == WorkspaceNodeKind::Directory && !metadata.is_dir())
+                || (expected.kind == WorkspaceNodeKind::File
+                    && (!metadata.is_file() || metadata.nlink() != 1))
+            {
+                return Err(workspace_error(format!(
+                    "owned staging entry was replaced and will not be removed: {}",
+                    path.display()
+                )));
+            }
+            let result = if expected.kind == WorkspaceNodeKind::Directory {
+                fs::remove_dir(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            match result {
+                Ok(()) => {
+                    nodes.remove(&relative);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    nodes.remove(&relative);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let root_metadata = metadata_at(root)?;
+        if ObjectIdentity::from_metadata(&root_metadata) != root_identity
+            || root_metadata.file_type().is_symlink()
+            || !root_metadata.is_dir()
+        {
+            return Err(workspace_error(format!(
+                "staging path was replaced and will not be removed: {}",
+                root.display()
+            )));
+        }
+        fs::remove_dir(root).map_err(RuntimeError::from)
+    }
+
+    fn create_marker(
+        stage: &Path,
+        context: &mut CloneContext,
+    ) -> Result<(PathBuf, String), RuntimeError> {
+        let marker_name = format!(
+            ".firecracker-runtime-owner-{}-{}",
+            std::process::id(),
+            context.entries
+        );
+        let marker_relative = PathBuf::from(&marker_name);
+        let marker_token = format!("{marker_name}:{}", context.bytes);
+        let marker_path = stage.join(&marker_relative);
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)
+            .map_err(RuntimeError::from)?;
+        marker
+            .write_all(marker_token.as_bytes())
+            .map_err(RuntimeError::from)?;
+        marker.sync_all().map_err(RuntimeError::from)?;
+        let metadata = metadata_at(&marker_path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(workspace_error("workspace ownership marker was replaced"));
+        }
+        context.nodes.insert(
+            marker_relative.clone(),
+            OwnedWorkspaceNode {
+                identity: ObjectIdentity::from_metadata(&metadata),
+                kind: WorkspaceNodeKind::File,
+            },
+        );
+        Ok((marker_relative, marker_token))
+    }
+
+    fn validate_marker(root: &Path, ownership: &WorkspaceOwnership) -> Result<(), RuntimeError> {
+        let marker_path = root.join(&ownership.marker);
+        let expected = ownership
+            .nodes
+            .get(&ownership.marker)
+            .ok_or_else(|| workspace_error("workspace ownership marker is not recorded"))?;
+        let metadata = metadata_at(&marker_path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.nlink() != 1
+            || ObjectIdentity::from_metadata(&metadata) != expected.identity
+        {
+            return Err(workspace_error(format!(
+                "workspace ownership marker was replaced: {}",
+                marker_path.display()
+            )));
+        }
+        let file = File::open(&marker_path).map_err(RuntimeError::from)?;
+        let opened_metadata = file.metadata().map_err(RuntimeError::from)?;
+        if ObjectIdentity::from_metadata(&opened_metadata) != expected.identity {
+            return Err(workspace_error(
+                "workspace ownership marker changed while opening",
+            ));
+        }
+        let mut contents = Vec::with_capacity(ownership.marker_token.len() + 1);
+        file.take((ownership.marker_token.len() + 1) as u64)
+            .read_to_end(&mut contents)
+            .map_err(RuntimeError::from)?;
+        if contents != ownership.marker_token.as_bytes() {
+            return Err(workspace_error(
+                "workspace ownership marker contents changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_owned_tree(
+        root: &Path,
+        ownership: &WorkspaceOwnership,
+    ) -> Result<(), RuntimeError> {
+        let root_metadata = metadata_at(root)?;
+        if root_metadata.file_type().is_symlink()
+            || !root_metadata.is_dir()
+            || ObjectIdentity::from_metadata(&root_metadata) != ownership.root
+        {
+            return Err(workspace_error(format!(
+                "workspace destination was replaced: {}",
+                root.display()
+            )));
+        }
+        Self::validate_marker(root, ownership)?;
+        for (relative, expected) in &ownership.nodes {
+            let path = root.join(relative);
+            let metadata = metadata_at(&path)?;
+            if metadata.file_type().is_symlink()
+                || ObjectIdentity::from_metadata(&metadata) != expected.identity
+                || (expected.kind == WorkspaceNodeKind::Directory && !metadata.is_dir())
+                || (expected.kind == WorkspaceNodeKind::File
+                    && (!metadata.is_file() || metadata.nlink() != 1))
+            {
+                return Err(workspace_error(format!(
+                    "owned workspace entry was replaced: {}",
+                    path.display()
+                )));
+            }
+        }
+        for (relative, expected) in &ownership.nodes {
+            if expected.kind != WorkspaceNodeKind::Directory {
+                continue;
+            }
+            let directory = root.join(relative);
+            let before = metadata_at(&directory)?;
+            for entry in fs::read_dir(&directory).map_err(RuntimeError::from)? {
+                let entry = entry.map_err(RuntimeError::from)?;
+                let child = if relative == Path::new(".") {
+                    PathBuf::from(entry.file_name())
+                } else {
+                    relative.join(entry.file_name())
+                };
+                if !ownership.nodes.contains_key(&child) {
+                    return Err(workspace_error(format!(
+                        "workspace contains an unowned entry: {}",
+                        directory.join(entry.file_name()).display()
+                    )));
+                }
+            }
+            let after = metadata_at(&directory)?;
+            if ObjectIdentity::from_metadata(&before) != ObjectIdentity::from_metadata(&after) {
+                return Err(workspace_error(format!(
+                    "workspace directory changed while validating: {}",
+                    directory.display()
+                )));
+            }
         }
         Ok(())
     }
@@ -1066,27 +1849,103 @@ impl FileSystem for RealFileSystem {
     }
 
     fn clone_workspace(&mut self, source: &Path, destination: &Path) -> Result<(), RuntimeError> {
-        if fs::symlink_metadata(destination).is_ok() {
-            return Err(RuntimeError::WorkspaceAlreadyExists(
-                destination.to_path_buf(),
-            ));
-        }
-        fs::create_dir_all(destination.parent().ok_or_else(|| {
-            RuntimeError::InvalidConfig("workspace clone has no parent directory".to_owned())
-        })?)
-        .map_err(RuntimeError::from)?;
-        Self::copy_entry(source, destination)
+        let prepared = self.prepare_clone(source, destination)?;
+        let ownership = Self::build_clone(source, &prepared)?;
+        self.publish_clone(destination, prepared, ownership)
     }
 
     fn remove_workspace(&mut self, path: &Path) -> Result<(), RuntimeError> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                fs::remove_dir_all(path).map_err(RuntimeError::from)
+        let Some(ownership) = self.owned_workspaces.get_mut(path) else {
+            return match fs::symlink_metadata(path) {
+                Ok(_) => Err(workspace_error(format!(
+                    "workspace path is not owned by this filesystem instance: {}",
+                    path.display()
+                ))),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            };
+        };
+        let root_metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.owned_workspaces.remove(path);
+                return Ok(());
             }
-            Ok(_) => fs::remove_file(path).map_err(RuntimeError::from),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+            Err(error) => return Err(error.into()),
+        };
+        let parent = path
+            .parent()
+            .ok_or_else(|| workspace_error("workspace destination has no parent directory"))?;
+        let parent_metadata = metadata_at(parent)?;
+        if ObjectIdentity::from_metadata(&parent_metadata) != ownership.parent {
+            return Err(workspace_error(format!(
+                "workspace parent was replaced and will not be modified: {}",
+                parent.display()
+            )));
         }
+        if root_metadata.file_type().is_symlink()
+            || !root_metadata.is_dir()
+            || ObjectIdentity::from_metadata(&root_metadata) != ownership.root
+        {
+            return Err(workspace_error(format!(
+                "workspace destination was replaced and will not be removed: {}",
+                path.display()
+            )));
+        }
+        Self::validate_owned_tree(path, ownership)?;
+        for relative in sort_workspace_paths(&ownership.nodes) {
+            if relative == Path::new(".") {
+                continue;
+            }
+            let child = path.join(&relative);
+            let metadata = match fs::symlink_metadata(&child) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let expected = ownership
+                .nodes
+                .get(&relative)
+                .ok_or_else(|| workspace_error("workspace ownership record changed"))?;
+            if metadata.file_type().is_symlink()
+                || ObjectIdentity::from_metadata(&metadata) != expected.identity
+                || (expected.kind == WorkspaceNodeKind::Directory && !metadata.is_dir())
+                || (expected.kind == WorkspaceNodeKind::File
+                    && (!metadata.is_file() || metadata.nlink() != 1))
+            {
+                return Err(workspace_error(format!(
+                    "workspace entry was replaced and will not be removed: {}",
+                    child.display()
+                )));
+            }
+            let result = if expected.kind == WorkspaceNodeKind::Directory {
+                fs::remove_dir(&child)
+            } else {
+                fs::remove_file(&child)
+            };
+            match result {
+                Ok(()) => {
+                    ownership.nodes.remove(&relative);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    ownership.nodes.remove(&relative);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let root_metadata = metadata_at(path)?;
+        if ObjectIdentity::from_metadata(&root_metadata) != ownership.root
+            || root_metadata.file_type().is_symlink()
+            || !root_metadata.is_dir()
+        {
+            return Err(workspace_error(format!(
+                "workspace destination was replaced and will not be removed: {}",
+                path.display()
+            )));
+        }
+        fs::remove_dir(path).map_err(RuntimeError::from)?;
+        self.owned_workspaces.remove(path);
+        Ok(())
     }
 }
 
@@ -1126,6 +1985,10 @@ impl IdentityId {
     pub fn to_hex(self) -> String {
         hex_encode(&self.0)
     }
+
+    fn is_zero(self) -> bool {
+        self.0.iter().all(|byte| *byte == 0)
+    }
 }
 
 /// All identities that must be regenerated for every restored VM.
@@ -1144,27 +2007,61 @@ pub struct IdentityBundle {
 }
 
 impl IdentityBundle {
+    /// Creates a host-allocated identity bundle after validating its domains.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::InvalidIdentity`] for an all-zero ID or
+    /// [`RuntimeError::StaleIdentity`] when two domains reuse an ID.
+    pub fn new(
+        vm_id: IdentityId,
+        session_id: IdentityId,
+        request_id: IdentityId,
+        subject_id: IdentityId,
+        capability_id: IdentityId,
+    ) -> Result<Self, RuntimeError> {
+        let bundle = Self {
+            vm_id,
+            session_id,
+            request_id,
+            subject_id,
+            capability_id,
+        };
+        bundle.validate(None)?;
+        Ok(bundle)
+    }
+
     fn generate(source: &mut impl IdentitySource) -> Result<Self, RuntimeError> {
-        let ids = [
-            source.generate()?,
-            source.generate()?,
-            source.generate()?,
-            source.generate()?,
-            source.generate()?,
-        ];
+        let bundle = Self {
+            vm_id: source.generate()?,
+            session_id: source.generate()?,
+            request_id: source.generate()?,
+            subject_id: source.generate()?,
+            capability_id: source.generate()?,
+        };
+        bundle.validate(None)?;
+        Ok(bundle)
+    }
+
+    fn validate(&self, forbidden: Option<&[IdentityId]>) -> Result<(), RuntimeError> {
+        let ids = self.ids();
+        if ids.iter().any(|identity| identity.is_zero()) {
+            return Err(RuntimeError::InvalidIdentity(
+                "identity bundle contains an all-zero identity".to_owned(),
+            ));
+        }
         let unique = ids.iter().copied().collect::<HashSet<_>>();
         if unique.len() != ids.len() {
             return Err(RuntimeError::StaleIdentity(
-                "identity generator returned duplicate IDs".to_owned(),
+                "identity bundle contains duplicate IDs".to_owned(),
             ));
         }
-        Ok(Self {
-            vm_id: ids[0],
-            session_id: ids[1],
-            request_id: ids[2],
-            subject_id: ids[3],
-            capability_id: ids[4],
-        })
+        if forbidden.is_some_and(|forbidden| ids.iter().any(|id| forbidden.contains(id))) {
+            return Err(RuntimeError::StaleIdentity(
+                "identity bundle contains an identity present in the snapshot".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn ids(&self) -> [IdentityId; 5] {
@@ -1264,7 +2161,9 @@ pub enum RuntimeState {
 pub struct RuntimeInstance {
     state: RuntimeState,
     process: ProcessHandle,
+    process_stopped: bool,
     workspace: PathBuf,
+    workspace_removed: bool,
     mapper_name: String,
     verity_opened: bool,
     config_fingerprint: Sha256Digest,
@@ -1370,7 +2269,9 @@ where
             Ok(RuntimeInstance {
                 state: RuntimeState::WorkloadStopped,
                 process: handle,
+                process_stopped: false,
                 workspace: workspace.clone(),
+                workspace_removed: false,
                 mapper_name: config.dm_verity.mapper_name.clone(),
                 verity_opened: true,
                 config_fingerprint: config.fingerprint(),
@@ -1442,6 +2343,14 @@ where
         config: &RuntimeConfig,
         snapshot: &Snapshot,
     ) -> Result<RuntimeInstance, RuntimeError> {
+        self.restore_generated(config, snapshot)
+    }
+
+    fn restore_generated(
+        &mut self,
+        config: &RuntimeConfig,
+        snapshot: &Snapshot,
+    ) -> Result<RuntimeInstance, RuntimeError> {
         config.validate()?;
         if config.fingerprint() != snapshot.artifact_fingerprint {
             return Err(RuntimeError::StaleSnapshot(
@@ -1481,19 +2390,109 @@ where
                 ),
             })?;
             let identities = IdentityBundle::generate(&mut self.identity_source)?;
-            if identities
-                .ids()
-                .iter()
-                .any(|identity| snapshot.forbidden_identities.contains(identity))
-            {
-                return Err(RuntimeError::StaleIdentity(
-                    "restore generated an identity present in the snapshot".to_owned(),
-                ));
-            }
+            identities.validate(Some(&snapshot.forbidden_identities))?;
             Ok(RuntimeInstance {
                 state: RuntimeState::IdentityRegenerated,
                 process: handle,
+                process_stopped: false,
                 workspace: workspace.clone(),
+                workspace_removed: false,
+                mapper_name: config.dm_verity.mapper_name.clone(),
+                verity_opened: true,
+                config_fingerprint: config.fingerprint(),
+                identities: Some(identities),
+            })
+        })();
+        match result {
+            Ok(instance) => Ok(instance),
+            Err(error) => {
+                let cleanup =
+                    self.rollback(process, verity_opened, workspace_cloned, &workspace, config);
+                Err(with_cleanup(error, &cleanup))
+            }
+        }
+    }
+
+    /// Restores a snapshot using identities allocated and validated by the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, stale-snapshot, stale-identity, adapter, API, or
+    /// rollback error when the supplied bundle or restore lifecycle is invalid.
+    pub fn restore_with_identities(
+        &mut self,
+        config: &RuntimeConfig,
+        snapshot: &Snapshot,
+        identities: IdentityBundle,
+    ) -> Result<RuntimeInstance, RuntimeError> {
+        identities.validate(Some(&snapshot.forbidden_identities))?;
+        self.restore_with_allocated_identities(config, snapshot, identities)
+    }
+
+    /// Alias for [`Self::restore_with_identities`] with an explicit bundle name.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::restore_with_identities`].
+    pub fn restore_with_identity_bundle(
+        &mut self,
+        config: &RuntimeConfig,
+        snapshot: &Snapshot,
+        identities: IdentityBundle,
+    ) -> Result<RuntimeInstance, RuntimeError> {
+        self.restore_with_identities(config, snapshot, identities)
+    }
+
+    fn restore_with_allocated_identities(
+        &mut self,
+        config: &RuntimeConfig,
+        snapshot: &Snapshot,
+        identities: IdentityBundle,
+    ) -> Result<RuntimeInstance, RuntimeError> {
+        config.validate()?;
+        if config.fingerprint() != snapshot.artifact_fingerprint {
+            return Err(RuntimeError::StaleSnapshot(
+                "snapshot artifact fingerprint does not match the requested runtime".to_owned(),
+            ));
+        }
+        validate_absolute_path("snapshot path", &snapshot.snapshot_path)?;
+        validate_absolute_path("snapshot memory path", &snapshot.memory_path)?;
+        self.verify_artifacts(config)?;
+        let workspace = config.workspace.clone_path();
+        if let Err(error) = self
+            .filesystem
+            .clone_workspace(&config.workspace.source, &workspace)
+        {
+            let cleanup = self
+                .filesystem
+                .remove_workspace(&workspace)
+                .err()
+                .map_or_else(Vec::new, |cleanup_error| vec![cleanup_error.to_string()]);
+            return Err(with_cleanup(error, &cleanup));
+        }
+        let workspace_cloned = true;
+        let mut verity_opened = false;
+        let mut process = None;
+        let result = (|| {
+            self.open_verity(config)?;
+            verity_opened = true;
+            let handle = self.start_jailer(config)?;
+            process = Some(handle);
+            self.api_call(ApiRequest {
+                method: HttpMethod::Put,
+                path: "/snapshot/load".to_owned(),
+                body: format!(
+                    "{{\"snapshot_path\":{},\"mem_file_path\":{},\"resume_vm\":true}}",
+                    json_string(&snapshot.snapshot_path.to_string_lossy()),
+                    json_string(&snapshot.memory_path.to_string_lossy())
+                ),
+            })?;
+            Ok(RuntimeInstance {
+                state: RuntimeState::IdentityRegenerated,
+                process: handle,
+                process_stopped: false,
+                workspace: workspace.clone(),
+                workspace_removed: false,
                 mapper_name: config.dm_verity.mapper_name.clone(),
                 verity_opened: true,
                 config_fingerprint: config.fingerprint(),
@@ -1577,27 +2576,36 @@ where
         instance: &mut RuntimeInstance,
         config: &RuntimeConfig,
     ) -> Result<(), RuntimeError> {
-        if matches!(instance.state, RuntimeState::Stopped | RuntimeState::New) {
+        if instance.state == RuntimeState::Stopped {
+            return Ok(());
+        }
+        if instance.state == RuntimeState::New {
             return Err(RuntimeError::InvalidState {
                 expected: "a live runtime instance".to_owned(),
                 actual: format!("{:?}", instance.state),
             });
         }
         let mut failures = Vec::new();
-        if let Err(error) = self.command_runner.stop(instance.process) {
-            failures.push(error.to_string());
+        if !instance.process_stopped {
+            match self.command_runner.stop(instance.process) {
+                Ok(()) => instance.process_stopped = true,
+                Err(error) => failures.push(error.to_string()),
+            }
         }
-        if instance.verity_opened
-            && let Err(error) = self.close_verity(config)
-        {
-            failures.push(error.to_string());
+        if instance.process_stopped && instance.verity_opened {
+            match self.close_verity(config) {
+                Ok(()) => instance.verity_opened = false,
+                Err(error) => failures.push(error.to_string()),
+            }
         }
-        if let Err(error) = self.filesystem.remove_workspace(&instance.workspace) {
-            failures.push(error.to_string());
+        if instance.process_stopped && !instance.verity_opened && !instance.workspace_removed {
+            match self.filesystem.remove_workspace(&instance.workspace) {
+                Ok(()) => instance.workspace_removed = true,
+                Err(error) => failures.push(error.to_string()),
+            }
         }
         if failures.is_empty() {
             instance.state = RuntimeState::Stopped;
-            instance.verity_opened = false;
             Ok(())
         } else {
             Err(RuntimeError::Cleanup(failures.join("; ")))

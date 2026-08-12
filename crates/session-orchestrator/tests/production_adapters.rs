@@ -22,8 +22,8 @@ use authority_core::{
 use firecracker_runtime::{
     ApiClient, ApiRequest, ApiResponse, CgroupConfig, CommandOutput, CommandRunner, CommandSpec,
     DmVerityConfig, FileSystem, HostIsolationConfig, IdentityId, IdentitySource, NamespaceConfig,
-    PinnedArtifact, ProcessHandle, Runtime, RuntimeConfig, RuntimeError, SeccompConfig,
-    Sha256Digest, Snapshot, VsockConfig, WorkspaceConfig, sha256,
+    PinnedArtifact, ProcessHandle, Runtime, RuntimeConfig, RuntimeError, SeccompConfig, Snapshot,
+    VsockConfig, WorkspaceConfig, sha256,
 };
 use session_orchestrator::{
     CleanupStage, CryptographicRandom, EntropyError, LifecycleState, SessionOrchestrator,
@@ -281,23 +281,6 @@ fn runtime_config() -> RuntimeConfig {
     }
 }
 
-fn config_fingerprint(config: &RuntimeConfig) -> Sha256Digest {
-    let mut bytes = Vec::new();
-    for artifact in [
-        &config.firecracker,
-        &config.kernel,
-        &config.rootfs,
-        &config.verity_hash,
-        &config.jailer,
-        &config.isolation.seccomp.filter,
-    ] {
-        bytes.extend_from_slice(&artifact.digest.as_bytes());
-    }
-    bytes.extend_from_slice(&config.dm_verity.root_hash.as_bytes());
-    bytes.extend_from_slice(&config.vsock.guest_cid.to_be_bytes());
-    sha256(&bytes)
-}
-
 fn authority_grant() -> AuthorityRootGrant {
     AuthorityRootGrant::new(
         TimeWindow::new(MonotonicTime::from_ticks(1), MonotonicTime::from_ticks(100))
@@ -348,7 +331,7 @@ fn production_adapters_preserve_exact_bindings_through_start_and_stop() {
     let snapshot = Snapshot::new(
         "/test/snapshot",
         "/test/memory",
-        config_fingerprint(&config),
+        config.snapshot_fingerprint(),
         Vec::new(),
     );
     let (mut vm, mut workload) =
@@ -453,7 +436,7 @@ fn failed_firecracker_restore_cleanup_is_retried_by_orchestrator_stop() {
     let snapshot = Snapshot::new(
         "/test/snapshot",
         "/test/memory",
-        config_fingerprint(&config),
+        config.snapshot_fingerprint(),
         Vec::new(),
     );
     let (mut vm, mut workload) =

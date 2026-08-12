@@ -146,7 +146,7 @@ root や child directory の再照合には、time-of-check to time-of-use race 
 
 module 内の test は mount ID の相違と、Linux が返し得る全 unsupported object kind の分類を直接検査する。実 nested mount の作成には mount namespace の権限が要るため、通常の unit test では metadata 判定までを固定している。実 mount を使った越境 test は FUSE 統合 test の段階で追加する。
 
-## この段階では保証しないこと
+## 正確な保証範囲
 
 `ValidatedRepository` は filesystem を凍結する仕組みではない。root fd は root path の差し替えから参照を守るが、別 process が child entry や file 内容を変更することまでは止めない。
 
@@ -157,6 +157,14 @@ supervisor は、事前検証を始める前から `capfs` の稼働終了まで
 まだ実装していないのは、実 FUSE mount 上のrename / write競合、mount越境、敵対的なbacking差し替えtestである。加えて、supervisorがbacking treeを非信頼processから隔離する実行基盤なしに、host上の任意のprocessをこのFUSE adapterだけで止めることはできない。
 
 したがってinitial link-free file operationは起動時検査から実I/Oまで接続されたが、「全 workload syscall が認可を通る」隔離境界はruntime-isolationを含めて完成する。
+
+## 変更時の確認点
+
+- `openat2` の resolve flag を減らさない。`RESOLVE_NO_SYMLINKS` を外すと、link-free の検査が起動時の一瞬にしか意味を持たなくなる。4 つは独立に別の脱出経路を塞いでいる。
+- 受理する object 種別を増やすときは、その種別が別名を作れないことを確認する。symlink と hard link を拒否している前提の上に、[共有 namespace registry](namespace-registry.md) の `ObjectId` と path の 1 対 1 対応が乗っている。
+- entry 名の検査と fd の取得の間に `(mount ID, inode)` を再照合する手順を省かない。省いても正常系は通るので、test を書かないと気付けない。
+- entry 数と深さの上限を変えるときは、manifest が占める memory と startup 時間の両方を見る。上限は片方だけを守っているのではない。
+- 検査を通った後に backing tree を他 process が書き換えられない配置は、supervisor 側の前提である。ここを緩めるなら、[Direct-I/O FUSE adapter](read-only-fuse.md) の毎操作再認可だけでは足りない。
 
 ## 関連
 

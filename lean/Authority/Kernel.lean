@@ -54,6 +54,28 @@ theorem AuditState.finish_preserves_metadata {state : AuditState}
       (finishAttempt_preserves_other _ _ _ _ _ sameAttempt).trans lookup,
       metadataMatches⟩
 
+/-- Recording an ambiguous terminal preserves every immutable start metadata record. -/
+theorem AuditState.finishCommitUnknown_preserves_metadata {state : AuditState}
+    {finishedAttempt existingAttempt : AttemptId}
+    {evidence : CommitUnknownEvidence} {metadata : AttemptMetadata}
+    (allowed : state.MayFinishCommitUnknown finishedAttempt evidence)
+    (existing : state.HasMetadata existingAttempt metadata) :
+    AuditState.HasMetadata
+      (state.finishCommitUnknownAttempt finishedAttempt allowed.currentRecord evidence)
+        existingAttempt metadata := by
+  rcases existing with ⟨record, lookup, metadataMatches⟩
+  by_cases sameAttempt : existingAttempt = finishedAttempt
+  · subst existingAttempt
+    have sameRecord : record = allowed.currentRecord := Option.some.inj
+      (lookup.symm.trans allowed.currentLookup)
+    subst record
+    exact ⟨state.terminalRecord allowed.currentRecord .commitUnknown none,
+      (finishCommitUnknown_stores_exact allowed).1,
+      by simpa [terminalRecord] using metadataMatches⟩
+  · exact ⟨record,
+      (finishCommitUnknown_preserves_other _ _ _ _ sameAttempt).trans lookup,
+      metadataMatches⟩
+
 /-- Composed state at protocol linearization points. -/
 structure KernelState where
   authority : CapabilityState
@@ -211,11 +233,20 @@ structure MayReject (state : KernelState) (attemptId : AttemptId)
   auditAllowed : state.audit.MayFinish attemptId outcome none
   noExternalEffect : state.externalEffects attemptId = none
 
-/-- The three Rust error paths where a terminal audit append can fail. -/
+/-- An ambiguous completion records evidence without asserting an external effect. -/
+structure MayCommitUnknown (state : KernelState) (attemptId : AttemptId)
+    (evidence : CommitUnknownEvidence) where
+  auditAllowed : state.audit.MayFinishCommitUnknown attemptId evidence
+  active : attemptId ∈ state.activeAttempts
+  authorized : state.HasAuthorizedSnapshot attemptId
+  noExternalEffect : state.externalEffects attemptId = none
+
+/-- Rust error paths where a terminal audit append can fail. -/
 inductive TerminalAuditFailure where
   | denialAudit
   | precommitAudit
   | committedButAudit
+  | commitUnknownAndAudit
   deriving Repr, BEq, DecidableEq
 
 namespace TerminalAuditFailure
@@ -235,6 +266,11 @@ def Evidence (failure : TerminalAuditFailure) (state : KernelState)
         state.externalEffects attemptId = some receipt ∧
           receipt.attemptId = attemptId ∧
           state.HasAuthorizedSnapshot attemptId
+  | .commitUnknownAndAudit =>
+      ∃ evidence : CommitUnknownEvidence,
+        evidence.attemptId = attemptId ∧
+          state.HasAuthorizedSnapshot attemptId ∧
+          state.externalEffects attemptId = none
 
 end TerminalAuditFailure
 
@@ -273,6 +309,13 @@ def rejectAttempt (state : KernelState) (attemptId : AttemptId)
   let finishedAudit := state.audit.finishAttempt attemptId current outcome none
   { state.releaseAttempt attemptId with audit := finishedAudit }
 
+/-- Durably record an ambiguous completion and release its shared guard. -/
+def commitUnknownAttempt (state : KernelState) (attemptId : AttemptId)
+    (evidence : CommitUnknownEvidence) (current : AttemptRecord) : KernelState :=
+  let finishedAudit :=
+    state.audit.finishCommitUnknownAttempt attemptId current evidence
+  { state.releaseAttempt attemptId with audit := finishedAudit }
+
 /-- Release the shared guard while retaining the Started audit and result evidence. -/
 def failTerminalAudit (state : KernelState) (attemptId : AttemptId) : KernelState :=
   state.releaseAttempt attemptId
@@ -301,6 +344,11 @@ inductive Step : KernelState → KernelState → Prop
       {outcome : AttemptOutcome} :
       (allowed : MayReject state attemptId outcome) →
       Step state (state.rejectAttempt attemptId outcome allowed.auditAllowed.currentRecord)
+  | commitUnknown {state : KernelState} {attemptId : AttemptId}
+      {evidence : CommitUnknownEvidence} :
+      (allowed : MayCommitUnknown state attemptId evidence) →
+      Step state
+        (state.commitUnknownAttempt attemptId evidence allowed.auditAllowed.currentRecord)
   | terminalAuditFailure {state : KernelState} {attemptId : AttemptId}
       {failure : TerminalAuditFailure} :
       MayFailTerminalAudit state attemptId failure →
@@ -316,7 +364,8 @@ theorem Step.authority_change_requires_unlocked {before after : KernelState}
     before.activeAttempts = [] ∧ after.activeAttempts = [] := by
   cases transition with
   | authorityTransition unlocked _ => exact ⟨unlocked, unlocked⟩
-  | begin | authorize | linearizeEffect | commit | reject | terminalAuditFailure =>
+  | begin | authorize | linearizeEffect | commit | reject | commitUnknown |
+      terminalAuditFailure =>
       exact False.elim (changed rfl)
 
 /-- While an attempt owns the guard, one step cannot mutate authority. -/
@@ -326,7 +375,8 @@ theorem Step.locked_authority_stable {before after : KernelState}
     after.authority = before.authority := by
   cases transition with
   | authorityTransition unlocked _ => simp [unlocked] at active
-  | begin | authorize | linearizeEffect | commit | reject | terminalAuditFailure => rfl
+  | begin | authorize | linearizeEffect | commit | reject | commitUnknown |
+      terminalAuditFailure => rfl
 
 /-- Begin stores both the exact audit record and durable-intent mirror. -/
 theorem begin_stores_exact_intent (state : KernelState) (attemptId : AttemptId)
@@ -395,7 +445,7 @@ theorem failTerminalAudit_retains_started {state : KernelState}
         record.outcome = .started := by
   exact ⟨allowed.currentRecord, allowed.auditLookup, allowed.auditStillStarted⟩
 
-/-- A terminal audit failure retains its denial, pre-commit, or commit evidence. -/
+/-- A terminal audit failure retains its typed result evidence. -/
 theorem failTerminalAudit_retains_evidence {state : KernelState}
     {attemptId : AttemptId} {failure : TerminalAuditFailure}
     (allowed : MayFailTerminalAudit state attemptId failure) :
@@ -454,6 +504,54 @@ theorem committedButAudit_failure_result {state : KernelState}
   exact ⟨failTerminalAudit_releases_attempt state attemptId,
     allowed.currentRecord, receipt, allowed.auditLookup, allowed.auditStillStarted,
     effect, matching, authorized⟩
+
+/-- `CommitUnknownAndAudit` leaves Started durable state and no claimed effect. -/
+theorem commitUnknownAndAudit_failure_result {state : KernelState}
+    {attemptId : AttemptId}
+    (allowed : MayFailTerminalAudit state attemptId .commitUnknownAndAudit) :
+    attemptId ∉ (state.failTerminalAudit attemptId).activeAttempts ∧
+      ∃ (record : AttemptRecord) (evidence : CommitUnknownEvidence),
+        (state.failTerminalAudit attemptId).audit.attempts attemptId = some record ∧
+          record.outcome = .started ∧
+          evidence.attemptId = attemptId ∧
+          evidence.token ≠ [] ∧
+          evidence.token.length ≤ commitUnknownEvidenceMaximumBytes ∧
+          (state.failTerminalAudit attemptId).HasAuthorizedSnapshot attemptId ∧
+          (state.failTerminalAudit attemptId).externalEffects attemptId = none := by
+  rcases allowed.evidence with ⟨evidence, matching, authorized, noEffect⟩
+  exact ⟨failTerminalAudit_releases_attempt state attemptId,
+    allowed.currentRecord, evidence, allowed.auditLookup, allowed.auditStillStarted,
+    matching, evidence.tokenNonempty, evidence.tokenBounded, authorized, noEffect⟩
+
+/-- A durable ambiguous terminal stores evidence without creating an effect snapshot. -/
+theorem commitUnknown_result {state : KernelState} {attemptId : AttemptId}
+    {evidence : CommitUnknownEvidence}
+    (allowed : MayCommitUnknown state attemptId evidence) :
+    attemptId ∉ (state.commitUnknownAttempt attemptId evidence
+        allowed.auditAllowed.currentRecord).activeAttempts ∧
+      (∃ record,
+        (state.commitUnknownAttempt attemptId evidence
+            allowed.auditAllowed.currentRecord).audit.attempts attemptId =
+          some record ∧ record.outcome = .commitUnknown) ∧
+      evidence.attemptId = attemptId ∧
+      evidence.token ≠ [] ∧
+      evidence.token.length ≤ commitUnknownEvidenceMaximumBytes ∧
+      (state.commitUnknownAttempt attemptId evidence
+          allowed.auditAllowed.currentRecord).audit.commitUnknownEvidence attemptId =
+        some evidence ∧
+      ¬ (state.commitUnknownAttempt attemptId evidence
+          allowed.auditAllowed.currentRecord).audit.HasEffect attemptId ∧
+      (state.commitUnknownAttempt attemptId evidence
+          allowed.auditAllowed.currentRecord).externalEffects attemptId = none := by
+  refine ⟨?_, ?_, allowed.auditAllowed.evidenceMatches, evidence.tokenNonempty,
+    evidence.tokenBounded, ?_, ?_, allowed.noExternalEffect⟩
+  · simp [commitUnknownAttempt, releaseAttempt]
+  · exact ⟨state.audit.terminalRecord allowed.auditAllowed.currentRecord
+        .commitUnknown none,
+      (AuditState.finishCommitUnknown_stores_exact allowed.auditAllowed).1,
+      by simp [AuditState.terminalRecord]⟩
+  · exact (AuditState.finishCommitUnknown_stores_exact allowed.auditAllowed).2
+  · exact AuditState.finish_commitUnknown_has_no_effect allowed.auditAllowed
 
 /-- Two distinct read-side attempts can be active at the same time. -/
 theorem two_attempts_can_overlap (authority : CapabilityState)
@@ -535,7 +633,7 @@ theorem Step.durable_start_persists {before after : KernelState}
         rw [started] at absent
         cases absent
       simpa [KernelState.beginAttempt, replace, differentAttempt] using started
-  | authorize | linearizeEffect | commit | reject | terminalAuditFailure |
+  | authorize | linearizeEffect | commit | reject | commitUnknown | terminalAuditFailure |
       authorityTransition => exact started
 
 /-- Same-snapshot authorization evidence persists across one accepted step. -/
@@ -564,7 +662,8 @@ theorem Step.authorized_snapshot_persists {before after : KernelState}
           using authorizationLookup
       · simpa [KernelState.authorizeAttempt, replace, differentAttempt]
           using authorityLookup
-  | linearizeEffect | commit | reject | terminalAuditFailure | authorityTransition =>
+  | linearizeEffect | commit | reject | commitUnknown | terminalAuditFailure |
+      authorityTransition =>
       exact ⟨metadata, authoritySnapshot, durableLookup, authorizationLookup,
         authorityLookup, allAuthorized⟩
 
@@ -574,7 +673,8 @@ theorem Step.external_effect_persists {before after : KernelState}
     (effect : before.externalEffects attemptId = some receipt) :
     after.externalEffects attemptId = some receipt := by
   cases transition with
-  | begin | authorize | commit | reject | terminalAuditFailure | authorityTransition =>
+  | begin | authorize | commit | reject | commitUnknown | terminalAuditFailure |
+      authorityTransition =>
       exact effect
   | linearizeEffect allowed =>
       rename_i newAttempt newReceipt
@@ -600,6 +700,9 @@ theorem Step.audit_metadata_persists {before after : KernelState}
       exact AuditState.finish_preserves_metadata allowed.auditAllowed mirrored
   | reject allowed =>
       exact AuditState.finish_preserves_metadata allowed.auditAllowed mirrored
+  | commitUnknown allowed =>
+      exact AuditState.finishCommitUnknown_preserves_metadata
+        allowed.auditAllowed mirrored
   | authorityTransition => exact mirrored
 
 /-- Recover an earlier committed effect across a new begin transition. -/
@@ -637,6 +740,22 @@ theorem committed_before_other_finish {state : KernelState}
     by simpa [AuditState.finishAttempt, replace, differentAttempt] using lookup,
     committedOutcome, storedReceipt, matching⟩
 
+/-- Recover an earlier effect across an ambiguous finish for another attempt. -/
+theorem committed_before_other_unknown_finish {state : KernelState}
+    {finishedAttempt attemptId : AttemptId} {evidence : CommitUnknownEvidence}
+    (allowed : state.audit.MayFinishCommitUnknown finishedAttempt evidence)
+    (differentAttempt : attemptId ≠ finishedAttempt)
+    (committed :
+      (state.audit.finishCommitUnknownAttempt finishedAttempt
+        allowed.currentRecord evidence).HasEffect attemptId) :
+    state.audit.HasEffect attemptId := by
+  rcases committed with ⟨record, receipt, lookup, committedOutcome,
+    storedReceipt, matching⟩
+  exact ⟨record, receipt,
+    by simpa [AuditState.finishCommitUnknownAttempt, replace, differentAttempt]
+      using lookup,
+    committedOutcome, storedReceipt, matching⟩
+
 /-- Every accepted protocol step preserves audit/effect coupling. -/
 theorem Step.preserves_wellFormed {before after : KernelState}
     (transition : Step before after) (wellFormed : before.WellFormed) :
@@ -654,6 +773,10 @@ theorem Step.preserves_wellFormed {before after : KernelState}
             (fun activeAttempt => activeAttempt ≠ allowed.auditAllowed.attemptId)
     | reject allowed =>
         simpa [rejectAttempt, releaseAttempt] using
+          wellFormed.activeAttemptsNodup.filter
+            (fun activeAttempt => activeAttempt ≠ allowed.auditAllowed.attemptId)
+    | commitUnknown allowed =>
+        simpa [commitUnknownAttempt, releaseAttempt] using
           wellFormed.activeAttemptsNodup.filter
             (fun activeAttempt => activeAttempt ≠ allowed.auditAllowed.attemptId)
     | terminalAuditFailure allowed =>
@@ -723,6 +846,21 @@ theorem Step.preserves_wellFormed {before after : KernelState}
               allowed.auditAllowed.currentRecord outcome none
               differentAttempt).trans auditLookup,
           metadataMatches, stillStarted⟩
+    | commitUnknown allowed =>
+        rename_i finishedAttempt evidence
+        have activeAndDifferent :
+            attemptId ∈ before.activeAttempts ∧ attemptId ≠ finishedAttempt := by
+          simpa [commitUnknownAttempt, releaseAttempt] using activeAfter
+        have activeBefore := activeAndDifferent.1
+        have differentAttempt := activeAndDifferent.2
+        rcases wellFormed.activeAttemptStarted attemptId activeBefore with
+          ⟨metadata, record, durableLookup, auditLookup, metadataMatches,
+            stillStarted⟩
+        exact ⟨metadata, record, durableLookup,
+          by simpa [commitUnknownAttempt, releaseAttempt] using
+            (AuditState.finishCommitUnknown_preserves_other before.audit finishedAttempt
+              allowed.auditAllowed.currentRecord evidence differentAttempt).trans auditLookup,
+          metadataMatches, stillStarted⟩
     | terminalAuditFailure allowed =>
         rename_i failedAttempt failure
         have activeAndDifferent :
@@ -756,6 +894,9 @@ theorem Step.preserves_wellFormed {before after : KernelState}
           (wellFormed.durableStartMirrored attemptId metadata durableLookup)
     | reject allowed =>
         exact Step.audit_metadata_persists (.reject allowed)
+          (wellFormed.durableStartMirrored attemptId metadata durableLookup)
+    | commitUnknown allowed =>
+        exact Step.audit_metadata_persists (.commitUnknown allowed)
           (wellFormed.durableStartMirrored attemptId metadata durableLookup)
     | terminalAuditFailure allowed =>
         exact Step.audit_metadata_persists (.terminalAuditFailure allowed)
@@ -799,6 +940,18 @@ theorem Step.preserves_wellFormed {before after : KernelState}
             simp [AuditState.terminalRecord] at committedOutcome
         · exact wellFormed.committedHasEffect attemptId
             (committed_before_other_finish allowed.auditAllowed sameAttempt committed)
+    | commitUnknown allowed =>
+        rename_i unknownAttempt evidence
+        by_cases sameAttempt : attemptId = unknownAttempt
+        · subst attemptId
+          rcases committed with ⟨record, receipt, lookup, committedOutcome⟩
+          have exactTerminal := AuditState.finishCommitUnknown_stores_exact
+            allowed.auditAllowed
+          have sameRecord := Option.some.inj (lookup.symm.trans exactTerminal.1)
+          subst record
+          simp [AuditState.terminalRecord] at committedOutcome
+        · exact wellFormed.committedHasEffect attemptId
+            (committed_before_other_unknown_finish allowed.auditAllowed sameAttempt committed)
     | terminalAuditFailure | authorityTransition =>
         exact wellFormed.committedHasEffect attemptId committed
   · intro attemptId receipt effect
@@ -823,6 +976,11 @@ theorem Step.preserves_wellFormed {before after : KernelState}
           ⟨matching, authorized⟩
         exact ⟨matching,
           Step.authorized_snapshot_persists (.reject allowed) authorized⟩
+    | commitUnknown allowed =>
+        rcases wellFormed.effectWasAuthorized attemptId receipt effect with
+          ⟨matching, authorized⟩
+        exact ⟨matching,
+          Step.authorized_snapshot_persists (.commitUnknown allowed) authorized⟩
     | terminalAuditFailure allowed =>
         rcases wellFormed.effectWasAuthorized attemptId receipt effect with
           ⟨matching, authorized⟩
@@ -872,6 +1030,30 @@ theorem Steps.preserve_wellFormed {before after : KernelState}
   | refl => exact wellFormed
   | tail _ transition inductionHypothesis =>
       exact transition.preserves_wellFormed inductionHypothesis
+
+/-- The concrete `CommitUnknown` trace is well formed and exposes no committed effect. -/
+theorem commitUnknown_trace_preserves_wellFormed {state : KernelState}
+    {attemptId : AttemptId} {evidence : CommitUnknownEvidence}
+    (wellFormed : state.WellFormed)
+    (allowed : MayCommitUnknown state attemptId evidence) :
+    ∃ after,
+      Steps state after ∧ after.WellFormed ∧
+        (∃ record, after.audit.attempts attemptId = some record ∧
+          record.outcome = .commitUnknown) ∧
+        evidence.attemptId = attemptId ∧
+        evidence.token ≠ [] ∧
+        evidence.token.length ≤ commitUnknownEvidenceMaximumBytes ∧
+        after.audit.commitUnknownEvidence attemptId = some evidence ∧
+        ¬ after.audit.HasEffect attemptId ∧
+        after.externalEffects attemptId = none := by
+  let after := state.commitUnknownAttempt attemptId evidence
+    allowed.auditAllowed.currentRecord
+  have transition : Step state after := .commitUnknown allowed
+  have trace : Steps state after := .tail (.refl state) transition
+  rcases commitUnknown_result allowed with
+    ⟨_, terminal, matching, nonempty, bounded, stored, noEffectSnapshot, noEffect⟩
+  exact ⟨after, trace, trace.preserve_wellFormed wellFormed,
+    terminal, matching, nonempty, bounded, stored, noEffectSnapshot, noEffect⟩
 
 /-- Durable start evidence persists across arbitrary finite protocol execution. -/
 theorem Steps.durable_start_persists {before after : KernelState}

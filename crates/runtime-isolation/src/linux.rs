@@ -15,9 +15,9 @@ mod implementation {
     use crate::backend::{ChildStartupNotifier, private::OperationPermit};
     use crate::{
         BackendError, BindMountConfig, CapabilityReport, CgroupConfig, ControlChannelConfig,
-        IdentityMap, IsolatedChildProcess, IsolationBackend, IsolationConfig, IsolationStep,
-        LandlockConfig, NamespaceIdentity, NamespacePreparation, PidNamespaceChild, SeccompPolicy,
-        SpawnOutcome,
+        EgressChannelConfig, IdentityMap, IsolatedChildProcess, IsolationBackend, IsolationConfig,
+        IsolationStep, LandlockConfig, NamespaceIdentity, NamespacePreparation, PidNamespaceChild,
+        SeccompPolicy, SpawnOutcome,
     };
 
     const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
@@ -337,7 +337,15 @@ mod implementation {
                     if let Some(control_channel) = config.control_channel {
                         validate_control_channel(step, control_channel)?;
                     }
-                    close_inherited_fds(step, notifier_fd, config.control_channel)
+                    if let Some(egress_channel) = config.egress_channel {
+                        validate_egress_channel(step, egress_channel)?;
+                    }
+                    close_inherited_fds(
+                        step,
+                        notifier_fd,
+                        config.control_channel,
+                        config.egress_channel,
+                    )
                 }
                 IsolationStep::Landlock => install_landlock(step, &config.landlock),
                 IsolationStep::DropCapabilities => self.drop_capabilities(step),
@@ -1387,10 +1395,86 @@ mod implementation {
         Ok(())
     }
 
+    fn validate_egress_channel(
+        step: IsolationStep,
+        egress_channel: EgressChannelConfig,
+    ) -> Result<(), BackendError> {
+        let descriptor = egress_channel.fd();
+        if descriptor < FIRST_NONSTANDARD_FD {
+            return Err(BackendError::new(
+                step,
+                "egress Broker channel overlapped a standard descriptor",
+                None,
+            ));
+        }
+        if descriptor_has_cloexec(step, descriptor)? {
+            return Err(BackendError::new(
+                step,
+                "egress Broker channel was close-on-exec",
+                None,
+            ));
+        }
+        let mut socket_type = 0_i32;
+        let mut socket_type_length = libc::socklen_t::try_from(std::mem::size_of_val(&socket_type))
+            .map_err(|_| {
+                BackendError::new(step, "socket type length did not fit socklen_t", None)
+            })?;
+        // SAFETY: the descriptor is supplied by the trusted guest supervisor; the output pointer
+        // and length point to writable storage of exactly the advertised size.
+        let socket_type_result = unsafe {
+            libc::getsockopt(
+                descriptor,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                (&raw mut socket_type).cast::<libc::c_void>(),
+                &raw mut socket_type_length,
+            )
+        };
+        if socket_type_result == -1 {
+            return Err(last_error(step, "inspect egress Broker socket type"));
+        }
+        if socket_type != libc::SOCK_STREAM {
+            return Err(BackendError::new(
+                step,
+                "egress Broker channel was not a stream socket",
+                None,
+            ));
+        }
+
+        let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut peer_length =
+            libc::socklen_t::try_from(std::mem::size_of_val(&peer)).map_err(|_| {
+                BackendError::new(step, "socket peer length did not fit socklen_t", None)
+            })?;
+        // SAFETY: `peer` and `peer_length` are writable buffers accepted by getpeername.
+        let peer_result = unsafe {
+            libc::getpeername(
+                descriptor,
+                (&raw mut peer).cast::<libc::sockaddr>(),
+                &raw mut peer_length,
+            )
+        };
+        if peer_result == -1 {
+            return Err(last_error(
+                step,
+                "verify egress Broker channel is connected",
+            ));
+        }
+        if i32::from(peer.ss_family) != libc::AF_VSOCK {
+            return Err(BackendError::new(
+                step,
+                "egress Broker channel peer was not vsock",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     fn close_inherited_fds(
         step: IsolationStep,
         preserved_notifier_fd: RawFd,
         control_channel: Option<ControlChannelConfig>,
+        egress_channel: Option<EgressChannelConfig>,
     ) -> Result<(), BackendError> {
         if preserved_notifier_fd < FIRST_NONSTANDARD_FD {
             return Err(BackendError::new(
@@ -1407,18 +1491,30 @@ mod implementation {
             ));
         }
         let mut preserved = vec![preserved_notifier_fd.cast_unsigned()];
-        if let Some(control_channel) = control_channel {
-            let descriptor = control_channel.fd();
+        for descriptor in [
+            control_channel.map(ControlChannelConfig::fd),
+            egress_channel.map(EgressChannelConfig::fd),
+        ]
+        .into_iter()
+        .flatten()
+        {
             if descriptor == preserved_notifier_fd {
                 return Err(BackendError::new(
                     step,
-                    "supervisor control channel overlapped the startup notifier",
+                    "preserved workload channel overlapped the startup notifier",
                     None,
                 ));
             }
             preserved.push(descriptor.cast_unsigned());
         }
         preserved.sort_unstable();
+        if preserved.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(BackendError::new(
+                step,
+                "preserved workload channels overlapped one descriptor",
+                None,
+            ));
+        }
         let mut first = FIRST_NONSTANDARD_FD.cast_unsigned();
         for descriptor in preserved {
             if descriptor > first {
@@ -2398,6 +2494,7 @@ mod implementation {
                 IsolationStep::CloseInheritedFileDescriptors,
                 libc::STDERR_FILENO,
                 None,
+                None,
             )
             .expect_err("a notifier may never overlap inherited standard IO");
 
@@ -2455,6 +2552,7 @@ mod implementation {
                         && close_inherited_fds(
                             IsolationStep::CloseInheritedFileDescriptors,
                             notifier_fd,
+                            None,
                             None,
                         )
                         .is_ok()

@@ -23,9 +23,10 @@ use crate::{
 };
 
 /// GitHub credential configuration retained exclusively by the host egress factory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GitHubEgressConfig {
     /// Rejects every GitHub request without reading any credential environment variable.
+    #[default]
     Disabled,
     /// Binds the host's `EGRESS_GITHUB_TOKEN` to one exact GitHub installation.
     Environment {
@@ -47,12 +48,6 @@ impl GitHubEgressConfig {
             installation,
             credential_handle,
         }
-    }
-}
-
-impl Default for GitHubEgressConfig {
-    fn default() -> Self {
-        Self::Disabled
     }
 }
 

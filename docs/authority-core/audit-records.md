@@ -117,6 +117,16 @@ kernel は 1 件も request を受け付けない。journal に「fate が未確
 version 2 は先頭に instance を持ち、その値は attach 時点の attempt sequence である。sequence
 は単調に消費されるので、record を 1 件でも書いた instance が同じ値を再び使うことはない。
 
+## 分からなかったものを、後から確定させる
+
+`CommitUnknown` は「起きたかもしれないし起きていないかもしれない」という記録である。放置すると監査証跡に未確定が積み上がるので、provider に問い合わせて確定させる経路がある。
+
+`reconcile_unknown_commits` が未解決の `CommitUnknown` を順に取り出し、`CommitReconciler` へ渡す。実装は provider 境界を持つ adapter が用意する。判定は record 自身から復号した `DurableAttemptMetadata`（caller、`CapId`、typed request、`auth_epoch`）だけで行えるので、別の帳簿と食い違う余地が無い。
+
+**terminal record は書き換えない。** 判定は `RECONCILE` という別の frame として追記する。曖昧だったという事実は実際に起きたことであり、それを消した監査証跡では「この host はいつ何を信じていたか」に答えられない。1 つの attempt に判定は 1 回だけで、2 回目は拒否する。後から読む人がどちらを信じるか選べる状態を作らないためである。
+
+adapter が「まだ分からない」と答えた場合は何も追記しない。推測を記録するより、未確定のままにして後で再度照合するほうが正しい。
+
 **過去の attempt は history であって state ではない。** recovery はそれらを再認可しないし、
 capability を復元もしない。復元しようとすれば、既に解放された host resource を指す capability を
 作ることになる。host resource の解放は session recovery journal の仕事で、audit journal の
@@ -160,7 +170,7 @@ Broker や supervisor が署名・remote append-only storage・provider 固有 m
 
 - hash chain、署名、remote append-only storage による耐改ざん性。
 - wall-clock timestamp と複数 process 間の全順序。
-- provider ごとの receipt reconciliation。recovery は `CommitUnknown` を残すところまでで、その attempt が実際に provider 側で成立したかを外部 API へ問い合わせる照合は含まない。
+- provider へ実際に問い合わせる adapter。照合の枠組みと記録は実装済みだが、GitHub や公開 HTTPS に問い合わせる `CommitReconciler` の実装は Broker 側の担当で、まだ無い。
 - filesystem や Broker 固有の result metadata、byte count、provider request ID。
 
 ## どう検証しているか

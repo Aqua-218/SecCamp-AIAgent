@@ -30,6 +30,7 @@ use rustix::{
 const LANDLOCK_ABI: u32 = 3;
 const ISOLATION_READY: &[u8; 8] = b"isolated";
 const EGRESS_BROKER_FD_ENV: &str = "EGRESS_BROKER_FD";
+const EGRESS_BROKER_SESSION_ENV: &str = "EGRESS_BROKER_SESSION_ID";
 
 #[derive(Debug)]
 struct LauncherConfig {
@@ -37,6 +38,7 @@ struct LauncherConfig {
     start_gate: PathBuf,
     control_socket: PathBuf,
     egress_broker_fd: i32,
+    egress_broker_session: String,
     workload_directory: PathBuf,
     program: PathBuf,
     arguments: Vec<OsString>,
@@ -172,6 +174,7 @@ fn execute_workload(
         .envs(config.environment.iter().cloned())
         .env("SUPERVISOR_CONTROL_FD", control_channel_fd.to_string())
         .env(EGRESS_BROKER_FD_ENV, egress_broker_fd.to_string())
+        .env(EGRESS_BROKER_SESSION_ENV, &config.egress_broker_session)
         .current_dir(&config.workload_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -202,6 +205,7 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
     let start_gate = required_path(&mut arguments, "--start-gate")?;
     let control_socket = required_path(&mut arguments, "--control-socket")?;
     let egress_broker_fd = required_descriptor(&mut arguments, "--egress-broker-fd")?;
+    let egress_broker_session = required_identity(&mut arguments, "--egress-broker-session")?;
 
     let mut read_only_paths = Vec::new();
     let mut writable_paths = Vec::new();
@@ -254,6 +258,7 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
         start_gate,
         control_socket,
         egress_broker_fd,
+        egress_broker_session,
         workload_directory: workspace_target,
         program,
         arguments: workload_arguments,
@@ -276,6 +281,32 @@ where
         return Err(format!("{flag} must be a nonstandard file descriptor"));
     }
     Ok(descriptor)
+}
+
+fn required_identity<I>(
+    arguments: &mut std::iter::Peekable<I>,
+    flag: &str,
+) -> Result<String, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    expect_flag(arguments, flag)?;
+    let identity = arguments
+        .next()
+        .ok_or_else(usage)?
+        .into_string()
+        .map_err(|_| usage())?;
+    if identity.len() != 32
+        || !identity
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || !identity.bytes().any(|byte| byte != b'0')
+    {
+        return Err(format!(
+            "{flag} must be a non-zero lower hexadecimal identity"
+        ));
+    }
+    Ok(identity)
 }
 
 fn required_path<I>(arguments: &mut std::iter::Peekable<I>, flag: &str) -> Result<PathBuf, String>
@@ -368,7 +399,7 @@ fn is_absolute_lexical_path(path: &Path) -> bool {
 }
 
 fn usage() -> String {
-    "usage: workload-isolation-launcher --rootfs-source <absolute-path> --rootfs-mount-target <absolute-path> --old-root <absolute-path> --workspace-source <absolute-path> --workspace-target <absolute-path> --tmpfs-target <absolute-path> --tmpfs-size-bytes <u64> --cgroup-root <absolute-path> --cgroup-name <safe-name> --memory-max-bytes <u64> --pids-max <u64> --host-uid <u32> --host-gid <u32> --start-gate <absolute-path> --control-socket <absolute-path> --egress-broker-fd <fd> --landlock-read-only <absolute-path>... --landlock-writable <absolute-path>... [--env NAME=VALUE]... --program <absolute-path> -- [arguments...]".to_owned()
+    "usage: workload-isolation-launcher --rootfs-source <absolute-path> --rootfs-mount-target <absolute-path> --old-root <absolute-path> --workspace-source <absolute-path> --workspace-target <absolute-path> --tmpfs-target <absolute-path> --tmpfs-size-bytes <u64> --cgroup-root <absolute-path> --cgroup-name <safe-name> --memory-max-bytes <u64> --pids-max <u64> --host-uid <u32> --host-gid <u32> --start-gate <absolute-path> --control-socket <absolute-path> --egress-broker-fd <fd> --egress-broker-session <identity> --landlock-read-only <absolute-path>... --landlock-writable <absolute-path>... [--env NAME=VALUE]... --program <absolute-path> -- [arguments...]".to_owned()
 }
 
 #[cfg(test)]
@@ -409,6 +440,8 @@ mod tests {
             "/run/supervisor/subject-a.sock",
             "--egress-broker-fd",
             "19",
+            "--egress-broker-session",
+            "00112233445566778899aabbccddeeff",
             "--landlock-read-only",
             "/",
             "--landlock-writable",
@@ -434,6 +467,10 @@ mod tests {
         );
         assert_eq!(config.arguments, [OsString::from("--fixed-argument")]);
         assert_eq!(config.egress_broker_fd, 19);
+        assert_eq!(
+            config.egress_broker_session,
+            "00112233445566778899aabbccddeeff"
+        );
         assert_eq!(
             config.environment,
             [(
@@ -466,5 +503,18 @@ mod tests {
         arguments.drain(index..=index + 1);
         let error = parse_config(arguments).expect_err("writable policy must be required");
         assert!(error.contains("writable Landlock path"));
+    }
+
+    #[test]
+    fn rejects_noncanonical_broker_session_identity() {
+        let mut arguments = arguments();
+        let index = arguments
+            .iter()
+            .position(|argument| argument == "--egress-broker-session")
+            .expect("test arguments contain Broker session")
+            + 1;
+        arguments[index] = OsString::from("00112233445566778899AABBCCDDEEFF");
+        let error = parse_config(arguments).expect_err("upper-case identity must be refused");
+        assert!(error.contains("non-zero lower hexadecimal identity"));
     }
 }

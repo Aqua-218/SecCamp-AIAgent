@@ -393,7 +393,7 @@ mod implementation {
                 IsolationStep::LimitedTmpfs => {
                     mount_tmpfs(step, &config.tmpfs.target, config.tmpfs.size_bytes)
                 }
-                IsolationStep::MaskProc => mask_mount(step, Path::new("/proc")),
+                IsolationStep::MaskProc => mount_procfs(step, Path::new("/proc")),
                 IsolationStep::MaskDevices => mask_mount(step, Path::new("/dev")),
                 IsolationStep::CloseInheritedFileDescriptors => {
                     let notifier_fd = self.startup_notifier_fd.ok_or_else(|| {
@@ -1204,6 +1204,20 @@ mod implementation {
             Some(Path::new("tmpfs")),
             libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
             Some(&data),
+        )
+    }
+
+    fn mount_procfs(step: IsolationStep, target: &Path) -> Result<(), BackendError> {
+        // A fresh PID namespace gives this procfs no host processes. Keeping its metadata
+        // read-only is still necessary for static Rust workloads, which use `/proc/self/exe`
+        // and `/proc/self/maps` while establishing their stack-overflow guard.
+        mount_call(
+            step,
+            Some(Path::new("proc")),
+            target,
+            Some(Path::new("proc")),
+            libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            None,
         )
     }
 

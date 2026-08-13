@@ -39,6 +39,8 @@ AgentはFUSE mountに対して通常の`open`、`read`、`write`、`create`、`m
 
 `O_TRUNC`は`O_WRONLY`または`O_RDWR`と組み合わせたときだけ受け付ける。`O_WRONLY | O_TRUNC`には`WriteData`と`Truncate`、`O_RDWR | O_TRUNC`には`ReadData`、`WriteData`、`Truncate`の全てが必要である。`O_RDONLY | O_TRUNC`は拒否する。FUSE `CREATE`内の`O_CREAT` / `O_EXCL`は受け付けるが、namespaceが「まだ存在しない」と確定してから`O_EXCL`で作るので、同requestの`O_TRUNC`は既存長を変更せず`Truncate`を追加要求しない。FUSE `RENAME`はempty flagまたは`RENAME_NOREPLACE`だけを受け付け、adapterはどちらの場合もno-replaceとして実行する。`O_APPEND`、`O_TMPFILE`、`MKNOD`は受け付けない。
 
+direct I/Oの`WRITE`に付く`FUSE_WRITE_KILL_SUIDGID`は、書き込みを拒否するflagではなく、callerが`CAP_FSETID`を持たないためsetuid / setgid bitを落とすよう求めるprotocol metadataである。adapterは書き込み後に同じbacking descriptorへ`fchmod`し、daemon自身のCapabilityに依存せずこの要求を実行する。`pwrite`後のmetadata取得または`fchmod`に失敗した場合、dataだけが既に書かれた可能性があるためcommit-unknownとしてrepositoryをquarantineする。一方、`FUSE_WRITE_CACHE`はrequest identityとfile handleを信頼できないため引き続き`EPERM`で拒否する。
+
 ## metadataはどこまで見せるのか
 
 Capabilityが`/src/private`を許可しているとき、rootと`/src`を完全に隠すと、Linuxは許可対象までpath walkできない。一方、同じ階層の`/docs`まで見せる必要はない。

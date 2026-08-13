@@ -795,6 +795,8 @@ mod implementation {
             config: &IsolationConfig,
         ) -> Result<(), BackendError> {
             let rootfs = &config.rootfs;
+            verify_read_only_filesystem(step, &rootfs.source)
+                .map_err(|error| with_context(error, "rootfs-source-readonly"))?;
             make_mounts_private(step).map_err(|error| with_context(error, "rootfs-private"))?;
             let workspace_source = pin_workspace_source(step, &config.workspace.source)
                 .map_err(|error| with_context(error, "rootfs-pin-workspace"))?;
@@ -831,32 +833,6 @@ mod implementation {
                     ));
                 }
                 return Err(error);
-            }
-            let result = mount_call(
-                step,
-                None,
-                &rootfs.mount_target,
-                None,
-                libc::MS_BIND
-                    | libc::MS_REMOUNT
-                    | libc::MS_RDONLY
-                    | libc::MS_NOSUID
-                    | libc::MS_NODEV,
-                None,
-            )
-            .map_err(|error| with_context(error, "rootfs-remount"));
-            if result.is_err() {
-                if let Err(cleanup_error) = unmount_path(step, &rootfs.mount_target) {
-                    return Err(BackendError::new(
-                        step,
-                        format!(
-                            "rootfs remount failed; failed to unmount partial rootfs staging mount: {}",
-                            cleanup_error.message
-                        ),
-                        cleanup_error.errno,
-                    ));
-                }
-                return result;
             }
             let result = (|| {
                 change_directory(step, &rootfs.mount_target)
@@ -2175,6 +2151,25 @@ mod implementation {
         } else {
             Ok(())
         }
+    }
+
+    fn verify_read_only_filesystem(step: IsolationStep, path: &Path) -> Result<(), BackendError> {
+        let path = c_path(step, path)?;
+        let mut details = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `details` is writable for the syscall output.
+        if unsafe { libc::statvfs(path.as_ptr(), details.as_mut_ptr()) } == -1 {
+            return Err(last_error(step, "inspect rootfs read-only mount flag"));
+        }
+        // SAFETY: statvfs initialized the complete structure on success.
+        let details = unsafe { details.assume_init() };
+        if details.f_flag & libc::ST_RDONLY == 0 {
+            return Err(BackendError::new(
+                step,
+                "rootfs source mount is writable",
+                None,
+            ));
+        }
+        Ok(())
     }
 
     fn pivot_root(

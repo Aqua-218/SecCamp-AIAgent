@@ -19,11 +19,47 @@ use crate::{
     state::AuthorizationEpoch,
 };
 
+/// Evidence recorded when recovery closes an attempt whose process stopped mid-effect.
+const RECOVERED_ATTEMPT_EVIDENCE: &[u8] =
+    b"authority-core recovery closed an attempt left started by an unclean shutdown";
+
 const OUTCOME_STARTED: u8 = 0;
 const OUTCOME_DENIED: u8 = 1;
 const OUTCOME_FAILED_BEFORE_COMMIT: u8 = 2;
 const OUTCOME_COMMITTED: u8 = 3;
 const OUTCOME_COMMIT_UNKNOWN: u8 = 4;
+
+/// What one journal recovery inherited and had to reconcile.
+///
+/// Prior attempts are never re-authorized. They stay in the journal as history belonging to an
+/// earlier capability-state instance, and the attempts that were still `Started` are closed as
+/// `CommitUnknown` so the journal holds no attempt whose fate is silently undetermined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRecovery {
+    state_instance: u64,
+    inherited_attempts: usize,
+    reconciled: Vec<AttemptId>,
+}
+
+impl AuditRecovery {
+    /// Returns the capability-state instance every new attempt is recorded under.
+    #[must_use]
+    pub const fn state_instance(&self) -> u64 {
+        self.state_instance
+    }
+
+    /// Returns how many attempts the journal already held.
+    #[must_use]
+    pub const fn inherited_attempts(&self) -> usize {
+        self.inherited_attempts
+    }
+
+    /// Returns the prior attempts closed as `CommitUnknown` by this recovery.
+    #[must_use]
+    pub fn reconciled(&self) -> &[AttemptId] {
+        &self.reconciled
+    }
+}
 
 /// Monotone identity for one authorization attempt in a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -310,6 +346,7 @@ struct AuditState {
 pub(crate) struct AuditTrail {
     state: Mutex<AuditState>,
     backend: Option<Arc<DurableAuditLog>>,
+    state_instance: u64,
 }
 
 impl AuditTrail {
@@ -320,6 +357,7 @@ impl AuditTrail {
                 attempts: Vec::new(),
             }),
             backend: None,
+            state_instance: 0,
         }
     }
 
@@ -342,7 +380,60 @@ impl AuditTrail {
                 attempts: Vec::new(),
             }),
             backend: Some(backend),
+            state_instance: 0,
         })
+    }
+
+    /// Attaches a fresh capability state to a journal that already holds attempts.
+    ///
+    /// Reconciliation happens before the trail is usable: every prior attempt still recorded as
+    /// `Started` is durably finished as `CommitUnknown`, because a process that stopped between
+    /// authorization and its terminal record cannot know whether the external effect landed. The
+    /// new instance then appends under its own state instance, so the prior instance's `CapId` and
+    /// `SubjectId` values can never be confused with this one's.
+    pub(crate) fn recover_with_backend(
+        backend: Arc<DurableAuditLog>,
+    ) -> Result<(Self, AuditRecovery), AuditError> {
+        let inherited = backend.attempts()?;
+        let state_instance = backend
+            .next_attempt_sequence()?
+            .ok_or(AuditError::AttemptIdExhausted)?;
+        let mut reconciled = Vec::new();
+        for attempt in &inherited {
+            if attempt.outcome() != AttemptOutcome::Started {
+                continue;
+            }
+            let evidence =
+                CommitUnknownEvidence::new(attempt.attempt_id(), RECOVERED_ATTEMPT_EVIDENCE)
+                    .map_err(AuditError::Durable)?;
+            backend
+                .finish_attempt(
+                    attempt.attempt_id(),
+                    AttemptOutcome::CommitUnknown,
+                    None,
+                    Some(&evidence),
+                )
+                .map_err(AuditError::Durable)?;
+            reconciled.push(attempt.attempt_id());
+        }
+        // Reconciliation consumes sequences, so the usable range is read after it completes.
+        let next_attempt_sequence = backend.next_attempt_sequence()?;
+        let trail = Self {
+            state: Mutex::new(AuditState {
+                next_attempt_sequence,
+                attempts: Vec::new(),
+            }),
+            backend: Some(backend),
+            state_instance,
+        };
+        Ok((
+            trail,
+            AuditRecovery {
+                state_instance,
+                inherited_attempts: inherited.len(),
+                reconciled,
+            },
+        ))
     }
 
     #[cfg(test)]
@@ -377,6 +468,7 @@ impl AuditTrail {
         state.next_attempt_sequence = sequence.checked_add(1);
         if let Some(backend) = &self.backend
             && let Err(error) = backend.begin_attempt(
+                self.state_instance,
                 AttemptId::from_u64(sequence),
                 &caller,
                 &capability_id,
@@ -544,6 +636,7 @@ mod tests {
 
     fn begin_durable(log: &DurableAuditLog, attempt: super::AttemptId) {
         log.begin_attempt(
+            0,
             attempt,
             &SubjectId::new(format!("subject-{}", attempt.as_u64())),
             &CapId::new(format!("capability-{}", attempt.as_u64())),
@@ -595,6 +688,108 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(start(&trail, 0).id(), super::AttemptId::from_u64(0));
+    }
+
+    #[test]
+    fn recovery_closes_dangling_attempts_and_leaves_terminal_history_alone() {
+        let journal = TestJournal::new();
+        let backend =
+            Arc::new(DurableAuditLog::create(&journal.path).expect("test WAL must be creatable"));
+
+        let committed = super::AttemptId::from_u64(0);
+        begin_durable(&backend, committed);
+        let receipt = CommitReceipt::kernel_success(committed);
+        backend
+            .finish_attempt(committed, AttemptOutcome::Committed, Some(&receipt), None)
+            .expect("committed outcome must be durable");
+        let dangling = super::AttemptId::from_u64(1);
+        begin_durable(&backend, dangling);
+        let second_dangling = super::AttemptId::from_u64(2);
+        begin_durable(&backend, second_dangling);
+        drop(backend);
+
+        let reopened = Arc::new(
+            DurableAuditLog::open(&journal.path).expect("a crashed WAL must reopen for recovery"),
+        );
+        let (trail, recovery) = AuditTrail::recover_with_backend(reopened)
+            .expect("prior attempts must not block a fresh capability state");
+
+        assert_eq!(recovery.inherited_attempts(), 3);
+        assert_eq!(recovery.reconciled(), &[dangling, second_dangling]);
+        assert_eq!(recovery.state_instance(), 3);
+
+        let durable = trail
+            .backend
+            .as_ref()
+            .expect("recovered trail keeps its backend")
+            .attempts()
+            .expect("recovered WAL must remain readable");
+        assert_eq!(durable[0].outcome(), AttemptOutcome::Committed);
+        for closed in &durable[1..] {
+            assert_eq!(closed.outcome(), AttemptOutcome::CommitUnknown);
+            assert_eq!(
+                closed
+                    .commit_unknown_evidence()
+                    .expect("a reconciled attempt records why its fate is unknown")
+                    .token(),
+                super::RECOVERED_ATTEMPT_EVIDENCE
+            );
+        }
+        assert!(
+            trail
+                .attempts()
+                .expect("recovered trail must expose no operational attempt")
+                .is_empty(),
+            "prior attempts are history, never live state"
+        );
+    }
+
+    #[test]
+    fn recovered_attempts_are_recorded_under_a_fresh_state_instance() {
+        let journal = TestJournal::new();
+        let backend =
+            Arc::new(DurableAuditLog::create(&journal.path).expect("test WAL must be creatable"));
+        let first = super::AttemptId::from_u64(0);
+        begin_durable(&backend, first);
+        backend
+            .finish_attempt(first, AttemptOutcome::Denied, None, None)
+            .expect("denied outcome must be durable");
+        let first_payload = backend
+            .attempts()
+            .expect("WAL must be readable")
+            .first()
+            .expect("one attempt exists")
+            .payload()
+            .to_vec();
+        drop(backend);
+
+        let reopened =
+            Arc::new(DurableAuditLog::open(&journal.path).expect("reopen for recovery must work"));
+        let (trail, recovery) =
+            AuditTrail::recover_with_backend(reopened).expect("recovery must succeed");
+        let guard = start(&trail, 0);
+        let next = guard.id();
+        guard.deny().expect("denial must be recorded");
+
+        assert_eq!(next, super::AttemptId::from_u64(1));
+        let attempts = trail
+            .backend
+            .as_ref()
+            .expect("recovered trail keeps its backend")
+            .attempts()
+            .expect("WAL must be readable");
+        let new_payload = attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id() == next)
+            .expect("the new attempt is durable")
+            .payload();
+        assert_eq!(first_payload[1..9], 0_u64.to_le_bytes());
+        assert_eq!(
+            new_payload[1..9],
+            recovery.state_instance().to_le_bytes(),
+            "a fresh capability state must not write under the crashed instance"
+        );
+        assert_ne!(first_payload[1..9], new_payload[1..9]);
     }
 
     #[test]

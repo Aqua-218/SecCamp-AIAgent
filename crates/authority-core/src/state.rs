@@ -224,6 +224,15 @@ impl AuthorizationEpoch {
         self.0
     }
 
+    /// Reconstructs an epoch recorded in a durable audit record.
+    ///
+    /// Deliberately crate-private: an epoch is meaningful only as something the kernel advanced,
+    /// so it is rebuilt when reading back what the kernel already wrote, never supplied by a
+    /// caller as an authorization input.
+    pub(crate) const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
     const fn checked_next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(value) => Some(Self(value)),

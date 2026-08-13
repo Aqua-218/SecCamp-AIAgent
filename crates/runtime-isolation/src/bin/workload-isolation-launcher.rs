@@ -88,8 +88,9 @@ fn run() -> Result<(), String> {
                 }
                 ChildStartupStatus::Failed(failure) => {
                     return Err(format!(
-                        "isolated workload setup failed at {:?} (errno {:?}, rollback failures {}, termination required {})",
+                        "isolated workload setup failed at {:?}: {} (errno {:?}, rollback failures {}, termination required {})",
                         failure.step(),
+                        failure.detail(),
                         failure.errno(),
                         failure.rollback_failure_count(),
                         failure.termination_required()

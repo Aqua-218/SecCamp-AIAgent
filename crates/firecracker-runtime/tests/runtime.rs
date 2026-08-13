@@ -160,6 +160,50 @@ impl FileSystem for MockFileSystem {
             .ok_or_else(|| RuntimeError::Io(format!("missing mock artifact {}", path.display())))
     }
 
+    fn bind_block_device(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        let expected_source = Path::new("/dev/mapper/rootfs-verity");
+        let expected_jailed_device = Path::new(JAIL_ROOT).join("dev/rootfs");
+        if source != expected_source || jailed_device != expected_jailed_device {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "unexpected mock block-device bind: {} -> {}",
+                source.display(),
+                jailed_device.display()
+            )));
+        }
+        self.events.borrow_mut().push(format!(
+            "filesystem:bind-device:{}:{}",
+            source.display(),
+            jailed_device.display()
+        ));
+        Ok(())
+    }
+
+    fn unbind_block_device(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        let expected_source = Path::new("/dev/mapper/rootfs-verity");
+        let expected_jailed_device = Path::new(JAIL_ROOT).join("dev/rootfs");
+        if source != expected_source || jailed_device != expected_jailed_device {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "unexpected mock block-device unbind: {} -> {}",
+                source.display(),
+                jailed_device.display()
+            )));
+        }
+        self.events.borrow_mut().push(format!(
+            "filesystem:unbind-device:{}:{}",
+            source.display(),
+            jailed_device.display()
+        ));
+        Ok(())
+    }
+
     fn verify_block_device_binding(
         &mut self,
         source: &Path,
@@ -487,13 +531,14 @@ fn launch_valid_profile_configures_verity_vsock_and_jailer_without_network() {
     assert!(events[1].starts_with("filesystem:image:"));
     assert!(events[2].starts_with("command:run:/artifacts/mke2fs -F -q -t ext4 -d"));
     assert!(events[3].starts_with("command:run:veritysetup open --readonly"));
-    assert!(events[4].starts_with("filesystem:verify-device:"));
-    assert!(events[5].contains("--new-pid-ns"));
-    assert!(events[5].contains("--uid 1000 --gid 1000 --cgroup-version 2"));
-    assert!(events[5].contains("--cgroup memory.max=268435456"));
-    assert!(events[5].contains("--cgroup cpu.max=100000 100000"));
-    assert!(events[5].contains("--chroot-base-dir /srv/jailer"));
-    assert!(!events[5].contains("--new-user-ns"));
+    assert!(events[4].starts_with("filesystem:bind-device:"));
+    assert!(events[5].starts_with("filesystem:verify-device:"));
+    assert!(events[6].contains("--new-pid-ns"));
+    assert!(events[6].contains("--uid 1000 --gid 1000 --cgroup-version 2"));
+    assert!(events[6].contains("--cgroup memory.max=268435456"));
+    assert!(events[6].contains("--cgroup cpu.max=100000 100000"));
+    assert!(events[6].contains("--chroot-base-dir /srv/jailer"));
+    assert!(!events[6].contains("--new-user-ns"));
     assert!(events.iter().any(|event| event.starts_with("api:/vsock:")));
     assert!(
         events
@@ -542,18 +587,20 @@ fn api_error_rolls_back_process_verity_and_workspace_in_reverse_order() {
         .expect_err("non-success API response must reject launch");
     assert!(matches!(error, RuntimeError::ApiStatus { status: 503, .. }));
     let events = events.borrow();
-    assert_eq!(events.len(), 11);
+    assert_eq!(events.len(), 13);
     assert!(events[0].starts_with("filesystem:clone:"));
     assert!(events[1].starts_with("filesystem:image:"));
     assert!(events[2].starts_with("command:run:/artifacts/mke2fs"));
     assert!(events[3].starts_with("command:run:veritysetup open"));
-    assert!(events[4].starts_with("filesystem:verify-device:"));
-    assert!(events[5].starts_with("command:start:"));
-    assert!(events[6].starts_with("api:/machine-config:"));
-    assert!(events[7].starts_with("api:/boot-source:"));
-    assert!(events[8].starts_with("command:stop:"));
-    assert!(events[9].starts_with("command:run:veritysetup close"));
-    assert!(events[10].starts_with("filesystem:remove:"));
+    assert!(events[4].starts_with("filesystem:bind-device:"));
+    assert!(events[5].starts_with("filesystem:verify-device:"));
+    assert!(events[6].starts_with("command:start:"));
+    assert!(events[7].starts_with("api:/machine-config:"));
+    assert!(events[8].starts_with("api:/boot-source:"));
+    assert!(events[9].starts_with("command:stop:"));
+    assert!(events[10].starts_with("filesystem:unbind-device:"));
+    assert!(events[11].starts_with("command:run:veritysetup close"));
+    assert!(events[12].starts_with("filesystem:remove:"));
 }
 
 #[test]

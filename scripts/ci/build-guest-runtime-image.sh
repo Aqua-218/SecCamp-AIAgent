@@ -292,6 +292,7 @@ for executable in "${guest_control_init}" "${guest_supervisor_init}" "${isolatio
 done
 install -d -m 0755 "${staging}/root/run/guest-supervisor"
 install -d -m 0755 "${staging}/root/workspace"
+install -d -m 0755 "${staging}/root/sys/fs/cgroup"
 install -d -m 1777 "${staging}/root/tmp"
 
 mksquashfs "${staging}/root" "${staging}/rootfs" -noappend -all-root -comp xz >/dev/null

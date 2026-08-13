@@ -13,6 +13,8 @@ pub enum Syscall {
     Write,
     /// Close a file descriptor.
     Close,
+    /// Wait for activity on an already-open file descriptor.
+    Poll,
     /// Read file metadata.
     Fstat,
     /// Read file metadata relative to a directory descriptor.
@@ -73,6 +75,12 @@ pub enum Syscall {
     ClockGettime,
     /// Read the current process identifier.
     Getpid,
+    /// Read the current thread identifier.
+    Gettid,
+    /// Read the process CPU-affinity mask.
+    SchedGetaffinity,
+    /// Configure the current thread's alternate signal stack.
+    Sigaltstack,
     /// Fill a buffer with kernel random bytes.
     Getrandom,
     /// Set the robust futex list.
@@ -347,6 +355,7 @@ impl Syscall {
             Self::Read => 0,
             Self::Write => 1,
             Self::Close => 3,
+            Self::Poll => 7,
             Self::Fstat => 5,
             Self::Newfstatat => 262,
             Self::Mmap => 9,
@@ -377,6 +386,9 @@ impl Syscall {
             Self::SchedYield => 24,
             Self::ClockGettime => 228,
             Self::Getpid => 39,
+            Self::Gettid => 186,
+            Self::SchedGetaffinity => 204,
+            Self::Sigaltstack => 131,
             Self::Getrandom => 318,
             Self::SetRobustList => 273,
             Self::SetTidAddress => 218,
@@ -411,6 +423,7 @@ impl FromStr for Syscall {
             "read" => Self::Read,
             "write" => Self::Write,
             "close" => Self::Close,
+            "poll" => Self::Poll,
             "fstat" => Self::Fstat,
             "newfstatat" => Self::Newfstatat,
             "mmap" => Self::Mmap,
@@ -441,6 +454,9 @@ impl FromStr for Syscall {
             "sched_yield" => Self::SchedYield,
             "clock_gettime" => Self::ClockGettime,
             "getpid" => Self::Getpid,
+            "gettid" => Self::Gettid,
+            "sched_getaffinity" => Self::SchedGetaffinity,
+            "sigaltstack" => Self::Sigaltstack,
             "getrandom" => Self::Getrandom,
             "set_robust_list" => Self::SetRobustList,
             "set_tid_address" => Self::SetTidAddress,
@@ -584,6 +600,7 @@ impl SeccompPolicy {
                 Syscall::Read,
                 Syscall::Write,
                 Syscall::Close,
+                Syscall::Poll,
                 Syscall::Fstat,
                 Syscall::Newfstatat,
                 Syscall::Mmap,
@@ -614,6 +631,9 @@ impl SeccompPolicy {
                 Syscall::SchedYield,
                 Syscall::ClockGettime,
                 Syscall::Getpid,
+                Syscall::Gettid,
+                Syscall::SchedGetaffinity,
+                Syscall::Sigaltstack,
                 Syscall::Getrandom,
                 Syscall::SetRobustList,
                 Syscall::SetTidAddress,

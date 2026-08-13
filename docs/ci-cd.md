@@ -65,6 +65,15 @@ scripts/ci/run.sh lean
 scripts/ci/run.sh differential
 ```
 
+実 VM 検証だけは、hosted pipeline ではなく `/dev/kvm` を持つ host で行う。次の 2 本が必要な artifact を version-scoped の不変 directory へ置き、`RuntimeConfig` が pin する SHA-256 と dm-verity root hash を印字する。
+
+```bash
+scripts/ci/install-firecracker.sh      # firecracker + jailer
+scripts/ci/install-guest-artifacts.sh  # guest kernel + read-only rootfs + verity hash device
+```
+
+Firecracker は上流が公開する SHA-256 と照合する。guest artifact の bucket は署名を公開していないため、script に書かれた digest は「この repository が観測して受け入れた bytes」であり、上流 build の信頼性を示すものではない。rootfs の hash device は download せず、その rootfs の bytes からその場で `veritysetup format` する。
+
 Semgrep and Gitleaks run from digest-pinned containers in both hosted pipelines. Their output, as well as JUnit, coverage, audit, and policy reports, is retained as CI artifacts.
 
 ## GitHub administration

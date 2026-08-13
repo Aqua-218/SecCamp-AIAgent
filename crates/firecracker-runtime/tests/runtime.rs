@@ -9,15 +9,16 @@ use firecracker_runtime::{
     ApiClient, ApiRequest, ApiResponse, CgroupConfig, CgroupVersion, CommandOutput, CommandRunner,
     CommandSpec, DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, IdentityBundle,
     IdentityId, IdentitySource, JailerConfig, MAX_COMMAND_OUTPUT_BYTES, MAX_HTTP_BODY_BYTES,
-    MAX_WORKSPACE_BYTES, MAX_WORKSPACE_DEPTH, NamespaceConfig, PinnedArtifact, ProcessHandle,
-    ProcessOwnership, RealCommandRunner, RealFileSystem, Runtime, RuntimeConfig, RuntimeError,
-    RuntimeState, SeccompConfig, Snapshot, VsockConfig, WorkspaceConfig, sha256,
+    MAX_WORKSPACE_BYTES, MAX_WORKSPACE_DEPTH, MIN_WORKSPACE_IMAGE_BYTES, NamespaceConfig,
+    PinnedArtifact, ProcessHandle, ProcessOwnership, RealCommandRunner, RealFileSystem, Runtime,
+    RuntimeConfig, RuntimeError, RuntimeState, SeccompConfig, Snapshot, VsockConfig,
+    WorkspaceConfig, WorkspaceImageConfig, sha256,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{MetadataExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -195,6 +196,20 @@ impl FileSystem for MockFileSystem {
         Ok(())
     }
 
+    fn create_workspace_image(
+        &mut self,
+        workspace: &Path,
+        image: &Path,
+        size_bytes: u64,
+    ) -> Result<(), RuntimeError> {
+        self.events.borrow_mut().push(format!(
+            "filesystem:image:{}:{}:{size_bytes}",
+            workspace.display(),
+            image.display()
+        ));
+        Ok(())
+    }
+
     fn remove_workspace(&mut self, path: &Path) -> Result<(), RuntimeError> {
         self.events
             .borrow_mut()
@@ -313,6 +328,10 @@ fn config() -> RuntimeConfig {
             source: PathBuf::from("/workspace/source"),
             clone_root: jail_root.join("workspace"),
             clone_id: "clone-a".to_owned(),
+            image: WorkspaceImageConfig {
+                formatter: artifact("/artifacts/mke2fs", "mke2fs"),
+                size_bytes: 64 * 1024 * 1024,
+            },
         },
         jailer: artifact("/artifacts/jailer", "jailer"),
         jailer_config: JailerConfig {
@@ -378,6 +397,7 @@ fn filesystem_for(config: &RuntimeConfig, events: Events) -> MockFileSystem {
         (&config.kernel.path, b"kernel".as_slice()),
         (&config.rootfs.path, b"rootfs".as_slice()),
         (&config.verity_hash.path, b"verity-hash".as_slice()),
+        (&config.workspace.image.formatter.path, b"mke2fs".as_slice()),
         (&config.jailer.path, b"jailer".as_slice()),
         (&config.isolation.seccomp.filter.path, b"seccomp".as_slice()),
         (&PathBuf::from(SNAPSHOT_STATE_PATH), SNAPSHOT_STATE_BYTES),
@@ -464,14 +484,16 @@ fn launch_valid_profile_configures_verity_vsock_and_jailer_without_network() {
     assert_eq!(instance.state(), RuntimeState::WorkloadStopped);
     let events = events.borrow();
     assert!(events[0].starts_with("filesystem:clone:"));
-    assert!(events[1].starts_with("command:run:veritysetup open --readonly"));
-    assert!(events[2].starts_with("filesystem:verify-device:"));
-    assert!(events[3].contains("--new-pid-ns"));
-    assert!(events[3].contains("--uid 1000 --gid 1000 --cgroup-version 2"));
-    assert!(events[3].contains("--cgroup memory.max=268435456"));
-    assert!(events[3].contains("--cgroup cpu.max=100000 100000"));
-    assert!(events[3].contains("--chroot-base-dir /srv/jailer"));
-    assert!(!events[3].contains("--new-user-ns"));
+    assert!(events[1].starts_with("filesystem:image:"));
+    assert!(events[2].starts_with("command:run:/artifacts/mke2fs -F -q -t ext4 -d"));
+    assert!(events[3].starts_with("command:run:veritysetup open --readonly"));
+    assert!(events[4].starts_with("filesystem:verify-device:"));
+    assert!(events[5].contains("--new-pid-ns"));
+    assert!(events[5].contains("--uid 1000 --gid 1000 --cgroup-version 2"));
+    assert!(events[5].contains("--cgroup memory.max=268435456"));
+    assert!(events[5].contains("--cgroup cpu.max=100000 100000"));
+    assert!(events[5].contains("--chroot-base-dir /srv/jailer"));
+    assert!(!events[5].contains("--new-user-ns"));
     assert!(events.iter().any(|event| event.starts_with("api:/vsock:")));
     assert!(
         events
@@ -520,16 +542,18 @@ fn api_error_rolls_back_process_verity_and_workspace_in_reverse_order() {
         .expect_err("non-success API response must reject launch");
     assert!(matches!(error, RuntimeError::ApiStatus { status: 503, .. }));
     let events = events.borrow();
-    assert_eq!(events.len(), 9);
+    assert_eq!(events.len(), 11);
     assert!(events[0].starts_with("filesystem:clone:"));
-    assert!(events[1].starts_with("command:run:veritysetup open"));
-    assert!(events[2].starts_with("filesystem:verify-device:"));
-    assert!(events[3].starts_with("command:start:"));
-    assert!(events[4].starts_with("api:/machine-config:"));
-    assert!(events[5].starts_with("api:/boot-source:"));
-    assert!(events[6].starts_with("command:stop:"));
-    assert!(events[7].starts_with("command:run:veritysetup close"));
-    assert!(events[8].starts_with("filesystem:remove:"));
+    assert!(events[1].starts_with("filesystem:image:"));
+    assert!(events[2].starts_with("command:run:/artifacts/mke2fs"));
+    assert!(events[3].starts_with("command:run:veritysetup open"));
+    assert!(events[4].starts_with("filesystem:verify-device:"));
+    assert!(events[5].starts_with("command:start:"));
+    assert!(events[6].starts_with("api:/machine-config:"));
+    assert!(events[7].starts_with("api:/boot-source:"));
+    assert!(events[8].starts_with("command:stop:"));
+    assert!(events[9].starts_with("command:run:veritysetup close"));
+    assert!(events[10].starts_with("filesystem:remove:"));
 }
 
 #[test]
@@ -585,7 +609,7 @@ fn assert_shutdown_retry(stop_failures: &[bool], run_failures: &[bool], remove_f
 fn shutdown_retries_each_pending_cleanup_without_repeating_successes() {
     // Every cleanup stage can fail independently; dependent stages wait for its retry.
     assert_shutdown_retry(&[true, false], &[], &[]);
-    assert_shutdown_retry(&[false], &[false, true], &[]);
+    assert_shutdown_retry(&[false], &[false, false, true], &[]);
     assert_shutdown_retry(&[false], &[false], &[true, false]);
 }
 
@@ -1010,6 +1034,36 @@ fn real_filesystem_publishes_and_removes_only_owned_complete_clones() {
         .expect("restored owned clone must be removable");
     assert!(!destination.exists());
 
+    fs::remove_dir_all(root).expect("test workspace must be removable");
+}
+
+#[test]
+fn real_filesystem_owns_and_removes_the_workspace_block_image_with_its_clone() {
+    let root = temporary_workspace("block-image");
+    let source = root.join("source");
+    let clone = root.join("clone-a");
+    let image = root.join("clone-a.ext4");
+    fs::create_dir(&source).expect("source directory must be creatable");
+    fs::write(source.join("workspace.txt"), b"workspace").expect("source file must be writable");
+
+    let mut filesystem = RealFileSystem::new();
+    filesystem
+        .clone_workspace(&source, &clone)
+        .expect("workspace clone must publish");
+    filesystem
+        .create_workspace_image(&clone, &image, MIN_WORKSPACE_IMAGE_BYTES)
+        .expect("owned clone must receive an exact-size block image");
+
+    let metadata = fs::metadata(&image).expect("workspace image must exist");
+    assert!(metadata.is_file());
+    assert_eq!(metadata.len(), MIN_WORKSPACE_IMAGE_BYTES);
+    assert_eq!(metadata.mode() & 0o077, 0);
+
+    filesystem
+        .remove_workspace(&clone)
+        .expect("owned clone and image must be removable together");
+    assert!(!clone.exists());
+    assert!(!image.exists());
     fs::remove_dir_all(root).expect("test workspace must be removable");
 }
 

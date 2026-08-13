@@ -872,8 +872,8 @@ mod implementation {
                     )?;
                 unmount_path(step, &old_root_after_pivot)
                     .map_err(|error| with_context(error, "rootfs-detach-old"))?;
-                fs::remove_dir(&old_root_after_pivot)
-                    .map_err(|error| io_error(step, "rootfs-remove-old", &error))?;
+                // The immutable rootfs contains this empty mountpoint. Once the old root is
+                // detached it exposes no host state, and SquashFS cannot remove the directory.
                 Ok::<(), BackendError>(())
             })();
             if let Err(error) = &result

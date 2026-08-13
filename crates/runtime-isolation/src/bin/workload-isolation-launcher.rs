@@ -10,7 +10,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     io::{Read, Write},
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, OwnedFd},
     os::unix::net::UnixStream,
     os::unix::{ffi::OsStringExt, process::CommandExt},
     path::{Component, Path, PathBuf},
@@ -19,8 +19,8 @@ use std::{
 
 use runtime_isolation::{
     BindMountConfig, CgroupConfig, ChildExit, ChildStartupStatus, ControlChannelConfig,
-    IdentityMap, IsolationConfig, LandlockConfig, LinuxBackend, RootfsConfig, RuntimeIsolation,
-    SeccompPolicy, SpawnOutcome, TmpfsConfig,
+    EgressChannelConfig, IdentityMap, IsolationConfig, LandlockConfig, LinuxBackend, RootfsConfig,
+    RuntimeIsolation, SeccompPolicy, SpawnOutcome, TmpfsConfig,
 };
 use rustix::{
     io::{FdFlags, fcntl_getfd, fcntl_setfd},
@@ -29,12 +29,14 @@ use rustix::{
 
 const LANDLOCK_ABI: u32 = 3;
 const ISOLATION_READY: &[u8; 8] = b"isolated";
+const EGRESS_BROKER_FD_ENV: &str = "EGRESS_BROKER_FD";
 
 #[derive(Debug)]
 struct LauncherConfig {
     isolation: IsolationConfig,
     start_gate: PathBuf,
     control_socket: PathBuf,
+    egress_broker_fd: i32,
     workload_directory: PathBuf,
     program: PathBuf,
     arguments: Vec<OsString>,
@@ -56,13 +58,21 @@ fn run() -> Result<(), String> {
     let mut start_gate = wait_for_start_gate(&config.start_gate)?;
     let control_channel = connect_control_channel(&config.control_socket)?;
     let control_channel_fd = control_channel.as_raw_fd();
-    let isolation = config.isolation.clone().with_control_channel(
-        ControlChannelConfig::new(control_channel_fd)
-            .map_err(|error| format!("configuring supervisor control channel: {error}"))?,
-    );
+    preserve_for_workload(&control_channel, "supervisor control channel")?;
+    let isolation = config
+        .isolation
+        .clone()
+        .with_control_channel(
+            ControlChannelConfig::new(control_channel_fd)
+                .map_err(|error| format!("configuring supervisor control channel: {error}"))?,
+        )
+        .with_egress_channel(
+            EgressChannelConfig::new(config.egress_broker_fd)
+                .map_err(|error| format!("configuring egress Broker channel: {error}"))?,
+        );
     let mut backend = LinuxBackend::new();
     match RuntimeIsolation::spawn_isolated(&mut backend, &isolation, |_| {
-        execute_workload(&config, control_channel_fd)
+        execute_workload(&config, control_channel_fd, config.egress_broker_fd)
     }) {
         Ok(SpawnOutcome::Parent(mut child)) => {
             match child
@@ -122,11 +132,14 @@ fn connect_control_channel(path: &Path) -> Result<OwnedFd, String> {
             path.display()
         )
     })?;
-    let descriptor_flags = fcntl_getfd(&descriptor)
-        .map_err(|error| format!("reading supervisor control descriptor flags: {error}"))?;
-    fcntl_setfd(&descriptor, descriptor_flags & !FdFlags::CLOEXEC)
-        .map_err(|error| format!("preserving supervisor control descriptor: {error}"))?;
     Ok(descriptor)
+}
+
+fn preserve_for_workload(descriptor: impl AsFd, label: &str) -> Result<(), String> {
+    let descriptor_flags = fcntl_getfd(&descriptor)
+        .map_err(|error| format!("reading {label} descriptor flags: {error}"))?;
+    fcntl_setfd(&descriptor, descriptor_flags & !FdFlags::CLOEXEC)
+        .map_err(|error| format!("preserving {label} descriptor: {error}"))
 }
 
 fn wait_for_start_gate(path: &Path) -> Result<UnixStream, String> {
@@ -148,12 +161,17 @@ fn wait_for_start_gate(path: &Path) -> Result<UnixStream, String> {
     }
 }
 
-fn execute_workload(config: &LauncherConfig, control_channel_fd: i32) -> Result<(), String> {
+fn execute_workload(
+    config: &LauncherConfig,
+    control_channel_fd: i32,
+    egress_broker_fd: i32,
+) -> Result<(), String> {
     let error = Command::new(&config.program)
         .args(&config.arguments)
         .env_clear()
         .envs(config.environment.iter().cloned())
         .env("SUPERVISOR_CONTROL_FD", control_channel_fd.to_string())
+        .env(EGRESS_BROKER_FD_ENV, egress_broker_fd.to_string())
         .current_dir(&config.workload_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -183,6 +201,7 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
     let host_gid = required_u32(&mut arguments, "--host-gid")?;
     let start_gate = required_path(&mut arguments, "--start-gate")?;
     let control_socket = required_path(&mut arguments, "--control-socket")?;
+    let egress_broker_fd = required_descriptor(&mut arguments, "--egress-broker-fd")?;
 
     let mut read_only_paths = Vec::new();
     let mut writable_paths = Vec::new();
@@ -234,11 +253,29 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
         isolation,
         start_gate,
         control_socket,
+        egress_broker_fd,
         workload_directory: workspace_target,
         program,
         arguments: workload_arguments,
         environment,
     })
+}
+
+fn required_descriptor<I>(arguments: &mut std::iter::Peekable<I>, flag: &str) -> Result<i32, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    expect_flag(arguments, flag)?;
+    let value = arguments
+        .next()
+        .ok_or_else(usage)?
+        .into_string()
+        .map_err(|_| usage())?;
+    let descriptor = value.parse::<i32>().map_err(|_| usage())?;
+    if descriptor < 3 {
+        return Err(format!("{flag} must be a nonstandard file descriptor"));
+    }
+    Ok(descriptor)
 }
 
 fn required_path<I>(arguments: &mut std::iter::Peekable<I>, flag: &str) -> Result<PathBuf, String>
@@ -331,7 +368,7 @@ fn is_absolute_lexical_path(path: &Path) -> bool {
 }
 
 fn usage() -> String {
-    "usage: workload-isolation-launcher --rootfs-source <absolute-path> --rootfs-mount-target <absolute-path> --old-root <absolute-path> --workspace-source <absolute-path> --workspace-target <absolute-path> --tmpfs-target <absolute-path> --tmpfs-size-bytes <u64> --cgroup-root <absolute-path> --cgroup-name <safe-name> --memory-max-bytes <u64> --pids-max <u64> --host-uid <u32> --host-gid <u32> --start-gate <absolute-path> --control-socket <absolute-path> --landlock-read-only <absolute-path>... --landlock-writable <absolute-path>... [--env NAME=VALUE]... --program <absolute-path> -- [arguments...]".to_owned()
+    "usage: workload-isolation-launcher --rootfs-source <absolute-path> --rootfs-mount-target <absolute-path> --old-root <absolute-path> --workspace-source <absolute-path> --workspace-target <absolute-path> --tmpfs-target <absolute-path> --tmpfs-size-bytes <u64> --cgroup-root <absolute-path> --cgroup-name <safe-name> --memory-max-bytes <u64> --pids-max <u64> --host-uid <u32> --host-gid <u32> --start-gate <absolute-path> --control-socket <absolute-path> --egress-broker-fd <fd> --landlock-read-only <absolute-path>... --landlock-writable <absolute-path>... [--env NAME=VALUE]... --program <absolute-path> -- [arguments...]".to_owned()
 }
 
 #[cfg(test)]
@@ -370,6 +407,8 @@ mod tests {
             "/run/supervisor/start-gate.sock",
             "--control-socket",
             "/run/supervisor/subject-a.sock",
+            "--egress-broker-fd",
+            "19",
             "--landlock-read-only",
             "/",
             "--landlock-writable",
@@ -394,6 +433,7 @@ mod tests {
             PathBuf::from("/usr/local/libexec/guest-workload")
         );
         assert_eq!(config.arguments, [OsString::from("--fixed-argument")]);
+        assert_eq!(config.egress_broker_fd, 19);
         assert_eq!(
             config.environment,
             [(

@@ -2177,12 +2177,22 @@ mod implementation {
         step: IsolationStep,
         path: &Path,
     ) -> Result<NamespaceIdentity, BackendError> {
-        let metadata = fs::metadata(path)
-            .map_err(|error| io_error(step, "observe PID namespace identity", &error))?;
-        Ok(NamespaceIdentity::from_kernel(
-            metadata.dev(),
-            metadata.ino(),
-        ))
+        let target = fs::read_link(path)
+            .map_err(|error| io_error(step, "read PID namespace identity", &error))?;
+        let target = target
+            .to_str()
+            .ok_or_else(|| BackendError::new(step, "decode PID namespace identity", None))?;
+        let inode = target
+            .rsplit_once('[')
+            .and_then(|(_, inode)| inode.strip_suffix(']'))
+            .ok_or_else(|| BackendError::new(step, "parse PID namespace identity", None))?;
+        let inode = inode
+            .parse::<u64>()
+            .map_err(|_| BackendError::new(step, "parse PID namespace identity", None))?;
+        // A namespace magic-link renders the kernel namespace inode directly.  Do not follow it:
+        // after `CLONE_NEWUSER`, following the pending PID namespace can be rejected because its
+        // owner is the parent user namespace even though its stable identity remains observable.
+        Ok(NamespaceIdentity::from_kernel(0, inode))
     }
 
     fn errno() -> i32 {

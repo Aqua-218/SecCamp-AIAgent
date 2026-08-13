@@ -4,14 +4,14 @@
 #
 # No executable, repository identifier, or runtime path is supplied through the host-to-guest
 # control channel. The only dynamic host input remains the verified identity bundle accepted by
-# guest-control-init; the image itself fixes guest-supervisor-init, the isolation launcher, and
-# the workload executable.
+# guest-control-init; the image itself fixes guest-supervisor-init, the isolation launcher,
+# workload executable, and the guest CapFS authority policy.
 
 set -euo pipefail
 
 usage() {
   printf '%s\n' \
-    'usage: build-guest-runtime-image.sh --base-rootfs PATH --guest-control-init PATH --guest-supervisor-init PATH --isolation-launcher PATH --agent-workload PATH --repository ID --port PORT --output-rootfs PATH --output-hash PATH' >&2
+    'usage: build-guest-runtime-image.sh --base-rootfs PATH --guest-control-init PATH --guest-supervisor-init PATH --isolation-launcher PATH --agent-workload PATH --repository ID --file-effects CANONICAL-LIST --path-prefix /|PATH --port PORT --output-rootfs PATH --output-hash PATH' >&2
 }
 
 fail() {
@@ -97,12 +97,59 @@ require_private_output_directory() {
   (( (8#${mode} & 8#022) == 0 )) || fail 'output directory must not be group- or world-writable'
 }
 
+validate_file_effects() {
+  local value="$1"
+  local name=''
+  local previous=-1
+  local current=-1
+  local -a names=()
+
+  [[ "${value}" != ,* && "${value}" != *, && "${value}" != *',,'* ]] || fail 'file effects cannot contain empty entries'
+  IFS=',' read -r -a names <<< "${value}"
+  ((${#names[@]} > 0)) || fail 'file effects cannot be empty'
+  for name in "${names[@]}"; do
+    case "${name}" in
+      read-data) current=0 ;;
+      list-directory) current=1 ;;
+      write-data) current=2 ;;
+      truncate) current=3 ;;
+      create-file) current=4 ;;
+      create-directory) current=5 ;;
+      remove-file) current=6 ;;
+      remove-directory) current=7 ;;
+      rename) current=8 ;;
+      set-metadata) current=9 ;;
+      read-link) current=10 ;;
+      create-symlink) current=11 ;;
+      create-hard-link) current=12 ;;
+      *) fail 'file effects must be canonical closed effect names' ;;
+    esac
+    ((current > previous)) || fail 'file effects must be strictly ordered without duplicates'
+    previous=${current}
+  done
+}
+
+validate_path_prefix() {
+  local value="$1"
+  local segment=''
+  local -a segments=()
+
+  [[ "${value}" == '/' ]] && return
+  [[ "${value}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] || fail 'path prefix must be / or canonical repository-relative segments'
+  IFS='/' read -r -a segments <<< "${value}"
+  for segment in "${segments[@]}"; do
+    [[ "${segment}" != '.' && "${segment}" != '..' ]] || fail 'path prefix cannot contain current or parent components'
+  done
+}
+
 base_rootfs=''
 guest_control_init=''
 guest_supervisor_init=''
 isolation_launcher=''
 agent_workload=''
 repository=''
+file_effects=''
+path_prefix=''
 port=''
 output_rootfs=''
 output_hash=''
@@ -139,6 +186,16 @@ while [[ "$#" -gt 0 ]]; do
       repository="$2"
       shift 2
       ;;
+    --file-effects)
+      [[ "$#" -ge 2 ]] || { usage; exit 2; }
+      file_effects="$2"
+      shift 2
+      ;;
+    --path-prefix)
+      [[ "$#" -ge 2 ]] || { usage; exit 2; }
+      path_prefix="$2"
+      shift 2
+      ;;
     --port)
       [[ "$#" -ge 2 ]] || { usage; exit 2; }
       port="$2"
@@ -165,11 +222,13 @@ done
   usage
   exit 2
 }
-[[ -n "${isolation_launcher}" && -n "${agent_workload}" && -n "${repository}" ]] || {
+[[ -n "${isolation_launcher}" && -n "${agent_workload}" && -n "${repository}" && -n "${file_effects}" && -n "${path_prefix}" ]] || {
   usage
   exit 2
 }
 [[ "${repository}" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || fail 'repository must be one safe non-empty identifier'
+validate_file_effects "${file_effects}"
+validate_path_prefix "${path_prefix}"
 [[ "${port}" =~ ^[0-9]+$ ]] || fail 'port must be decimal'
 ((port > 0 && port < 4294967295)) || fail 'port must be explicit, non-zero, and non-wildcard'
 
@@ -238,4 +297,4 @@ sha256sum "${output_rootfs}" | awk '{print $1}'
 printf 'hash SHA-256: '
 sha256sum "${output_hash}" | awk '{print $1}'
 grep -E '^Root hash:' "${output_verity}"
-printf 'boot args: console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init -- --port %s --workload /usr/local/libexec/guest-supervisor-init -- --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository %s\n' "${port}" "${repository}"
+printf 'boot args: console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init -- --port %s --workload /usr/local/libexec/guest-supervisor-init -- --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository %s --file-effects %s --path-prefix %s\n' "${port}" "${repository}" "${file_effects}" "${path_prefix}"

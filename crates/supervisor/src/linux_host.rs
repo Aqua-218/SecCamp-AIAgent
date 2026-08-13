@@ -45,8 +45,6 @@ const START_GATE_RELEASE: [u8; 1] = [1];
 
 /// Environment variable carrying the subject's `CapFS` mount point to its workload.
 pub const WORKLOAD_MOUNTPOINT_ENV: &str = "CAPFS_MOUNTPOINT";
-/// Environment variable carrying the subject's control socket path to its workload.
-pub const WORKLOAD_CONTROL_SOCKET_ENV: &str = "SUPERVISOR_CONTROL_SOCKET";
 /// Environment variable carrying the subject identity to its workload.
 pub const WORKLOAD_SUBJECT_ENV: &str = "SUPERVISOR_SUBJECT";
 
@@ -177,14 +175,6 @@ impl WorkloadIsolationConfig {
             format!(
                 "{WORKLOAD_MOUNTPOINT_ENV}={}",
                 self.workspace_target.display()
-            ),
-        );
-        append_argument(
-            &mut arguments,
-            "--env",
-            format!(
-                "{WORKLOAD_CONTROL_SOCKET_ENV}={}",
-                launch.control_path.display()
             ),
         );
         append_argument(&mut arguments, "--program", launch.workload_program);

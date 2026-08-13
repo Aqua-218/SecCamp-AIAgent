@@ -160,7 +160,14 @@ fn start_workload(
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn()?;
+        .spawn()
+        .map_err(|error| {
+            eprintln!(
+                "guest-control-init: starting image-configured workload {}: {error}",
+                config.workload.display()
+            );
+            error
+        })?;
     *workload = Some(child);
     Ok(())
 }

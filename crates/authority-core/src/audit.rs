@@ -15,7 +15,10 @@ use std::sync::{
 
 use crate::{
     capability::{CapId, CapabilityRequest, CapabilityRequestSet, SubjectId},
-    durable_audit::{CommitReceipt, CommitUnknownEvidence, DurableAuditError, DurableAuditLog},
+    durable_audit::{
+        CommitReceipt, CommitUnknownEvidence, DurableAttempt, DurableAttemptMetadata,
+        DurableAuditError, DurableAuditLog, ReconciledCommit,
+    },
     state::AuthorizationEpoch,
 };
 
@@ -59,6 +62,146 @@ impl AuditRecovery {
     pub fn reconciled(&self) -> &[AttemptId] {
         &self.reconciled
     }
+}
+
+/// Resolves whether an attempt whose commit was unknown actually landed.
+///
+/// Implemented by the adapter that owns the external boundary, because only it can ask the
+/// provider. The decoded metadata carries the typed request, so an implementation identifies the
+/// operation from the audit record itself rather than from separate bookkeeping that could drift.
+pub trait CommitReconciler {
+    /// Adapter-specific failure type.
+    type Error: Error + Send + Sync + 'static;
+
+    /// Returns the provider's verdict, or `None` while the outcome stays unknown.
+    ///
+    /// Returning `None` is the honest answer when the provider cannot say. It leaves the record
+    /// unresolved rather than guessing, and the attempt can be reconciled again later.
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter error when the provider could not be consulted at all.
+    fn resolve(
+        &mut self,
+        attempt: &DurableAttempt,
+        metadata: &DurableAttemptMetadata,
+    ) -> Result<Option<ReconciledCommit>, Self::Error>;
+}
+
+/// What one reconciliation pass resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciliationSummary {
+    committed: Vec<AttemptId>,
+    not_committed: Vec<AttemptId>,
+    still_unknown: Vec<AttemptId>,
+}
+
+impl ReconciliationSummary {
+    /// Returns the attempts a provider confirmed as committed.
+    #[must_use]
+    pub fn committed(&self) -> &[AttemptId] {
+        &self.committed
+    }
+
+    /// Returns the attempts a provider confirmed never landed.
+    #[must_use]
+    pub fn not_committed(&self) -> &[AttemptId] {
+        &self.not_committed
+    }
+
+    /// Returns the attempts whose outcome the provider still cannot determine.
+    #[must_use]
+    pub fn still_unknown(&self) -> &[AttemptId] {
+        &self.still_unknown
+    }
+}
+
+/// Failure while reconciling unknown commits against their providers.
+#[derive(Debug)]
+pub enum ReconciliationError {
+    /// The journal could not be read or appended to.
+    Durable(DurableAuditError),
+    /// A provider adapter failed while being consulted.
+    ///
+    /// Carries the attempt so an operator knows which record is still open.
+    Provider {
+        /// Attempt whose provider could not be consulted.
+        attempt: AttemptId,
+        /// Adapter failure.
+        source: Box<dyn Error + Send + Sync>,
+    },
+}
+
+impl fmt::Display for ReconciliationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Durable(error) => error.fmt(formatter),
+            Self::Provider { attempt, source } => write!(
+                formatter,
+                "provider could not be consulted for attempt {}: {source}",
+                attempt.as_u64()
+            ),
+        }
+    }
+}
+
+impl Error for ReconciliationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Durable(error) => Some(error),
+            Self::Provider { source, .. } => Some(source.as_ref()),
+        }
+    }
+}
+
+/// Asks a provider about every unresolved `CommitUnknown` attempt and records what it says.
+///
+/// Recovery leaves `CommitUnknown` records behind on purpose: the host genuinely could not tell.
+/// This is the second half of that story, and it is separate because only an adapter that can
+/// reach the provider can finish it. Verdicts append to the journal; nothing already written is
+/// rewritten.
+///
+/// # Errors
+///
+/// Returns [`ReconciliationError`] on the first journal failure, or when an adapter reports it
+/// could not consult its provider. Verdicts recorded before the failure stay durable.
+pub fn reconcile_unknown_commits<R>(
+    log: &DurableAuditLog,
+    reconciler: &mut R,
+) -> Result<ReconciliationSummary, ReconciliationError>
+where
+    R: CommitReconciler,
+{
+    let attempts = log.attempts().map_err(ReconciliationError::Durable)?;
+    let mut summary = ReconciliationSummary {
+        committed: Vec::new(),
+        not_committed: Vec::new(),
+        still_unknown: Vec::new(),
+    };
+    for attempt in attempts {
+        if attempt.outcome() != AttemptOutcome::CommitUnknown || attempt.reconciliation().is_some()
+        {
+            continue;
+        }
+        let metadata = attempt.metadata().map_err(ReconciliationError::Durable)?;
+        let verdict = reconciler.resolve(&attempt, &metadata).map_err(|error| {
+            ReconciliationError::Provider {
+                attempt: attempt.attempt_id(),
+                source: Box::new(error),
+            }
+        })?;
+        let Some(verdict) = verdict else {
+            summary.still_unknown.push(attempt.attempt_id());
+            continue;
+        };
+        log.reconcile_attempt(attempt.attempt_id(), &verdict)
+            .map_err(ReconciliationError::Durable)?;
+        match verdict {
+            ReconciledCommit::Committed(_) => summary.committed.push(attempt.attempt_id()),
+            ReconciledCommit::NotCommitted => summary.not_committed.push(attempt.attempt_id()),
+        }
+    }
+    Ok(summary)
 }
 
 /// Monotone identity for one authorization attempt in a session.
@@ -754,13 +897,13 @@ mod tests {
         backend
             .finish_attempt(first, AttemptOutcome::Denied, None, None)
             .expect("denied outcome must be durable");
-        let first_payload = backend
+        let first_metadata = backend
             .attempts()
             .expect("WAL must be readable")
             .first()
             .expect("one attempt exists")
-            .payload()
-            .to_vec();
+            .metadata()
+            .expect("a durable attempt must decode");
         drop(backend);
 
         let reopened =
@@ -778,18 +921,23 @@ mod tests {
             .expect("recovered trail keeps its backend")
             .attempts()
             .expect("WAL must be readable");
-        let new_payload = attempts
+        let new_metadata = attempts
             .iter()
             .find(|attempt| attempt.attempt_id() == next)
             .expect("the new attempt is durable")
-            .payload();
-        assert_eq!(first_payload[1..9], 0_u64.to_le_bytes());
+            .metadata()
+            .expect("a durable attempt must decode");
+        assert_eq!(first_metadata.state_instance(), 0);
         assert_eq!(
-            new_payload[1..9],
-            recovery.state_instance().to_le_bytes(),
+            new_metadata.state_instance(),
+            recovery.state_instance(),
             "a fresh capability state must not write under the crashed instance"
         );
-        assert_ne!(first_payload[1..9], new_payload[1..9]);
+        assert_ne!(
+            new_metadata.state_instance(),
+            first_metadata.state_instance()
+        );
+        assert_eq!(new_metadata.caller().as_str(), "subject-0");
     }
 
     #[test]
@@ -919,5 +1067,186 @@ mod tests {
             Err(AuditError::LockPoisoned),
             "a poisoned audit lock must not expose partial records"
         );
+    }
+    #[derive(Default)]
+    struct ScriptedReconciler {
+        verdicts: Vec<Option<super::ReconciledCommit>>,
+        seen: Vec<(super::AttemptId, String)>,
+        fail_at: Option<usize>,
+        calls: usize,
+    }
+
+    #[derive(Debug)]
+    struct ProviderUnreachable;
+
+    impl std::fmt::Display for ProviderUnreachable {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("provider unreachable")
+        }
+    }
+
+    impl std::error::Error for ProviderUnreachable {}
+
+    impl super::CommitReconciler for ScriptedReconciler {
+        type Error = ProviderUnreachable;
+
+        fn resolve(
+            &mut self,
+            attempt: &super::DurableAttempt,
+            metadata: &super::DurableAttemptMetadata,
+        ) -> Result<Option<super::ReconciledCommit>, Self::Error> {
+            let index = self.calls;
+            self.calls += 1;
+            if self.fail_at == Some(index) {
+                return Err(ProviderUnreachable);
+            }
+            self.seen
+                .push((attempt.attempt_id(), metadata.caller().as_str().to_owned()));
+            Ok(self.verdicts.get(index).cloned().flatten())
+        }
+    }
+
+    fn unknown_attempt(backend: &DurableAuditLog, id: super::AttemptId) {
+        begin_durable(backend, id);
+        let evidence = CommitUnknownEvidence::new(id, b"provider-timeout")
+            .expect("test evidence must be valid");
+        backend
+            .finish_attempt(id, AttemptOutcome::CommitUnknown, None, Some(&evidence))
+            .expect("commit-unknown outcome must be durable");
+    }
+
+    #[test]
+    fn reconciliation_records_each_verdict_without_rewriting_the_ambiguity() {
+        let journal = TestJournal::new();
+        let backend = DurableAuditLog::create(&journal.path).expect("test WAL must be creatable");
+        let committed = super::AttemptId::from_u64(0);
+        let missed = super::AttemptId::from_u64(1);
+        let open = super::AttemptId::from_u64(2);
+        unknown_attempt(&backend, committed);
+        unknown_attempt(&backend, missed);
+        unknown_attempt(&backend, open);
+
+        let mut reconciler = ScriptedReconciler {
+            verdicts: vec![
+                Some(super::ReconciledCommit::Committed(CommitReceipt::new(
+                    committed,
+                    b"provider-accepted-1".to_vec(),
+                ))),
+                Some(super::ReconciledCommit::NotCommitted),
+                None,
+            ],
+            ..ScriptedReconciler::default()
+        };
+        let summary = super::reconcile_unknown_commits(&backend, &mut reconciler)
+            .expect("reconciliation must complete");
+
+        assert_eq!(summary.committed(), &[committed]);
+        assert_eq!(summary.not_committed(), &[missed]);
+        assert_eq!(summary.still_unknown(), &[open]);
+        assert_eq!(
+            reconciler.seen,
+            vec![
+                (committed, "subject-0".to_owned()),
+                (missed, "subject-1".to_owned()),
+                (open, "subject-2".to_owned()),
+            ],
+            "each verdict must be decided from the record's own decoded metadata"
+        );
+        drop(backend);
+
+        let reopened = DurableAuditLog::open(&journal.path).expect("a reconciled WAL must reopen");
+        let attempts = reopened.attempts().expect("WAL must be readable");
+        for attempt in &attempts {
+            assert_eq!(
+                attempt.outcome(),
+                AttemptOutcome::CommitUnknown,
+                "a verdict must not rewrite the terminal record"
+            );
+            assert!(
+                attempt.commit_unknown_evidence().is_some(),
+                "the original ambiguity evidence must survive reconciliation"
+            );
+        }
+        assert!(matches!(
+            attempts[0].reconciliation(),
+            Some(super::ReconciledCommit::Committed(receipt))
+                if receipt.token() == b"provider-accepted-1"
+        ));
+        assert_eq!(
+            attempts[1].reconciliation(),
+            Some(&super::ReconciledCommit::NotCommitted)
+        );
+        assert_eq!(attempts[2].reconciliation(), None);
+    }
+
+    #[test]
+    fn an_attempt_is_reconciled_at_most_once_and_only_when_unknown() {
+        let journal = TestJournal::new();
+        let backend = DurableAuditLog::create(&journal.path).expect("test WAL must be creatable");
+        let unknown = super::AttemptId::from_u64(0);
+        unknown_attempt(&backend, unknown);
+        let denied = super::AttemptId::from_u64(1);
+        begin_durable(&backend, denied);
+        backend
+            .finish_attempt(denied, AttemptOutcome::Denied, None, None)
+            .expect("denied outcome must be durable");
+
+        backend
+            .reconcile_attempt(unknown, &super::ReconciledCommit::NotCommitted)
+            .expect("first verdict must be durable");
+        assert!(
+            backend
+                .reconcile_attempt(unknown, &super::ReconciledCommit::NotCommitted)
+                .is_err(),
+            "a second verdict would let a later reader pick which one to believe"
+        );
+        assert!(
+            backend
+                .reconcile_attempt(denied, &super::ReconciledCommit::NotCommitted)
+                .is_err(),
+            "an attempt that was never ambiguous has nothing to reconcile"
+        );
+        assert!(
+            backend
+                .reconcile_attempt(
+                    unknown,
+                    &super::ReconciledCommit::Committed(CommitReceipt::new(
+                        super::AttemptId::from_u64(9),
+                        b"foreign".to_vec(),
+                    )),
+                )
+                .is_err(),
+            "a receipt for another attempt must not attach here"
+        );
+    }
+
+    #[test]
+    fn a_provider_failure_keeps_the_verdicts_already_recorded() {
+        let journal = TestJournal::new();
+        let backend = DurableAuditLog::create(&journal.path).expect("test WAL must be creatable");
+        let first = super::AttemptId::from_u64(0);
+        let second = super::AttemptId::from_u64(1);
+        unknown_attempt(&backend, first);
+        unknown_attempt(&backend, second);
+
+        let mut reconciler = ScriptedReconciler {
+            verdicts: vec![Some(super::ReconciledCommit::NotCommitted), None],
+            fail_at: Some(1),
+            ..ScriptedReconciler::default()
+        };
+        let error = super::reconcile_unknown_commits(&backend, &mut reconciler)
+            .expect_err("an unreachable provider must surface");
+
+        assert!(matches!(
+            error,
+            super::ReconciliationError::Provider { attempt, .. } if attempt == second
+        ));
+        let attempts = backend.attempts().expect("WAL must be readable");
+        assert_eq!(
+            attempts[0].reconciliation(),
+            Some(&super::ReconciledCommit::NotCommitted),
+            "a verdict recorded before the failure stays durable"
+        );
+        assert_eq!(attempts[1].reconciliation(), None);
     }
 }

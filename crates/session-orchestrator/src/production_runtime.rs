@@ -485,6 +485,16 @@ pub struct SessionEgressRequest {
 }
 
 impl SessionEgressRequest {
+    /// Creates the exact identity-bound input supplied to an egress provisioner.
+    ///
+    /// Production composition creates this request only after durable identity allocation. The
+    /// constructor is also available to integration tests that verify a concrete
+    /// [`PerSessionEgressFactory`] without constructing a live Broker listener.
+    #[must_use]
+    pub const fn new(identity: SessionIdentity) -> Self {
+        Self { identity }
+    }
+
     /// Returns the exact orchestrator identity for this dispatcher.
     #[must_use]
     pub const fn identity(&self) -> SessionIdentity {

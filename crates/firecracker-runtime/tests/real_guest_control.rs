@@ -557,7 +557,12 @@ fn real_firecracker_guest_runtime_preserves_the_broker_channel_through_isolation
     let report = broker
         .join()
         .expect("host Broker thread must not panic")
-        .expect("isolated guest workload must serve one Broker request");
+        .unwrap_or_else(|error| {
+            panic!(
+                "isolated guest workload did not reach the Broker: {error}; guest serial output:\n{}",
+                vm.guest_serial_log()
+            )
+        });
     assert_eq!(report.requests_served(), 1);
     assert_eq!(
         report.close_reason(),

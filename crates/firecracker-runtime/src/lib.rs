@@ -487,7 +487,7 @@ impl RuntimeConfig {
             let component = component.to_str().ok_or_else(|| {
                 RuntimeError::InvalidConfig("cgroup parent must be valid UTF-8".to_owned())
             })?;
-            validate_safe_name("cgroup parent component", component)?;
+            validate_cgroup_component(component)?;
         }
         Ok(parent)
     }
@@ -760,6 +760,27 @@ fn validate_absolute_path(label: &str, path: &Path) -> Result<(), RuntimeError> 
     if path.to_string_lossy().contains('\0') {
         return Err(RuntimeError::InvalidConfig(format!(
             "{label} path contains a NUL byte"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates one existing cgroup v2 directory name in the parent of a session leaf.
+///
+/// This is deliberately looser than [`validate_safe_name`]: every systemd-managed cgroup a host
+/// would nest sessions under is named `user.slice`, `system.slice`, or `init.scope`, so rejecting
+/// `.` would reject the standard hierarchy. Traversal is still impossible because the caller only
+/// passes [`Component::Normal`] components, and `.`, `..`, and leading dots are rejected here so a
+/// component can never be a relative reference or a hidden name.
+fn validate_cgroup_component(value: &str) -> Result<(), RuntimeError> {
+    if value.is_empty()
+        || value.starts_with('.')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "cgroup parent component must be a non-hidden name of ASCII letters, digits, '_', '-' or '.': {value}"
         )));
     }
     Ok(())
@@ -5031,6 +5052,33 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+
+    #[test]
+    fn cgroup_parent_components_accept_the_standard_systemd_hierarchy() {
+        for accepted in [
+            "user.slice",
+            "system.slice",
+            "init.scope",
+            "session-runtime",
+        ] {
+            validate_cgroup_component(accepted)
+                .unwrap_or_else(|error| panic!("{accepted} must be an acceptable parent: {error}"));
+        }
+        for rejected in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "with space",
+            "with/slash",
+            "tab\t",
+        ] {
+            assert!(
+                validate_cgroup_component(rejected).is_err(),
+                "{rejected:?} must not be an acceptable cgroup parent component"
+            );
+        }
+    }
 
     #[derive(Default)]
     struct CleanupRunner {

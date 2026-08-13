@@ -53,9 +53,10 @@ impl BindMountConfig {
 
 /// An already-connected, kernel-authenticated control channel kept for the workload.
 ///
-/// The launcher must create this `AF_UNIX` `SOCK_SEQPACKET` descriptor before namespace setup.
-/// Keeping a single fixed descriptor lets the workload exchange canonical supervisor messages
-/// through ordinary `read` and `write` calls while seccomp continues to deny socket creation and
+/// The launcher must create this `AF_UNIX` `SOCK_SEQPACKET` descriptor before namespace setup and
+/// pass its number to the fixed workload through an allowlisted environment variable. Retaining
+/// one preconnected descriptor lets the workload exchange canonical supervisor messages through
+/// ordinary `read` and `write` calls while seccomp continues to deny socket creation and
 /// connection syscalls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControlChannelConfig {
@@ -63,25 +64,22 @@ pub struct ControlChannelConfig {
 }
 
 impl ControlChannelConfig {
-    /// The only descriptor number an isolated workload may inherit for supervisor control.
-    pub const WORKLOAD_FD: RawFd = 3;
-
-    /// Describes the fixed inherited control descriptor.
+    /// Describes the nonstandard inherited control descriptor.
     ///
     /// # Errors
     ///
-    /// Returns [`IsolationError::InvalidConfig`] unless `fd` is the fixed descriptor reserved for
-    /// the supervisor control channel.
+    /// Returns [`IsolationError::InvalidConfig`] when `fd` overlaps standard input, output, or
+    /// error.
     pub fn new(fd: RawFd) -> Result<Self, IsolationError> {
-        if fd != Self::WORKLOAD_FD {
+        if fd < 3 {
             return Err(InvalidConfig::message(
-                "the supervisor control channel must use descriptor 3",
+                "the supervisor control channel must not use a standard descriptor",
             ));
         }
         Ok(Self { fd })
     }
 
-    /// Returns the reserved descriptor that the workload inherits.
+    /// Returns the descriptor that the workload inherits.
     #[must_use]
     pub const fn fd(self) -> RawFd {
         self.fd
@@ -270,14 +268,19 @@ mod tests {
     use super::ControlChannelConfig;
 
     #[test]
-    fn refuses_control_channel_descriptors_other_than_the_reserved_fd() {
+    fn refuses_control_channel_descriptors_that_overlap_standard_io() {
         assert!(ControlChannelConfig::new(2).is_err());
-        assert!(ControlChannelConfig::new(4).is_err());
         assert_eq!(
-            ControlChannelConfig::new(ControlChannelConfig::WORKLOAD_FD)
-                .expect("the reserved descriptor must be accepted")
+            ControlChannelConfig::new(3)
+                .expect("the first nonstandard descriptor must be accepted")
                 .fd(),
-            ControlChannelConfig::WORKLOAD_FD
+            3
+        );
+        assert_eq!(
+            ControlChannelConfig::new(4)
+                .expect("another nonstandard descriptor must be accepted")
+                .fd(),
+            4
         );
     }
 }

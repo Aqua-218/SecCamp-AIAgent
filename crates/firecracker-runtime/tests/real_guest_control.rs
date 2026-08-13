@@ -457,7 +457,9 @@ fn real_firecracker_guest_reaches_host_broker_over_vsock() {
         .expect("guest Broker probe must be released after identity injection");
     assert_eq!(
         started.body,
-        request.canonical_acknowledgement(GuestControlAction::StartWorkload)
+        request.canonical_acknowledgement(GuestControlAction::StartWorkload),
+        "guest runtime failed to start; guest serial output:\n{}",
+        vm.guest_serial_log(),
     );
 
     let report = broker

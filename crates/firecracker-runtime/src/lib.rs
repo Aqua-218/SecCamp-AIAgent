@@ -32,6 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rustix::fs::{
     CWD, Mode, OFlags, RenameFlags, fcntl_getfl, fcntl_setfl, open, openat, renameat_with, statfs,
 };
+use rustix::mount::{UnmountFlags, mount_bind, unmount};
 use sha2::{Digest, Sha256};
 
 const REQUIRED_BLOCKED_SYSCALLS: [&str; 8] = [
@@ -1016,6 +1017,36 @@ pub trait FileSystem {
     ) -> Result<(), RuntimeError> {
         Err(RuntimeError::Io(
             "filesystem adapter cannot verify jailed block-device bindings".to_owned(),
+        ))
+    }
+    /// Bind-mounts a verified host block device at an owner-owned path inside the jail.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the source is not a block device, the target cannot be
+    /// exclusively created, or the mount cannot be observed as the exact source device.
+    fn bind_block_device(
+        &mut self,
+        _source: &Path,
+        _jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Io(
+            "filesystem adapter cannot bind a jailed block device".to_owned(),
+        ))
+    }
+    /// Unmounts and removes a block-device target created by [`Self::bind_block_device`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the exact owned mount or its covered target cannot be
+    /// observed and released safely.
+    fn unbind_block_device(
+        &mut self,
+        _source: &Path,
+        _jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Io(
+            "filesystem adapter cannot unbind a jailed block device".to_owned(),
         ))
     }
     /// Creates a clone at `destination` from `source`.
@@ -2479,6 +2510,20 @@ struct WorkspaceImageOwnership {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockDeviceBindingState {
+    Mounted,
+    Unmounted,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockDeviceBinding {
+    source: ObjectIdentity,
+    target: ObjectIdentity,
+    parent: ObjectIdentity,
+    state: BlockDeviceBindingState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SourceSnapshot {
     identity: ObjectIdentity,
     kind: WorkspaceNodeKind,
@@ -2639,6 +2684,7 @@ fn sort_workspace_paths(nodes: &HashMap<PathBuf, OwnedWorkspaceNode>) -> Vec<Pat
 pub struct RealFileSystem {
     owned_workspaces: HashMap<PathBuf, WorkspaceOwnership>,
     owned_workspace_images: HashMap<PathBuf, WorkspaceImageOwnership>,
+    block_devices: HashMap<PathBuf, BlockDeviceBinding>,
 }
 
 struct CloneContext {
@@ -2651,6 +2697,38 @@ struct PreparedClone {
     parent_identity: ObjectIdentity,
     stage: PathBuf,
     stage_identity: ObjectIdentity,
+}
+
+fn prepare_block_device_bind_target(
+    jailed_device: &Path,
+) -> Result<(ObjectIdentity, ObjectIdentity), RuntimeError> {
+    let parent = jailed_device.parent().ok_or_else(|| {
+        RuntimeError::InvalidConfig("jailed dm-verity device has no parent".to_owned())
+    })?;
+    let parent_identity = ensure_directory_path(parent, false)?;
+    validate_destination_absence(jailed_device)?;
+    let target = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(jailed_device)
+        .map_err(RuntimeError::from)?;
+    target.sync_all().map_err(RuntimeError::from)?;
+    let target_metadata = metadata_at(jailed_device)?;
+    if target_metadata.file_type().is_symlink()
+        || !target_metadata.is_file()
+        || target_metadata.nlink() != 1
+        || target_metadata.mode() & 0o077 != 0
+    {
+        return Err(workspace_error(format!(
+            "jailed dm-verity mount target is not an exclusive owner-only regular file: {}",
+            jailed_device.display()
+        )));
+    }
+    Ok((
+        parent_identity,
+        ObjectIdentity::from_metadata(&target_metadata),
+    ))
 }
 
 impl RealFileSystem {
@@ -3269,6 +3347,154 @@ impl FileSystem for RealFileSystem {
         digest_file(path)
     }
 
+    fn bind_block_device(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        validate_absolute_path("opened dm-verity device", source)?;
+        validate_absolute_path("jailed dm-verity device", jailed_device)?;
+        let source_metadata = fs::metadata(source).map_err(RuntimeError::from)?;
+        if !source_metadata.file_type().is_block_device() {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "opened dm-verity source is not a block device: {}",
+                source.display()
+            )));
+        }
+        if self.block_devices.contains_key(jailed_device) {
+            return Err(RuntimeError::WorkspaceAlreadyExists(
+                jailed_device.to_path_buf(),
+            ));
+        }
+        let (parent_identity, target_identity) = prepare_block_device_bind_target(jailed_device)?;
+        if let Err(error) = mount_bind(source, jailed_device) {
+            let cleanup = match metadata_at(jailed_device) {
+                Ok(metadata)
+                    if !metadata.file_type().is_symlink()
+                        && metadata.is_file()
+                        && metadata.nlink() == 1
+                        && ObjectIdentity::from_metadata(&metadata) == target_identity =>
+                {
+                    fs::remove_file(jailed_device).map_err(RuntimeError::from)
+                }
+                Ok(_) => Err(workspace_error(
+                    "jailed dm-verity mount target changed while binding",
+                )),
+                Err(cleanup_error) => Err(cleanup_error),
+            };
+            return match cleanup {
+                Ok(()) => Err(RuntimeError::from(io::Error::from(error))),
+                Err(cleanup_error) => Err(RuntimeError::Rollback {
+                    operation: error.to_string(),
+                    cleanup: cleanup_error.to_string(),
+                }),
+            };
+        }
+        let mounted_metadata = fs::metadata(jailed_device).map_err(RuntimeError::from)?;
+        if mounted_metadata.file_type().is_symlink()
+            || !mounted_metadata.file_type().is_block_device()
+            || mounted_metadata.rdev() != source_metadata.rdev()
+            || ObjectIdentity::from_metadata(&mounted_metadata)
+                != ObjectIdentity::from_metadata(&source_metadata)
+        {
+            let operation = workspace_error(format!(
+                "jailed dm-verity mount does not expose the exact source device: {}",
+                jailed_device.display()
+            ));
+            let cleanup = unmount(jailed_device, UnmountFlags::NOFOLLOW)
+                .map_err(|error| RuntimeError::from(io::Error::from(error)))
+                .and_then(|()| {
+                    let metadata = metadata_at(jailed_device)?;
+                    if metadata.file_type().is_symlink()
+                        || !metadata.is_file()
+                        || metadata.nlink() != 1
+                        || ObjectIdentity::from_metadata(&metadata) != target_identity
+                    {
+                        return Err(workspace_error(
+                            "jailed dm-verity target changed after bind-mount rollback",
+                        ));
+                    }
+                    fs::remove_file(jailed_device).map_err(RuntimeError::from)
+                });
+            return match cleanup {
+                Ok(()) => Err(operation),
+                Err(cleanup_error) => Err(RuntimeError::Rollback {
+                    operation: operation.to_string(),
+                    cleanup: cleanup_error.to_string(),
+                }),
+            };
+        }
+        self.block_devices.insert(
+            jailed_device.to_path_buf(),
+            BlockDeviceBinding {
+                source: ObjectIdentity::from_metadata(&source_metadata),
+                target: target_identity,
+                parent: parent_identity,
+                state: BlockDeviceBindingState::Mounted,
+            },
+        );
+        Ok(())
+    }
+
+    fn unbind_block_device(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        let Some(binding) = self.block_devices.get(jailed_device).copied() else {
+            return Err(workspace_error(format!(
+                "jailed dm-verity device is not owned by this filesystem instance: {}",
+                jailed_device.display()
+            )));
+        };
+        let parent = jailed_device.parent().ok_or_else(|| {
+            RuntimeError::InvalidConfig("jailed dm-verity device has no parent".to_owned())
+        })?;
+        let parent_metadata = metadata_at(parent)?;
+        if ObjectIdentity::from_metadata(&parent_metadata) != binding.parent {
+            return Err(workspace_error(format!(
+                "jailed dm-verity mount parent was replaced and will not be modified: {}",
+                parent.display()
+            )));
+        }
+        if binding.state == BlockDeviceBindingState::Mounted {
+            let source_metadata = fs::metadata(source).map_err(RuntimeError::from)?;
+            let mounted_metadata = fs::metadata(jailed_device).map_err(RuntimeError::from)?;
+            if !source_metadata.file_type().is_block_device()
+                || !mounted_metadata.file_type().is_block_device()
+                || ObjectIdentity::from_metadata(&source_metadata) != binding.source
+                || ObjectIdentity::from_metadata(&mounted_metadata) != binding.source
+                || source_metadata.rdev() != mounted_metadata.rdev()
+            {
+                return Err(workspace_error(
+                    "jailed dm-verity mount no longer exposes the exact owned source device",
+                ));
+            }
+            unmount(jailed_device, UnmountFlags::NOFOLLOW)
+                .map_err(|error| RuntimeError::from(io::Error::from(error)))?;
+            let Some(binding) = self.block_devices.get_mut(jailed_device) else {
+                return Err(workspace_error(
+                    "jailed dm-verity binding disappeared after unmount",
+                ));
+            };
+            binding.state = BlockDeviceBindingState::Unmounted;
+        }
+        let target_metadata = metadata_at(jailed_device)?;
+        if target_metadata.file_type().is_symlink()
+            || !target_metadata.is_file()
+            || target_metadata.nlink() != 1
+            || ObjectIdentity::from_metadata(&target_metadata) != binding.target
+        {
+            return Err(workspace_error(format!(
+                "jailed dm-verity target was replaced and will not be removed: {}",
+                jailed_device.display()
+            )));
+        }
+        fs::remove_file(jailed_device).map_err(RuntimeError::from)?;
+        self.block_devices.remove(jailed_device);
+        Ok(())
+    }
+
     fn verify_block_device_binding(
         &mut self,
         source: &Path,
@@ -3786,10 +4012,17 @@ pub struct RuntimeInstance {
     workspace_removed: bool,
     mapper_name: String,
     verity_opened: bool,
+    block_device_state: BlockDeviceState,
     restore_fingerprint: Sha256Digest,
     config_fingerprint: Sha256Digest,
     identities: Option<IdentityBundle>,
     guest_control_challenge: Option<IdentityId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockDeviceState {
+    Bound,
+    Unbound,
 }
 
 impl RuntimeInstance {
@@ -3840,14 +4073,29 @@ impl<C, F, A, G, I> Drop for Runtime<C, F, A, G, I> {
 #[derive(Debug)]
 struct PendingCleanup {
     process: Option<ProcessHandle>,
+    block_device: Option<(PathBuf, PathBuf)>,
     verity_opened: bool,
     workspace: Option<PathBuf>,
     mapper_name: String,
 }
 
+#[derive(Clone, Copy)]
+struct RollbackResources<'a> {
+    process: Option<ProcessHandle>,
+    verity_opened: bool,
+    block_device_bound: bool,
+    workspace_cloned: bool,
+    workspace: &'a Path,
+    mapper_name: &'a str,
+    jailed_device: &'a Path,
+}
+
 impl PendingCleanup {
     fn is_complete(&self) -> bool {
-        self.process.is_none() && !self.verity_opened && self.workspace.is_none()
+        self.process.is_none()
+            && self.block_device.is_none()
+            && !self.verity_opened
+            && self.workspace.is_none()
     }
 }
 
@@ -3951,22 +4199,39 @@ where
             .filesystem
             .clone_workspace(&config.workspace.source, &workspace)
         {
-            let cleanup =
-                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
+            let cleanup = self.rollback(RollbackResources {
+                process: None,
+                verity_opened: false,
+                block_device_bound: false,
+                workspace_cloned: true,
+                workspace: &workspace,
+                mapper_name: &config.dm_verity.mapper_name,
+                jailed_device: &config.dm_verity.jailed_device_path,
+            });
             return Err(with_cleanup(error, &cleanup));
         }
         if let Err(error) = self.create_workspace_block_image(config, &workspace) {
-            let cleanup =
-                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
+            let cleanup = self.rollback(RollbackResources {
+                process: None,
+                verity_opened: false,
+                block_device_bound: false,
+                workspace_cloned: true,
+                workspace: &workspace,
+                mapper_name: &config.dm_verity.mapper_name,
+                jailed_device: &config.dm_verity.jailed_device_path,
+            });
             return Err(with_cleanup(error, &cleanup));
         }
         let workspace_cloned = true;
         let mut verity_opened = false;
+        let mut block_device_bound = false;
         let mut process = None;
 
         let result = (|| {
             self.open_verity(config)?;
             verity_opened = true;
+            self.bind_verity_device(config)?;
+            block_device_bound = true;
             self.verify_verity_binding(config)?;
             let handle = self.start_jailer(config)?;
             process = Some(handle);
@@ -3987,6 +4252,7 @@ where
                 workspace_removed: false,
                 mapper_name: config.dm_verity.mapper_name.clone(),
                 verity_opened: true,
+                block_device_state: BlockDeviceState::Bound,
                 restore_fingerprint: config.snapshot_fingerprint(),
                 config_fingerprint: config.instance_fingerprint(),
                 identities: None,
@@ -3996,13 +4262,15 @@ where
         match result {
             Ok(instance) => Ok(instance),
             Err(error) => {
-                let cleanup = self.rollback(
+                let cleanup = self.rollback(RollbackResources {
                     process,
                     verity_opened,
+                    block_device_bound,
                     workspace_cloned,
-                    &workspace,
-                    &config.dm_verity.mapper_name,
-                );
+                    workspace: &workspace,
+                    mapper_name: &config.dm_verity.mapper_name,
+                    jailed_device: &config.dm_verity.jailed_device_path,
+                });
                 Err(with_cleanup(error, &cleanup))
             }
         }
@@ -4114,21 +4382,38 @@ where
             .filesystem
             .clone_workspace(&config.workspace.source, &workspace)
         {
-            let cleanup =
-                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
+            let cleanup = self.rollback(RollbackResources {
+                process: None,
+                verity_opened: false,
+                block_device_bound: false,
+                workspace_cloned: true,
+                workspace: &workspace,
+                mapper_name: &config.dm_verity.mapper_name,
+                jailed_device: &config.dm_verity.jailed_device_path,
+            });
             return Err(with_cleanup(error, &cleanup));
         }
         if let Err(error) = self.create_workspace_block_image(config, &workspace) {
-            let cleanup =
-                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
+            let cleanup = self.rollback(RollbackResources {
+                process: None,
+                verity_opened: false,
+                block_device_bound: false,
+                workspace_cloned: true,
+                workspace: &workspace,
+                mapper_name: &config.dm_verity.mapper_name,
+                jailed_device: &config.dm_verity.jailed_device_path,
+            });
             return Err(with_cleanup(error, &cleanup));
         }
         let workspace_cloned = true;
         let mut verity_opened = false;
+        let mut block_device_bound = false;
         let mut process = None;
         let result = (|| {
             self.open_verity(config)?;
             verity_opened = true;
+            self.bind_verity_device(config)?;
+            block_device_bound = true;
             self.verify_verity_binding(config)?;
             let handle = self.start_jailer(config)?;
             process = Some(handle);
@@ -4157,6 +4442,7 @@ where
                 workspace_removed: false,
                 mapper_name: config.dm_verity.mapper_name.clone(),
                 verity_opened: true,
+                block_device_state: BlockDeviceState::Bound,
                 restore_fingerprint: config.snapshot_fingerprint(),
                 config_fingerprint: config.instance_fingerprint(),
                 identities: Some(identities),
@@ -4166,13 +4452,15 @@ where
         match result {
             Ok(instance) => Ok(instance),
             Err(error) => {
-                let cleanup = self.rollback(
+                let cleanup = self.rollback(RollbackResources {
                     process,
                     verity_opened,
+                    block_device_bound,
                     workspace_cloned,
-                    &workspace,
-                    &config.dm_verity.mapper_name,
-                );
+                    workspace: &workspace,
+                    mapper_name: &config.dm_verity.mapper_name,
+                    jailed_device: &config.dm_verity.jailed_device_path,
+                });
                 Err(with_cleanup(error, &cleanup))
             }
         }
@@ -4228,21 +4516,38 @@ where
             .filesystem
             .clone_workspace(&config.workspace.source, &workspace)
         {
-            let cleanup =
-                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
+            let cleanup = self.rollback(RollbackResources {
+                process: None,
+                verity_opened: false,
+                block_device_bound: false,
+                workspace_cloned: true,
+                workspace: &workspace,
+                mapper_name: &config.dm_verity.mapper_name,
+                jailed_device: &config.dm_verity.jailed_device_path,
+            });
             return Err(with_cleanup(error, &cleanup));
         }
         if let Err(error) = self.create_workspace_block_image(config, &workspace) {
-            let cleanup =
-                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
+            let cleanup = self.rollback(RollbackResources {
+                process: None,
+                verity_opened: false,
+                block_device_bound: false,
+                workspace_cloned: true,
+                workspace: &workspace,
+                mapper_name: &config.dm_verity.mapper_name,
+                jailed_device: &config.dm_verity.jailed_device_path,
+            });
             return Err(with_cleanup(error, &cleanup));
         }
         let workspace_cloned = true;
         let mut verity_opened = false;
+        let mut block_device_bound = false;
         let mut process = None;
         let result = (|| {
             self.open_verity(config)?;
             verity_opened = true;
+            self.bind_verity_device(config)?;
+            block_device_bound = true;
             self.verify_verity_binding(config)?;
             let handle = self.start_jailer(config)?;
             process = Some(handle);
@@ -4269,6 +4574,7 @@ where
                 workspace_removed: false,
                 mapper_name: config.dm_verity.mapper_name.clone(),
                 verity_opened: true,
+                block_device_state: BlockDeviceState::Bound,
                 restore_fingerprint: config.snapshot_fingerprint(),
                 config_fingerprint: config.instance_fingerprint(),
                 identities: Some(identities),
@@ -4278,13 +4584,15 @@ where
         match result {
             Ok(instance) => Ok(instance),
             Err(error) => {
-                let cleanup = self.rollback(
+                let cleanup = self.rollback(RollbackResources {
                     process,
                     verity_opened,
+                    block_device_bound,
                     workspace_cloned,
-                    &workspace,
-                    &config.dm_verity.mapper_name,
-                );
+                    workspace: &workspace,
+                    mapper_name: &config.dm_verity.mapper_name,
+                    jailed_device: &config.dm_verity.jailed_device_path,
+                });
                 Err(with_cleanup(error, &cleanup))
             }
         }
@@ -4395,7 +4703,7 @@ where
         Ok(())
     }
 
-    /// Stops the process, closes dm-verity, and removes the clone-specific workspace.
+    /// Stops the process, unbinds and closes dm-verity, and removes the clone-specific workspace.
     ///
     /// # Errors
     ///
@@ -4431,7 +4739,19 @@ where
                 Err(error) => failures.push(error.to_string()),
             }
         }
-        if instance.process_stopped && instance.verity_opened {
+        if instance.process_stopped && instance.block_device_state == BlockDeviceState::Bound {
+            match self.filesystem.unbind_block_device(
+                &Path::new("/dev/mapper").join(&instance.mapper_name),
+                &config.dm_verity.jailed_device_path,
+            ) {
+                Ok(()) => instance.block_device_state = BlockDeviceState::Unbound,
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if instance.process_stopped
+            && instance.block_device_state == BlockDeviceState::Unbound
+            && instance.verity_opened
+        {
             match self.close_verity_mapper(&instance.mapper_name) {
                 Ok(()) => instance.verity_opened = false,
                 Err(error) => failures.push(error.to_string()),
@@ -4561,6 +4881,13 @@ where
     fn close_verity_mapper(&mut self, mapper_name: &str) -> Result<(), RuntimeError> {
         let command = CommandSpec::new("veritysetup", ["close".to_owned(), mapper_name.to_owned()]);
         self.command_runner.run(&command).map(|_| ())
+    }
+
+    fn bind_verity_device(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
+        self.filesystem.bind_block_device(
+            &Path::new("/dev/mapper").join(&config.dm_verity.mapper_name),
+            &config.dm_verity.jailed_device_path,
+        )
     }
 
     fn verify_verity_binding(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
@@ -4763,20 +5090,21 @@ where
         Ok(())
     }
 
-    fn rollback(
-        &mut self,
-        process: Option<ProcessHandle>,
-        verity_opened: bool,
-        workspace_cloned: bool,
-        workspace: &Path,
-        mapper_name: &str,
-    ) -> Vec<String> {
+    fn rollback(&mut self, resources: RollbackResources<'_>) -> Vec<String> {
         debug_assert!(self.pending_cleanup.is_none());
         let mut pending = PendingCleanup {
-            process,
-            verity_opened,
-            workspace: workspace_cloned.then(|| workspace.to_path_buf()),
-            mapper_name: mapper_name.to_owned(),
+            process: resources.process,
+            block_device: resources.block_device_bound.then(|| {
+                (
+                    Path::new("/dev/mapper").join(resources.mapper_name),
+                    resources.jailed_device.to_path_buf(),
+                )
+            }),
+            verity_opened: resources.verity_opened,
+            workspace: resources
+                .workspace_cloned
+                .then(|| resources.workspace.to_path_buf()),
+            mapper_name: resources.mapper_name.to_owned(),
         };
         let failures = self.cleanup_pending(&mut pending);
         if !pending.is_complete() {
@@ -4789,6 +5117,12 @@ where
         if let Some(process) = pending.process {
             match self.command_runner.stop(process) {
                 Ok(()) => pending.process = None,
+                Err(error) => return vec![error.to_string()],
+            }
+        }
+        if let Some((source, jailed_device)) = pending.block_device.as_ref() {
+            match self.filesystem.unbind_block_device(source, jailed_device) {
+                Ok(()) => pending.block_device = None,
                 Err(error) => return vec![error.to_string()],
             }
         }
@@ -5597,6 +5931,32 @@ mod tests {
             Ok(b"artifact".to_vec())
         }
 
+        fn bind_block_device(
+            &mut self,
+            source: &Path,
+            jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            self.events.borrow_mut().push(format!(
+                "bind-device:{}:{}",
+                source.display(),
+                jailed_device.display()
+            ));
+            Ok(())
+        }
+
+        fn unbind_block_device(
+            &mut self,
+            source: &Path,
+            jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            self.events.borrow_mut().push(format!(
+                "unbind-device:{}:{}",
+                source.display(),
+                jailed_device.display()
+            ));
+            Ok(())
+        }
+
         fn verify_block_device_binding(
             &mut self,
             source: &Path,
@@ -5740,6 +6100,22 @@ mod tests {
                 .get(path)
                 .cloned()
                 .unwrap_or_else(|| b"artifact".to_vec()))
+        }
+
+        fn bind_block_device(
+            &mut self,
+            _source: &Path,
+            _jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn unbind_block_device(
+            &mut self,
+            _source: &Path,
+            _jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
         }
 
         fn verify_block_device_binding(
@@ -6707,13 +7083,15 @@ mod tests {
     fn pending_cleanup_keeps_verity_and_workspace_when_process_stop_fails() {
         let mut runtime = cleanup_runtime([true, false], std::iter::empty());
 
-        let failures = runtime.rollback(
-            Some(ProcessHandle { pid: 42 }),
-            true,
-            true,
-            Path::new("/workspace/session"),
-            "session-root",
-        );
+        let failures = runtime.rollback(RollbackResources {
+            process: Some(ProcessHandle { pid: 42 }),
+            verity_opened: true,
+            block_device_bound: false,
+            workspace_cloned: true,
+            workspace: Path::new("/workspace/session"),
+            mapper_name: "session-root",
+            jailed_device: Path::new("/jail/dev/rootfs"),
+        });
         assert!(failures[0].contains("stop failed"));
         assert_eq!(runtime.command_runner.events, ["stop:42"]);
         assert!(runtime.filesystem.events.is_empty());
@@ -6734,13 +7112,15 @@ mod tests {
     fn pending_cleanup_keeps_workspace_when_verity_close_fails() {
         let mut runtime = cleanup_runtime(std::iter::empty(), [true, false]);
 
-        let failures = runtime.rollback(
-            Some(ProcessHandle { pid: 42 }),
-            true,
-            true,
-            Path::new("/workspace/session"),
-            "session-root",
-        );
+        let failures = runtime.rollback(RollbackResources {
+            process: Some(ProcessHandle { pid: 42 }),
+            verity_opened: true,
+            block_device_bound: false,
+            workspace_cloned: true,
+            workspace: Path::new("/workspace/session"),
+            mapper_name: "session-root",
+            jailed_device: Path::new("/jail/dev/rootfs"),
+        });
         assert!(failures[0].contains("close failed"));
         assert_eq!(
             runtime.command_runner.events,
@@ -7008,6 +7388,7 @@ mod tests {
             let mut runtime = cleanup_runtime([true], std::iter::empty());
             runtime.pending_cleanup = Some(PendingCleanup {
                 process: Some(ProcessHandle { pid: 42 }),
+                block_device: None,
                 verity_opened: true,
                 workspace: Some(PathBuf::from("/workspace/session")),
                 mapper_name: "session-root".to_owned(),

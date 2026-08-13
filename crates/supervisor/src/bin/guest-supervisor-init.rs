@@ -129,6 +129,7 @@ fn run_session(config: &Config, identity: &GuestIdentity, workspace: &Path) -> R
             getegid().as_raw(),
         ),
         broker_channel.as_raw_fd(),
+        identity.session.clone(),
     );
     let host = LinuxHostResources::new(LinuxHostConfig::new(
         &config.cgroup_parent,

@@ -1452,13 +1452,15 @@ impl CapabilityFilesystem {
             .map_err(|error| map_namespace_operation_error(&error))
     }
 
-    fn write_file(
+    fn write_file_with_flags(
         &self,
         node: NodeId,
         handle: u64,
         offset: u64,
         bytes: &[u8],
+        write_flags: WriteFlags,
     ) -> Result<u32, AdapterError> {
+        let kill_set_id = supported_write_flags(write_flags)?;
         self.ensure_healthy()?;
         if bytes.len() > MAX_IO_SIZE as usize {
             return Err(AdapterError::InvalidRequest);
@@ -1485,7 +1487,12 @@ impl CapabilityFilesystem {
             .with_object_mutation(&resource.object, |object| {
                 self.ensure_healthy()?;
                 self.with_authorized_object(object, FileEffect::WriteData, || {
-                    let Ok(written) = backing.write_at(offset, bytes) else {
+                    let write = if kill_set_id {
+                        backing.write_at_killing_set_id(offset, bytes)
+                    } else {
+                        backing.write_at(offset, bytes)
+                    };
+                    let Ok(written) = write else {
                         return commit_unknown();
                     };
                     match u32::try_from(written) {
@@ -1495,6 +1502,17 @@ impl CapabilityFilesystem {
                 })
             })
             .map_err(|error| map_namespace_operation_error(&error))
+    }
+
+    #[cfg(test)]
+    fn write_file(
+        &self,
+        node: NodeId,
+        handle: u64,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<u32, AdapterError> {
+        self.write_file_with_flags(node, handle, offset, bytes, WriteFlags::empty())
     }
 
     fn truncate_file(
@@ -2327,13 +2345,7 @@ impl Filesystem for CapabilityFilesystem {
             reply.error(Errno::EIO);
             return;
         };
-        if write_flags
-            .intersects(WriteFlags::FUSE_WRITE_CACHE | WriteFlags::FUSE_WRITE_KILL_SUIDGID)
-        {
-            reply.error(Errno::EPERM);
-            return;
-        }
-        match self.write_file(node, handle.0, offset, data) {
+        match self.write_file_with_flags(node, handle.0, offset, data, write_flags) {
             Ok(written) => reply.written(written),
             Err(error) => reply.error(error.errno()),
         }
@@ -2687,6 +2699,14 @@ fn supported_open_flags(flags: OpenFlags) -> Result<OFlags, AdapterError> {
     Ok(flags)
 }
 
+/// Validates FUSE write provenance and returns whether set-ID bits must die.
+fn supported_write_flags(flags: WriteFlags) -> Result<bool, AdapterError> {
+    if flags.contains(WriteFlags::FUSE_WRITE_CACHE) {
+        return Err(AdapterError::Unsupported);
+    }
+    Ok(flags.contains(WriteFlags::FUSE_WRITE_KILL_SUIDGID))
+}
+
 const fn map_node_lookup_error(error: &NodeTableError) -> AdapterError {
     match error {
         NodeTableError::UnknownNode(_) => AdapterError::NotFound,
@@ -2782,14 +2802,14 @@ mod tests {
         state::{CapabilityGrant, CapabilityState, StaticAuthorityEnvelope, Subject},
         time::{MonotonicTime, TimeWindow},
     };
-    use fuser::{OpenFlags, RenameFlags, TimeOrNow};
+    use fuser::{OpenFlags, RenameFlags, TimeOrNow, WriteFlags};
     use rustix::fs::OFlags;
     use tempfile::{TempDir, tempdir};
 
     use super::{
         AdapterError, CapabilityFilesystem, CapabilityFilesystemError, MetadataUpdate,
         MountAuthority, MountInstanceId, NodeId, OpenBacking, SetattrMutation, TruncateCommit,
-        supported_setattr_mutation,
+        supported_setattr_mutation, supported_write_flags,
     };
     use crate::{
         backing::{ImportedRepository, PreflightLimits},
@@ -2803,6 +2823,23 @@ mod tests {
 
     fn open_flags(flags: OFlags) -> OpenFlags {
         OpenFlags(i32::try_from(flags.bits()).expect("test open flags must fit i32"))
+    }
+
+    #[test]
+    fn write_flags_accept_kernel_set_id_cleanup_but_reject_cached_writes() {
+        assert_eq!(
+            supported_write_flags(WriteFlags::FUSE_WRITE_KILL_SUIDGID),
+            Ok(true),
+            "ordinary direct writes may require set-ID cleanup"
+        );
+        assert_eq!(supported_write_flags(WriteFlags::empty()), Ok(false));
+        assert_eq!(
+            supported_write_flags(
+                WriteFlags::FUSE_WRITE_CACHE | WriteFlags::FUSE_WRITE_KILL_SUIDGID,
+            ),
+            Err(AdapterError::Unsupported),
+            "page-cache writes do not carry trustworthy identity or handles"
+        );
     }
 
     fn create_flags(flags: OFlags) -> i32 {

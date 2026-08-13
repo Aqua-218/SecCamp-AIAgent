@@ -216,4 +216,6 @@ scripts/ci/check-docs.sh docs/capfs/namespace-registry.md
 
 ## ライセンス
 
-未設定。現時点で利用条件を定義していない。
+Copyright © 2026 Aqua-218.
+
+このプロジェクトは [GNU Affero General Public License v3.0 only](LICENSE)（`AGPL-3.0-only`）で公開する。改変版をネットワーク越しに利用させる場合を含め、対応するソースコードの提供条件はライセンス本文に従う。

@@ -2129,6 +2129,11 @@ mod implementation {
         flags: libc::c_ulong,
         data: Option<&CString>,
     ) -> Result<(), BackendError> {
+        let source_description =
+            source.map_or_else(|| "<none>".to_owned(), |path| path.display().to_string());
+        let target_description = target.display().to_string();
+        let filesystem_description =
+            filesystem.map_or_else(|| "<none>".to_owned(), |path| path.display().to_string());
         let source = source.map(|path| c_path(step, path)).transpose()?;
         let target = c_path(step, target)?;
         let filesystem = filesystem.map(|path| c_path(step, path)).transpose()?;
@@ -2150,7 +2155,14 @@ mod implementation {
             )
         };
         if result == -1 {
-            Err(last_error(step, "mount filesystem"))
+            let error = io::Error::last_os_error();
+            Err(BackendError::new(
+                step,
+                format!(
+                    "mount filesystem source={source_description} target={target_description} filesystem={filesystem_description} flags={flags:#x}"
+                ),
+                error.raw_os_error(),
+            ))
         } else {
             Ok(())
         }

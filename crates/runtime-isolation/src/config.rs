@@ -1,6 +1,9 @@
 //! Validated policy types for the isolation transaction.
 
-use std::path::{Component, Path, PathBuf};
+use std::{
+    os::fd::RawFd,
+    path::{Component, Path, PathBuf},
+};
 
 use crate::{IsolationError, SeccompPolicy};
 
@@ -45,6 +48,43 @@ impl BindMountConfig {
             source: source.into(),
             target: target.into(),
         }
+    }
+}
+
+/// An already-connected, kernel-authenticated control channel kept for the workload.
+///
+/// The launcher must create this `AF_UNIX` `SOCK_SEQPACKET` descriptor before namespace setup.
+/// Keeping a single fixed descriptor lets the workload exchange canonical supervisor messages
+/// through ordinary `read` and `write` calls while seccomp continues to deny socket creation and
+/// connection syscalls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlChannelConfig {
+    fd: RawFd,
+}
+
+impl ControlChannelConfig {
+    /// The only descriptor number an isolated workload may inherit for supervisor control.
+    pub const WORKLOAD_FD: RawFd = 3;
+
+    /// Describes the fixed inherited control descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IsolationError::InvalidConfig`] unless `fd` is the fixed descriptor reserved for
+    /// the supervisor control channel.
+    pub fn new(fd: RawFd) -> Result<Self, IsolationError> {
+        if fd != Self::WORKLOAD_FD {
+            return Err(InvalidConfig::message(
+                "the supervisor control channel must use descriptor 3",
+            ));
+        }
+        Ok(Self { fd })
+    }
+
+    /// Returns the reserved descriptor that the workload inherits.
+    #[must_use]
+    pub const fn fd(self) -> RawFd {
+        self.fd
     }
 }
 
@@ -143,6 +183,7 @@ pub struct IsolationConfig {
     pub(crate) landlock: LandlockConfig,
     pub(crate) seccomp: SeccompPolicy,
     pub(crate) identity: IdentityMap,
+    pub(crate) control_channel: Option<ControlChannelConfig>,
 }
 
 impl IsolationConfig {
@@ -164,7 +205,15 @@ impl IsolationConfig {
             landlock,
             seccomp,
             identity,
+            control_channel: None,
         }
+    }
+
+    /// Retains the fixed preconnected supervisor control channel across isolation and `exec`.
+    #[must_use]
+    pub fn with_control_channel(mut self, control_channel: ControlChannelConfig) -> Self {
+        self.control_channel = Some(control_channel);
+        self
     }
 
     /// Validates all paths, limits, and policy combinations without side effects.
@@ -213,6 +262,23 @@ impl IsolationConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ControlChannelConfig;
+
+    #[test]
+    fn refuses_control_channel_descriptors_other_than_the_reserved_fd() {
+        assert!(ControlChannelConfig::new(2).is_err());
+        assert!(ControlChannelConfig::new(4).is_err());
+        assert_eq!(
+            ControlChannelConfig::new(ControlChannelConfig::WORKLOAD_FD)
+                .expect("the reserved descriptor must be accepted")
+                .fd(),
+            ControlChannelConfig::WORKLOAD_FD
+        );
     }
 }
 

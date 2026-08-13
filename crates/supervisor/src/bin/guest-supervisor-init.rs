@@ -33,7 +33,7 @@ use capfs::{
     read_only::MountInstanceId,
 };
 use rustix::{
-    fs::statfs,
+    fs::{CWD, FileType, Mode, makedev, mknodat, statfs},
     mount::{MountFlags, UnmountFlags, mount, unmount},
     net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with},
     process::{getegid, geteuid},
@@ -60,6 +60,8 @@ const DEVTMPFS_SUPER_MAGIC: i64 = 0x1373;
 const TMPFS_SUPER_MAGIC: i64 = 0x0102_1994;
 const WORKSPACE_DEVICE: &str = "/dev/vdb";
 const FUSE_DEVICE: &str = "/dev/fuse";
+const FUSE_MAJOR: u32 = 10;
+const FUSE_MINOR: u32 = 229;
 
 #[derive(Debug)]
 struct Config {
@@ -412,6 +414,7 @@ fn verify_runtime_devices() -> Result<(), String> {
             "guest workspace device {WORKSPACE_DEVICE} is not a block device"
         ));
     }
+    ensure_fuse_device()?;
     let fuse = fs::metadata(FUSE_DEVICE)
         .map_err(|error| format!("inspecting guest FUSE device {FUSE_DEVICE}: {error}"))?;
     if !fuse.file_type().is_char_device() {
@@ -420,6 +423,28 @@ fn verify_runtime_devices() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Creates the standard FUSE device node when the kernel has not populated it in devtmpfs.
+///
+/// `/dev/fuse` is the one fixed kernel interface needed by the image-configured `CapFS` server;
+/// it is not a host path or a device selected by an untrusted workload. A kernel that lacks the
+/// FUSE driver still rejects the later open, so this node never emulates FUSE support.
+fn ensure_fuse_device() -> Result<(), String> {
+    match fs::symlink_metadata(FUSE_DEVICE) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => mknodat(
+            CWD,
+            FUSE_DEVICE,
+            FileType::CharacterDevice,
+            Mode::RUSR | Mode::WUSR,
+            makedev(FUSE_MAJOR, FUSE_MINOR),
+        )
+        .map_err(|error| format!("creating guest FUSE device {FUSE_DEVICE}: {error}")),
+        Err(error) => Err(format!(
+            "inspecting guest FUSE device {FUSE_DEVICE}: {error}"
+        )),
+    }
 }
 
 /// Mounts the cgroup v2 hierarchy that owns all supervisor-created workload leaves.

@@ -9,6 +9,8 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
+    io::{Read, Write},
+    os::unix::net::UnixStream,
     os::unix::{ffi::OsStringExt, process::CommandExt},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -25,6 +27,7 @@ const LANDLOCK_ABI: u32 = 3;
 #[derive(Debug)]
 struct LauncherConfig {
     isolation: IsolationConfig,
+    start_gate: PathBuf,
     program: PathBuf,
     arguments: Vec<OsString>,
     environment: Vec<(OsString, OsString)>,
@@ -42,6 +45,7 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), String> {
     let config = parse_config(env::args_os().skip(1))?;
+    wait_for_start_gate(&config.start_gate)?;
     let mut backend = LinuxBackend::new();
     match RuntimeIsolation::spawn_isolated(&mut backend, &config.isolation, |_| {
         execute_workload(&config)
@@ -80,6 +84,25 @@ fn run() -> Result<(), String> {
     }
 }
 
+fn wait_for_start_gate(path: &Path) -> Result<(), String> {
+    let mut gate = UnixStream::connect(path).map_err(|error| {
+        format!(
+            "connecting to parent-controlled workload start gate {}: {error}",
+            path.display()
+        )
+    })?;
+    gate.write_all(b"ready")
+        .map_err(|error| format!("announcing workload start-gate readiness: {error}"))?;
+    let mut release = [0_u8; 1];
+    gate.read_exact(&mut release)
+        .map_err(|error| format!("waiting for workload start-gate release: {error}"))?;
+    if release == [1] {
+        Ok(())
+    } else {
+        Err("parent refused workload start-gate release".to_owned())
+    }
+}
+
 fn execute_workload(config: &LauncherConfig) -> Result<(), String> {
     let error = Command::new(&config.program)
         .args(&config.arguments)
@@ -112,6 +135,7 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
     let pids_max = required_u64(&mut arguments, "--pids-max")?;
     let host_uid = required_u32(&mut arguments, "--host-uid")?;
     let host_gid = required_u32(&mut arguments, "--host-gid")?;
+    let start_gate = required_path(&mut arguments, "--start-gate")?;
 
     let mut read_only_paths = Vec::new();
     let mut writable_paths = Vec::new();
@@ -161,6 +185,7 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
 
     Ok(LauncherConfig {
         isolation,
+        start_gate,
         program,
         arguments: workload_arguments,
         environment,
@@ -257,7 +282,7 @@ fn is_absolute_lexical_path(path: &Path) -> bool {
 }
 
 fn usage() -> String {
-    "usage: workload-isolation-launcher --rootfs-source <absolute-path> --rootfs-mount-target <absolute-path> --old-root <absolute-path> --workspace-source <absolute-path> --workspace-target <absolute-path> --tmpfs-target <absolute-path> --tmpfs-size-bytes <u64> --cgroup-root <absolute-path> --cgroup-name <safe-name> --memory-max-bytes <u64> --pids-max <u64> --host-uid <u32> --host-gid <u32> --landlock-read-only <absolute-path>... --landlock-writable <absolute-path>... [--env NAME=VALUE]... --program <absolute-path> -- [arguments...]".to_owned()
+    "usage: workload-isolation-launcher --rootfs-source <absolute-path> --rootfs-mount-target <absolute-path> --old-root <absolute-path> --workspace-source <absolute-path> --workspace-target <absolute-path> --tmpfs-target <absolute-path> --tmpfs-size-bytes <u64> --cgroup-root <absolute-path> --cgroup-name <safe-name> --memory-max-bytes <u64> --pids-max <u64> --host-uid <u32> --host-gid <u32> --start-gate <absolute-path> --landlock-read-only <absolute-path>... --landlock-writable <absolute-path>... [--env NAME=VALUE]... --program <absolute-path> -- [arguments...]".to_owned()
 }
 
 #[cfg(test)]
@@ -292,6 +317,8 @@ mod tests {
             "1000",
             "--host-gid",
             "1000",
+            "--start-gate",
+            "/run/supervisor/start-gate.sock",
             "--landlock-read-only",
             "/",
             "--landlock-writable",

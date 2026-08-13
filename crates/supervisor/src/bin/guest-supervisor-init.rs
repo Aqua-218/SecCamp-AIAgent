@@ -104,6 +104,8 @@ fn run_session(config: &Config, identity: &GuestIdentity, workspace: &Path) -> R
         .map_err(|error| format!("creating guest control directory: {error}"))?;
     fs::create_dir_all(&mountpoint)
         .map_err(|error| format!("creating guest CapFS mount directory: {error}"))?;
+    fs::create_dir_all(&rootfs_mount_target)
+        .map_err(|error| format!("creating guest isolation rootfs mount directory: {error}"))?;
 
     let isolation = WorkloadIsolationConfig::new(
         &config.isolation_launcher,

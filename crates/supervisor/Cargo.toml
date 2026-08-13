@@ -18,6 +18,7 @@ runtime-isolation = { path = "../runtime-isolation" }
 capfs = { path = "../capfs" }
 fuser = { version = "0.18.0", default-features = false }
 rustix = { version = "1.1.4", features = ["fs", "mount", "net", "process"] }
+socket2 = { version = "0.6.5", features = ["all"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

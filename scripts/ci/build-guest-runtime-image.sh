@@ -291,7 +291,6 @@ for executable in "${guest_control_init}" "${guest_supervisor_init}" "${isolatio
   install_elf_dependencies "${executable}"
 done
 install -d -m 0755 "${staging}/root/run/guest-supervisor"
-install -d -m 0755 "${staging}/root/.old-root"
 install -d -m 0755 "${staging}/root/workspace"
 install -d -m 0755 "${staging}/root/sys/fs/cgroup"
 install -d -m 1777 "${staging}/root/tmp"

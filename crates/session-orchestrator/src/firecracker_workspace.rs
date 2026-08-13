@@ -25,6 +25,12 @@ struct SharedWorkspaceState<F> {
     prepared: HashMap<crate::WorkspaceId, PreparedWorkspace>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceImageState {
+    NotCreated,
+    Created,
+}
+
 /// The exact binding retained after the orchestrator prepares a workspace.
 struct PreparedWorkspace {
     session_id: crate::SessionId,
@@ -33,6 +39,7 @@ struct PreparedWorkspace {
     session_jail_root: PathBuf,
     destination: PathBuf,
     runtime_claimed: bool,
+    runtime_image: WorkspaceImageState,
     runtime_released: bool,
     orchestrator_released: bool,
 }
@@ -188,6 +195,7 @@ where
                 session_jail_root,
                 destination,
                 runtime_claimed: false,
+                runtime_image: WorkspaceImageState::NotCreated,
                 runtime_released: false,
                 orchestrator_released: false,
             },
@@ -331,6 +339,52 @@ where
         Ok(())
     }
 
+    fn create_workspace_image(
+        &mut self,
+        workspace: &Path,
+        image: &Path,
+        size_bytes: u64,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
+        let workspace_id = state
+            .prepared
+            .values()
+            .find(|record| record.destination == workspace)
+            .map(|record| record.workspace_id)
+            .ok_or_else(|| {
+                runtime_workspace_error(
+                    "workspace image is not bound to a prepared workspace destination",
+                )
+            })?;
+        let record = state.prepared.get(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared while preparing its block image")
+        })?;
+        let expected_image = record.destination.with_extension("ext4");
+        if !record.runtime_claimed || record.runtime_released || record.orchestrator_released {
+            return Err(runtime_workspace_error(
+                "workspace image requires a live Runtime claim",
+            ));
+        }
+        if record.runtime_image == WorkspaceImageState::Created {
+            return Err(runtime_workspace_error(
+                "workspace image was already created for this Runtime claim",
+            ));
+        }
+        if image != expected_image {
+            return Err(runtime_workspace_error(
+                "workspace image path is not the exact session-owned sibling",
+            ));
+        }
+        state
+            .filesystem
+            .create_workspace_image(workspace, image, size_bytes)?;
+        let record = state.prepared.get_mut(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared after creating its block image")
+        })?;
+        record.runtime_image = WorkspaceImageState::Created;
+        Ok(())
+    }
+
     fn remove_workspace(&mut self, path: &Path) -> Result<(), RuntimeError> {
         let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
         let workspace_id = state
@@ -413,6 +467,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeState {
         clones: Vec<(PathBuf, PathBuf)>,
+        images: Vec<(PathBuf, PathBuf, u64)>,
         reads: Vec<PathBuf>,
         block_bindings: Vec<(PathBuf, PathBuf)>,
         removals: Vec<PathBuf>,
@@ -450,6 +505,20 @@ mod tests {
                 .expect("fake state must not be poisoned")
                 .clones
                 .push((source.to_owned(), destination.to_owned()));
+            Ok(())
+        }
+
+        fn create_workspace_image(
+            &mut self,
+            workspace: &Path,
+            image: &Path,
+            size_bytes: u64,
+        ) -> Result<(), RuntimeError> {
+            self.state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .images
+                .push((workspace.to_owned(), image.to_owned(), size_bytes));
             Ok(())
         }
 
@@ -550,6 +619,49 @@ mod tests {
                 .clones
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn workspace_image_is_forwarded_once_only_for_the_claimed_session_sibling() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let (mut backend, mut runtime_filesystem) = adapters(Arc::clone(&state));
+        let session = identity(0x11, 0xab);
+        let workspace_id = session.workspace_id().to_string();
+        let workspace = PathBuf::from(format!(
+            "/srv/jailer/firecracker/{workspace_id}/root/workspace/{workspace_id}"
+        ));
+        let image = workspace.with_extension("ext4");
+        backend
+            .clone_workspace(&session, &WorkspaceTemplateId::new("template-a"))
+            .expect("orchestrator clone must succeed");
+        runtime_filesystem
+            .clone_workspace(Path::new("/workspace/source"), &workspace)
+            .expect("runtime must claim the prepared clone");
+
+        assert!(
+            runtime_filesystem
+                .create_workspace_image(
+                    &workspace,
+                    &workspace.with_extension("foreign"),
+                    64 * 1024 * 1024
+                )
+                .is_err()
+        );
+        runtime_filesystem
+            .create_workspace_image(&workspace, &image, 64 * 1024 * 1024)
+            .expect("exact image must be forwarded once");
+        assert!(
+            runtime_filesystem
+                .create_workspace_image(&workspace, &image, 64 * 1024 * 1024)
+                .is_err()
+        );
+        assert_eq!(
+            state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .images,
+            [(workspace, image, 64 * 1024 * 1024)]
         );
     }
 

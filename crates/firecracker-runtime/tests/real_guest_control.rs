@@ -60,9 +60,8 @@ enum GuestWorkload {
 impl GuestWorkload {
     const fn program(self) -> &'static str {
         match self {
-            Self::Sleep | Self::CgroupProbe | Self::BrokerProbe => {
-                "/usr/local/libexec/guest-workload"
-            }
+            Self::Sleep | Self::BrokerProbe => "/usr/local/libexec/guest-workload",
+            Self::CgroupProbe => "/usr/bin/dash",
             Self::RuntimeBrokerProbe => "/usr/local/libexec/guest-supervisor-init",
         }
     }
@@ -71,7 +70,7 @@ impl GuestWorkload {
         match self {
             Self::Sleep => "sleep 600",
             Self::CgroupProbe => {
-                r#"sh -c \"/usr/local/libexec/guest-workload mkdir -p /sys/fs/cgroup; /usr/local/libexec/guest-workload mount -t cgroup2 none /sys/fs/cgroup; printf 'cgroup-probe-controllers: '; /usr/local/libexec/guest-workload cat /sys/fs/cgroup/cgroup.controllers; sleep 600\""#
+                r#"-c \"/usr/bin/mkdir -p /sys/fs/cgroup; /usr/bin/mount -t cgroup2 none /sys/fs/cgroup; printf 'cgroup-probe-controllers: '; /usr/bin/cat /sys/fs/cgroup/cgroup.controllers; /usr/bin/sleep 600\""#
             }
             Self::BrokerProbe => "--port 18081",
             Self::RuntimeBrokerProbe => {

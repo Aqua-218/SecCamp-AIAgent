@@ -74,7 +74,10 @@ fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("guest-supervisor-init: {error}");
+            eprintln!(
+                "guest-supervisor-init: {error}; fixed image arguments: {:?}",
+                env::args_os().skip(1).collect::<Vec<_>>()
+            );
             std::process::ExitCode::FAILURE
         }
     }

@@ -30,13 +30,17 @@ use authority_core::{
 };
 use egress_broker::{
     dispatch::{
-        BrokerDispatcher, DispatchContext, PublicDispatchAdapter, default_github_response_cap,
+        BrokerDispatcher, DispatchContext, DispatchError, PublicDispatchAdapter,
+        default_github_response_cap,
     },
     github::{GitHubAdapter, GitHubAdapterError, GitHubResponse},
     public_fetch::{FetchError, PublicResponse},
-    server::{ConnectionCloseReason, ConnectionReport, serve_connection},
+    server::{ConnectionCloseReason, ConnectionReport, ServerError, serve_connection},
 };
-use egress_protocol::{budget::SessionBudgetLimits, session::BrokerSessionId};
+use egress_protocol::{
+    budget::SessionBudgetLimits,
+    session::{BrokerSessionId, EnvelopeError},
+};
 use firecracker_runtime::{
     ApiClient, ApiRequest, FirecrackerVsockApiClient, HttpMethod, IdentityBundle, IdentityId,
     RuntimeError, UnixApiClient, firecracker_guest_port_path,
@@ -340,7 +344,14 @@ fn serve_probe_connection(
                     &mut clock,
                     NonZeroUsize::new(1).expect("fixed connection request limit must be non-zero"),
                 )
-                .map_err(|error| format!("serving guest Broker request: {error}"));
+                .map_err(|error| match error {
+                    ServerError::Dispatch(DispatchError::Envelope(
+                        EnvelopeError::WrongSession { expected, received },
+                    )) => format!(
+                        "serving guest Broker request: expected session {expected:?}, received {received:?}"
+                    ),
+                    error => format!("serving guest Broker request: {error}"),
+                });
             }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>

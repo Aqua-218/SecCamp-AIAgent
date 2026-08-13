@@ -22,7 +22,8 @@ mod supervisor;
 #[cfg(target_os = "linux")]
 pub use linux_host::{
     LinuxHostConfig, LinuxHostError, LinuxHostResources, WORKLOAD_CONTROL_SOCKET_ENV,
-    WORKLOAD_MOUNTPOINT_ENV, WORKLOAD_SUBJECT_ENV,
+    WORKLOAD_MOUNTPOINT_ENV, WORKLOAD_SUBJECT_ENV, WorkloadIsolationConfig,
+    WorkloadIsolationLimits,
 };
 
 #[cfg(target_os = "linux")]

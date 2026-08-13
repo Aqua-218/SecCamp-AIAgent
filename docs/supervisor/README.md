@@ -77,7 +77,9 @@ lifecycle、順序、rollback、handle の所有権はすべて `CapabilityKerne
 
 production の caller resolver と control socket は [`control_socket.rs`](../../crates/supervisor/src/control_socket.rs) にある。subject ごとの `SOCK_SEQPACKET` listener が `SO_PEERCRED` から `ConnectionIdentity` を組み立て、request bytes を読む前に subject を確定させる。実 socket を使った module test で検証済みである。
 
-一方、Linux の namespace / cgroup / mount 実装、実 workload、実 guest control channel はこの crate に存在しない。listener を subject の setup 経路へ結線する host 側の組み立てと、guest VM 内の agent process からの end-to-end も未検証である。
+cgroup、control socket、workload の実 Linux 実装は [`linux_host.rs`](../../crates/supervisor/src/linux_host.rs) の `LinuxHostResources` にある。subject ごとに cgroup v2 leaf を作り、`SOCK_SEQPACKET` の control socket を bind し、workload をその leaf に閉じ込めて起動し、停止時は `cgroup.kill` で subtree ごと落として reap する。capfs の実 mount と unmount は `CapfsRuntimeResources` が持つ。
+
+handle には OS object を持たせていない。subject の file は capfs mount 越しに触るので descriptor は guest 側にあり、host が知る必要があるのは「どの handle identity をまだ保持しているか」だけである。listener を subject の setup 経路へ結線する host 側の組み立てと、guest VM 内の agent process からの end-to-end も未検証である。
 
 検査があるのに test が無い箇所がいくつかある。`ConnectionNotBoundToSubject`、`GrantSubjectMismatch`、`DuplicateSubject`、親の非 Running gate、`derive` の拒否経路。詳細は[検証対応表](verification.md)。
 

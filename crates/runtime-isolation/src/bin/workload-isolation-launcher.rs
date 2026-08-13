@@ -14,7 +14,7 @@ use std::{
     os::unix::net::UnixStream,
     os::unix::{ffi::OsStringExt, process::CommandExt},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
 };
 
 use runtime_isolation::{
@@ -177,12 +177,9 @@ fn execute_workload(
         .env(EGRESS_BROKER_FD_ENV, egress_broker_fd.to_string())
         .env(EGRESS_BROKER_SESSION_ENV, &config.egress_broker_session)
         .current_dir(&config.workload_directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        // Keep normal workload output closed, but retain stderr on the guest serial console so
-        // an image-configured program cannot fail after the isolation attestation without a
-        // diagnostic. No host command line or credential reaches this process.
-        .stderr(Stdio::inherit())
+        // Standard descriptors were replaced with close-on-exec `/dev/null` placeholders before
+        // this transaction. Do not reopen `/dev/null` here: the device tree is intentionally
+        // hidden before the workload is execed.
         .exec();
     Err(format!(
         "execing configured workload {} after isolation: {error}",

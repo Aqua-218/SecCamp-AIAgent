@@ -25,13 +25,28 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use crate::{
     audit::AttemptOutcome,
     capability::{AuthorityRequest, CapId, CapabilityRequest, CapabilityRequestSet, SubjectId},
+    file::{FileEffect, FileRequest},
+    github::{BranchName, GitHubOperation, GitHubRequest, InstallationId},
+    http::{CanonicalHost, CanonicalUrlPath, HttpFetchMethod, HttpFetchRequest},
+    path::CanonicalPath,
+    repository::RepoId,
     state::AuthorizationEpoch,
+    time::MonotonicTime,
 };
 
 const MAGIC: &[u8; 8] = b"AUTHWAL1";
 const VERSION: u16 = 1;
 const START_KIND: u8 = 1;
 const FINISH_KIND: u8 = 2;
+/// A later verdict attached to an attempt whose commit was recorded as unknown.
+///
+/// Reconciliation never rewrites the terminal record. The ambiguity actually happened, and an
+/// audit trail that edits it away cannot be used to answer "what did this host believe, and
+/// when". The verdict is a new append-only frame that refers back to the attempt.
+const RECONCILE_KIND: u8 = 3;
+const RECONCILE_PAYLOAD_VERSION: u8 = 1;
+const RECONCILED_COMMITTED: u8 = 1;
+const RECONCILED_NOT_COMMITTED: u8 = 2;
 const HEADER_LEN: usize = 8 + 2 + 1 + 1 + 8 + 8 + 4;
 const CHECKSUM_LEN: usize = 8;
 const MAX_RECORD_PAYLOAD: usize = 8 * 1024 * 1024;
@@ -132,6 +147,15 @@ impl CommitUnknownEvidence {
     }
 }
 
+/// What an external provider reported about an attempt whose commit was unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconciledCommit {
+    /// The provider confirmed the effect landed, with the receipt it reported.
+    Committed(CommitReceipt),
+    /// The provider confirmed the effect never landed.
+    NotCommitted,
+}
+
 /// A recovered durable attempt, including attempts whose completion was not
 /// known when the process stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +167,7 @@ pub struct DurableAttempt {
     finish_sequence: Option<u64>,
     receipt: Option<CommitReceipt>,
     commit_unknown_evidence: Option<CommitUnknownEvidence>,
+    reconciliation: Option<ReconciledCommit>,
 }
 
 impl DurableAttempt {
@@ -186,6 +211,75 @@ impl DurableAttempt {
     #[must_use]
     pub fn commit_unknown_evidence(&self) -> Option<&CommitUnknownEvidence> {
         self.commit_unknown_evidence.as_ref()
+    }
+
+    /// Returns the later provider verdict, if this attempt's ambiguity was resolved.
+    ///
+    /// `None` on a `CommitUnknown` attempt means the ambiguity is still open, not that the effect
+    /// did not happen.
+    #[must_use]
+    pub const fn reconciliation(&self) -> Option<&ReconciledCommit> {
+        self.reconciliation.as_ref()
+    }
+
+    /// Decodes the canonical attempt metadata this record was started with.
+    ///
+    /// Without this an audit reader sees opaque bytes and has to reimplement the writer's format
+    /// to learn who was authorized for what. Reading through the same module that writes is what
+    /// keeps the two from drifting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableAuditError::InvalidRecord`] when the payload is truncated, uses an
+    /// unknown version or authority tag, or contains a value the typed request rejects.
+    pub fn metadata(&self) -> Result<DurableAttemptMetadata, DurableAuditError> {
+        decode_attempt_payload(&self.payload)
+    }
+}
+
+/// Canonical metadata decoded from one attempt START record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableAttemptMetadata {
+    state_instance: u64,
+    caller: SubjectId,
+    capability_id: CapId,
+    authorization_epoch: AuthorizationEpoch,
+    requests: CapabilityRequestSet,
+}
+
+impl DurableAttemptMetadata {
+    /// Returns the capability-state instance that authorized this attempt.
+    ///
+    /// `CapId` and `SubjectId` are unique only inside one [`crate::state::CapabilityState`], so
+    /// two records naming the same capability describe the same capability only when this value
+    /// matches. Records written before the instance was recorded decode as instance 0.
+    #[must_use]
+    pub const fn state_instance(&self) -> u64 {
+        self.state_instance
+    }
+
+    /// Returns the subject the attempt was authorized for.
+    #[must_use]
+    pub const fn caller(&self) -> &SubjectId {
+        &self.caller
+    }
+
+    /// Returns the capability the attempt was authorized against.
+    #[must_use]
+    pub const fn capability_id(&self) -> &CapId {
+        &self.capability_id
+    }
+
+    /// Returns the authorization epoch current when the attempt started.
+    #[must_use]
+    pub const fn authorization_epoch(&self) -> AuthorizationEpoch {
+        self.authorization_epoch
+    }
+
+    /// Returns the complete request set authorized as one atomic operation.
+    #[must_use]
+    pub const fn requests(&self) -> &CapabilityRequestSet {
+        &self.requests
     }
 }
 
@@ -353,6 +447,7 @@ struct DurableAttemptState {
     finish_sequence: Option<u64>,
     receipt: Option<CommitReceipt>,
     commit_unknown_evidence: Option<CommitUnknownEvidence>,
+    reconciliation: Option<ReconciledCommit>,
 }
 
 impl DurableAttemptState {
@@ -365,6 +460,7 @@ impl DurableAttemptState {
             finish_sequence: self.finish_sequence,
             receipt: self.receipt.clone(),
             commit_unknown_evidence: self.commit_unknown_evidence.clone(),
+            reconciliation: self.reconciliation.clone(),
         }
     }
 }
@@ -714,6 +810,7 @@ impl DurableAuditLog {
                 finish_sequence: None,
                 receipt: None,
                 commit_unknown_evidence: None,
+                reconciliation: None,
             },
         );
         state.next_sequence = sequence.checked_add(1);
@@ -758,6 +855,54 @@ impl DurableAuditLog {
         attempt.finish_sequence = Some(sequence);
         attempt.receipt = receipt.cloned();
         attempt.commit_unknown_evidence = commit_unknown_evidence.cloned();
+        state.next_sequence = sequence.checked_add(1);
+        Ok(())
+    }
+
+    /// Appends the provider verdict that resolves one previously unknown commit.
+    ///
+    /// The terminal `CommitUnknown` record stays exactly as written. This adds what was learned
+    /// afterwards, so the journal shows both that the host could not tell at the time and what
+    /// the provider said later.
+    ///
+    /// # Errors
+    ///
+    /// Returns a durable journal error when the attempt is unknown, is not `CommitUnknown`, has
+    /// already been reconciled, carries a receipt for another attempt, or cannot be synced.
+    pub fn reconcile_attempt(
+        &self,
+        attempt_id: crate::audit::AttemptId,
+        verdict: &ReconciledCommit,
+    ) -> Result<(), DurableAuditError> {
+        if let ReconciledCommit::Committed(receipt) = verdict
+            && receipt.attempt_id() != attempt_id
+        {
+            return Err(DurableAuditError::InvalidRecord(
+                "reconciled receipt belongs to another attempt".to_owned(),
+            ));
+        }
+        let payload = encode_reconcile_payload(verdict)?;
+        let mut state = self.lock_state()?;
+        if state.unusable {
+            return Err(DurableAuditError::JournalUnavailable);
+        }
+        let Some(attempt) = state.attempts.get(&attempt_id) else {
+            return Err(DurableAuditError::ReplayDetected { attempt_id });
+        };
+        if attempt.outcome != AttemptOutcome::CommitUnknown {
+            return Err(DurableAuditError::InvalidRecord(
+                "only an unknown commit can be reconciled".to_owned(),
+            ));
+        }
+        if attempt.reconciliation.is_some() {
+            return Err(DurableAuditError::ReplayDetected { attempt_id });
+        }
+        let sequence = next_sequence(&state)?;
+        append_frame(&mut state, sequence, RECONCILE_KIND, attempt_id, &payload)?;
+        let attempt = state.attempts.get_mut(&attempt_id).ok_or_else(|| {
+            DurableAuditError::InvalidRecord("attempt disappeared during reconciliation".to_owned())
+        })?;
+        attempt.reconciliation = Some(verdict.clone());
         state.next_sequence = sequence.checked_add(1);
         Ok(())
     }
@@ -1267,6 +1412,7 @@ fn parse_journal(
                         finish_sequence: None,
                         receipt: None,
                         commit_unknown_evidence: None,
+                        reconciliation: None,
                     },
                 );
             }
@@ -1284,6 +1430,7 @@ fn parse_journal(
                 attempt.receipt = receipt;
                 attempt.commit_unknown_evidence = commit_unknown_evidence;
             }
+            RECONCILE_KIND => apply_reconcile_frame(&mut attempts, attempt_id, payload)?,
             _ => {
                 return Err(DurableAuditError::InvalidRecord(
                     "unknown journal record kind".to_owned(),
@@ -1295,6 +1442,27 @@ fn parse_journal(
             .ok_or(DurableAuditError::SequenceExhausted)?;
     }
     Ok((Some(expected_sequence), attempts))
+}
+
+fn apply_reconcile_frame(
+    attempts: &mut BTreeMap<crate::audit::AttemptId, DurableAttemptState>,
+    attempt_id: crate::audit::AttemptId,
+    payload: &[u8],
+) -> Result<(), DurableAuditError> {
+    let verdict = decode_reconcile_payload(payload, attempt_id)?;
+    let Some(attempt) = attempts.get_mut(&attempt_id) else {
+        return Err(DurableAuditError::ReplayDetected { attempt_id });
+    };
+    if attempt.outcome != AttemptOutcome::CommitUnknown {
+        return Err(DurableAuditError::InvalidRecord(
+            "only an unknown commit can be reconciled".to_owned(),
+        ));
+    }
+    if attempt.reconciliation.is_some() {
+        return Err(DurableAuditError::ReplayDetected { attempt_id });
+    }
+    attempt.reconciliation = Some(verdict);
+    Ok(())
 }
 
 fn validate_finish(
@@ -1572,9 +1740,293 @@ impl PayloadWriter {
         Ok(())
     }
 
+    fn bytes(&mut self, value: &[u8]) {
+        self.bytes.extend_from_slice(value);
+    }
+
     fn finish(self) -> Vec<u8> {
         self.bytes
     }
+}
+
+struct PayloadReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> PayloadReader<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], DurableAuditError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| invalid_payload("attempt payload length overflowed"))?;
+        let slice = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| invalid_payload("attempt payload ended early"))?;
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn byte(&mut self) -> Result<u8, DurableAuditError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, DurableAuditError> {
+        let bytes: [u8; 4] = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| invalid_payload("attempt payload holds a malformed u32"))?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64, DurableAuditError> {
+        let bytes: [u8; 8] = self
+            .take(8)?
+            .try_into()
+            .map_err(|_| invalid_payload("attempt payload holds a malformed u64"))?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn string(&mut self) -> Result<String, DurableAuditError> {
+        let length = usize::try_from(self.u32()?)
+            .map_err(|_| invalid_payload("attempt payload string exceeds this platform"))?;
+        let bytes = self.take(length)?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| invalid_payload("attempt payload string is not UTF-8"))
+    }
+
+    fn segments(&mut self) -> Result<Vec<String>, DurableAuditError> {
+        let count = usize::try_from(self.u32()?)
+            .map_err(|_| invalid_payload("attempt payload segment count exceeds this platform"))?;
+        // A count is not evidence that the bytes exist, so each segment is read before the next
+        // is expected. Preallocating from the count would let a corrupt record request any size.
+        let mut segments = Vec::new();
+        for _ in 0..count {
+            segments.push(self.string()?);
+        }
+        Ok(segments)
+    }
+
+    const fn is_exhausted(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+}
+
+fn invalid_payload(message: &str) -> DurableAuditError {
+    DurableAuditError::InvalidRecord(message.to_owned())
+}
+
+fn encode_reconcile_payload(verdict: &ReconciledCommit) -> Result<Vec<u8>, DurableAuditError> {
+    let mut writer = PayloadWriter::new();
+    writer.byte(RECONCILE_PAYLOAD_VERSION);
+    match verdict {
+        ReconciledCommit::Committed(receipt) => {
+            writer.byte(RECONCILED_COMMITTED);
+            writer.u64(receipt.attempt_id().as_u64());
+            let token = receipt.token();
+            let length = u32::try_from(token.len())
+                .map_err(|_| DurableAuditError::RecordTooLarge(token.len()))?;
+            writer.u32(length);
+            writer.bytes(token);
+        }
+        ReconciledCommit::NotCommitted => writer.byte(RECONCILED_NOT_COMMITTED),
+    }
+    let payload = writer.finish();
+    if payload.len() > MAX_RECORD_PAYLOAD {
+        return Err(DurableAuditError::RecordTooLarge(payload.len()));
+    }
+    Ok(payload)
+}
+
+fn decode_reconcile_payload(
+    payload: &[u8],
+    attempt_id: crate::audit::AttemptId,
+) -> Result<ReconciledCommit, DurableAuditError> {
+    let mut reader = PayloadReader::new(payload);
+    let version = reader.byte()?;
+    if version != RECONCILE_PAYLOAD_VERSION {
+        return Err(invalid_payload(&format!(
+            "unsupported reconciliation payload version {version}"
+        )));
+    }
+    let verdict = match reader.byte()? {
+        RECONCILED_COMMITTED => {
+            let recorded = crate::audit::AttemptId::from_u64(reader.u64()?);
+            if recorded != attempt_id {
+                return Err(invalid_payload(
+                    "reconciled receipt belongs to another attempt",
+                ));
+            }
+            let length = usize::try_from(reader.u32()?)
+                .map_err(|_| invalid_payload("reconciled receipt exceeds this platform"))?;
+            let token = reader.take(length)?.to_vec();
+            if token.is_empty() {
+                return Err(invalid_payload("reconciled receipt token is empty"));
+            }
+            ReconciledCommit::Committed(CommitReceipt::new(attempt_id, token))
+        }
+        RECONCILED_NOT_COMMITTED => ReconciledCommit::NotCommitted,
+        tag => {
+            return Err(invalid_payload(&format!(
+                "unknown reconciliation verdict {tag}"
+            )));
+        }
+    };
+    if !reader.is_exhausted() {
+        return Err(invalid_payload("reconciliation payload has trailing bytes"));
+    }
+    Ok(verdict)
+}
+
+fn decode_attempt_payload(payload: &[u8]) -> Result<DurableAttemptMetadata, DurableAuditError> {
+    let mut reader = PayloadReader::new(payload);
+    let version = reader.byte()?;
+    let state_instance = match version {
+        // Version 1 predates the recorded capability-state instance and is always the first one.
+        1 => 0,
+        2 => reader.u64()?,
+        _ => {
+            return Err(invalid_payload(&format!(
+                "unsupported attempt payload version {version}"
+            )));
+        }
+    };
+    let caller = SubjectId::new(reader.string()?);
+    let capability_id = CapId::new(reader.string()?);
+    let authorization_epoch = AuthorizationEpoch::from_u64(reader.u64()?);
+    let count = reader.u32()?;
+    if count == 0 {
+        return Err(invalid_payload("attempt payload authorized no request"));
+    }
+    let mut requests = Vec::new();
+    for _ in 0..count {
+        let time = MonotonicTime::from_ticks(reader.u64()?);
+        requests.push(CapabilityRequest::new(
+            time,
+            decode_authority_request(&mut reader)?,
+        ));
+    }
+    if !reader.is_exhausted() {
+        return Err(invalid_payload("attempt payload has trailing bytes"));
+    }
+    let mut requests = requests.into_iter();
+    let first = requests
+        .next()
+        .ok_or_else(|| invalid_payload("attempt payload authorized no request"))?;
+    let requests = CapabilityRequestSet::new(first, requests);
+    Ok(DurableAttemptMetadata {
+        state_instance,
+        caller,
+        capability_id,
+        authorization_epoch,
+        requests,
+    })
+}
+
+fn decode_file_effect(tag: u8) -> Result<FileEffect, DurableAuditError> {
+    // Written as `effect as u8`, so this match is the only thing keeping the two in step.
+    match tag {
+        0 => Ok(FileEffect::ReadData),
+        1 => Ok(FileEffect::ListDirectory),
+        2 => Ok(FileEffect::WriteData),
+        3 => Ok(FileEffect::Truncate),
+        4 => Ok(FileEffect::CreateFile),
+        5 => Ok(FileEffect::CreateDirectory),
+        6 => Ok(FileEffect::RemoveFile),
+        7 => Ok(FileEffect::RemoveDirectory),
+        8 => Ok(FileEffect::Rename),
+        9 => Ok(FileEffect::SetMetadata),
+        10 => Ok(FileEffect::ReadLink),
+        11 => Ok(FileEffect::CreateSymlink),
+        12 => Ok(FileEffect::CreateHardLink),
+        _ => Err(invalid_payload(&format!(
+            "attempt payload holds unknown file effect {tag}"
+        ))),
+    }
+}
+
+fn decode_http_method(tag: u8) -> Result<HttpFetchMethod, DurableAuditError> {
+    match tag {
+        0 => Ok(HttpFetchMethod::Get),
+        1 => Ok(HttpFetchMethod::Head),
+        _ => Err(invalid_payload(&format!(
+            "attempt payload holds unknown HTTP method {tag}"
+        ))),
+    }
+}
+
+fn decode_github_operation(tag: u8) -> Result<GitHubOperation, DurableAuditError> {
+    match tag {
+        0 => Ok(GitHubOperation::PublishBranch),
+        1 => Ok(GitHubOperation::CreatePullRequest),
+        _ => Err(invalid_payload(&format!(
+            "attempt payload holds unknown GitHub operation {tag}"
+        ))),
+    }
+}
+
+fn decode_authority_request(
+    reader: &mut PayloadReader<'_>,
+) -> Result<AuthorityRequest, DurableAuditError> {
+    match reader.byte()? {
+        1 => {
+            let repository = RepoId::new(reader.string()?);
+            let effect = decode_file_effect(reader.byte()?)?;
+            let path = CanonicalPath::new(reader.segments()?)
+                .map_err(|error| invalid_payload(&format!("attempt payload path: {error}")))?;
+            Ok(AuthorityRequest::File(FileRequest::new(
+                repository, effect, path,
+            )))
+        }
+        2 => {
+            let method = decode_http_method(reader.byte()?)?;
+            let host = CanonicalHost::new(reader.string()?)
+                .map_err(|error| invalid_payload(&format!("attempt payload host: {error}")))?;
+            let path = decode_url_path(&reader.segments()?)?;
+            let max_response_bytes = reader.u64()?;
+            Ok(AuthorityRequest::HttpFetch(HttpFetchRequest::new(
+                method,
+                host,
+                path,
+                max_response_bytes,
+            )))
+        }
+        3 => {
+            let installation = InstallationId::new(reader.string()?);
+            let repository = RepoId::new(reader.string()?);
+            let operation = decode_github_operation(reader.byte()?)?;
+            let base = decode_branch(&reader.segments()?)?;
+            let head = decode_branch(&reader.segments()?)?;
+            Ok(AuthorityRequest::GitHub(GitHubRequest::new(
+                installation,
+                repository,
+                operation,
+                base,
+                head,
+            )))
+        }
+        tag => Err(invalid_payload(&format!(
+            "attempt payload holds unknown authority tag {tag}"
+        ))),
+    }
+}
+
+fn decode_url_path(segments: &[String]) -> Result<CanonicalUrlPath, DurableAuditError> {
+    if segments.is_empty() {
+        return Ok(CanonicalUrlPath::root());
+    }
+    CanonicalUrlPath::new(format!("/{}", segments.join("/")))
+        .map_err(|error| invalid_payload(&format!("attempt payload URL path: {error}")))
+}
+
+fn decode_branch(segments: &[String]) -> Result<BranchName, DurableAuditError> {
+    BranchName::new(segments.join("/"))
+        .map_err(|error| invalid_payload(&format!("attempt payload branch: {error}")))
 }
 
 fn encode_authority_request(
@@ -1650,7 +2102,8 @@ mod tests {
 
     use super::{
         CommitReceipt, CommitUnknownEvidence, DurableAuditError, DurableAuditLog, DurableAuditView,
-        MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES, MAX_JOURNAL_BYTES, PRIVATE_FILE_MODE, durable_lock_name,
+        MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES, MAX_JOURNAL_BYTES, PRIVATE_FILE_MODE,
+        decode_attempt_payload, durable_lock_name, encode_attempt_payload,
         validate_owner_and_permissions,
     };
     use crate::{
@@ -2336,6 +2789,124 @@ mod tests {
                 .expect("rejected evidence must leave the journal readable")[0]
                 .outcome(),
             AttemptOutcome::Started
+        );
+    }
+    #[test]
+    fn attempt_payload_round_trips_every_authority_shape() {
+        use crate::{
+            github::{BranchName, GitHubOperation, GitHubRequest, InstallationId},
+            http::{CanonicalHost, CanonicalUrlPath, HttpFetchMethod, HttpFetchRequest},
+        };
+
+        let file = CapabilityRequest::new(
+            MonotonicTime::from_ticks(7),
+            AuthorityRequest::File(FileRequest::new(
+                RepoId::new("workspace"),
+                FileEffect::CreateHardLink,
+                CanonicalPath::new(["src", "main.rs"]).expect("canonical path"),
+            )),
+        );
+        let http = CapabilityRequest::new(
+            MonotonicTime::from_ticks(8),
+            AuthorityRequest::HttpFetch(HttpFetchRequest::new(
+                HttpFetchMethod::Head,
+                CanonicalHost::new("example.test").expect("canonical host"),
+                CanonicalUrlPath::new("/a/b").expect("canonical URL path"),
+                4096,
+            )),
+        );
+        let github = CapabilityRequest::new(
+            MonotonicTime::from_ticks(9),
+            AuthorityRequest::GitHub(GitHubRequest::new(
+                InstallationId::new("install-1"),
+                RepoId::new("workspace"),
+                GitHubOperation::CreatePullRequest,
+                BranchName::new("main").expect("branch"),
+                BranchName::new("feature/topic").expect("branch"),
+            )),
+        );
+        let requests = CapabilityRequestSet::new(file, [http, github]);
+        let caller = SubjectId::new("subject-a");
+        let capability = CapId::new("capability-a");
+        let epoch = AuthorizationEpoch::from_u64(42);
+
+        let payload = encode_attempt_payload(11, &caller, &capability, &requests, epoch)
+            .expect("payload must encode");
+        let decoded = decode_attempt_payload(&payload).expect("payload must decode");
+
+        assert_eq!(decoded.state_instance(), 11);
+        assert_eq!(decoded.caller(), &caller);
+        assert_eq!(decoded.capability_id(), &capability);
+        assert_eq!(decoded.authorization_epoch(), epoch);
+        assert_eq!(decoded.requests(), &requests);
+    }
+
+    #[test]
+    fn version_one_payloads_decode_as_the_first_capability_state_instance() {
+        let requests = CapabilityRequestSet::one(CapabilityRequest::new(
+            MonotonicTime::from_ticks(1),
+            AuthorityRequest::File(FileRequest::new(
+                RepoId::new("workspace"),
+                FileEffect::ReadData,
+                CanonicalPath::root(),
+            )),
+        ));
+        let current = encode_attempt_payload(
+            0,
+            &SubjectId::new("subject-a"),
+            &CapId::new("capability-a"),
+            &requests,
+            AuthorizationEpoch::default(),
+        )
+        .expect("payload must encode");
+        // Version 1 is the same bytes without the instance the writer now prefixes.
+        let mut legacy = vec![1_u8];
+        legacy.extend_from_slice(&current[9..]);
+
+        let decoded = decode_attempt_payload(&legacy).expect("a version 1 payload must decode");
+        assert_eq!(decoded.state_instance(), 0);
+        assert_eq!(decoded.requests(), &requests);
+    }
+
+    #[test]
+    fn malformed_attempt_payloads_fail_closed() {
+        let requests = CapabilityRequestSet::one(CapabilityRequest::new(
+            MonotonicTime::from_ticks(1),
+            AuthorityRequest::File(FileRequest::new(
+                RepoId::new("workspace"),
+                FileEffect::ReadData,
+                CanonicalPath::root(),
+            )),
+        ));
+        let payload = encode_attempt_payload(
+            3,
+            &SubjectId::new("subject-a"),
+            &CapId::new("capability-a"),
+            &requests,
+            AuthorizationEpoch::default(),
+        )
+        .expect("payload must encode");
+
+        assert!(decode_attempt_payload(&[]).is_err(), "empty payload");
+        let mut unknown_version = payload.clone();
+        unknown_version[0] = 3;
+        assert!(decode_attempt_payload(&unknown_version).is_err(), "version");
+        assert!(
+            decode_attempt_payload(&payload[..payload.len() - 1]).is_err(),
+            "truncated payload"
+        );
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert!(decode_attempt_payload(&trailing).is_err(), "trailing bytes");
+        let mut unknown_effect = payload.clone();
+        let effect_index = unknown_effect
+            .len()
+            .checked_sub(9)
+            .expect("payload holds a file effect");
+        unknown_effect[effect_index] = 200;
+        assert!(
+            decode_attempt_payload(&unknown_effect).is_err(),
+            "unknown file effect"
         );
     }
 }

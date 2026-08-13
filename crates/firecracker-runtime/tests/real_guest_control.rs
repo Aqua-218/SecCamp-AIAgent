@@ -541,7 +541,9 @@ fn real_firecracker_guest_runtime_preserves_the_broker_channel_through_isolation
         .expect("guest runtime must start only after identity injection");
     assert_eq!(
         started.body,
-        request.canonical_acknowledgement(GuestControlAction::StartWorkload)
+        request.canonical_acknowledgement(GuestControlAction::StartWorkload),
+        "guest runtime failed to start; guest serial output:\n{}",
+        vm.guest_serial_log(),
     );
 
     let report = broker

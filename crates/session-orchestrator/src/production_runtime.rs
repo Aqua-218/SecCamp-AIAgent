@@ -2233,6 +2233,7 @@ mod tests {
 
     #[derive(Default)]
     struct ExecutionCapture {
+        block_device_bind: Option<(PathBuf, PathBuf)>,
         block_binding: Option<(PathBuf, PathBuf)>,
         cloned_workspace: Option<(PathBuf, PathBuf)>,
         workspace_image: Option<(PathBuf, PathBuf, u64)>,
@@ -2287,6 +2288,26 @@ mod tests {
     impl FileSystem for ExecutionFileSystem {
         fn read(&mut self, _path: &Path) -> Result<Vec<u8>, RuntimeError> {
             Ok(b"pinned".to_vec())
+        }
+
+        fn bind_block_device(
+            &mut self,
+            source: &Path,
+            jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            self.capture
+                .lock()
+                .expect("execution capture must not be poisoned")
+                .block_device_bind = Some((source.to_owned(), jailed_device.to_owned()));
+            Ok(())
+        }
+
+        fn unbind_block_device(
+            &mut self,
+            _source: &Path,
+            _jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
         }
 
         fn verify_block_device_binding(
@@ -3461,6 +3482,13 @@ mod tests {
         let capture = capture
             .lock()
             .expect("execution capture must not be poisoned");
+        assert_eq!(
+            capture.block_device_bind,
+            Some((
+                Path::new("/dev/mapper").join(&expected_mapper),
+                jail_root.join("dev/rootfs"),
+            ))
+        );
         assert_eq!(
             capture.block_binding,
             Some((

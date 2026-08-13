@@ -13,7 +13,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     num::NonZeroUsize,
-    os::fd::OwnedFd,
+    os::fd::{AsRawFd, OwnedFd},
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -36,6 +36,7 @@ use rustix::{
     net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with},
     process::{getegid, geteuid},
 };
+use socket2::{Domain, SockAddr, Socket, Type};
 use supervisor::{
     CapfsMountPlan, CapfsRuntimeConfig, CapfsRuntimeManager, CapfsUnmountStrategy,
     DispatchResponse, LinuxHostConfig, LinuxHostResources, RefusalCode, SubjectCredential,
@@ -50,12 +51,15 @@ const CAPFS_LIMIT_DEPTH: usize = 64;
 const WORKLOAD_TMPFS_BYTES: u64 = 64 * 1024 * 1024;
 const WORKLOAD_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const WORKLOAD_PIDS_MAX: u64 = 32;
+const HOST_VSOCK_CID: u32 = 2;
+const BROKER_IO_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(Debug)]
 struct Config {
     workspace_device: PathBuf,
     runtime_dir: PathBuf,
     cgroup_parent: PathBuf,
+    broker_port: u32,
     isolation_launcher: PathBuf,
     workload: PathBuf,
     repository: RepoId,
@@ -108,6 +112,7 @@ fn run_session(config: &Config, identity: &GuestIdentity, workspace: &Path) -> R
         .map_err(|error| format!("creating guest CapFS mount directory: {error}"))?;
     fs::create_dir_all(&rootfs_mount_target)
         .map_err(|error| format!("creating guest isolation rootfs mount directory: {error}"))?;
+    let broker_channel = connect_broker(config.broker_port)?;
 
     let isolation = WorkloadIsolationConfig::new(
         &config.isolation_launcher,
@@ -123,6 +128,7 @@ fn run_session(config: &Config, identity: &GuestIdentity, workspace: &Path) -> R
             geteuid().as_raw(),
             getegid().as_raw(),
         ),
+        broker_channel.as_raw_fd(),
     );
     let host = LinuxHostResources::new(LinuxHostConfig::new(
         &config.cgroup_parent,
@@ -286,6 +292,28 @@ fn connect_seqpacket(path: &Path) -> Result<OwnedFd, String> {
     Ok(socket)
 }
 
+fn connect_broker(port: u32) -> Result<Socket, String> {
+    let broker = Socket::new(Domain::VSOCK, Type::STREAM, None)
+        .map_err(|error| format!("creating guest Broker vsock: {error}"))?;
+    broker
+        .set_read_timeout(Some(std::time::Duration::from_secs(
+            BROKER_IO_TIMEOUT_SECONDS,
+        )))
+        .map_err(|error| format!("setting guest Broker read timeout: {error}"))?;
+    broker
+        .set_write_timeout(Some(std::time::Duration::from_secs(
+            BROKER_IO_TIMEOUT_SECONDS,
+        )))
+        .map_err(|error| format!("setting guest Broker write timeout: {error}"))?;
+    broker
+        .connect(&SockAddr::vsock(HOST_VSOCK_CID, port))
+        .map_err(|error| format!("connecting guest Broker to host port {port}: {error}"))?;
+    broker
+        .set_cloexec(false)
+        .map_err(|error| format!("preserving guest Broker descriptor for workload: {error}"))?;
+    Ok(broker)
+}
+
 fn prepare_runtime_directory(path: &Path) -> Result<(), String> {
     require_absolute_lexical_path("runtime directory", path)?;
     let metadata = fs::metadata(path).map_err(|error| {
@@ -334,6 +362,7 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Config,
     let workspace_device = required_path(&mut arguments, "--workspace-device")?;
     let runtime_dir = required_path(&mut arguments, "--runtime-dir")?;
     let cgroup_parent = required_path(&mut arguments, "--cgroup-parent")?;
+    let broker_port = required_port(&mut arguments, "--broker-port")?;
     let isolation_launcher = required_path(&mut arguments, "--isolation-launcher")?;
     let workload = required_path(&mut arguments, "--workload")?;
     expect_flag(&mut arguments, "--repository")?;
@@ -365,12 +394,33 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Config,
         workspace_device,
         runtime_dir,
         cgroup_parent,
+        broker_port,
         isolation_launcher,
         workload,
         repository: RepoId::new(repository),
         effects,
         path,
     })
+}
+
+fn required_port(
+    arguments: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+) -> Result<u32, String> {
+    expect_flag(arguments, flag)?;
+    let port = arguments
+        .next()
+        .ok_or_else(usage)?
+        .into_string()
+        .map_err(|_| usage())?
+        .parse::<u32>()
+        .map_err(|_| usage())?;
+    if port == 0 || port == u32::MAX {
+        return Err(format!(
+            "{flag} must be explicit, non-zero, and non-wildcard"
+        ));
+    }
+    Ok(port)
 }
 
 fn parse_file_effects(value: &str) -> Result<FileEffects, String> {
@@ -456,7 +506,7 @@ fn require_absolute_lexical_path(label: &str, path: &Path) -> Result<(), String>
 }
 
 fn usage() -> String {
-    "usage: guest-supervisor-init --workspace-device <absolute-path> --runtime-dir <absolute-path> --cgroup-parent <absolute-path> --isolation-launcher <absolute-path> --workload <absolute-path> --repository <repository-id> --file-effects <canonical-comma-list> --path-prefix </|canonical/relative/path>".to_owned()
+    "usage: guest-supervisor-init --workspace-device <absolute-path> --runtime-dir <absolute-path> --cgroup-parent <absolute-path> --broker-port <1..4294967294> --isolation-launcher <absolute-path> --workload <absolute-path> --repository <repository-id> --file-effects <canonical-comma-list> --path-prefix </|canonical/relative/path>".to_owned()
 }
 
 #[cfg(test)]
@@ -472,6 +522,8 @@ mod tests {
             OsString::from("/run/guest-supervisor"),
             OsString::from("--cgroup-parent"),
             OsString::from("/sys/fs/cgroup"),
+            OsString::from("--broker-port"),
+            OsString::from("18081"),
             OsString::from("--isolation-launcher"),
             OsString::from("/usr/local/libexec/workload-isolation-launcher"),
             OsString::from("--workload"),
@@ -486,6 +538,7 @@ mod tests {
         .expect("fixed guest runtime configuration must parse");
         assert_eq!(config.workspace_device, PathBuf::from("/dev/vdb"));
         assert_eq!(config.repository, RepoId::new("workspace"));
+        assert_eq!(config.broker_port, 18081);
         assert!(config.effects.contains(FileEffect::ReadData));
         assert!(config.effects.contains(FileEffect::ListDirectory));
         assert!(config.effects.contains(FileEffect::WriteData));

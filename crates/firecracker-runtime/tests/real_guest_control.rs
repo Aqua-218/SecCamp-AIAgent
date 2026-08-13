@@ -52,6 +52,7 @@ const API_WAIT: Duration = Duration::from_secs(5);
 #[derive(Clone, Copy)]
 enum GuestWorkload {
     Sleep,
+    CgroupProbe,
     BrokerProbe,
     RuntimeBrokerProbe,
 }
@@ -59,7 +60,9 @@ enum GuestWorkload {
 impl GuestWorkload {
     const fn program(self) -> &'static str {
         match self {
-            Self::Sleep | Self::BrokerProbe => "/usr/local/libexec/guest-workload",
+            Self::Sleep | Self::CgroupProbe | Self::BrokerProbe => {
+                "/usr/local/libexec/guest-workload"
+            }
             Self::RuntimeBrokerProbe => "/usr/local/libexec/guest-supervisor-init",
         }
     }
@@ -67,6 +70,9 @@ impl GuestWorkload {
     const fn arguments(self) -> &'static str {
         match self {
             Self::Sleep => "sleep 600",
+            Self::CgroupProbe => {
+                r#"sh -c \"mkdir -p /sys/fs/cgroup; mount -t cgroup2 none /sys/fs/cgroup; printf 'cgroup-probe: '; cat /proc/cgroups; printf 'cgroup-probe-controllers: '; cat /sys/fs/cgroup/cgroup.controllers; sleep 600\""#
+            }
             Self::BrokerProbe => "--port 18081",
             Self::RuntimeBrokerProbe => {
                 "--workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port 18081 --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository workspace --file-effects read-data,list-directory,write-data --path-prefix /"
@@ -399,6 +405,66 @@ fn real_firecracker_guest_control_enforces_identity_gate_over_vsock() {
     assert_eq!(
         retried_start.body,
         request.canonical_acknowledgement(GuestControlAction::StartWorkload)
+    );
+}
+
+#[test]
+#[ignore = "requires KVM, Firecracker, and a static BusyBox guest-control rootfs"]
+fn real_firecracker_guest_cgroup_v2_exposes_required_controllers() {
+    let firecracker = required_path("REAL_FIRECRACKER_BIN");
+    let kernel = required_path("REAL_FIRECRACKER_KERNEL");
+    let rootfs = required_path("REAL_FIRECRACKER_ROOTFS");
+    let vm = RealFirecracker::start(&firecracker);
+    let mut api = UnixApiClient::new(vm.api_socket()).expect("real API path must be valid");
+    let vsock = vm.vsock_socket();
+    configure_and_start_real_vm(
+        &mut api,
+        &vm,
+        &kernel,
+        &rootfs,
+        GuestWorkload::CgroupProbe,
+        None,
+    );
+
+    wait_for_guest_vsock(&vsock);
+    let request = guest_request();
+    let mut client = FirecrackerVsockApiClient::new(&vsock, GUEST_CID, GUEST_CONTROL_PORT)
+        .expect("exact real guest endpoint must be valid");
+    for action in [
+        GuestControlAction::InjectIdentity,
+        GuestControlAction::StartWorkload,
+    ] {
+        let response = client
+            .request(&ApiRequest {
+                method: HttpMethod::Put,
+                path: action.path().to_owned(),
+                body: request.canonical_body(),
+            })
+            .expect("guest identity action must reach the real guest");
+        assert_eq!(response.body, request.canonical_acknowledgement(action));
+    }
+
+    let deadline = Instant::now() + API_WAIT;
+    let serial = loop {
+        let serial = vm.guest_serial_log();
+        if serial.contains("cgroup-probe-controllers: ") || Instant::now() >= deadline {
+            break serial;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let controllers = serial
+        .split("cgroup-probe-controllers: ")
+        .nth(1)
+        .and_then(|value| value.lines().next())
+        .unwrap_or_default();
+    assert!(
+        controllers
+            .split_whitespace()
+            .any(|controller| controller == "memory")
+            && controllers
+                .split_whitespace()
+                .any(|controller| controller == "pids"),
+        "cgroup v2 must expose the memory and pids controllers; guest serial output:\n{serial}"
     );
 }
 

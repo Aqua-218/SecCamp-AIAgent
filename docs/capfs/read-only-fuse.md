@@ -32,8 +32,12 @@ AgentはFUSE mountに対して通常の`open`、`read`、`write`、`create`、`m
 | `OPENDIR` | read-only access mode、directory種別、現在pathの`ListDirectory`を確認してhandleを登録する |
 | `READDIR` | 現在pathの`ListDirectory`を再確認し、見えてよいdirect childだけを返す |
 | `RELEASEDIR` | namespace側とAuthority側のdirectory handleを閉じる |
+| `READLINK` | symlink種別を確認し、`ReadLink`を認可し、返す直前にlinkの現在pathからtargetを再解決する。repository外へ出るなら`EXDEV`を返して本文を渡さない |
+| `SYMLINK` | targetを検証してnamespaceへstageし、`CreateSymlink`を認可してから`symlinkat`する。解決がrepository外なら`EXDEV`、文法違反なら`EPERM` |
+| `LINK` | namespace transaction内で既存objectへ名前を1つ足し、**新しい名前と既存の全ての名前**に`CreateHardLink`を要求してから`linkat`する。directoryは拒否する |
+| `MKNOD` | policyによる拒否として`EPERM`を返す。fuserのdefaultは`ENOSYS`だが、それは「未実装」を意味してしまう |
 
-`O_TRUNC`は`O_WRONLY`または`O_RDWR`と組み合わせたときだけ受け付ける。`O_WRONLY | O_TRUNC`には`WriteData`と`Truncate`、`O_RDWR | O_TRUNC`には`ReadData`、`WriteData`、`Truncate`の全てが必要である。`O_RDONLY | O_TRUNC`は拒否する。FUSE `CREATE`内の`O_CREAT` / `O_EXCL`は受け付けるが、namespaceが「まだ存在しない」と確定してから`O_EXCL`で作るので、同requestの`O_TRUNC`は既存長を変更せず`Truncate`を追加要求しない。FUSE `RENAME`はempty flagまたは`RENAME_NOREPLACE`だけを受け付け、adapterはどちらの場合もno-replaceとして実行する。`O_APPEND`、`O_TMPFILE`、`SYMLINK`、`LINK`、`MKNOD`はまだ受け付けない。
+`O_TRUNC`は`O_WRONLY`または`O_RDWR`と組み合わせたときだけ受け付ける。`O_WRONLY | O_TRUNC`には`WriteData`と`Truncate`、`O_RDWR | O_TRUNC`には`ReadData`、`WriteData`、`Truncate`の全てが必要である。`O_RDONLY | O_TRUNC`は拒否する。FUSE `CREATE`内の`O_CREAT` / `O_EXCL`は受け付けるが、namespaceが「まだ存在しない」と確定してから`O_EXCL`で作るので、同requestの`O_TRUNC`は既存長を変更せず`Truncate`を追加要求しない。FUSE `RENAME`はempty flagまたは`RENAME_NOREPLACE`だけを受け付け、adapterはどちらの場合もno-replaceとして実行する。`O_APPEND`、`O_TMPFILE`、`MKNOD`は受け付けない。
 
 ## metadataはどこまで見せるのか
 
@@ -82,7 +86,7 @@ sequenceDiagram
     B-->>K: 検証済みmetadata
     K->>T: remember_lookup(ObjectId)
     T-->>F: nodeid
-    F-->>F: TTL 0でreply
+    F-->>F: attribute TTL付きでreply
 ```
 
 parentのdirectory確認、child pathの作成、`path -> ObjectId`解決、Capability visibility、backing metadata取得、node公開までnamespace read lockを外さない。並行renameはwrite lockを必要とするため、この途中へ割り込めない。
@@ -179,7 +183,7 @@ READ / WRITEが先: authorize -> pread / pwrite完了 -> revoke完了
 revokeが先: revoke完了 -> authorization denied -> backing I/Oを発行しない
 ```
 
-さらに`OPEN` replyへ`FOPEN_DIRECT_IO`を付け、entry/attribute TTLを0にする。Linux page cacheだけでreadが完了するとadapterへrequestが戻らず再認可できないため、direct I/Oはrevokeの意味を実syscallまで届けるために必要である。
+cached readはpage cacheだけで完了し、cached attributeは`LOOKUP` / `GETATTR`をadapterへ戻さない。これを止めるのはdirect I/Oではなく、revoke側の強制無効化である。`CapabilityKernel`のrevokeと`begin_subject_close`は、返る前に登録済み`RevocationObserver`を走らせる。adapterはmountごとにobserverを登録し、kernelへ渡した全nodeidを`FUSE_NOTIFY_INVAL_INODE`で無効化する。FUSE notificationはOS側でinlineに処理されるため、無効化が返った時点でcached pageとcached attributeは既に無い。よってrevoke復帰後のreadはcacheから答えられず、adapterへ戻って再認可され拒否される。無効化を確認できない場合はmountをfatalにし、revoke呼び出し元へ`RevocationNotPropagated`を返す。詳細は[capfs 設計](../design/capfs.md)の「revoke を page cache に抜かせない」を正とする。
 
 `O_RDWR`はopen時に`ReadData`と`WriteData`の両方を同じshared guardで確認する。`O_TRUNC`があれば`Truncate`も同じrequest setへ加える。Capability kernelの複合認可は、これらを片方ずつ監査・commitするのではなく、全requestを1つのattempt/effect recordとして残す。open後の個々のread/writeは再び単独で認可するため、open時のallowがrevoke後のI/Oを許可し続けることはない。
 
@@ -218,7 +222,9 @@ FUSE境界では内部構造を細かく漏らさず、失敗の種類を次の�
 |---|---|
 | 権限外path、stale node、invalid child名 | `ENOENT` |
 | `OPEN` / `CREATE` / `MKDIR` / `UNLINK` / `RMDIR` / `RENAME` / `READ` / `WRITE` / `SETATTR` / `OPENDIR` / `READDIR`の最終認可失敗 | `EACCES` |
-| `O_APPEND`、`O_TMPFILE`、`O_RDONLY | O_TRUNC`、unsupported rename flag、unsupported / mixed `SETATTR`、cached write | `EPERM` |
+| `O_APPEND`、`O_TMPFILE`、`O_RDONLY | O_TRUNC`、unsupported rename flag、unsupported / mixed `SETATTR`、cached write、`MKNOD`、表現できない symlink target | `EPERM` |
+| repository の外へ解決される symlink target、directory への `LINK` | `EXDEV` |
+| symlink でない object への `READLINK` | `EINVAL` |
 | 既に存在するchild | `EEXIST` |
 | directoryをregular fileとしてopen | `EISDIR` |
 | regular fileをdirectoryとしてopen、fileをparentにしたcreate | `ENOTDIR` |
@@ -235,7 +241,7 @@ FUSE境界では内部構造を細かく漏らさず、失敗の種類を次の�
 
 `read_only.rs`のmodule testは、許可範囲と祖先だけのlookup、backingとCapabilityのrepository identity不一致、namespaceとAuthority両方のfile / directory handle count、位置指定read / write、`O_WRONLY`がreadを得ないこと、`O_RDWR`の両effect要求、`O_TRUNC`の複合認可、size変更の`Truncate`再認可、mode / timestampの`SetMetadata`再認可とspecial mode bit除去、`CREATE`に必要な`CreateFile`とhandle effect、`MKDIR`に必要な`CreateDirectory`、creation umask、`UNLINK`の`RemoveFile`とopen handle排他、`RMDIR`の`RemoveDirectory`、subtree全pathの`RENAME`複合認可とaudit、occupied childとnon-directory parent、generation付きdirectory cookie、exact patternによるchild filter、revoke後の既存handle read / write / truncate / metadata / readdir拒否、releaseによるcleanup、malformed FORGET後のfail closedを直接確認する。
 
-[`crates/capfs/tests/read_only_fuse.rs`](../../crates/capfs/tests/read_only_fuse.rs) は実際にLinux FUSEへmountする。`allowed.txt`を開いて読んだ後にCapabilityをrevokeし、同じOS file descriptorで再度readして`PermissionDenied`になることを確認する。write testは`O_TRUNC` openでfileを空にし、writeを成功させた後にCapabilityをrevokeする。同じdescriptorからの次のwriteと`set_len`はともに`PermissionDenied`になり、backingの長さも変わらない。metadata testは同じdescriptorで`chmod`してordinary modeだけが反映されること、revoke後の次の`chmod`は`PermissionDenied`でbackingを変えないことを確認する。create testは`MKDIR`、writable `CREATE`、返却handleからのwriteを実mountで通し、parent directory fdを保持したままrevoke後に`mkdirat`すると、targetのlookup自体が`NotFound`となり削除に届かないことを確認する。mutation testはno-replace `RENAME`、`UNLINK`、`RMDIR`を実mountで通し、revoke後に同じparent fdからの`unlinkat`がtarget lookupで`NotFound`となることを確認する。同じmount上の権限外 siblingも`NotFound`になる。directory testでは、祖先directoryのlisting拒否、許可prefixのcanonical-name順 listingを確認する。さらに40 byteの`getdents` bufferで応答を1 entryずつに分け、1回目の`READDIR`後にrevokeして、同じdirectory fdからの2回目が`PermissionDenied`になること、同様に1回目の後で`CREATE`したstreamは2回目で`EAGAIN`になることを確認する。
+[`crates/capfs/tests/read_only_fuse.rs`](../../crates/capfs/tests/read_only_fuse.rs) は実際にLinux FUSEへmountする。`allowed.txt`を開いて読んだ後にCapabilityをrevokeし、同じOS file descriptorで再度readして`PermissionDenied`になることを確認する。write testは`O_TRUNC` openでfileを空にし、writeを成功させた後にCapabilityをrevokeする。同じdescriptorからの次のwriteと`set_len`はともに`PermissionDenied`になり、backingの長さも変わらない。metadata testは同じdescriptorで`chmod`してordinary modeだけが反映されること、revoke後の次の`chmod`は`PermissionDenied`でbackingを変えないことを確認する。create testは`MKDIR`、writable `CREATE`、返却handleからのwriteを実mountで通し、parent directory fdを保持したままrevoke後に`mkdirat`すると、targetのlookup自体が`NotFound`となり削除に届かないことを確認する。mutation testはno-replace `RENAME`、`UNLINK`、`RMDIR`を実mountで通し、revoke後に同じparent fdからの`unlinkat`がtarget lookupで`NotFound`となることを確認する。同じmount上の権限外 siblingも`NotFound`になる。directory testでは、祖先directoryのlisting拒否、許可prefixのcanonical-name順 listingを確認する。さらに40 byteの`getdents` bufferで応答を1 entryずつに分け、1回目の`READDIR`後にrevokeして、同じdirectory fdからの2回目が`PermissionDenied`になること、同様に1回目の後で`CREATE`したstreamは2回目で`EAGAIN`になることを確認する。link testは実mount上で`symlink(2)`・`readlink(2)`・link経由のreadを通し、絶対target・root外へ出るtarget・名前付きcomponentの後ろに`..`を持つtargetが作られないこと、`CreateSymlink`と`ReadLink`がそれぞれ独立に要ること、`link(2)`が同一inodeへ2つ目の名前を作り許可範囲外へは作れないこと、**repository外にaliasを持つinodeは許可範囲内の名前からもread不能かつlistingに現れないこと**、`mknod(2)`が`EPERM`になることを確認する。
 
 実mount testは`/dev/fuse`が存在しない環境だけskipする。deviceが存在するのにmount設定や権限が壊れている場合はtest failureとして扱う。
 
@@ -249,17 +255,30 @@ rename / writeの物理的な競合、複数thread FUSE sessionはこのunit con
 実FUSE mount testは`/dev/fuse`がない環境では実行不能理由を標準エラーへ記録して終了し、
 deviceが存在するのにmount設定または権限が壊れている場合は失敗として扱う。
 
+## linkをどう認可するのか
+
+**symlinkの解決を行うのはこのadapterではなくOSである。** kernelは`READLINK`でtarget文字列を受け取り、その後のwalkを自分で進める。`..`の解決でadapterへ戻ってはこない。したがって**返す文字列が唯一の強制点**であり、targetは相対path・先頭の連続部分にのみ`..`・canonical segment・4096 byte以内に限る。名前付きcomponentの後ろの`..`を拒むのは、そのcomponent自身が浅いdirectoryを指すsymlinkだった場合、字句上の検査が通ってもkernelのwalkがroot上へ出るからである。
+
+targetはregistryが所有し、`READLINK`のたびにlinkの**現在の**pathから再解決する。renameは同じliteralの意味を変えるので、登録時の判定を使い回さない。backingのlink bodyもregistryの記録と毎回照合し、食い違えばfail closedにする。
+
+hard linkは1つのinodeに複数のpathを与える。adapterは**全てのpath**に対してeffectを要求する。1つでも許可されなければ操作は失敗し、可視性も同じ規則に従う。この規則の下ではaliasを増やして権限が広がることはない。増えるのは要求されるauthorityの方である。詳細は[ADR 0017](../decisions/0017-authorize-an-aliased-inode-on-every-name.md)にある。
+
 ## 正確な保証範囲
 
-`SYMLINK`、`LINK`、`MKNOD`、xattr、ioctl、fallocate、copy-rangeは初期link-free filesystem modelの外なので`EPERM`のままである。metadataではowner / group、BSD flag、creation / status-change / backup timeと、modeとtimestampを同時に変えるatomic requestをまだ表現しない。後者を追加するには、Linuxの複数syscallをまたぐ部分成功の意味論を先に定義する必要がある。
+`MKNOD`、xattr、ioctl、fallocate、copy-rangeはmodelの外なので`EPERM`である。metadataではowner / group、BSD flag、creation / status-change / backup timeと、modeとtimestampを同時に変えるatomic requestをまだ表現しない。後者を追加するには、Linuxの複数syscallをまたぐ部分成功の意味論を先に定義する必要がある。
 
 ## 変更時の確認点
 
-- operation を足すときは、対応する `FileEffect` を[File authority](../authority-core/file-authorities.md)の 10 種から選ぶ。対応が無いなら、まず effect 側の設計を決める。
+- operation を足すときは、対応する `FileEffect` を[File authority](../authority-core/file-authorities.md)の 13 種から選ぶ。対応が無いなら、まず effect 側の設計を決める。
+- object 単位の認可には `object_requests` を使い、`primary_path()` を認可に使わない。hard link を持つ inode は名前ごとに認可が要る（[ADR 0017](../decisions/0017-authorize-an-aliased-inode-on-every-name.md)）。
+- `init` で `FUSE_CACHE_SYMLINKS` を要求しない。`READLINK` の再解決を kernel が飛ばすようになる。
 - 認可を operation の入口だけで行い、実 I/O の直前で省略しない。revoke は認可と I/O の間に効きうる。
 - fd-relative I/O を path 再構築に変えない。rename と競合したときに別 object を触る。
 - `EAGAIN` で再開を要求している箇所を、成功として返すように変えない。古い cookie で listing を続けると、既に消えた entry を返す。
-- Direct-I/O を外さない。page cache 経由で revoke 後の読み出しが通る。
+- revoke の cache 無効化を外さない。page cache と attribute cache 経由で revoke 後の読み出しと stat が通る。observer を外すと [`mounted_read_only_view_denies_read_after_revoke`](../../crates/capfs/tests/read_only_fuse.rs) が落ちる。
+- observer を state の排他 guard の内側へ移さない。無効化は in-flight request の排出を待ち、その request は拒否されるために shared access を要るので deadlock する。
+- `FOPEN_KEEP_CACHE` を足さない。open をまたいで page cache が残り、他 mount の write が見えなくなる。
+- writable handle を cached へ変えない。buffered write は partial page で read-modify-write を要し、direct より遅い。
 
 ## 関連
 

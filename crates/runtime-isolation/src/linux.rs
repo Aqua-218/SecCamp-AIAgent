@@ -800,6 +800,30 @@ mod implementation {
             make_mounts_private(step).map_err(|error| with_context(error, "rootfs-private"))?;
             let workspace_source = pin_workspace_source(step, &config.workspace.source)
                 .map_err(|error| with_context(error, "rootfs-pin-workspace"))?;
+            if rootfs.source == Path::new("/") {
+                // A guest image already booted from an immutable root cannot be pivoted onto a
+                // bind of itself: the kernel rejects that arrangement because the staged root is
+                // a descendant of the active root mount.  Keep that immutable mount as `/`, then
+                // replace every guest-runtime mount that could expose supervisor state.
+                mount_call(
+                    step,
+                    Some(&workspace_source.proc_path()),
+                    &config.workspace.target,
+                    None,
+                    libc::MS_BIND,
+                    None,
+                )
+                .map_err(|error| with_context(error, "rootfs-bind-workspace"))?;
+                verify_pinned_workspace_mount(step, &workspace_source, &config.workspace.target)
+                    .map_err(|error| with_context(error, "rootfs-verify-workspace"))?;
+                mask_mount(step, Path::new("/run"))
+                    .map_err(|error| with_context(error, "rootfs-mask-runtime"))?;
+                mask_mount(step, Path::new("/sys"))
+                    .map_err(|error| with_context(error, "rootfs-mask-sys"))?;
+                self.rootfs_pivoted = true;
+                self.workspace_source = Some(workspace_source);
+                return Ok(());
+            }
             let setup_result = (|| {
                 mount_call(
                     step,

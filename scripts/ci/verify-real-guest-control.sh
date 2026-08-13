@@ -24,6 +24,8 @@ readonly busybox
 [[ -c /dev/vhost-vsock ]] || { printf '%s\n' 'real guest-control verification requires /dev/vhost-vsock' >&2; exit 2; }
 command -v veritysetup >/dev/null || { printf '%s\n' 'real guest-control verification requires veritysetup' >&2; exit 2; }
 [[ -n "${busybox}" ]] || { printf '%s\n' 'real guest-control verification requires busybox' >&2; exit 2; }
+command -v mkfs.ext4 >/dev/null || { printf '%s\n' 'real guest-control verification requires mkfs.ext4' >&2; exit 2; }
+command -v truncate >/dev/null || { printf '%s\n' 'real guest-control verification requires truncate' >&2; exit 2; }
 
 "${repository_root}/scripts/ci/install-firecracker.sh"
 "${repository_root}/scripts/ci/install-guest-artifacts.sh"
@@ -33,6 +35,18 @@ RUSTFLAGS='-C target-feature=+crt-static' cargo build \
   -p firecracker-runtime \
   --bin guest-control-init \
   --bin guest-broker-probe \
+  --release \
+  --locked
+RUSTFLAGS='-C target-feature=+crt-static' cargo build \
+  --manifest-path "${repository_root}/Cargo.toml" \
+  -p supervisor \
+  --bin guest-supervisor-init \
+  --release \
+  --locked
+RUSTFLAGS='-C target-feature=+crt-static' cargo build \
+  --manifest-path "${repository_root}/Cargo.toml" \
+  -p runtime-isolation \
+  --bin workload-isolation-launcher \
   --release \
   --locked
 
@@ -88,3 +102,48 @@ run_real_test \
   broker \
   "${repository_root}/target/release/guest-broker-probe" \
   real_firecracker_guest_reaches_host_broker_over_vsock
+
+run_runtime_test() {
+  local image_rootfs="${staging}/runtime.squashfs"
+  local image_hash="${image_rootfs}.hash"
+  local workspace_image="${staging}/workspace.ext4"
+  local root_hash=''
+
+  mapper_name="guest-runtime-ci-$$"
+  truncate -s 64M "${workspace_image}"
+  mkfs.ext4 -F -q "${workspace_image}"
+  "${repository_root}/scripts/ci/build-guest-runtime-image.sh" \
+    --base-rootfs "${base_rootfs}" \
+    --guest-control-init "${repository_root}/target/release/guest-control-init" \
+    --guest-supervisor-init "${repository_root}/target/release/guest-supervisor-init" \
+    --isolation-launcher "${repository_root}/target/release/workload-isolation-launcher" \
+    --agent-workload "${repository_root}/target/release/guest-broker-probe" \
+    --repository workspace \
+    --file-effects read-data,list-directory,write-data \
+    --path-prefix / \
+    --port 18080 \
+    --broker-port 18081 \
+    --output-rootfs "${image_rootfs}" \
+    --output-hash "${image_hash}"
+  root_hash="$(awk '/^Root hash:/ {print $3}' "${image_rootfs}.verity")"
+  [[ "${root_hash}" =~ ^[0-9a-f]{64}$ ]] || { printf '%s\n' 'guest runtime image did not emit one lower-case dm-verity root hash' >&2; exit 2; }
+  veritysetup open "${image_rootfs}" "${mapper_name}" "${image_hash}" "${root_hash}"
+  veritysetup status "${mapper_name}" | grep -q 'mode:        readonly'
+
+  REAL_FIRECRACKER_BIN="${firecracker}" \
+  REAL_FIRECRACKER_KERNEL="${kernel}" \
+  REAL_FIRECRACKER_ROOTFS="/dev/mapper/${mapper_name}" \
+  REAL_FIRECRACKER_WORKSPACE="${workspace_image}" \
+  cargo test \
+    --manifest-path "${repository_root}/Cargo.toml" \
+    -p firecracker-runtime \
+    --test real_guest_control \
+    --locked \
+    -- \
+    --ignored \
+    --exact real_firecracker_guest_runtime_preserves_the_broker_channel_through_isolation
+  veritysetup close "${mapper_name}"
+  mapper_name=''
+}
+
+run_runtime_test

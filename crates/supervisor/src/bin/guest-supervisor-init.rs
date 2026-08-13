@@ -515,7 +515,8 @@ fn prepare_cgroup_hierarchy(path: &Path) -> Result<(), String> {
             path.display()
         )
     })?;
-    wait_for_cgroup_controllers(path)
+    wait_for_cgroup_controllers(path)?;
+    enable_cgroup_controllers(path)
 }
 
 fn wait_for_cgroup_controllers(path: &Path) -> Result<(), String> {
@@ -538,6 +539,16 @@ fn wait_for_cgroup_controllers(path: &Path) -> Result<(), String> {
         }
         std::thread::sleep(CGROUP_READY_POLL_INTERVAL);
     }
+}
+
+fn enable_cgroup_controllers(path: &Path) -> Result<(), String> {
+    let subtree_control = path.join("cgroup.subtree_control");
+    fs::write(&subtree_control, "+memory +pids").map_err(|error| {
+        format!(
+            "enabling guest memory and PID cgroup controllers at {}: {error}",
+            subtree_control.display()
+        )
+    })
 }
 
 fn mount_workspace(device: &Path, target: &Path) -> Result<(), String> {

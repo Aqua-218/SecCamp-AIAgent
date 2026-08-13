@@ -71,7 +71,7 @@ workspace で唯一作れるのは regular file と directory。残り 5 種類�
 
 **FIFO（`MAKE_FIFO`）。** workload は単一プロセスなので使い道が無い。増える surface を減らす。
 
-**symlink（`MAKE_SYM`）。** これが一番効く。symlink を作れると、workspace 内の名前から workspace 外の実体を指せる。capfs 側は backing tree が link-free であることを startup で検査しているが（[Backing repository の事前検証](../capfs/backing-preflight.md)）、それは起動時点の話。実行中に workload が symlink を作れるなら、検査の意味がなくなる。
+**symlink（`MAKE_SYM`）。** これが一番効く。symlink を作れると、workspace 内の名前から workspace 外の実体を指せる。capfs は symlink を扱うが、target が repository の外へ出ないことを registry が保証している（[Backing repository の事前検証](../capfs/backing-preflight.md)）。workload が capfs を迂回して backing tree に直接 symlink を作れるなら、その保証が消える。
 
 `REFER` は許可している。これが無いと workspace 内での rename ができない。ABI 3 未満の kernel では `REFER` そのものが存在せず、rename が一律拒否される。これが `MIN_LANDLOCK_ABI = 3` の理由の半分。
 
@@ -106,7 +106,7 @@ rootfs と workspace の権限差が定数 2 つに集約されているので�
 ## 変更時の確認点
 
 - `LANDLOCK_WORKSPACE_ACCESS` に bit を足すときは、それが capfs 側の `FileEffect` のどれに対応するかを確認する。対応が無い bit を足すと、Capability を経由しない操作が生まれる。
-- `MAKE_SYM` を足そうとしている場合は、[Backing repository の事前検証](../capfs/backing-preflight.md)の link-free 検査が前提を失うことを先に確認する。
+- `MAKE_SYM` を足そうとしている場合は、[Backing repository の事前検証](../capfs/backing-preflight.md)の symlink target 検査が前提を失うことを先に確認する。
 - `MIN_LANDLOCK_ABI` を上げるときは、新しい ABI で追加された bit を `LANDLOCK_ALL_ACCESS` に含める。handled access に入れ忘れると、その操作は制御されないまま通る。
 - ABI を下げるときは `TRUNCATE` と `REFER` が失われる。前者は capfs の effect 分離が壊れ、後者は rename が使えなくなる。
 

@@ -37,13 +37,13 @@ RUSTFLAGS='-C target-feature=+crt-static' cargo build \
   --bin guest-broker-probe \
   --release \
   --locked
-RUSTFLAGS='-C target-feature=+crt-static' cargo build \
+cargo build \
   --manifest-path "${repository_root}/Cargo.toml" \
   -p supervisor \
   --bin guest-supervisor-init \
   --release \
   --locked
-RUSTFLAGS='-C target-feature=+crt-static' cargo build \
+cargo build \
   --manifest-path "${repository_root}/Cargo.toml" \
   -p runtime-isolation \
   --bin workload-isolation-launcher \

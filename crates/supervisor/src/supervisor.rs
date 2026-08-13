@@ -855,6 +855,19 @@ where
         &mut self.resources
     }
 
+    /// Temporarily borrows the resource and caller-identity adapters together.
+    ///
+    /// A production transport must bind an accepted connection in `callers` before exposing its
+    /// bytes to [`Self::dispatch_wire`]. Keeping both mutable borrows inside one closure lets the
+    /// host adapter accept the connection and register that binding without exposing either
+    /// partially-updated adapter to unrelated supervisor operations.
+    pub fn with_resources_and_callers<T>(
+        &mut self,
+        operation: impl FnOnce(&mut R, &mut C) -> T,
+    ) -> T {
+        operation(&mut self.resources, &mut self.callers)
+    }
+
     /// Creates a subject transaction and exposes it only after workload start succeeds.
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     pub fn create_subject(

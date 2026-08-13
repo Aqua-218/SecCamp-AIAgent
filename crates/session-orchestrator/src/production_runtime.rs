@@ -2242,6 +2242,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::filesystem_factory::{FilesystemFirecrackerFactory, SnapshotTemplate};
     use crate::recovery::SessionRecoveryLease;
     use crate::{IdentityKind, IdentityLedger};
 
@@ -3443,6 +3444,89 @@ mod tests {
             PreparedFirecrackerSession::verify(&request, changed, snapshot, request.snapshot_id,),
             Err(SessionPreparationError::RuntimeConfigMismatch)
         ));
+    }
+
+    #[test]
+    fn filesystem_factory_copies_pinned_artifacts_into_the_exact_session_jail() {
+        let root = TestDirectory::new();
+        create_jail_parent(&root.0);
+        let mut template = runtime_config(&root.0);
+        let template_jail =
+            session_jail_root(&template).expect("template jail root must be derivable");
+        let kernel_source = template_jail.join("artifacts/kernel");
+        let seccomp_source = template_jail.join("artifacts/seccomp");
+        let state_source = root.0.join("clean-snapshot-state");
+        let memory_source = root.0.join("clean-snapshot-memory");
+        fs::create_dir_all(
+            kernel_source
+                .parent()
+                .expect("kernel source must have a parent"),
+        )
+        .expect("template artifacts directory must be creatable");
+        fs::write(&kernel_source, b"kernel-v1").expect("kernel source must be writable");
+        fs::write(&seccomp_source, b"seccomp-v1").expect("seccomp source must be writable");
+        fs::write(&state_source, b"snapshot-state-v1").expect("state source must be writable");
+        fs::write(&memory_source, b"snapshot-memory-v1").expect("memory source must be writable");
+        template.kernel = PinnedArtifact::new(&kernel_source, sha256(b"kernel-v1"));
+        template.isolation.seccomp.filter =
+            PinnedArtifact::new(&seccomp_source, sha256(b"seccomp-v1"));
+
+        let session = identity(0x61);
+        let session_config =
+            rebind_runtime_config(&template, session).expect("session config must rebind");
+        let session_jail =
+            session_jail_root(&session_config).expect("session jail root must be derivable");
+        fs::create_dir_all(session_config.workspace.clone_path())
+            .expect("workspace clone fixture must be creatable");
+        let request = SessionFirecrackerRequest::new(
+            session,
+            session_config.clone(),
+            SnapshotId::new([0x62; crate::ID_BYTES]),
+            session_jail.join("snapshots/state"),
+            session_jail.join("snapshots/memory"),
+            19_002,
+        );
+        let mut factory = FilesystemFirecrackerFactory::new(
+            request.snapshot_id(),
+            template.clone(),
+            SnapshotTemplate::new(
+                PinnedArtifact::new(&state_source, sha256(b"snapshot-state-v1")),
+                PinnedArtifact::new(&memory_source, sha256(b"snapshot-memory-v1")),
+            ),
+        );
+
+        factory
+            .prepare(&request)
+            .expect("pinned session artifacts must be prepared");
+
+        assert_eq!(fs::read(&session_config.kernel.path).unwrap(), b"kernel-v1");
+        assert_eq!(
+            fs::read(&session_config.isolation.seccomp.filter.path).unwrap(),
+            b"seccomp-v1"
+        );
+        assert_eq!(
+            fs::read(request.snapshot_path()).unwrap(),
+            b"snapshot-state-v1"
+        );
+        assert_eq!(
+            fs::read(request.memory_path()).unwrap(),
+            b"snapshot-memory-v1"
+        );
+        for absent in [
+            &session_config.api_socket,
+            &session_config.vsock.uds_path,
+            &session_config.dm_verity.jailed_device_path,
+        ] {
+            assert!(
+                !absent.exists(),
+                "factory must reserve but not create runtime-owned path {}",
+                absent.display()
+            );
+        }
+        assert!(
+            factory.prepare(&request).is_err(),
+            "a second prepare must not replace the session-owned immutable files"
+        );
     }
 
     #[test]

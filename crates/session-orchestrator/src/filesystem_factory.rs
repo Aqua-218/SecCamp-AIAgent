@@ -7,13 +7,13 @@
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read as _, Write as _},
+    io::{self, Write as _},
     os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
     path::{Component, Path, PathBuf},
 };
 
 use firecracker_runtime::{
-    FileSystem as _, PinnedArtifact, RealFileSystem, RuntimeConfig, Sha256Digest, Snapshot,
+    FileSystem as _, PinnedArtifact, RealFileSystem, RuntimeConfig, Snapshot,
 };
 
 use crate::{
@@ -193,11 +193,7 @@ impl FilesystemFirecrackerFactory {
         Ok(jail_root)
     }
 
-    fn provision_layout(
-        &self,
-        config: &RuntimeConfig,
-        jail_root: &Path,
-    ) -> Result<(), BackendError> {
+    fn provision_layout(config: &RuntimeConfig, jail_root: &Path) -> Result<(), BackendError> {
         let chroot_base = &config.jailer_config.chroot_base_dir;
         let executable_parent = chroot_base.join(
             config
@@ -289,7 +285,7 @@ impl PerSessionFirecrackerFactory for FilesystemFirecrackerFactory {
         request: &SessionFirecrackerRequest,
     ) -> Result<PreparedFirecrackerSession, BackendError> {
         let jail_root = self.validate_request(request)?;
-        self.provision_layout(request.runtime_config(), &jail_root)?;
+        Self::provision_layout(request.runtime_config(), &jail_root)?;
         let snapshot = self.copy_template_files(request)?;
         PreparedFirecrackerSession::verify(
             request,
@@ -482,6 +478,7 @@ fn require_absent(path: &Path) -> Result<(), BackendError> {
     }
 }
 
+#[allow(clippy::too_many_lines)] // Every copy phase checks one ownership or digest invariant.
 fn copy_pinned_file(
     label: &str,
     source: &PinnedArtifact,
@@ -556,16 +553,15 @@ fn copy_pinned_file(
                 destination.display()
             ))
         })?;
-    let destination_identity =
-        output
-            .metadata()
-            .map(FileIdentity::from_metadata)
-            .map_err(|error| {
-                BackendError::new(format!(
-                    "cannot inspect created {label} destination {}: {error}",
-                    destination.display()
-                ))
-            })?;
+    let destination_identity = output
+        .metadata()
+        .map(|metadata| FileIdentity::from_metadata(&metadata))
+        .map_err(|error| {
+            BackendError::new(format!(
+                "cannot inspect created {label} destination {}: {error}",
+                destination.display()
+            ))
+        })?;
     let copy_result = (|| {
         io::copy(&mut input, &mut output).map_err(|error| {
             BackendError::new(format!(

@@ -1234,7 +1234,9 @@ impl RuntimeIsolation {
     {
         match Self::spawn_isolated_transaction(backend, config, workload_entry) {
             Err(error @ IsolationError::TerminationRequired { .. }) => {
-                eprintln!("runtime-isolation: aborting an irreversibly mutated launcher: {error}");
+                eprintln!(
+                    "runtime-isolation: aborting an irreversibly mutated launcher: {error}; detail: {error:?}"
+                );
                 std::process::abort();
             }
             outcome => outcome,

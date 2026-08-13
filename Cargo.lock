@@ -1596,6 +1596,7 @@ dependencies = [
  "fuser",
  "runtime-isolation",
  "rustix",
+ "socket2",
  "tempfile",
 ]
 

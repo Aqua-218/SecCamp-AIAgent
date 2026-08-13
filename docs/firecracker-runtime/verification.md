@@ -61,6 +61,19 @@ HTTP を自前で実装しているので、request smuggling の入口になり
 | 所有する完成済み clone だけを公開・削除する | `real_filesystem_publishes_and_removes_only_owned_complete_clones` |
 | source の alias、symlink、hard link、上限超過を拒否する | `real_filesystem_rejects_source_aliases_symlinks_hardlinks_and_bounds` |
 
+### crash recovery の subtree 削除
+
+| 境界 | test |
+|---|---|
+| jail 内の symlink を、外部の実体に触れずに unlink する | `jail_symlink_is_unlinked_without_touching_its_external_target` |
+| 幅の広い木と深い木のどちらでも、1 回あたりの削除量を区切って前進する | `iterative_removal_makes_bounded_progress_across_wide_and_deep_trees` |
+| この host が作り得ない深さの subtree を歩かずに拒否する | `removal_refuses_a_subtree_deeper_than_this_host_could_have_built` |
+| cgroup の descendant を control file を残したまま bottom-up で削除する | `cgroup_descendant_cleanup_removes_directories_bottom_up` |
+
+深さ制限は `MAX_WORKSPACE_DEPTH` と同じ 64 である。降下は削除 budget を消費しないので、guest が workspace 内に深い chain を作ると、最初の 1 件を unlink する前に木の底まで歩くことになる。`open_descendant_directory` は毎回 root から開き直すため、その walk は深さの 2 乗で効く。workspace は 64 段までしか作られないので、それより深い subtree は「この host が作ったものではない」として歩かずに拒否する。
+
+symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` で開いて種別を判定し、link 自体を消すので、外の実体には触れない。
+
 ### SHA-256
 
 `sha256_matches_nist_empty_vector`、`sha256_matches_nist_abc_vector`、`digest_parser_rejects_wrong_length_and_accepts_case`。NIST の既知 vector 2 本と、hex parser の境界。

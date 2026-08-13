@@ -14,7 +14,8 @@ repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repository_root
 readonly tools_root="${CI_TOOLS_DIR:-${repository_root}/.ci-tools}"
 readonly firecracker="${tools_root}/firecracker/v1.16.1/firecracker"
-readonly kernel="${tools_root}/guest/v1.12/vmlinux-6.1.128"
+kernel="${REAL_GUEST_KERNEL:-${tools_root}/guest/v1.12/vmlinux-6.1.128}"
+readonly kernel
 readonly base_rootfs="${tools_root}/guest/v1.12/ubuntu-24.04.squashfs"
 busybox="$(command -v busybox || true)"
 readonly busybox
@@ -26,6 +27,10 @@ command -v veritysetup >/dev/null || { printf '%s\n' 'real guest-control verific
 [[ -n "${busybox}" ]] || { printf '%s\n' 'real guest-control verification requires busybox' >&2; exit 2; }
 command -v mkfs.ext4 >/dev/null || { printf '%s\n' 'real guest-control verification requires mkfs.ext4' >&2; exit 2; }
 command -v truncate >/dev/null || { printf '%s\n' 'real guest-control verification requires truncate' >&2; exit 2; }
+[[ "${kernel}" == /* && -f "${kernel}" && ! -L "${kernel}" ]] || {
+  printf '%s\n' 'real guest-control verification requires an absolute regular guest kernel image' >&2
+  exit 2
+}
 
 "${repository_root}/scripts/ci/install-firecracker.sh"
 "${repository_root}/scripts/ci/install-guest-artifacts.sh"

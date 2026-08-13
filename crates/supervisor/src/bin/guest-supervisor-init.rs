@@ -98,6 +98,9 @@ fn run() -> Result<(), String> {
     let workspace = config.runtime_dir.join("workspace");
     mount_workspace(&config.workspace_device, &workspace)?;
     let result = run_session(&config, &identity, &workspace);
+    if let Err(error) = &result {
+        eprintln!("guest-supervisor-init: session failed before workspace cleanup: {error}");
+    }
     let unmount_result = unmount(&workspace, UnmountFlags::NOFOLLOW).map_err(|error| {
         format!(
             "unmounting guest workspace {}: {error}",

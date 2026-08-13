@@ -78,6 +78,27 @@ if bound_subject != subject_id {
 
 これが無いと、record の `connection` field が別の subject に解決される channel を指すことになる。検査 2 の等号比較が「間違った対応」を検証してしまい、その channel からの要求が record の subject として動く。
 
+## production の resolver と listener
+
+[`control_socket.rs`](../../crates/supervisor/src/control_socket.rs) が production 側の 2 つを提供する。Linux でのみ compile される。
+
+**`SubjectControlListener` は subject ごとに 1 本の `SOCK_SEQPACKET` socket を持つ。** その socket で受理した connection は、構造上その subject のものにしかならない。ADR 0013 の「1 connection = 1 subject」を、後から書き足す検査ではなく transport の性質として持たせている。
+
+```rust
+let mut listener = SubjectControlListener::bind(path, subject, credential, backlog)?;
+let connection = listener.accept(&mut resolver)?;   // ここで binding が確定する
+let identity = connection.identity();               // peer credential は kernel から取る
+let request = connection.receive_request()?;        // bytes を読むのはこの後だけ
+```
+
+`accept` は `SO_PEERCRED` を読んで `ConnectionIdentity` を組み立て、`SubjectCredentialResolver` に binding を登録してから返す。**request bytes へ到達する唯一の経路が `AcceptedControlConnection::receive_request` なので、decode より前に subject が決まっていることが型で保証される。** ADR 0013 が要求する順序が、規律ではなく API の形になっている。
+
+`SOCK_SEQPACKET` を使うのは、1 request = 1 datagram を kernel に守らせるためである。byte stream だと peer が request を分割・連結でき、境界の解釈が supervisor 側の実装になる。
+
+**`SubjectCredentialResolver` は socket ID から subject を引き、peer credential が一致することを要求する。** subject を provisioning したときの uid/gid と、kernel が報告した uid/gid が違えば `ForeignCredential` で落ちる。未登録の socket ID は `Unbound` で落ちる。`bind` は同じ socket ID の再登録を `ConnectionRebindError` で拒否する。
+
+socket は bind 直後に mode 0600 へ絞る。node が出来るのは bind の後なので、connect され得る前に権限が閉じている。
+
 ## `ConnectionIdentity` の強さ
 
 `ConnectionIdentity` は 4 field を持ち、比較と hash はその全部を使う。identity の強度は host の socket ID 割り当てと peer credential の質で決まる。
@@ -113,8 +134,10 @@ if bound_subject != subject_id {
 
 ## 正確な保証範囲
 
-- `StaticCallerResolver` は in-memory の map で、実 socket の peer credential を読まない。production の caller resolver は実装されていない。
-- `SOCK_PEERCRED` / `SCM_CREDENTIALS` の取得、socket ID の非再利用、`SOCK_SEQPACKET` の使用はいずれも host 側の責務で、この crate では検証していない。
+- `StaticCallerResolver` は in-memory の map で、実 socket の peer credential を読まない。test と小さな host adapter 用である。
+- `SubjectControlListener` は実 `SOCK_SEQPACKET` socket に対して module test で検証済み。実 `SO_PEERCRED` の取得、socket ID の単調割り当てと非再利用、4 KiB 超 datagram の decode 前拒否、mode 0600、絶対 path 以外の拒否を確認している。
+- guest VM の中で実際に agent process が接続する end-to-end は未検証である。uid/gid を偽装した peer からの接続は、test process が別 uid を作れないため resolver 単体でしか確認していない。
+- `SubjectControlListener` を `Supervisor::create_subject` の connection 引数へ接続する host 側の組み立ては、この crate に無い。
 - `ConnectionNotBoundToSubject` に test が無い。2 つの `ConnectionIdentity` を 1 subject に bind して誤った channel から呼ぶ経路は未検証。
 - `CallerBindingError` にも supervisor level の test が無い。未 bind の connection から `dispatch_wire` / `derive` / `open_handle` / `close_handle` を呼ぶ経路は未検証。
 - `GrantSubjectMismatch` と `DuplicateSubject` にも test が無い。

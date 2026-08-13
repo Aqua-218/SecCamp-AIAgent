@@ -70,7 +70,7 @@ impl GuestWorkload {
         match self {
             Self::Sleep => "sleep 600",
             Self::CgroupProbe => {
-                r#"-c \"/usr/bin/mkdir -p /sys/fs/cgroup; /usr/bin/mount -t cgroup2 none /sys/fs/cgroup; printf 'cgroup-probe-controllers: '; /usr/bin/cat /sys/fs/cgroup/cgroup.controllers; /usr/bin/sleep 600\""#
+                r#"-c \"/usr/bin/mount -t cgroup2 none /sys/fs/cgroup; printf 'cgroup-probe-controllers: '; /usr/bin/cat /sys/fs/cgroup/cgroup.controllers; /usr/bin/sleep 600\""#
             }
             Self::BrokerProbe => "--port 18081",
             Self::RuntimeBrokerProbe => {
@@ -408,7 +408,7 @@ fn real_firecracker_guest_control_enforces_identity_gate_over_vsock() {
 }
 
 #[test]
-#[ignore = "requires KVM, Firecracker, and a static BusyBox guest-control rootfs"]
+#[ignore = "requires KVM, Firecracker, and a guest capability-runtime rootfs"]
 fn real_firecracker_guest_cgroup_v2_exposes_required_controllers() {
     let firecracker = required_path("REAL_FIRECRACKER_BIN");
     let kernel = required_path("REAL_FIRECRACKER_KERNEL");

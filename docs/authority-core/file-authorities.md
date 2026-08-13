@@ -69,9 +69,9 @@ flowchart LR
 
 この3条件を `file_body_below` / `fileBodyBelow` がまとめて判定する。
 
-## 操作を10種類に分ける
+## 操作を13種類に分ける
 
-単一の「read / write」だけでは、必要以上に強い権限を渡しやすい。たとえば内容を書けることと、file を削除・rename できることは別の効果である。そのため `FileEffect` は次の10種類を個別に持つ。
+単一の「read / write」だけでは、必要以上に強い権限を渡しやすい。たとえば内容を書けることと、file を削除・rename できることは別の効果である。そのため `FileEffect` は次の13種類を個別に持つ。
 
 | Rust | Lean | 許可する効果 |
 |---|---|---|
@@ -85,10 +85,13 @@ flowchart LR
 | `RemoveDirectory` | `.removeDirectory` | directory を削除する |
 | `Rename` | `.rename` | file / directory を rename する |
 | `SetMetadata` | `.setMetadata` | 対応する mode や timestamp を変える |
+| `ReadLink` | `.readLink` | symlink の target を読む |
+| `CreateSymlink` | `.createSymlink` | symlink を作る |
+| `CreateHardLink` | `.createHardLink` | 既存 inode に名前を増やす |
 
 必要な効果だけを集合として渡せるので、`ReadData` だけの子へ `Rename` や `RemoveFile` が暗黙に付くことはない。
 
-この module が判定するのは、1 request につき1 effect と1 path である。rename の移動元と移動先を両方確認する手順や、FUSE operation をどの effect へ変換するかは [`capfs`](../design/capfs.md) の責務である。
+この module が判定するのは、1 request につき1 effect と1 path である。rename の移動元と移動先を両方確認する手順、hard link を持つ inode の全ての名前を確認する手順、FUSE operation をどの effect へ変換するかは [`capfs`](../design/capfs.md) の責務である（[ADR 0017](../decisions/0017-authorize-an-aliased-inode-on-every-name.md)）。
 
 ## effect 集合をどう表すか
 

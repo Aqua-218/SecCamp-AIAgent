@@ -33,15 +33,21 @@ use egress_protocol::{
 use firecracker_runtime::{
     FirecrackerVsockApiClient, RealCommandRunner, RealFileSystem, Runtime, RuntimeConfig,
     RuntimeError, Snapshot, SystemIdentitySource, UnixApiClient,
+    recovery::{
+        FirecrackerRecovery, LinuxFirecrackerRecovery, ProvisioningRecovery, RecoveryError,
+        RecoveryStage, RecoveryTools, SessionResourceOwnership,
+    },
 };
 
 #[cfg(test)]
 use firecracker_runtime::{ApiClient, ApiRequest};
 
 use crate::{
-    BackendError, BrokerLease, CapabilityLease, DurableIdentityLedger, LedgerError, LifecycleState,
-    OsEntropy, SessionIdentity, SessionInfo, SessionOrchestrator, SnapshotDescriptor, SnapshotId,
-    StartError, VmBackend, VmLease, WorkloadBackend, WorkloadLease, WorkspaceLease,
+    BackendError, BrokerLease, BrokerSessionId, CapabilityId, CapabilityLease,
+    DurableIdentityLedger, ID_BYTES, IdentityKind, IdentityLedger, LedgerError, LifecycleState,
+    OsEntropy, RequestId, SessionId, SessionIdentity, SessionInfo, SessionOrchestrator,
+    SnapshotDescriptor, SnapshotId, StartError, SubjectId, VmBackend, VmId, VmLease,
+    WorkloadBackend, WorkloadLease, WorkspaceBackend, WorkspaceId, WorkspaceLease,
     WorkspaceTemplateId,
     authority_backend::{AuthorityCoreBackend, AuthorityRootGrant},
     egress_backend::{
@@ -52,6 +58,10 @@ use crate::{
     },
     firecracker_workspace::{
         FirecrackerFileSystem, FirecrackerWorkspaceBackend, new_firecracker_workspace_adapters,
+    },
+    recovery::{
+        DurableSessionRecoveryJournal, SessionRecoveryError, SessionRecoveryIntent,
+        SessionRecoveryStage,
     },
     session_owner::{
         OwnerPollError, OwnerPollOutcome, OwnerPollRequest, SessionBackends, SessionOwner,
@@ -65,8 +75,10 @@ pub enum AuthorityAuditMode {
     CreateNew(PathBuf),
     /// Requests recovery of an existing journal.
     ///
-    /// Production runtime recovery is not implemented, so [`ProductionSessionRuntimeBuilder`]
-    /// rejects this mode instead of inferring how an incomplete effect should be reconciled.
+    /// The journal's prior attempts stay as history belonging to an earlier capability-state
+    /// instance. They are never re-authorized, and each attempt left `Started` by an unclean
+    /// shutdown is durably closed as `CommitUnknown` before the owner is returned. Recovery runs
+    /// after host resource reconciliation, so the prior instance owns nothing by then.
     OpenExisting(PathBuf),
 }
 
@@ -82,6 +94,7 @@ impl AuthorityAuditMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionDurabilityConfig {
     identity_ledger_path: PathBuf,
+    recovery_journal_path: PathBuf,
     authority_audit: AuthorityAuditMode,
     broker_wal_root: PathBuf,
 }
@@ -91,11 +104,13 @@ impl ProductionDurabilityConfig {
     #[must_use]
     pub fn new(
         identity_ledger_path: impl Into<PathBuf>,
+        recovery_journal_path: impl Into<PathBuf>,
         authority_audit: AuthorityAuditMode,
         broker_wal_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             identity_ledger_path: identity_ledger_path.into(),
+            recovery_journal_path: recovery_journal_path.into(),
             authority_audit,
             broker_wal_root: broker_wal_root.into(),
         }
@@ -208,12 +223,34 @@ impl ProductionBrokerLimits {
     }
 }
 
+/// One session runtime configuration together with the pinned tools that clean it up.
+///
+/// Both halves describe the same host resources: `runtime` names the cgroup, jail, workspace,
+/// and dm-verity mapping a session owns, and `recovery_tools` are the exact pinned binaries the
+/// crash-recovery driver is allowed to run against them.
+#[derive(Debug, Clone)]
+pub struct ProductionFirecrackerConfig {
+    runtime: RuntimeConfig,
+    recovery_tools: RecoveryTools,
+}
+
+impl ProductionFirecrackerConfig {
+    /// Binds one runtime configuration to the recovery tools that release its resources.
+    #[must_use]
+    pub const fn new(runtime: RuntimeConfig, recovery_tools: RecoveryTools) -> Self {
+        Self {
+            runtime,
+            recovery_tools,
+        }
+    }
+}
+
 /// Complete immutable input for the host production composition.
 #[derive(Debug, Clone)]
 pub struct ProductionSessionConfig {
     durability: ProductionDurabilityConfig,
     issuer: IssuerId,
-    firecracker: RuntimeConfig,
+    firecracker: ProductionFirecrackerConfig,
     workspace_template: WorkspaceTemplateId,
     broker_endpoint: ProductionBrokerEndpoint,
     guest_control_endpoint: ProductionGuestControlEndpoint,
@@ -226,7 +263,7 @@ impl ProductionSessionConfig {
     pub const fn new(
         durability: ProductionDurabilityConfig,
         issuer: IssuerId,
-        firecracker: RuntimeConfig,
+        firecracker: ProductionFirecrackerConfig,
         workspace_template: WorkspaceTemplateId,
         broker_endpoint: ProductionBrokerEndpoint,
         guest_control_endpoint: ProductionGuestControlEndpoint,
@@ -241,6 +278,33 @@ impl ProductionSessionConfig {
             guest_control_endpoint,
             broker_limits,
         }
+    }
+}
+
+/// Exact persisted ownership supplied only to crash-recovery provisioning cleanup.
+pub struct SessionFirecrackerRecoveryRequest {
+    identity: SessionIdentity,
+    runtime_config: RuntimeConfig,
+    ownership: SessionResourceOwnership,
+}
+
+impl SessionFirecrackerRecoveryRequest {
+    /// Returns the session whose factory-owned provisioning state must be released.
+    #[must_use]
+    pub const fn identity(&self) -> SessionIdentity {
+        self.identity
+    }
+
+    /// Returns the exact rebound configuration reconstructed from durable identity history.
+    #[must_use]
+    pub const fn runtime_config(&self) -> &RuntimeConfig {
+        &self.runtime_config
+    }
+
+    /// Returns the sealed host resources that the recovery driver is advancing.
+    #[must_use]
+    pub const fn ownership(&self) -> &SessionResourceOwnership {
+        &self.ownership
     }
 }
 
@@ -368,6 +432,20 @@ pub trait PerSessionFirecrackerFactory: Send + 'static {
         &mut self,
         request: &SessionFirecrackerRequest,
     ) -> Result<PreparedFirecrackerSession, BackendError>;
+
+    /// Idempotently releases factory-owned provisioning for one exact persisted session.
+    ///
+    /// This callback runs only after the recovery driver has verified the session cgroup empty,
+    /// before mapper and jail cleanup. It must reject ownership not represented by `request` and
+    /// must return an error while any owned resource remains.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] while exact provisioning cleanup is incomplete or ambiguous.
+    fn recover_provisioning(
+        &mut self,
+        request: &SessionFirecrackerRecoveryRequest,
+    ) -> Result<(), BackendError>;
 }
 
 /// Exact session identity for which host-owned egress adapters must be prepared.
@@ -528,6 +606,46 @@ impl Error for SessionPreparationError {
     }
 }
 
+/// Typed failure while reconciling or advancing durable session recovery.
+#[derive(Debug)]
+pub enum ProductionRecoveryError {
+    /// The durable recovery journal could not be read or advanced safely.
+    Journal(SessionRecoveryError),
+    /// Exact Firecracker resource ownership could not be reconstructed.
+    Runtime(RuntimeError),
+    /// A physical cleanup stage remains incomplete.
+    Firecracker(RecoveryError),
+    /// Recovery history and the no-reuse identity ledger disagree.
+    IdentityMismatch(String),
+}
+
+impl fmt::Display for ProductionRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Journal(error) => write!(formatter, "session recovery journal failed: {error}"),
+            Self::Runtime(error) => write!(
+                formatter,
+                "session recovery ownership could not be reconstructed: {error}"
+            ),
+            Self::Firecracker(error) => error.fmt(formatter),
+            Self::IdentityMismatch(message) => {
+                write!(formatter, "session recovery identity mismatch: {message}")
+            }
+        }
+    }
+}
+
+impl Error for ProductionRecoveryError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Journal(error) => Some(error),
+            Self::Runtime(error) => Some(error),
+            Self::Firecracker(error) => Some(error),
+            Self::IdentityMismatch(_) => None,
+        }
+    }
+}
+
 /// Failure before a production session owner can be returned.
 #[derive(Debug)]
 pub enum ProductionBuildError {
@@ -537,24 +655,20 @@ pub enum ProductionBuildError {
     Runtime(RuntimeError),
     /// Durable identity-ledger acquisition or recovery failed.
     IdentityLedger(LedgerError),
-    /// A nonempty identity ledger requires host session reconciliation.
-    UnsupportedIdentityRecovery {
-        /// Ledger that already records allocated session identities.
-        path: PathBuf,
-        /// Number of durable identity records already present.
-        committed_records: usize,
-    },
+    /// Durable session ownership recovery or ledger reconciliation failed.
+    Recovery(Box<ProductionRecoveryError>),
     /// Durable authority journal creation failed.
     AuthorityAudit(DurableAuditError),
-    /// Existing authority journals need explicit reconciliation that is not implemented.
-    UnsupportedAuthorityRecovery {
-        /// Existing WAL that requires operator reconciliation.
-        path: PathBuf,
-    },
     /// Production Broker backend validation failed.
     Broker(BackendError),
     /// Authority Core could not inspect the fresh journal.
     AuthorityKernel(authority_core::audit::AuditError),
+}
+
+impl ProductionBuildError {
+    fn recovery(error: ProductionRecoveryError) -> Self {
+        Self::Recovery(Box::new(error))
+    }
 }
 
 impl fmt::Display for ProductionBuildError {
@@ -569,22 +683,10 @@ impl fmt::Display for ProductionBuildError {
             Self::IdentityLedger(error) => {
                 write!(formatter, "identity ledger unavailable: {error}")
             }
-            Self::UnsupportedIdentityRecovery {
-                path,
-                committed_records,
-            } => write!(
-                formatter,
-                "identity ledger recovery is unsupported without session reconciliation: {} contains {committed_records} records",
-                path.display()
-            ),
+            Self::Recovery(error) => error.fmt(formatter),
             Self::AuthorityAudit(error) => {
                 write!(formatter, "authority audit WAL unavailable: {error}")
             }
-            Self::UnsupportedAuthorityRecovery { path } => write!(
-                formatter,
-                "authority audit recovery is unsupported without reconciliation: {}",
-                path.display()
-            ),
             Self::Broker(error) => write!(
                 formatter,
                 "production Broker backend rejected config: {error}"
@@ -602,12 +704,11 @@ impl Error for ProductionBuildError {
         match self {
             Self::Runtime(error) => Some(error),
             Self::IdentityLedger(error) => Some(error),
+            Self::Recovery(error) => Some(error),
             Self::AuthorityAudit(error) => Some(error),
             Self::Broker(error) => Some(error),
             Self::AuthorityKernel(error) => Some(error),
-            Self::InvalidConfig(_)
-            | Self::UnsupportedIdentityRecovery { .. }
-            | Self::UnsupportedAuthorityRecovery { .. } => None,
+            Self::InvalidConfig(_) => None,
         }
     }
 }
@@ -617,8 +718,16 @@ impl Error for ProductionBuildError {
 pub enum ProductionStartError {
     /// This composition has already consumed its one session identity allocation attempt.
     AlreadyStarted,
+    /// A pending durable recovery obligation could not be drained before startup effects.
+    Recovery(Box<ProductionRecoveryError>),
     /// The underlying fail-closed lifecycle start failed.
     Start(StartError),
+}
+
+impl ProductionStartError {
+    fn recovery(error: ProductionRecoveryError) -> Self {
+        Self::Recovery(Box::new(error))
+    }
 }
 
 impl fmt::Display for ProductionStartError {
@@ -627,6 +736,7 @@ impl fmt::Display for ProductionStartError {
             Self::AlreadyStarted => formatter.write_str(
                 "production session runtime is one-shot and has already attempted startup",
             ),
+            Self::Recovery(error) => error.fmt(formatter),
             Self::Start(error) => error.fmt(formatter),
         }
     }
@@ -636,9 +746,378 @@ impl Error for ProductionStartError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::AlreadyStarted => None,
+            Self::Recovery(error) => Some(error),
             Self::Start(error) => Some(error),
         }
     }
+}
+
+type ProductionRecoveryDriver = FirecrackerRecovery<LinuxFirecrackerRecovery>;
+type SharedProductionRecovery = Arc<Mutex<ProductionRecoveryState>>;
+
+struct ProductionRecoveryState {
+    journal: DurableSessionRecoveryJournal,
+    driver: ProductionRecoveryDriver,
+}
+
+struct RecoveryAwareIdentityLedger {
+    inner: DurableIdentityLedger,
+    recovery: SharedProductionRecovery,
+    base_config: RuntimeConfig,
+}
+
+impl RecoveryAwareIdentityLedger {
+    const fn new(
+        inner: DurableIdentityLedger,
+        recovery: SharedProductionRecovery,
+        base_config: RuntimeConfig,
+    ) -> Self {
+        Self {
+            inner,
+            recovery,
+            base_config,
+        }
+    }
+}
+
+impl IdentityLedger for RecoveryAwareIdentityLedger {
+    fn reserve_batch(
+        &mut self,
+        identities: &[(IdentityKind, [u8; ID_BYTES])],
+    ) -> Result<(), LedgerError> {
+        let identity = session_identity_from_reservation(identities)?;
+        let request = recovery_request(&self.base_config, identity)
+            .map_err(|error| recovery_ledger_error(&error))?;
+        let mut recovery = self.recovery.lock().map_err(|_| LedgerError::Unavailable {
+            reason: "session recovery state is poisoned before identity reservation".to_owned(),
+        })?;
+        let lease = recovery
+            .journal
+            .prepare(SessionRecoveryIntent::new(
+                identity,
+                request.ownership.config_fingerprint(),
+            ))
+            .map_err(recovery_journal_ledger_error)?;
+
+        if let Err(error) = self.inner.reserve_batch(identities) {
+            if matches!(
+                error,
+                LedgerError::Duplicate { .. } | LedgerError::CapacityExceeded { .. }
+            ) && let Err(abandon_error) = recovery.journal.abandon(&lease)
+            {
+                return Err(LedgerError::Unavailable {
+                    reason: format!(
+                        "identity reservation failed without effect ({error}), but its durable recovery intent could not be abandoned: {abandon_error}"
+                    ),
+                });
+            }
+            return Err(error);
+        }
+
+        recovery
+            .journal
+            .checkpoint(&lease, SessionRecoveryStage::IdentityReserved)
+            .map(|_| ())
+            .map_err(recovery_journal_ledger_error)
+    }
+}
+
+fn session_identity_from_reservation(
+    identities: &[(IdentityKind, [u8; ID_BYTES])],
+) -> Result<SessionIdentity, LedgerError> {
+    const EXPECTED: [IdentityKind; 7] = [
+        IdentityKind::Session,
+        IdentityKind::Request,
+        IdentityKind::Vm,
+        IdentityKind::Subject,
+        IdentityKind::Workspace,
+        IdentityKind::Capability,
+        IdentityKind::BrokerSession,
+    ];
+    if identities.len() != EXPECTED.len()
+        || identities
+            .iter()
+            .zip(EXPECTED)
+            .any(|((actual, _), expected)| *actual != expected)
+    {
+        return Err(LedgerError::Unavailable {
+            reason: "production identity reservation is not the exact seven-kind session batch"
+                .to_owned(),
+        });
+    }
+    for (index, (_, identity)) in identities.iter().enumerate() {
+        if identities
+            .iter()
+            .skip(index + 1)
+            .any(|(_, candidate)| candidate == identity)
+        {
+            return Err(LedgerError::Duplicate {
+                kind: identities[index].0,
+                identity: *identity,
+            });
+        }
+    }
+    Ok(SessionIdentity {
+        session_id: SessionId::new(identities[0].1),
+        request_id: RequestId::new(identities[1].1),
+        vm_id: VmId::new(identities[2].1),
+        subject_id: SubjectId::new(identities[3].1),
+        workspace_id: WorkspaceId::new(identities[4].1),
+        capability_id: CapabilityId::new(identities[5].1),
+        broker_session_id: BrokerSessionId::new(identities[6].1),
+    })
+}
+
+fn recovery_request(
+    base_config: &RuntimeConfig,
+    identity: SessionIdentity,
+) -> Result<SessionFirecrackerRecoveryRequest, ProductionRecoveryError> {
+    let runtime_config = rebind_runtime_config(base_config, identity)
+        .map_err(|error| ProductionRecoveryError::IdentityMismatch(error.to_string()))?;
+    let ownership = SessionResourceOwnership::from_runtime_config(&runtime_config)
+        .map_err(ProductionRecoveryError::Runtime)?;
+    Ok(SessionFirecrackerRecoveryRequest {
+        identity,
+        runtime_config,
+        ownership,
+    })
+}
+
+fn recovery_ledger_error(error: &ProductionRecoveryError) -> LedgerError {
+    LedgerError::Unavailable {
+        reason: error.to_string(),
+    }
+}
+
+fn recovery_journal_ledger_error(error: SessionRecoveryError) -> LedgerError {
+    recovery_ledger_error(&ProductionRecoveryError::Journal(error))
+}
+
+struct FactoryProvisioningRecovery<'a> {
+    factory: &'a mut dyn PerSessionFirecrackerFactory,
+    request: &'a SessionFirecrackerRecoveryRequest,
+}
+
+impl ProvisioningRecovery for FactoryProvisioningRecovery<'_> {
+    fn release_provisioning(
+        &mut self,
+        ownership: &SessionResourceOwnership,
+    ) -> Result<(), RuntimeError> {
+        if ownership != self.request.ownership() {
+            return Err(RuntimeError::Cleanup(
+                "provisioning recovery received foreign resource ownership".to_owned(),
+            ));
+        }
+        self.factory
+            .recover_provisioning(self.request)
+            .map_err(|error| RuntimeError::Cleanup(error.to_string()))
+    }
+}
+
+fn firecracker_stage(
+    stage: SessionRecoveryStage,
+) -> Result<RecoveryStage, ProductionRecoveryError> {
+    match stage {
+        SessionRecoveryStage::IdentityReserved => Ok(RecoveryStage::IdentityReserved),
+        SessionRecoveryStage::CgroupEmpty => Ok(RecoveryStage::CgroupEmpty),
+        SessionRecoveryStage::MapperClosed => Ok(RecoveryStage::MapperClosed),
+        SessionRecoveryStage::ProvisioningReleased => Ok(RecoveryStage::ProvisioningReleased),
+        SessionRecoveryStage::JailRemoved => Ok(RecoveryStage::JailRemoved),
+        SessionRecoveryStage::Complete => Ok(RecoveryStage::Complete),
+        SessionRecoveryStage::Intent | SessionRecoveryStage::Abandoned => {
+            Err(ProductionRecoveryError::IdentityMismatch(format!(
+                "stage {stage} has no Firecracker cleanup ownership"
+            )))
+        }
+    }
+}
+
+const fn journal_stage(stage: RecoveryStage) -> SessionRecoveryStage {
+    match stage {
+        RecoveryStage::IdentityReserved => SessionRecoveryStage::IdentityReserved,
+        RecoveryStage::CgroupEmpty => SessionRecoveryStage::CgroupEmpty,
+        RecoveryStage::MapperClosed => SessionRecoveryStage::MapperClosed,
+        RecoveryStage::ProvisioningReleased => SessionRecoveryStage::ProvisioningReleased,
+        RecoveryStage::JailRemoved => SessionRecoveryStage::JailRemoved,
+        RecoveryStage::Complete => SessionRecoveryStage::Complete,
+    }
+}
+
+fn drain_recovery_to(
+    recovery: &mut ProductionRecoveryState,
+    base_config: &RuntimeConfig,
+    factory: &mut dyn PerSessionFirecrackerFactory,
+    target: SessionRecoveryStage,
+) -> Result<(), ProductionRecoveryError> {
+    loop {
+        let Some(lease) = recovery.journal.pending() else {
+            return Ok(());
+        };
+        if lease.stage() == SessionRecoveryStage::Intent {
+            return Err(ProductionRecoveryError::IdentityMismatch(
+                "recovery intent has not durably reserved its seven identities".to_owned(),
+            ));
+        }
+        if lease.stage() >= target {
+            return Ok(());
+        }
+        if lease.stage() == SessionRecoveryStage::JailRemoved {
+            recovery
+                .journal
+                .complete(&lease)
+                .map_err(ProductionRecoveryError::Journal)?;
+            continue;
+        }
+        let request = recovery_request(base_config, lease.intent().identity())?;
+        if request.ownership.config_fingerprint() != lease.intent().config_fingerprint() {
+            return Err(ProductionRecoveryError::IdentityMismatch(format!(
+                "persisted config fingerprint for session {} does not match reconstructed ownership",
+                lease.intent().identity().session_id()
+            )));
+        }
+        let mut provisioning = FactoryProvisioningRecovery {
+            factory,
+            request: &request,
+        };
+        let progress = ProductionRecoveryDriver::begin(
+            &request.ownership,
+            lease.intent().config_fingerprint(),
+            firecracker_stage(lease.stage())?,
+        )
+        .map_err(ProductionRecoveryError::Firecracker)?;
+        let advanced = recovery
+            .driver
+            .recover_next(&request.ownership, progress, &mut provisioning)
+            .map_err(ProductionRecoveryError::Firecracker)?;
+        if advanced == RecoveryStage::Complete {
+            recovery
+                .journal
+                .complete(&lease)
+                .map_err(ProductionRecoveryError::Journal)?;
+        } else {
+            recovery
+                .journal
+                .checkpoint(&lease, journal_stage(advanced))
+                .map_err(ProductionRecoveryError::Journal)?;
+        }
+    }
+}
+
+fn reconcile_recovery(
+    ledger: &mut DurableIdentityLedger,
+    recovery: &mut ProductionRecoveryState,
+    base_config: &RuntimeConfig,
+    factory: &mut dyn PerSessionFirecrackerFactory,
+) -> Result<(), ProductionBuildError> {
+    if let Some(lease) = recovery.journal.pending()
+        && lease.stage() == SessionRecoveryStage::Intent
+    {
+        let request = recovery_request(base_config, lease.intent().identity())
+            .map_err(ProductionBuildError::recovery)?;
+        if request.ownership.config_fingerprint() != lease.intent().config_fingerprint() {
+            return Err(ProductionBuildError::recovery(
+                ProductionRecoveryError::IdentityMismatch(format!(
+                    "persisted config fingerprint for session {} does not match reconstructed ownership",
+                    lease.intent().identity().session_id()
+                )),
+            ));
+        }
+        let identities = lease.intent().identities();
+        require_distinct_intent_identities(&identities).map_err(ProductionBuildError::recovery)?;
+        let present = identities
+            .iter()
+            .filter(|(_, identity)| ledger.contains(*identity))
+            .count();
+        match present {
+            0 => {
+                if let Err(error) = ledger.reserve_batch(&identities) {
+                    if matches!(
+                        error,
+                        LedgerError::Duplicate { .. } | LedgerError::CapacityExceeded { .. }
+                    ) {
+                        recovery
+                            .journal
+                            .abandon(&lease)
+                            .map_err(ProductionRecoveryError::Journal)
+                            .map_err(ProductionBuildError::recovery)?;
+                    }
+                    return Err(ProductionBuildError::IdentityLedger(error));
+                }
+            }
+            7 => {}
+            count => {
+                return Err(ProductionBuildError::recovery(
+                    ProductionRecoveryError::IdentityMismatch(format!(
+                        "pending intent has only {count} of seven identities in the ledger"
+                    )),
+                ));
+            }
+        }
+        recovery
+            .journal
+            .checkpoint(&lease, SessionRecoveryStage::IdentityReserved)
+            .map_err(ProductionRecoveryError::Journal)
+            .map_err(ProductionBuildError::recovery)?;
+    }
+
+    validate_recovery_ledger_exactness(ledger, &recovery.journal)
+        .map_err(ProductionBuildError::recovery)?;
+    drain_recovery_to(
+        recovery,
+        base_config,
+        factory,
+        SessionRecoveryStage::Complete,
+    )
+    .map_err(ProductionBuildError::recovery)
+}
+
+fn require_distinct_intent_identities(
+    identities: &[(IdentityKind, [u8; ID_BYTES]); 7],
+) -> Result<(), ProductionRecoveryError> {
+    for (index, (_, identity)) in identities.iter().enumerate() {
+        if identities
+            .iter()
+            .skip(index + 1)
+            .any(|(_, candidate)| candidate == identity)
+        {
+            return Err(ProductionRecoveryError::IdentityMismatch(
+                "one recovery intent repeats a supposedly disjoint identity".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovery_ledger_exactness(
+    ledger: &DurableIdentityLedger,
+    journal: &DurableSessionRecoveryJournal,
+) -> Result<(), ProductionRecoveryError> {
+    let reserved = journal.identity_reserved_intent_count();
+    let expected = reserved.checked_mul(7).ok_or_else(|| {
+        ProductionRecoveryError::IdentityMismatch(
+            "reserved recovery history exceeds identity-count capacity".to_owned(),
+        )
+    })?;
+    if ledger.committed_count() != expected {
+        return Err(ProductionRecoveryError::IdentityMismatch(format!(
+            "ledger contains {} identities but recovery history accounts for exactly {expected}",
+            ledger.committed_count()
+        )));
+    }
+    for intent in journal.identity_reserved_intents() {
+        let identities = intent.identities();
+        require_distinct_intent_identities(&identities)?;
+        if identities
+            .iter()
+            .any(|(_, identity)| !ledger.contains(*identity))
+        {
+            return Err(ProductionRecoveryError::IdentityMismatch(format!(
+                "ledger is missing an identity reserved for session {}",
+                intent.identity().session_id()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Fail-closed builder for one non-cloneable production session runtime.
@@ -688,48 +1167,60 @@ impl ProductionSessionRuntimeBuilder {
             ));
         }
 
-        let AuthorityAuditMode::CreateNew(audit_path) = &self.config.durability.authority_audit
-        else {
-            return Err(ProductionBuildError::UnsupportedAuthorityRecovery {
-                path: self.config.durability.authority_audit.path().to_owned(),
-            });
-        };
-        let ledger = DurableIdentityLedger::open(&self.config.durability.identity_ledger_path)
+        let mut ledger = DurableIdentityLedger::open(&self.config.durability.identity_ledger_path)
             .map_err(ProductionBuildError::IdentityLedger)?;
-        let committed_records = ledger.committed_count();
-        if committed_records != 0 {
-            return Err(ProductionBuildError::UnsupportedIdentityRecovery {
-                path: self.config.durability.identity_ledger_path.clone(),
-                committed_records,
-            });
-        }
-        let orchestrator = SessionOrchestrator::with_ledger(OsEntropy, ledger);
-        let audit =
-            DurableAuditLog::create(audit_path).map_err(ProductionBuildError::AuthorityAudit)?;
-        let kernel = Arc::new(
-            CapabilityKernel::try_new_with_durable_audit(
-                CapabilityState::new(self.config.issuer),
-                audit,
-            )
-            .map_err(ProductionBuildError::AuthorityKernel)?,
+        let journal =
+            DurableSessionRecoveryJournal::open(&self.config.durability.recovery_journal_path)
+                .map_err(ProductionRecoveryError::Journal)
+                .map_err(ProductionBuildError::recovery)?;
+        let recovery_backend =
+            LinuxFirecrackerRecovery::new(self.config.firecracker.recovery_tools)
+                .map_err(ProductionBuildError::Runtime)?;
+        let mut recovery = ProductionRecoveryState {
+            journal,
+            driver: FirecrackerRecovery::new(recovery_backend),
+        };
+        let mut firecracker_factory = self.firecracker_factory;
+        reconcile_recovery(
+            &mut ledger,
+            &mut recovery,
+            &self.config.firecracker.runtime,
+            firecracker_factory.as_mut(),
+        )?;
+        let recovery = Arc::new(Mutex::new(recovery));
+        let ledger = RecoveryAwareIdentityLedger::new(
+            ledger,
+            Arc::clone(&recovery),
+            self.config.firecracker.runtime.clone(),
         );
+        let orchestrator = SessionOrchestrator::with_ledger(OsEntropy, ledger);
+        let kernel = Arc::new(open_authority_kernel(
+            &self.config.durability.authority_audit,
+            self.config.issuer,
+        )?);
         let capability = AuthorityCoreBackend::new(Arc::clone(&kernel));
 
-        let jail_root = executable_jail_root(&self.config.firecracker)?;
+        let jail_root = executable_jail_root(&self.config.firecracker.runtime)?;
         let (workspace, runtime_filesystem) = new_firecracker_workspace_adapters(
             RealFileSystem::new(),
             self.config.workspace_template.clone(),
-            self.config.firecracker.workspace.source.clone(),
+            self.config.firecracker.runtime.workspace.source.clone(),
             jail_root,
         );
         let deferred = DeferredFirecrackerFactory::new(
-            self.firecracker_factory,
+            firecracker_factory,
             runtime_filesystem,
-            self.config.firecracker,
+            self.config.firecracker.runtime,
             snapshot_id,
             self.config.guest_control_endpoint,
+            recovery,
         );
+        let deferred_state = Arc::clone(&deferred.shared);
         let (vm, workload) = deferred.into_handles();
+        let workspace = RecoveryAwareWorkspace {
+            inner: workspace,
+            deferred: Arc::clone(&deferred_state),
+        };
 
         let broker_runtime_factory = ProductionBrokerRuntimeFactory {
             authority: AuthorityCoreBackend::new(kernel),
@@ -755,6 +1246,7 @@ impl ProductionSessionRuntimeBuilder {
                 owner,
                 snapshot: SnapshotDescriptor::clean(snapshot_id),
                 workspace_template: self.config.workspace_template,
+                deferred: deferred_state,
                 start_attempted: false,
             }),
         })
@@ -818,13 +1310,14 @@ trait OwnedSession {
     fn stop(&mut self) -> Result<OwnerPollOutcome, OwnerPollError>;
 }
 
-type OwnedWorkspace = FirecrackerWorkspaceBackend<RealFileSystem>;
+type OwnedWorkspaceInner = FirecrackerWorkspaceBackend<RealFileSystem>;
+type OwnedWorkspace = RecoveryAwareWorkspace;
 type OwnedBroker = ProductionBrokerBackend<ProductionBrokerRuntimeFactory>;
 type OwnedVm = DeferredFirecrackerVm;
 type OwnedWorkload = DeferredFirecrackerWorkload;
 type ConcreteSessionOwner = SessionOwner<
     OsEntropy,
-    DurableIdentityLedger,
+    RecoveryAwareIdentityLedger,
     OwnedWorkspace,
     OwnedBroker,
     OwnedVm,
@@ -836,6 +1329,7 @@ struct ConcreteOwnedSession {
     owner: ConcreteSessionOwner,
     snapshot: SnapshotDescriptor,
     workspace_template: WorkspaceTemplateId,
+    deferred: Arc<Mutex<DeferredFirecrackerState>>,
     start_attempted: bool,
 }
 
@@ -852,10 +1346,23 @@ impl OwnedSession for ConcreteOwnedSession {
         if self.start_attempted {
             return Err(ProductionStartError::AlreadyStarted);
         }
+        {
+            let mut state = lock_deferred_for_recovery(&self.deferred)
+                .map_err(ProductionStartError::recovery)?;
+            drain_deferred_recovery(&mut state, SessionRecoveryStage::Complete)
+                .map_err(ProductionStartError::recovery)?;
+        }
         self.start_attempted = true;
-        self.owner
-            .start(&self.snapshot, &self.workspace_template, grant)
-            .map_err(ProductionStartError::Start)
+        let started = self
+            .owner
+            .start(&self.snapshot, &self.workspace_template, grant);
+        if started.is_err() && self.owner.state() == LifecycleState::Ready {
+            let mut state = lock_deferred_for_recovery(&self.deferred)
+                .map_err(ProductionStartError::recovery)?;
+            drain_deferred_recovery(&mut state, SessionRecoveryStage::Complete)
+                .map_err(ProductionStartError::recovery)?;
+        }
+        started.map_err(ProductionStartError::Start)
     }
 
     fn poll(&mut self, request: OwnerPollRequest) -> Result<OwnerPollOutcome, OwnerPollError> {
@@ -895,6 +1402,7 @@ struct DeferredFirecrackerState {
     base_config: RuntimeConfig,
     snapshot_id: SnapshotId,
     guest_control_endpoint: ProductionGuestControlEndpoint,
+    recovery: SharedProductionRecovery,
     prepared_identity: Option<SessionIdentity>,
     vm: Option<OwnedFirecrackerVm>,
     workload: Option<OwnedFirecrackerWorkload>,
@@ -911,6 +1419,7 @@ impl DeferredFirecrackerFactory {
         base_config: RuntimeConfig,
         snapshot_id: SnapshotId,
         guest_control_endpoint: ProductionGuestControlEndpoint,
+        recovery: SharedProductionRecovery,
     ) -> Self {
         Self {
             shared: Arc::new(Mutex::new(DeferredFirecrackerState {
@@ -919,6 +1428,7 @@ impl DeferredFirecrackerFactory {
                 base_config,
                 snapshot_id,
                 guest_control_endpoint,
+                recovery,
                 prepared_identity: None,
                 vm: None,
                 workload: None,
@@ -944,6 +1454,30 @@ struct DeferredFirecrackerVm {
 
 struct DeferredFirecrackerWorkload {
     shared: Arc<Mutex<DeferredFirecrackerState>>,
+}
+
+struct RecoveryAwareWorkspace {
+    inner: OwnedWorkspaceInner,
+    deferred: Arc<Mutex<DeferredFirecrackerState>>,
+}
+
+impl WorkspaceBackend for RecoveryAwareWorkspace {
+    fn clone_workspace(
+        &mut self,
+        identity: &SessionIdentity,
+        template: &WorkspaceTemplateId,
+    ) -> Result<WorkspaceLease, BackendError> {
+        self.inner.clone_workspace(identity, template)
+    }
+
+    fn isolate_workspace(&mut self, lease: &WorkspaceLease) -> Result<(), BackendError> {
+        let mut state = lock_deferred(&self.deferred)?;
+        drain_deferred_recovery(&mut state, SessionRecoveryStage::ProvisioningReleased)
+            .map_err(|error| recovery_backend_error(&error))?;
+        self.inner.isolate_workspace(lease)?;
+        drain_deferred_recovery(&mut state, SessionRecoveryStage::Complete)
+            .map_err(|error| recovery_backend_error(&error))
+    }
 }
 
 impl VmBackend for DeferredFirecrackerVm {
@@ -980,7 +1514,9 @@ impl VmBackend for DeferredFirecrackerVm {
         match state.vm.as_mut() {
             Some(vm) => vm.cleanup_failed_start(),
             None => Ok(()),
-        }
+        }?;
+        drain_deferred_recovery(&mut state, SessionRecoveryStage::ProvisioningReleased)
+            .map_err(|error| recovery_backend_error(&error))
     }
 
     fn kill_vm(&mut self, lease: &VmLease) -> Result<(), BackendError> {
@@ -989,7 +1525,9 @@ impl VmBackend for DeferredFirecrackerVm {
             .vm
             .as_mut()
             .ok_or_else(|| BackendError::new("no prepared Firecracker VM owns this lease"))?
-            .kill_vm(lease)
+            .kill_vm(lease)?;
+        drain_deferred_recovery(&mut state, SessionRecoveryStage::ProvisioningReleased)
+            .map_err(|error| recovery_backend_error(&error))
     }
 }
 
@@ -1020,6 +1558,34 @@ fn lock_deferred(
     shared.lock().map_err(|_| {
         BackendError::new("deferred Firecracker state is poisoned; refusing lifecycle operation")
     })
+}
+
+fn lock_deferred_for_recovery(
+    shared: &Arc<Mutex<DeferredFirecrackerState>>,
+) -> Result<MutexGuard<'_, DeferredFirecrackerState>, ProductionRecoveryError> {
+    shared.lock().map_err(|_| {
+        ProductionRecoveryError::IdentityMismatch(
+            "deferred Firecracker state is poisoned; refusing recovery".to_owned(),
+        )
+    })
+}
+
+fn drain_deferred_recovery(
+    state: &mut DeferredFirecrackerState,
+    target: SessionRecoveryStage,
+) -> Result<(), ProductionRecoveryError> {
+    let shared_recovery = Arc::clone(&state.recovery);
+    let base_config = state.base_config.clone();
+    let mut recovery = shared_recovery.lock().map_err(|_| {
+        ProductionRecoveryError::IdentityMismatch(
+            "session recovery state is poisoned; refusing cleanup".to_owned(),
+        )
+    })?;
+    drain_recovery_to(&mut recovery, &base_config, state.factory.as_mut(), target)
+}
+
+fn recovery_backend_error(error: &ProductionRecoveryError) -> BackendError {
+    BackendError::new(error.to_string())
 }
 
 fn prepare_firecracker(
@@ -1186,17 +1752,48 @@ impl BrokerRuntimeFactory<VsockStream> for ProductionBrokerRuntimeFactory {
     }
 }
 
+/// Attaches capability state to the configured authority journal.
+///
+/// Host resource recovery runs before this, so by the time an existing journal is reopened the
+/// instance that wrote it no longer owns any session resource this kernel could collide with.
+fn open_authority_kernel(
+    mode: &AuthorityAuditMode,
+    issuer: IssuerId,
+) -> Result<CapabilityKernel, ProductionBuildError> {
+    let state = CapabilityState::new(issuer);
+    match mode {
+        AuthorityAuditMode::CreateNew(path) => {
+            let audit =
+                DurableAuditLog::create(path).map_err(ProductionBuildError::AuthorityAudit)?;
+            CapabilityKernel::try_new_with_durable_audit(state, audit)
+                .map_err(ProductionBuildError::AuthorityKernel)
+        }
+        AuthorityAuditMode::OpenExisting(path) => {
+            let audit =
+                DurableAuditLog::open(path).map_err(ProductionBuildError::AuthorityAudit)?;
+            CapabilityKernel::try_recover_with_durable_audit(state, audit)
+                .map(|(kernel, _recovery)| kernel)
+                .map_err(ProductionBuildError::AuthorityKernel)
+        }
+    }
+}
+
 fn validate_production_config(
     config: &ProductionSessionConfig,
 ) -> Result<(), ProductionBuildError> {
     config
         .firecracker
+        .runtime
         .validate()
         .map_err(ProductionBuildError::Runtime)?;
     for (label, path) in [
         (
             "identity ledger",
             config.durability.identity_ledger_path.as_path(),
+        ),
+        (
+            "session recovery WAL",
+            config.durability.recovery_journal_path.as_path(),
         ),
         (
             "authority audit WAL",
@@ -1228,7 +1825,7 @@ fn validate_production_config(
             config.durability.broker_wal_root.display()
         )));
     }
-    if config.broker_endpoint.expected_guest_cid != config.firecracker.vsock.guest_cid {
+    if config.broker_endpoint.expected_guest_cid != config.firecracker.runtime.vsock.guest_cid {
         return Err(ProductionBuildError::InvalidConfig(
             "Broker guest CID must equal the Firecracker vsock guest CID".to_owned(),
         ));
@@ -1291,6 +1888,10 @@ fn validate_durability_path_separation(
     let durability = [
         ComparedPath::new("identity ledger", &config.durability.identity_ledger_path)?,
         ComparedPath::new(
+            "session recovery WAL",
+            &config.durability.recovery_journal_path,
+        )?,
+        ComparedPath::new(
             "authority audit WAL",
             config.durability.authority_audit.path(),
         )?,
@@ -1305,43 +1906,46 @@ fn validate_durability_path_separation(
     let runtime_paths = [
         ComparedPath::new(
             "workspace template source",
-            &config.firecracker.workspace.source,
+            &config.firecracker.runtime.workspace.source,
         )?,
         ComparedPath::new(
             "workspace clone tree",
-            &config.firecracker.workspace.clone_root,
+            &config.firecracker.runtime.workspace.clone_root,
         )?,
         ComparedPath::new(
             "Firecracker jail tree",
-            &config.firecracker.jailer_config.chroot_base_dir,
+            &config.firecracker.runtime.jailer_config.chroot_base_dir,
         )?,
         ComparedPath::new(
             "Firecracker executable",
-            &config.firecracker.firecracker.path,
+            &config.firecracker.runtime.firecracker.path,
         )?,
-        ComparedPath::new("kernel artifact", &config.firecracker.kernel.path)?,
-        ComparedPath::new("rootfs artifact", &config.firecracker.rootfs.path)?,
+        ComparedPath::new("kernel artifact", &config.firecracker.runtime.kernel.path)?,
+        ComparedPath::new("rootfs artifact", &config.firecracker.runtime.rootfs.path)?,
         ComparedPath::new(
             "dm-verity hash artifact",
-            &config.firecracker.verity_hash.path,
+            &config.firecracker.runtime.verity_hash.path,
         )?,
-        ComparedPath::new("jailer executable", &config.firecracker.jailer.path)?,
+        ComparedPath::new("jailer executable", &config.firecracker.runtime.jailer.path)?,
         ComparedPath::new(
             "seccomp filter artifact",
-            &config.firecracker.isolation.seccomp.filter.path,
+            &config.firecracker.runtime.isolation.seccomp.filter.path,
         )?,
-        ComparedPath::new("Firecracker API socket", &config.firecracker.api_socket)?,
+        ComparedPath::new(
+            "Firecracker API socket",
+            &config.firecracker.runtime.api_socket,
+        )?,
         ComparedPath::new(
             "Firecracker vsock socket",
-            &config.firecracker.vsock.uds_path,
+            &config.firecracker.runtime.vsock.uds_path,
         )?,
         ComparedPath::new(
             "jailed dm-verity device",
-            &config.firecracker.dm_verity.jailed_device_path,
+            &config.firecracker.runtime.dm_verity.jailed_device_path,
         )?,
         ComparedPath::new(
             "Firecracker cgroup",
-            &config.firecracker.isolation.cgroup.path,
+            &config.firecracker.runtime.isolation.cgroup.path,
         )?,
     ];
     for durable in &durability {
@@ -1586,7 +2190,8 @@ fn rebind_cgroup_path(
 mod tests {
     use std::{
         sync::atomic::{AtomicU64, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
+        thread::sleep,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use egress_broker::durable::DurableBrokerView;
@@ -1598,6 +2203,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::recovery::SessionRecoveryLease;
     use crate::{IdentityKind, IdentityLedger};
 
     struct TestApi;
@@ -1742,6 +2348,71 @@ mod tests {
         ) -> Result<PreparedFirecrackerSession, BackendError> {
             Err(BackendError::new("test factory must not run during build"))
         }
+
+        fn recover_provisioning(
+            &mut self,
+            _request: &SessionFirecrackerRecoveryRequest,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    struct FailingRecoveryFactory {
+        snapshot_id: SnapshotId,
+        attempts: Arc<AtomicU64>,
+    }
+
+    struct RecordingRecoveryFactory {
+        snapshot_id: SnapshotId,
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl PerSessionFirecrackerFactory for RecordingRecoveryFactory {
+        fn snapshot_id(&self) -> SnapshotId {
+            self.snapshot_id
+        }
+
+        fn prepare(
+            &mut self,
+            _request: &SessionFirecrackerRequest,
+        ) -> Result<PreparedFirecrackerSession, BackendError> {
+            Err(BackendError::new(
+                "test factory must not prepare during recovery",
+            ))
+        }
+
+        fn recover_provisioning(
+            &mut self,
+            _request: &SessionFirecrackerRecoveryRequest,
+        ) -> Result<(), BackendError> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    impl PerSessionFirecrackerFactory for FailingRecoveryFactory {
+        fn snapshot_id(&self) -> SnapshotId {
+            self.snapshot_id
+        }
+
+        fn prepare(
+            &mut self,
+            _request: &SessionFirecrackerRequest,
+        ) -> Result<PreparedFirecrackerSession, BackendError> {
+            Err(BackendError::new(
+                "test factory must not prepare during recovery",
+            ))
+        }
+
+        fn recover_provisioning(
+            &mut self,
+            _request: &SessionFirecrackerRecoveryRequest,
+        ) -> Result<(), BackendError> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            Err(BackendError::new(
+                "factory provisioning cleanup remains incomplete",
+            ))
+        }
     }
 
     struct TestEgressFactory;
@@ -1869,6 +2540,70 @@ mod tests {
         PinnedArtifact::new(path, sha256(b"pinned"))
     }
 
+    fn recovery_tools(root: &Path) -> RecoveryTools {
+        let veritysetup = root.join("veritysetup-v1");
+        let dmsetup = root.join("dmsetup-v1");
+        fs::write(&veritysetup, b"pinned").expect("recovery tool fixture must be writable");
+        fs::write(&dmsetup, b"pinned").expect("recovery tool fixture must be writable");
+        RecoveryTools::new(artifact(veritysetup), artifact(dmsetup))
+    }
+
+    fn cgroup_parent() -> PathBuf {
+        PathBuf::from("/sys/fs/cgroup/session-runtime")
+    }
+
+    fn recovery_platform_or_skip() -> bool {
+        let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+            eprintln!("skipping recovery composition: /proc/self/mountinfo is unavailable");
+            return false;
+        };
+        let cgroup2 = mountinfo.lines().any(|line| {
+            let Some((mount, filesystem)) = line.split_once(" - ") else {
+                return false;
+            };
+            mount.split_ascii_whitespace().nth(4) == Some("/sys/fs/cgroup")
+                && filesystem.split_ascii_whitespace().next() == Some("cgroup2")
+        });
+        if !cgroup2 {
+            eprintln!("skipping recovery composition: /sys/fs/cgroup is not cgroup2");
+            return false;
+        }
+        let parent = cgroup_parent();
+        let Ok(metadata) = fs::symlink_metadata(&parent) else {
+            eprintln!(
+                "skipping recovery composition: production-valid cgroup parent is absent: {}",
+                parent.display()
+            );
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let effective_uid = fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|status| {
+                    status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Uid:"))
+                        .and_then(|uids| uids.split_ascii_whitespace().nth(1))
+                        .and_then(|uid| uid.parse::<u32>().ok())
+                });
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.mode() & 0o022 != 0
+                || !matches!(effective_uid, Some(uid) if metadata.uid() == 0 || metadata.uid() == uid)
+            {
+                eprintln!(
+                    "skipping recovery composition: cgroup parent is not a stable trusted directory: {}",
+                    parent.display()
+                );
+                return false;
+            }
+        }
+        true
+    }
+
     fn runtime_config(root: &Path) -> RuntimeConfig {
         let clone_id = "template";
         let jail_root = root
@@ -1913,7 +2648,7 @@ mod tests {
                     uts: false,
                 },
                 cgroup: CgroupConfig {
-                    path: PathBuf::from("/sys/fs/cgroup/session-runtime/template"),
+                    path: cgroup_parent().join(clone_id),
                     memory_max_bytes: 1024 * 1024,
                     cpu_quota_micros: 10_000,
                     cpu_period_micros: 100_000,
@@ -1961,11 +2696,12 @@ mod tests {
         ProductionSessionConfig::new(
             ProductionDurabilityConfig::new(
                 root.join("identity.ledger"),
+                root.join("session-recovery.wal"),
                 audit,
                 root.join("broker-wal"),
             ),
             IssuerId::new("production-test"),
-            runtime_config(root),
+            ProductionFirecrackerConfig::new(runtime_config(root), recovery_tools(root)),
             WorkspaceTemplateId::new("workspace-template-v1"),
             ProductionBrokerEndpoint::new(2, 7, 19_001, 16),
             ProductionGuestControlEndpoint::new(19_002),
@@ -1983,6 +2719,500 @@ mod tests {
             broker_session_id: crate::BrokerSessionId::new([seed.wrapping_add(5); crate::ID_BYTES]),
             capability_id: crate::CapabilityId::new([seed.wrapping_add(6); crate::ID_BYTES]),
         }
+    }
+
+    fn identity_reservation(
+        identity: SessionIdentity,
+    ) -> [(IdentityKind, [u8; crate::ID_BYTES]); 7] {
+        [
+            (IdentityKind::Session, identity.session_id().as_bytes()),
+            (IdentityKind::Request, identity.request_id().as_bytes()),
+            (IdentityKind::Vm, identity.vm_id().as_bytes()),
+            (IdentityKind::Subject, identity.subject_id().as_bytes()),
+            (IdentityKind::Workspace, identity.workspace_id().as_bytes()),
+            (
+                IdentityKind::Capability,
+                identity.capability_id().as_bytes(),
+            ),
+            (
+                IdentityKind::BrokerSession,
+                identity.broker_session_id().as_bytes(),
+            ),
+        ]
+    }
+
+    /// Creates the jail parent that [`SessionResourceOwnership`] seals before any cleanup.
+    ///
+    /// The jailer creates `<chroot base>/<jailer executable name>` once per host, so recovery
+    /// requires it to already exist rather than inventing it during cleanup.
+    fn create_jail_parent(root: &Path) {
+        fs::create_dir_all(root.join("jailer").join("firecracker-v1"))
+            .expect("jail parent fixture must be creatable");
+    }
+
+    fn recovery_intent(root: &Path, session: SessionIdentity) -> SessionRecoveryIntent {
+        let request = recovery_request(&runtime_config(root), session)
+            .expect("test recovery ownership must be reconstructable");
+        SessionRecoveryIntent::new(session, request.ownership.config_fingerprint())
+    }
+
+    fn write_recovery_crash_point(
+        root: &Path,
+        session: SessionIdentity,
+        stage: SessionRecoveryStage,
+    ) {
+        let intent = recovery_intent(root, session);
+        let mut journal = DurableSessionRecoveryJournal::open(root.join("session-recovery.wal"))
+            .expect("test recovery journal must open");
+        let mut lease = journal
+            .prepare(intent)
+            .expect("test recovery intent must be durable");
+        if stage == SessionRecoveryStage::Intent {
+            return;
+        }
+        let mut ledger = DurableIdentityLedger::open(root.join("identity.ledger"))
+            .expect("test identity ledger must open");
+        ledger
+            .reserve_batch(&intent.identities())
+            .expect("test identities must be durable");
+        drop(ledger);
+        for checkpoint in [
+            SessionRecoveryStage::IdentityReserved,
+            SessionRecoveryStage::CgroupEmpty,
+            SessionRecoveryStage::ProvisioningReleased,
+            SessionRecoveryStage::MapperClosed,
+            SessionRecoveryStage::JailRemoved,
+            SessionRecoveryStage::Complete,
+        ] {
+            if checkpoint == SessionRecoveryStage::Complete {
+                journal
+                    .complete(&lease)
+                    .expect("test completion must be durable");
+            } else {
+                lease = journal
+                    .checkpoint(&lease, checkpoint)
+                    .expect("test checkpoint must be durable");
+            }
+            if checkpoint == stage {
+                break;
+            }
+        }
+    }
+
+    /// Reopens a durable file whose owner this test just dropped.
+    ///
+    /// `Command::spawn` forks, and a fork duplicates every descriptor in the process, including
+    /// the journal descriptors other test threads hold. `CLOEXEC` closes them in the child, but
+    /// only at `exec`, so between fork and exec a concurrent `Drop` cannot yet release its
+    /// `flock`. The cross-process locking tests in this binary fork while these tests run, so a
+    /// reopen can observe a `Locked` that belongs to a descriptor nobody is using. The wait is
+    /// bounded and reports the last real error, so a genuine leaked writer still fails the test.
+    fn reopen_after_release<T, E: fmt::Debug>(
+        what: &str,
+        mut open: impl FnMut() -> Result<T, E>,
+        transient: impl Fn(&E) -> bool,
+    ) -> T {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match open() {
+                Ok(value) => return value,
+                Err(error) if transient(&error) && Instant::now() < deadline => {
+                    sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{what} must reopen after its owner released it: {error:?}"),
+            }
+        }
+    }
+
+    fn reopened_recovery_state(
+        root: &Path,
+    ) -> (DurableSessionRecoveryJournal, DurableIdentityLedger) {
+        (
+            reopen_after_release(
+                "recovery journal",
+                || DurableSessionRecoveryJournal::open(root.join("session-recovery.wal")),
+                |error| matches!(error, SessionRecoveryError::Locked { .. }),
+            ),
+            reopen_after_release(
+                "identity ledger",
+                || DurableIdentityLedger::open(root.join("identity.ledger")),
+                |error| matches!(error, LedgerError::Unavailable { .. }),
+            ),
+        )
+    }
+
+    fn build_test_runtime<F>(
+        root: &Path,
+        factory: F,
+    ) -> Result<ProductionSessionRuntime, ProductionBuildError>
+    where
+        F: PerSessionFirecrackerFactory,
+    {
+        ProductionSessionRuntimeBuilder::new(
+            production_config(
+                root,
+                AuthorityAuditMode::CreateNew(root.join("authority.wal")),
+            ),
+            factory,
+            TestEgressFactory,
+        )
+        .build()
+    }
+
+    #[test]
+    fn build_drains_every_durable_recovery_crash_point_to_completion() {
+        if !recovery_platform_or_skip() {
+            return;
+        }
+        for (seed, stage) in [
+            SessionRecoveryStage::IdentityReserved,
+            SessionRecoveryStage::CgroupEmpty,
+            SessionRecoveryStage::ProvisioningReleased,
+            SessionRecoveryStage::MapperClosed,
+            SessionRecoveryStage::JailRemoved,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = TestDirectory::new();
+            fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
+            create_jail_parent(&root.0);
+            let session = identity(u8::try_from(seed).expect("seed fits a byte") + 1);
+            write_recovery_crash_point(&root.0, session, stage);
+
+            let runtime = ProductionSessionRuntimeBuilder::new(
+                production_config(
+                    &root.0,
+                    AuthorityAuditMode::CreateNew(root.0.join("authority.wal")),
+                ),
+                TestFirecrackerFactory {
+                    snapshot_id: SnapshotId::new([0x91; crate::ID_BYTES]),
+                },
+                TestEgressFactory,
+            )
+            .build()
+            .unwrap_or_else(|error| {
+                panic!("crash point {stage} must be recoverable during build: {error}")
+            });
+            assert_eq!(runtime.state(), LifecycleState::Ready);
+            drop(runtime);
+
+            let (journal, ledger) = reopened_recovery_state(&root.0);
+            assert!(
+                journal.pending().is_none(),
+                "crash point {stage} left a pending recovery obligation"
+            );
+            assert_eq!(journal.identity_reserved_intent_count(), 1);
+            assert_eq!(ledger.committed_count(), 7);
+            for (_, value) in recovery_intent(&root.0, session).identities() {
+                assert!(
+                    ledger.contains(value),
+                    "crash point {stage} dropped a durably reserved identity"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_reserves_identities_for_an_intent_that_crashed_before_the_ledger() {
+        if !recovery_platform_or_skip() {
+            return;
+        }
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
+        create_jail_parent(&root.0);
+        let session = identity(0x21);
+        write_recovery_crash_point(&root.0, session, SessionRecoveryStage::Intent);
+        assert!(!root.0.join("identity.ledger").exists());
+
+        let runtime = ProductionSessionRuntimeBuilder::new(
+            production_config(
+                &root.0,
+                AuthorityAuditMode::CreateNew(root.0.join("authority.wal")),
+            ),
+            TestFirecrackerFactory {
+                snapshot_id: SnapshotId::new([0x91; crate::ID_BYTES]),
+            },
+            TestEgressFactory,
+        )
+        .build()
+        .expect("an intent-only crash point must be reconcilable");
+        drop(runtime);
+
+        let (journal, ledger) = reopened_recovery_state(&root.0);
+        assert!(journal.pending().is_none());
+        assert_eq!(ledger.committed_count(), 7);
+        for (_, value) in recovery_intent(&root.0, session).identities() {
+            assert!(
+                ledger.contains(value),
+                "reconciliation must durably reserve the whole intent before any cleanup effect"
+            );
+        }
+    }
+
+    #[test]
+    fn build_accepts_an_intent_whose_exact_seven_identities_were_already_reserved() {
+        if !recovery_platform_or_skip() {
+            return;
+        }
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
+        create_jail_parent(&root.0);
+        let session = identity(0x22);
+        let intent = recovery_intent(&root.0, session);
+        write_recovery_crash_point(&root.0, session, SessionRecoveryStage::Intent);
+        let mut ledger = DurableIdentityLedger::open(root.0.join("identity.ledger"))
+            .expect("test identity ledger must open");
+        ledger
+            .reserve_batch(&intent.identities())
+            .expect("all seven identities must become durable");
+        drop(ledger);
+
+        let runtime = build_test_runtime(
+            &root.0,
+            TestFirecrackerFactory {
+                snapshot_id: SnapshotId::new([0x91; crate::ID_BYTES]),
+            },
+        )
+        .expect("the exact seven-identity crash window must reconcile");
+        drop(runtime);
+
+        let (journal, ledger) = reopened_recovery_state(&root.0);
+        assert!(journal.pending().is_none());
+        assert_eq!(journal.identity_reserved_intent_count(), 1);
+        assert_eq!(ledger.committed_count(), 7);
+    }
+
+    #[test]
+    fn build_rejects_a_partially_reserved_intent_before_new_effects() {
+        if !recovery_platform_or_skip() {
+            return;
+        }
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
+        create_jail_parent(&root.0);
+        let session = identity(0x23);
+        let intent = recovery_intent(&root.0, session);
+        write_recovery_crash_point(&root.0, session, SessionRecoveryStage::Intent);
+        let mut ledger = DurableIdentityLedger::open(root.0.join("identity.ledger"))
+            .expect("test identity ledger must open");
+        ledger
+            .reserve_batch(&intent.identities()[..3])
+            .expect("the partial crash fixture must become durable");
+        drop(ledger);
+
+        let error = build_test_runtime(
+            &root.0,
+            TestFirecrackerFactory {
+                snapshot_id: SnapshotId::new([0x91; crate::ID_BYTES]),
+            },
+        )
+        .err()
+        .expect("a partially reserved identity batch must fail closed");
+        assert!(matches!(
+            error,
+            ProductionBuildError::Recovery(recovery)
+                if matches!(&*recovery, ProductionRecoveryError::IdentityMismatch(message)
+                    if message.contains("only 3 of seven"))
+        ));
+        assert!(!root.0.join("authority.wal").exists());
+
+        let (journal, ledger) = reopened_recovery_state(&root.0);
+        assert_eq!(
+            journal.pending().map(SessionRecoveryLease::stage),
+            Some(SessionRecoveryStage::Intent)
+        );
+        assert_eq!(ledger.committed_count(), 3);
+    }
+
+    #[test]
+    fn build_rejects_a_foreign_recovery_fingerprint_before_reserving_identities() {
+        if !recovery_platform_or_skip() {
+            return;
+        }
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
+        create_jail_parent(&root.0);
+        let session = identity(0x24);
+        let mut journal = DurableSessionRecoveryJournal::open(root.0.join("session-recovery.wal"))
+            .expect("test recovery journal must open");
+        journal
+            .prepare(SessionRecoveryIntent::new(
+                session,
+                Sha256Digest::from_bytes([0xa5; 32]),
+            ))
+            .expect("foreign fingerprint fixture must be durable");
+        drop(journal);
+
+        let error = build_test_runtime(
+            &root.0,
+            TestFirecrackerFactory {
+                snapshot_id: SnapshotId::new([0x91; crate::ID_BYTES]),
+            },
+        )
+        .err()
+        .expect("a foreign ownership fingerprint must fail closed");
+        assert!(matches!(
+            error,
+            ProductionBuildError::Recovery(recovery)
+                if matches!(&*recovery, ProductionRecoveryError::IdentityMismatch(message)
+                    if message.contains("config fingerprint"))
+        ));
+        assert!(!root.0.join("authority.wal").exists());
+
+        let (journal, ledger) = reopened_recovery_state(&root.0);
+        assert_eq!(
+            journal.pending().map(SessionRecoveryLease::stage),
+            Some(SessionRecoveryStage::Intent)
+        );
+        assert_eq!(ledger.committed_count(), 0);
+    }
+
+    #[test]
+    fn build_accepts_a_fully_reconciled_nonempty_history() {
+        if !recovery_platform_or_skip() {
+            return;
+        }
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
+        create_jail_parent(&root.0);
+        write_recovery_crash_point(&root.0, identity(0x25), SessionRecoveryStage::Complete);
+
+        let runtime = build_test_runtime(
+            &root.0,
+            TestFirecrackerFactory {
+                snapshot_id: SnapshotId::new([0x91; crate::ID_BYTES]),
+            },
+        )
+        .expect("fully reconciled nonempty history must be reusable");
+        assert_eq!(runtime.state(), LifecycleState::Ready);
+        drop(runtime);
+
+        let (journal, ledger) = reopened_recovery_state(&root.0);
+        assert!(journal.pending().is_none());
+        assert_eq!(journal.identity_reserved_intent_count(), 1);
+        assert_eq!(ledger.committed_count(), 7);
+    }
+
+    #[test]
+    fn known_identity_collision_durably_abandons_the_pre_effect_intent() {
+        if !recovery_platform_or_skip() {
+            return;
+        }
+        let root = TestDirectory::new();
+        create_jail_parent(&root.0);
+        let session = identity(0x26);
+        let ledger_path = root.0.join("identity.ledger");
+        let journal_path = root.0.join("session-recovery.wal");
+        let mut inner =
+            DurableIdentityLedger::open(&ledger_path).expect("test identity ledger must open");
+        inner
+            .reserve(IdentityKind::Session, session.session_id().as_bytes())
+            .expect("collision fixture must become durable");
+        let journal = DurableSessionRecoveryJournal::open(&journal_path)
+            .expect("test recovery journal must open");
+        let driver = FirecrackerRecovery::new(
+            LinuxFirecrackerRecovery::new(recovery_tools(&root.0))
+                .expect("test recovery driver must construct"),
+        );
+        let recovery = Arc::new(Mutex::new(ProductionRecoveryState { journal, driver }));
+        let mut ledger =
+            RecoveryAwareIdentityLedger::new(inner, Arc::clone(&recovery), runtime_config(&root.0));
+
+        let error = ledger
+            .reserve_batch(&identity_reservation(session))
+            .expect_err("a known collision must remain rejected");
+        assert!(matches!(error, LedgerError::Duplicate { .. }));
+        drop(ledger);
+        drop(recovery);
+
+        let journal = DurableSessionRecoveryJournal::open(&journal_path)
+            .expect("abandoned journal must reopen");
+        assert!(journal.pending().is_none());
+        assert_eq!(
+            journal.history().last().map(|history| history.stage()),
+            Some(SessionRecoveryStage::Abandoned)
+        );
+        let ledger =
+            DurableIdentityLedger::open(&ledger_path).expect("collision ledger must reopen");
+        assert_eq!(ledger.committed_count(), 1);
+    }
+
+    #[test]
+    fn incomplete_provisioning_recovery_fails_the_build_closed() {
+        if !recovery_platform_or_skip() {
+            return;
+        }
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
+        create_jail_parent(&root.0);
+        let session = identity(0x31);
+        write_recovery_crash_point(&root.0, session, SessionRecoveryStage::CgroupEmpty);
+        let attempts = Arc::new(AtomicU64::new(0));
+
+        let error = ProductionSessionRuntimeBuilder::new(
+            production_config(
+                &root.0,
+                AuthorityAuditMode::CreateNew(root.0.join("authority.wal")),
+            ),
+            FailingRecoveryFactory {
+                snapshot_id: SnapshotId::new([0x91; crate::ID_BYTES]),
+                attempts: Arc::clone(&attempts),
+            },
+            TestEgressFactory,
+        )
+        .build()
+        .err()
+        .expect("unreleased provisioning must fail the build closed");
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            error,
+            ProductionBuildError::Recovery(recovery)
+                if matches!(&*recovery, ProductionRecoveryError::Firecracker(failure)
+                    if failure.pending_stage() == RecoveryStage::CgroupEmpty)
+        ));
+        assert!(
+            !root.0.join("authority.wal").exists(),
+            "no durable authority journal may exist while recovery is incomplete"
+        );
+
+        let (journal, _) = reopened_recovery_state(&root.0);
+        assert_eq!(
+            journal.pending().map(SessionRecoveryLease::stage),
+            Some(SessionRecoveryStage::CgroupEmpty),
+            "a failed cleanup must retain its exact durable retry point"
+        );
+    }
+
+    #[test]
+    fn crash_after_provisioning_effect_retries_the_same_durable_stage() {
+        if !recovery_platform_or_skip() {
+            return;
+        }
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
+        create_jail_parent(&root.0);
+        write_recovery_crash_point(&root.0, identity(0x32), SessionRecoveryStage::CgroupEmpty);
+        let attempts = Arc::new(AtomicU64::new(1));
+
+        let runtime = build_test_runtime(
+            &root.0,
+            RecordingRecoveryFactory {
+                snapshot_id: SnapshotId::new([0x91; crate::ID_BYTES]),
+                attempts: Arc::clone(&attempts),
+            },
+        )
+        .expect("an idempotent uncheckpointed provisioning effect must be retried");
+        drop(runtime);
+
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "the persisted CgroupEmpty stage must retry provisioning after reopen"
+        );
+        let (journal, _) = reopened_recovery_state(&root.0);
+        assert!(journal.pending().is_none());
     }
 
     #[test]
@@ -2007,11 +3237,33 @@ mod tests {
     }
 
     #[test]
-    fn existing_authority_wal_recovery_is_rejected_before_owner_construction() {
+    fn existing_authority_wal_is_recovered_into_a_fresh_capability_state() {
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
+        let audit = root.0.join("authority.wal");
+        drop(DurableAuditLog::create(&audit).expect("a prior instance's WAL must be creatable"));
+
+        let runtime = ProductionSessionRuntimeBuilder::new(
+            production_config(&root.0, AuthorityAuditMode::OpenExisting(audit.clone())),
+            TestFirecrackerFactory {
+                snapshot_id: SnapshotId::new([0x91; crate::ID_BYTES]),
+            },
+            TestEgressFactory,
+        )
+        .build()
+        .expect("an existing authority WAL must be recoverable after resource reconciliation");
+
+        assert_eq!(runtime.state(), LifecycleState::Ready);
+        assert!(audit.is_file());
+    }
+
+    #[test]
+    fn unreadable_authority_wal_still_fails_closed() {
         let root = TestDirectory::new();
         fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
         let audit = root.0.join("authority.wal");
         fs::write(&audit, b"existing").expect("test WAL must be writable");
+
         let error = ProductionSessionRuntimeBuilder::new(
             production_config(&root.0, AuthorityAuditMode::OpenExisting(audit.clone())),
             TestFirecrackerFactory {
@@ -2021,17 +3273,13 @@ mod tests {
         )
         .build()
         .err()
-        .expect("unsupported recovery must fail closed");
+        .expect("a WAL that is not a journal must fail closed");
 
-        assert!(matches!(
-            error,
-            ProductionBuildError::UnsupportedAuthorityRecovery { path } if path == audit
-        ));
-        assert!(!root.0.join("identity.ledger").exists());
+        assert!(matches!(error, ProductionBuildError::AuthorityAudit(_)));
     }
 
     #[test]
-    fn nonempty_identity_ledger_requires_explicit_session_reconciliation() {
+    fn nonempty_identity_ledger_without_recovery_history_fails_closed() {
         let root = TestDirectory::new();
         fs::create_dir(root.0.join("broker-wal")).expect("broker WAL root must be creatable");
         let ledger_path = root.0.join("identity.ledger");
@@ -2058,10 +3306,9 @@ mod tests {
 
         assert!(matches!(
             error,
-            ProductionBuildError::UnsupportedIdentityRecovery {
-                path,
-                committed_records: 1
-            } if path == ledger_path
+            ProductionBuildError::Recovery(recovery)
+                if matches!(&*recovery, ProductionRecoveryError::IdentityMismatch(message)
+                    if message.contains("ledger contains 1 identities"))
         ));
         assert!(!root.0.join("authority.wal").exists());
     }
@@ -2132,7 +3379,7 @@ mod tests {
         let workspace_id = session.workspace_id().to_string();
         let jail_root = session_jail_root(&prepared).expect("session jail root must resolve");
         let expected_mapper = format!("session-root-{workspace_id}");
-        let expected_cgroup = PathBuf::from("/sys/fs/cgroup/session-runtime").join(&workspace_id);
+        let expected_cgroup = cgroup_parent().join(&workspace_id);
         let expected_workspace = jail_root.join("workspace").join(&workspace_id);
 
         assert_eq!(prepared.dm_verity.mapper_name, expected_mapper);
@@ -2237,6 +3484,18 @@ mod tests {
             validate_production_config(&audit_config),
             Err(ProductionBuildError::InvalidConfig(message))
                 if message.contains("authority audit WAL")
+                    && message.contains("workspace template source")
+        ));
+
+        let mut recovery_config = production_config(
+            &root.0,
+            AuthorityAuditMode::CreateNew(root.0.join("authority.wal")),
+        );
+        recovery_config.durability.recovery_journal_path = workspace.join("recovery.wal");
+        assert!(matches!(
+            validate_production_config(&recovery_config),
+            Err(ProductionBuildError::InvalidConfig(message))
+                if message.contains("session recovery WAL")
                     && message.contains("workspace template source")
         ));
 
@@ -2366,8 +3625,11 @@ mod tests {
 
         drop(runtime);
         assert_eq!(Arc::strong_count(&kernel), 2);
-        let recovered =
-            DurableBrokerView::open(&wal_path).expect("host-created WAL must be fully recoverable");
+        let recovered = reopen_after_release(
+            "host-created Broker WAL",
+            || DurableBrokerView::open(&wal_path),
+            |error| format!("{error:?}").contains("Locked"),
+        );
         assert_eq!(
             recovered.config(),
             DurableSessionConfig::new(

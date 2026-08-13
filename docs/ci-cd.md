@@ -132,7 +132,7 @@ Replace the host, group, project, and tag with the values for the publishing pro
 
 ## Release invariants and recovery
 
-The release archive contains only the versioned binary and `BUILD-METADATA.json`. Its entries are sorted, ownership is normalized to root, and timestamps come from the source commit. The SPDX namespace and creation time are likewise normalized to source data. Two builds from the same commit and toolchain therefore produce identical archive and SBOM bytes.
+The release archive contains the versioned binary, the complete `AGPL-3.0-only` license text, and `BUILD-METADATA.json`. The metadata identifies the immutable source revision and gives a direct URL for downloading its corresponding source. Archive entries are sorted, ownership is normalized to root, and timestamps come from the source commit. The SPDX namespace and creation time are likewise normalized to source data. Two builds from the same commit and toolchain therefore produce identical archive and SBOM bytes.
 
 A failed package or signature job publishes nothing. A failed protected publication can be retried because both publisher scripts are idempotent. If a release asset already exists with different bytes, the job stops and requires investigation; deleting or replacing a published asset is intentionally not automated. Rollback means publishing a new patch version, not mutating an existing release.
 

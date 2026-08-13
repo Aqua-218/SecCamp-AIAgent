@@ -48,7 +48,7 @@ typed Capability、正規化型、`Matches`、`PathBelow`、`WeakerThan`、HTTP/
 
 状態遷移では subject tree、static envelope、server-side ID、root issuance、held、Derive、revoke、祖先失効、`auth_epoch`、subject lifecycle、open-handle registry を実装済みである。attempt/effect についても in-memory journal と `DurableAuditLog` の write-ahead journal、reopen、Started crash window、commit receipt、checksum/replay validation が実装されている。
 
-mock/contract 検証は完了しているが、durable journal の cross-process writer coordination と外部 provider の commit receipt reconciliation は実機統合の残課題である。詳細は [Attempt / effect audit](../authority-core/audit-records.md) と [検証戦略](verification.md) を参照する。
+durable journal の cross-process writer coordination は実装済みで、identity ledger・session recovery journal・authority audit WAL のいずれも、別 process を実際に起動して二重 writer が拒否されることを確認している。既存 audit journal の recovery も実装済みである。crash 後に `Started` のまま残った attempt は、新しい capability state を attach する前に `CommitUnknown` として durable に閉じ、以後の attempt は別の capability-state instance として記録する。残る実機課題は、外部 provider が保持する receipt と `CommitUnknown` を突き合わせる照合だけである。詳細は [Attempt / effect audit](../authority-core/audit-records.md) と [検証戦略](verification.md) を参照する。
 
 ## 2. 状態機械と revoke
 
@@ -58,9 +58,9 @@ loom は direct/ancestor revoke、単一/compound effect、2 effects/1 revoke �
 
 ## 3. capfs
 
-link-free repository preflight、`RepoId` と backing root/namespace の binding、manifest の原子的 import、共有 namespace registry、subject-local node table、Direct-I/O FUSE adapter は実装済みである。`LOOKUP`、`GETATTR`、`FORGET`、`OPEN`、`READ`、`WRITE`、`SETATTR`、`CREATE`、`MKDIR`、`UNLINK`、`RMDIR`、`RENAME`、`RELEASE`、`OPENDIR`、`READDIR`、`RELEASEDIR` を root fd、node table、namespace registry、Authority kernel へ接続する。
+repository preflight、`RepoId` と backing root/namespace の binding、manifest の原子的 import、共有 namespace registry、subject-local node table、Direct-I/O FUSE adapter は実装済みである。`LOOKUP`、`GETATTR`、`FORGET`、`OPEN`、`READ`、`WRITE`、`SETATTR`、`CREATE`、`MKDIR`、`UNLINK`、`RMDIR`、`RENAME`、`RELEASE`、`OPENDIR`、`READDIR`、`RELEASEDIR` を root fd、node table、namespace registry、Authority kernel へ接続する。
 
-mock/contract 検証に加え、環境に `/dev/fuse` がある場合の実 mount test で、権限外 sibling の不可視化、open handle の revoke 後再認可、create/remove/rename transaction、directory stream の generation restart を確認する。全 thread schedule の rename/write 競合、kernel の FORGET lifecycle 全体、隔離層を含む end-to-end は未検証である。symlink/hard link の認可モデルは link-free 初期境界の後段であり、現在の完了条件に含めない。
+mock/contract 検証に加え、環境に `/dev/fuse` がある場合の実 mount test で、権限外 sibling の不可視化、open handle の revoke 後再認可、create/remove/rename transaction、directory stream の generation restart を確認する。全 thread schedule の rename/write 競合、kernel の FORGET lifecycle 全体、隔離層を含む end-to-end は未検証である。symlink と hard link の認可モデルは実装済みである（[ADR 0017](../decisions/0017-authorize-an-aliased-inode-on-every-name.md)）。
 
 ## 4. runtime isolation
 
@@ -95,7 +95,7 @@ fake command/filesystem/API/identity source による contract test と local Un
 
 ## 7. Supervisor / session orchestrator
 
-`supervisor` は authenticated connection identity から subject を解決し、最大 4 KiB の versioned closed wire protocol、subject setup、Authority Core transition、runtime handle registry、ordered shutdown を実装済みである。実際の namespace、cgroup、mount、descriptor syscall は `RuntimeResources` adapter の責務である。
+`supervisor` は authenticated connection identity から subject を解決し、最大 4 KiB の versioned closed wire protocol、subject setup、Authority Core transition、runtime handle registry、ordered shutdown を実装済みである。実際の namespace、cgroup、mount、descriptor syscall は `RuntimeResources` adapter の責務である。production の caller resolver も実装済みで、subject ごとの `SOCK_SEQPACKET` listener が `SO_PEERCRED` から connection identity を作り、request を decode する前に subject を確定させる。
 
 `session-orchestrator` は durable 128-bit no-reuse ledger、snapshot identity rejection、workspace/Broker/VM/capability/workload lease binding、startup commit 順、failure rollback、stop retry を実装済みである。Authority Core、Broker listener、Firecracker runtime、workspace の production adapter と、それらを同じ startup/stop 経路へ接続する composition test も実装している。
 

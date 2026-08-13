@@ -66,7 +66,9 @@ struct FsLog {
     clones: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
     images: Arc<Mutex<Vec<(PathBuf, PathBuf, u64)>>>,
     removals: Arc<Mutex<Vec<PathBuf>>>,
+    device_binds: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
     device_bindings: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
+    device_unbinds: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
     lifecycle: LifecycleEvents,
 }
 
@@ -100,6 +102,52 @@ impl FileSystem for TestFileSystem {
             .expect("filesystem read log must not be poisoned")
             .push(path.to_owned());
         Ok(Vec::new())
+    }
+
+    fn bind_block_device(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        let expected_source = PathBuf::from(format!(
+            "/dev/mapper/composition-verity-{}",
+            expected_workspace_id()
+        ));
+        let expected_device = session_jail_root().join("dev/rootfs");
+        if source != expected_source || jailed_device != expected_device {
+            return Err(RuntimeError::Io(
+                "test filesystem rejected inexact jailed block-device bind".to_owned(),
+            ));
+        }
+        self.log
+            .device_binds
+            .lock()
+            .expect("device-bind log must not be poisoned")
+            .push((source.to_owned(), jailed_device.to_owned()));
+        Ok(())
+    }
+
+    fn unbind_block_device(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        let expected_source = PathBuf::from(format!(
+            "/dev/mapper/composition-verity-{}",
+            expected_workspace_id()
+        ));
+        let expected_device = session_jail_root().join("dev/rootfs");
+        if source != expected_source || jailed_device != expected_device {
+            return Err(RuntimeError::Io(
+                "test filesystem rejected inexact jailed block-device unbind".to_owned(),
+            ));
+        }
+        self.log
+            .device_unbinds
+            .lock()
+            .expect("device-unbind log must not be poisoned")
+            .push((source.to_owned(), jailed_device.to_owned()));
+        Ok(())
     }
 
     fn verify_block_device_binding(
@@ -778,6 +826,17 @@ fn assert_successful_restore_observations(
     );
     assert_eq!(
         fs_log
+            .device_binds
+            .lock()
+            .expect("device-bind log must not be poisoned")
+            .as_slice(),
+        [(
+            PathBuf::from(format!("/dev/mapper/composition-verity-{workspace_id}")),
+            session_jail_root().join("dev/rootfs"),
+        )]
+    );
+    assert_eq!(
+        fs_log
             .device_bindings
             .lock()
             .expect("device-binding log must not be poisoned")
@@ -845,6 +904,22 @@ fn assert_failed_restore_observations(
         "failed snapshot load must not claim restore-resource verification"
     );
     assert_snapshot_reverified(fs_log);
+    assert_eq!(
+        fs_log
+            .device_binds
+            .lock()
+            .expect("device-bind log must not be poisoned")
+            .len(),
+        1
+    );
+    assert!(
+        fs_log
+            .device_unbinds
+            .lock()
+            .expect("device-unbind log must not be poisoned")
+            .is_empty(),
+        "a failed process stop must retain the live block-device bind"
+    );
     assert_eq!(
         fs_log
             .device_bindings

@@ -220,31 +220,42 @@ mod implementation {
                 );
             }
             let controllers = config.cgroup.root.join("cgroup.controllers");
-            let required_controllers = fs::read_to_string(&controllers)
-                .map(|value| {
-                    value
+            let controllers = fs::read_to_string(&controllers);
+            let required_controllers = controllers.as_ref().is_ok_and(|value| {
+                value
+                    .split_whitespace()
+                    .any(|controller| controller == "memory")
+                    && value
                         .split_whitespace()
-                        .any(|controller| controller == "memory")
-                        && value
-                            .split_whitespace()
-                            .any(|controller| controller == "pids")
-                })
-                .unwrap_or(false);
-            let control_files = ["memory.max", "pids.max", "cgroup.procs"];
-            let controls_available = control_files.iter().all(|name| {
-                let path = config.cgroup.root.join(name);
-                path.is_file() && access_path(&path, libc::W_OK)
+                        .any(|controller| controller == "pids")
             });
-            report.cgroup_v2_available = required_controllers
-                && access_path(&config.cgroup.root, libc::W_OK | libc::X_OK)
-                && controls_available;
+            let control_files = ["memory.max", "pids.max", "cgroup.procs"];
+            let control_files = control_files
+                .iter()
+                .map(|name| {
+                    let path = config.cgroup.root.join(name);
+                    (*name, path.is_file() && access_path(&path, libc::W_OK))
+                })
+                .collect::<Vec<_>>();
+            let controls_available = control_files.iter().all(|(_, available)| *available);
+            let root_writable = access_path(&config.cgroup.root, libc::W_OK | libc::X_OK);
+            report.cgroup_v2_available =
+                required_controllers && root_writable && controls_available;
             if !report.cgroup_v2_available {
+                let controller_status = controllers.as_ref().map_or_else(
+                    |error| format!("unreadable ({error})"),
+                    |value| value.trim().to_owned(),
+                );
+                let control_status = control_files
+                    .iter()
+                    .map(|(name, available)| format!("{name}={available}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 report
                     .reasons
-                    .push(
-                        "configured cgroup v2 root or required control files are absent or not writable"
-                            .to_owned(),
-                    );
+                    .push(format!(
+                        "configured cgroup v2 root or required control files are absent or not writable: controllers={controller_status:?}, root_writable={root_writable}, controls={control_status}"
+                    ));
             }
             report.seccomp_available = seccomp_is_available();
             if !report.seccomp_available {

@@ -13,7 +13,7 @@ use loom::sync::RwLock;
 use std::sync::RwLock;
 
 use crate::{
-    audit::{AttemptId, AttemptRecord, AuditError, AuditTrail, EffectRecord},
+    audit::{AttemptId, AttemptRecord, AuditError, AuditRecovery, AuditTrail, EffectRecord},
     capability::{CapId, Capability, CapabilityRequest, CapabilityRequestSet, SubjectId},
     durable_audit::{
         CommitReceipt, DurableAuditError, DurableAuditLog, MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES,
@@ -364,6 +364,39 @@ impl CapabilityKernel {
             audit: AuditTrail::new_with_backend(Arc::new(backend))?,
             revocation_observers: RwLock::new(Vec::new()),
         })
+    }
+
+    /// Attaches fresh capability state to a WAL that already contains attempts.
+    ///
+    /// The prior attempts are history, not state: they are never re-authorized and their
+    /// capabilities are not resurrected. A process that stopped between authorization and its
+    /// terminal record leaves an attempt whose external effect may or may not have landed, so
+    /// recovery durably closes each such attempt as `CommitUnknown` before this kernel accepts a
+    /// single request. Every attempt this kernel records afterwards carries its own
+    /// capability-state instance, which is what keeps the prior instance's `CapId` values from
+    /// being read as this instance's.
+    ///
+    /// Use this only after the resources of the prior instance have been released. Reattaching a
+    /// live session's WAL would let two capability states append under different instances while
+    /// both believe they own the same host resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditError`] when the backend cannot be inspected, when a dangling attempt
+    /// cannot be durably closed, or when the attempt sequence is exhausted.
+    pub fn try_recover_with_durable_audit(
+        state: CapabilityState,
+        backend: DurableAuditLog,
+    ) -> Result<(Self, AuditRecovery), AuditError> {
+        let (audit, recovery) = AuditTrail::recover_with_backend(Arc::new(backend))?;
+        Ok((
+            Self {
+                state: RwLock::new(state),
+                audit,
+                revocation_observers: RwLock::new(Vec::new()),
+            },
+            recovery,
+        ))
     }
 
     /// Registers an observer notified by every revoking transition.

@@ -52,12 +52,13 @@ flowchart LR
 | revoke / commit | loom | 小さく切った model 内の全 interleaving | bounded model は検証済み、実 adapter は未検証 |
 | FUSE operation | 実 mount の統合テスト | syscall が正しい effect へ変換されること | 条件付き実 mount、全 kernel lifecycle は未検証 |
 | namespace race | loom + stress test | rename、unlink、open handle の競合 | 限定的 test、全 interleaving は未検証 |
-| symlink resolver（後続機能） | stateful proptest + 実 mount の攻撃テスト | 解決後 path での認可、root 脱出・cycle・stale resolution の拒否 | 初期 link-free 境界、未実装範囲 |
+| link 対応 | 実 mount の攻撃テスト | 解決後 path での認可、root 脱出の拒否、rename 後の再解決、alias を持つ inode の全名前認可 | 深い chain と cycle（kernel の `ELOOP` に委譲）、体系的な backing 差し替え |
 | SSRF | resolver / redirect test | 非公開宛先と rebinding の拒否 | fake resolver/connector、実 DNS は未検証 |
 | Host Egress Broker | module/contract test | frame、replay、budget、typed dispatch、公開 HTTPS、GitHub plan | mock/contract 検証済み、実 `AF_VSOCK`/外部 provider は未検証 |
 | runtime isolation | mock backend + capability detection | ordered apply/rollback と policy validation | mock 検証済み、privileged apply は未検証 |
 | Firecracker runtime | fake command/filesystem/API + Unix socket test | artifact、jailer/API 順序、snapshot state、identity/workload gate | contract 検証済み、実 VM/jailer/dm-verity は未検証 |
-| Supervisor | protocol module test + `FakeResources` | identity binding、subject lifecycle、handle cleanup | mock/contract 検証済み、Linux resource/実 socket は未検証 |
+| Supervisor | protocol module test + `FakeResources` | identity binding、subject lifecycle、handle cleanup | mock/contract 検証済み、Linux resource は未検証 |
+| Supervisor control socket | 実 `SOCK_SEQPACKET` の module test | accept 時の `SO_PEERCRED` 束縛、decode 前の subject 確定、bounded datagram | 実 socket で検証済み、guest からの end-to-end は未検証 |
 | Session orchestrator | mock state-machine test + production adapter composition | lease binding、startup rollback、stop retry、durable identity、Authority/Broker/Firecracker/workspace adapter | test-double 境界まで検証済み、実 guest capfs/isolation・実 VM は未検証 |
 | VM 境界 | escape 試行 | 実際の jailer、kernel、mount、seccomp 設定 | 実機未検証 |
 | snapshot | 同一 snapshot の複数 restore | ID、workspace、Broker session の一意性 | state contract のみ、実 snapshot restore は未検証 |
@@ -100,7 +101,7 @@ wire module test は version、closed tag、4 KiB size、field length、body len
 
 state-machine test は mock backend の call log と lease を使い、workspace -> Broker -> VM -> capability -> workload の commit 順、各 failure の rollback、VM kill failure 時の workspace isolation 保留、snapshot identity rejection、identity reuse、foreign lease、二重 start、stop retry を検査する。production adapter composition test は実 `CapabilityKernel` と Broker / Firecracker / workspace adapter を同じ経路へ接続し、外部 command、filesystem、API、listener を test double にする。したがって adapter 間の identity と cleanup 契約は検証するが、実 Firecracker、実 Broker/vsock、実 capfs mount、特権 isolation の検証ではない。詳細は [Session orchestrator](../session-orchestrator/README.md) を参照する。
 
-symlink resolver の test は初期 `capfs` の完了条件には含めない。link-free な namespace と revoke の検証を先に終え、[symlink 対応](capfs.md#symlink-は後続機能として追加する)を実装する段階で追加する。
+link の test は実 mount 上で `symlink(2)` / `readlink(2)` / `link(2)` を通し、target が repository の外へ出る形を作らせないこと、alias を持つ inode が全ての名前で認可されることを確認する（[symlink](capfs.md#symlink-は-registry-が-target-を所有する)、[hard link](capfs.md#hard-link-は全ての名前で認可することで閉じる)）。深い chain と cycle は kernel 自身の `ELOOP` に委ねており、独自の test は置いていない。
 
 ## Lean で証明するもの
 

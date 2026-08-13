@@ -62,6 +62,7 @@ stateDiagram-v2
 | [0014](0014-keep-the-workspace-when-vm-kill-fails.md) | VM kill が失敗した場合に workspace isolation を実行しない | Accepted |
 | [0015](0015-persist-the-identity-ledger-across-restarts.md) | identity ledger を永続化し、restart をまたいで非再利用にする | Accepted |
 | [0016](0016-terminate-the-child-after-an-unrollbackable-isolation-failure.md) | rollback 不可能な isolation step の失敗後は child を終了させる | Accepted |
+| [0017](0017-authorize-an-aliased-inode-on-every-name.md) | alias を持つ inode は全ての名前で認可する | Accepted |
 
 ## 遡及分について
 

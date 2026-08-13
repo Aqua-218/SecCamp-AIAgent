@@ -18,6 +18,14 @@ use std::{
 use authority_core::{
     capability::{AuthorityBody, IssuerId},
     file::{FileAuthority, FileEffect, FileEffects},
+    github::{
+        BranchName, BranchPattern, GitHubAuthority, GitHubOperation, GitHubOperations,
+        InstallationId,
+    },
+    http::{
+        CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethod, HttpFetchMethods,
+        UrlPathPattern,
+    },
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
     time::{MonotonicTime, TimeWindow},
@@ -263,7 +271,12 @@ impl DaemonConfig {
             MonotonicTime::from_ticks(u64::MAX),
         )
         .map_err(|error| format!("creating fixed guest-compatible validity window: {error}"))?;
-        let grant = AuthorityRootGrant::new(validity, AuthorityBody::File(authority));
+        let (broker_authority, github_egress) =
+            parse_egress_profile(&mut arguments, authority.repository().clone())?;
+        let mut grant = AuthorityRootGrant::new(validity, AuthorityBody::File(authority));
+        if let Some(broker_authority) = broker_authority {
+            grant = grant.with_broker_authority(broker_authority);
+        }
         let audit_path = arguments.absolute_path("authority-audit")?;
         let audit_mode = match arguments.required("authority-audit-mode")?.as_str() {
             "create" => AuthorityAuditMode::CreateNew(audit_path),
@@ -304,25 +317,6 @@ impl DaemonConfig {
             ProductionGuestControlEndpoint::new(arguments.number("guest-control-port")?),
             broker_limits,
         );
-        let github_egress = match (
-            arguments.optional("github-installation")?,
-            arguments.optional("github-credential-handle")?,
-        ) {
-            (None, None) => GitHubEgressConfig::Disabled,
-            (Some(installation), Some(handle)) => GitHubEgressConfig::environment(
-                authority_core::github::InstallationId::new(installation),
-                CredentialHandle::from_host_id(parse_number(
-                    "--github-credential-handle",
-                    &handle,
-                )?),
-            ),
-            _ => {
-                return Err(
-                    "--github-installation and --github-credential-handle must be configured together"
-                        .to_owned(),
-                );
-            }
-        };
         let stop_file = arguments.absolute_path("stop-file")?;
         match fs::symlink_metadata(&stop_file) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -580,6 +574,167 @@ fn parse_path_prefix(value: &str) -> Result<PathPattern, String> {
         .map_err(|error| format!("invalid --path-prefix: {error}"))
 }
 
+/// Parses the sole external authority family that may be attached to this session's Broker.
+///
+/// File authority always remains in the guest capability channel. The Broker gets a distinct
+/// typed root only for an explicitly selected external profile, so a guest cannot turn a
+/// workspace capability into ambient network or GitHub access.
+fn parse_egress_profile(
+    arguments: &mut Arguments,
+    repository: RepoId,
+) -> Result<(Option<AuthorityBody>, GitHubEgressConfig), String> {
+    match arguments.required("egress-authority")?.as_str() {
+        "none" => {
+            reject_egress_flags(arguments)?;
+            Ok((None, GitHubEgressConfig::Disabled))
+        }
+        "public" => {
+            reject_github_flags(arguments)?;
+            let methods = parse_http_methods(&arguments.required("public-methods")?)?;
+            let host = CanonicalHost::new(arguments.required("public-host")?)
+                .map_err(|error| format!("invalid --public-host: {error}"))?;
+            let path = CanonicalUrlPath::new(arguments.required("public-path-prefix")?)
+                .map_err(|error| format!("invalid --public-path-prefix: {error}"))?;
+            let max_response_bytes = arguments.nonzero_u64("public-max-response-bytes")?.get();
+            Ok((
+                Some(AuthorityBody::HttpFetch(HttpFetchAuthority::new(
+                    methods,
+                    host,
+                    UrlPathPattern::Prefix(path),
+                    max_response_bytes,
+                ))),
+                GitHubEgressConfig::Disabled,
+            ))
+        }
+        "github" => {
+            reject_public_flags(arguments)?;
+            let installation = InstallationId::new(arguments.required("github-installation")?);
+            let credential_handle =
+                CredentialHandle::from_host_id(arguments.number("github-credential-handle")?);
+            let operations = parse_github_operations(&arguments.required("github-operations")?)?;
+            let base = parse_branch_pattern(
+                "--github-base-branch-pattern",
+                &arguments.required("github-base-branch-pattern")?,
+            )?;
+            let head = parse_branch_pattern(
+                "--github-head-branch-pattern",
+                &arguments.required("github-head-branch-pattern")?,
+            )?;
+            Ok((
+                Some(AuthorityBody::GitHub(GitHubAuthority::new(
+                    installation.clone(),
+                    repository,
+                    operations,
+                    base,
+                    head,
+                ))),
+                GitHubEgressConfig::environment(installation, credential_handle),
+            ))
+        }
+        value => Err(format!(
+            "--egress-authority must be none, public, or github, got {value:?}"
+        )),
+    }
+}
+
+fn reject_egress_flags(arguments: &mut Arguments) -> Result<(), String> {
+    reject_public_flags(arguments)?;
+    reject_github_flags(arguments)
+}
+
+fn reject_public_flags(arguments: &mut Arguments) -> Result<(), String> {
+    reject_absent(
+        arguments,
+        [
+            "public-methods",
+            "public-host",
+            "public-path-prefix",
+            "public-max-response-bytes",
+        ],
+    )
+}
+
+fn reject_github_flags(arguments: &mut Arguments) -> Result<(), String> {
+    reject_absent(
+        arguments,
+        [
+            "github-installation",
+            "github-credential-handle",
+            "github-operations",
+            "github-base-branch-pattern",
+            "github-head-branch-pattern",
+        ],
+    )
+}
+
+fn reject_absent<'a>(
+    arguments: &mut Arguments,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    for name in names {
+        if arguments.optional(name)?.is_some() {
+            return Err(format!(
+                "--{name} is incompatible with this --egress-authority"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_http_methods(value: &str) -> Result<HttpFetchMethods, String> {
+    if value.is_empty() || value.starts_with(',') || value.ends_with(',') || value.contains(",,") {
+        return Err("--public-methods must be a non-empty canonical comma list".to_owned());
+    }
+    let mut previous = None;
+    let mut parsed = Vec::new();
+    for method in value.split(',') {
+        let (index, method) = match method {
+            "get" => (0, HttpFetchMethod::Get),
+            "head" => (1, HttpFetchMethod::Head),
+            _ => return Err("--public-methods contains a non-canonical method".to_owned()),
+        };
+        if previous.is_some_and(|previous| index <= previous) {
+            return Err("--public-methods must be ordered with no duplicates".to_owned());
+        }
+        previous = Some(index);
+        parsed.push(method);
+    }
+    Ok(HttpFetchMethods::from_methods(parsed))
+}
+
+fn parse_github_operations(value: &str) -> Result<GitHubOperations, String> {
+    if value.is_empty() || value.starts_with(',') || value.ends_with(',') || value.contains(",,") {
+        return Err("--github-operations must be a non-empty canonical comma list".to_owned());
+    }
+    let mut previous = None;
+    let mut parsed = Vec::new();
+    for operation in value.split(',') {
+        let (index, operation) = match operation {
+            "publish-branch" => (0, GitHubOperation::PublishBranch),
+            "create-pull-request" => (1, GitHubOperation::CreatePullRequest),
+            _ => return Err("--github-operations contains a non-canonical operation".to_owned()),
+        };
+        if previous.is_some_and(|previous| index <= previous) {
+            return Err("--github-operations must be ordered with no duplicates".to_owned());
+        }
+        previous = Some(index);
+        parsed.push(operation);
+    }
+    Ok(GitHubOperations::from_operations(parsed))
+}
+
+fn parse_branch_pattern(label: &str, value: &str) -> Result<BranchPattern, String> {
+    let (kind, branch) = value
+        .split_once(':')
+        .ok_or_else(|| format!("{label} must be exact:BRANCH or prefix:BRANCH"))?;
+    let branch = BranchName::new(branch).map_err(|error| format!("invalid {label}: {error}"))?;
+    match kind {
+        "exact" => Ok(BranchPattern::Exact(branch)),
+        "prefix" => Ok(BranchPattern::Prefix(branch)),
+        _ => Err(format!("{label} must be exact:BRANCH or prefix:BRANCH")),
+    }
+}
+
 fn usage() -> &'static str {
     "usage: host-sessiond \\
   --firecracker PATH --firecracker-sha256 SHA256 --jailer PATH --jailer-sha256 SHA256 \\
@@ -598,13 +753,19 @@ fn usage() -> &'static str {
   --guest-control-port PORT --broker-replay-capacity COUNT --broker-budget-requests COUNT \\
   --broker-budget-response-bytes BYTES --broker-budget-concurrent COUNT --github-response-cap-bytes BYTES \\
   --broker-max-connection-requests COUNT --repository ID --file-effects CANONICAL-LIST \\
-  --path-prefix /|PATH --stop-file PATH --poll-millis MILLIS \\
-  [--github-installation ID --github-credential-handle INTEGER]\n\nThe stop file must be absent at startup. Create it to request a retrying, dependency-ordered shutdown.\nGitHub egress is disabled unless both optional GitHub flags are supplied; the token is read only from EGRESS_GITHUB_TOKEN."
+  --path-prefix /|PATH --egress-authority none|public|github --stop-file PATH --poll-millis MILLIS \\
+  [--public-methods get[,head] --public-host DNS --public-path-prefix /PATH --public-max-response-bytes BYTES] \\
+  [--github-installation ID --github-credential-handle INTEGER --github-operations CANONICAL-LIST \\
+   --github-base-branch-pattern exact:BRANCH|prefix:BRANCH \\
+   --github-head-branch-pattern exact:BRANCH|prefix:BRANCH]\n\nThe stop file must be absent at startup. Create it to request a retrying, dependency-ordered shutdown. Select exactly one egress profile: `none` issues no external authority, `public` issues a host/path/method-limited HTTPS authority, and `github` issues a typed GitHub authority. GitHub tokens are read only from EGRESS_GITHUB_TOKEN."
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_file_effects, parse_hex_16, parse_path_prefix};
+    use super::{
+        parse_branch_pattern, parse_file_effects, parse_github_operations, parse_hex_16,
+        parse_http_methods, parse_path_prefix,
+    };
 
     #[test]
     fn policy_parser_matches_the_guest_image_contract() {
@@ -615,5 +776,18 @@ mod tests {
         assert!(parse_path_prefix("src/../escape").is_err());
         assert!(parse_hex_16("snapshot", "0123456789abcdef0123456789abcdef").is_ok());
         assert!(parse_hex_16("snapshot", "invalid").is_err());
+    }
+
+    #[test]
+    fn egress_policy_lists_are_closed_and_canonical() {
+        assert!(parse_http_methods("get,head").is_ok());
+        assert!(parse_http_methods("head,get").is_err());
+        assert!(parse_http_methods("get,get").is_err());
+        assert!(parse_github_operations("publish-branch,create-pull-request").is_ok());
+        assert!(parse_github_operations("create-pull-request,publish-branch").is_err());
+        assert!(parse_branch_pattern("--branch", "exact:main").is_ok());
+        assert!(parse_branch_pattern("--branch", "prefix:agent/work").is_ok());
+        assert!(parse_branch_pattern("--branch", "all:main").is_err());
+        assert!(parse_branch_pattern("--branch", "prefix:refs/heads/main").is_err());
     }
 }

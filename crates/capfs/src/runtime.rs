@@ -325,6 +325,28 @@ impl OpenedBackingFile {
             .map_err(|error| runtime_io_error("write", &self.path, error))
     }
 
+    /// Writes data and removes set-ID bits from the same open inode.
+    ///
+    /// Linux requests this behavior with `FUSE_WRITE_KILL_SUIDGID` when the
+    /// writer lacks `CAP_FSETID`. The backing process may itself hold that
+    /// capability, so relying on `pwrite` to clear the bits would make the
+    /// result depend on daemon privileges. A failure after the write is
+    /// intentionally returned to the adapter as an ambiguous commit outcome.
+    pub(crate) fn write_at_killing_set_id(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<usize, RuntimeBackingError> {
+        let written = self.write_at(offset, bytes)?;
+        let metadata = metadata_for_fd(&self.fd, &self.path)?;
+        if metadata.stx_mode & 0o6000 != 0 {
+            let permissions = Mode::from_raw_mode(u32::from(metadata.stx_mode & 0o1777));
+            fchmod(&self.fd, permissions)
+                .map_err(|error| runtime_io_error("clear set-ID bits", &self.path, error))?;
+        }
+        Ok(written)
+    }
+
     /// Changes the file length without following a path or reopening the file.
     ///
     /// Callers must authorize this as an explicit `Truncate` effect. Ordinary
@@ -1433,6 +1455,43 @@ mod tests {
         assert_eq!(
             fs::read(file_path).expect("written test file must remain readable"),
             b"capSAFEity"
+        );
+    }
+
+    #[test]
+    fn runtime_fuse_write_request_clears_set_id_bits() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let file_path = directory.path().join("notes.txt");
+        fs::write(&file_path, b"capability").expect("test file must be writable");
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o6755))
+            .expect("test set-ID permissions must be configurable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("link-free repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let path = CanonicalPath::new(["notes.txt"]).expect("test path must be canonical");
+        let object = namespace
+            .object_at_path_snapshot(&path)
+            .expect("namespace must remain readable")
+            .expect("manifest file must exist");
+
+        let file = backing
+            .open_runtime_writable_file(&object)
+            .expect("unchanged regular file must open for writing");
+        assert_eq!(
+            file.write_at_killing_set_id(0, b"C")
+                .expect("FUSE write semantics must clear set-ID bits"),
+            1
+        );
+        drop(file);
+
+        assert_eq!(
+            fs::metadata(&file_path)
+                .expect("written file metadata must remain readable")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
         );
     }
 

@@ -53,6 +53,7 @@ const WORKLOAD_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const WORKLOAD_PIDS_MAX: u64 = 32;
 const HOST_VSOCK_CID: u32 = 2;
 const BROKER_IO_TIMEOUT_SECONDS: u64 = 5;
+const DEVICE_DIRECTORY: &str = "/dev";
 
 #[derive(Debug)]
 struct Config {
@@ -80,6 +81,8 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<(), String> {
     let config = parse_config(env::args_os().skip(1))?;
     let identity = GuestIdentity::from_environment()?;
+    prepare_device_directory()?;
+    prepare_cgroup_hierarchy(&config.cgroup_parent)?;
     prepare_runtime_directory(&config.runtime_dir)?;
     let workspace = config.runtime_dir.join("workspace");
     mount_workspace(&config.workspace_device, &workspace)?;
@@ -337,6 +340,57 @@ fn prepare_runtime_directory(path: &Path) -> Result<(), String> {
         None,
     )
     .map_err(|error| format!("mounting guest runtime tmpfs {}: {error}", path.display()))
+}
+
+/// Mounts the guest-owned device namespace before consuming the workspace block device.
+///
+/// The immutable image deliberately has no host-provided device nodes. `devtmpfs` is the kernel
+/// boundary that exposes only the Firecracker devices assigned to this VM, including `/dev/vdb`
+/// and `/dev/fuse`; the subsequently isolated workload never receives the raw mount path.
+fn prepare_device_directory() -> Result<(), String> {
+    let path = Path::new(DEVICE_DIRECTORY);
+    fs::create_dir_all(path).map_err(|error| {
+        format!(
+            "creating guest device directory {}: {error}",
+            path.display()
+        )
+    })?;
+    mount(
+        "devtmpfs",
+        path,
+        "devtmpfs",
+        MountFlags::NOSUID | MountFlags::NOEXEC,
+        None,
+    )
+    .map_err(|error| format!("mounting guest devtmpfs {}: {error}", path.display()))
+}
+
+/// Mounts the cgroup v2 hierarchy that owns all supervisor-created workload leaves.
+///
+/// `guest-control-init` is the image's PID 1, so no distribution init system mounts cgroupfs on
+/// its behalf. Creating it here ensures `LinuxHostResources` cannot silently fall back to a
+/// host-like directory when it assigns the isolated workload's memory and PID limits.
+fn prepare_cgroup_hierarchy(path: &Path) -> Result<(), String> {
+    require_absolute_lexical_path("cgroup parent", path)?;
+    fs::create_dir_all(path).map_err(|error| {
+        format!(
+            "creating guest cgroup mountpoint {}: {error}",
+            path.display()
+        )
+    })?;
+    mount(
+        "cgroup2",
+        path,
+        "cgroup2",
+        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+        None,
+    )
+    .map_err(|error| {
+        format!(
+            "mounting guest cgroup v2 hierarchy {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn mount_workspace(device: &Path, target: &Path) -> Result<(), String> {

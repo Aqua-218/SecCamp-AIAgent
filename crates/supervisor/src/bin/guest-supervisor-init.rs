@@ -59,6 +59,8 @@ struct Config {
     isolation_launcher: PathBuf,
     workload: PathBuf,
     repository: RepoId,
+    effects: FileEffects,
+    path: PathPattern,
 }
 
 fn main() -> std::process::ExitCode {
@@ -142,22 +144,8 @@ fn run_session(config: &Config, identity: &GuestIdentity, workspace: &Path) -> R
     .map_err(|error| format!("importing guest workspace: {error}"))?;
     let authority = AuthorityBody::File(FileAuthority::new(
         config.repository.clone(),
-        FileEffects::from_effects([
-            FileEffect::ReadData,
-            FileEffect::ListDirectory,
-            FileEffect::WriteData,
-            FileEffect::Truncate,
-            FileEffect::CreateFile,
-            FileEffect::CreateDirectory,
-            FileEffect::RemoveFile,
-            FileEffect::RemoveDirectory,
-            FileEffect::Rename,
-            FileEffect::SetMetadata,
-            FileEffect::ReadLink,
-            FileEffect::CreateSymlink,
-            FileEffect::CreateHardLink,
-        ]),
-        PathPattern::Prefix(CanonicalPath::root()),
+        config.effects,
+        config.path.clone(),
     ));
     let validity = TimeWindow::new(
         MonotonicTime::from_ticks(0),
@@ -354,6 +342,22 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Config,
         .ok_or_else(usage)?
         .into_string()
         .map_err(|_| usage())?;
+    expect_flag(&mut arguments, "--file-effects")?;
+    let effects = parse_file_effects(
+        &arguments
+            .next()
+            .ok_or_else(usage)?
+            .into_string()
+            .map_err(|_| usage())?,
+    )?;
+    expect_flag(&mut arguments, "--path-prefix")?;
+    let path = parse_path_prefix(
+        &arguments
+            .next()
+            .ok_or_else(usage)?
+            .into_string()
+            .map_err(|_| usage())?,
+    )?;
     if arguments.next().is_some() {
         return Err(usage());
     }
@@ -364,7 +368,58 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Config,
         isolation_launcher,
         workload,
         repository: RepoId::new(repository),
+        effects,
+        path,
     })
+}
+
+fn parse_file_effects(value: &str) -> Result<FileEffects, String> {
+    const EFFECTS: [(&str, FileEffect); 13] = [
+        ("read-data", FileEffect::ReadData),
+        ("list-directory", FileEffect::ListDirectory),
+        ("write-data", FileEffect::WriteData),
+        ("truncate", FileEffect::Truncate),
+        ("create-file", FileEffect::CreateFile),
+        ("create-directory", FileEffect::CreateDirectory),
+        ("remove-file", FileEffect::RemoveFile),
+        ("remove-directory", FileEffect::RemoveDirectory),
+        ("rename", FileEffect::Rename),
+        ("set-metadata", FileEffect::SetMetadata),
+        ("read-link", FileEffect::ReadLink),
+        ("create-symlink", FileEffect::CreateSymlink),
+        ("create-hard-link", FileEffect::CreateHardLink),
+    ];
+
+    let mut previous = None;
+    let mut effects = Vec::new();
+    for name in value.split(',') {
+        let index = EFFECTS
+            .iter()
+            .position(|(candidate, _)| *candidate == name)
+            .ok_or_else(|| "file effects must use the canonical closed effect names".to_owned())?;
+        if previous.is_some_and(|previous| index <= previous) {
+            return Err("file effects must be strictly ordered without duplicates".to_owned());
+        }
+        previous = Some(index);
+        effects.push(EFFECTS[index].1);
+    }
+    let effects = FileEffects::from_effects(effects);
+    if effects.is_empty() {
+        return Err("file effects cannot be empty".to_owned());
+    }
+    Ok(effects)
+}
+
+fn parse_path_prefix(value: &str) -> Result<PathPattern, String> {
+    if value == "/" {
+        return Ok(PathPattern::Prefix(CanonicalPath::root()));
+    }
+    if value.is_empty() || value.starts_with('/') || value.ends_with('/') {
+        return Err("path prefix must be / or canonical repository-relative segments".to_owned());
+    }
+    CanonicalPath::new(value.split('/'))
+        .map(PathPattern::Prefix)
+        .map_err(|error| format!("invalid path prefix: {error}"))
 }
 
 fn required_path(
@@ -401,7 +456,7 @@ fn require_absolute_lexical_path(label: &str, path: &Path) -> Result<(), String>
 }
 
 fn usage() -> String {
-    "usage: guest-supervisor-init --workspace-device <absolute-path> --runtime-dir <absolute-path> --cgroup-parent <absolute-path> --isolation-launcher <absolute-path> --workload <absolute-path> --repository <repository-id>".to_owned()
+    "usage: guest-supervisor-init --workspace-device <absolute-path> --runtime-dir <absolute-path> --cgroup-parent <absolute-path> --isolation-launcher <absolute-path> --workload <absolute-path> --repository <repository-id> --file-effects <canonical-comma-list> --path-prefix </|canonical/relative/path>".to_owned()
 }
 
 #[cfg(test)]
@@ -423,10 +478,24 @@ mod tests {
             OsString::from("/usr/local/libexec/agent-workload"),
             OsString::from("--repository"),
             OsString::from("workspace"),
+            OsString::from("--file-effects"),
+            OsString::from("read-data,list-directory,write-data"),
+            OsString::from("--path-prefix"),
+            OsString::from("src/agent"),
         ])
         .expect("fixed guest runtime configuration must parse");
         assert_eq!(config.workspace_device, PathBuf::from("/dev/vdb"));
         assert_eq!(config.repository, RepoId::new("workspace"));
+        assert!(config.effects.contains(FileEffect::ReadData));
+        assert!(config.effects.contains(FileEffect::ListDirectory));
+        assert!(config.effects.contains(FileEffect::WriteData));
+        assert!(!config.effects.contains(FileEffect::Rename));
+        assert_eq!(
+            config.path,
+            PathPattern::Prefix(
+                CanonicalPath::new(["src", "agent"]).expect("test path prefix must be canonical")
+            )
+        );
     }
 
     #[test]
@@ -437,5 +506,18 @@ mod tests {
         ])
         .expect_err("relative device path must be rejected before side effects");
         assert!(error.contains("workspace-device must be an absolute lexical path"));
+    }
+
+    #[test]
+    fn rejects_noncanonical_guest_authority_policy() {
+        assert!(parse_file_effects("write-data,read-data").is_err());
+        assert!(parse_file_effects("read-data,read-data").is_err());
+        assert!(parse_file_effects("read").is_err());
+        assert!(parse_path_prefix("/src").is_err());
+        assert!(parse_path_prefix("src/../secret").is_err());
+        assert_eq!(
+            parse_path_prefix("/").expect("root path prefix must be accepted"),
+            PathPattern::Prefix(CanonicalPath::root())
+        );
     }
 }

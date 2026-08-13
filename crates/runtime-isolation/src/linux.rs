@@ -795,8 +795,9 @@ mod implementation {
             config: &IsolationConfig,
         ) -> Result<(), BackendError> {
             let rootfs = &config.rootfs;
-            make_mounts_private(step)?;
-            let workspace_source = pin_workspace_source(step, &config.workspace.source)?;
+            make_mounts_private(step).map_err(|error| with_context(error, "rootfs-private"))?;
+            let workspace_source = pin_workspace_source(step, &config.workspace.source)
+                .map_err(|error| with_context(error, "rootfs-pin-workspace"))?;
             let setup_result = (|| {
                 mount_call(
                     step,
@@ -805,16 +806,19 @@ mod implementation {
                     None,
                     libc::MS_BIND,
                     None,
-                )?;
+                )
+                .map_err(|error| with_context(error, "rootfs-bind"))?;
                 fs::create_dir_all(&rootfs.old_root)
-                    .map_err(|error| io_error(step, "create old-root directory", &error))?;
-                create_rootfs_mount_targets(step, config)?;
+                    .map_err(|error| io_error(step, "rootfs-old-root", &error))?;
+                create_rootfs_mount_targets(step, config)
+                    .map_err(|error| with_context(error, "rootfs-targets"))?;
                 stage_workspace_mount(
                     step,
                     &rootfs.mount_target,
                     &config.workspace.target,
                     &workspace_source,
-                )?;
+                )
+                .map_err(|error| with_context(error, "rootfs-stage-workspace"))?;
                 Ok::<(), BackendError>(())
             })();
             if let Err(error) = setup_result {
@@ -841,7 +845,8 @@ mod implementation {
                     | libc::MS_NOSUID
                     | libc::MS_NODEV,
                 None,
-            );
+            )
+            .map_err(|error| with_context(error, "rootfs-remount"));
             if result.is_err() {
                 if let Err(cleanup_error) = unmount_path(step, &rootfs.mount_target) {
                     return Err(BackendError::new(
@@ -856,17 +861,19 @@ mod implementation {
                 return result;
             }
             let result = (|| {
-                pivot_root(step, &rootfs.mount_target, &rootfs.old_root)?;
+                pivot_root(step, &rootfs.mount_target, &rootfs.old_root)
+                    .map_err(|error| with_context(error, "rootfs-pivot"))?;
                 self.rootfs_pivoted = true;
-                change_directory(step, Path::new("/"))?;
+                change_directory(step, Path::new("/"))
+                    .map_err(|error| with_context(error, "rootfs-chdir"))?;
                 let old_root_after_pivot =
                     old_root_after_pivot(&rootfs.mount_target, &rootfs.old_root).ok_or_else(
                         || BackendError::new(step, "old-root path was not beneath rootfs", None),
                     )?;
-                unmount_path(step, &old_root_after_pivot)?;
-                fs::remove_dir(&old_root_after_pivot).map_err(|error| {
-                    io_error(step, "remove detached old-root directory", &error)
-                })?;
+                unmount_path(step, &old_root_after_pivot)
+                    .map_err(|error| with_context(error, "rootfs-detach-old"))?;
+                fs::remove_dir(&old_root_after_pivot)
+                    .map_err(|error| io_error(step, "rootfs-remove-old", &error))?;
                 Ok::<(), BackendError>(())
             })();
             if let Err(error) = &result
@@ -1824,6 +1831,11 @@ mod implementation {
             ),
             primary.errno.or(secondary.errno),
         )
+    }
+
+    fn with_context(mut error: BackendError, context: &str) -> BackendError {
+        error.message = format!("{context}: {}", error.message);
+        error
     }
 
     fn cleanup_failed_spawn(child_pid: libc::pid_t, original: BackendError) -> BackendError {

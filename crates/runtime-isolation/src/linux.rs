@@ -187,6 +187,7 @@ mod implementation {
 
     #[allow(private_bounds, private_interfaces)]
     impl IsolationBackend for LinuxBackend {
+        #[allow(clippy::too_many_lines)]
         fn detect_capabilities(&mut self, config: &IsolationConfig) -> CapabilityReport {
             let mut report = CapabilityReport {
                 namespaces_available: true,
@@ -255,10 +256,24 @@ mod implementation {
                     |error| format!("unreadable ({error})"),
                     |value| value.trim().replace('\n', "; "),
                 );
+                let current_cgroup = fs::read_to_string("/proc/self/cgroup").map_or_else(
+                    |error| format!("unreadable ({error})"),
+                    |value| value.trim().replace('\n', "; "),
+                );
+                let cgroup_mount = fs::read_to_string("/proc/self/mountinfo").map_or_else(
+                    |error| format!("unreadable ({error})"),
+                    |value| {
+                        value
+                            .lines()
+                            .find(|line| line.contains(" - cgroup2 "))
+                            .unwrap_or("absent")
+                            .to_owned()
+                    },
+                );
                 report
                     .reasons
                     .push(format!(
-                        "configured cgroup v2 root or required control files are absent or not writable: controllers={controller_status:?}, root_writable={root_writable}, controls={control_status}, kernel_cgroups={kernel_cgroup_status:?}"
+                        "configured cgroup v2 root or required control files are absent or not writable: controllers={controller_status:?}, root_writable={root_writable}, controls={control_status}, kernel_cgroups={kernel_cgroup_status:?}, current_cgroup={current_cgroup:?}, cgroup_mount={cgroup_mount:?}"
                     ));
             }
             report.seccomp_available = seccomp_is_available();

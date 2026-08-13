@@ -1305,12 +1305,12 @@ mod implementation {
     ) -> Result<(), BackendError> {
         for target in 0..FIRST_NONSTANDARD_FD {
             loop {
-                // CLOEXEC prevents even the harmless placeholder from becoming
-                // an implicit workload channel after its eventual exec.
-                // SAFETY: the source is live, differs from every target, and
-                // dup3 atomically replaces each inherited standard descriptor.
-                let result =
-                    unsafe { libc::dup3(null_device.as_raw_fd(), target, libc::O_CLOEXEC) };
+                // Keep a known `/dev/null` descriptor valid through exec. Static runtimes
+                // commonly probe standard descriptors during startup, while this replacement
+                // still removes every caller-supplied input or output channel.
+                // SAFETY: the source is live, differs from every target, and dup3 atomically
+                // replaces each inherited standard descriptor.
+                let result = unsafe { libc::dup3(null_device.as_raw_fd(), target, 0) };
                 if result == target {
                     break;
                 }
@@ -2843,10 +2843,8 @@ mod implementation {
         }
 
         fn standard_descriptors_are_sanitized() -> bool {
-            (libc::STDIN_FILENO..=libc::STDERR_FILENO).all(|descriptor| {
-                descriptor_has_cloexec(IsolationStep::Namespaces, descriptor).unwrap_or(false)
-                    && descriptor_is_null_device(descriptor)
-            })
+            (libc::STDIN_FILENO..=libc::STDERR_FILENO)
+                .all(|descriptor| descriptor_is_null_device(descriptor))
         }
 
         fn descriptor_is_null_device(descriptor: RawFd) -> bool {

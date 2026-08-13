@@ -42,6 +42,7 @@ const WORKLOAD_START_TIMEOUT: Duration = Duration::from_secs(10);
 const ISOLATED_WORKLOAD_CGROUP: &str = "workload";
 const START_GATE_READY: &[u8; 5] = b"ready";
 const START_GATE_RELEASE: [u8; 1] = [1];
+const START_GATE_ISOLATED: &[u8; 8] = b"isolated";
 
 /// Environment variable carrying the subject's `CapFS` mount point to its workload.
 pub const WORKLOAD_MOUNTPOINT_ENV: &str = "CAPFS_MOUNTPOINT";
@@ -464,7 +465,7 @@ impl WorkloadStartGate {
                         ));
                     }
                     stream
-                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .set_read_timeout(Some(WORKLOAD_START_TIMEOUT))
                         .map_err(|source| {
                             io_error("setting workload start-gate read timeout", source)
                         })?;
@@ -480,6 +481,15 @@ impl WorkloadStartGate {
                     stream
                         .write_all(&START_GATE_RELEASE)
                         .map_err(|source| io_error("releasing workload start gate", source))?;
+                    let mut isolated = [0_u8; START_GATE_ISOLATED.len()];
+                    stream.read_exact(&mut isolated).map_err(|source| {
+                        io_error("reading isolated workload startup attestation", source)
+                    })?;
+                    if isolated != *START_GATE_ISOLATED {
+                        return Err(LinuxHostError::StartGate(
+                            "launcher sent an invalid isolation attestation".to_owned(),
+                        ));
+                    }
                     return Ok(());
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -856,30 +866,20 @@ impl CapfsHostResources for LinuxHostResources {
                 start_gate: Some(start_gate),
             },
         );
-        let pid = self
+        let release = self
             .workloads
             .get(&handle)
-            .map_or(0, |owned| owned.child.id());
-        if let Err(error) = fs::write(cgroup_path.join("cgroup.procs"), pid.to_string()) {
+            .and_then(|owned| owned.start_gate.as_ref())
+            .ok_or_else(|| LinuxHostError::StartGate("start gate disappeared".to_owned()))
+            .and_then(WorkloadStartGate::release);
+        if let Err(error) = release {
             return ResourceAcquisition::CleanupRequired {
                 resource: handle,
-                error: io_error("moving the workload into its cgroup", error),
+                error,
             };
         }
         match cgroup_populated(&cgroup_path) {
             Ok(true) => {
-                let release = self
-                    .workloads
-                    .get(&handle)
-                    .and_then(|owned| owned.start_gate.as_ref())
-                    .ok_or_else(|| LinuxHostError::StartGate("start gate disappeared".to_owned()))
-                    .and_then(WorkloadStartGate::release);
-                if let Err(error) = release {
-                    return ResourceAcquisition::CleanupRequired {
-                        resource: handle,
-                        error,
-                    };
-                }
                 let Some(start_gate) = self
                     .workloads
                     .get_mut(&handle)
@@ -904,13 +904,10 @@ impl CapfsHostResources for LinuxHostResources {
                     }
                 }
             }
-            // The workload exited before confinement could be observed. Its exit is not proof
-            // that it did nothing, so the caller still owns a workload it must stop.
             Ok(false) => ResourceAcquisition::CleanupRequired {
                 resource: handle,
-                error: io_error(
-                    "confirming the workload joined its cgroup",
-                    io::Error::other("the cgroup is empty immediately after the move"),
+                error: LinuxHostError::StartGate(
+                    "isolated workload did not populate its delegated cgroup".to_owned(),
                 ),
             },
             Err(error) => ResourceAcquisition::CleanupRequired {

@@ -554,15 +554,16 @@ fn real_firecracker_guest_runtime_preserves_the_broker_channel_through_isolation
         vm.guest_serial_log(),
     );
 
-    let report = broker
-        .join()
-        .expect("host Broker thread must not panic")
-        .unwrap_or_else(|error| {
-            panic!(
-                "isolated guest workload did not reach the Broker: {error}; guest serial output:\n{}",
-                vm.guest_serial_log()
-            )
-        });
+    let report = broker.join().expect("host Broker thread must not panic");
+    let report = report.unwrap_or_else(|error| {
+        // The guest may still be flushing its supervisor error after the host observes EOF.
+        // Keep the VM alive long enough to capture that causally relevant serial diagnostic.
+        thread::sleep(Duration::from_millis(250));
+        panic!(
+            "isolated guest workload did not reach the Broker: {error}; guest serial output:\n{}",
+            vm.guest_serial_log()
+        )
+    });
     assert_eq!(report.requests_served(), 1);
     assert_eq!(
         report.close_reason(),

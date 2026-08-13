@@ -22,6 +22,7 @@
 
 pub mod authority_backend;
 pub mod egress_backend;
+pub mod filesystem_factory;
 pub mod firecracker_backend;
 pub mod firecracker_identity;
 pub mod firecracker_workspace;

@@ -27,6 +27,13 @@ require_absolute_file() {
   [[ -x "${path}" ]] || fail "${label} must be executable: ${path}"
 }
 
+require_absolute_regular_file() {
+  local label="$1"
+  local path="$2"
+  [[ "${path}" == /* ]] || fail "${label} must be absolute: ${path}"
+  [[ -f "${path}" && ! -L "${path}" ]] || fail "${label} must be a regular non-symlink file: ${path}"
+}
+
 install_elf_dependencies() {
   local executable="$1"
   local output=''
@@ -240,7 +247,8 @@ validate_path_prefix "${path_prefix}"
 [[ "${broker_port}" =~ ^[0-9]+$ ]] || fail 'broker port must be decimal'
 ((broker_port > 0 && broker_port < 4294967295)) || fail 'broker port must be explicit, non-zero, and non-wildcard'
 
-for input in "${base_rootfs}" "${guest_control_init}" "${guest_supervisor_init}" "${isolation_launcher}" "${agent_workload}"; do
+require_absolute_regular_file 'base rootfs' "${base_rootfs}"
+for input in "${guest_control_init}" "${guest_supervisor_init}" "${isolation_launcher}" "${agent_workload}"; do
   require_absolute_file 'runtime input' "${input}"
 done
 require_absolute_lexical_path 'rootfs output path' "${output_rootfs}"

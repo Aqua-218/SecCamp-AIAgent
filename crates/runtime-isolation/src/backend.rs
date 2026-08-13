@@ -412,13 +412,14 @@ const STARTUP_READY: u8 = 1;
 const STARTUP_FAILED: u8 = 2;
 const TERMINATION_REQUIRED: u8 = 1;
 const ERRNO_UNAVAILABLE: i32 = i32::MIN;
+const STARTUP_FAILURE_DETAIL_LEN: usize = 16;
 const DROP_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 static FORCE_PIDFD_TERMINATION_FAILURE: AtomicBool = AtomicBool::new(false);
 
 /// A child's kernel-observed startup result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChildStartupStatus {
     /// Every required isolation step completed in the child.
     Ready(ChildStartupReady),
@@ -445,33 +446,44 @@ impl ChildStartupReady {
 }
 
 /// Parent-observable isolation failure reported before the child terminates.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChildStartupFailure {
     step: IsolationStep,
     errno: Option<i32>,
     rollback_failure_count: u32,
     termination_required: bool,
+    detail: [u8; STARTUP_FAILURE_DETAIL_LEN],
 }
 
 impl ChildStartupFailure {
     /// Returns the operation that stopped isolation.
-    pub const fn step(self) -> IsolationStep {
+    pub const fn step(&self) -> IsolationStep {
         self.step
     }
 
     /// Returns the kernel errno, when the failed operation supplied one.
-    pub const fn errno(self) -> Option<i32> {
+    pub const fn errno(&self) -> Option<i32> {
         self.errno
     }
 
     /// Returns how many best-effort rollback operations also failed.
-    pub const fn rollback_failure_count(self) -> u32 {
+    pub const fn rollback_failure_count(&self) -> u32 {
         self.rollback_failure_count
     }
 
     /// Returns whether the child must terminate rather than continue execution.
-    pub const fn termination_required(self) -> bool {
+    pub const fn termination_required(&self) -> bool {
         self.termination_required
+    }
+
+    /// Returns a bounded, printable summary of the failed operation.
+    pub fn detail(&self) -> &str {
+        let length = self
+            .detail
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(STARTUP_FAILURE_DETAIL_LEN);
+        std::str::from_utf8(&self.detail[..length]).unwrap_or("invalid startup failure detail")
     }
 }
 
@@ -614,11 +626,13 @@ fn encode_startup_ready(namespace: NamespaceIdentity) -> [u8; STARTUP_MESSAGE_LE
 }
 
 fn encode_startup_failure(failure: &IsolationError) -> [u8; STARTUP_MESSAGE_LEN] {
-    let (original, failures, termination_required) = match failure {
-        IsolationError::Backend(original) => (original, 0, false),
-        IsolationError::Rollback { original, failures } => (original, failures.len(), false),
+    let (original, failures, termination_required, detail) = match failure {
+        IsolationError::Backend(original) => (original, 0, false, original.message.as_str()),
+        IsolationError::Rollback { original, failures } => {
+            (original, failures.len(), false, original.message.as_str())
+        }
         IsolationError::TerminationRequired { original, failures } => {
-            (original, failures.len(), true)
+            (original, failures.len(), true, original.message.as_str())
         }
         // The child protocol is emitted only after successful preflight and
         // namespace preparation. Retain a fail-closed representation if that
@@ -635,6 +649,7 @@ fn encode_startup_failure(failure: &IsolationError) -> [u8; STARTUP_MESSAGE_LEN]
             message[6] = IsolationStep::Namespaces.wire_code();
             message[7] = TERMINATION_REQUIRED;
             message[8..12].copy_from_slice(&ERRNO_UNAVAILABLE.to_le_bytes());
+            message[12..28].copy_from_slice(&encode_failure_detail("internal failure"));
             return message;
         }
     };
@@ -646,8 +661,21 @@ fn encode_startup_failure(failure: &IsolationError) -> [u8; STARTUP_MESSAGE_LEN]
     message[6] = original.step.wire_code();
     message[7] = u8::from(termination_required) * TERMINATION_REQUIRED;
     message[8..12].copy_from_slice(&original.errno.unwrap_or(ERRNO_UNAVAILABLE).to_le_bytes());
+    message[12..28].copy_from_slice(&encode_failure_detail(detail));
     message[28..32].copy_from_slice(&u32::try_from(failures).unwrap_or(u32::MAX).to_le_bytes());
     message
+}
+
+fn encode_failure_detail(detail: &str) -> [u8; STARTUP_FAILURE_DETAIL_LEN] {
+    let mut encoded = [0_u8; STARTUP_FAILURE_DETAIL_LEN];
+    for (slot, byte) in encoded.iter_mut().zip(detail.bytes()) {
+        *slot = if byte.is_ascii_graphic() || byte == b' ' {
+            byte
+        } else {
+            b'?'
+        };
+    }
+    encoded
 }
 
 fn read_startup_status(reader: OwnedFd) -> Result<ChildStartupStatus, ChildProcessError> {
@@ -720,19 +748,15 @@ fn decode_startup_status(
                 pid_namespace: NamespaceIdentity::from_kernel(device, inode),
             }))
         }
-        STARTUP_FAILED => {
-            if device != 0 || inode != 0 {
-                return Err(ChildProcessError::InvalidStartupStatus(
-                    "failure message contained a namespace attestation",
-                ));
-            }
-            Ok(ChildStartupStatus::Failed(ChildStartupFailure {
-                step,
-                errno: (errno != ERRNO_UNAVAILABLE).then_some(errno),
-                rollback_failure_count,
-                termination_required: message[7] == TERMINATION_REQUIRED,
-            }))
-        }
+        STARTUP_FAILED => Ok(ChildStartupStatus::Failed(ChildStartupFailure {
+            step,
+            errno: (errno != ERRNO_UNAVAILABLE).then_some(errno),
+            rollback_failure_count,
+            termination_required: message[7] == TERMINATION_REQUIRED,
+            detail: message[12..28]
+                .try_into()
+                .expect("fixed status failure detail has the correct length"),
+        })),
         _ => Err(ChildProcessError::InvalidStartupStatus(
             "message kind is unknown",
         )),
@@ -1234,9 +1258,7 @@ impl RuntimeIsolation {
     {
         match Self::spawn_isolated_transaction(backend, config, workload_entry) {
             Err(error @ IsolationError::TerminationRequired { .. }) => {
-                eprintln!(
-                    "runtime-isolation: aborting an irreversibly mutated launcher: {error}; detail: {error:?}"
-                );
+                eprintln!("runtime-isolation: aborting an irreversibly mutated launcher: {error}");
                 std::process::abort();
             }
             outcome => outcome,
@@ -1474,6 +1496,7 @@ mod tests {
         assert_eq!(failure.errno(), Some(libc::EACCES));
         assert_eq!(failure.rollback_failure_count(), 1);
         assert!(failure.termination_required());
+        assert_eq!(failure.detail(), "denied");
     }
 
     #[test]

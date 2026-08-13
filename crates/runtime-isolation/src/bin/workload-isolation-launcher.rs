@@ -178,7 +178,10 @@ fn execute_workload(
         .current_dir(&config.workload_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Keep normal workload output closed, but retain stderr on the guest serial console so
+        // an image-configured program cannot fail after the isolation attestation without a
+        // diagnostic. No host command line or credential reaches this process.
+        .stderr(Stdio::inherit())
         .exec();
     Err(format!(
         "execing configured workload {} after isolation: {error}",

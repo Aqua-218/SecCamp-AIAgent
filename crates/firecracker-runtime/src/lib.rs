@@ -19,7 +19,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -55,6 +55,12 @@ pub const MAX_WORKSPACE_ENTRIES: usize = 100_000;
 pub const MAX_WORKSPACE_DEPTH: usize = 64;
 /// Maximum aggregate regular-file bytes copied into one workspace.
 pub const MAX_WORKSPACE_BYTES: u64 = 1 << 30;
+/// Smallest raw ext4 image accepted for a cloned guest workspace.
+pub const MIN_WORKSPACE_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
+/// Largest sparse raw ext4 image a session may provision.
+pub const MAX_WORKSPACE_IMAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const WORKSPACE_IMAGE_BLOCK_BYTES: u64 = 4096;
+const WORKSPACE_IMAGE_FILE_SUFFIX: &str = ".ext4";
 const ID_LENGTH: usize = 16;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -149,7 +155,16 @@ impl PinnedArtifact {
     }
 }
 
-/// Workspace source and clone destination policy.
+/// Pinned formatter and capacity policy for one writable workspace block device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceImageConfig {
+    /// Pinned `mke2fs` executable used to create the ext4 filesystem.
+    pub formatter: PinnedArtifact,
+    /// Exact sparse raw-image capacity exposed to the guest.
+    pub size_bytes: u64,
+}
+
+/// Workspace source, clone destination, and raw block-device policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceConfig {
     /// Read-only source workspace used as the clone input.
@@ -158,6 +173,8 @@ pub struct WorkspaceConfig {
     pub clone_root: PathBuf,
     /// Stable, validated clone identifier used in the destination name.
     pub clone_id: String,
+    /// Formatter and capacity policy for the guest-visible ext4 block device.
+    pub image: WorkspaceImageConfig,
 }
 
 impl WorkspaceConfig {
@@ -165,6 +182,13 @@ impl WorkspaceConfig {
     #[must_use]
     pub fn clone_path(&self) -> PathBuf {
         self.clone_root.join(&self.clone_id)
+    }
+
+    /// Returns the guest workspace's session-owned raw ext4 image path.
+    #[must_use]
+    pub fn image_path(&self) -> PathBuf {
+        self.clone_root
+            .join(format!("{}{}", self.clone_id, WORKSPACE_IMAGE_FILE_SUFFIX))
     }
 }
 
@@ -357,6 +381,7 @@ impl RuntimeConfig {
         validate_artifact("kernel", &self.kernel)?;
         validate_artifact("rootfs", &self.rootfs)?;
         validate_artifact("dm-verity hash image", &self.verity_hash)?;
+        validate_artifact("workspace image formatter", &self.workspace.image.formatter)?;
         validate_artifact("jailer", &self.jailer)?;
         validate_artifact("seccomp filter", &self.isolation.seccomp.filter)?;
         validate_absolute_path("API socket", &self.api_socket)?;
@@ -388,13 +413,29 @@ impl RuntimeConfig {
         validate_safe_name("dm-verity mapper name", &self.dm_verity.mapper_name)?;
         validate_safe_name("workspace clone id", &self.workspace.clone_id)?;
         let clone_path = self.workspace.clone_path();
+        let image_path = self.workspace.image_path();
         if self.workspace.source == clone_path
+            || self.workspace.source == image_path
             || clone_path.starts_with(&self.workspace.source)
+            || image_path.starts_with(&self.workspace.source)
             || self.workspace.source.starts_with(&clone_path)
+            || self.workspace.source.starts_with(&image_path)
         {
             return Err(RuntimeError::InvalidConfig(
-                "workspace source and clone paths must not overlap".to_owned(),
+                "workspace source, clone, and image paths must not overlap".to_owned(),
             ));
+        }
+        if self.workspace.image.size_bytes < MIN_WORKSPACE_IMAGE_BYTES
+            || self.workspace.image.size_bytes > MAX_WORKSPACE_IMAGE_BYTES
+            || !self
+                .workspace
+                .image
+                .size_bytes
+                .is_multiple_of(WORKSPACE_IMAGE_BLOCK_BYTES)
+        {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "workspace image size must be between {MIN_WORKSPACE_IMAGE_BYTES} and {MAX_WORKSPACE_IMAGE_BYTES} bytes and divisible by {WORKSPACE_IMAGE_BLOCK_BYTES}"
+            )));
         }
         if self.vsock.guest_cid < 3 {
             return Err(RuntimeError::InvalidConfig(
@@ -463,6 +504,7 @@ impl RuntimeConfig {
             &self.dm_verity.jailed_device_path,
         )?;
         self.jail_path("workspace clone", &self.workspace.clone_path())?;
+        self.jail_path("workspace block image", &self.workspace.image_path())?;
         self.jail_path("seccomp filter", &self.isolation.seccomp.filter.path)?;
         self.jail_path("vsock UDS", &self.vsock.uds_path)?;
         Ok(())
@@ -572,6 +614,16 @@ impl RuntimeConfig {
             "workspace.clone_root",
             self,
             &self.workspace.clone_root,
+        );
+        fingerprint_artifact(
+            &mut bytes,
+            "workspace.image.formatter",
+            &self.workspace.image.formatter,
+        );
+        fingerprint_bytes(
+            &mut bytes,
+            "workspace.image.size_bytes",
+            &self.workspace.image.size_bytes.to_be_bytes(),
         );
         fingerprint_artifact(&mut bytes, "jailer", &self.jailer);
         fingerprint_bytes(
@@ -972,6 +1024,25 @@ pub trait FileSystem {
     ///
     /// Returns an adapter error when the clone cannot be created.
     fn clone_workspace(&mut self, source: &Path, destination: &Path) -> Result<(), RuntimeError>;
+    /// Creates a sparse, exclusively-owned raw image adjacent to an existing workspace clone.
+    ///
+    /// The image remains owned by `workspace` and is removed together with it. The caller runs
+    /// the separately pinned formatter only after this method returns successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the clone is not owned, the image path is unsafe or already
+    /// present, or the exact-size regular file cannot be durably created.
+    fn create_workspace_image(
+        &mut self,
+        _workspace: &Path,
+        _image: &Path,
+        _size_bytes: u64,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Io(
+            "filesystem adapter cannot create a workspace block image".to_owned(),
+        ))
+    }
     /// Removes a clone or a dm-verity-related filesystem staging path.
     ///
     /// # Errors
@@ -2401,6 +2472,12 @@ struct WorkspaceOwnership {
     nodes: HashMap<PathBuf, OwnedWorkspaceNode>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WorkspaceImageOwnership {
+    parent: ObjectIdentity,
+    image: ObjectIdentity,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SourceSnapshot {
     identity: ObjectIdentity,
@@ -2561,6 +2638,7 @@ fn sort_workspace_paths(nodes: &HashMap<PathBuf, OwnedWorkspaceNode>) -> Vec<Pat
 #[derive(Debug, Default)]
 pub struct RealFileSystem {
     owned_workspaces: HashMap<PathBuf, WorkspaceOwnership>,
+    owned_workspace_images: HashMap<PathBuf, WorkspaceImageOwnership>,
 }
 
 struct CloneContext {
@@ -3132,6 +3210,54 @@ impl RealFileSystem {
         }
         Ok(())
     }
+
+    fn remove_owned_workspace_image(&mut self, workspace: &Path) -> Result<(), RuntimeError> {
+        let Some(ownership) = self.owned_workspace_images.get(workspace).copied() else {
+            return Ok(());
+        };
+        let image = workspace
+            .parent()
+            .ok_or_else(|| workspace_error("workspace clone has no parent directory"))?
+            .join(format!(
+                "{}{}",
+                workspace
+                    .file_name()
+                    .ok_or_else(|| workspace_error("workspace clone has no final component"))?
+                    .to_string_lossy(),
+                WORKSPACE_IMAGE_FILE_SUFFIX
+            ));
+        let parent = image
+            .parent()
+            .ok_or_else(|| workspace_error("workspace image has no parent directory"))?;
+        let parent_metadata = metadata_at(parent)?;
+        if ObjectIdentity::from_metadata(&parent_metadata) != ownership.parent {
+            return Err(workspace_error(format!(
+                "workspace image parent was replaced and will not be modified: {}",
+                parent.display()
+            )));
+        }
+        let metadata = match fs::symlink_metadata(&image) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.owned_workspace_images.remove(workspace);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.nlink() != 1
+            || ObjectIdentity::from_metadata(&metadata) != ownership.image
+        {
+            return Err(workspace_error(format!(
+                "workspace image was replaced and will not be removed: {}",
+                image.display()
+            )));
+        }
+        fs::remove_file(&image).map_err(RuntimeError::from)?;
+        self.owned_workspace_images.remove(workspace);
+        Ok(())
+    }
 }
 
 impl FileSystem for RealFileSystem {
@@ -3183,8 +3309,71 @@ impl FileSystem for RealFileSystem {
         self.publish_clone(destination, prepared, ownership)
     }
 
+    fn create_workspace_image(
+        &mut self,
+        workspace: &Path,
+        image: &Path,
+        size_bytes: u64,
+    ) -> Result<(), RuntimeError> {
+        let ownership = self.owned_workspaces.get(workspace).ok_or_else(|| {
+            workspace_error(format!(
+                "workspace image requires an owned clone: {}",
+                workspace.display()
+            ))
+        })?;
+        Self::validate_owned_tree(workspace, ownership)?;
+        let parent = workspace
+            .parent()
+            .ok_or_else(|| workspace_error("workspace clone has no parent directory"))?;
+        if image.parent() != Some(parent) {
+            return Err(workspace_error(format!(
+                "workspace image must be adjacent to its clone: {}",
+                image.display()
+            )));
+        }
+        let parent_metadata = metadata_at(parent)?;
+        if ObjectIdentity::from_metadata(&parent_metadata) != ownership.parent {
+            return Err(workspace_error(format!(
+                "workspace image parent was replaced: {}",
+                parent.display()
+            )));
+        }
+        validate_destination_absence(image)?;
+        if self.owned_workspace_images.contains_key(workspace) {
+            return Err(RuntimeError::WorkspaceAlreadyExists(image.to_path_buf()));
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(image)
+            .map_err(RuntimeError::from)?;
+        file.set_len(size_bytes).map_err(RuntimeError::from)?;
+        file.sync_all().map_err(RuntimeError::from)?;
+        let metadata = metadata_at(image)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.len() != size_bytes
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(workspace_error(format!(
+                "workspace image is not an exclusive owner-only regular file: {}",
+                image.display()
+            )));
+        }
+        self.owned_workspace_images.insert(
+            workspace.to_path_buf(),
+            WorkspaceImageOwnership {
+                parent: ownership.parent,
+                image: ObjectIdentity::from_metadata(&metadata),
+            },
+        );
+        Ok(())
+    }
+
     fn remove_workspace(&mut self, path: &Path) -> Result<(), RuntimeError> {
-        let Some(ownership) = self.owned_workspaces.get_mut(path) else {
+        let Some(ownership) = self.owned_workspaces.get(path) else {
             return match fs::symlink_metadata(path) {
                 Ok(_) => Err(workspace_error(format!(
                     "workspace path is not owned by this filesystem instance: {}",
@@ -3197,6 +3386,7 @@ impl FileSystem for RealFileSystem {
         let root_metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.remove_owned_workspace_image(path)?;
                 self.owned_workspaces.remove(path);
                 return Ok(());
             }
@@ -3222,6 +3412,11 @@ impl FileSystem for RealFileSystem {
             )));
         }
         Self::validate_owned_tree(path, ownership)?;
+        self.remove_owned_workspace_image(path)?;
+        let ownership = self
+            .owned_workspaces
+            .get_mut(path)
+            .ok_or_else(|| workspace_error("workspace ownership disappeared during cleanup"))?;
         for relative in sort_workspace_paths(&ownership.nodes) {
             if relative == Path::new(".") {
                 continue;
@@ -3760,6 +3955,11 @@ where
                 self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
             return Err(with_cleanup(error, &cleanup));
         }
+        if let Err(error) = self.create_workspace_block_image(config, &workspace) {
+            let cleanup =
+                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
+            return Err(with_cleanup(error, &cleanup));
+        }
         let workspace_cloned = true;
         let mut verity_opened = false;
         let mut process = None;
@@ -3918,6 +4118,11 @@ where
                 self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
             return Err(with_cleanup(error, &cleanup));
         }
+        if let Err(error) = self.create_workspace_block_image(config, &workspace) {
+            let cleanup =
+                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
+            return Err(with_cleanup(error, &cleanup));
+        }
         let workspace_cloned = true;
         let mut verity_opened = false;
         let mut process = None;
@@ -4023,6 +4228,11 @@ where
             .filesystem
             .clone_workspace(&config.workspace.source, &workspace)
         {
+            let cleanup =
+                self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
+            return Err(with_cleanup(error, &cleanup));
+        }
+        if let Err(error) = self.create_workspace_block_image(config, &workspace) {
             let cleanup =
                 self.rollback(None, false, true, &workspace, &config.dm_verity.mapper_name);
             return Err(with_cleanup(error, &cleanup));
@@ -4247,6 +4457,10 @@ where
             ("kernel", &config.kernel),
             ("rootfs", &config.rootfs),
             ("dm-verity hash image", &config.verity_hash),
+            (
+                "workspace image formatter",
+                &config.workspace.image.formatter,
+            ),
             ("jailer", &config.jailer),
             ("seccomp filter", &config.isolation.seccomp.filter),
         ] {
@@ -4260,6 +4474,32 @@ where
                 });
             }
         }
+        Ok(())
+    }
+
+    fn create_workspace_block_image(
+        &mut self,
+        config: &RuntimeConfig,
+        workspace: &Path,
+    ) -> Result<(), RuntimeError> {
+        let image = config.workspace.image_path();
+        self.filesystem.create_workspace_image(
+            workspace,
+            &image,
+            config.workspace.image.size_bytes,
+        )?;
+        self.command_runner.run(&CommandSpec::new(
+            &config.workspace.image.formatter.path,
+            [
+                "-F".to_owned(),
+                "-q".to_owned(),
+                "-t".to_owned(),
+                "ext4".to_owned(),
+                "-d".to_owned(),
+                workspace.display().to_string(),
+                image.display().to_string(),
+            ],
+        ))?;
         Ok(())
     }
 
@@ -4384,7 +4624,8 @@ where
     }
 
     fn bind_restored_workspace(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
-        let workspace_path = config.jail_path("workspace clone", &config.workspace.clone_path())?;
+        let workspace_path =
+            config.jail_path("workspace block image", &config.workspace.image_path())?;
         let vsock_path = config.jail_path("vsock UDS", &config.vsock.uds_path)?;
         self.api_call(ApiRequest {
             method: HttpMethod::Patch,
@@ -4445,7 +4686,7 @@ where
                 "{{\"drive_id\":\"workspace\",\"path_on_host\":{},\"is_root_device\":false,\"is_read_only\":false}}",
                 json_string(
                     &config
-                        .jail_path("workspace clone", &config.workspace.clone_path())?
+                        .jail_path("workspace block image", &config.workspace.image_path())?
                         .to_string_lossy()
                 )
             ),
@@ -5227,6 +5468,10 @@ mod tests {
                 source: PathBuf::from("/workspace/source"),
                 clone_root: jail_root.join("workspace"),
                 clone_id: "session-a".to_owned(),
+                image: WorkspaceImageConfig {
+                    formatter: test_artifact("/artifacts/mke2fs"),
+                    size_bytes: 64 * 1024 * 1024,
+                },
             },
             jailer: test_artifact("/artifacts/jailer"),
             jailer_config: JailerConfig {
@@ -5376,6 +5621,18 @@ mod tests {
             Ok(())
         }
 
+        fn create_workspace_image(
+            &mut self,
+            _workspace: &Path,
+            image: &Path,
+            size_bytes: u64,
+        ) -> Result<(), RuntimeError> {
+            self.events
+                .borrow_mut()
+                .push(format!("image:{}:{size_bytes}", image.display()));
+            Ok(())
+        }
+
         fn remove_workspace(&mut self, path: &Path) -> Result<(), RuntimeError> {
             self.events
                 .borrow_mut()
@@ -5503,6 +5760,18 @@ mod tests {
                 .push(format!("clone:{}", destination.display()));
             self.files
                 .insert(self.state_path.clone(), b"state-v2".to_vec());
+            Ok(())
+        }
+
+        fn create_workspace_image(
+            &mut self,
+            _workspace: &Path,
+            image: &Path,
+            size_bytes: u64,
+        ) -> Result<(), RuntimeError> {
+            self.events
+                .borrow_mut()
+                .push(format!("image:{}:{size_bytes}", image.display()));
             Ok(())
         }
 
@@ -5696,6 +5965,24 @@ mod tests {
             "workspace.clone_root",
             |config: &mut RuntimeConfig| {
                 config.workspace.clone_root.push("changed");
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "workspace.image.formatter.path",
+            |config: &mut RuntimeConfig| {
+                config.workspace.image.formatter.path.push("changed");
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "workspace.image.formatter.digest",
+            |config: &mut RuntimeConfig| {
+                config.workspace.image.formatter.digest = sha256(b"changed-workspace-formatter");
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "workspace.image.size_bytes",
+            |config: &mut RuntimeConfig| {
+                config.workspace.image.size_bytes += WORKSPACE_IMAGE_BLOCK_BYTES;
             }
         );
         assert_mutation_changes_fingerprint!("jailer.path", |config: &mut RuntimeConfig| {
@@ -6023,7 +6310,7 @@ mod tests {
             .iter()
             .position(|event| event.contains("firecracker:Patch:/drives/workspace:"))
             .expect("restore must bind the fresh workspace through Firecracker");
-        assert!(events[workspace].contains("\"path_on_host\":\"/workspace/session-a\""));
+        assert!(events[workspace].contains("\"path_on_host\":\"/workspace/session-a.ext4\""));
         let verifies = events
             .iter()
             .enumerate()
@@ -6037,7 +6324,7 @@ mod tests {
         let resources = events
             .iter()
             .position(|event| {
-                event == "firecracker:verify-resources:/workspace/session-a:/run/session-a.vsock:42"
+                event == "firecracker:verify-resources:/workspace/session-a.ext4:/run/session-a.vsock:42"
             })
             .expect("restore must observe the exact Firecracker device bindings");
         assert!(
@@ -6054,24 +6341,24 @@ mod tests {
         let valid = r#"{
             "drives":[
                 {"drive_id":"rootfs","path_on_host":"/dev/rootfs"},
-                {"drive_id":"workspace","path_on_host":"/workspace/session-a"}
+                {"drive_id":"workspace","path_on_host":"/workspace/session-a.ext4"}
             ],
             "vsock":{"guest_cid":42,"uds_path":"/run/session-a.vsock"},
             "machine-config":{"vcpu_count":2}
         }"#;
         verify_exported_restore_resources(
             valid,
-            Path::new("/workspace/session-a"),
+            Path::new("/workspace/session-a.ext4"),
             Path::new("/run/session-a.vsock"),
             42,
         )
         .expect("exact exported resource bindings must verify");
 
-        let wrong_workspace = valid.replace("/workspace/session-a", "/workspace/stale");
+        let wrong_workspace = valid.replace("/workspace/session-a.ext4", "/workspace/stale.ext4");
         assert!(matches!(
             verify_exported_restore_resources(
                 &wrong_workspace,
-                Path::new("/workspace/session-a"),
+                Path::new("/workspace/session-a.ext4"),
                 Path::new("/run/session-a.vsock"),
                 42,
             ),
@@ -6081,7 +6368,7 @@ mod tests {
         assert!(matches!(
             verify_exported_restore_resources(
                 &wrong_vsock,
-                Path::new("/workspace/session-a"),
+                Path::new("/workspace/session-a.ext4"),
                 Path::new("/run/session-a.vsock"),
                 42,
             ),
@@ -6091,7 +6378,7 @@ mod tests {
         assert!(matches!(
             verify_exported_restore_resources(
                 &duplicate_key,
-                Path::new("/workspace/session-a"),
+                Path::new("/workspace/session-a.ext4"),
                 Path::new("/run/session-a.vsock"),
                 42,
             ),

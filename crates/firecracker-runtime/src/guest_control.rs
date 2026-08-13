@@ -248,9 +248,8 @@ impl GuestControlServer {
 
     /// Reads, applies, and writes one request, starting the fixed workload before its success ACK.
     ///
-    /// The callback is invoked only for a committed `start-workload` transition. It may be called
-    /// again after the host loses an acknowledgement, so callers must make it idempotent for this
-    /// guest image. A callback failure is reported as `503` and never acknowledges workload start.
+    /// This compatibility entry point deliberately does not expose identities to an image that
+    /// does not need them. New guest supervisors should use [`Self::serve_once_with_identity`].
     ///
     /// # Errors
     ///
@@ -264,11 +263,42 @@ impl GuestControlServer {
     where
         F: FnOnce() -> io::Result<()>,
     {
+        self.serve_once_with_identity(stream, |_| start_workload())
+    }
+
+    /// Reads, applies, and writes one request while exposing the accepted identity to a fixed workload.
+    ///
+    /// The callback receives only the canonical identity request accepted for the current guest.
+    /// It may be called again after the host loses an acknowledgement, so callers must make it
+    /// idempotent for this guest image. A callback failure is reported as `503` and never
+    /// acknowledges workload start.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GuestControlIoError`] for a transport or malformed HTTP envelope. A workload
+    /// callback failure is returned to the peer as `503 Service Unavailable` instead.
+    pub fn serve_once_with_identity<S: Read + Write, F>(
+        &mut self,
+        stream: &mut S,
+        start_workload: F,
+    ) -> Result<GuestControlHttpResponse, GuestControlIoError>
+    where
+        F: FnOnce(&GuestControlRequest) -> io::Result<()>,
+    {
         let request = read_http_request(stream)?;
         let mut result = self.handle(&request.method, &request.path, &request.body);
-        if result.outcome == Some(GuestControlOutcome::WorkloadStarted) && start_workload().is_err()
-        {
-            result = response(503, String::new(), None);
+        if result.outcome == Some(GuestControlOutcome::WorkloadStarted) {
+            let accepted = match &self.state {
+                GuestControlState::WorkloadStarted(accepted) => accepted,
+                GuestControlState::AwaitingIdentity | GuestControlState::IdentityInjected(_) => {
+                    result = response(503, String::new(), None);
+                    write_http_response(stream, &result)?;
+                    return Ok(result);
+                }
+            };
+            if start_workload(accepted).is_err() {
+                result = response(503, String::new(), None);
+            }
         }
         write_http_response(stream, &result)?;
         Ok(result)
@@ -875,5 +905,31 @@ mod tests {
         assert_eq!(response.status(), 503);
         assert_eq!(response.outcome(), None);
         assert!(response.body().is_empty());
+    }
+
+    #[test]
+    fn workload_callback_receives_only_the_canonical_accepted_identity() {
+        let request = request(91);
+        let body = request.canonical_body();
+        let mut server = GuestControlServer::new();
+        assert_eq!(
+            server
+                .handle(
+                    "PUT",
+                    GuestControlAction::InjectIdentity.path(),
+                    body.as_bytes(),
+                )
+                .status(),
+            200
+        );
+        let input = http_request("PUT", GuestControlAction::StartWorkload.path(), &body);
+        let mut stream = Cursor::new(input);
+        let response = server
+            .serve_once_with_identity(&mut stream, |accepted| {
+                assert_eq!(accepted, &request);
+                Ok(())
+            })
+            .expect("valid workload release must receive an HTTP response");
+        assert_eq!(response.status(), 200);
     }
 }

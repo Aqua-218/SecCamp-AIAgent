@@ -9,8 +9,9 @@
 
 use std::{
     env,
+    fs::File,
     io::{Read, Write},
-    os::fd::{FromRawFd, OwnedFd},
+    os::fd::{FromRawFd, IntoRawFd, OwnedFd},
 };
 
 use authority_core::http::{CanonicalHost, CanonicalUrlPath, HttpFetchMethod, HttpFetchRequest};
@@ -72,22 +73,12 @@ fn run() -> Result<(), String> {
     )
     .map_err(|error| format!("framing fixed probe request: {error}"))?;
 
-    let mut socket = open_transport(transport)?;
-    socket
-        .set_read_timeout(Some(std::time::Duration::from_secs(
-            RESPONSE_TIMEOUT_SECONDS,
-        )))
-        .map_err(|error| format!("setting read timeout: {error}"))?;
-    socket
-        .set_write_timeout(Some(std::time::Duration::from_secs(
-            RESPONSE_TIMEOUT_SECONDS,
-        )))
-        .map_err(|error| format!("setting write timeout: {error}"))?;
-    socket
+    let mut channel = File::from(open_transport(transport)?);
+    channel
         .write_all(&frame.encode())
         .map_err(|error| format!("writing fixed probe frame: {error}"))?;
 
-    let response = read_response(&mut socket)?;
+    let response = read_response(&mut channel)?;
     if response.request() != PROBE_REQUEST {
         return Err("host response did not bind the fixed probe request".to_owned());
     }
@@ -117,7 +108,7 @@ fn parse_transport(mut arguments: impl Iterator<Item = String>) -> Result<Transp
     Ok(Transport::DirectVsock(port))
 }
 
-fn open_transport(transport: Transport) -> Result<Socket, String> {
+fn open_transport(transport: Transport) -> Result<OwnedFd, String> {
     match transport {
         Transport::DirectVsock(port) => {
             let socket = Socket::new(Domain::VSOCK, Type::STREAM, None)
@@ -125,7 +116,18 @@ fn open_transport(transport: Transport) -> Result<Socket, String> {
             socket
                 .connect(&SockAddr::vsock(VMADDR_CID_HOST, port))
                 .map_err(|error| format!("connecting to host AF_VSOCK port {port}: {error}"))?;
-            Ok(socket)
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(
+                    RESPONSE_TIMEOUT_SECONDS,
+                )))
+                .map_err(|error| format!("setting direct Broker read timeout: {error}"))?;
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(
+                    RESPONSE_TIMEOUT_SECONDS,
+                )))
+                .map_err(|error| format!("setting direct Broker write timeout: {error}"))?;
+            // SAFETY: `into_raw_fd` transfers this socket's unique descriptor ownership.
+            Ok(unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) })
         }
         Transport::Inherited => {
             let descriptor = env::var(EGRESS_BROKER_FD_ENV)
@@ -142,7 +144,7 @@ fn open_transport(transport: Transport) -> Result<Socket, String> {
             // nonstandard descriptor. This process receives its own descriptor table entry, so
             // taking ownership closes only the workload's endpoint.
             let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
-            Ok(Socket::from(descriptor))
+            Ok(descriptor)
         }
     }
 }
@@ -172,16 +174,16 @@ fn broker_session_from_environment() -> Result<BrokerSessionId, String> {
     Ok(BrokerSessionId::new(bytes))
 }
 
-fn read_response(socket: &mut Socket) -> Result<CanonicalBrokerResponse, String> {
+fn read_response(channel: &mut File) -> Result<CanonicalBrokerResponse, String> {
     let mut prefix = [0_u8; CONTROL_FRAME_LENGTH_PREFIX_BYTES];
-    socket
+    channel
         .read_exact(&mut prefix)
         .map_err(|error| format!("reading response frame prefix: {error}"))?;
     let length = ValidatedFrameLength::from_network_prefix(prefix)
         .map_err(|error| format!("validating response frame length: {error}"))?
         .as_usize();
     let mut payload = vec![0_u8; length];
-    socket
+    channel
         .read_exact(&mut payload)
         .map_err(|error| format!("reading response frame payload: {error}"))?;
     CanonicalBrokerResponse::decode(&payload)

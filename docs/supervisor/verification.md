@@ -6,7 +6,7 @@
 
 > **対象読者:** supervisor の実装者、レビュー担当者、統合 test を書く人
 
-この crate の test は 2 種類ある。lifecycle と認可の contract test は `CapabilityKernel`（本物）と `FakeResources`（event log）と `StaticCallerResolver`（in-memory map）を組み合わせ、実 syscall を出さない。control socket の module test だけが実 `SOCK_SEQPACKET` socket と実 `SO_PEERCRED` を使う。
+この crate の test は 2 種類ある。lifecycle と認可の contract test は `CapabilityKernel`（本物）と `FakeResources`（event log）と `StaticCallerResolver`（in-memory map）を組み合わせ、実 syscall を出さない。control socket と Linux host resource の module test は、実 `SOCK_SEQPACKET` socket、実 `SO_PEERCRED`、実 cgroup v2、実 process を使う。cgroup v2 が書けない host では後者だけ skip する。
 
 ## local test で確認したこと
 
@@ -34,9 +34,45 @@ control socket は実 socket に対して確認する。
 | 相対 path と root path を bind しない | `listener_rejects_paths_it_cannot_own` |
 | bind 直後の socket node が mode 0600 である | `bound_socket_is_owner_only` |
 
+実 Linux resource は実 cgroup v2 と実 process に対して確認する。
+
+| 境界 | test |
+|---|---|
+| workload が cgroup に閉じ込められ、停止で子孫ごと消える | `a_confined_workload_is_stopped_with_every_descendant` |
+| 1 subject が持てる cgroup と control socket は 1 つずつで、解放は idempotent | `one_subject_owns_at_most_one_cgroup_and_control_socket` |
+| 他 subject の token で workload を起動できない | `a_workload_cannot_borrow_another_subjects_tokens` |
+| directory を抜け出せる subject 名を拒否する | `subject_names_that_could_escape_their_directory_are_refused` |
+| handle は subject ごとに追跡され、close は idempotent | `handles_are_tracked_per_subject_and_close_is_idempotent` |
+| 設定した directory が実在しなければ構築を拒否する | `host_config_requires_existing_owned_directories` |
+
+返信の形式も固定してある。
+
+| 境界 | test |
+|---|---|
+| 全 response が bounded encoding を round trip する | `every_response_round_trips_through_the_bounded_encoding` |
+| 壊れた response を推測せず拒否する | `malformed_responses_are_rejected_rather_than_guessed` |
+| response が guest の学べる識別子を運ばない | `a_response_never_carries_an_identifier_a_guest_could_learn_from` |
+| 返信が 1 datagram として peer へ届く | `a_reply_reaches_the_peer_as_one_bounded_datagram` |
+
 spoof の test には注意点がある。詐称した `CloseHandle` は**拒否されるのではなく、caller 自身の handle を閉じる**。claim が捨てられることを示しているのであって、詐称に対する error 経路が存在するわけではない。
 
 `authenticated_foreign_subject_cannot_close_another_subjects_handle` は直接 API を呼ぶ。`dispatch_wire` は経由しない。`resources.close_handle` が呼ばれなかったことも assert していない。
+
+### 拒否経路の test
+
+| 対象 | test |
+|---|---|
+| `ConnectionNotBoundToSubject` | `a_second_connection_bound_to_one_subject_cannot_act_as_it` |
+| `CallerBindingError` | `an_unbound_connection_reaches_no_authority_operation` |
+| `GrantSubjectMismatch` | `issue_root_refuses_a_grant_naming_another_subject` |
+| `DuplicateSubject` | `the_same_subject_id_cannot_be_created_twice` |
+| 親の gate | `a_child_cannot_be_created_under_a_parent_that_is_not_running` |
+| `derive` の拒否 | `derive_requires_a_running_caller_and_a_capability_it_holds` |
+
+いずれも「adapter に届く前に落ちる」ことまで確認する。resource の event log が拒否前後で変わらないことを assert しているので、検査だけ通って副作用が残る形にはならない。
+
+`derive` の grant 対象検査が無いこと自体は依然として意図された契約であり、test はその非対称を固定していない。
+
 
 ## 実行コマンド
 
@@ -53,8 +89,8 @@ cargo clippy --manifest-path crates/supervisor/Cargo.toml --all-targets -- -D wa
 | 本来の依存 | 代替 | 省いていること |
 |---|---|---|
 | `RuntimeResources` | `FakeResources`（`Vec<&'static str>` の event log） | namespace、cgroup、mount、descriptor の実操作。process が止まったこと、mount が消えたことは一切示さない |
-| `CallerResolver` | `StaticCallerResolver`（in-memory map） | `SO_PEERCRED` / `SCM_CREDENTIALS`、実 socket の identity |
-| transport | 無し | 実 `SOCK_SEQPACKET` listener、guest との接続 |
+| `CallerResolver` | `StaticCallerResolver`（in-memory map） | lifecycle test の中でだけ。production 経路は `SubjectCredentialResolver` が実 `SO_PEERCRED` を使う |
+| transport | lifecycle test では無し | lifecycle test は listener を経由しない。listener 自体は別 test で実 socket に対して検証している |
 
 event の順序 assertion が示すのは呼び出し順だけ。副作用は示さない。
 
@@ -62,12 +98,6 @@ event の順序 assertion が示すのは呼び出し順だけ。副作用は示
 
 | 対象 | 何が未検証か |
 |---|---|
-| `ConnectionNotBoundToSubject` | 2 つの connection を 1 subject に bind し、誤った channel から呼ぶ経路 |
-| `CallerBindingError` | 未 bind の connection から `dispatch_wire` / `derive` / `open_handle` / `close_handle` を呼ぶ経路 |
-| `GrantSubjectMismatch` | `issue_root` に別 subject の grant を渡す経路 |
-| `DuplicateSubject` | 同じ `SubjectId` で 2 回 `create_subject` を呼ぶ経路 |
-| 親の gate | `Creating` / `Closing` / `Closed` / 未知の親。Running の成功経路しか通っていない |
-| `derive` | 拒否経路が 1 つも無い。`Closing` の caller、親を持たない caller、grant の対象検査が無いことの影響 |
 | `revoke` の所有権 | caller と lifecycle は test 済み。対象 capability を caller が保持しているかは検査も test も無い |
 | `CleanupStep::BeginClose` / `FinishClose` | kernel が `finish_subject_close` を拒否する経路、および `begin_subject_close` の `?` で subject が非 Running のまま止まる経路 |
 | cleanup 失敗の形 | `stop_workload` 失敗、`remove_cgroup` 失敗、shutdown 中の `close_handle` 失敗、複数 phase の同時失敗 |

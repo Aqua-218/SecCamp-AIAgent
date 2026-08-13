@@ -31,6 +31,13 @@ enum WorkspaceImageState {
     Created,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceBlockDeviceState {
+    NeverBound,
+    Bound,
+    Released,
+}
+
 /// The exact binding retained after the orchestrator prepares a workspace.
 struct PreparedWorkspace {
     session_id: crate::SessionId,
@@ -40,6 +47,7 @@ struct PreparedWorkspace {
     destination: PathBuf,
     runtime_claimed: bool,
     runtime_image: WorkspaceImageState,
+    runtime_block_device: WorkspaceBlockDeviceState,
     runtime_released: bool,
     orchestrator_released: bool,
 }
@@ -70,6 +78,39 @@ pub struct FirecrackerWorkspaceBackendFactory<F> {
 
 /// Short name for [`FirecrackerWorkspaceBackendFactory`].
 pub type FirecrackerWorkspaceFactory<F> = FirecrackerWorkspaceBackendFactory<F>;
+
+fn workspace_id_for_block_device<F>(
+    state: &SharedWorkspaceState<F>,
+    source: &Path,
+    jailed_device: &Path,
+) -> Result<crate::WorkspaceId, RuntimeError> {
+    let record = state
+        .prepared
+        .values()
+        .find(|record| {
+            record.runtime_claimed
+                && !record.runtime_released
+                && !record.orchestrator_released
+                && record.session_jail_root.join("dev/rootfs") == jailed_device
+        })
+        .ok_or_else(|| {
+            runtime_workspace_error(
+                "block-device operation is not bound to the active session jail",
+            )
+        })?;
+    let expected_mapper_suffix = format!("-{}", record.workspace_id);
+    let mapper_is_session_bound = source.parent() == Some(Path::new("/dev/mapper"))
+        && source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&expected_mapper_suffix));
+    if !mapper_is_session_bound {
+        return Err(runtime_workspace_error(
+            "block-device mapper is not bound to the active workspace identity",
+        ));
+    }
+    Ok(record.workspace_id)
+}
 
 impl<F> FirecrackerWorkspaceBackendFactory<F> {
     /// Creates a factory around one filesystem, source path, Firecracker jail root, and template
@@ -196,6 +237,7 @@ where
                 destination,
                 runtime_claimed: false,
                 runtime_image: WorkspaceImageState::NotCreated,
+                runtime_block_device: WorkspaceBlockDeviceState::NeverBound,
                 runtime_released: false,
                 orchestrator_released: false,
             },
@@ -270,35 +312,72 @@ where
         state.filesystem.read(path)
     }
 
+    fn bind_block_device(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
+        let workspace_id = workspace_id_for_block_device(&state, source, jailed_device)?;
+        let record = state.prepared.get(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared while binding its block device")
+        })?;
+        if record.runtime_image != WorkspaceImageState::Created {
+            return Err(runtime_workspace_error(
+                "block-device binding requires the claimed workspace image",
+            ));
+        }
+        if record.runtime_block_device != WorkspaceBlockDeviceState::NeverBound {
+            return Err(runtime_workspace_error(
+                "block-device binding was already consumed by this Runtime claim",
+            ));
+        }
+        state.filesystem.bind_block_device(source, jailed_device)?;
+        let record = state.prepared.get_mut(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared after binding its block device")
+        })?;
+        record.runtime_block_device = WorkspaceBlockDeviceState::Bound;
+        Ok(())
+    }
+
+    fn unbind_block_device(
+        &mut self,
+        source: &Path,
+        jailed_device: &Path,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
+        let workspace_id = workspace_id_for_block_device(&state, source, jailed_device)?;
+        let record = state.prepared.get(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared while unbinding its block device")
+        })?;
+        if record.runtime_block_device != WorkspaceBlockDeviceState::Bound {
+            return Err(runtime_workspace_error(
+                "block-device unbinding requires the exact live Runtime binding",
+            ));
+        }
+        state
+            .filesystem
+            .unbind_block_device(source, jailed_device)?;
+        let record = state.prepared.get_mut(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared after unbinding its block device")
+        })?;
+        record.runtime_block_device = WorkspaceBlockDeviceState::Released;
+        Ok(())
+    }
+
     fn verify_block_device_binding(
         &mut self,
         source: &Path,
         jailed_device: &Path,
     ) -> Result<(), RuntimeError> {
         let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
-        let record = state
-            .prepared
-            .values()
-            .find(|record| {
-                record.runtime_claimed
-                    && !record.runtime_released
-                    && !record.orchestrator_released
-                    && record.session_jail_root.join("dev/rootfs") == jailed_device
-            })
-            .ok_or_else(|| {
-                runtime_workspace_error(
-                    "block-device verification is not bound to the active session jail",
-                )
-            })?;
-        let expected_mapper_suffix = format!("-{}", record.workspace_id);
-        let mapper_is_session_bound = source.parent() == Some(Path::new("/dev/mapper"))
-            && source
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(&expected_mapper_suffix));
-        if !mapper_is_session_bound {
+        let workspace_id = workspace_id_for_block_device(&state, source, jailed_device)?;
+        let record = state.prepared.get(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared while verifying its block device")
+        })?;
+        if record.runtime_block_device != WorkspaceBlockDeviceState::Bound {
             return Err(runtime_workspace_error(
-                "block-device mapper is not bound to the active workspace identity",
+                "block-device verification requires the exact live Runtime binding",
             ));
         }
         state
@@ -411,6 +490,11 @@ where
         if record.runtime_released {
             return Ok(());
         }
+        if record.runtime_block_device == WorkspaceBlockDeviceState::Bound {
+            return Err(runtime_workspace_error(
+                "remove_workspace cannot release a live block-device binding",
+            ));
+        }
 
         // The orchestrator owns physical deletion. Runtime cleanup only records
         // that the Runtime side released its claim, so it cannot delete a path
@@ -469,7 +553,9 @@ mod tests {
         clones: Vec<(PathBuf, PathBuf)>,
         images: Vec<(PathBuf, PathBuf, u64)>,
         reads: Vec<PathBuf>,
+        block_device_binds: Vec<(PathBuf, PathBuf)>,
         block_bindings: Vec<(PathBuf, PathBuf)>,
+        block_device_unbinds: Vec<(PathBuf, PathBuf)>,
         removals: Vec<PathBuf>,
         remove_failures: VecDeque<bool>,
     }
@@ -519,6 +605,32 @@ mod tests {
                 .expect("fake state must not be poisoned")
                 .images
                 .push((workspace.to_owned(), image.to_owned(), size_bytes));
+            Ok(())
+        }
+
+        fn bind_block_device(
+            &mut self,
+            source: &Path,
+            jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            self.state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .block_device_binds
+                .push((source.to_owned(), jailed_device.to_owned()));
+            Ok(())
+        }
+
+        fn unbind_block_device(
+            &mut self,
+            source: &Path,
+            jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            self.state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .block_device_unbinds
+                .push((source.to_owned(), jailed_device.to_owned()));
             Ok(())
         }
 
@@ -733,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn block_device_verification_is_session_bound_and_forwarded_exactly() {
+    fn block_device_lifecycle_is_session_bound_and_forwarded_exactly() {
         let state = Arc::new(Mutex::new(FakeState::default()));
         let (mut backend, mut runtime_filesystem) = adapters(Arc::clone(&state));
         let session = identity(0x11, 0xab);
@@ -759,12 +871,12 @@ mod tests {
 
         assert!(
             runtime_filesystem
-                .verify_block_device_binding(&mapper, &foreign_device)
+                .bind_block_device(&mapper, &foreign_device)
                 .is_err()
         );
         assert!(
             runtime_filesystem
-                .verify_block_device_binding(
+                .bind_block_device(
                     Path::new("/dev/mapper/rootfs-verity-foreign"),
                     &jailed_device
                 )
@@ -774,19 +886,71 @@ mod tests {
             state
                 .lock()
                 .expect("fake state must not be poisoned")
-                .block_bindings
+                .block_device_binds
                 .is_empty(),
-            "cross-session bindings must not reach the production filesystem boundary"
+            "cross-session bind operations must not reach the production filesystem boundary"
+        );
+
+        assert!(
+            runtime_filesystem
+                .verify_block_device_binding(&mapper, &jailed_device)
+                .is_err(),
+            "verification must not accept an unbound target"
+        );
+        runtime_filesystem
+            .create_workspace_image(
+                &destination,
+                &destination.with_extension("ext4"),
+                64 * 1024 * 1024,
+            )
+            .expect("exact workspace image must precede the block binding");
+        runtime_filesystem
+            .bind_block_device(&mapper, &jailed_device)
+            .expect("the exact session block device must be delegated once");
+        assert!(
+            runtime_filesystem
+                .bind_block_device(&mapper, &jailed_device)
+                .is_err(),
+            "one Runtime claim cannot bind its device twice"
         );
 
         runtime_filesystem
             .verify_block_device_binding(&mapper, &jailed_device)
             .expect("the exact session block binding must be delegated");
+        runtime_filesystem
+            .unbind_block_device(&mapper, &jailed_device)
+            .expect("the exact session block device must be released once");
+        assert!(
+            runtime_filesystem
+                .verify_block_device_binding(&mapper, &jailed_device)
+                .is_err(),
+            "verification must reject an already released target"
+        );
+        assert!(
+            runtime_filesystem
+                .unbind_block_device(&mapper, &jailed_device)
+                .is_err(),
+            "one Runtime claim cannot release its device twice"
+        );
+        assert_eq!(
+            state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .block_device_binds,
+            [(mapper.clone(), jailed_device.clone())]
+        );
         assert_eq!(
             state
                 .lock()
                 .expect("fake state must not be poisoned")
                 .block_bindings,
+            [(mapper.clone(), jailed_device.clone())]
+        );
+        assert_eq!(
+            state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .block_device_unbinds,
             [(mapper, jailed_device)]
         );
     }

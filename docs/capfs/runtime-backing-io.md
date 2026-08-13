@@ -12,7 +12,7 @@
 
 ## 起動時検査だけでは足りない
 
-[Backing repository の事前検証](backing-preflight.md)は、起動時点で tree が link-free であることを確認する。しかしそれは起動時点の話である。
+[Backing repository の事前検証](backing-preflight.md)は、起動時点の tree を確認する。しかしそれは起動時点の話である。
 
 ```text
 preflight: <repo>/notes.txt は regular file、nlink == 1

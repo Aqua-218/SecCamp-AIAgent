@@ -879,7 +879,10 @@ impl CapfsHostResources for LinuxHostResources {
             .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            // The fixed guest workload has neither host credentials nor a host-controlled command
+            // line. Retaining only stderr makes isolated startup failures observable on the guest
+            // serial console without turning normal workload output into a host data channel.
+            .stderr(Stdio::inherit());
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {

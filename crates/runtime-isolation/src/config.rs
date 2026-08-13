@@ -86,6 +86,40 @@ impl ControlChannelConfig {
     }
 }
 
+/// An already-connected guest-to-host Broker channel kept for the workload.
+///
+/// The guest supervisor creates this `AF_VSOCK` `SOCK_STREAM` descriptor before namespace setup
+/// and gives its number to the fixed workload through an allowlisted environment variable.
+/// Retaining this one pre-connected channel lets the workload use the closed Broker protocol
+/// without gaining permission to create or connect arbitrary sockets after seccomp is installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EgressChannelConfig {
+    fd: RawFd,
+}
+
+impl EgressChannelConfig {
+    /// Describes the nonstandard inherited Broker descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IsolationError::InvalidConfig`] when `fd` overlaps standard input, output, or
+    /// error.
+    pub fn new(fd: RawFd) -> Result<Self, IsolationError> {
+        if fd < 3 {
+            return Err(InvalidConfig::message(
+                "the egress Broker channel must not use a standard descriptor",
+            ));
+        }
+        Ok(Self { fd })
+    }
+
+    /// Returns the descriptor that the workload inherits.
+    #[must_use]
+    pub const fn fd(self) -> RawFd {
+        self.fd
+    }
+}
+
 /// A bounded writable tmpfs mount.
 #[derive(Clone, Debug)]
 pub struct TmpfsConfig {
@@ -182,6 +216,7 @@ pub struct IsolationConfig {
     pub(crate) seccomp: SeccompPolicy,
     pub(crate) identity: IdentityMap,
     pub(crate) control_channel: Option<ControlChannelConfig>,
+    pub(crate) egress_channel: Option<EgressChannelConfig>,
 }
 
 impl IsolationConfig {
@@ -204,6 +239,7 @@ impl IsolationConfig {
             seccomp,
             identity,
             control_channel: None,
+            egress_channel: None,
         }
     }
 
@@ -211,6 +247,13 @@ impl IsolationConfig {
     #[must_use]
     pub fn with_control_channel(mut self, control_channel: ControlChannelConfig) -> Self {
         self.control_channel = Some(control_channel);
+        self
+    }
+
+    /// Retains the fixed preconnected Broker channel across isolation and `exec`.
+    #[must_use]
+    pub fn with_egress_channel(mut self, egress_channel: EgressChannelConfig) -> Self {
+        self.egress_channel = Some(egress_channel);
         self
     }
 
@@ -265,7 +308,7 @@ impl IsolationConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::ControlChannelConfig;
+    use super::{ControlChannelConfig, EgressChannelConfig};
 
     #[test]
     fn refuses_control_channel_descriptors_that_overlap_standard_io() {
@@ -281,6 +324,17 @@ mod tests {
                 .expect("another nonstandard descriptor must be accepted")
                 .fd(),
             4
+        );
+    }
+
+    #[test]
+    fn refuses_egress_channel_descriptors_that_overlap_standard_io() {
+        assert!(EgressChannelConfig::new(2).is_err());
+        assert_eq!(
+            EgressChannelConfig::new(3)
+                .expect("the first nonstandard descriptor must be accepted")
+                .fd(),
+            3
         );
     }
 }

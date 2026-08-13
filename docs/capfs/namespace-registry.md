@@ -39,9 +39,11 @@ next_object_sequence : 次に割り当てる単調な ObjectId sequence
 generation  : namespace変更ごとに増える単調なversion
 ```
 
-`NamespaceObject` は現在の `CanonicalPath`、directory / regular file の種別、live handle数を持つ。初期実装ではsymlink、hard link、deviceなどを型に入れていない。
+`NamespaceObject` は自分を指す `CanonicalPath` の**集合**、directory / regular file / symlink の種別、symlinkならtarget、live handle数を持つ。deviceなどは型に入れていない。
 
-`objects` と `paths` は同じ関係を逆向きに引くindexである。生きているobjectにはpathがちょうど1つあり、生きているpathにもobjectがちょうど1つある。数学的には、live objectとlive pathの間の一対一対応を維持している。
+path集合は最小のpath（`primary_path`）と残りのalias listに分けて持つ。「生きているobjectは必ず名前を1つ以上持つ」がこれで型の性質になり、registryが覚える規則ではなくなる。**認可は`paths()`の全要素に対して行う。`primary_path`は backing I/O と診断のためのものであり、認可に使ってはならない**（[ADR 0017](../decisions/0017-authorize-an-aliased-inode-on-every-name.md)）。
+
+`objects` と `paths` は同じ関係を逆向きに引くindexである。生きているpathにはobjectがちょうど1つあり、生きているobjectには**1つ以上**のpathがある。複数になるのはhard linkを持つregular fileとsymlinkだけで、directoryは常に1つである。
 
 この対応があることで、次を拒否できる。
 
@@ -111,7 +113,9 @@ executorがpanicした場合はwriter lockがpoisonされる。その後のlooku
 
 renameはsource subtree内を調べ、1件でもlive handleがあればexecutorを呼ばず`OpenHandleInSubtree`で拒否する。removeも対象にlive handleがあれば拒否し、directoryにchildが残っていれば`DirectoryNotEmpty`で拒否する。
 
-これにより初期実装では、rename / unlink後にpathを失ったinodeをopen fdだけで使い続ける状態を作らない。POSIX互換性より「live objectは必ず1つのcanonical pathを持つ」という認可上の単純さを優先している。
+これにより、rename / unlink後にpathを失ったinodeをopen fdだけで使い続ける状態を作らない。POSIX互換性より「live objectは必ずcanonical pathを持つ」という認可上の単純さを優先している。
+
+名前が2つ以上あるobjectから1つを消す場合は、inodeが名前を失わないのでこの制限は掛からない。open handleがあっても消せる。最後の名前を消すときだけ`EBUSY`になる。
 
 Direct-I/O FUSE adapterは、fileとdirectoryのopen時にnamespace open countとAuthority coreのsubject-boundな`OpenHandle` recordを同じobjectへ登録する。片方の登録や認可に失敗すればcountをrollbackし、releaseでは両方を閉じる。adapterはlocal handle table、namespace、Capability kernelの順にlockを取得し、全経路で順序を統一している。既存fileへのread / write / metadata変更、`CREATE` / `MKDIR`、`UNLINK` / `RMDIR`、no-replace `RENAME`はこの境界に載っている。
 
@@ -149,6 +153,10 @@ renameには`rename_child`を使う。source parent / nameとdestination parent 
 - child creationがwriter lock内の現在parent pathを使い、`CREATE`用の初期open count 1をclose前のremoveから守ること。
 - child removalとrenameが両parentの現在pathを使い、rename planがobject kindを保つこと。
 - subtree renameが全descendant pathを同じsuffixのまま移すこと。
+- `link_child`がregular fileとsymlinkに名前を足し、directoryには足せないこと。
+- 名前を1つ消してもobjectが生き、最後の名前を消したときだけretireされること。
+- subtree renameがsubtree内のpathだけを動かし、外にあるaliasを同じobjectに残すこと。
+- repository外へ解決されるsymlinkをexecutor呼び出し前に拒否すること。
 - no-replace、root変更、source subtree内へのrenameの拒否。
 - open handleがrename / removeを止め、open / close失敗時にcountがrollbackされること。
 - read operationが終わるまで並行renameのwrite lockが進まないこと。

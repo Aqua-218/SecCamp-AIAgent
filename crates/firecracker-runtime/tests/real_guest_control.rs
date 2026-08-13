@@ -413,6 +413,7 @@ fn real_firecracker_guest_cgroup_v2_exposes_required_controllers() {
     let firecracker = required_path("REAL_FIRECRACKER_BIN");
     let kernel = required_path("REAL_FIRECRACKER_KERNEL");
     let rootfs = required_path("REAL_FIRECRACKER_ROOTFS");
+    let workspace = required_path("REAL_FIRECRACKER_WORKSPACE");
     let vm = RealFirecracker::start(&firecracker);
     let mut api = UnixApiClient::new(vm.api_socket()).expect("real API path must be valid");
     let vsock = vm.vsock_socket();
@@ -422,7 +423,7 @@ fn real_firecracker_guest_cgroup_v2_exposes_required_controllers() {
         &kernel,
         &rootfs,
         GuestWorkload::CgroupProbe,
-        None,
+        Some(&workspace),
     );
 
     wait_for_guest_vsock(&vsock);

@@ -36,7 +36,7 @@
 | **Capability** | authority body に typed metadata と有効期間を付けた `Capability`。実際に保持・委譲されるのはこの単位 |
 | **委譲 (delegation)** | 親 Capability から、親を越えない子を導出すること |
 | **`weakerThan` / `below`** | 子が親を越えないことの構造判定。3 軸をそれぞれ比較する |
-| **`FileEffect`** | file 操作の効果。`ReadData`、`ListDirectory`、`WriteData`、`Truncate`、`CreateFile`、`CreateDirectory`、`RemoveFile`、`RemoveDirectory`、`Rename`、`SetMetadata` の 10 種 |
+| **`FileEffect`** | file 操作の効果。`ReadData`、`ListDirectory`、`WriteData`、`Truncate`、`CreateFile`、`CreateDirectory`、`RemoveFile`、`RemoveDirectory`、`Rename`、`SetMetadata`、`ReadLink`、`CreateSymlink`、`CreateHardLink` の 13 種 |
 | **`FileEffects`** | `FileEffect` の集合。Rust は private な `u16` bitset、Lean は membership 関数として持つ |
 | **`RepoId`** | repository の identity。比較は exact equality だけで、前方一致や包含を持たない |
 | **`SubjectId`** | 権限を保持する主体の identity。host が割り当てる |
@@ -72,7 +72,7 @@
 
 | 語 | 定義 |
 |---|---|
-| **backing repository** | 実体を持つ workspace tree。startup 前に link-free であることを検査する |
+| **backing repository** | 実体を持つ workspace tree。startup 前に object の種類、symlink target、hard link の名前集合を検査する |
 | **root fd** | backing repository の root directory を指す file descriptor。以降の I/O は全てこれを起点にする |
 | **`ObjectId`** | 共有 namespace 内の object identity。path から独立し、再利用しない |
 | **`NamespaceGeneration`** | 共有 namespace の path mapping の単調な version。`initial()` が `0` |

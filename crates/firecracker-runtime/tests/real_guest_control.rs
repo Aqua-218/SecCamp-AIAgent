@@ -57,6 +57,13 @@ enum GuestWorkload {
 }
 
 impl GuestWorkload {
+    const fn program(self) -> &'static str {
+        match self {
+            Self::Sleep | Self::BrokerProbe => "/usr/local/libexec/guest-workload",
+            Self::RuntimeBrokerProbe => "/usr/local/libexec/guest-supervisor-init",
+        }
+    }
+
     const fn arguments(self) -> &'static str {
         match self {
             Self::Sleep => "sleep 600",
@@ -217,8 +224,9 @@ fn configure_and_start_real_vm(
         api,
         "/boot-source",
         format!(
-            r#"{{"kernel_image_path":"{}","boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/usr/local/libexec/guest-control-init -- --port {GUEST_CONTROL_PORT} --workload /usr/local/libexec/guest-workload {}"}}"#,
+            r#"{{"kernel_image_path":"{}","boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/usr/local/libexec/guest-control-init -- --port {GUEST_CONTROL_PORT} --workload {} {}"}}"#,
             kernel.display(),
+            workload.program(),
             workload.arguments(),
         ),
     );

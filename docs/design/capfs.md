@@ -63,15 +63,15 @@ flowchart LR
 
 ## 現在の実装位置
 
-[`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) に起動時の backing repository 検査、[`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) にVM共通の link-free namespace registry、[`crates/capfs/src/node.rs`](../../crates/capfs/src/node.rs) にsubject mountごとのnode table、[`crates/capfs/src/runtime.rs`](../../crates/capfs/src/runtime.rs)と[`crates/capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs)にDirect-I/O FUSE adapterを実装している。
+[`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) に起動時の backing repository 検査、[`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) にVM共通のnamespace registry、[`crates/capfs/src/node.rs`](../../crates/capfs/src/node.rs) にsubject mountごとのnode table、[`crates/capfs/src/runtime.rs`](../../crates/capfs/src/runtime.rs)と[`crates/capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs)にDirect-I/O FUSE adapterを実装している。
 
 - root を symlink follow なしで開き、mount ID と inode の再照合後に directory fd を保持する。
-- `statx` と `openat2` による fd-relative scan で symlink、hard link、special file、nested mount を拒否する。
+- `statx` と `openat2` による fd-relative scan で special file と nested mount を拒否し、symlink の target を検証し、hard link の名前が全て repository 内にあることを確認する。
 - UTF-8・canonical segment、entry 数、depth を検査し、path 順の初期 manifest を作る。
 - manifest全件へpath非依存の`ObjectId`を割り当て、root fdと完成したregistryを`ImportedRepository`で一緒に所有する。cloneしたmountは同じshared stateを参照する。
 - host-assigned `RepoId`も`ImportedRepository`へ束ね、mount authorityとidentityが違うbacking接続をconstructorで拒否する。
 
-- `ObjectId -> NamespaceObject` と `CanonicalPath -> ObjectId` を同じ lock 内で管理する。
+- `ObjectId -> NamespaceObject` と `CanonicalPath -> ObjectId` を同じ lock 内で管理する。object は自分を指す path の集合と、symlink なら target を持つ。
 - create、remove、subtree rename が成功したときだけ `namespace_generation` を進める。
 - `ObjectId` は remove 後も再利用せず、rename 先は no-replace とする。
 - subtree に open handle が1件でもあれば rename / remove executor を呼ばない。
@@ -83,63 +83,58 @@ flowchart LR
 - stale node、過剰FORGET、counter / sequence枯渇、lock poison、index不一致をfail closedで拒否する。
 - nodeidはsubject mount内だけのidentityとし、VM共通のpath解決には`ObjectId`を使う。
 
-- `LOOKUP`と`GETATTR`はCapabilityの許可範囲またはその祖先だけをzero TTLで公開する。
+- `LOOKUP`と`GETATTR`はCapabilityの許可範囲またはその祖先だけを公開する。attribute TTLは有限値で、revokeが返る前に強制無効化される。
 - `OPEN`はaccess modeを`ReadData` / `WriteData`の単一または複合認可へ変換する。writableな`O_TRUNC`には`Truncate`も同じ複合認可へ加える。`SETATTR`のsizeは`Truncate`、ordinary modeまたはatime/mtimeは`SetMetadata`を現在pathで再認可する。`CREATE`は`CreateFile`と返却handleのaccess effectを複合認可し、`MKDIR`は`CreateDirectory`を認可してから現在のparent pathの直下へno-replace作成する。`UNLINK`、`RMDIR`、`RENAME`も現在のchild / subtree全pathに対応effectを要求する。毎回の`READ` / `WRITE`はnamespace上の現在pathに対して対応effectを再認可する。
-- regular fileは`FOPEN_DIRECT_IO`で開き、revoke後のreadがpage cacheを迂回しないようにする。
-- runtime metadata/open/read/writeはroot fdから`openat2`で解決し、symlink、mount越境、hard linkの出現をfail closedで拒否する。
+- regular fileはOSのpage cacheを使って開き、revokeが返る前に`RevocationObserver`がその全nodeidのcached pageとcached attributeを破棄する。revoke後のreadはcacheから答えられず`capfs`へ戻る。`FOPEN_KEEP_CACHE`、`FUSE_WRITEBACK_CACHE`、shared writable `mmap`は使わない。
+- runtime metadata/open/read/writeはroot fdから`openat2`で解決し、path途中のsymlink、mount越境、registryが知らない名前の出現をfail closedで拒否する。
 - FUSE handle、namespace open count、Authority open handleを同じ`ObjectId`へ結び、`RELEASE`で一緒に閉じる。
 
-詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。initial link-free file modelの全10 `FileEffect`はFUSE operationへ接続済みである。directory streamはopen時のgenerationを保持し、途中でnamespaceが変われば`EAGAIN`を返してcookieの再利用を止める。
+詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。全13 `FileEffect`はFUSE operationへ接続済みである。directory streamはopen時のgenerationを保持し、途中でnamespaceが変われば`EAGAIN`を返してcookieの再利用を止める。
 
 namespace writer lockとCapability kernelのshared / exclusive guardを組み合わせたbounded
 競合契約を[`crates/capfs/tests/concurrency.rs`](../../crates/capfs/tests/concurrency.rs)で
 実行する。write中のrevoke、open / close、rename、unlinkを32 round走らせ、writeのcommitが
 revoke returnを越えないこと、revoke後のmutationがbacking executorへ入らないこと、open
 count・authority handle・namespace pathのrollback / publishとcommitted effect数が一致することを確認する。
-これはinitial link-free modelのunit境界を閉じる検査であり、実FUSE kernelの複数thread
+これはunit境界を閉じる検査であり、実FUSE kernelの複数thread
 requestや敵対的backing差し替えを仮定しない。
 
-## 初期実装は workspace を木に限定する
+## workspace が扱う object の universe
 
-最初の `capfs` は、path-based authority と相性が悪い alias を扱わない。これは初期実装の安全境界であり、symlink を恒久的に非対応とする決定ではない。
+`capfs` が表現する object は directory、regular file、symlink の3種類だけである。device、FIFO、socket、workspace 内 mount は起動前に拒否し、`MKNOD` と `O_TMPFILE` は `EPERM` を返す。`MKNOD` は「未実装」ではなく policy による拒否なので、`ENOSYS` ではなく `EPERM` を明示的に返す。
 
-- 起動前に symlink、hard link、device、FIFO、socket、workspace 内 mount を拒否する。
-- `SYMLINK`、`LINK`、`MKNOD`、`O_TMPFILE` は `EPERM`。
-- link を実体へ置換しない。対象 repository 自体を非対応として返す。
-- 生きている object は必ず1つの canonical path を持つ。
+Git は symlink を mode `120000` の tree entry として表現し、blob の内容に link target を保持する。[Git fast-import documentation](https://git-scm.com/docs/git-fast-import) 一般的な Git repository を扱うには symlink が要る。hard link も、object store を共有する repository では現れる。どちらも初期実装では拒否していたが、現在は両方を扱う。判断の記録は [ADR 0017](../decisions/0017-authorize-an-aliased-inode-on-every-name.md) にある。
 
-この段階では、link を含まない repository に対象を絞って namespace registry、rename、revoke の競合を先に閉じる。link 解決を同時に導入して、認可失敗と namespace resolver の不具合を混ぜないためである。
+## symlink は registry が target を所有する
 
-## symlink は後続機能として追加する
+**path 解決を行うのは `capfs` ではなく OS である。** FUSE kernel は `READLINK` で target 文字列を受け取り、その後の walk を自分で進める。`..` の解決に `capfs` は呼ばれない。したがって **`capfs` が返す文字列が唯一の強制点**であり、target はその文字列が mount の外へ出ないと証明できる形に限られる。
 
-Git は symlink を mode `120000` の tree entry として表現し、blob の内容に link target を保持する。[Git fast-import documentation](https://git-scm.com/docs/git-fast-import)
+受理する文法は次のとおりである。
 
-一般的な Git repository を扱うには symlink 対応が必要になるため、初期 `capfs` の完成後に次の規則で追加する。
+- 相対 path のみ。絶対 path は caller の mount namespace で解決されるので拒否する。
+- `..` は先頭の連続部分にのみ現れてよい。
+- 各名前付き component は canonical path segment の規則を満たす。
+- 4096 byte 以内。
 
-- symlink は backing filesystem の alias として直接辿らず、namespace registry 上の link node と target として保持する。
-- file operation は symlink の見かけ上の path ではなく、解決後の `CanonicalPath` に対して認可する。
-- link 解決、現在 path の確定、Capability 判定、backing I/O の開始を同じ namespace lock の範囲で行う。
-- repository root の外へ出る target と absolute target は `EXDEV`、cycle と40回を超える解決は `ELOOP` で拒否する。
-- backing I/O の `RESOLVE_NO_SYMLINKS` と `RESOLVE_NO_MAGICLINKS` は、registry を迂回する symlink が存在しないことを強制する防御層として残す。
-- `SYMLINK` operation による新規作成は、作成先と target の認可 semantics を追加するまで `EPERM` のままとする。
+先頭の `..` だけを許すのは、それが link 自身の祖先 directory を辿るからである。registry 上、path の親は必ず directory であり、この pop は一意に決まる。名前付き component の後ろの `..` は、その component 自身が浅い directory を指す symlink だった場合、字句上の containment 検査が通っても kernel の walk は root の上へ出る。この形を予測するのではなく、受理しないことで穴を消す。
 
-symlink 対応の完了条件は次のとおりである。
+target は registry が保持し、`READLINK` のたびに **link の現在の path から**再解決する。rename は同じ literal の意味を変えるので、登録時の判定を使い回さない。解決が repository の外へ出るなら `EXDEV` を返し、文字列を kernel に渡さない。backing の link body は registry の記録と毎回照合し、食い違えば fail closed にする。`FUSE_CACHE_SYMLINKS` は要求しない。要求すれば、この再検査を経ずに kernel が古い body を辿り続ける。
 
-- repository 内で完結する symlink を通した read / write が、解決後の target path の権限で判定される。
-- 許可範囲内の link から許可範囲外の target へ到達する操作が拒否される。
-- dangling link は `ENOENT`、cycle と40回を超える link chain は `ELOOP` で終了し、backing object へ到達しない。
-- symlink の rename と revoke が競合しても、古い解決結果による commit が成立しない。
+file operation は link の見かけ上の path ではなく、kernel が到達した実 path に対して認可される。許可範囲内の link から許可範囲外の target へ向かう walk は、target 側の `LOOKUP` が `ENOENT` になって止まる。dangling link は `ENOENT`、cycle と40回を超える chain は kernel 自身の `ELOOP` で終わり、いずれも backing object へ到達しない。backing I/O の `RESOLVE_NO_SYMLINKS` と `RESOLVE_NO_MAGICLINKS` は、registry を迂回する symlink が存在しないことを強制する防御層として残っている。
 
-## hard link は別の拡張として扱う
+## hard link は「全ての名前で認可する」ことで閉じる
 
-symlink は link node と target object を分けられるが、hard link は1つの inode に複数の canonical path を与える。これは「生きている object は必ず1つの canonical path を持つ」という初期 invariant を直接壊す。
+hard link は1つの inode に複数の canonical path を与える。認可は path に対して与えられているので、「どの path の権限で判定するか」を決めなければならない。
 
-そのため、runtime の `LINK` は symlink 対応後も自動的には有効化しない。hard link を扱う場合は、次のどちらかを明示的に選ぶ。
+**`capfs` は全ての path で判定する。** `NamespaceObject` は自分を指す path の集合を持ち、operation はその全要素に対して effect を要求する。1つでも許可されなければ失敗する。可視性（`LOOKUP` / `GETATTR` / `READDIR`）も同じ規則に従う。
 
-- import 時に各 path を別 inode へコピーし、hard-link 関係を解消した専用 workspace を作る。
-- namespace registry を複数 path 対応へ拡張し、どの alias から変更しても他の alias 側の権限を侵害しない認可規則を追加する。
+この規則の下では、alias を増やすことで誰かの権限が広がることは決してない。増えるのは要求される authority の方である。`/secret/data.txt` への authority を持たない subject が `/allowed/alias` に link を作っても、`/allowed/alias` への操作は `/secret/data.txt` への authority も要求し続ける。逆に、権限を持つ object を到達不能にする嫌がらせは可能なので、`LINK` は新しい名前と既存の全ての名前の両方に `CreateHardLink` を要求する。
 
-後者は path containment だけでは証明できない。alias 集合と mutation の意味論、rename / unlink / revoke との競合モデルを追加してから採用する。
+directory は alias を持てない。Linux 自身が禁じており、`..` と subtree 規則が扱えない。
+
+名前が2つ以上ある object から1つを消しても inode は名前を失わないので、open handle の有無に依らず許される。最後の名前を消す場合だけ従来どおり `EBUSY` になる。「path を失ったまま生きる inode を作らない」という不変条件はそのまま保たれる。
+
+link count の検査は `nlink == 1` から `nlink == 名前の数` に変わった。`capfs` 経由で作られた link は registry が知っているので、**`capfs` の外で作られた名前は依然として検出される**。preflight も同じ形で、inode の名前が全て repository 内にあることを要求する。repository の外に名前がある inode は、repository が inode の部分的な view でしかないことを意味する。既定では **内容を repository 内の新しい inode へ複製し、repository 側の名前をその複製へ移す**。外の名前は元の inode を持ったまま触らない。repository 内で互いに alias だった名前は複製の alias として残り、切れるのは境界をまたぐ関係だけである。複製する総 byte 数には上限があり、実体化した名前は呼び出し側へ報告する。startup が backing tree へ一切書いてはならない場合は、policy を `Reject` にして repository 全体を拒否できる。
 
 ## rename をどう閉じるか
 
@@ -173,17 +168,47 @@ unlink も open handle が残っている間は `EBUSY` にする。多少 POSIX
 
 ## revoke を page cache に抜かせない
 
-regular file の `OPEN` は `FOPEN_DIRECT_IO` を返す。`FUSE_WRITEBACK_CACHE` と shared writable `mmap` は使わない。
+cached FUSE read は page cache だけで完了する場合があり、cached attribute も同様に `LOOKUP` / `GETATTR` を `capfs` まで戻さない。放置すれば revoke 後の read も stat も止められない。[Linux FUSE I/O modes](https://docs.kernel.org/filesystems/fuse/fuse-io.html)
 
-cached FUSE read は page cache だけで完了する場合があり、それでは revoke 後の read を止められない。direct I/O にすることで、read / write の両方を毎回 `capfs` まで戻す。[Linux FUSE I/O modes](https://docs.kernel.org/filesystems/fuse/fuse-io.html)
+当初はこれを `FOPEN_DIRECT_IO` と全 timeout 0 で塞いだ。それは正しかったが、代償が大きい。毎 operation が 2 回の context switch を伴う FUSE 往復になり、4 KiB read で 32 µs、stat で 95 µs を要した。実測では `capfs` 自身のコードはその 5% 未満で、残りは往復そのものである。
 
-```text
-entry_timeout    = 0
-attr_timeout     = 0
-negative_timeout = 0
-```
+現在は **cache を有効にし、revoke が cache を同期的に破棄してから返る**方式を採る。守る不変条件は変わらない。
 
-内部キャッシュは使ってよい。ただし key に `auth_epoch` と `namespace_generation` を含め、Capability の期限を越えて再利用しない。
+> revoke が返った後、その Capability で満たされる operation は存在しない。
+
+read-only handle は page cache を使い、`attr_timeout` / `entry_timeout` に有限値を置く。writable handle は `FOPEN_DIRECT_IO` のまま残す。`FUSE_WRITEBACK_CACHE`、`FOPEN_KEEP_CACHE`、shared writable `mmap` は引き続き使わない。
+
+writable handle を direct のままにするのは 2 つの理由による。buffered な FUSE write は page 単位に分解され、partial page では read-modify-write を要するため直接書くより遅い。そして cached handle と direct handle が同一 inode に共存しても、direct write 側が cache を無効化するため古い内容が残らない（[`cached_read_handle_observes_writes_made_through_a_direct_handle`](../../crates/capfs/tests/read_only_fuse.rs) が実 mount 上で確認する）。write は毎回 `WRITE` として `capfs` へ戻り、再認可される。
+
+### なぜ同じ強さが保てるのか
+
+`CapabilityKernel` に `RevocationObserver` を置き、revoke と `begin_subject_close` は observer を走らせてから返る。`capfs` は mount ごとに observer を登録し、その mount が kernel へ渡した全 `nodeid` を `FUSE_NOTIFY_INVAL_INODE` で無効化する。
+
+根拠は 3 点である。
+
+1. FUSE notification は FUSE device への write 中に OS 側でインライン処理される。`inval_inode` が返った時点で、その inode の cached page と cached attribute は既に無い。
+2. 無効化対象は node table が保持する「kernel へ渡した全 nodeid」であり、これが cache を持ち得る集合の上界である。`FORGET` 済みの identity は kernel が既に捨てており、identity は再利用されない。
+3. したがって observer 復帰後に cache から答えられる要求は無い。以後の read は `capfs` へ戻り、再認可され、revoke 済みとして拒否される。
+
+revoke 確定時点で既に in-flight の read は対象外である。それは revoke 前に認可されており、順序付けは kernel の state guard が行う。
+
+### lock 順序が正しさの一部である
+
+observer は **state の排他 guard を解放してから**走らせる。これは都合ではなく要件である。cache 無効化は OS がその mount の in-flight request を排出し終えるまでブロックし得るが、その request は拒否されるために shared state access を必要とする。排他 guard を保持したまま observer を走らせると、revoke は自分が止めようとしている request と deadlock する。
+
+### 確認できないなら fail closed
+
+notifier が未装着、node table が読めない、OS が無効化を拒否した、のいずれでも mount を fatal にし、revoke 呼び出し元へ `RevocationNotPropagated` を返す。空だと証明できない cache は、埋まっているものとして扱う。
+
+### この方式が実際に検査されていること
+
+[`mounted_read_only_view_denies_read_after_revoke`](../../crates/capfs/tests/read_only_fuse.rs) は revoke 前に file 全体を読んで cache を埋め、revoke 後の read が `EACCES` になることを実 mount 上で確認する。observer を外すとこの test は落ちる。`begin_subject_close` 経路は [`mounted_view_denies_cached_read_after_subject_close`](../../crates/capfs/tests/read_only_fuse.rs) が同じ形で押さえる。
+
+### cache coherence の範囲
+
+`FOPEN_KEEP_CACHE` は使わない。page cache は handle が開いている間だけ有効で、次の `OPEN` で破棄される。同一 repository を複数 mount が共有する場合、他 mount の write が見えるまでの遅れは 1 回の open 期間に収まる。attribute は `attr_timeout` に収まる。close-to-open coherence であり、これは security の弱化ではなく可視性の粒度である。
+
+内部キャッシュも使ってよい。ただし key に `auth_epoch` と `namespace_generation` を含め、Capability の期限を越えて再利用しない。
 
 ## 実装する操作
 
@@ -197,7 +222,10 @@ negative_timeout = 0
 | `UNLINK`, `RMDIR` | 対象を認可。open 中なら拒否 |
 | `RENAME` | source / destination を認可し、VM 共通 lock で更新 |
 | `SETATTR` | size は `Truncate`、ordinary mode または atime/mtime は `SetMetadata`。owner・flag・複合metadata変更は拒否 |
-| symlink / hard link、device、xattr、ioctl、fallocate、copy-range | 初期実装では `EPERM` |
+| `READLINK` | `ReadLink` を確認。返す前に現在 path から再解決し、外へ出るなら `EXDEV` |
+| `SYMLINK` | `CreateSymlink` を確認。target が repository 内に解決できなければ `EXDEV` / `EPERM` |
+| `LINK` | 新しい名前と既存の全ての名前に `CreateHardLink` を要求。directory は不可 |
+| device、xattr、ioctl、fallocate、copy-range | `EPERM` |
 | 未実装 opcode | backing に触れず fail closed |
 
 backing ext4 は supervisor の mount namespace にしか置かない。操作は事前に開いた directory fd から始め、`openat2` の `RESOLVE_BENEATH`、`RESOLVE_NO_SYMLINKS`、`RESOLVE_NO_MAGICLINKS`、`RESOLVE_NO_XDEV` を使う。[openat2(2)](https://man7.org/linux/man-pages/man2/openat2.2.html)

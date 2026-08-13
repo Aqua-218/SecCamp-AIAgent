@@ -16,7 +16,10 @@ use std::{
     ffi::{OsStr, OsString},
     fmt, fs,
     io::{self, Read, Write},
-    os::unix::{fs::PermissionsExt, net::UnixListener},
+    os::{
+        fd::RawFd,
+        unix::{fs::PermissionsExt, net::UnixListener},
+    },
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     thread::sleep,
@@ -91,6 +94,7 @@ pub struct WorkloadIsolationConfig {
     old_root: PathBuf,
     workspace_target: PathBuf,
     limits: WorkloadIsolationLimits,
+    egress_broker_fd: RawFd,
 }
 
 impl WorkloadIsolationConfig {
@@ -103,6 +107,7 @@ impl WorkloadIsolationConfig {
         old_root: impl Into<PathBuf>,
         workspace_target: impl Into<PathBuf>,
         limits: WorkloadIsolationLimits,
+        egress_broker_fd: RawFd,
     ) -> Self {
         Self {
             launcher: launcher.into(),
@@ -111,6 +116,7 @@ impl WorkloadIsolationConfig {
             old_root: old_root.into(),
             workspace_target: workspace_target.into(),
             limits,
+            egress_broker_fd,
         }
     }
 
@@ -159,6 +165,11 @@ impl WorkloadIsolationConfig {
         );
         append_argument(&mut arguments, "--start-gate", launch.start_gate);
         append_argument(&mut arguments, "--control-socket", launch.control_path);
+        append_argument(
+            &mut arguments,
+            "--egress-broker-fd",
+            self.egress_broker_fd.to_string(),
+        );
         append_argument(&mut arguments, "--landlock-read-only", "/");
         append_argument(
             &mut arguments,
@@ -409,6 +420,11 @@ fn validate_isolation_config(config: &WorkloadIsolationConfig) -> Result<(), Lin
     {
         return Err(LinuxHostError::StartGate(
             "isolation limits must be positive and tmpfs must not exceed 1 GiB".to_owned(),
+        ));
+    }
+    if config.egress_broker_fd < 3 {
+        return Err(LinuxHostError::StartGate(
+            "egress Broker descriptor must not overlap standard I/O".to_owned(),
         ));
     }
     Ok(())
@@ -1028,6 +1044,7 @@ mod tests {
             "/mnt/rootfs/.old-root",
             "/workspace",
             WorkloadIsolationLimits::new("/tmp", 1024 * 1024, 1024 * 1024, 8, 1000, 1000),
+            19,
         )
     }
 
@@ -1108,6 +1125,11 @@ mod tests {
                 OsString::from("/run/supervisor/subject-a.sock"),
             ]
         }));
+        assert!(
+            arguments.windows(2).any(|pair| {
+                pair == [OsString::from("--egress-broker-fd"), OsString::from("19")]
+            })
+        );
         assert_eq!(arguments.last(), Some(&OsString::from("--fixed")));
     }
 

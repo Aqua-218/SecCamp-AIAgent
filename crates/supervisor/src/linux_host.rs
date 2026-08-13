@@ -421,6 +421,7 @@ struct SubjectCgroup {
 struct SubjectControl {
     subject: SubjectId,
     listener: SubjectControlListener,
+    bootstrap_reserved: bool,
 }
 
 struct SubjectWorkload {
@@ -573,6 +574,79 @@ impl LinuxHostResources {
             .map(|control| &mut control.listener)
     }
 
+    /// Reserves the subject's control listener before the setup transaction begins.
+    ///
+    /// A guest bootstrap connection must be accepted before
+    /// [`crate::Supervisor::create_subject`] can use that kernel-authenticated identity. The
+    /// subsequent setup transaction adopts this exact listener through `open_control_fd`; callers
+    /// must therefore invoke this only immediately before creating the same subject.
+    pub fn prepare_control_listener(
+        &mut self,
+        subject: &SubjectId,
+    ) -> Result<ControlFdHandle, LinuxHostError> {
+        match self.create_control_listener(subject, true) {
+            ResourceAcquisition::Acquired(handle) => Ok(handle),
+            ResourceAcquisition::NoEffect(error) | ResourceAcquisition::EffectUnknown(error) => {
+                Err(error)
+            }
+            ResourceAcquisition::CleanupRequired { resource, error } => {
+                let cleanup = self.close_control_fd(resource);
+                Err(match cleanup {
+                    ResourceMutation::Applied => error,
+                    ResourceMutation::NoEffect(cleanup_error)
+                    | ResourceMutation::CleanupRequired(cleanup_error)
+                    | ResourceMutation::EffectUnknown(cleanup_error) => {
+                        LinuxHostError::StartGate(format!(
+                            "control listener setup failed ({error}); cleanup also failed ({cleanup_error})"
+                        ))
+                    }
+                })
+            }
+        }
+    }
+
+    fn create_control_listener(
+        &mut self,
+        subject: &SubjectId,
+        bootstrap_reserved: bool,
+    ) -> ResourceAcquisition<ControlFdHandle, LinuxHostError> {
+        if self
+            .controls
+            .values()
+            .any(|owned| owned.subject == *subject)
+        {
+            return ResourceAcquisition::NoEffect(LinuxHostError::AlreadyOwned(
+                "control descriptor",
+            ));
+        }
+        let Some(path) = self.control_socket_path(subject) else {
+            return ResourceAcquisition::NoEffect(LinuxHostError::InvalidSubjectName(
+                subject.clone(),
+            ));
+        };
+        let listener = match SubjectControlListener::bind(
+            &path,
+            subject.clone(),
+            self.config.workload_credential,
+            8,
+        ) {
+            Ok(listener) => listener,
+            Err(error) => {
+                return ResourceAcquisition::NoEffect(LinuxHostError::ControlSocket(error));
+            }
+        };
+        let handle = ControlFdHandle::new(self.issue_token());
+        self.controls.insert(
+            handle,
+            SubjectControl {
+                subject: subject.clone(),
+                listener,
+                bootstrap_reserved,
+            },
+        );
+        ResourceAcquisition::Acquired(handle)
+    }
+
     fn issue_token(&mut self) -> u64 {
         let token = self.next_token;
         // A 64-bit counter cannot wrap within a session; saturating keeps the type total without
@@ -665,40 +739,20 @@ impl CapfsHostResources for LinuxHostResources {
         &mut self,
         subject: &SubjectId,
     ) -> ResourceAcquisition<ControlFdHandle, Self::Error> {
-        if self
+        if let Some((handle, owned)) = self
             .controls
-            .values()
-            .any(|owned| owned.subject == *subject)
+            .iter_mut()
+            .find(|(_, owned)| owned.subject == *subject)
         {
+            if owned.bootstrap_reserved {
+                owned.bootstrap_reserved = false;
+                return ResourceAcquisition::Acquired(*handle);
+            }
             return ResourceAcquisition::NoEffect(LinuxHostError::AlreadyOwned(
                 "control descriptor",
             ));
         }
-        let Some(path) = self.control_socket_path(subject) else {
-            return ResourceAcquisition::NoEffect(LinuxHostError::InvalidSubjectName(
-                subject.clone(),
-            ));
-        };
-        let listener = match SubjectControlListener::bind(
-            &path,
-            subject.clone(),
-            self.config.workload_credential,
-            8,
-        ) {
-            Ok(listener) => listener,
-            Err(error) => {
-                return ResourceAcquisition::NoEffect(LinuxHostError::ControlSocket(error));
-            }
-        };
-        let handle = ControlFdHandle::new(self.issue_token());
-        self.controls.insert(
-            handle,
-            SubjectControl {
-                subject: subject.clone(),
-                listener,
-            },
-        );
-        ResourceAcquisition::Acquired(handle)
+        self.create_control_listener(subject, false)
     }
 
     fn close_control_fd(&mut self, control: ControlFdHandle) -> ResourceMutation<Self::Error> {

@@ -159,6 +159,7 @@ impl WorkloadIsolationConfig {
             self.limits.group_id.to_string(),
         );
         append_argument(&mut arguments, "--start-gate", launch.start_gate);
+        append_argument(&mut arguments, "--control-socket", launch.control_path);
         append_argument(&mut arguments, "--landlock-read-only", "/");
         append_argument(
             &mut arguments,
@@ -1058,6 +1059,12 @@ mod tests {
             pair == [
                 OsString::from("--start-gate"),
                 OsString::from("/run/supervisor/subject-a.start-gate.sock"),
+            ]
+        }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                OsString::from("--control-socket"),
+                OsString::from("/run/supervisor/subject-a.sock"),
             ]
         }));
         assert_eq!(arguments.last(), Some(&OsString::from("--fixed")));

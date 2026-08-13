@@ -808,8 +808,6 @@ mod implementation {
                     None,
                 )
                 .map_err(|error| with_context(error, "rootfs-bind"))?;
-                fs::create_dir_all(&rootfs.old_root)
-                    .map_err(|error| io_error(step, "rootfs-old-root", &error))?;
                 create_rootfs_mount_targets(step, config)
                     .map_err(|error| with_context(error, "rootfs-targets"))?;
                 stage_workspace_mount(
@@ -861,19 +859,18 @@ mod implementation {
                 return result;
             }
             let result = (|| {
-                pivot_root(step, &rootfs.mount_target, &rootfs.old_root)
+                change_directory(step, &rootfs.mount_target)
+                    .map_err(|error| with_context(error, "rootfs-enter-staging"))?;
+                // Moving the old root onto the new root itself avoids creating a writable
+                // put-old directory inside the immutable SquashFS image. Linux documents this
+                // `pivot_root(".", ".")` form together with a detached unmount of `.`.
+                pivot_root(step, Path::new("."), Path::new("."))
                     .map_err(|error| with_context(error, "rootfs-pivot"))?;
                 self.rootfs_pivoted = true;
+                unmount_path(step, Path::new("."))
+                    .map_err(|error| with_context(error, "rootfs-detach-old"))?;
                 change_directory(step, Path::new("/"))
                     .map_err(|error| with_context(error, "rootfs-chdir"))?;
-                let old_root_after_pivot =
-                    old_root_after_pivot(&rootfs.mount_target, &rootfs.old_root).ok_or_else(
-                        || BackendError::new(step, "old-root path was not beneath rootfs", None),
-                    )?;
-                unmount_path(step, &old_root_after_pivot)
-                    .map_err(|error| with_context(error, "rootfs-detach-old"))?;
-                // The immutable rootfs contains this empty mountpoint. Once the old root is
-                // detached it exposes no host state, and SquashFS cannot remove the directory.
                 Ok::<(), BackendError>(())
             })();
             if let Err(error) = &result
@@ -2187,7 +2184,7 @@ mod implementation {
     ) -> Result<(), BackendError> {
         let new_root = c_path(step, new_root)?;
         let old_root = c_path(step, old_root)?;
-        // SAFETY: Both paths are validated absolute paths and remain alive for the syscall.
+        // SAFETY: Both paths are NUL-terminated and remain alive for the syscall.
         let result =
             unsafe { libc::syscall(libc::SYS_pivot_root, new_root.as_ptr(), old_root.as_ptr()) };
         if result == -1 {
@@ -2226,11 +2223,6 @@ mod implementation {
     fn rootfs_path(rootfs_target: &Path, target: &Path) -> Option<PathBuf> {
         let relative = target.strip_prefix("/").ok()?;
         Some(rootfs_target.join(relative))
-    }
-
-    fn old_root_after_pivot(rootfs_target: &Path, old_root: &Path) -> Option<PathBuf> {
-        let relative = old_root.strip_prefix(rootfs_target).ok()?;
-        Some(Path::new("/").join(relative))
     }
 
     fn c_path(step: IsolationStep, path: &Path) -> Result<CString, BackendError> {

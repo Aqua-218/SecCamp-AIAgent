@@ -448,7 +448,7 @@ fn real_firecracker_guest_cgroup_v2_exposes_required_controllers() {
     let deadline = Instant::now() + API_WAIT;
     let serial = loop {
         let serial = vm.guest_serial_log();
-        if serial.matches(marker).count() >= 2 || Instant::now() >= deadline {
+        if serial.matches(marker).count() >= 3 || Instant::now() >= deadline {
             break serial;
         }
         thread::sleep(Duration::from_millis(10));

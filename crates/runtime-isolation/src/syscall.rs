@@ -13,6 +13,8 @@ pub enum Syscall {
     Write,
     /// Close a file descriptor.
     Close,
+    /// Configure an option on an already-open socket.
+    Setsockopt,
     /// Read file metadata.
     Fstat,
     /// Read file metadata relative to a directory descriptor.
@@ -347,6 +349,7 @@ impl Syscall {
             Self::Read => 0,
             Self::Write => 1,
             Self::Close => 3,
+            Self::Setsockopt => 54,
             Self::Fstat => 5,
             Self::Newfstatat => 262,
             Self::Mmap => 9,
@@ -411,6 +414,7 @@ impl FromStr for Syscall {
             "read" => Self::Read,
             "write" => Self::Write,
             "close" => Self::Close,
+            "setsockopt" => Self::Setsockopt,
             "fstat" => Self::Fstat,
             "newfstatat" => Self::Newfstatat,
             "mmap" => Self::Mmap,
@@ -584,6 +588,7 @@ impl SeccompPolicy {
                 Syscall::Read,
                 Syscall::Write,
                 Syscall::Close,
+                Syscall::Setsockopt,
                 Syscall::Fstat,
                 Syscall::Newfstatat,
                 Syscall::Mmap,

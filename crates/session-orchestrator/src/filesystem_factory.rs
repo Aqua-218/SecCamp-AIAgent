@@ -40,6 +40,33 @@ pub struct SnapshotTemplate {
     memory: PinnedArtifact,
 }
 
+/// Immutable kernel and seccomp sources copied into every session jail.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuestArtifactTemplate {
+    kernel: PinnedArtifact,
+    seccomp: PinnedArtifact,
+}
+
+impl GuestArtifactTemplate {
+    /// Creates the immutable boot and filter files used by every session.
+    #[must_use]
+    pub const fn new(kernel: PinnedArtifact, seccomp: PinnedArtifact) -> Self {
+        Self { kernel, seccomp }
+    }
+
+    /// Returns the pinned host-side kernel source.
+    #[must_use]
+    pub const fn kernel(&self) -> &PinnedArtifact {
+        &self.kernel
+    }
+
+    /// Returns the pinned host-side seccomp source.
+    #[must_use]
+    pub const fn seccomp(&self) -> &PinnedArtifact {
+        &self.seccomp
+    }
+}
+
 impl SnapshotTemplate {
     /// Creates the two immutable files that comprise a full Firecracker snapshot.
     #[must_use]
@@ -68,20 +95,46 @@ impl SnapshotTemplate {
 pub struct FilesystemFirecrackerFactory {
     snapshot_id: SnapshotId,
     template_runtime: RuntimeConfig,
+    guest_artifacts: GuestArtifactTemplate,
     snapshot_template: SnapshotTemplate,
 }
 
 impl FilesystemFirecrackerFactory {
     /// Binds a trusted snapshot identity to one immutable runtime and snapshot template.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         snapshot_id: SnapshotId,
         template_runtime: RuntimeConfig,
+        snapshot_template: SnapshotTemplate,
+    ) -> Self {
+        let guest_artifacts = GuestArtifactTemplate::new(
+            template_runtime.kernel.clone(),
+            template_runtime.isolation.seccomp.filter.clone(),
+        );
+        Self::with_guest_artifacts(
+            snapshot_id,
+            template_runtime,
+            guest_artifacts,
+            snapshot_template,
+        )
+    }
+
+    /// Binds separate immutable kernel and seccomp sources to the session runtime template.
+    ///
+    /// The runtime config still names the final jail-visible paths. This constructor lets a host
+    /// daemon keep source artifacts outside the jail hierarchy while requiring their digests to
+    /// equal the restore-compatibility template.
+    #[must_use]
+    pub const fn with_guest_artifacts(
+        snapshot_id: SnapshotId,
+        template_runtime: RuntimeConfig,
+        guest_artifacts: GuestArtifactTemplate,
         snapshot_template: SnapshotTemplate,
     ) -> Self {
         Self {
             snapshot_id,
             template_runtime,
+            guest_artifacts,
             snapshot_template,
         }
     }
@@ -90,6 +143,8 @@ impl FilesystemFirecrackerFactory {
         self.template_runtime
             .validate()
             .map_err(runtime_error("template runtime configuration"))?;
+        validate_pinned_file("guest kernel", self.guest_artifacts.kernel())?;
+        validate_pinned_file("seccomp filter", self.guest_artifacts.seccomp())?;
         validate_pinned_file("snapshot state", self.snapshot_template.state())?;
         validate_pinned_file("snapshot memory", self.snapshot_template.memory())?;
         Ok(())
@@ -113,9 +168,8 @@ impl FilesystemFirecrackerFactory {
                 "session runtime is not compatible with the factory snapshot template",
             ));
         }
-        if config.kernel.digest != self.template_runtime.kernel.digest
-            || config.isolation.seccomp.filter.digest
-                != self.template_runtime.isolation.seccomp.filter.digest
+        if config.kernel.digest != self.guest_artifacts.kernel().digest
+            || config.isolation.seccomp.filter.digest != self.guest_artifacts.seccomp().digest
         {
             return Err(BackendError::new(
                 "session runtime kernel or seccomp digest differs from the factory template",
@@ -246,12 +300,12 @@ impl FilesystemFirecrackerFactory {
         let config = request.runtime_config();
         copy_pinned_file(
             "guest kernel",
-            &self.template_runtime.kernel,
+            self.guest_artifacts.kernel(),
             &config.kernel.path,
         )?;
         copy_pinned_file(
             "seccomp filter",
-            &self.template_runtime.isolation.seccomp.filter,
+            self.guest_artifacts.seccomp(),
             &config.isolation.seccomp.filter.path,
         )?;
         copy_pinned_file(

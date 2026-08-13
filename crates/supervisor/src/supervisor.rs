@@ -527,6 +527,47 @@ pub enum DispatchResponse {
     HandleClosed,
 }
 
+impl From<DispatchResponse> for crate::protocol::WireResponse {
+    fn from(response: DispatchResponse) -> Self {
+        match response {
+            DispatchResponse::SubjectClosed => Self::SubjectClosed,
+            DispatchResponse::HandleClosed => Self::HandleClosed,
+        }
+    }
+}
+
+impl<KE, RE, CE> SupervisorError<KE, RE, CE> {
+    /// Returns the coarse refusal a guest may be told about this failure.
+    ///
+    /// Every authorization and lifecycle failure maps to the same code on purpose. A guest that
+    /// could tell "not yours" from "does not exist" could enumerate another subject's handles one
+    /// refusal at a time. The distinguishing detail stays on the host.
+    #[must_use]
+    pub const fn refusal(&self) -> crate::protocol::RefusalCode {
+        use crate::protocol::RefusalCode;
+        match self {
+            Self::Wire(_) => RefusalCode::Malformed,
+            Self::Resource(_)
+            | Self::SetupFailed { .. }
+            | Self::CleanupFailed { .. }
+            | Self::CleanupBlocked { .. } => RefusalCode::Unavailable,
+            Self::Caller(_)
+            | Self::Kernel(_)
+            | Self::DuplicateSubject(_)
+            | Self::KernelNotPristine
+            | Self::UnknownSubject(_)
+            | Self::SubjectNotRunning(_)
+            | Self::SubjectClosing(_)
+            | Self::SubjectClosed(_)
+            | Self::ConnectionSubjectMismatch { .. }
+            | Self::GrantSubjectMismatch { .. }
+            | Self::ConnectionNotBoundToSubject { .. }
+            | Self::HandleNotOwned { .. }
+            | Self::StaleHandle(_) => RefusalCode::NotPermitted,
+        }
+    }
+}
+
 /// Errors returned by supervisor orchestration.
 #[derive(Debug)]
 pub enum SupervisorError<KE, RE, CE> {

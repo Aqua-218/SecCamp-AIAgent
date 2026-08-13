@@ -599,3 +599,237 @@ fn revoke_requires_a_bound_running_connection() {
         "a subject that is no longer running must not revoke"
     );
 }
+
+#[test]
+fn a_second_connection_bound_to_one_subject_cannot_act_as_it() {
+    // The resolver maps both connections to the same subject, so only the record's own
+    // `connection` separates the channel that created the subject from a later one.
+    let created = ConnectionIdentity::new(1, 101, 1000, 1000);
+    let extra = ConnectionIdentity::new(2, 102, 1000, 1000);
+    let mut callers = StaticCallerResolver::new();
+    callers
+        .bind(created, root_subject())
+        .expect("first binding must be unique");
+    callers
+        .bind(extra, root_subject())
+        .expect("second binding must be unique");
+    let mut supervisor = Supervisor::new(
+        CapabilityKernel::new(CapabilityState::new(IssuerId::new("session"))),
+        FakeResources::default(),
+        callers,
+    )
+    .expect("pristine kernel must initialize supervisor");
+    supervisor
+        .create_subject(Subject::new(root_subject(), root_envelope()), created)
+        .expect("subject setup must succeed");
+
+    assert!(matches!(
+        supervisor.open_handle(&extra, HandleId::new("handle-1"), ObjectId::new("object-1")),
+        Err(SupervisorError::ConnectionNotBoundToSubject { subject, identity })
+            if subject == root_subject() && identity == extra
+    ));
+    assert!(
+        supervisor
+            .resources()
+            .events
+            .iter()
+            .all(|event| *event != "open_handle"),
+        "a foreign channel must be refused before the adapter is reached"
+    );
+}
+
+#[test]
+fn an_unbound_connection_reaches_no_authority_operation() {
+    let (mut supervisor, _) = new_supervisor();
+    let unbound = ConnectionIdentity::new(9, 909, 1000, 1000);
+    let request = supervisor::WireRequest::CloseSubject {
+        claimed_subject: root_subject(),
+    }
+    .encode()
+    .expect("request must encode");
+
+    assert!(matches!(
+        supervisor.dispatch_wire(&unbound, &request),
+        Err(SupervisorError::Caller(_))
+    ));
+    assert!(matches!(
+        supervisor.open_handle(
+            &unbound,
+            HandleId::new("handle-1"),
+            ObjectId::new("object-1")
+        ),
+        Err(SupervisorError::Caller(_))
+    ));
+    assert!(matches!(
+        supervisor.derive(
+            &unbound,
+            &authority_core::capability::CapId::new("session:0"),
+            CapabilityGrant::new(child_subject(), window(20, 80), authority()),
+            time(30),
+        ),
+        Err(SupervisorError::Caller(_))
+    ));
+    assert_eq!(
+        supervisor
+            .lifecycle(&root_subject())
+            .expect("the subject record must remain queryable"),
+        SubjectLifecycle::Running,
+        "a caller that cannot be resolved must change nothing"
+    );
+}
+
+#[test]
+fn issue_root_refuses_a_grant_naming_another_subject() {
+    let (supervisor, _) = new_supervisor();
+
+    assert!(matches!(
+        supervisor.issue_root(
+            &root_subject(),
+            CapabilityGrant::new(child_subject(), window(1, 99), authority()),
+        ),
+        Err(SupervisorError::GrantSubjectMismatch { requested, granted })
+            if requested == root_subject() && granted == child_subject()
+    ));
+}
+
+#[test]
+fn the_same_subject_id_cannot_be_created_twice() {
+    let created = ConnectionIdentity::new(1, 101, 1000, 1000);
+    let second = ConnectionIdentity::new(2, 102, 1000, 1000);
+    let mut callers = StaticCallerResolver::new();
+    callers
+        .bind(created, root_subject())
+        .expect("first binding must be unique");
+    callers
+        .bind(second, root_subject())
+        .expect("second binding must be unique");
+    let mut supervisor = Supervisor::new(
+        CapabilityKernel::new(CapabilityState::new(IssuerId::new("session"))),
+        FakeResources::default(),
+        callers,
+    )
+    .expect("pristine kernel must initialize supervisor");
+    supervisor
+        .create_subject(Subject::new(root_subject(), root_envelope()), created)
+        .expect("first setup must succeed");
+    let after_first = supervisor.resources().events.clone();
+
+    assert!(matches!(
+        supervisor.create_subject(Subject::new(root_subject(), root_envelope()), second),
+        Err(SupervisorError::DuplicateSubject(subject)) if subject == root_subject()
+    ));
+    assert_eq!(
+        supervisor.resources().events,
+        after_first,
+        "a duplicate subject must be refused before any resource is acquired"
+    );
+}
+
+#[test]
+fn a_child_cannot_be_created_under_a_parent_that_is_not_running() {
+    let root_identity = ConnectionIdentity::new(1, 101, 1000, 1000);
+    let child_identity = ConnectionIdentity::new(2, 102, 1000, 1000);
+    let mut callers = StaticCallerResolver::new();
+    callers
+        .bind(root_identity, root_subject())
+        .expect("root binding must be unique");
+    callers
+        .bind(child_identity, child_subject())
+        .expect("child binding must be unique");
+    let mut supervisor = Supervisor::new(
+        CapabilityKernel::new(CapabilityState::new(IssuerId::new("session"))),
+        FakeResources::default(),
+        callers,
+    )
+    .expect("pristine kernel must initialize supervisor");
+    supervisor
+        .create_subject(Subject::new(root_subject(), root_envelope()), root_identity)
+        .expect("root setup must succeed");
+    supervisor
+        .shutdown_subject(&root_subject())
+        .expect("shutdown must complete");
+    assert_eq!(
+        supervisor
+            .lifecycle(&root_subject())
+            .expect("the closed subject record must remain queryable"),
+        SubjectLifecycle::Closed
+    );
+    let after_shutdown = supervisor.resources().events.clone();
+
+    let error = supervisor
+        .create_subject(
+            Subject::new(child_subject(), child_envelope()).with_parent(root_subject()),
+            child_identity,
+        )
+        .expect_err("a closed parent must not accept a new child");
+
+    assert!(
+        matches!(&error, SupervisorError::SubjectClosed(subject) if *subject == root_subject()),
+        "unexpected parent gate failure: {error:?}"
+    );
+    assert!(
+        supervisor.lifecycle(&child_subject()).is_err(),
+        "a refused child must leave no record behind"
+    );
+    assert_eq!(
+        supervisor.resources().events,
+        after_shutdown,
+        "the parent gate must run before any child resource is acquired"
+    );
+}
+
+#[test]
+fn derive_requires_a_running_caller_and_a_capability_it_holds() {
+    let root_identity = ConnectionIdentity::new(1, 101, 1000, 1000);
+    let child_identity = ConnectionIdentity::new(2, 102, 1000, 1000);
+    let mut callers = StaticCallerResolver::new();
+    callers
+        .bind(root_identity, root_subject())
+        .expect("root binding must be unique");
+    callers
+        .bind(child_identity, child_subject())
+        .expect("child binding must be unique");
+    let mut supervisor = Supervisor::new(
+        CapabilityKernel::new(CapabilityState::new(IssuerId::new("session"))),
+        FakeResources::default(),
+        callers,
+    )
+    .expect("pristine kernel must initialize supervisor");
+    supervisor
+        .create_subject(Subject::new(root_subject(), root_envelope()), root_identity)
+        .expect("root setup must succeed");
+    supervisor
+        .create_subject(
+            Subject::new(child_subject(), child_envelope()).with_parent(root_subject()),
+            child_identity,
+        )
+        .expect("child setup must succeed");
+    let root = supervisor
+        .issue_root(&root_subject(), root_grant())
+        .expect("root issuance must succeed");
+
+    // A caller that does not hold the parent capability cannot derive from it.
+    assert!(matches!(
+        supervisor.derive(
+            &child_identity,
+            &root,
+            CapabilityGrant::new(child_subject(), window(20, 80), authority()),
+            time(30),
+        ),
+        Err(SupervisorError::Kernel(_))
+    ));
+
+    // A closed caller cannot derive at all, even from a capability it held.
+    supervisor
+        .shutdown_subject(&root_subject())
+        .expect("shutdown must complete");
+    assert!(matches!(
+        supervisor.derive(
+            &root_identity,
+            &root,
+            CapabilityGrant::new(root_subject(), window(20, 80), authority()),
+            time(30),
+        ),
+        Err(SupervisorError::SubjectClosed(subject)) if subject == root_subject()
+    ));
+}

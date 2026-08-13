@@ -1458,6 +1458,19 @@ where
         bytes: &[u8],
     ) -> SupervisorResult<K::Error, R::Error, C::Error, DispatchResponse> {
         let request = WireRequest::decode(bytes).map_err(SupervisorError::Wire)?;
+        self.dispatch_request(identity, request)
+    }
+
+    /// Dispatches one already-decoded closed control request.
+    ///
+    /// Production transports that decode a bounded datagram before handing it to the supervisor
+    /// can use this method without re-encoding the request. Authorization still selects the
+    /// caller only from `identity`; the request's claimed subject remains diagnostic data.
+    pub fn dispatch_request(
+        &mut self,
+        identity: &ConnectionIdentity,
+        request: WireRequest,
+    ) -> SupervisorResult<K::Error, R::Error, C::Error, DispatchResponse> {
         match request {
             WireRequest::CloseSubject { claimed_subject: _ } => {
                 let caller = self.resolve_caller(identity)?;

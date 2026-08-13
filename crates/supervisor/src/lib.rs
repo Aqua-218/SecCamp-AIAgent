@@ -12,8 +12,16 @@
 
 #[cfg(target_os = "linux")]
 mod capfs_resources;
+#[cfg(target_os = "linux")]
+mod control_socket;
 mod protocol;
 mod supervisor;
+
+#[cfg(target_os = "linux")]
+pub use control_socket::{
+    AcceptedControlConnection, ConnectionRebindError, ControlSocketError, CredentialResolveError,
+    SubjectControlListener, SubjectCredential, SubjectCredentialResolver,
+};
 
 #[cfg(target_os = "linux")]
 pub use capfs_resources::{

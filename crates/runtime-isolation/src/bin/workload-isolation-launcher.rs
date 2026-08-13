@@ -10,6 +10,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     io::{Read, Write},
+    os::fd::{AsRawFd, OwnedFd},
     os::unix::net::UnixStream,
     os::unix::{ffi::OsStringExt, process::CommandExt},
     path::{Component, Path, PathBuf},
@@ -17,9 +18,13 @@ use std::{
 };
 
 use runtime_isolation::{
-    BindMountConfig, CgroupConfig, ChildExit, ChildStartupStatus, IdentityMap, IsolationConfig,
-    LandlockConfig, LinuxBackend, RootfsConfig, RuntimeIsolation, SeccompPolicy, SpawnOutcome,
-    TmpfsConfig,
+    BindMountConfig, CgroupConfig, ChildExit, ChildStartupStatus, ControlChannelConfig,
+    IdentityMap, IsolationConfig, LandlockConfig, LinuxBackend, RootfsConfig, RuntimeIsolation,
+    SeccompPolicy, SpawnOutcome, TmpfsConfig,
+};
+use rustix::{
+    io::{FdFlags, fcntl_getfd, fcntl_setfd},
+    net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with},
 };
 
 const LANDLOCK_ABI: u32 = 3;
@@ -28,6 +33,7 @@ const LANDLOCK_ABI: u32 = 3;
 struct LauncherConfig {
     isolation: IsolationConfig,
     start_gate: PathBuf,
+    control_socket: PathBuf,
     workload_directory: PathBuf,
     program: PathBuf,
     arguments: Vec<OsString>,
@@ -47,9 +53,15 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<(), String> {
     let config = parse_config(env::args_os().skip(1))?;
     wait_for_start_gate(&config.start_gate)?;
+    let control_channel = connect_control_channel(&config.control_socket)?;
+    let control_channel_fd = control_channel.as_raw_fd();
+    let isolation = config.isolation.clone().with_control_channel(
+        ControlChannelConfig::new(control_channel_fd)
+            .map_err(|error| format!("configuring supervisor control channel: {error}"))?,
+    );
     let mut backend = LinuxBackend::new();
-    match RuntimeIsolation::spawn_isolated(&mut backend, &config.isolation, |_| {
-        execute_workload(&config)
+    match RuntimeIsolation::spawn_isolated(&mut backend, &isolation, |_| {
+        execute_workload(&config, control_channel_fd)
     }) {
         Ok(SpawnOutcome::Parent(mut child)) => {
             match child
@@ -85,6 +97,33 @@ fn run() -> Result<(), String> {
     }
 }
 
+fn connect_control_channel(path: &Path) -> Result<OwnedFd, String> {
+    let address = SocketAddrUnix::new(path).map_err(|_| {
+        format!(
+            "encoding supervisor control socket path {} as Unix address",
+            path.display()
+        )
+    })?;
+    let descriptor = socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|error| format!("creating supervisor control channel: {error}"))?;
+    connect(&descriptor, &address).map_err(|error| {
+        format!(
+            "connecting to supervisor control socket {}: {error}",
+            path.display()
+        )
+    })?;
+    let descriptor_flags = fcntl_getfd(&descriptor)
+        .map_err(|error| format!("reading supervisor control descriptor flags: {error}"))?;
+    fcntl_setfd(&descriptor, descriptor_flags & !FdFlags::CLOEXEC)
+        .map_err(|error| format!("preserving supervisor control descriptor: {error}"))?;
+    Ok(descriptor)
+}
+
 fn wait_for_start_gate(path: &Path) -> Result<(), String> {
     let mut gate = UnixStream::connect(path).map_err(|error| {
         format!(
@@ -104,11 +143,12 @@ fn wait_for_start_gate(path: &Path) -> Result<(), String> {
     }
 }
 
-fn execute_workload(config: &LauncherConfig) -> Result<(), String> {
+fn execute_workload(config: &LauncherConfig, control_channel_fd: i32) -> Result<(), String> {
     let error = Command::new(&config.program)
         .args(&config.arguments)
         .env_clear()
         .envs(config.environment.iter().cloned())
+        .env("SUPERVISOR_CONTROL_FD", control_channel_fd.to_string())
         .current_dir(&config.workload_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -120,7 +160,7 @@ fn execute_workload(config: &LauncherConfig) -> Result<(), String> {
     ))
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::similar_names, clippy::too_many_lines)]
 fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<LauncherConfig, String> {
     let mut arguments = arguments.into_iter().peekable();
     let rootfs_source = required_path(&mut arguments, "--rootfs-source")?;
@@ -137,6 +177,7 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
     let host_uid = required_u32(&mut arguments, "--host-uid")?;
     let host_gid = required_u32(&mut arguments, "--host-gid")?;
     let start_gate = required_path(&mut arguments, "--start-gate")?;
+    let control_socket = required_path(&mut arguments, "--control-socket")?;
 
     let mut read_only_paths = Vec::new();
     let mut writable_paths = Vec::new();
@@ -187,6 +228,7 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
     Ok(LauncherConfig {
         isolation,
         start_gate,
+        control_socket,
         workload_directory: workspace_target,
         program,
         arguments: workload_arguments,
@@ -284,7 +326,7 @@ fn is_absolute_lexical_path(path: &Path) -> bool {
 }
 
 fn usage() -> String {
-    "usage: workload-isolation-launcher --rootfs-source <absolute-path> --rootfs-mount-target <absolute-path> --old-root <absolute-path> --workspace-source <absolute-path> --workspace-target <absolute-path> --tmpfs-target <absolute-path> --tmpfs-size-bytes <u64> --cgroup-root <absolute-path> --cgroup-name <safe-name> --memory-max-bytes <u64> --pids-max <u64> --host-uid <u32> --host-gid <u32> --start-gate <absolute-path> --landlock-read-only <absolute-path>... --landlock-writable <absolute-path>... [--env NAME=VALUE]... --program <absolute-path> -- [arguments...]".to_owned()
+    "usage: workload-isolation-launcher --rootfs-source <absolute-path> --rootfs-mount-target <absolute-path> --old-root <absolute-path> --workspace-source <absolute-path> --workspace-target <absolute-path> --tmpfs-target <absolute-path> --tmpfs-size-bytes <u64> --cgroup-root <absolute-path> --cgroup-name <safe-name> --memory-max-bytes <u64> --pids-max <u64> --host-uid <u32> --host-gid <u32> --start-gate <absolute-path> --control-socket <absolute-path> --landlock-read-only <absolute-path>... --landlock-writable <absolute-path>... [--env NAME=VALUE]... --program <absolute-path> -- [arguments...]".to_owned()
 }
 
 #[cfg(test)]
@@ -321,6 +363,8 @@ mod tests {
             "1000",
             "--start-gate",
             "/run/supervisor/start-gate.sock",
+            "--control-socket",
+            "/run/supervisor/subject-a.sock",
             "--landlock-read-only",
             "/",
             "--landlock-writable",

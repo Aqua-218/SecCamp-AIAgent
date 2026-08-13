@@ -17,6 +17,7 @@ use std::{
     os::unix::fs::FileTypeExt,
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use authority_core::{
@@ -64,6 +65,8 @@ const WORKSPACE_DEVICE: &str = "/dev/vdb";
 const FUSE_DEVICE: &str = "/dev/fuse";
 const FUSE_MAJOR: u32 = 10;
 const FUSE_MINOR: u32 = 229;
+const CGROUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const CGROUP_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 struct Config {
@@ -511,7 +514,30 @@ fn prepare_cgroup_hierarchy(path: &Path) -> Result<(), String> {
             "mounting guest cgroup v2 hierarchy {}: {error}",
             path.display()
         )
-    })
+    })?;
+    wait_for_cgroup_controllers(path)
+}
+
+fn wait_for_cgroup_controllers(path: &Path) -> Result<(), String> {
+    let controllers = path.join("cgroup.controllers");
+    let deadline = Instant::now() + CGROUP_READY_TIMEOUT;
+    loop {
+        let available = fs::read_to_string(&controllers).unwrap_or_default();
+        if ["memory", "pids"].into_iter().all(|controller| {
+            available
+                .split_whitespace()
+                .any(|available| available == controller)
+        }) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "guest cgroup v2 controllers did not become ready at {} before timeout: {available:?}",
+                controllers.display()
+            ));
+        }
+        std::thread::sleep(CGROUP_READY_POLL_INTERVAL);
+    }
 }
 
 fn mount_workspace(device: &Path, target: &Path) -> Result<(), String> {

@@ -6,7 +6,7 @@
 
 > **対象読者:** supervisor の実装者、レビュー担当者、統合 test を書く人
 
-この crate の test は 1 種類しかない。`CapabilityKernel`（本物）と `FakeResources`（event log）と `StaticCallerResolver`（in-memory map）を組み合わせた contract test。実 socket も実 syscall も出てこない。
+この crate の test は 2 種類ある。lifecycle と認可の contract test は `CapabilityKernel`（本物）と `FakeResources`（event log）と `StaticCallerResolver`（in-memory map）を組み合わせ、実 syscall を出さない。control socket の module test だけが実 `SOCK_SEQPACKET` socket と実 `SO_PEERCRED` を使う。
 
 ## local test で確認したこと
 
@@ -22,6 +22,17 @@
 | 閉じた `HandleId` の再 open が、adapter を呼ぶ前に `StaleHandle` になる | `closed_handle_id_cannot_be_reused` |
 | kernel 登録失敗と補償失敗が重なっても、ID が予約され、shutdown が runtime close を retry する | `failed_handle_registration_retains_runtime_cleanup_and_reserves_id` |
 | 未 bind の connection と非 Running の subject が revoke できない | `revoke_requires_a_bound_running_connection` |
+
+control socket は実 socket に対して確認する。
+
+| 境界 | test |
+|---|---|
+| accept が kernel の `SO_PEERCRED` から identity を作り、listener の subject へ解決する | `accept_binds_the_listening_subject_from_the_kernel_credential` |
+| 4 KiB を超える datagram を decode 前に拒否する | `oversized_datagram_is_rejected_without_decoding` |
+| 受理した socket ID が単調で、release 後に解決不能になる | `accepted_socket_identities_are_not_reused_across_connections` |
+| 未 bind の socket ID と、subject の credential と違う peer を拒否する | `resolution_fails_closed_for_unbound_and_foreign_credentials` |
+| 相対 path と root path を bind しない | `listener_rejects_paths_it_cannot_own` |
+| bind 直後の socket node が mode 0600 である | `bound_socket_is_owner_only` |
 
 spoof の test には注意点がある。詐称した `CloseHandle` は**拒否されるのではなく、caller 自身の handle を閉じる**。claim が捨てられることを示しているのであって、詐称に対する error 経路が存在するわけではない。
 

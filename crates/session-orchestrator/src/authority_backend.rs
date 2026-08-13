@@ -29,6 +29,7 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 pub struct AuthorityRootGrant {
     validity: TimeWindow,
     authority: AuthorityBody,
+    broker_authority: Option<AuthorityBody>,
     delegable: bool,
 }
 
@@ -39,6 +40,7 @@ impl AuthorityRootGrant {
         Self {
             validity,
             authority,
+            broker_authority: None,
             delegable: false,
         }
     }
@@ -47,6 +49,17 @@ impl AuthorityRootGrant {
     #[must_use]
     pub const fn with_delegable(mut self, delegable: bool) -> Self {
         self.delegable = delegable;
+        self
+    }
+
+    /// Assigns a separate typed authority to the host Broker's non-guest root.
+    ///
+    /// The guest root remains the only capability injected into the guest supervisor. The Broker
+    /// root stays host-owned, allowing file and egress authorities to be revoked together without
+    /// exposing the egress authority as a guest descriptor or control message.
+    #[must_use]
+    pub fn with_broker_authority(mut self, broker_authority: AuthorityBody) -> Self {
+        self.broker_authority = Some(broker_authority);
         self
     }
 
@@ -62,6 +75,15 @@ impl AuthorityRootGrant {
         &self.authority
     }
 
+    /// Returns the authority bound to the host Broker root.
+    ///
+    /// Without an explicit Broker authority, the guest root authority is reused. That preserves
+    /// the original single-family policy while still using two distinct Authority Core roots.
+    #[must_use]
+    pub fn broker_authority(&self) -> &AuthorityBody {
+        self.broker_authority.as_ref().unwrap_or(&self.authority)
+    }
+
     /// Returns whether the root capability may derive child capabilities.
     #[must_use]
     pub const fn is_delegable(&self) -> bool {
@@ -74,6 +96,15 @@ impl AuthorityRootGrant {
 
     fn capability_grant(&self, subject: AuthoritySubjectId) -> CapabilityGrant {
         CapabilityGrant::new(subject, self.validity, self.authority.clone())
+            .with_delegable(self.delegable)
+    }
+
+    fn broker_envelope(&self) -> StaticAuthorityEnvelope {
+        StaticAuthorityEnvelope::new(self.validity, self.broker_authority().clone())
+    }
+
+    fn broker_capability_grant(&self, subject: AuthoritySubjectId) -> CapabilityGrant {
+        CapabilityGrant::new(subject, self.validity, self.broker_authority().clone())
             .with_delegable(self.delegable)
     }
 }
@@ -102,8 +133,10 @@ enum BindingStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RootBinding {
     lease: CapabilityLease,
-    subject: AuthoritySubjectId,
-    capability: CapId,
+    guest_subject: AuthoritySubjectId,
+    guest_capability: CapId,
+    broker_subject: AuthoritySubjectId,
+    broker_capability: CapId,
     status: BindingStatus,
 }
 
@@ -144,12 +177,20 @@ impl AuthorityCoreBackend {
         Arc::clone(&self.kernel)
     }
 
-    /// Derives the exact Authority Core identities for one Broker worker.
+    /// Derives the exact Authority Core identities for one host Broker worker.
     ///
     /// This is the sole conversion point from orchestrator subject and
     /// capability identities into their Authority Core representations.
     #[must_use]
     pub fn broker_binding(&self, identity: &SessionIdentity) -> AuthorityBrokerBinding {
+        let broker = to_lower_hex(identity.broker_session_id().as_bytes());
+        AuthorityBrokerBinding {
+            caller: AuthoritySubjectId::new(format!("broker-{broker}")),
+            capability: CapId::new(format!("broker-{broker}")),
+        }
+    }
+
+    fn guest_binding(identity: &SessionIdentity) -> AuthorityBrokerBinding {
         AuthorityBrokerBinding {
             caller: AuthoritySubjectId::new(to_lower_hex(identity.subject_id().as_bytes())),
             capability: CapId::new(to_lower_hex(identity.capability_id().as_bytes())),
@@ -173,47 +214,38 @@ impl CapabilityBackend<AuthorityRootGrant> for AuthorityCoreBackend {
             )));
         }
 
-        let AuthorityBrokerBinding {
-            caller: subject,
-            capability,
-        } = self.broker_binding(identity);
+        let guest = Self::guest_binding(identity);
+        let broker = self.broker_binding(identity);
         let lease = CapabilityLease::new(
             identity.session_id(),
             identity.subject_id(),
             identity.capability_id(),
         );
 
-        self.kernel
-            .register_subject(Subject::new(subject.clone(), grant.envelope()))
-            .map_err(|error| {
-                BackendError::new(format!(
-                    "failed to register Authority Core subject `{subject}`: {error}"
-                ))
-            })?;
-
-        let issued = match self
-            .kernel
-            .issue_root_with_id(capability.clone(), grant.capability_grant(subject.clone()))
-        {
-            Ok(capability) => capability,
-            Err(error) => {
-                return Err(self.issue_failure(&subject, &error.to_string(), None));
-            }
-        };
-
-        if issued != capability {
-            let issue_error = format!(
-                "Authority Core returned capability ID `{issued}` instead of requested `{capability}`"
-            );
-            return Err(self.issue_failure(&subject, &issue_error, Some(&issued)));
+        self.register_and_issue(
+            &guest,
+            grant.envelope(),
+            grant.capability_grant(guest.caller.clone()),
+        )?;
+        if let Err(error) = self.register_and_issue(
+            &broker,
+            grant.broker_envelope(),
+            grant.broker_capability_grant(broker.caller.clone()),
+        ) {
+            let cleanup = self.close_issued(&guest.caller, &guest.capability);
+            return Err(BackendError::new(format!(
+                "failed to issue host Broker root after guest root was issued: {error}; guest root cleanup was {cleanup}"
+            )));
         }
 
         self.bindings.insert(
             session_id,
             RootBinding {
                 lease: lease.clone(),
-                subject,
-                capability,
+                guest_subject: guest.caller,
+                guest_capability: guest.capability,
+                broker_subject: broker.caller,
+                broker_capability: broker.capability,
                 status: BindingStatus::Active,
             },
         );
@@ -241,15 +273,16 @@ impl CapabilityRevocationBackend for AuthorityCoreBackend {
             )));
         }
 
-        self.kernel
-            .revoke_held_by(&binding.subject, &binding.capability)
-            .map_err(|error| revoke_error(&binding, "revoke", &error))?;
-        self.kernel
-            .begin_subject_close(&binding.subject)
-            .map_err(|error| revoke_error(&binding, "begin subject close", &error))?;
-        self.kernel
-            .finish_subject_close(&binding.subject)
-            .map_err(|error| revoke_error(&binding, "finish subject close", &error))?;
+        self.revoke_and_close(
+            &binding.broker_subject,
+            &binding.broker_capability,
+            binding.status,
+        )?;
+        self.revoke_and_close(
+            &binding.guest_subject,
+            &binding.guest_capability,
+            binding.status,
+        )?;
 
         if let Some(binding) = self.bindings.get_mut(&lease.session_id()) {
             binding.status = BindingStatus::Closed;
@@ -259,6 +292,69 @@ impl CapabilityRevocationBackend for AuthorityCoreBackend {
 }
 
 impl AuthorityCoreBackend {
+    fn register_and_issue(
+        &self,
+        binding: &AuthorityBrokerBinding,
+        envelope: StaticAuthorityEnvelope,
+        grant: CapabilityGrant,
+    ) -> Result<(), BackendError> {
+        self.kernel
+            .register_subject(Subject::new(binding.caller.clone(), envelope))
+            .map_err(|error| {
+                BackendError::new(format!(
+                    "failed to register Authority Core subject `{}`: {error}",
+                    binding.caller
+                ))
+            })?;
+        let issued = match self
+            .kernel
+            .issue_root_with_id(binding.capability.clone(), grant)
+        {
+            Ok(capability) => capability,
+            Err(error) => {
+                return Err(self.issue_failure(&binding.caller, &error.to_string(), None));
+            }
+        };
+        if issued != binding.capability {
+            let issue_error = format!(
+                "Authority Core returned capability ID `{issued}` instead of requested `{}`",
+                binding.capability
+            );
+            return Err(self.issue_failure(&binding.caller, &issue_error, Some(&issued)));
+        }
+        Ok(())
+    }
+
+    fn revoke_and_close(
+        &self,
+        subject: &AuthoritySubjectId,
+        capability: &CapId,
+        status: BindingStatus,
+    ) -> Result<(), BackendError> {
+        self.kernel
+            .revoke_held_by(subject, capability)
+            .map_err(|error| revoke_error(subject, capability, status, "revoke", &error))?;
+        self.kernel.begin_subject_close(subject).map_err(|error| {
+            revoke_error(subject, capability, status, "begin subject close", &error)
+        })?;
+        self.kernel.finish_subject_close(subject).map_err(|error| {
+            revoke_error(subject, capability, status, "finish subject close", &error)
+        })?;
+        Ok(())
+    }
+
+    fn close_issued(&self, subject: &AuthoritySubjectId, capability: &CapId) -> String {
+        let revoke = self.kernel.revoke_held_by(subject, capability);
+        let begin = self.kernel.begin_subject_close(subject);
+        let finish = self.kernel.finish_subject_close(subject);
+        format!(
+            "revoke {}, begin {}, finish {}",
+            close_result_detail(&revoke),
+            close_result_detail(&begin),
+            close_result_detail(&finish)
+        )
+    }
+
     fn issue_failure(
         &self,
         subject: &AuthoritySubjectId,
@@ -284,13 +380,14 @@ impl AuthorityCoreBackend {
 }
 
 fn revoke_error(
-    binding: &RootBinding,
+    subject: &AuthoritySubjectId,
+    capability: &CapId,
+    status: BindingStatus,
     operation: &str,
     error: &CapabilityKernelError,
 ) -> BackendError {
     BackendError::new(format!(
-        "failed to {operation} root capability `{}` for subject `{}` while binding was {:?}: {error}",
-        binding.capability, binding.subject, binding.status
+        "failed to {operation} root capability `{capability}` for subject `{subject}` while binding was {status:?}: {error}"
     ))
 }
 
@@ -317,6 +414,10 @@ mod tests {
     use authority_core::{
         capability::{AuthorityRequest, CapabilityRequest, IssuerId},
         file::{FileAuthority, FileEffect, FileEffects, FileRequest},
+        http::{
+            CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethod, HttpFetchMethods,
+            HttpFetchRequest, UrlPathPattern,
+        },
         kernel::CapabilityKernel,
         path::{CanonicalPath, PathPattern},
         repository::RepoId,
@@ -389,6 +490,27 @@ mod tests {
         )
     }
 
+    fn broker_authority() -> AuthorityBody {
+        AuthorityBody::HttpFetch(HttpFetchAuthority::new(
+            HttpFetchMethods::only(HttpFetchMethod::Get),
+            CanonicalHost::new("api.example.test").expect("test host must be canonical"),
+            UrlPathPattern::Prefix(CanonicalUrlPath::root()),
+            1_024,
+        ))
+    }
+
+    fn broker_request() -> CapabilityRequest {
+        CapabilityRequest::new(
+            time(10),
+            AuthorityRequest::HttpFetch(HttpFetchRequest::new(
+                HttpFetchMethod::Get,
+                CanonicalHost::new("api.example.test").expect("test host must be canonical"),
+                CanonicalUrlPath::new("/v1/status").expect("test path must be canonical"),
+                1_024,
+            )),
+        )
+    }
+
     #[test]
     fn root_injection_uses_exact_lowercase_authority_ids_and_grant() {
         let mut backend = backend();
@@ -447,6 +569,41 @@ mod tests {
     }
 
     #[test]
+    fn host_broker_uses_a_separate_typed_root_from_the_guest_capability() {
+        let mut backend = backend();
+        let identity = identity();
+        let grant = grant().with_broker_authority(broker_authority());
+        backend
+            .inject_root_capability(&identity, &grant)
+            .expect("guest and Broker roots must issue together");
+
+        let guest = AuthorityCoreBackend::guest_binding(&identity);
+        backend
+            .kernel()
+            .authorize_and_execute_classified(&guest.caller, &guest.capability, &request(), |_| {
+                authority_core::kernel::EffectExecution::<(), Infallible>::Committed {
+                    value: (),
+                    receipt: None,
+                }
+            })
+            .expect("guest file root must retain its original authority");
+
+        let broker = backend.broker_binding(&identity);
+        backend
+            .kernel()
+            .authorize_and_execute_classified(
+                &broker.caller,
+                &broker.capability,
+                &broker_request(),
+                |_| authority_core::kernel::EffectExecution::<(), Infallible>::Committed {
+                    value: (),
+                    receipt: None,
+                },
+            )
+            .expect("host Broker root must authorize its separate typed request");
+    }
+
+    #[test]
     fn broker_binding_and_executor_preserve_the_exact_production_identity() {
         let backend = backend();
         let identity = identity();
@@ -454,10 +611,13 @@ mod tests {
         let binding = backend.broker_binding(&identity);
         let executor = backend.broker_executor();
 
-        assert_eq!(binding.caller.as_str(), "000102030405060708090a0b0c0d0e0f");
+        assert_eq!(
+            binding.caller.as_str(),
+            "broker-50505050505050505050505050505050"
+        );
         assert_eq!(
             binding.capability.as_str(),
-            "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+            "broker-50505050505050505050505050505050"
         );
         assert!(Arc::ptr_eq(&executor, backend.kernel()));
     }
@@ -481,6 +641,13 @@ mod tests {
                 .kernel()
                 .subject_status(&backend.broker_binding(&identity).caller)
                 .expect("subject status lookup must succeed"),
+            Some(SubjectStatus::Closed)
+        );
+        assert_eq!(
+            backend
+                .kernel()
+                .subject_status(&AuthorityCoreBackend::guest_binding(&identity).caller)
+                .expect("guest subject status lookup must succeed"),
             Some(SubjectStatus::Closed)
         );
     }

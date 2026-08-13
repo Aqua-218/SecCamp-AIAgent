@@ -36,7 +36,13 @@ const HEADER_LEN: usize = 8 + 2 + 1 + 1 + 8 + 8 + 4;
 const CHECKSUM_LEN: usize = 8;
 const MAX_RECORD_PAYLOAD: usize = 8 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
-const ATTEMPT_PAYLOAD_VERSION: u8 = 1;
+/// Version 2 prefixes the attempt metadata with the capability-state instance that authorized it.
+///
+/// A journal outlives the process that created it, so one file can hold attempts from several
+/// capability-state instances. `CapId` and `SubjectId` are only unique inside one instance, so
+/// without the instance an offline auditor cannot tell whether two records naming `cap-3` describe
+/// the same capability. Version 1 records are still readable and belong to instance 0.
+const ATTEMPT_PAYLOAD_VERSION: u8 = 2;
 #[cfg(target_os = "linux")]
 const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(unix)]
@@ -675,13 +681,20 @@ impl DurableAuditLog {
     /// payload is too large, or the frame cannot be synced.
     pub(crate) fn begin_attempt(
         &self,
+        state_instance: u64,
         attempt_id: crate::audit::AttemptId,
         caller: &SubjectId,
         capability_id: &CapId,
         requests: &CapabilityRequestSet,
         authorization_epoch: AuthorizationEpoch,
     ) -> Result<(), DurableAuditError> {
-        let payload = encode_attempt_payload(caller, capability_id, requests, authorization_epoch)?;
+        let payload = encode_attempt_payload(
+            state_instance,
+            caller,
+            capability_id,
+            requests,
+            authorization_epoch,
+        )?;
         let mut state = self.lock_state()?;
         if state.unusable {
             return Err(DurableAuditError::JournalUnavailable);
@@ -1498,6 +1511,7 @@ fn read_u64(bytes: &[u8], offset: &mut usize) -> Result<u64, DurableAuditError> 
 }
 
 fn encode_attempt_payload(
+    state_instance: u64,
     caller: &SubjectId,
     capability_id: &CapId,
     requests: &CapabilityRequestSet,
@@ -1505,6 +1519,7 @@ fn encode_attempt_payload(
 ) -> Result<Vec<u8>, DurableAuditError> {
     let mut writer = PayloadWriter::new();
     writer.byte(ATTEMPT_PAYLOAD_VERSION);
+    writer.u64(state_instance);
     writer.string(caller.as_str())?;
     writer.string(capability_id.as_str())?;
     writer.u64(authorization_epoch.as_u64());
@@ -1701,6 +1716,7 @@ mod tests {
 
     fn begin(log: &DurableAuditLog, attempt: u64) {
         log.begin_attempt(
+            0,
             AttemptId::from_u64(attempt),
             &SubjectId::new("subject"),
             &CapId::new("capability"),
@@ -1861,6 +1877,7 @@ mod tests {
 
         assert!(matches!(
             log.begin_attempt(
+                0,
                 AttemptId::from_u64(1),
                 &SubjectId::new("subject"),
                 &CapId::new("capability"),

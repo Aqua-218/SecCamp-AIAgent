@@ -32,6 +32,7 @@ use capfs::{
     read_only::MountInstanceId,
 };
 use rustix::{
+    fs::statfs,
     mount::{MountFlags, UnmountFlags, mount, unmount},
     net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with},
     process::{getegid, geteuid},
@@ -54,6 +55,7 @@ const WORKLOAD_PIDS_MAX: u64 = 32;
 const HOST_VSOCK_CID: u32 = 2;
 const BROKER_IO_TIMEOUT_SECONDS: u64 = 5;
 const DEVICE_DIRECTORY: &str = "/dev";
+const DEVTMPFS_SUPER_MAGIC: i64 = 0x1373;
 
 #[derive(Debug)]
 struct Config {
@@ -342,11 +344,12 @@ fn prepare_runtime_directory(path: &Path) -> Result<(), String> {
     .map_err(|error| format!("mounting guest runtime tmpfs {}: {error}", path.display()))
 }
 
-/// Mounts the guest-owned device namespace before consuming the workspace block device.
+/// Verifies the guest-owned device namespace before consuming the workspace block device.
 ///
 /// The immutable image deliberately has no host-provided device nodes. `devtmpfs` is the kernel
 /// boundary that exposes only the Firecracker devices assigned to this VM, including `/dev/vdb`
-/// and `/dev/fuse`; the subsequently isolated workload never receives the raw mount path.
+/// and `/dev/fuse`; the subsequently isolated workload never receives the raw mount path. Linux
+/// may mount it before PID 1, so the check accepts that exact mount rather than remounting it.
 fn prepare_device_directory() -> Result<(), String> {
     let path = Path::new(DEVICE_DIRECTORY);
     fs::create_dir_all(path).map_err(|error| {
@@ -355,6 +358,15 @@ fn prepare_device_directory() -> Result<(), String> {
             path.display()
         )
     })?;
+    let filesystem = statfs(path).map_err(|error| {
+        format!(
+            "inspecting guest device directory {}: {error}",
+            path.display()
+        )
+    })?;
+    if filesystem.f_type == DEVTMPFS_SUPER_MAGIC {
+        return Ok(());
+    }
     mount(
         "devtmpfs",
         path,
@@ -362,7 +374,21 @@ fn prepare_device_directory() -> Result<(), String> {
         MountFlags::NOSUID | MountFlags::NOEXEC,
         None,
     )
-    .map_err(|error| format!("mounting guest devtmpfs {}: {error}", path.display()))
+    .map_err(|error| format!("mounting guest devtmpfs {}: {error}", path.display()))?;
+    let filesystem = statfs(path).map_err(|error| {
+        format!(
+            "rechecking guest device directory {}: {error}",
+            path.display()
+        )
+    })?;
+    if filesystem.f_type == DEVTMPFS_SUPER_MAGIC {
+        Ok(())
+    } else {
+        Err(format!(
+            "guest device directory {} is not devtmpfs after mount",
+            path.display()
+        ))
+    }
 }
 
 /// Mounts the cgroup v2 hierarchy that owns all supervisor-created workload leaves.

@@ -14,9 +14,10 @@ mod implementation {
 
     use crate::backend::{ChildStartupNotifier, private::OperationPermit};
     use crate::{
-        BackendError, BindMountConfig, CapabilityReport, CgroupConfig, IdentityMap,
-        IsolatedChildProcess, IsolationBackend, IsolationConfig, IsolationStep, LandlockConfig,
-        NamespaceIdentity, NamespacePreparation, PidNamespaceChild, SeccompPolicy, SpawnOutcome,
+        BackendError, BindMountConfig, CapabilityReport, CgroupConfig, ControlChannelConfig,
+        IdentityMap, IsolatedChildProcess, IsolationBackend, IsolationConfig, IsolationStep,
+        LandlockConfig, NamespaceIdentity, NamespacePreparation, PidNamespaceChild, SeccompPolicy,
+        SpawnOutcome,
     };
 
     const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
@@ -333,7 +334,10 @@ mod implementation {
                             None,
                         )
                     })?;
-                    close_inherited_fds(step, notifier_fd)
+                    if let Some(control_channel) = config.control_channel {
+                        validate_control_channel(step, control_channel)?;
+                    }
+                    close_inherited_fds(step, notifier_fd, config.control_channel)
                 }
                 IsolationStep::Landlock => install_landlock(step, &config.landlock),
                 IsolationStep::DropCapabilities => self.drop_capabilities(step),
@@ -1308,9 +1312,85 @@ mod implementation {
         Ok(())
     }
 
+    fn validate_control_channel(
+        step: IsolationStep,
+        control_channel: ControlChannelConfig,
+    ) -> Result<(), BackendError> {
+        let descriptor = control_channel.fd();
+        if descriptor < FIRST_NONSTANDARD_FD {
+            return Err(BackendError::new(
+                step,
+                "supervisor control channel overlapped a standard descriptor",
+                None,
+            ));
+        }
+        if descriptor_has_cloexec(step, descriptor)? {
+            return Err(BackendError::new(
+                step,
+                "supervisor control channel was close-on-exec",
+                None,
+            ));
+        }
+        let mut socket_type = 0_i32;
+        let mut socket_type_length = libc::socklen_t::try_from(std::mem::size_of_val(&socket_type))
+            .map_err(|_| {
+                BackendError::new(step, "socket type length did not fit socklen_t", None)
+            })?;
+        // SAFETY: the descriptor is supplied by the trusted launcher; the output pointer and
+        // length point to writable storage of exactly the advertised size.
+        let socket_type_result = unsafe {
+            libc::getsockopt(
+                descriptor,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                (&raw mut socket_type).cast::<libc::c_void>(),
+                &raw mut socket_type_length,
+            )
+        };
+        if socket_type_result == -1 {
+            return Err(last_error(step, "inspect supervisor control socket type"));
+        }
+        if socket_type != libc::SOCK_SEQPACKET {
+            return Err(BackendError::new(
+                step,
+                "supervisor control channel was not a Unix seqpacket socket",
+                None,
+            ));
+        }
+
+        let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut peer_length =
+            libc::socklen_t::try_from(std::mem::size_of_val(&peer)).map_err(|_| {
+                BackendError::new(step, "socket peer length did not fit socklen_t", None)
+            })?;
+        // SAFETY: `peer` and `peer_length` are writable buffers accepted by getpeername.
+        let peer_result = unsafe {
+            libc::getpeername(
+                descriptor,
+                (&raw mut peer).cast::<libc::sockaddr>(),
+                &raw mut peer_length,
+            )
+        };
+        if peer_result == -1 {
+            return Err(last_error(
+                step,
+                "verify supervisor control socket is connected",
+            ));
+        }
+        if i32::from(peer.ss_family) != libc::AF_UNIX {
+            return Err(BackendError::new(
+                step,
+                "supervisor control channel peer was not Unix-domain",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     fn close_inherited_fds(
         step: IsolationStep,
         preserved_notifier_fd: RawFd,
+        control_channel: Option<ControlChannelConfig>,
     ) -> Result<(), BackendError> {
         if preserved_notifier_fd < FIRST_NONSTANDARD_FD {
             return Err(BackendError::new(
@@ -1326,15 +1406,30 @@ mod implementation {
                 None,
             ));
         }
-        let preserved_notifier_fd = preserved_notifier_fd.cast_unsigned();
-        if preserved_notifier_fd > FIRST_NONSTANDARD_FD.cast_unsigned() {
-            close_fd_range(
-                step,
-                FIRST_NONSTANDARD_FD.cast_unsigned(),
-                preserved_notifier_fd - 1,
-            )?;
+        let mut preserved = vec![preserved_notifier_fd.cast_unsigned()];
+        if let Some(control_channel) = control_channel {
+            let descriptor = control_channel.fd();
+            if descriptor == preserved_notifier_fd {
+                return Err(BackendError::new(
+                    step,
+                    "supervisor control channel overlapped the startup notifier",
+                    None,
+                ));
+            }
+            preserved.push(descriptor.cast_unsigned());
         }
-        close_fd_range(step, preserved_notifier_fd + 1, u32::MAX)
+        preserved.sort_unstable();
+        let mut first = FIRST_NONSTANDARD_FD.cast_unsigned();
+        for descriptor in preserved {
+            if descriptor > first {
+                close_fd_range(step, first, descriptor - 1)?;
+            }
+            first = descriptor.checked_add(1).ok_or_else(|| {
+                BackendError::new(step, "preserved descriptor exceeded the valid range", None)
+            })?;
+        }
+        close_fd_range(step, first, u32::MAX)?;
+        Ok(())
     }
 
     fn close_fd_range(step: IsolationStep, first: u32, last: u32) -> Result<(), BackendError> {
@@ -2302,6 +2397,7 @@ mod implementation {
             let error = close_inherited_fds(
                 IsolationStep::CloseInheritedFileDescriptors,
                 libc::STDERR_FILENO,
+                None,
             )
             .expect_err("a notifier may never overlap inherited standard IO");
 
@@ -2359,6 +2455,7 @@ mod implementation {
                         && close_inherited_fds(
                             IsolationStep::CloseInheritedFileDescriptors,
                             notifier_fd,
+                            None,
                         )
                         .is_ok()
                         && descriptor_is_closed(leaked_fd)

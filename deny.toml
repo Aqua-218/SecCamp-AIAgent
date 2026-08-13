@@ -21,9 +21,19 @@ allow = [
   "Unicode-3.0",
   "Unlicense",
 ]
+exceptions = [
+  { allow = ["AGPL-3.0-only"], crate = "authority-core" },
+  { allow = ["AGPL-3.0-only"], crate = "capfs" },
+  { allow = ["AGPL-3.0-only"], crate = "egress-broker" },
+  { allow = ["AGPL-3.0-only"], crate = "egress-protocol" },
+  { allow = ["AGPL-3.0-only"], crate = "firecracker-runtime" },
+  { allow = ["AGPL-3.0-only"], crate = "runtime-isolation" },
+  { allow = ["AGPL-3.0-only"], crate = "session-orchestrator" },
+  { allow = ["AGPL-3.0-only"], crate = "supervisor" },
+]
 
 [licenses.private]
-ignore = true
+ignore = false
 
 [bans]
 multiple-versions = "warn"

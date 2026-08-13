@@ -7,6 +7,7 @@
 
 use std::{
     env,
+    fs::File,
     num::{NonZeroU64, NonZeroUsize},
     os::unix::{fs::FileTypeExt, net::UnixListener},
     path::Path,
@@ -71,6 +72,7 @@ struct RealFirecracker {
     process: Child,
     directory: TempDir,
     api_socket: std::path::PathBuf,
+    serial_log: std::path::PathBuf,
 }
 
 impl RealFirecracker {
@@ -78,13 +80,16 @@ impl RealFirecracker {
         let directory = tempfile::tempdir().expect("real VM temporary directory must be created");
         let api_socket = directory.path().join("api.sock");
         let log = directory.path().join("firecracker.log");
+        let serial_log = directory.path().join("guest-serial.log");
         let process = Command::new(firecracker)
             .arg("--api-sock")
             .arg(&api_socket)
             .arg("--log-path")
             .arg(log)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::from(
+                File::create(&serial_log).expect("guest serial log must be creatable"),
+            ))
             .stderr(Stdio::null())
             .spawn()
             .expect("real Firecracker must start");
@@ -100,6 +105,7 @@ impl RealFirecracker {
             process,
             directory,
             api_socket,
+            serial_log,
         }
     }
 
@@ -109,6 +115,11 @@ impl RealFirecracker {
 
     fn vsock_socket(&self) -> std::path::PathBuf {
         self.directory.path().join("vsock.sock")
+    }
+
+    fn guest_serial_log(&self) -> String {
+        std::fs::read_to_string(&self.serial_log)
+            .unwrap_or_else(|error| format!("could not read guest serial log: {error}"))
     }
 }
 
@@ -366,7 +377,9 @@ fn real_firecracker_guest_control_enforces_identity_gate_over_vsock() {
         .expect("workload release must reach the real guest");
     assert_eq!(
         started.body,
-        request.canonical_acknowledgement(GuestControlAction::StartWorkload)
+        request.canonical_acknowledgement(GuestControlAction::StartWorkload),
+        "guest runtime failed to start; guest serial output:\n{}",
+        vm.guest_serial_log(),
     );
     let retried_start = client
         .request(&ApiRequest {

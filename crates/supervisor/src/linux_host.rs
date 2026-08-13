@@ -95,11 +95,13 @@ pub struct WorkloadIsolationConfig {
     workspace_target: PathBuf,
     limits: WorkloadIsolationLimits,
     egress_broker_fd: RawFd,
+    egress_broker_session: String,
 }
 
 impl WorkloadIsolationConfig {
     /// Creates one complete static isolation policy for a guest supervisor.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // Every isolation and Broker boundary is explicit.
     pub fn new(
         launcher: impl Into<PathBuf>,
         rootfs_source: impl Into<PathBuf>,
@@ -108,6 +110,7 @@ impl WorkloadIsolationConfig {
         workspace_target: impl Into<PathBuf>,
         limits: WorkloadIsolationLimits,
         egress_broker_fd: RawFd,
+        egress_broker_session: impl Into<String>,
     ) -> Self {
         Self {
             launcher: launcher.into(),
@@ -117,6 +120,7 @@ impl WorkloadIsolationConfig {
             workspace_target: workspace_target.into(),
             limits,
             egress_broker_fd,
+            egress_broker_session: egress_broker_session.into(),
         }
     }
 
@@ -169,6 +173,11 @@ impl WorkloadIsolationConfig {
             &mut arguments,
             "--egress-broker-fd",
             self.egress_broker_fd.to_string(),
+        );
+        append_argument(
+            &mut arguments,
+            "--egress-broker-session",
+            &self.egress_broker_session,
         );
         append_argument(&mut arguments, "--landlock-read-only", "/");
         append_argument(
@@ -427,7 +436,20 @@ fn validate_isolation_config(config: &WorkloadIsolationConfig) -> Result<(), Lin
             "egress Broker descriptor must not overlap standard I/O".to_owned(),
         ));
     }
+    if !is_canonical_identity(&config.egress_broker_session) {
+        return Err(LinuxHostError::StartGate(
+            "egress Broker session must be non-zero lower hexadecimal identity".to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn is_canonical_identity(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        && value.bytes().any(|byte| byte != b'0')
 }
 
 struct SubjectCgroup {
@@ -1045,6 +1067,7 @@ mod tests {
             "/workspace",
             WorkloadIsolationLimits::new("/tmp", 1024 * 1024, 1024 * 1024, 8, 1000, 1000),
             19,
+            "00112233445566778899aabbccddeeff",
         )
     }
 
@@ -1105,6 +1128,12 @@ mod tests {
             pair == [
                 OsString::from("--workspace-source"),
                 OsString::from("/run/capfs/subject-a"),
+            ]
+        }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                OsString::from("--egress-broker-session"),
+                OsString::from("00112233445566778899aabbccddeeff"),
             ]
         }));
         assert!(arguments.windows(2).any(|pair| {

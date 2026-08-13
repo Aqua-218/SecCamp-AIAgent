@@ -1970,7 +1970,7 @@ mod tests {
         process::{Command, Stdio},
         sync::atomic::{AtomicU64, Ordering},
         thread,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
@@ -2130,8 +2130,28 @@ mod tests {
         let after = fs::metadata(fixture.lock_path()).expect("stable lock must survive drop");
         #[cfg(unix)]
         assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
-        DurableSessionRecoveryJournal::open(&fixture.path)
-            .expect("released writer lock must be reusable");
+        reopen_released_journal(&fixture.path);
+    }
+
+    /// Reopens a journal whose only writer this test just dropped.
+    ///
+    /// `Command::spawn` forks, and a fork duplicates every descriptor in the process, including
+    /// the journal descriptors other test threads hold. `CLOEXEC` closes them in the child, but
+    /// only at `exec`, so between fork and exec a concurrent `Drop` cannot yet release its
+    /// `flock`. The cross-process tests in this binary fork while this test runs, so the reopen
+    /// can observe a `Locked` that belongs to a descriptor nobody is using. The wait is bounded,
+    /// so a genuinely leaked writer still fails.
+    fn reopen_released_journal(path: &Path) -> DurableSessionRecoveryJournal {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match DurableSessionRecoveryJournal::open(path) {
+                Ok(journal) => return journal,
+                Err(SessionRecoveryError::Locked { .. }) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("released writer lock must be reusable: {error:?}"),
+            }
+        }
     }
 
     #[cfg(unix)]

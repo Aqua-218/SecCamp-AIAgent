@@ -13,6 +13,8 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Aqua-218/SecCamp-AIAgent"
 rust-version = "1.93.1"
 version = "0.1.0"
 

@@ -14,12 +14,20 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-use firecracker_runtime::guest_control::{GuestControlOutcome, GuestControlServer};
+use firecracker_runtime::guest_control::{
+    GuestControlOutcome, GuestControlRequest, GuestControlServer,
+};
 use socket2::{Domain, SockAddr, Socket, Type};
 
 const VMADDR_CID_ANY: u32 = u32::MAX;
 const VMADDR_CID_HOST: u32 = 2;
 const LISTEN_BACKLOG: i32 = 4;
+const GUEST_CHALLENGE_ENV: &str = "GUEST_IDENTITY_CHALLENGE";
+const GUEST_VM_ID_ENV: &str = "GUEST_IDENTITY_VM_ID";
+const GUEST_SESSION_ID_ENV: &str = "GUEST_IDENTITY_SESSION_ID";
+const GUEST_REQUEST_ID_ENV: &str = "GUEST_IDENTITY_REQUEST_ID";
+const GUEST_SUBJECT_ID_ENV: &str = "GUEST_IDENTITY_SUBJECT_ID";
+const GUEST_CAPABILITY_ID_ENV: &str = "GUEST_IDENTITY_CAPABILITY_ID";
 
 #[derive(Debug)]
 struct Config {
@@ -69,7 +77,9 @@ fn run() -> Result<(), String> {
             .set_write_timeout(Some(std::time::Duration::from_secs(5)))
             .map_err(|error| format!("setting guest-control write timeout: {error}"))?;
         let response = server
-            .serve_once_with(&mut stream, || start_workload(&config, &mut workload))
+            .serve_once_with_identity(&mut stream, |request| {
+                start_workload(&config, &mut workload, request)
+            })
             .map_err(|error| format!("serving guest-control request: {error}"))?;
         if response.outcome() == Some(GuestControlOutcome::WorkloadStarted) {
             reap_workload(&mut workload)?;
@@ -135,18 +145,51 @@ fn is_absolute_lexical_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
 }
 
-fn start_workload(config: &Config, workload: &mut Option<Child>) -> io::Result<()> {
+fn start_workload(
+    config: &Config,
+    workload: &mut Option<Child>,
+    request: &GuestControlRequest,
+) -> io::Result<()> {
     if workload.is_some() {
         return Ok(());
     }
     let child = Command::new(&config.workload)
         .args(&config.workload_arguments)
+        .env_clear()
+        .envs(workload_environment(request))
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
     *workload = Some(child);
     Ok(())
+}
+
+fn workload_environment(request: &GuestControlRequest) -> [(OsString, String); 6] {
+    let identities = request.identities();
+    [
+        (
+            OsString::from(GUEST_CHALLENGE_ENV),
+            request.challenge().to_hex(),
+        ),
+        (OsString::from(GUEST_VM_ID_ENV), identities.vm_id.to_hex()),
+        (
+            OsString::from(GUEST_SESSION_ID_ENV),
+            identities.session_id.to_hex(),
+        ),
+        (
+            OsString::from(GUEST_REQUEST_ID_ENV),
+            identities.request_id.to_hex(),
+        ),
+        (
+            OsString::from(GUEST_SUBJECT_ID_ENV),
+            identities.subject_id.to_hex(),
+        ),
+        (
+            OsString::from(GUEST_CAPABILITY_ID_ENV),
+            identities.capability_id.to_hex(),
+        ),
+    ]
 }
 
 fn reap_workload(workload: &mut Option<Child>) -> Result<(), String> {
@@ -167,6 +210,7 @@ fn reap_workload(workload: &mut Option<Child>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use firecracker_runtime::{IdentityBundle, IdentityId};
 
     #[test]
     fn accepts_the_kernel_init_argument_delimiter() {
@@ -202,5 +246,39 @@ mod tests {
         ])
         .expect_err("workload path must not contain a parent traversal");
         assert!(error.contains("absolute and lexical"));
+    }
+
+    #[test]
+    fn workload_environment_contains_only_the_canonical_identity_bundle() {
+        let identity = |byte| {
+            IdentityId::from_hex(&format!("{byte:02x}").repeat(16))
+                .expect("test identity must be valid")
+        };
+        let request = GuestControlRequest::new(
+            identity(1),
+            IdentityBundle::new(
+                identity(2),
+                identity(3),
+                identity(4),
+                identity(5),
+                identity(6),
+            )
+            .expect("distinct test identities must form a bundle"),
+        )
+        .expect("challenge must not be inside the bundle");
+        let environment = workload_environment(&request);
+        assert_eq!(environment.len(), 6);
+        assert_eq!(
+            environment[0],
+            (OsString::from(GUEST_CHALLENGE_ENV), "01".repeat(16))
+        );
+        assert_eq!(
+            environment[4],
+            (OsString::from(GUEST_SUBJECT_ID_ENV), "05".repeat(16))
+        );
+        assert_eq!(
+            environment[5],
+            (OsString::from(GUEST_CAPABILITY_ID_ENV), "06".repeat(16))
+        );
     }
 }

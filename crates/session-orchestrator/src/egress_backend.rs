@@ -10,7 +10,10 @@ use std::{
     io::{self, Read, Write},
     net::Shutdown,
     num::NonZeroUsize,
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::{
+        fs::{MetadataExt, PermissionsExt},
+        net::{UnixListener, UnixStream},
+    },
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
@@ -135,7 +138,9 @@ impl FirecrackerUnixListener {
                 format!("invalid Firecracker guest Broker socket: {error}"),
             )
         })?;
+        validate_private_socket_parent(&path)?;
         let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener,
@@ -166,6 +171,29 @@ impl FirecrackerUnixListener {
             Err(error) => Err(error),
         }
     }
+}
+
+fn validate_private_socket_parent(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Firecracker guest Broker socket has no parent directory",
+        )
+    })?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Firecracker guest Broker socket parent must be a non-symlink directory",
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Firecracker guest Broker socket parent must not be group- or world-writable",
+        ));
+    }
+    Ok(())
 }
 
 /// One guest-to-host stream forwarded by Firecracker's per-port Unix socket.
@@ -1122,7 +1150,10 @@ fn unknown_lease_error(operation: &str) -> BackendError {
 mod tests {
     use std::{
         io::{self, Cursor},
-        os::unix::net::UnixStream,
+        os::unix::{
+            fs::{MetadataExt as _, PermissionsExt as _},
+            net::UnixStream,
+        },
         path::Path,
         sync::{
             Arc, Condvar, Mutex,
@@ -1394,6 +1425,8 @@ mod tests {
                 .as_nanos(),
         ));
         std::fs::create_dir(&root).expect("test socket root must be creatable");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("test socket root must be private");
         let session = identity(0x40);
         let base = root.join(format!("{}.vsock", session.workspace_id()));
         let factory_root = root.clone();
@@ -1409,6 +1442,13 @@ mod tests {
         assert_eq!(
             listener.path(),
             root.join(format!("{}.vsock_18081", session.workspace_id()))
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(listener.path())
+                .expect("bound socket must be inspectable")
+                .mode()
+                & 0o777,
+            0o600
         );
         assert!(
             listener
@@ -1441,10 +1481,26 @@ mod tests {
         drop(listener);
         std::fs::remove_file(firecracker_guest_port_path(&base, 18_081).expect("path is valid"))
             .expect("test socket must be removable");
-        std::fs::remove_dir(root).expect("test socket root must be removable");
         assert!(firecracker_guest_port_path(Path::new("relative.vsock"), 18_081).is_err());
         assert!(firecracker_guest_port_path(Path::new("/tmp/../vsock"), 18_081).is_err());
         assert!(firecracker_guest_port_path(Path::new("/tmp/vsock"), 0).is_err());
+
+        let insecure_root = root.join("insecure");
+        std::fs::create_dir(&insecure_root).expect("insecure test root must be creatable");
+        std::fs::set_permissions(&insecure_root, std::fs::Permissions::from_mode(0o777))
+            .expect("insecure test root mode must be configurable");
+        assert!(
+            FirecrackerUnixListener::bind_nonblocking(
+                insecure_root.join("session.vsock"),
+                42,
+                18_081,
+            )
+            .is_err()
+        );
+        std::fs::set_permissions(&insecure_root, std::fs::Permissions::from_mode(0o700))
+            .expect("insecure test root must become removable");
+        std::fs::remove_dir(insecure_root).expect("insecure test root must be removable");
+        std::fs::remove_dir(root).expect("test socket root must be removable");
     }
 
     fn release_runtime(gate: &Arc<(Mutex<BlockState>, Condvar)>) {

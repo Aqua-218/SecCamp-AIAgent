@@ -481,7 +481,7 @@ mod tests {
         ApiRequest, ApiResponse, CgroupVersion, CommandOutput, CommandSpec, DmVerityConfig,
         HostIsolationConfig, IdentityId, JailerConfig, NamespaceConfig, PinnedArtifact,
         ProcessHandle, ProcessOwnership, Runtime, SeccompConfig, VsockConfig, WorkspaceConfig,
-        sha256,
+        WorkspaceImageConfig, sha256,
     };
 
     use super::*;
@@ -549,6 +549,15 @@ mod tests {
                 .lock()
                 .expect("test filesystem mutex must not be poisoned")
                 .push(destination.to_owned());
+            Ok(())
+        }
+
+        fn create_workspace_image(
+            &mut self,
+            _workspace: &Path,
+            _image: &Path,
+            _size_bytes: u64,
+        ) -> Result<(), RuntimeError> {
             Ok(())
         }
 
@@ -674,6 +683,10 @@ mod tests {
                 source: PathBuf::from("/test/source"),
                 clone_root: jail_root.join("workspace"),
                 clone_id: "base".to_owned(),
+                image: WorkspaceImageConfig {
+                    formatter: artifact("/test/mke2fs"),
+                    size_bytes: 64 * 1024 * 1024,
+                },
             },
             jailer: artifact("/test/jailer"),
             jailer_config: JailerConfig {

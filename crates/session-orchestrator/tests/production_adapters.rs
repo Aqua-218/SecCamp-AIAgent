@@ -26,7 +26,7 @@ use firecracker_runtime::{
     CommandSpec, DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, IdentityId,
     IdentitySource, JailerConfig, NamespaceConfig, PinnedArtifact, ProcessHandle, ProcessOwnership,
     Runtime, RuntimeConfig, RuntimeError, SeccompConfig, Snapshot, VsockConfig, WorkspaceConfig,
-    sha256,
+    WorkspaceImageConfig, sha256,
 };
 use session_orchestrator::{
     BackendError, BrokerBackend as BrokerBackendTrait, BrokerLease, CapabilityBackend,
@@ -64,6 +64,7 @@ fn record_event(events: &LifecycleEvents, event: &'static str) {
 struct FsLog {
     reads: Arc<Mutex<Vec<PathBuf>>>,
     clones: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
+    images: Arc<Mutex<Vec<(PathBuf, PathBuf, u64)>>>,
     removals: Arc<Mutex<Vec<PathBuf>>>,
     device_bindings: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
     lifecycle: LifecycleEvents,
@@ -80,6 +81,7 @@ impl FileSystem for TestFileSystem {
             PathBuf::from("/test/firecracker"),
             PathBuf::from("/test/rootfs"),
             PathBuf::from("/test/verity"),
+            PathBuf::from("/test/mke2fs"),
             PathBuf::from("/test/jailer"),
             jail_root.join("artifacts/kernel"),
             jail_root.join("artifacts/seccomp"),
@@ -137,6 +139,34 @@ impl FileSystem for TestFileSystem {
             .lock()
             .expect("filesystem log must not be poisoned")
             .push((source.to_owned(), destination.to_owned()));
+        Ok(())
+    }
+
+    fn create_workspace_image(
+        &mut self,
+        workspace: &Path,
+        image: &Path,
+        size_bytes: u64,
+    ) -> Result<(), RuntimeError> {
+        let expected_workspace = session_jail_root()
+            .join("workspace")
+            .join(expected_workspace_id().to_string());
+        let expected_image = session_jail_root()
+            .join("workspace")
+            .join(format!("{}.ext4", expected_workspace_id()));
+        if workspace != expected_workspace
+            || image != expected_image
+            || size_bytes != 64 * 1024 * 1024
+        {
+            return Err(RuntimeError::Io(
+                "test filesystem rejected inexact workspace image".to_owned(),
+            ));
+        }
+        self.log
+            .images
+            .lock()
+            .expect("filesystem image log must not be poisoned")
+            .push((workspace.to_owned(), image.to_owned(), size_bytes));
         Ok(())
     }
 
@@ -312,7 +342,8 @@ impl ApiClient for TestApi {
         vsock_uds_path: &Path,
         guest_cid: u32,
     ) -> Result<(), RuntimeError> {
-        let expected_workspace = PathBuf::from(format!("/workspace/{}", expected_workspace_id()));
+        let expected_workspace =
+            PathBuf::from(format!("/workspace/{}.ext4", expected_workspace_id()));
         if workspace_path != expected_workspace
             || vsock_uds_path != Path::new("/run/vsock.sock")
             || guest_cid != 3
@@ -697,6 +728,22 @@ fn assert_successful_restore_observations(
                 .join(workspace_id.to_string()),
         )]
     );
+    assert_eq!(
+        fs_log
+            .images
+            .lock()
+            .expect("workspace-image log must not be poisoned")
+            .as_slice(),
+        [(
+            session_jail_root()
+                .join("workspace")
+                .join(workspace_id.to_string()),
+            session_jail_root()
+                .join("workspace")
+                .join(format!("{workspace_id}.ext4")),
+            64 * 1024 * 1024,
+        )]
+    );
     assert_snapshot_reverified(fs_log);
     assert_eq!(
         runner_log
@@ -724,7 +771,7 @@ fn assert_successful_restore_observations(
             .expect("restore-verification log must not be poisoned")
             .as_slice(),
         [(
-            PathBuf::from(format!("/workspace/{workspace_id}")),
+            PathBuf::from(format!("/workspace/{workspace_id}.ext4")),
             PathBuf::from("/run/vsock.sock"),
             3,
         )]
@@ -837,6 +884,10 @@ fn runtime_config() -> RuntimeConfig {
             source: PathBuf::from("/test/source"),
             clone_root: jail_root.join("workspace"),
             clone_id: "unbound".to_owned(),
+            image: WorkspaceImageConfig {
+                formatter: artifact("/test/mke2fs"),
+                size_bytes: 64 * 1024 * 1024,
+            },
         },
         jailer: artifact("/test/jailer"),
         jailer_config: JailerConfig {

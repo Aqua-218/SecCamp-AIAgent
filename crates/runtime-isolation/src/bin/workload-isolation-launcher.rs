@@ -28,6 +28,7 @@ const LANDLOCK_ABI: u32 = 3;
 struct LauncherConfig {
     isolation: IsolationConfig,
     start_gate: PathBuf,
+    workload_directory: PathBuf,
     program: PathBuf,
     arguments: Vec<OsString>,
     environment: Vec<(OsString, OsString)>,
@@ -108,7 +109,7 @@ fn execute_workload(config: &LauncherConfig) -> Result<(), String> {
         .args(&config.arguments)
         .env_clear()
         .envs(config.environment.iter().cloned())
-        .current_dir("/workspace")
+        .current_dir(&config.workload_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -172,7 +173,7 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
 
     let isolation = IsolationConfig::new(
         RootfsConfig::new(rootfs_source, rootfs_mount_target, old_root),
-        BindMountConfig::new(workspace_source, workspace_target),
+        BindMountConfig::new(workspace_source, workspace_target.clone()),
         TmpfsConfig::new(tmpfs_target, tmpfs_size_bytes),
         CgroupConfig::new(cgroup_root, cgroup_name, memory_max_bytes, pids_max),
         LandlockConfig::new(LANDLOCK_ABI, read_only_paths, writable_paths),
@@ -186,6 +187,7 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
     Ok(LauncherConfig {
         isolation,
         start_gate,
+        workload_directory: workspace_target,
         program,
         arguments: workload_arguments,
         environment,

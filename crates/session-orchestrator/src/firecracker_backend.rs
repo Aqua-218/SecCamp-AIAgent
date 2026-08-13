@@ -540,6 +540,22 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn bind_block_device(
+            &mut self,
+            _source: &Path,
+            _jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn unbind_block_device(
+            &mut self,
+            _source: &Path,
+            _jailed_device: &Path,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
         fn clone_workspace(
             &mut self,
             _source: &Path,

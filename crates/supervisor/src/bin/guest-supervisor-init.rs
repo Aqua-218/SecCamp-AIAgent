@@ -14,6 +14,7 @@ use std::{
     fs,
     num::NonZeroUsize,
     os::fd::{AsRawFd, OwnedFd},
+    os::unix::fs::FileTypeExt,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -56,6 +57,9 @@ const HOST_VSOCK_CID: u32 = 2;
 const BROKER_IO_TIMEOUT_SECONDS: u64 = 5;
 const DEVICE_DIRECTORY: &str = "/dev";
 const DEVTMPFS_SUPER_MAGIC: i64 = 0x1373;
+const TMPFS_SUPER_MAGIC: i64 = 0x0102_1994;
+const WORKSPACE_DEVICE: &str = "/dev/vdb";
+const FUSE_DEVICE: &str = "/dev/fuse";
 
 #[derive(Debug)]
 struct Config {
@@ -367,8 +371,8 @@ fn prepare_device_directory() -> Result<(), String> {
             path.display()
         )
     })?;
-    if filesystem.f_type == DEVTMPFS_SUPER_MAGIC {
-        return Ok(());
+    if matches!(filesystem.f_type, DEVTMPFS_SUPER_MAGIC | TMPFS_SUPER_MAGIC) {
+        return verify_runtime_devices();
     }
     mount(
         "devtmpfs",
@@ -384,14 +388,38 @@ fn prepare_device_directory() -> Result<(), String> {
             path.display()
         )
     })?;
-    if filesystem.f_type == DEVTMPFS_SUPER_MAGIC {
-        Ok(())
+    if matches!(filesystem.f_type, DEVTMPFS_SUPER_MAGIC | TMPFS_SUPER_MAGIC) {
+        verify_runtime_devices()
     } else {
         Err(format!(
             "guest device directory {} is not devtmpfs after mount",
             path.display()
         ))
     }
+}
+
+/// Confirms the image receives exactly the block and FUSE device classes required at runtime.
+///
+/// Linux reports `devtmpfs` as tmpfs through `statfs`, so the filesystem magic alone does not
+/// prove that PID 1 can mount the workspace or run `CapFS`. These typed device checks make a
+/// missing Firecracker drive or missing kernel FUSE support fail before any authority is created.
+fn verify_runtime_devices() -> Result<(), String> {
+    let workspace = fs::metadata(WORKSPACE_DEVICE).map_err(|error| {
+        format!("inspecting guest workspace device {WORKSPACE_DEVICE}: {error}")
+    })?;
+    if !workspace.file_type().is_block_device() {
+        return Err(format!(
+            "guest workspace device {WORKSPACE_DEVICE} is not a block device"
+        ));
+    }
+    let fuse = fs::metadata(FUSE_DEVICE)
+        .map_err(|error| format!("inspecting guest FUSE device {FUSE_DEVICE}: {error}"))?;
+    if !fuse.file_type().is_char_device() {
+        return Err(format!(
+            "guest FUSE device {FUSE_DEVICE} is not a character device"
+        ));
+    }
+    Ok(())
 }
 
 /// Mounts the cgroup v2 hierarchy that owns all supervisor-created workload leaves.

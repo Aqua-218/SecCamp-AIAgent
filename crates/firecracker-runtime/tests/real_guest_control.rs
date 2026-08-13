@@ -166,6 +166,12 @@ fn identity(value: u8) -> IdentityId {
     IdentityId::from_hex(&format!("{value:032x}")).expect("test identity must be valid")
 }
 
+fn broker_session_identity(value: u8) -> BrokerSessionId {
+    let mut bytes = [0_u8; 16];
+    bytes[15] = value;
+    BrokerSessionId::new(bytes)
+}
+
 fn guest_request() -> GuestControlRequest {
     GuestControlRequest::new(
         identity(1),
@@ -583,13 +589,13 @@ fn real_firecracker_guest_runtime_preserves_the_broker_channel_through_isolation
         let public_calls = Arc::clone(&public_calls);
         let github_calls = Arc::clone(&github_calls);
         move || {
-            // `guest_request` fixes the session identity to 03..03. Matching it here proves the
+            // `guest_request` fixes the session identity to 00..03. Matching it here proves the
             // isolated workload uses the host-issued session rather than the probe's legacy ID.
             serve_probe_connection(
                 &listener,
                 public_calls,
                 github_calls,
-                BrokerSessionId::new([3; 16]),
+                broker_session_identity(3),
             )
         }
     });

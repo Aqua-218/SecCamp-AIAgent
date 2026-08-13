@@ -84,6 +84,7 @@ mod implementation {
     const FIRST_NONSTANDARD_FD: RawFd = 3;
     const NULL_DEVICE_MAJOR: libc::c_uint = 1;
     const NULL_DEVICE_MINOR: libc::c_uint = 3;
+    const CLONE_INTO_CGROUP: u64 = 1_u64 << 33;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct PidNamespaceObservation {
@@ -102,6 +103,27 @@ mod implementation {
         descriptor: OwnedFd,
         device: u64,
         inode: u64,
+    }
+
+    #[derive(Debug)]
+    struct PreparedCgroup {
+        path: PathBuf,
+        descriptor: fs::File,
+    }
+
+    #[repr(C)]
+    struct CloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+        set_tid: u64,
+        set_tid_size: u64,
+        cgroup: u64,
     }
 
     impl PinnedWorkspaceSource {
@@ -151,8 +173,7 @@ mod implementation {
 
     /// Linux syscall backend. It must be used in a child process before the workload is execed.
     pub struct LinuxBackend {
-        previous_cgroup: Option<PathBuf>,
-        created_cgroup: Option<PathBuf>,
+        prepared_cgroup: Option<PreparedCgroup>,
         rootfs_pivoted: bool,
         max_capability_index: Option<libc::c_int>,
         prepared_pid_namespaces: Option<(NamespaceIdentity, NamespaceIdentity)>,
@@ -166,8 +187,7 @@ mod implementation {
         /// Creates a backend with no process-global state changed.
         pub const fn new() -> Self {
             Self {
-                previous_cgroup: None,
-                created_cgroup: None,
+                prepared_cgroup: None,
                 rootfs_pivoted: false,
                 max_capability_index: None,
                 prepared_pid_namespaces: None,
@@ -182,6 +202,16 @@ mod implementation {
     impl Default for LinuxBackend {
         fn default() -> Self {
             Self::new()
+        }
+    }
+
+    impl Drop for LinuxBackend {
+        fn drop(&mut self) {
+            let Some(prepared) = self.prepared_cgroup.take() else {
+                return;
+            };
+            drop(prepared.descriptor);
+            let _ = fs::remove_dir(prepared.path);
         }
     }
 
@@ -207,6 +237,13 @@ mod implementation {
                 report
                     .reasons
                     .push("user namespaces are disabled by the host".to_owned());
+            }
+            if !clone3_is_available() {
+                report.namespaces_available = false;
+                report.reasons.push(
+                    "clone3 is unavailable; constrained namespace creation cannot be made atomic"
+                        .to_owned(),
+                );
             }
             if !close_range_is_available() {
                 report.reasons.push(
@@ -298,16 +335,18 @@ mod implementation {
         fn prepare_namespaces(
             &mut self,
             _permit: OperationPermit,
-            _config: &IsolationConfig,
+            config: &IsolationConfig,
         ) -> Result<NamespacePreparation, BackendError> {
-            if self.prepared_pid_namespaces.is_some() {
+            if self.prepared_pid_namespaces.is_some() || self.prepared_cgroup.is_some() {
                 return Err(BackendError::new(
                     IsolationStep::Namespaces,
                     "namespace preparation already has an unconsumed child handoff",
                     None,
                 ));
             }
-            let preparation = prepare_namespaces(IsolationStep::Namespaces)?;
+            let before = observe_pid_namespaces(IsolationStep::Namespaces)?;
+            self.prepare_cgroup(IsolationStep::CgroupV2, &config.cgroup)?;
+            let preparation = NamespacePreparation::attest(before.current, before.current);
             self.prepared_pid_namespaces = Some((preparation.parent(), preparation.child()));
             Ok(preparation)
         }
@@ -430,7 +469,9 @@ mod implementation {
         where
             F: FnOnce(&mut Self, NamespacePreparation, ChildStartupNotifier) -> T,
         {
-            self.consume_prepared_namespace_handoff(&preparation)?;
+            if let Err(error) = self.consume_prepared_namespace_handoff(&preparation) {
+                return Err(self.cleanup_prepared_cgroup_after_error(error));
+            }
             let previous_signal_mask = block_all_signals(IsolationStep::Namespaces)?;
             let fork_resources = (|| {
                 if !process_is_single_threaded(IsolationStep::Namespaces)? {
@@ -448,31 +489,51 @@ mod implementation {
             let (startup_pipe, null_device) = match fork_resources {
                 Ok(resources) => resources,
                 Err(error) => {
-                    if let Err(restore_error) =
+                    let error = if let Err(restore_error) =
                         restore_signal_mask(IsolationStep::Namespaces, &previous_signal_mask)
                     {
-                        return Err(combine_errors(&error, &restore_error));
-                    }
-                    return Err(error);
+                        combine_errors(&error, &restore_error)
+                    } else {
+                        error
+                    };
+                    return Err(self.cleanup_prepared_cgroup_after_error(error));
                 }
             };
+            let cgroup_descriptor = if let Some(prepared) = self.prepared_cgroup.as_ref() {
+                prepared.descriptor.as_raw_fd()
+            } else {
+                let error = BackendError::new(
+                    IsolationStep::CgroupV2,
+                    "namespace handoff has no constrained cgroup prepared for atomic child placement",
+                    None,
+                );
+                let error = if let Err(restore_error) =
+                    restore_signal_mask(IsolationStep::Namespaces, &previous_signal_mask)
+                {
+                    combine_errors(&error, &restore_error)
+                } else {
+                    error
+                };
+                return Err(self.cleanup_prepared_cgroup_after_error(error));
+            };
             let launcher_pid = current_pid();
-            // SAFETY: Namespace preparation can succeed only for a single-threaded
-            // launcher. Signals are blocked across fork so inherited handlers
-            // cannot execute before the child replaces their process-global state.
-            let fork_result = unsafe { libc::fork() };
-            match fork_result {
-                -1 => {
-                    let fork_error = last_error(
-                        IsolationStep::Namespaces,
-                        "fork prepared PID namespace child",
-                    );
-                    if let Err(restore_error) =
+            let clone_result = clone_into_cgroup(IsolationStep::Namespaces, cgroup_descriptor);
+            let fork_result = match clone_result {
+                Ok(child_pid) => child_pid,
+                Err(error) => {
+                    let error = if let Err(restore_error) =
                         restore_signal_mask(IsolationStep::Namespaces, &previous_signal_mask)
                     {
-                        return Err(combine_errors(&fork_error, &restore_error));
-                    }
-                    Err(fork_error)
+                        combine_errors(&error, &restore_error)
+                    } else {
+                        error
+                    };
+                    return Err(self.cleanup_prepared_cgroup_after_error(error));
+                }
+            };
+            match fork_result {
+                -1 => {
+                    unreachable!("clone_into_cgroup converts clone3 errors into BackendError")
                 }
                 0 => {
                     drop(startup_pipe.reader);
@@ -510,20 +571,22 @@ mod implementation {
                     if let Err(error) =
                         restore_signal_mask(IsolationStep::Namespaces, &previous_signal_mask)
                     {
-                        return Err(cleanup_failed_spawn(child_pid, error));
+                        return Err(self.cleanup_prepared_cgroup_after_error(
+                            cleanup_failed_spawn(child_pid, error),
+                        ));
                     }
                     let child_pid = u32::try_from(child_pid)
                         .ok()
                         .and_then(NonZeroU32::new)
                         .ok_or_else(|| {
-                            cleanup_failed_spawn(
+                            self.cleanup_prepared_cgroup_after_error(cleanup_failed_spawn(
                                 raw_child_pid,
                                 BackendError::new(
                                     IsolationStep::Namespaces,
-                                    "fork returned an invalid child PID",
+                                    "clone3 returned an invalid child PID",
                                     None,
                                 ),
-                            )
+                            ))
                         })?;
                     let child_namespace = namespace_identity(
                         IsolationStep::Namespaces,
@@ -531,9 +594,19 @@ mod implementation {
                             .join(child_pid.get().to_string())
                             .join("ns/pid"),
                     )
-                    .map_err(|error| cleanup_failed_spawn(raw_child_pid, error))?;
-                    let pidfd = open_pidfd(IsolationStep::Namespaces, child_pid)
-                        .map_err(|error| cleanup_failed_spawn(raw_child_pid, error))?;
+                    .map_err(|error| {
+                        self.cleanup_prepared_cgroup_after_error(cleanup_failed_spawn(
+                            raw_child_pid,
+                            error,
+                        ))
+                    })?;
+                    let pidfd =
+                        open_pidfd(IsolationStep::Namespaces, child_pid).map_err(|error| {
+                            self.cleanup_prepared_cgroup_after_error(cleanup_failed_spawn(
+                                raw_child_pid,
+                                error,
+                            ))
+                        })?;
                     Ok(SpawnOutcome::Parent(IsolatedChildProcess::from_spawn(
                         child_pid,
                         child_namespace,
@@ -563,6 +636,59 @@ mod implementation {
                 ));
             }
             Ok(())
+        }
+
+        fn prepare_cgroup(
+            &mut self,
+            step: IsolationStep,
+            config: &CgroupConfig,
+        ) -> Result<(), BackendError> {
+            let path = config.root.join(&config.name);
+            fs::create_dir(&path).map_err(|error| io_error(step, "create cgroup", &error))?;
+            let descriptor = (|| {
+                write_text(
+                    step,
+                    &path.join("memory.max"),
+                    &config.memory_max_bytes.to_string(),
+                )?;
+                write_text(step, &path.join("pids.max"), &config.pids_max.to_string())?;
+                fs::File::open(&path)
+                    .map_err(|error| io_error(step, "open constrained cgroup", &error))
+            })();
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    if let Err(cleanup_error) = fs::remove_dir(&path) {
+                        return Err(BackendError::new(
+                            step,
+                            format!(
+                                "{error}; failed to remove partially configured cgroup: {cleanup_error}"
+                            ),
+                            cleanup_error.raw_os_error(),
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            self.prepared_cgroup = Some(PreparedCgroup { path, descriptor });
+            Ok(())
+        }
+
+        fn cleanup_prepared_cgroup_after_error(&mut self, original: BackendError) -> BackendError {
+            match self.release_prepared_cgroup(IsolationStep::CgroupV2) {
+                Ok(()) => original,
+                Err(cleanup_error) => combine_errors(&original, &cleanup_error),
+            }
+        }
+
+        fn release_prepared_cgroup(&mut self, step: IsolationStep) -> Result<(), BackendError> {
+            let Some(prepared) = self.prepared_cgroup.take() else {
+                return Ok(());
+            };
+            let path = prepared.path;
+            drop(prepared.descriptor);
+            fs::remove_dir(&path)
+                .map_err(|error| io_error(step, "remove constrained cgroup", &error))
         }
 
         fn install_identity_map(
@@ -600,52 +726,66 @@ mod implementation {
             step: IsolationStep,
             config: &CgroupConfig,
         ) -> Result<(), BackendError> {
-            self.previous_cgroup = Some(current_cgroup_path(step, &config.root)?);
-            let path = config.root.join(&config.name);
-            fs::create_dir(&path).map_err(|error| io_error(step, "create cgroup", &error))?;
-            self.created_cgroup = Some(path.clone());
-            let result = (|| {
-                write_text(
+            let prepared = self.prepared_cgroup.as_ref().ok_or_else(|| {
+                BackendError::new(
                     step,
-                    &path.join("memory.max"),
-                    &config.memory_max_bytes.to_string(),
-                )?;
-                write_text(step, &path.join("pids.max"), &config.pids_max.to_string())?;
-                write_text(step, &path.join("cgroup.procs"), &current_pid().to_string())?;
-                Ok::<(), BackendError>(())
-            })();
-            if let Err(error) = result {
-                if let Err(cleanup_error) = fs::remove_dir(&path) {
-                    return Err(BackendError::new(
-                        step,
-                        format!(
-                            "{error}; failed to remove partially configured cgroup: {cleanup_error}"
-                        ),
-                        cleanup_error.raw_os_error(),
-                    ));
-                }
-                self.created_cgroup = None;
-                self.previous_cgroup = None;
-                return Err(error);
+                    "isolated child has no cgroup prepared by its launcher",
+                    None,
+                )
+            })?;
+            let expected_path = config.root.join(&config.name);
+            if prepared.path != expected_path {
+                return Err(BackendError::new(
+                    step,
+                    "isolated child received a cgroup prepared for a different policy",
+                    None,
+                ));
+            }
+            let path = PathBuf::from(format!("/proc/self/fd/{}", prepared.descriptor.as_raw_fd()));
+            let memory_max = fs::read_to_string(path.join("memory.max")).map_err(|error| {
+                io_error(step, "read preconfigured memory cgroup limit", &error)
+            })?;
+            if memory_max.trim() != config.memory_max_bytes.to_string() {
+                return Err(BackendError::new(
+                    step,
+                    "isolated child cgroup has an unexpected memory limit",
+                    None,
+                ));
+            }
+            let pids_max = fs::read_to_string(path.join("pids.max"))
+                .map_err(|error| io_error(step, "read preconfigured PID cgroup limit", &error))?;
+            if pids_max.trim() != config.pids_max.to_string() {
+                return Err(BackendError::new(
+                    step,
+                    "isolated child cgroup has an unexpected PID limit",
+                    None,
+                ));
+            }
+            let members = fs::read_to_string(path.join("cgroup.procs"))
+                .map_err(|error| io_error(step, "read preconfigured cgroup membership", &error))?;
+            if !members
+                .split_whitespace()
+                .any(|member| member == current_pid().to_string())
+            {
+                return Err(BackendError::new(
+                    step,
+                    "isolated child was not created inside its constrained cgroup",
+                    None,
+                ));
             }
             Ok(())
         }
 
         fn rollback_cgroup(&mut self, step: IsolationStep) -> Result<(), BackendError> {
-            let previous = self.previous_cgroup.as_ref().ok_or_else(|| {
-                BackendError::new(step, "previous cgroup membership was not recorded", None)
+            self.prepared_cgroup.as_ref().ok_or_else(|| {
+                BackendError::new(
+                    step,
+                    "isolated child had no launcher-owned cgroup to retain for cleanup",
+                    None,
+                )
             })?;
-            let created = self.created_cgroup.as_ref().ok_or_else(|| {
-                BackendError::new(step, "created cgroup path was not recorded", None)
-            })?;
-            write_text(
-                step,
-                &previous.join("cgroup.procs"),
-                &current_pid().to_string(),
-            )?;
-            fs::remove_dir(created).map_err(|error| io_error(step, "remove cgroup", &error))?;
-            self.previous_cgroup = None;
-            self.created_cgroup = None;
+            // The parent launcher owns the cgroup and removes it only after it has reaped the
+            // child.  The isolated child cannot safely alter its parent-owned cgroup namespace.
             Ok(())
         }
 
@@ -798,25 +938,50 @@ mod implementation {
         }
     }
 
-    fn prepare_namespaces(step: IsolationStep) -> Result<NamespacePreparation, BackendError> {
-        let before = observe_pid_namespaces(step)?;
-        let flags = libc::CLONE_NEWUSER
-            | libc::CLONE_NEWNS
-            | libc::CLONE_NEWPID
-            | libc::CLONE_NEWNET
-            | libc::CLONE_NEWIPC
-            | libc::CLONE_NEWUTS
-            | libc::CLONE_NEWCGROUP;
-        // SAFETY: `flags` is a fixed allowlisted set and no pointer crosses the FFI boundary.
-        let result = unsafe { libc::unshare(flags) };
+    fn clone_into_cgroup(
+        step: IsolationStep,
+        cgroup_descriptor: RawFd,
+    ) -> Result<libc::pid_t, BackendError> {
+        let flags = (libc::CLONE_NEWUSER as u64)
+            | (libc::CLONE_NEWNS as u64)
+            | (libc::CLONE_NEWPID as u64)
+            | (libc::CLONE_NEWNET as u64)
+            | (libc::CLONE_NEWIPC as u64)
+            | (libc::CLONE_NEWUTS as u64)
+            | (libc::CLONE_NEWCGROUP as u64)
+            | CLONE_INTO_CGROUP;
+        let arguments = CloneArgs {
+            flags,
+            pidfd: 0,
+            child_tid: 0,
+            parent_tid: 0,
+            exit_signal: libc::SIGCHLD as u64,
+            stack: 0,
+            stack_size: 0,
+            tls: 0,
+            set_tid: 0,
+            set_tid_size: 0,
+            cgroup: u64::from(cgroup_descriptor.cast_unsigned()),
+        };
+        // SAFETY: the arguments contain an allowlisted namespace set, the cgroup fd remains open
+        // through the call, and no pointer survives the syscall. The caller blocks signals and
+        // verifies it is single-threaded before creating this child.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_clone3,
+                &raw const arguments,
+                std::mem::size_of::<CloneArgs>(),
+            )
+        };
         if result == -1 {
-            return Err(last_error(step, "unshare required namespaces"));
+            return Err(last_error(
+                step,
+                "clone isolation child into constrained cgroup and required namespaces",
+            ));
         }
-
-        // `CLONE_NEWPID` affects the next child, not this launcher. The pending namespace cannot
-        // be observed reliably through procfs until that child exists, so its stable identity is
-        // collected by the parent after `fork`; child entry still proves it differs from `before`.
-        Ok(NamespacePreparation::attest(before.current, before.current))
+        libc::pid_t::try_from(result).map_err(|_| {
+            BackendError::new(step, "clone3 returned a PID outside the pid_t ABI", None)
+        })
     }
 
     // Consuming the preparation token prevents a caller from verifying it twice.
@@ -1630,6 +1795,15 @@ mod implementation {
         }
     }
 
+    fn clone3_is_available() -> bool {
+        // A null argument with a zero structure size cannot create a process. Implemented kernels
+        // reject it with EINVAL or EFAULT, while kernels without clone3 return ENOSYS.
+        // SAFETY: no valid clone arguments are provided, so this availability probe has no child.
+        let result =
+            unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<CloneArgs>(), 0_usize) };
+        result >= 0 || errno() != libc::ENOSYS
+    }
+
     fn combine_results(
         first: Result<(), BackendError>,
         second: Result<(), BackendError>,
@@ -2023,19 +2197,6 @@ mod implementation {
 
     fn write_text(step: IsolationStep, path: &Path, value: &str) -> Result<(), BackendError> {
         fs::write(path, value).map_err(|error| io_error(step, "write kernel control file", &error))
-    }
-
-    fn current_cgroup_path(
-        step: IsolationStep,
-        cgroup_root: &Path,
-    ) -> Result<PathBuf, BackendError> {
-        let content = fs::read_to_string("/proc/self/cgroup")
-            .map_err(|error| io_error(step, "read current cgroup membership", &error))?;
-        let path = content
-            .lines()
-            .find_map(|line| line.strip_prefix("0::"))
-            .ok_or_else(|| BackendError::new(step, "unified cgroup membership is missing", None))?;
-        Ok(cgroup_root.join(path.trim_start_matches('/')))
     }
 
     fn rootfs_path(rootfs_target: &Path, target: &Path) -> Option<PathBuf> {

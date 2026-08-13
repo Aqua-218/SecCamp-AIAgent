@@ -325,6 +325,31 @@ pub struct SessionFirecrackerRequest {
 }
 
 impl SessionFirecrackerRequest {
+    /// Creates the exact session-scoped input supplied to a Firecracker provisioner.
+    ///
+    /// Callers that implement [`PerSessionFirecrackerFactory`] can use this constructor in
+    /// integration tests. Production composition constructs the request only after the
+    /// orchestrator has durably allocated `identity`; provisioners must still validate every
+    /// field before creating a session-owned resource.
+    #[must_use]
+    pub fn new(
+        identity: SessionIdentity,
+        runtime_config: RuntimeConfig,
+        snapshot_id: SnapshotId,
+        snapshot_path: impl Into<PathBuf>,
+        memory_path: impl Into<PathBuf>,
+        guest_control_port: u32,
+    ) -> Self {
+        Self {
+            identity,
+            runtime_config,
+            snapshot_id,
+            snapshot_path: snapshot_path.into(),
+            memory_path: memory_path.into(),
+            guest_control_port,
+        }
+    }
+
     /// Returns the only session identity accepted for this preparation.
     #[must_use]
     pub const fn identity(&self) -> SessionIdentity {

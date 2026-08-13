@@ -34,6 +34,32 @@ const SNAPSHOT_MEMORY_BYTES: &[u8] = b"snapshot-memory";
 
 static UNIX_API_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+fn read_test_api_request(stream: &mut impl Read) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut expected_length = None;
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let count = stream.read(&mut buffer).expect("test API server must read");
+        assert!(count > 0, "client closed before completing its request");
+        request.extend_from_slice(&buffer[..count]);
+
+        if expected_length.is_none()
+            && let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+        {
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .and_then(|value| value.parse::<usize>().ok())
+                .expect("client must send content length");
+            expected_length = Some(header_end + 4 + content_length);
+        }
+        if expected_length.is_some_and(|length| request.len() >= length) {
+            return request;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct MockRunner {
     events: Events,
@@ -797,22 +823,7 @@ fn unix_api_client_sends_real_http_over_unix_socket() {
     let listener = UnixListener::bind(&socket).expect("test Unix socket must bind");
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("test API server must accept");
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 1024];
-        let length = loop {
-            let count = stream.read(&mut buffer).expect("test API server must read");
-            request.extend_from_slice(&buffer[..count]);
-            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&request[..header_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Content-Length: "))
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .expect("client must send content length");
-                break header_end + 4 + content_length;
-            }
-        };
-        assert!(request.len() >= length);
+        let request = read_test_api_request(&mut stream);
         assert!(String::from_utf8_lossy(&request).starts_with("PUT /machine-config HTTP/1.1"));
         let response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         stream
@@ -845,6 +856,7 @@ fn request_with_response(name: &str, response: &[u8]) -> Result<ApiResponse, Run
     let response = response.to_vec();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("test API server must accept");
+        let _request = read_test_api_request(&mut stream);
         stream
             .write_all(&response)
             .expect("test API server must respond");
@@ -933,7 +945,10 @@ fn unix_api_client_rejects_unsupported_and_out_of_range_status_lines() {
         b"HTTP/2 200 OK\r\nContent-Length: 0\r\n\r\n",
     )
     .expect_err("unsupported HTTP version must fail closed");
-    assert!(matches!(error, RuntimeError::Api(message) if message.contains("HTTP version")));
+    assert!(
+        matches!(&error, RuntimeError::Api(message) if message.contains("HTTP version")),
+        "unexpected unsupported-version error: {error:?}"
+    );
 
     let error = request_with_response(
         "out-of-range-status",

@@ -26,13 +26,13 @@ use authority_core::capability::SubjectId;
 use rustix::{
     fs::{AtFlags, CWD, Mode, chmodat},
     net::{
-        AddressFamily, RecvFlags, SocketAddrUnix, SocketFlags, SocketType, accept, bind, listen,
-        recv, socket_with, sockopt::socket_peercred,
+        AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType, accept, bind,
+        listen, recv, send, socket_with, sockopt::socket_peercred,
     },
 };
 
 use crate::{
-    protocol::{MAX_WIRE_REQUEST_BYTES, WireDecodeError, WireRequest},
+    protocol::{MAX_WIRE_REQUEST_BYTES, WireDecodeError, WireRequest, WireResponse},
     supervisor::{CallerResolver, ConnectionIdentity},
 };
 
@@ -227,6 +227,8 @@ pub enum ControlSocketError {
     PeerClosed,
     /// The bounded request could not be decoded.
     Decode(WireDecodeError),
+    /// The bounded reply could not be encoded.
+    Encode(String),
 }
 
 impl fmt::Display for ControlSocketError {
@@ -250,6 +252,9 @@ impl fmt::Display for ControlSocketError {
                 formatter.write_str("control peer closed the connection before sending a request")
             }
             Self::Decode(error) => error.fmt(formatter),
+            Self::Encode(message) => {
+                write!(formatter, "control reply could not be encoded: {message}")
+            }
         }
     }
 }
@@ -263,7 +268,8 @@ impl Error for ControlSocketError {
             Self::InvalidPath(_)
             | Self::SocketIdExhausted
             | Self::RequestTooLarge { .. }
-            | Self::PeerClosed => None,
+            | Self::PeerClosed
+            | Self::Encode(_) => None,
         }
     }
 }
@@ -408,6 +414,28 @@ impl AcceptedControlConnection {
             return Err(ControlSocketError::RequestTooLarge { received });
         }
         WireRequest::decode(&buffer[..received]).map_err(ControlSocketError::Decode)
+    }
+
+    /// Sends one bounded reply as a single datagram.
+    ///
+    /// A guest that never receives a reply cannot tell a refused request from a lost one, so it
+    /// retries, and a retried close is exactly the shape that produces stale-handle errors. The
+    /// reply carries no identifier, so answering costs nothing in disclosure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlSocketError`] when the reply cannot be encoded or the peer is gone.
+    pub fn send_response(&self, response: WireResponse) -> Result<(), ControlSocketError> {
+        let encoded = response
+            .encode()
+            .map_err(|error| ControlSocketError::Encode(error.to_string()))?;
+        let sent = send(self.socket.as_fd(), &encoded, SendFlags::empty())?;
+        if sent != encoded.len() {
+            return Err(ControlSocketError::Io(io::Error::other(
+                "control reply was partially sent",
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -610,6 +638,54 @@ mod tests {
             &std::fs::symlink_metadata(listener.path()).expect("socket node must exist"),
         );
         assert_eq!(mode & 0o777, 0o600);
+        drop(std::fs::remove_file(&path));
+    }
+    #[test]
+    fn a_reply_reaches_the_peer_as_one_bounded_datagram() {
+        let path = socket_path("reply");
+        let mut listener =
+            SubjectControlListener::bind(&path, SubjectId::new("subject-a"), self_credential(), 4)
+                .expect("listener must bind");
+        let mut resolver = SubjectCredentialResolver::new();
+        let encoded = WireRequest::CloseSubject {
+            claimed_subject: SubjectId::new("subject-a"),
+        }
+        .encode()
+        .expect("request must encode");
+
+        let client_path = path.clone();
+        let client = thread::spawn(move || {
+            let address = SocketAddrUnix::new(&client_path).expect("test address must encode");
+            let client = socket_with(
+                AddressFamily::UNIX,
+                SocketType::SEQPACKET,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .expect("test client socket must be creatable");
+            rustix::net::connect(&client, &address).expect("test client must connect");
+            send(&client, &encoded, SendFlags::empty()).expect("test client must send");
+            let mut buffer = [0_u8; crate::protocol::MAX_WIRE_RESPONSE_BYTES];
+            let received = recv(&client, &mut buffer[..], RecvFlags::empty())
+                .expect("test client must receive one reply")
+                .0;
+            WireResponse::decode(&buffer[..received]).expect("reply must decode")
+        });
+
+        let connection = listener.accept(&mut resolver).expect("accept must succeed");
+        connection
+            .receive_request()
+            .expect("bounded request must decode");
+        connection
+            .send_response(WireResponse::Refused(
+                crate::protocol::RefusalCode::NotPermitted,
+            ))
+            .expect("reply must send");
+
+        assert_eq!(
+            client.join().expect("test client must finish"),
+            WireResponse::Refused(crate::protocol::RefusalCode::NotPermitted)
+        );
         drop(std::fs::remove_file(&path));
     }
 }

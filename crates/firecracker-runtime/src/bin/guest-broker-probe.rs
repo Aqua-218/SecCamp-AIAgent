@@ -85,7 +85,8 @@ fn run(stage: &mut u8) -> Result<(), String> {
         .map_err(|error| format!("writing fixed probe frame: {error}"))?;
 
     *stage = 8;
-    let response = read_response(&mut channel)?;
+    let response = read_response(&mut channel)
+        .map_err(|error| format!("{error}; fixed probe request used Broker session {session:?}"))?;
     *stage = 9;
     if response.request() != PROBE_REQUEST {
         return Err("host response did not bind the fixed probe request".to_owned());

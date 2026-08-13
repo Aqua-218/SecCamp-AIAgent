@@ -11,7 +11,7 @@ set -euo pipefail
 
 usage() {
   printf '%s\n' \
-    'usage: build-guest-runtime-image.sh --base-rootfs PATH --guest-control-init PATH --guest-supervisor-init PATH --isolation-launcher PATH --agent-workload PATH --repository ID --file-effects CANONICAL-LIST --path-prefix /|PATH --port PORT --output-rootfs PATH --output-hash PATH' >&2
+    'usage: build-guest-runtime-image.sh --base-rootfs PATH --guest-control-init PATH --guest-supervisor-init PATH --isolation-launcher PATH --agent-workload PATH --repository ID --file-effects CANONICAL-LIST --path-prefix /|PATH --port PORT --broker-port PORT --output-rootfs PATH --output-hash PATH' >&2
 }
 
 fail() {
@@ -151,6 +151,7 @@ repository=''
 file_effects=''
 path_prefix=''
 port=''
+broker_port=''
 output_rootfs=''
 output_hash=''
 
@@ -201,6 +202,11 @@ while [[ "$#" -gt 0 ]]; do
       port="$2"
       shift 2
       ;;
+    --broker-port)
+      [[ "$#" -ge 2 ]] || { usage; exit 2; }
+      broker_port="$2"
+      shift 2
+      ;;
     --output-rootfs)
       [[ "$#" -ge 2 ]] || { usage; exit 2; }
       output_rootfs="$2"
@@ -222,7 +228,7 @@ done
   usage
   exit 2
 }
-[[ -n "${isolation_launcher}" && -n "${agent_workload}" && -n "${repository}" && -n "${file_effects}" && -n "${path_prefix}" ]] || {
+[[ -n "${isolation_launcher}" && -n "${agent_workload}" && -n "${repository}" && -n "${file_effects}" && -n "${path_prefix}" && -n "${broker_port}" ]] || {
   usage
   exit 2
 }
@@ -231,6 +237,8 @@ validate_file_effects "${file_effects}"
 validate_path_prefix "${path_prefix}"
 [[ "${port}" =~ ^[0-9]+$ ]] || fail 'port must be decimal'
 ((port > 0 && port < 4294967295)) || fail 'port must be explicit, non-zero, and non-wildcard'
+[[ "${broker_port}" =~ ^[0-9]+$ ]] || fail 'broker port must be decimal'
+((broker_port > 0 && broker_port < 4294967295)) || fail 'broker port must be explicit, non-zero, and non-wildcard'
 
 for input in "${base_rootfs}" "${guest_control_init}" "${guest_supervisor_init}" "${isolation_launcher}" "${agent_workload}"; do
   require_absolute_file 'runtime input' "${input}"
@@ -297,4 +305,4 @@ sha256sum "${output_rootfs}" | awk '{print $1}'
 printf 'hash SHA-256: '
 sha256sum "${output_hash}" | awk '{print $1}'
 grep -E '^Root hash:' "${output_verity}"
-printf 'boot args: console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init -- --port %s --workload /usr/local/libexec/guest-supervisor-init -- --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository %s --file-effects %s --path-prefix %s\n' "${port}" "${repository}" "${file_effects}" "${path_prefix}"
+printf 'boot args: console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init -- --port %s --workload /usr/local/libexec/guest-supervisor-init -- --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port %s --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository %s --file-effects %s --path-prefix %s\n' "${port}" "${broker_port}" "${repository}" "${file_effects}" "${path_prefix}"

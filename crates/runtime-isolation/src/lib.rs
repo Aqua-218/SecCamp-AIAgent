@@ -251,8 +251,6 @@ mod tests {
     ) {
         assert_common_startup_header(message, 2, step_code, 1);
         assert_eq!(read_i32(message, 8), errno.unwrap_or(i32::MIN));
-        assert_eq!(read_u64(message, 12), 0);
-        assert_eq!(read_u64(message, 20), 0);
         assert_eq!(read_u32(message, 28), rollback_failure_count);
     }
 

@@ -72,6 +72,7 @@ Unix の permission bit と同じ形にする。
 - Lean の `allFileEffects` が 10 要素の列挙になり、`fileEffectsBelow` の計算がその上を走る。variant を増やすとここも増える。
 - `mask()` が `u16` なので 16 variant までしか入らない。17 個目を足すときは bitset の型を広げる必要がある。
 - effect を増やす変更は Rust enum、Lean inductive、`allFileEffects`、両言語の test、capfs の対応表の 5 箇所に同時に現れる。1 箇所で静かに増えない。
+- link 対応で `ReadLink`、`CreateSymlink`、`CreateHardLink` の 3 つが加わり、現在は 13 variant である。分割の基準は変えていない（[ADR 0017](0017-authorize-an-aliased-inode-on-every-name.md)）。discriminant は durable audit record に符号化されるため、追加は末尾のみとする。`u16` の残りは 3。
 - 空 effect 集合の扱いについては [ADR 0003](0003-require-repository-and-path-match-for-empty-effects.md) を参照する。
 
 ## 関連

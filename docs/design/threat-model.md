@@ -86,12 +86,14 @@ supervisor は TCB なので、侵害後も細粒度 Capability が守られる�
 - supervisor 再起動後の Capability 復元。
 - Agent / Tool からの raw TCP / UDP。
 
-次は初期実装で拒否する。symlink には後続の対応計画があり、hard link と共有書き込み `mmap` は別の認可モデルができるまで拒否を維持する。
+次は拒否を維持する。
 
-- symlink または hard link を含む workspace。
-- `SYMLINK`、`LINK`、共有書き込み `mmap`。
+- device、FIFO、socket、`MKNOD`、`O_TMPFILE`、共有書き込み `mmap`。
+- repository の外へ解決される symlink target。絶対 path と、root より上へ climb する相対 path の両方。
+- inode の名前が repository の外にもある hard link。その名前は `capfs` が認可を検査できない。
+- directory への hard link。
 
-symlink は、link 解決後の canonical target path で認可する後続機能として追加する。hard link は複数 path が同じ inode を共有するため、別の alias-aware な認可モデルまたは import 時の分離を必要とする。詳細は[capfs](capfs.md#symlink-は後続機能として追加する)を参照する。
+symlink と hard link を含む workspace 自体は扱う。symlink は registry が target を所有し、`READLINK` のたびに link の現在 path から再解決して、外へ出るなら本文を kernel へ渡さない。hard link を持つ inode は、その**全ての**名前に対して認可される。alias を増やして権限が広がることはなく、増えるのは要求される authority の方である。詳細は [capfs](capfs.md#symlink-は-registry-が-target-を所有する) と [ADR 0017](../decisions/0017-authorize-an-aliased-inode-on-every-name.md) を参照する。
 
 ## 関連
 

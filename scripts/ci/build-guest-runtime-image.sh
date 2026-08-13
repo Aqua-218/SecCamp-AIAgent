@@ -27,6 +27,49 @@ require_absolute_file() {
   [[ -x "${path}" ]] || fail "${label} must be executable: ${path}"
 }
 
+install_elf_dependencies() {
+  local executable="$1"
+  local output=''
+  local line=''
+  local library=''
+
+  if ! output="$(LC_ALL=C ldd -- "${executable}" 2>&1)"; then
+    case "${output}" in
+      *'not a dynamic executable'*|*'statically linked'*)
+        return 0
+        ;;
+      *)
+        fail "could not resolve ELF dependencies for ${executable}: ${output}"
+        ;;
+    esac
+  fi
+
+  case "${output}" in
+    *'not a dynamic executable'*|*'statically linked'*)
+      return 0
+      ;;
+  esac
+
+  while IFS= read -r line; do
+    case "${line}" in
+      *' => '*)
+        library="${line#* => }"
+        library="${library%% *}"
+        ;;
+      [[:space:]]/*)
+        library="${line#${line%%[![:space:]]*}}"
+        library="${library%% *}"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+    [[ "${library}" == /* ]] || fail "ELF dependency is not an absolute path: ${library}"
+    [[ -f "${library}" ]] || fail "ELF dependency is not a regular file: ${library}"
+    install -D -m 0755 "${library}" "${staging}/root${library}"
+  done <<< "${output}"
+}
+
 require_absolute_lexical_path() {
   local label="$1"
   local path="$2"
@@ -156,6 +199,7 @@ require_output_file_or_absent 'verity output' "${output_verity}"
 command -v unsquashfs >/dev/null || fail 'unsquashfs is required'
 command -v mksquashfs >/dev/null || fail 'mksquashfs is required'
 command -v veritysetup >/dev/null || fail 'veritysetup is required'
+command -v ldd >/dev/null || fail 'ldd is required to close ELF dependencies into the guest rootfs'
 
 staging="$(mktemp -d "${output_directory}/.guest-runtime-image.XXXXXX")"
 cleanup() {
@@ -168,6 +212,9 @@ install -D -m 0755 "${guest_control_init}" "${staging}/root/usr/local/libexec/gu
 install -D -m 0755 "${guest_supervisor_init}" "${staging}/root/usr/local/libexec/guest-supervisor-init"
 install -D -m 0755 "${isolation_launcher}" "${staging}/root/usr/local/libexec/workload-isolation-launcher"
 install -D -m 0755 "${agent_workload}" "${staging}/root/usr/local/libexec/agent-workload"
+for executable in "${guest_control_init}" "${guest_supervisor_init}" "${isolation_launcher}" "${agent_workload}"; do
+  install_elf_dependencies "${executable}"
+done
 install -d -m 0755 "${staging}/root/run/guest-supervisor"
 install -d -m 0755 "${staging}/root/workspace"
 install -d -m 1777 "${staging}/root/tmp"

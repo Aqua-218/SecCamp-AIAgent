@@ -27,5 +27,15 @@ fi
 export ELAN_HOME="${elan_home}"
 export PATH="${elan_home}/bin:${PATH}"
 
-elan toolchain install "${lean_toolchain}"
+toolchain_installed=false
+while IFS= read -r installed_toolchain; do
+  if [[ "${installed_toolchain%% *}" == "${lean_toolchain}" ]]; then
+    toolchain_installed=true
+    break
+  fi
+done < <(elan toolchain list)
+
+if [[ "${toolchain_installed}" == false ]]; then
+  elan toolchain install "${lean_toolchain}"
+fi
 printf '%s\n' "${elan_home}/bin"

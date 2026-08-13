@@ -1232,7 +1232,11 @@ mod tests {
         let lease = backend
             .establish_broker_session(&identity(10))
             .expect("Broker establishment must succeed");
+        // The typed exit below only exists once the worker has published its connection shutdown
+        // slot. Releasing the runtime before that races the worker into a plain `Cancelled` exit,
+        // so an expired wait is reported as itself instead of as a surprising exit variant.
         let deadline = Instant::now() + Duration::from_secs(1);
+        let mut reached_connection = false;
         while shutdowns.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             if let Some(active) = backend.active.as_ref()
                 && active
@@ -1241,10 +1245,15 @@ mod tests {
                     .expect("shutdown slot must not be poisoned")
                     .is_some()
             {
+                reached_connection = true;
                 break;
             }
             thread::yield_now();
         }
+        assert!(
+            reached_connection || shutdowns.load(Ordering::SeqCst) != 0,
+            "the worker must publish its connection shutdown slot before the runtime is released"
+        );
         release_runtime(&gate);
 
         backend

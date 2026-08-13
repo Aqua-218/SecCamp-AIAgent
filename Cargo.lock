@@ -1316,6 +1316,7 @@ name = "runtime-isolation"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustix",
 ]
 
 [[package]]

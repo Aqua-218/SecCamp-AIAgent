@@ -119,7 +119,7 @@ flowchart LR
 | 境界 | 実装済み | mock/contract 検証済み | 実機・外部統合の状態 |
 |---|---|---|---|
 | Authority core と audit | typed authority、状態遷移、`auth_epoch`、in-memory audit、`DurableAuditLog` の WAL/receipt | Rust/Lean 共通 corpus、property test、loom、durable audit contract test | 複数 process の journal owner 調整、実 provider との receipt reconciliation は未検証 |
-| capfs | link-free preflight、namespace/node table、Direct-I/O FUSE adapter | module/contract test と環境依存の実 mount test | 全 interleaving の loom、敵対的 backing 差し替え、隔離層との end-to-end は未検証 |
+| capfs | preflight、namespace/node table、link を含む Direct-I/O FUSE adapter | module/contract test と環境依存の実 mount test | 全 interleaving の loom、敵対的 backing 差し替え、隔離層との end-to-end は未検証 |
 | `egress-broker` | bounded transport、typed dispatch、DNS/IP policy、公開 HTTPS、型付き GitHub adapter | fake resolver/connector/provider による module test | 実 `AF_VSOCK`、外部 DNS/HTTPS/GitHub API、guest-to-host は未検証 |
 | `runtime-isolation` | policy validation、`LinuxBackend`、13 段階の ordered apply/rollback | mock backend test、host capability detection | privileged isolation apply、workload 実行中の escape test は未検証 |
 | `firecracker-runtime` | artifact pin、dm-verity/jailer/API 順序、workspace、snapshot/restore、identity/workload gate | fake boundary test、local Unix socket HTTP exchange | 実 Firecracker/jailer/dm-verity/guest kernel/VM は未検証 |

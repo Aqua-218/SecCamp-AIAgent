@@ -28,6 +28,7 @@ use rustix::{
 };
 
 const LANDLOCK_ABI: u32 = 3;
+const ISOLATION_READY: &[u8; 8] = b"isolated";
 
 #[derive(Debug)]
 struct LauncherConfig {
@@ -52,7 +53,7 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), String> {
     let config = parse_config(env::args_os().skip(1))?;
-    wait_for_start_gate(&config.start_gate)?;
+    let mut start_gate = wait_for_start_gate(&config.start_gate)?;
     let control_channel = connect_control_channel(&config.control_socket)?;
     let control_channel_fd = control_channel.as_raw_fd();
     let isolation = config.isolation.clone().with_control_channel(
@@ -68,7 +69,11 @@ fn run() -> Result<(), String> {
                 .wait_for_startup()
                 .map_err(|error| format!("waiting for isolated workload startup: {error}"))?
             {
-                ChildStartupStatus::Ready(_) => {}
+                ChildStartupStatus::Ready(_) => {
+                    start_gate.write_all(ISOLATION_READY).map_err(|error| {
+                        format!("confirming isolated workload startup to parent: {error}")
+                    })?;
+                }
                 ChildStartupStatus::Failed(failure) => {
                     return Err(format!(
                         "isolated workload setup failed at {:?} (errno {:?}, rollback failures {}, termination required {})",
@@ -124,7 +129,7 @@ fn connect_control_channel(path: &Path) -> Result<OwnedFd, String> {
     Ok(descriptor)
 }
 
-fn wait_for_start_gate(path: &Path) -> Result<(), String> {
+fn wait_for_start_gate(path: &Path) -> Result<UnixStream, String> {
     let mut gate = UnixStream::connect(path).map_err(|error| {
         format!(
             "connecting to parent-controlled workload start gate {}: {error}",
@@ -137,7 +142,7 @@ fn wait_for_start_gate(path: &Path) -> Result<(), String> {
     gate.read_exact(&mut release)
         .map_err(|error| format!("waiting for workload start-gate release: {error}"))?;
     if release == [1] {
-        Ok(())
+        Ok(gate)
     } else {
         Err("parent refused workload start-gate release".to_owned())
     }

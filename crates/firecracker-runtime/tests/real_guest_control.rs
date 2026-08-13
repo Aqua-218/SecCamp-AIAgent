@@ -71,7 +71,7 @@ impl GuestWorkload {
         match self {
             Self::Sleep => "sleep 600",
             Self::CgroupProbe => {
-                r#"sh -c \"mkdir -p /sys/fs/cgroup; mount -t cgroup2 none /sys/fs/cgroup; printf 'cgroup-probe: '; cat /proc/cgroups; printf 'cgroup-probe-controllers: '; cat /sys/fs/cgroup/cgroup.controllers; sleep 600\""#
+                r#"sh -c \"/usr/local/libexec/guest-workload mkdir -p /sys/fs/cgroup; /usr/local/libexec/guest-workload mount -t cgroup2 none /sys/fs/cgroup; printf 'cgroup-probe-controllers: '; /usr/local/libexec/guest-workload cat /sys/fs/cgroup/cgroup.controllers; sleep 600\""#
             }
             Self::BrokerProbe => "--port 18081",
             Self::RuntimeBrokerProbe => {
@@ -444,17 +444,18 @@ fn real_firecracker_guest_cgroup_v2_exposes_required_controllers() {
         assert_eq!(response.body, request.canonical_acknowledgement(action));
     }
 
+    let marker = "cgroup-probe-controllers: ";
     let deadline = Instant::now() + API_WAIT;
     let serial = loop {
         let serial = vm.guest_serial_log();
-        if serial.contains("cgroup-probe-controllers: ") || Instant::now() >= deadline {
+        if serial.matches(marker).count() >= 2 || Instant::now() >= deadline {
             break serial;
         }
         thread::sleep(Duration::from_millis(10));
     };
     let controllers = serial
-        .split("cgroup-probe-controllers: ")
-        .nth(1)
+        .rsplit(marker)
+        .next()
         .and_then(|value| value.lines().next())
         .unwrap_or_default();
     assert!(

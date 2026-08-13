@@ -7,6 +7,8 @@
 
 #![warn(clippy::all)]
 
+/// Canonical request and acknowledgement encoding for the host-to-guest control channel.
+pub mod guest_control;
 pub mod recovery;
 
 use std::collections::{HashMap, HashSet};
@@ -4086,13 +4088,19 @@ where
         let challenge = instance.guest_control_challenge.ok_or_else(|| {
             RuntimeError::StaleIdentity("resumed VM has no guest-control challenge".to_owned())
         })?;
+        let request =
+            guest_control::GuestControlRequest::new(challenge, identities).map_err(|error| {
+                RuntimeError::StaleIdentity(format!("invalid guest-control request: {error}"))
+            })?;
         self.control_call_with_identity_ack(
             ApiRequest {
                 method: HttpMethod::Put,
-                path: "/actions/inject-identity".to_owned(),
-                body: guest_control_request_body(challenge, &identities),
+                path: guest_control::GuestControlAction::InjectIdentity
+                    .path()
+                    .to_owned(),
+                body: request.canonical_body(),
             },
-            &guest_control_ack_body("identity-injected", challenge, &identities),
+            &request.canonical_acknowledgement(guest_control::GuestControlAction::InjectIdentity),
         )?;
         instance.state = RuntimeState::IdentityInjected;
         Ok(())
@@ -4123,13 +4131,19 @@ where
                 "identity-injected state has no guest-control challenge".to_owned(),
             )
         })?;
+        let request =
+            guest_control::GuestControlRequest::new(challenge, identities).map_err(|error| {
+                RuntimeError::StaleIdentity(format!("invalid guest-control request: {error}"))
+            })?;
         self.control_call_with_identity_ack(
             ApiRequest {
                 method: HttpMethod::Put,
-                path: "/actions/start-workload".to_owned(),
-                body: guest_control_request_body(challenge, &identities),
+                path: guest_control::GuestControlAction::StartWorkload
+                    .path()
+                    .to_owned(),
+                body: request.canonical_body(),
             },
-            &guest_control_ack_body("workload-started", challenge, &identities),
+            &request.canonical_acknowledgement(guest_control::GuestControlAction::StartWorkload),
         )?;
         instance.state = RuntimeState::Running;
         Ok(())
@@ -4553,35 +4567,6 @@ fn json_string(value: &str) -> String {
     }
     escaped.push('"');
     escaped
-}
-
-fn guest_control_request_body(challenge: IdentityId, identities: &IdentityBundle) -> String {
-    format!(
-        "{{\"challenge\":{},\"vm_id\":{},\"session_id\":{},\"request_id\":{},\"subject_id\":{},\"capability_id\":{}}}",
-        json_string(&challenge.to_hex()),
-        json_string(&identities.vm_id.to_hex()),
-        json_string(&identities.session_id.to_hex()),
-        json_string(&identities.request_id.to_hex()),
-        json_string(&identities.subject_id.to_hex()),
-        json_string(&identities.capability_id.to_hex())
-    )
-}
-
-fn guest_control_ack_body(
-    acknowledgement: &str,
-    challenge: IdentityId,
-    identities: &IdentityBundle,
-) -> String {
-    format!(
-        "{{\"ack\":{},\"challenge\":{},\"vm_id\":{},\"session_id\":{},\"request_id\":{},\"subject_id\":{},\"capability_id\":{}}}",
-        json_string(acknowledgement),
-        json_string(&challenge.to_hex()),
-        json_string(&identities.vm_id.to_hex()),
-        json_string(&identities.session_id.to_hex()),
-        json_string(&identities.request_id.to_hex()),
-        json_string(&identities.subject_id.to_hex()),
-        json_string(&identities.capability_id.to_hex())
-    )
 }
 
 #[derive(Debug)]
@@ -6260,13 +6245,17 @@ mod tests {
             let response = if mismatch == "nonce" {
                 let mut wrong_challenge = challenge;
                 wrong_challenge.0[0] ^= 1;
-                guest_control_ack_body("identity-injected", wrong_challenge, &identities)
+                guest_control::GuestControlRequest::new(wrong_challenge, identities.clone())
+                    .expect("wrong challenge remains independent from test identities")
+                    .canonical_acknowledgement(guest_control::GuestControlAction::InjectIdentity)
             } else {
                 let mut wrong_identities = identities.clone();
                 wrong_identities.session_id =
                     IdentityId::from_hex("00000000000000000000000000000007")
                         .expect("wrong identity fixture must be valid");
-                guest_control_ack_body("identity-injected", challenge, &wrong_identities)
+                guest_control::GuestControlRequest::new(challenge, wrong_identities)
+                    .expect("wrong test identity remains distinct")
+                    .canonical_acknowledgement(guest_control::GuestControlAction::InjectIdentity)
             };
             runtime.guest_client.response_bodies.push_back(response);
 

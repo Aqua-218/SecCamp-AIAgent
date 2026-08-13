@@ -12,7 +12,7 @@
 
 - **実装済み:** 型、API、production adapter のコードが repository にある。
 - **mock/contract 検証済み:** fake、mock、module test、local contract test で境界を確認した。
-- **実機未検証:** 特権 kernel 操作、実 VM、実 `AF_VSOCK`、外部 DNS/HTTPS/provider、guest-to-host end-to-end をまだ実行していない。
+- **実機未検証:** Firecracker の guest control 以外の特権 kernel 操作、実 jailer、snapshot restore、Broker の host listener、外部 DNS/HTTPS/provider、guest-to-host egress end-to-end。
 
 ## 全体の依存関係
 
@@ -91,7 +91,7 @@ mock/contract 検証は完了している。実 `AF_VSOCK`、実 DNS、外部 HT
 
 launch は `RuntimeState::WorkloadStopped` で戻り、restore は `IdentityRegenerated` で止まる。`inject_identity` が成功して初めて `IdentityInjected`、`start_workload` が成功して `Running` へ進む。artifact、workspace、verity、jailer、API failure には rollback がある。
 
-fake command/filesystem/API/identity source による contract test と local Unix socket HTTP exchange は検証済みである。実 Firecracker process、jailer が作る namespace/cgroup、実 dm-verity device、guest kernel、snapshot/restore、VM escape、guest supervisor control channel は未検証である。実機 test が完了するまで Phase 6 を「VM 起動完了」とは表示しない。
+fake command/filesystem/API/identity source による contract test と local Unix socket HTTP exchange に加え、[`verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は実 Firecracker process、実 dm-verity device、guest kernel、guest `AF_VSOCK` control channel を通す。jailer が作る namespace/cgroup、snapshot/restore、workspace drive、VM escape、CapabilityKernel/capfs を含む guest supervisor は未検証である。したがって Phase 6 は「identity gate を持つ VM boot を実証済み」だが「VM 隔離全体が完成」ではない。
 
 ## 7. Supervisor / session orchestrator
 

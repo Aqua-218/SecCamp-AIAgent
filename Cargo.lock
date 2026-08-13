@@ -367,6 +367,8 @@ version = "0.1.0"
 dependencies = [
  "rustix",
  "sha2",
+ "socket2",
+ "tempfile",
 ]
 
 [[package]]

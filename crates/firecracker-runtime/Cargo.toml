@@ -16,3 +16,7 @@ workspace = true
 [dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
 sha2 = "0.10.9"
+socket2 = { version = "0.6.5", features = ["all"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

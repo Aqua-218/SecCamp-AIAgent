@@ -108,8 +108,8 @@ restore の失敗が resource を残さないので、retry が安全に書け�
 
 state 遷移と identity 検査は fake adapter を使う test で確認している。
 
-- guest 側の init が本当に pre-session gate で止まるかは、この crate では確認できない。`IdentityInjected` から `Running` への遷移は host 側の状態を進めるだけで、guest がそれに従うことは guest supervisor の実装に依存する。
-- identity の注入が guest に届いたことは確認していない。`control_call` は fake client 越しにしか実行していない。
+- [`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は実 VM で pre-session gate を提供し、[`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) は注入前の `start-workload` を拒否し、identity 注入後だけ固定 workload を release することを確認する。ただしこれは CapabilityKernel / capfs / runtime-isolation を起動する guest supervisor ではない。
+- 実機 test は raw boot の control channel を通す。`Runtime::restore` と snapshot の identity injection を同じ guest image で通したものではない。
 - 実 Firecracker の `/snapshot/load` が `resume_vm: true` でどう振る舞うかは未検証。
 - `forbidden_identities` の一覧が「snapshot に焼き込まれた全 identity」を漏れなく含んでいることは、この crate では保証できない。一覧を作るのは snapshot を取る側。
 - entropy source の品質は `IdentitySource` の実装依存。`SystemIdentitySource` は host kernel の entropy device を使うが、その品質はここでは検証していない。

@@ -6,7 +6,7 @@
 
 > **対象読者:** firecracker-runtime の実装者、レビュー担当者、実機で統合 test を回す人
 
-この crate の test は 3 層に分かれる。fake adapter を使う lifecycle test、実 Unix socket と実プロセスを使う adapter test、実 filesystem を使う workspace test。実 Firecracker と実 VM はどの層にも出てこない。
+この crate の test は 4 層に分かれる。fake adapter を使う lifecycle test、実 Unix socket と実プロセスを使う adapter test、実 filesystem を使う workspace test、KVM host で実 Firecracker を boot する opt-in test である。最後の層だけは root、`/dev/kvm`、`/dev/vhost-vsock`、device-mapper を要求し、通常の `cargo test` では実行しない。
 
 ## local test で確認したこと
 
@@ -78,33 +78,47 @@ symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` �
 
 `sha256_matches_nist_empty_vector`、`sha256_matches_nist_abc_vector`、`digest_parser_rejects_wrong_length_and_accepts_case`。NIST の既知 vector 2 本と、hex parser の境界。
 
+### 実 Firecracker / dm-verity / guest `AF_VSOCK`（opt-in）
+
+[`scripts/ci/verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は pinned kernel と base rootfs から static `guest-control-init` を含む squashfs image を作り、その image を実 `veritysetup open` で read-only mapper として開く。mapper を root disk にした実 Firecracker に対して、[`real_firecracker_guest_control_enforces_identity_gate_over_vsock`](../../crates/firecracker-runtime/tests/real_guest_control.rs) が次を確認する。
+
+| 境界 | 実際に確認すること |
+|---|---|
+| boot / artifact | KVM 上の Firecracker が read-only dm-verity mapper を root として起動する |
+| guest control listener | guest PID 1 が `AF_VSOCK` port 18080 で host CID からの HTTP request を受ける |
+| identity gate | identity 注入前の workload start は `409 Conflict` になる |
+| identity injection | 5 個の session-bound identity を canonical JSON で注入し、guest の canonical ACK を返す |
+| workload release | identity 注入後の start だけが canonical ACK を返し、image に固定した workload を起動する |
+
+この test は `Runtime::launch` を経由せず、Firecracker REST API を直接構成する。従って guest control の実境界は確認するが、runtime の jailer / workspace / snapshot lifecycle を実証する test ではない。
+
 ## 実行コマンド
 
 ```bash
 cargo fmt --manifest-path crates/firecracker-runtime/Cargo.toml -- --check
 cargo test --manifest-path crates/firecracker-runtime/Cargo.toml
 cargo clippy --manifest-path crates/firecracker-runtime/Cargo.toml --all-targets -- -D warnings
+
+# root、KVM、vhost-vsock、device-mapper がある Linux host でだけ実行する
+scripts/ci/verify-real-guest-control.sh
 ```
 
 ## 未検証の境界
 
 | 未検証の対象 | なぜ未検証か | 何があれば検証できる |
 |---|---|---|
-| 実 Firecracker の起動 | binary、KVM、特権が必要 | KVM が使える Linux host と pinned binary |
 | 実 jailer の隔離効果 | 特権と cgroup v2 書き込みが必要 | 同上。加えて namespace / cgroup を外から観測する手段 |
-| 実 dm-verity mapping | `veritysetup` と device-mapper が必要 | root 権限と hash image を用意した環境 |
-| Firecracker API の受理 | fake client は status 200 を返すだけ | 実 Firecracker の API socket |
 | snapshot / restore の実動作 | VM が無い | 実 VM |
-| guest 側の pre-session gate | guest supervisor が別 | VM 内で init が停止していることを観測する手段 |
-| identity 注入が guest へ届くこと | `control_call` が fake | guest control channel の実装と実 VM |
+| `Runtime::launch` の実 lifecycle | opt-in test は REST API を直接使い、jailer / workspace / rollback を通さない | jailer と workspace drive を含む実 launch test |
+| guest `CapabilityKernel` / capfs / supervisor | PID 1 は identity gate と固定 workload 起動だけを担う | guest supervisor を image に組み込み、workload と end-to-end で結ぶ test |
 | seccomp filter の中身 | 宣言の文字列比較のみ、filter を解析していない | filter を parse するか、実プロセスで syscall を試す test |
 | digest 照合と exec の間の差し替え | fd を保持した exec になっていない | jailer 経由の起動で fd を引き回す仕組み |
 
-test double は 4 つ。`CommandRunner`、`FileSystem`、`ApiClient`（Firecracker 用と guest control 用の 2 つ）、`IdentitySource`。
+test double は 4 種。`CommandRunner`、`FileSystem`、`ApiClient`（Firecracker 用と guest control 用）、`IdentitySource`。実 guest-control test は Firecracker API と guest control API の両方を production transport で置き換えるが、`Runtime::launch` が使う他の境界を置き換えるものではない。
 
 このうち `CommandRunner` と `FileSystem` は production 実装のほうにも test がある。`ApiClient` は production 実装（`UnixApiClient`）に実 socket test があるが、その相手は Firecracker ではなく test 用の listener。
 
-mock test が全部通っても、VM 実起動や full isolation の完成とは判断しない。この方針は [docs/README.md](../README.md) の宣言に従う。
+mock test が全部通っても、また guest-control の実 VM test が通っても、full isolation の完成とは判断しない。この方針は [docs/README.md](../README.md) の宣言に従う。
 
 ## 関連
 

@@ -122,7 +122,7 @@ flowchart LR
 | capfs | preflight、namespace/node table、link を含む Direct-I/O FUSE adapter | module/contract test と環境依存の実 mount test | 全 interleaving の loom、敵対的 backing 差し替え、隔離層との end-to-end は未検証 |
 | `egress-broker` | bounded transport、typed dispatch、DNS/IP policy、公開 HTTPS、型付き GitHub adapter | fake resolver/connector/provider による module test | 実 `AF_VSOCK`、外部 DNS/HTTPS/GitHub API、guest-to-host は未検証 |
 | `runtime-isolation` | policy validation、`LinuxBackend`、13 段階の ordered apply/rollback | mock backend test、host capability detection | privileged isolation apply、workload 実行中の escape test は未検証 |
-| `firecracker-runtime` | artifact pin、dm-verity/jailer/API 順序、workspace、snapshot/restore、identity/workload gate | fake boundary test、local Unix socket HTTP exchange | 実 Firecracker/jailer/dm-verity/guest kernel/VM は未検証 |
+| `firecracker-runtime` | artifact pin、dm-verity/jailer/API 順序、workspace、snapshot/restore、identity/workload gate | fake boundary test、local Unix socket HTTP exchange、opt-in KVM test | 実 Firecracker + dm-verity + guest `AF_VSOCK` identity gate は確認。jailer / snapshot restore は未検証 |
 | `supervisor` | connection-to-subject binding、bounded wire protocol、subject/handle lifecycle | `CapabilityKernel` + `FakeResources` による test | Linux namespace/cgroup/mount、実 socket、guest supervisor は未検証 |
 | `session-orchestrator` | durable 128-bit identity ledger、lease binding、Authority/Broker/Firecracker/workspace production adapter | mock state-machine test、test-double 境界までの production adapter composition | 実 command/filesystem/vsock、guest capfs/isolation、実 VM は未検証 |
 

@@ -58,7 +58,7 @@ flowchart TB
     class ws,sock data;
 ```
 
-紫の 4 つが唯一の副作用境界。test はここに fake を挿すので、実 Firecracker も実 jailer も実 dm-verity も一度も動いていない。
+紫の 4 つが唯一の副作用境界。通常の test はここに fake を挿す。一方、KVM host 向けの [`verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は実 Firecracker、実 dm-verity mapper、guest の `AF_VSOCK` listener まで通す。
 
 ## この crate が絶対にやらないこと
 
@@ -71,7 +71,7 @@ flowchart TB
 
 lifecycle、API 呼び出し順序、rollback、identity gate は fake command runner / filesystem / API client を使う test で検証済み。`UnixApiClient` は本物の HTTP/1.x を local Unix socket 上で話す test まで通っている。
 
-一方、実 Firecracker binary、実 jailer、実 dm-verity mapping、実 VM の起動は一度も実行していない。詳細は[検証対応表](verification.md)。
+実機 test は direct Firecracker API で boot し、identity 注入前の workload start が `409` になること、canonical acknowledgement、dm-verity rootfs を確認する。`Runtime::launch` 経由の実 jailer、snapshot restore、workspace drive、host egress は対象外である。詳細は[検証対応表](verification.md)。
 
 ## 文書一覧
 

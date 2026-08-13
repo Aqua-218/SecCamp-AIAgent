@@ -118,7 +118,7 @@ flowchart BT
 
 灰色の 3 つは、どの crate からも依存されていない。`firecracker-runtime` と `runtime-isolation` は `authority-core` すら参照せず、前者は `rustix` と `sha2`、後者は `libc` だけで立っている。
 
-workspace 全体で binary は [`authority-corpus`](../../crates/authority-core/src/bin/authority-corpus.rs) 1 本だけで、これは Rust と Lean の判定を突き合わせる検証用の runner である。**host daemon も guest init も存在しない。** 配置図の箱を実際に組み立てて動かす composition root が、まだどの crate にも無い。
+host daemon は無く、guest の CapabilityKernel / capfs / supervisor / runtime-isolation を一つの session として組み立てる init も無い。[`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は例外で、実 VM 内の identity/workload gate 専用 PID 1 である。任意 command、credential、authority body を host から受け取らないため、配置図の guest supervisor の代替ではない。
 
 これは書き忘れではなく順序の結果で、[実装順序](implementation-plan.md)が「Authority core と capfs をホスト上で確定してから統合する」という並びを選んでいる。ただし、そのぶん「crate 単体の test が通ること」と「システムが動くこと」の距離は、依存グラフを見ただけでは分からない。
 
@@ -231,9 +231,9 @@ orchestrator の `SubjectId` と `authority_core` の `SubjectId` は名前が�
 | supervisor → runtime-isolation | `RuntimeResources` の実装が無い。`supervisor` の依存に `runtime-isolation` が入っていない | 13 step を呼ぶ backend 実装と、child process 側で `apply` を開始する起動経路 |
 | orchestrator → capfs | [契約](../session-orchestrator/contracts.md)が `ImportedRepository::open` → `CapabilityFilesystem::new` → `spawn_mount` の順序を書いているが、`session-orchestrator` の依存に `capfs` が無い | workspace adapter の実装。ただし mount するのは guest 側なので、host adapter が直接呼ぶ形でよいかは未決 |
 | root capability の受け渡し | `/actions/inject-identity` が送るのは 5 つの ID の hex だけで、authority body は含まれない | guest supervisor の trusted control channel と、その上の型 |
-| guest 側 kernel の生成 | `Arc<CapabilityKernel>` を作って capfs と supervisor へ配る主体が無い | guest init に相当する crate または binary |
+| guest 側 kernel の生成 | identity/workload gate 用の `guest-control-init` はあるが、`Arc<CapabilityKernel>` を作って capfs と supervisor へ配る主体は無い | authority policy を受け取る trusted guest init と、その上の型 |
 | host の vsock listener | [`server.rs`](../../crates/egress-broker/src/server.rs) に `serve_expected_peer` があり、accept から dispatch までは実装済み。ただし test は `Cursor` 上で、実 `AF_VSOCK` の bind / accept は一度も通っていない | 実 VM と実 vsock を伴う統合 test |
-| Firecracker の実起動 | fake command runner / filesystem / API client での検証のみ | 実 Firecracker、実 jailer、実 dm-verity device |
+| Firecracker の実起動 | [`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) が実 Firecracker、dm-verity rootfs、guest `AF_VSOCK` control を通す | `Runtime::launch` 経由の実 jailer、workspace drive、snapshot restore |
 
 `authority-core` と `capfs` の内側は、この表とは検証の水準が違う。前者は Rust と Lean の 150 件共通 corpus と loom、後者は `/dev/fuse` がある環境での実 mount test まで通っている。crate ごとの正確な線引きは各 [検証対応表](verification.md)を見る。
 

@@ -90,8 +90,8 @@ flowchart TB
 
 ### まだ無いもの
 
-- **composition root が無い。** workspace の binary は corpus runner 2 本（`authority-corpus`、`authority-runtime-corpus`）だけで、どちらも Rust と Lean の判定を突き合わせる検証用である。host daemon も guest init も存在せず、配置図の箱を実際に組み立てる主体はまだどの crate にも無い。
-- **VM の実起動と full isolation は未達成。** 実 Firecracker、実 jailer、実 dm-verity device、実 `AF_VSOCK` の bind / accept、外部 DNS / HTTPS / GitHub API は一度も通っていない。
+- **完全な composition root は無い。** `guest-control-init` は実 VM 内で identity gate を担うが、host daemon と、guest の CapabilityKernel / capfs / supervisor / runtime-isolation を一つの session として組み立てる入口は無い。
+- **実 VM の一部分だけを検証済み。** KVM 上の実 Firecracker、実 dm-verity mapper、guest の `AF_VSOCK` listener、host からの identity 注入と workload gate は [`verify-real-guest-control.sh`](scripts/ci/verify-real-guest-control.sh) で通る。一方、実 jailer、snapshot restore、Broker の host listener、外部 DNS / HTTPS / GitHub API、full isolation は未検証である。
 - **特権 isolation の実 syscall は未実行。** 13 step の apply / rollback は mock backend と純粋関数までしか動かしていない。
 
 これは書き忘れではなく順序の結果で、[実装順序](docs/design/implementation-plan.md)が「Authority core と capfs を確定してから統合する」という並びを選んでいる。
@@ -127,7 +127,7 @@ crate ごとの正確な線引きは各 crate の検証対応表（`docs/<crate>
 | [capfs](crates/capfs/) | backing root、namespace registry、node table、Direct-I/O FUSE adapter | 実 mount test を含む。実 VM 内は未検証 |
 | [egress-protocol](crates/egress-protocol/) | bounded frame、canonical CBOR、session と sequence、budget | module test |
 | [egress-broker](crates/egress-broker/) | `AF_VSOCK` frame、replay、budget、公開 HTTPS、型付き GitHub adapter | fake resolver / connector / provider。実 vsock と外部 API は未検証 |
-| [firecracker-runtime](crates/firecracker-runtime/) | artifact 固定、dm-verity、jailer、API 順序、snapshot / restore、identity gate | fake command / filesystem / API。実 VM は未検証 |
+| [firecracker-runtime](crates/firecracker-runtime/) | artifact 固定、dm-verity、jailer、API 順序、snapshot / restore、identity gate、guest-control PID 1 | fake boundary test に加え、実 Firecracker + dm-verity + guest `AF_VSOCK` identity gate。jailer / snapshot restore は未検証 |
 | [runtime-isolation](crates/runtime-isolation/) | exec 直前の 13 step。namespace、mount、cgroup、Landlock、capability、seccomp | mock backend と純粋関数。実 syscall は未検証 |
 | [supervisor](crates/supervisor/) | 認証済み connection の subject binding、wire protocol、subject lifecycle | `CapabilityKernel` と `FakeResources`。実 socket は未検証 |
 | [session-orchestrator](crates/session-orchestrator/) | session identity、backend lease、startup / rollback / stop | production adapter composition test。実 VM は未検証 |

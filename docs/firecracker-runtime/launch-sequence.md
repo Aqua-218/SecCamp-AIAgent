@@ -100,7 +100,7 @@ API 呼び出しが 1 関数に閉じているため、Firecracker の API 仕�
 
 fake adapter を使う限りにおいて、順序と rollback が上記のとおり動くことは test で確認している。
 
-- 実 Firecracker がこの順序の呼び出しを受け付けるかは未検証。fake API client は status 200 を返すだけで、Firecracker の状態機械を模倣していない。
+- [`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) は実 Firecracker に `machine-config`、`boot-source`、read-only root drive、`vsock`、`InstanceStart` をこの順に送って boot する。workspace drive、`Runtime::launch` の jailer 経路、snapshot restore は同 test の対象外である。
 - `veritysetup` と `jailer` の実際のコマンドラインと実行結果は未検証。`RealCommandRunner` は本物のプロセスを起動する test を持つが、対象は出力量と終了処理の確認であって Firecracker ではない。
 - rollback が実際に host resource を解放することは未検証。fake filesystem は削除要求を記録するだけ。
 - 起動したプロセスが jailer 配下で隔離されているかはこの crate では確認できない。[ホスト隔離プロファイル](host-isolation.md)が扱うのは config の検査までで、実効果ではない。

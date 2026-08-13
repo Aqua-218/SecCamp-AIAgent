@@ -8,7 +8,7 @@
 
 全部を1つの形式手法で証明しようとはしない。純粋関数、状態遷移、並行処理、Linux kernel との接続では、効く道具が違うからである。
 
-この文書の「実装済み」は repository に code/API があること、「mock/contract 検証済み」は fake、mock、module test、local contract test の結果、「実機未検証」は特権 kernel、実 VM、実 `AF_VSOCK`、外部 DNS/HTTPS/provider、guest-to-host end-to-end をまだ実行していないことを表す。後者を実施していない段階で、full isolation や VM 境界を完成と判定しない。
+この文書の「実装済み」は repository に code/API があること、「mock/contract 検証済み」は fake、mock、module test、local contract test の結果である。`firecracker-runtime` の guest control だけは KVM host で実 Firecracker、dm-verity、guest `AF_VSOCK` を通す。その他の特権 kernel、外部 DNS/HTTPS/provider、guest-to-host egress end-to-end は未検証であり、full isolation や VM 境界全体を完成と判定しない。
 
 ## どの道具を、どこに当てるか
 
@@ -56,7 +56,7 @@ flowchart LR
 | SSRF | resolver / redirect test | 非公開宛先と rebinding の拒否 | fake resolver/connector、実 DNS は未検証 |
 | Host Egress Broker | module/contract test | frame、replay、budget、typed dispatch、公開 HTTPS、GitHub plan | mock/contract 検証済み、実 `AF_VSOCK`/外部 provider は未検証 |
 | runtime isolation | mock backend + capability detection | ordered apply/rollback と policy validation | mock 検証済み、privileged apply は未検証 |
-| Firecracker runtime | fake command/filesystem/API + Unix socket test | artifact、jailer/API 順序、snapshot state、identity/workload gate | contract 検証済み、実 VM/jailer/dm-verity は未検証 |
+| Firecracker runtime | fake command/filesystem/API + Unix socket test + opt-in KVM test | artifact、jailer/API 順序、snapshot state、identity/workload gate | 実 Firecracker + dm-verity + guest `AF_VSOCK` identity gate を確認。jailer / snapshot restore は未検証 |
 | Supervisor | protocol module test + `FakeResources` | identity binding、subject lifecycle、handle cleanup | mock/contract 検証済み、Linux resource は未検証 |
 | Supervisor control socket | 実 `SOCK_SEQPACKET` の module test | accept 時の `SO_PEERCRED` 束縛、decode 前の subject 確定、bounded datagram | 実 socket で検証済み、guest からの end-to-end は未検証 |
 | Session orchestrator | mock state-machine test + production adapter composition | lease binding、startup rollback、stop retry、durable identity、Authority/Broker/Firecracker/workspace adapter | test-double 境界まで検証済み、実 guest capfs/isolation・実 VM は未検証 |
@@ -91,7 +91,7 @@ Direct-I/O FUSE adapterのmodule testは、許可範囲と祖先だけのmetadat
 
 ### Firecracker runtime
 
-`firecracker-runtime` の test は artifact digest、mutable `latest` path、network device、workspace overlap、jailer/verity/API の順序、API error rollback、snapshot fingerprint、stale/duplicate identity、identity injection 前の workload gate を fake boundary で検査する。`UnixApiClient` には local Unix socket の HTTP exchange test があるが、Firecracker の Unix API socket そのものではない。実 Firecracker、jailer、dm-verity device、guest kernel、snapshot/restore、VM escape は未検証である。詳細は [Firecracker runtime](../firecracker-runtime/README.md) を参照する。
+`firecracker-runtime` の test は artifact digest、mutable `latest` path、network device、workspace overlap、jailer/verity/API の順序、API error rollback、snapshot fingerprint、stale/duplicate identity、identity injection 前の workload gate を fake boundary で検査する。さらに [`verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は static PID 1 image を作り、実 dm-verity mapper を read-only で開き、実 Firecracker を boot して guest `AF_VSOCK` control channel の `409` gate、identity injection、workload release を確認する。`Runtime::launch` の jailer、workspace drive、snapshot/restore、VM escape は未検証である。詳細は [Firecracker runtime](../firecracker-runtime/README.md) を参照する。
 
 ### Supervisor
 

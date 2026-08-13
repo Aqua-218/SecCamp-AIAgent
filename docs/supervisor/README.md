@@ -65,7 +65,7 @@ syscall は 1 つも呼ばない。namespace も cgroup も mount も `RuntimeRe
 
 | 文書 | 対象ソース | 内容 |
 |---|---|---|
-| [誰の要求として扱うか](caller-identity.md) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | connection からの subject 解決、3 段の照合、wire に無い操作 |
+| [誰の要求として扱うか](caller-identity.md) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs), [`control_socket.rs`](../../crates/supervisor/src/control_socket.rs) | connection からの subject 解決、3 段の照合、production の listener と peer credential、wire に無い操作 |
 | [wire protocol](wire-protocol.md) | [`protocol.rs`](../../crates/supervisor/src/protocol.rs) | datagram の形、閉じた tag 集合、decode の検査順序 |
 | [subject の setup と shutdown](subject-lifecycle.md) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | setup transaction、rollback、authority を先に落とす順序 |
 | [handle の lifecycle](handle-lifecycle.md) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | 所有権検査の位置、2 つの集合、2 つの永久予約表 |
@@ -75,7 +75,9 @@ syscall は 1 つも呼ばない。namespace も cgroup も mount も `RuntimeRe
 
 lifecycle、順序、rollback、handle の所有権はすべて `CapabilityKernel`（本物）と `FakeResources`（event log）を使う contract test で検証済み。
 
-一方、Linux の namespace / cgroup / mount 実装、実 socket listener、実 workload、実 guest control channel はこの crate に存在しない。production の caller resolver も未実装で、`StaticCallerResolver` は in-memory の map である。
+production の caller resolver と control socket は [`control_socket.rs`](../../crates/supervisor/src/control_socket.rs) にある。subject ごとの `SOCK_SEQPACKET` listener が `SO_PEERCRED` から `ConnectionIdentity` を組み立て、request bytes を読む前に subject を確定させる。実 socket を使った module test で検証済みである。
+
+一方、Linux の namespace / cgroup / mount 実装、実 workload、実 guest control channel はこの crate に存在しない。listener を subject の setup 経路へ結線する host 側の組み立てと、guest VM 内の agent process からの end-to-end も未検証である。
 
 検査があるのに test が無い箇所がいくつかある。`ConnectionNotBoundToSubject`、`GrantSubjectMismatch`、`DuplicateSubject`、親の非 Running gate、`derive` の拒否経路。詳細は[検証対応表](verification.md)。
 

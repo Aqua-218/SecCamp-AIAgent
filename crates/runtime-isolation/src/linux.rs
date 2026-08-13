@@ -251,10 +251,14 @@ mod implementation {
                     .map(|(name, available)| format!("{name}={available}"))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let kernel_cgroup_status = fs::read_to_string("/proc/cgroups").map_or_else(
+                    |error| format!("unreadable ({error})"),
+                    |value| value.trim().replace('\n', "; "),
+                );
                 report
                     .reasons
                     .push(format!(
-                        "configured cgroup v2 root or required control files are absent or not writable: controllers={controller_status:?}, root_writable={root_writable}, controls={control_status}"
+                        "configured cgroup v2 root or required control files are absent or not writable: controllers={controller_status:?}, root_writable={root_writable}, controls={control_status}, kernel_cgroups={kernel_cgroup_status:?}"
                     ));
             }
             report.seccomp_available = seccomp_is_available();

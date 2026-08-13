@@ -1,0 +1,577 @@
+# Delivery gate manifest.
+#
+# This file is the single source of truth for the pipeline topology. Three
+# repository-owned scripts read it, and nothing else is allowed to invent a gate:
+#
+#   scripts/ci/plan-pipeline.sh        decides which gates a given event must run
+#   scripts/ci/check-pipeline-parity.sh proves GitHub and GitLab both implement them
+#   scripts/ci/summarize-pipeline.sh   renders the executed plan into one report
+#
+# A gate that exists in a workflow but not here fails parity validation, and a
+# gate listed here that no platform implements fails it too. The manifest is the
+# reason a platform migration cannot quietly drop a check.
+#
+# Gate fields
+#   id            Stable identifier. The GitHub job id and the GitLab job name
+#                 must both equal this string.
+#   title         Human-readable name used in reports and job names.
+#   stage         validate | quality | test | verify | analyze | delivery |
+#                 security | system
+#   tier          fast | standard | deep
+#   scopes        Change scopes that make the gate relevant. A gate runs when any
+#                 of its scopes changed, or when the event carries no diff.
+#   github        GitHub Actions job id, or `null` when the platform cannot host it.
+#   gitlab        GitLab CI job name, or `null`.
+#   workflow      GitHub workflow file that defines the job.
+#   include       GitLab include file that defines the job.
+#   matrix        Optional matrix key from `matrices` below, expanded by the planner.
+#   why_platform  Required whenever `github` or `gitlab` is null.
+
+version: 2
+
+# Tier gates cost. `fast` runs on literally every pipeline; `standard` adds the
+# checks a merge must not skip; `deep` holds everything that needs an unpinnable
+# host, a nightly toolchain, or minutes measured in tens.
+tiers:
+  fast:
+    description: Runs on every pipeline, including draft pushes and merge queue entries.
+    events: [pull_request, push, merge_group, schedule, workflow_dispatch, tag, web, api]
+  standard:
+    description: Runs on anything that can become main, plus every deep pipeline.
+    events: [pull_request, push, merge_group, schedule, workflow_dispatch, tag]
+  deep:
+    description: >-
+      Scheduled and manually dispatched only. Holds the nightly-toolchain gates,
+      the KVM host gate, and the multi-minute analyses.
+    events: [schedule, workflow_dispatch]
+
+# Change scopes. `plan-pipeline.sh` classifies every changed path into one or
+# more of these, and a gate runs when any of its declared scopes is present.
+scopes:
+  always:
+    description: Never filtered out.
+    patterns: []
+  rust:
+    description: Rust sources, workspace manifests, the lockfile, or the toolchain pin.
+    patterns:
+      - "crates/"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".config/"
+      - "deny.toml"
+  lean:
+    description: Lean sources, the Lean toolchain pin, or the differential corpus drivers.
+    patterns:
+      - "lean/"
+      - "scripts/check-authority-corpus.sh"
+      - "scripts/check-runtime-corpus.sh"
+  docs:
+    description: Documentation tree and its conventions.
+    patterns:
+      - "docs/"
+  pipeline:
+    description: Pipeline definitions, CI scripts, the gate manifest, and policy files.
+    patterns:
+      - ".github/"
+      - ".gitlab/"
+      - ".gitlab-ci.yml"
+      - "ci/"
+      - "scripts/ci/"
+      - ".semgrep.yml"
+      - "CODEOWNERS"
+
+# Every workspace member, in the order the test shards are numbered. Adding a
+# crate here is what creates its shard; `check-pipeline-parity.sh` proves the
+# list still equals `[workspace].members`.
+packages:
+  - authority-core
+  - capfs
+  - egress-broker
+  - egress-protocol
+  - firecracker-runtime
+  - runtime-isolation
+  - session-orchestrator
+  - supervisor
+
+matrices:
+  # One shard per crate. Deterministic, and a failing shard names the crate.
+  test_shards:
+    source: packages
+
+  # Each crate checked on its own, outside the workspace feature unification
+  # that hides a missing dependency when a sibling happens to enable it.
+  isolation_packages:
+    source: packages
+
+  # `cargo check` never links, so a cross target needs only the std component.
+  # deny.toml already carries the same triples for its advisory graph.
+  cross_targets:
+    values:
+      - triple: aarch64-unknown-linux-gnu
+        why: Non-x86 host support for the supervisor and authority kernel.
+      - triple: x86_64-unknown-linux-musl
+        why: Static-linkage target; catches glibc-only assumptions in the syscall layer.
+
+  # Miri interprets Rust; it cannot execute the real syscalls that the isolation
+  # and runtime crates exist to make. Only the crates whose unsafe code is pure
+  # memory work are listed, and that boundary is documented in docs/ci-cd.md.
+  miri_packages:
+    values:
+      - package: authority-core
+        why: Durable audit framing and GitHub metadata hold the pointer-level unsafe.
+      - package: egress-protocol
+        why: Length-prefixed frame and canonical CBOR decoding of untrusted bytes.
+
+  # LeakSanitizer is implied by AddressSanitizer; ThreadSanitizer needs an
+  # instrumented std (`-Zbuild-std`) and is deliberately not run here.
+  sanitizer_modes:
+    values:
+      - mode: address
+        package: capfs
+      - mode: address
+        package: runtime-isolation
+      - mode: leak
+        package: egress-broker
+
+  # libFuzzer targets live in crates/*/fuzz. See docs/ci-cd.md for the one-time
+  # lockfile bootstrap they require.
+  fuzz_targets:
+    values:
+      - package: egress-protocol
+        target: frame_decode
+      - package: egress-protocol
+        target: cbor_request_decode
+      - package: authority-core
+        target: canonical_path
+
+  # cargo-mutants over the decision kernel, split so a full run fits the timeout.
+  mutation_shards:
+    values:
+      - shard: 1
+        package: authority-core
+      - shard: 2
+        package: egress-protocol
+
+gates:
+  # ---------------------------------------------------------------- validate --
+  - id: pipeline_policy
+    title: Pipeline policy
+    stage: validate
+    tier: fast
+    scopes: [always]
+    github: pipeline_policy
+    gitlab: pipeline_policy
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  - id: pipeline_self_test
+    title: Pipeline script self-test
+    stage: validate
+    tier: fast
+    scopes: [always]
+    github: pipeline_self_test
+    gitlab: pipeline_self_test
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  - id: docs_policy
+    title: Documentation policy
+    stage: validate
+    tier: fast
+    scopes: [always]
+    github: docs_policy
+    gitlab: docs_policy
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  - id: adr_index
+    title: Decision record index
+    stage: validate
+    tier: fast
+    scopes: [always]
+    github: adr_index
+    gitlab: adr_index
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  - id: verification_traceability
+    title: Verification page traceability
+    stage: validate
+    tier: fast
+    scopes: [rust, docs]
+    github: verification_traceability
+    gitlab: verification_traceability
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  - id: commit_policy
+    title: Commit policy
+    stage: validate
+    tier: fast
+    scopes: [always]
+    github: commit_policy
+    gitlab: commit_policy
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  - id: repository_hygiene
+    title: Repository hygiene
+    stage: validate
+    tier: fast
+    scopes: [always]
+    github: repository_hygiene
+    gitlab: repository_hygiene
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  - id: codeowners_coverage
+    title: CODEOWNERS coverage
+    stage: validate
+    tier: fast
+    scopes: [always]
+    github: codeowners_coverage
+    gitlab: codeowners_coverage
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  - id: toolchain_consistency
+    title: Toolchain consistency
+    stage: validate
+    tier: fast
+    scopes: [always]
+    github: toolchain_consistency
+    gitlab: toolchain_consistency
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  - id: dependency_usage
+    title: Declared dependency usage
+    stage: validate
+    tier: fast
+    scopes: [rust]
+    github: dependency_usage
+    gitlab: dependency_usage
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  - id: lockfile_integrity
+    title: Lockfile integrity
+    stage: validate
+    tier: fast
+    scopes: [rust]
+    github: lockfile_integrity
+    gitlab: lockfile_integrity
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  - id: lean_hygiene
+    title: Lean proof hygiene
+    stage: validate
+    tier: fast
+    scopes: [lean]
+    github: lean_hygiene
+    gitlab: lean_hygiene
+    workflow: wf-validate.yml
+    include: validate.yml
+
+  # ----------------------------------------------------------------- quality --
+  - id: rust_quality
+    title: Rust quality gate
+    stage: quality
+    tier: fast
+    scopes: [rust]
+    github: rust_quality
+    gitlab: rust_quality
+    workflow: wf-quality.yml
+    include: quality.yml
+
+  - id: api_surface
+    title: Public API surface
+    stage: quality
+    tier: fast
+    scopes: [rust]
+    github: api_surface
+    gitlab: api_surface
+    workflow: wf-quality.yml
+    include: quality.yml
+
+  - id: crate_isolation
+    title: Per-crate isolation build
+    stage: quality
+    tier: standard
+    scopes: [rust]
+    github: crate_isolation
+    gitlab: crate_isolation
+    workflow: wf-quality.yml
+    include: quality.yml
+    matrix: isolation_packages
+
+  - id: cross_targets
+    title: Cross-target check
+    stage: quality
+    tier: standard
+    scopes: [rust]
+    github: cross_targets
+    gitlab: cross_targets
+    workflow: wf-quality.yml
+    include: quality.yml
+    matrix: cross_targets
+
+  # -------------------------------------------------------------------- test --
+  - id: rust_tests
+    title: Rust tests
+    stage: test
+    tier: fast
+    scopes: [rust]
+    github: rust_tests
+    gitlab: rust_tests
+    workflow: wf-test.yml
+    include: test.yml
+    matrix: test_shards
+
+  - id: rust_doctests
+    title: Rust doctests
+    stage: test
+    tier: fast
+    scopes: [rust]
+    github: rust_doctests
+    gitlab: rust_doctests
+    workflow: wf-test.yml
+    include: test.yml
+
+  # ------------------------------------------------------------------ verify --
+  - id: loom
+    title: Loom concurrency model
+    stage: verify
+    tier: standard
+    scopes: [rust]
+    github: loom
+    gitlab: loom
+    workflow: wf-verify.yml
+    include: verify.yml
+
+  - id: lean_proofs
+    title: Lean proofs
+    stage: verify
+    tier: standard
+    scopes: [rust, lean]
+    github: lean_proofs
+    gitlab: lean_proofs
+    workflow: wf-verify.yml
+    include: verify.yml
+
+  - id: differential_corpus
+    title: Rust and Lean differential corpus
+    stage: verify
+    tier: standard
+    scopes: [rust, lean]
+    github: differential_corpus
+    gitlab: differential_corpus
+    workflow: wf-verify.yml
+    include: verify.yml
+
+  - id: miri
+    title: Miri undefined-behaviour check
+    stage: verify
+    tier: deep
+    scopes: [rust]
+    github: miri
+    gitlab: miri
+    workflow: wf-verify.yml
+    include: verify.yml
+    matrix: miri_packages
+
+  - id: sanitizers
+    title: Sanitizer run
+    stage: verify
+    tier: deep
+    scopes: [rust]
+    github: sanitizers
+    gitlab: sanitizers
+    workflow: wf-verify.yml
+    include: verify.yml
+    matrix: sanitizer_modes
+
+  # ----------------------------------------------------------------- analyze --
+  - id: coverage
+    title: Workspace coverage
+    stage: analyze
+    tier: standard
+    scopes: [rust]
+    github: coverage
+    gitlab: coverage
+    workflow: wf-analyze.yml
+    include: analyze.yml
+
+  - id: mutation
+    title: Mutation testing
+    stage: analyze
+    tier: deep
+    scopes: [rust]
+    github: mutation
+    gitlab: mutation
+    workflow: wf-analyze.yml
+    include: analyze.yml
+    matrix: mutation_shards
+
+  - id: fuzz
+    title: Fuzz targets
+    stage: analyze
+    tier: deep
+    scopes: [rust]
+    github: fuzz
+    gitlab: fuzz
+    workflow: wf-analyze.yml
+    include: analyze.yml
+    matrix: fuzz_targets
+
+  - id: benchmarks
+    title: Benchmark regression
+    stage: analyze
+    tier: deep
+    scopes: [rust]
+    github: benchmarks
+    gitlab: benchmarks
+    workflow: wf-analyze.yml
+    include: analyze.yml
+
+  # ---------------------------------------------------------------- delivery --
+  - id: release_dry_run
+    title: Release dry run
+    stage: delivery
+    tier: standard
+    scopes: [rust, pipeline]
+    github: release_dry_run
+    gitlab: release_dry_run
+    workflow: wf-delivery.yml
+    include: delivery.yml
+
+  - id: reproducibility
+    title: Release reproducibility
+    stage: delivery
+    tier: deep
+    scopes: [rust, pipeline]
+    github: reproducibility
+    gitlab: reproducibility
+    workflow: wf-delivery.yml
+    include: delivery.yml
+
+  # ---------------------------------------------------------------- security --
+  - id: codeql
+    title: CodeQL Rust analysis
+    stage: security
+    tier: standard
+    scopes: [rust]
+    github: codeql
+    gitlab: null
+    why_platform: >-
+      CodeQL is a GitHub Advanced Security product. GitLab covers the same
+      surface with Semgrep plus the RustSec advisory audit.
+    workflow: security.yml
+    include: null
+
+  - id: dependency_audit
+    title: RustSec advisory audit
+    stage: security
+    tier: standard
+    scopes: [rust]
+    github: dependency_audit
+    gitlab: dependency_audit
+    workflow: security.yml
+    include: security.yml
+
+  - id: dependency_policy
+    title: Dependency policy
+    stage: security
+    tier: standard
+    scopes: [rust]
+    github: dependency_policy
+    gitlab: dependency_policy
+    workflow: security.yml
+    include: security.yml
+
+  - id: sast
+    title: Semgrep SAST
+    stage: security
+    tier: standard
+    scopes: [rust, pipeline]
+    github: sast
+    gitlab: sast
+    workflow: security.yml
+    include: security.yml
+
+  - id: secrets
+    title: Secret detection
+    stage: security
+    tier: standard
+    scopes: [always]
+    github: secrets
+    gitlab: secret_detection
+    workflow: security.yml
+    include: security.yml
+
+  - id: supply_chain_inventory
+    title: Supply-chain inventory
+    stage: security
+    tier: standard
+    scopes: [rust, pipeline]
+    github: supply_chain_inventory
+    gitlab: supply_chain_inventory
+    workflow: security.yml
+    include: security.yml
+
+  - id: scorecard
+    title: OpenSSF Scorecard
+    stage: security
+    tier: deep
+    scopes: [always]
+    github: scorecard
+    gitlab: null
+    why_platform: >-
+      Scorecard scores GitHub repository administration. The equivalent GitLab
+      controls are configured administratively and documented in docs/ci-cd.md.
+    workflow: security.yml
+    include: null
+
+  # ------------------------------------------------------------------ system --
+  - id: real_vm
+    title: Real Firecracker VM verification
+    stage: system
+    tier: deep
+    scopes: [rust]
+    github: real_vm
+    gitlab: real_vm
+    workflow: deep.yml
+    include: deep.yml
+
+  - id: pin_inventory
+    title: Pin inventory
+    stage: system
+    tier: deep
+    scopes: [always]
+    github: pin_inventory
+    gitlab: pin_inventory
+    workflow: deep.yml
+    include: deep.yml
+
+# Release stages are not gates: they run only on a semantic-version tag and are
+# ordered rather than planned. Parity validation still requires both platforms
+# to implement each one.
+release_stages:
+  - id: package
+    title: Build and attest release
+    github: package
+    gitlab: package_release
+  - id: verify
+    title: Verify release assets
+    github: verify
+    gitlab: verify_release
+  - id: publish
+    title: Publish through the protected environment
+    github: publish
+    gitlab: publish_release
+  - id: record
+    title: Create the immutable release record
+    github: record
+    gitlab: create_release

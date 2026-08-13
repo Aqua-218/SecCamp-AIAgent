@@ -2394,8 +2394,7 @@ mod tests {
             let lease = checkpoint_through_jail(&mut journal, lease);
             journal.complete(&lease).expect("completion must commit");
         }
-        let reopened = DurableSessionRecoveryJournal::open(&fixture.path)
-            .expect("completed history must reopen");
+        let reopened = reopen_released_journal(&fixture.path);
         assert_eq!(reopened.pending(), None);
         assert_eq!(reopened.intent_count(), 1);
         assert_eq!(reopened.history()[0].intent(), expected);

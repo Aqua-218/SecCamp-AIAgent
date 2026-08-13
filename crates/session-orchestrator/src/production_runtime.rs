@@ -2252,7 +2252,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::filesystem_factory::{FilesystemFirecrackerFactory, SnapshotTemplate};
+    use crate::filesystem_factory::{
+        FilesystemFirecrackerFactory, GuestArtifactTemplate, SnapshotTemplate,
+    };
     use crate::recovery::SessionRecoveryLease;
     use crate::{IdentityKind, IdentityLedger};
 
@@ -3463,23 +3465,20 @@ mod tests {
         let mut template = runtime_config(&root.0);
         let template_jail =
             session_jail_root(&template).expect("template jail root must be derivable");
-        let kernel_source = template_jail.join("artifacts/kernel");
-        let seccomp_source = template_jail.join("artifacts/seccomp");
+        let kernel_source = root.0.join("guest-kernel-source");
+        let seccomp_source = root.0.join("guest-seccomp-source");
         let state_source = root.0.join("clean-snapshot-state");
         let memory_source = root.0.join("clean-snapshot-memory");
-        fs::create_dir_all(
-            kernel_source
-                .parent()
-                .expect("kernel source must have a parent"),
-        )
-        .expect("template artifacts directory must be creatable");
         fs::write(&kernel_source, b"kernel-v1").expect("kernel source must be writable");
         fs::write(&seccomp_source, b"seccomp-v1").expect("seccomp source must be writable");
         fs::write(&state_source, b"snapshot-state-v1").expect("state source must be writable");
         fs::write(&memory_source, b"snapshot-memory-v1").expect("memory source must be writable");
-        template.kernel = PinnedArtifact::new(&kernel_source, sha256(b"kernel-v1"));
-        template.isolation.seccomp.filter =
-            PinnedArtifact::new(&seccomp_source, sha256(b"seccomp-v1"));
+        template.kernel =
+            PinnedArtifact::new(template_jail.join("artifacts/kernel"), sha256(b"kernel-v1"));
+        template.isolation.seccomp.filter = PinnedArtifact::new(
+            template_jail.join("artifacts/seccomp"),
+            sha256(b"seccomp-v1"),
+        );
 
         let session = identity(0x61);
         let session_config =
@@ -3496,9 +3495,13 @@ mod tests {
             session_jail.join("snapshots/memory"),
             19_002,
         );
-        let mut factory = FilesystemFirecrackerFactory::new(
+        let mut factory = FilesystemFirecrackerFactory::with_guest_artifacts(
             request.snapshot_id(),
             template.clone(),
+            GuestArtifactTemplate::new(
+                PinnedArtifact::new(&kernel_source, sha256(b"kernel-v1")),
+                PinnedArtifact::new(&seccomp_source, sha256(b"seccomp-v1")),
+            ),
             SnapshotTemplate::new(
                 PinnedArtifact::new(&state_source, sha256(b"snapshot-state-v1")),
                 PinnedArtifact::new(&memory_source, sha256(b"snapshot-memory-v1")),

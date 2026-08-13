@@ -56,8 +56,10 @@ const WORKLOAD_PIDS_MAX: u64 = 32;
 const HOST_VSOCK_CID: u32 = 2;
 const BROKER_IO_TIMEOUT_SECONDS: u64 = 5;
 const DEVICE_DIRECTORY: &str = "/dev";
+const PROC_DIRECTORY: &str = "/proc";
 const DEVTMPFS_SUPER_MAGIC: i64 = 0x1373;
 const TMPFS_SUPER_MAGIC: i64 = 0x0102_1994;
+const PROC_SUPER_MAGIC: i64 = 0x9fa0;
 const WORKSPACE_DEVICE: &str = "/dev/vdb";
 const FUSE_DEVICE: &str = "/dev/fuse";
 const FUSE_MAJOR: u32 = 10;
@@ -93,6 +95,7 @@ fn run() -> Result<(), String> {
     let config = parse_config(env::args_os().skip(1))?;
     let identity = GuestIdentity::from_environment()?;
     prepare_device_directory()?;
+    prepare_procfs()?;
     prepare_cgroup_hierarchy(&config.cgroup_parent)?;
     prepare_runtime_directory(&config.runtime_dir)?;
     let workspace = config.runtime_dir.join("workspace");
@@ -354,6 +357,39 @@ fn prepare_runtime_directory(path: &Path) -> Result<(), String> {
         None,
     )
     .map_err(|error| format!("mounting guest runtime tmpfs {}: {error}", path.display()))
+}
+
+/// Mounts the private procfs needed by durable audit handles and the isolation launcher.
+///
+/// The immutable image intentionally has no distribution init system.  Both the durable audit
+/// writer and `RuntimeIsolation` use `/proc/self` kernel views to pin trusted descriptors and
+/// inspect namespace state, so PID 1 must establish procfs before constructing either component.
+/// The isolated workload replaces this mount with its read-only mask before it executes.
+fn prepare_procfs() -> Result<(), String> {
+    let path = Path::new(PROC_DIRECTORY);
+    fs::create_dir_all(path).map_err(|error| {
+        format!(
+            "creating guest procfs mount directory {}: {error}",
+            path.display()
+        )
+    })?;
+    let filesystem = statfs(path).map_err(|error| {
+        format!(
+            "inspecting guest procfs mount directory {}: {error}",
+            path.display()
+        )
+    })?;
+    if filesystem.f_type == PROC_SUPER_MAGIC {
+        return Ok(());
+    }
+    mount(
+        "proc",
+        path,
+        "proc",
+        MountFlags::NOSUID | MountFlags::NODEV | MountFlags::NOEXEC,
+        None,
+    )
+    .map_err(|error| format!("mounting guest procfs {}: {error}", path.display()))
 }
 
 /// Verifies the guest-owned device namespace before consuming the workspace block device.

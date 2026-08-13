@@ -14,8 +14,16 @@
 mod capfs_resources;
 #[cfg(target_os = "linux")]
 mod control_socket;
+#[cfg(target_os = "linux")]
+mod linux_host;
 mod protocol;
 mod supervisor;
+
+#[cfg(target_os = "linux")]
+pub use linux_host::{
+    LinuxHostConfig, LinuxHostError, LinuxHostResources, WORKLOAD_CONTROL_SOCKET_ENV,
+    WORKLOAD_MOUNTPOINT_ENV, WORKLOAD_SUBJECT_ENV,
+};
 
 #[cfg(target_os = "linux")]
 pub use control_socket::{
@@ -30,7 +38,10 @@ pub use capfs_resources::{
     CapfsSupervisorError, CapfsUnmountStrategy,
 };
 
-pub use protocol::{MAX_WIRE_REQUEST_BYTES, WireDecodeError, WireEncodeError, WireRequest};
+pub use protocol::{
+    MAX_WIRE_REQUEST_BYTES, MAX_WIRE_RESPONSE_BYTES, RefusalCode, WireDecodeError, WireEncodeError,
+    WireRequest, WireResponse,
+};
 pub use supervisor::{
     AuthorityKernel, CallerBindingError, CallerResolver, CgroupHandle, CleanupFailure, CleanupStep,
     ConnectionIdentity, ControlFdHandle, DispatchResponse, MountHandle, OperationFailure,

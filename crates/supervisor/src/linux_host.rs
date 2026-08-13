@@ -736,6 +736,12 @@ fn cgroup_populated(path: &Path) -> Result<bool, LinuxHostError> {
         })
 }
 
+fn enable_cgroup_controllers(path: &Path) -> Result<(), LinuxHostError> {
+    let subtree_control = path.join("cgroup.subtree_control");
+    fs::write(&subtree_control, "+memory +pids")
+        .map_err(|error| io_error("delegating memory and PID cgroup controllers", error))
+}
+
 impl CapfsHostResources for LinuxHostResources {
     type Error = LinuxHostError;
 
@@ -836,6 +842,12 @@ impl CapfsHostResources for LinuxHostResources {
             return ResourceAcquisition::NoEffect(LinuxHostError::ForeignToken("cgroup"));
         }
         let cgroup_path = owned_cgroup.path.clone();
+        // The launcher creates the final workload leaf with clone3. Delegate controllers while
+        // this subject cgroup is still empty: cgroup v2 forbids enabling subtree controllers
+        // after the launcher itself has joined the leaf.
+        if let Err(error) = enable_cgroup_controllers(&cgroup_path) {
+            return ResourceAcquisition::NoEffect(error);
+        }
         let Some(owned_control) = self.controls.get(&control) else {
             return ResourceAcquisition::NoEffect(LinuxHostError::ForeignToken(
                 "control descriptor",

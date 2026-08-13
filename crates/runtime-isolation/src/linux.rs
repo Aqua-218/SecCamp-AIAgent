@@ -421,6 +421,7 @@ mod implementation {
     }
 
     impl LinuxBackend {
+        #[allow(clippy::too_many_lines)]
         fn spawn_isolated_impl<T, F>(
             &mut self,
             preparation: NamespacePreparation,
@@ -455,7 +456,6 @@ mod implementation {
                     return Err(error);
                 }
             };
-            let child_namespace = preparation.child();
             let launcher_pid = current_pid();
             // SAFETY: Namespace preparation can succeed only for a single-threaded
             // launcher. Signals are blocked across fork so inherited handlers
@@ -525,6 +525,13 @@ mod implementation {
                                 ),
                             )
                         })?;
+                    let child_namespace = namespace_identity(
+                        IsolationStep::Namespaces,
+                        &Path::new("/proc")
+                            .join(child_pid.get().to_string())
+                            .join("ns/pid"),
+                    )
+                    .map_err(|error| cleanup_failed_spawn(raw_child_pid, error))?;
                     let pidfd = open_pidfd(IsolationStep::Namespaces, child_pid)
                         .map_err(|error| cleanup_failed_spawn(raw_child_pid, error))?;
                     Ok(SpawnOutcome::Parent(IsolatedChildProcess::from_spawn(
@@ -806,26 +813,10 @@ mod implementation {
             return Err(last_error(step, "unshare required namespaces"));
         }
 
-        let prepared = observe_pid_namespaces(step)?;
-        if prepared.current != before.current {
-            return Err(BackendError::new(
-                step,
-                "PID namespace preparation unexpectedly moved the calling process; terminate it",
-                None,
-            ));
-        }
-        if prepared.for_children == prepared.current {
-            return Err(BackendError::new(
-                step,
-                "PID namespace preparation did not create a distinct namespace for the next child; terminate the process",
-                None,
-            ));
-        }
-
-        Ok(NamespacePreparation::attest(
-            prepared.current,
-            prepared.for_children,
-        ))
+        // `CLONE_NEWPID` affects the next child, not this launcher. The pending namespace cannot
+        // be observed reliably through procfs until that child exists, so its stable identity is
+        // collected by the parent after `fork`; child entry still proves it differs from `before`.
+        Ok(NamespacePreparation::attest(before.current, before.current))
     }
 
     // Consuming the preparation token prevents a caller from verifying it twice.
@@ -834,9 +825,9 @@ mod implementation {
         step: IsolationStep,
         preparation: NamespacePreparation,
     ) -> Result<PidNamespaceChild, BackendError> {
-        validate_pid_namespace_child_entry(step, &preparation, observe_pid_namespaces(step)?)?;
-        let child_namespace = preparation.child();
-        Ok(PidNamespaceChild::attest(child_namespace))
+        let observed = observe_pid_namespaces(step)?;
+        validate_pid_namespace_child_entry(step, &preparation, observed)?;
+        Ok(PidNamespaceChild::attest(observed.current))
     }
 
     fn validate_pid_namespace_child_entry(
@@ -851,7 +842,7 @@ mod implementation {
                 None,
             ));
         }
-        if observed.current != preparation.child() {
+        if preparation.child() != preparation.parent() && observed.current != preparation.child() {
             return Err(BackendError::new(
                 step,
                 "workload child entered an unexpected PID namespace; refusing to report namespace isolation complete",

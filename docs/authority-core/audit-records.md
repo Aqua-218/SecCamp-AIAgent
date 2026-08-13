@@ -100,6 +100,28 @@ terminal 遷移をすべて検査する。途中で切れた frame、checksum mi
 は拒否し、自動 truncate や「修復して成功」は行わない。checksum は torn write 検出用であり、
 署名付き・耐改ざんの監査証跡ではない。
 
+## 既存 journal に新しい capability state を付け直す
+
+crash 後の host は、同じ journal に続きを書く。`try_recover_with_durable_audit` がその入口で、
+2 つのことを順に行う。
+
+**1. 宙ぶらりんの attempt を閉じる。** `Started` のまま残った attempt は、effect が起きたとも
+起きなかったとも言えない。recovery はそれを `CommitUnknown` として durable に閉じ、evidence に
+「unclean shutdown が残した attempt を recovery が閉じた」ことを記録する。閉じ終わるまで
+kernel は 1 件も request を受け付けない。journal に「fate が未確定のまま放置された attempt」が
+残らないようにするためである。
+
+**2. capability-state instance を分ける。** `CapId` と `SubjectId` が一意なのは 1 つの
+`CapabilityState` の中だけである。新しい state は ID を 0 から振り直すので、instance を記録
+しないと、同じ journal の `cap-3` が 2 つの別々の capability を指してしまう。attempt payload
+version 2 は先頭に instance を持ち、その値は attach 時点の attempt sequence である。sequence
+は単調に消費されるので、record を 1 件でも書いた instance が同じ値を再び使うことはない。
+
+**過去の attempt は history であって state ではない。** recovery はそれらを再認可しないし、
+capability を復元もしない。復元しようとすれば、既に解放された host resource を指す capability を
+作ることになる。host resource の解放は session recovery journal の仕事で、audit journal の
+recovery はその後に走る。
+
 ## `auth_epoch` と record の関係
 
 effect が先に shared guard を取った場合、その attempt は revoke 前の epoch を記録して commit する。revoke が先なら epoch が増え、その後の attempt は新しい epoch と `Denied` を記録する。
@@ -130,13 +152,15 @@ Broker や supervisor が署名・remote append-only storage・provider 固有 m
 - caller、Capability、typed request、`auth_epoch` の保存。
 - audit entry を作れない場合の pre-executor fail closed。
 - durable WAL の reopen、crash window、receipt、truncation、checksum / replay 拒否。
+- 別 process からの二重 writer の拒否（実 process を起動して確認）。
+- 既存 journal への新しい capability state の attach、宙ぶらりん attempt の `CommitUnknown` 化、capability-state instance の分離。
 - direct revoke / ancestor revoke / 複数 effect、open handle、複数 revoke の Loom model での record consistency。
 
 次はまだ含まれない。
 
 - hash chain、署名、remote append-only storage による耐改ざん性。
 - wall-clock timestamp と複数 process 間の全順序。
-- provider ごとの receipt reconciliation と、executor が返さず process ごと停止した場合の supervisor protocol。
+- provider ごとの receipt reconciliation。recovery は `CommitUnknown` を残すところまでで、その attempt が実際に provider 側で成立したかを外部 API へ問い合わせる照合は含まない。
 - filesystem や Broker 固有の result metadata、byte count、provider request ID。
 
 ## どう検証しているか
@@ -162,6 +186,8 @@ replay、receipt grammar の拒否を確認する。
 - record から攻撃を検出する仕組みは無い。ここにあるのは材料だけ。
 - in-memory journal は process の生存期間しか残らない。restart をまたぐのは durable WAL のほう。
 - `auth_epoch` は record の順序付けに使えるが、実時刻ではない。時刻との対応はここでは持たない。
+- recovery が付ける `CommitUnknown` は「分からない」という記録であって、effect が無かったことの証明ではない。provider 側の照合は運用側の責務である。
+- `try_recover_with_durable_audit` は、その journal を書いた instance が host resource を既に手放していることを前提にする。稼働中の session の journal に付け直すと、2 つの capability state が同じ resource を所有していると信じたまま追記できてしまう。
 
 ## 変更時の確認点
 

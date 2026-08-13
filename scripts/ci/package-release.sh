@@ -23,10 +23,21 @@ readonly workspace_version="$(awk '
     gsub(/["[:space:]]/, "", $3); print $3; exit
   }
 ' Cargo.toml)"
+source_repository="$(awk -F'"' '
+  /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+  /^\[/ { in_workspace_package = 0 }
+  in_workspace_package && /^repository = / { print $2; exit }
+' Cargo.toml)"
+readonly source_repository
 
 if [[ "${release_tag#v}" != "${workspace_version}" ]]; then
   printf 'tag %s does not match workspace version %s\n' \
     "${release_tag}" "${workspace_version}" >&2
+  exit 1
+fi
+if [[ ! "${source_repository}" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  printf 'workspace repository is not a canonical GitHub HTTPS URL: %s\n' \
+    "${source_repository:-<empty>}" >&2
   exit 1
 fi
 
@@ -55,14 +66,18 @@ cargo build --release --locked --target "${target_triple}" \
   --package authority-core --bin authority-corpus
 install -m 0755 "target/${target_triple}/release/authority-corpus" \
   "${package_root}/bin/authority-corpus"
+install -m 0644 LICENSE "${package_root}/LICENSE"
 
 cat > "${package_root}/BUILD-METADATA.json" <<EOF
 {
   "artifact": "${artifact_stem}",
   "source_revision": "${source_revision}",
+  "source_repository": "${source_repository}",
+  "corresponding_source": "${source_repository}/archive/${source_revision}.tar.gz",
   "source_tag": "${release_tag}",
   "target": "${target_triple}",
-  "workspace_version": "${workspace_version}"
+  "workspace_version": "${workspace_version}",
+  "license": "AGPL-3.0-only"
 }
 EOF
 

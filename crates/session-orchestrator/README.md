@@ -62,5 +62,4 @@ restore 後の identity は必ず ledger から fresh に予約する。
 
 `tests/production_adapters.rs` はこれらを `start_session` から `stop_session` まで接続し、
 exact identity、snapshot、workspace、listener、Authority subject closure を検査する。
-外部境界は fake command runner / filesystem / API / listener なので、実 Firecracker、
-実 `AF_VSOCK`、特権 isolation、guest 内 capfs の end-to-end 実行を示すものではない。
+外部 command runner / filesystem / API は fake なので、実 Firecracker、特権 isolation、guest 内 capfs の end-to-end 実行を示すものではない。Broker の Firecracker per-port Unix listener と closed request の往復は別の module / opt-in KVM test で確認する。

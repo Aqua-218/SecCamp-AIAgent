@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 
-# Runs the opt-in Firecracker guest-control test against real KVM, dm-verity, and AF_VSOCK.
+# Runs opt-in Firecracker guest-control and guest-to-host Broker tests over real KVM, dm-verity,
+# and AF_VSOCK.
 #
 # This is intentionally a privileged Linux verification job. It builds the static PID 1 from this
 # checkout and combines it with the pinned downloaded kernel/rootfs before making any VM. The
-# guest workload is a static BusyBox sleep process; it exists only to prove the gate and does not
-# receive a host-supplied command or credentials.
+# fixed guest workloads are a static BusyBox sleep process and a static canonical Broker probe;
+# neither receives a host-supplied command, credential, or authority body.
 
 set -euo pipefail
 
@@ -31,42 +32,59 @@ RUSTFLAGS='-C target-feature=+crt-static' cargo build \
   --manifest-path "${repository_root}/Cargo.toml" \
   -p firecracker-runtime \
   --bin guest-control-init \
+  --bin guest-broker-probe \
   --release \
   --locked
 
 staging="$(mktemp -d)"
-mapper_name="guest-control-ci-$$"
+mapper_name=''
 cleanup() {
-  veritysetup close "${mapper_name}" >/dev/null 2>&1 || true
+  [[ -z "${mapper_name}" ]] || veritysetup close "${mapper_name}" >/dev/null 2>&1 || true
   rm -rf -- "${staging}"
 }
 trap cleanup EXIT
 
-"${repository_root}/scripts/ci/build-guest-control-image.sh" \
-  --base-rootfs "${base_rootfs}" \
-  --guest-control-init "${repository_root}/target/release/guest-control-init" \
-  --workload "${busybox}" \
-  --port 18080 \
-  --output-rootfs "${staging}/guest-control.squashfs" \
-  --output-hash "${staging}/guest-control.squashfs.hash"
+run_real_test() {
+  local mode="$1"
+  local workload="$2"
+  local test_name="$3"
+  local image_rootfs="${staging}/${mode}.squashfs"
+  local image_hash="${image_rootfs}.hash"
+  local root_hash=''
 
-root_hash="$(awk '/^Root hash:/ {print $3}' "${staging}/guest-control.squashfs.verity")"
-[[ "${root_hash}" =~ ^[0-9a-f]{64}$ ]] || { printf '%s\n' 'guest image did not emit one lower-case dm-verity root hash' >&2; exit 2; }
-veritysetup open \
-  "${staging}/guest-control.squashfs" \
-  "${mapper_name}" \
-  "${staging}/guest-control.squashfs.hash" \
-  "${root_hash}"
-veritysetup status "${mapper_name}" | grep -q 'mode:        readonly'
+  mapper_name="guest-control-ci-$$-${mode}"
+  "${repository_root}/scripts/ci/build-guest-control-image.sh" \
+    --base-rootfs "${base_rootfs}" \
+    --guest-control-init "${repository_root}/target/release/guest-control-init" \
+    --workload "${workload}" \
+    --port 18080 \
+    --output-rootfs "${image_rootfs}" \
+    --output-hash "${image_hash}"
+  root_hash="$(awk '/^Root hash:/ {print $3}' "${image_rootfs}.verity")"
+  [[ "${root_hash}" =~ ^[0-9a-f]{64}$ ]] || { printf '%s\n' 'guest image did not emit one lower-case dm-verity root hash' >&2; exit 2; }
+  veritysetup open "${image_rootfs}" "${mapper_name}" "${image_hash}" "${root_hash}"
+  veritysetup status "${mapper_name}" | grep -q 'mode:        readonly'
 
-REAL_FIRECRACKER_BIN="${firecracker}" \
-REAL_FIRECRACKER_KERNEL="${kernel}" \
-REAL_FIRECRACKER_ROOTFS="/dev/mapper/${mapper_name}" \
-cargo test \
-  --manifest-path "${repository_root}/Cargo.toml" \
-  -p firecracker-runtime \
-  --test real_guest_control \
-  --locked \
-  -- \
-  --ignored \
-  --exact real_firecracker_guest_control_enforces_identity_gate_over_vsock
+  REAL_FIRECRACKER_BIN="${firecracker}" \
+  REAL_FIRECRACKER_KERNEL="${kernel}" \
+  REAL_FIRECRACKER_ROOTFS="/dev/mapper/${mapper_name}" \
+  cargo test \
+    --manifest-path "${repository_root}/Cargo.toml" \
+    -p firecracker-runtime \
+    --test real_guest_control \
+    --locked \
+    -- \
+    --ignored \
+    --exact "${test_name}"
+  veritysetup close "${mapper_name}"
+  mapper_name=''
+}
+
+run_real_test \
+  control \
+  "${busybox}" \
+  real_firecracker_guest_control_enforces_identity_gate_over_vsock
+run_real_test \
+  broker \
+  "${repository_root}/target/release/guest-broker-probe" \
+  real_firecracker_guest_reaches_host_broker_over_vsock

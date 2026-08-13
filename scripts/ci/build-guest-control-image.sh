@@ -43,6 +43,15 @@ require_output_file_or_absent() {
   [[ ! -e "${path}" || -f "${path}" ]] || fail "${label} must be a regular file or absent: ${path}"
 }
 
+require_private_output_directory() {
+  local directory="$1"
+  local owner mode
+  owner="$(stat -c '%u' -- "${directory}")" || fail 'could not determine output directory owner'
+  mode="$(stat -c '%a' -- "${directory}")" || fail 'could not determine output directory mode'
+  [[ "${owner}" == "$(id -u)" ]] || fail 'output directory must be owned by the invoking user'
+  (( (8#${mode} & 8#022) == 0 )) || fail 'output directory must not be group- or world-writable'
+}
+
 base_rootfs=''
 guest_control_init=''
 workload=''
@@ -113,6 +122,7 @@ hash_directory="$(dirname -- "${output_hash}")"
 output_directory="$(cd -P -- "${output_directory}" && pwd)"
 hash_directory="$(cd -P -- "${hash_directory}" && pwd)"
 [[ "${output_directory}" == "${hash_directory}" ]] || fail 'rootfs and hash outputs must share one directory'
+require_private_output_directory "${output_directory}"
 output_rootfs="${output_directory}/${output_rootfs_name}"
 output_hash="${output_directory}/${output_hash_name}"
 output_verity="${output_rootfs}.verity"

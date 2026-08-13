@@ -6,7 +6,7 @@
 
 > **対象読者:** orchestrator の実装者、レビュー担当者、実機で統合 test を回す人
 
-test は 3 系統ある。mock backend による state machine test、durable ledger を直接叩く test、production adapter の composition test。実 VM、実 vsock、実 filesystem はどれにも出てこない。
+test は 3 系統ある。mock backend による state machine test、durable ledger を直接叩く test、production adapter の composition test。加えて Broker の Firecracker per-port Unix listener は module test と repository の opt-in KVM test で確認する。実 `SessionOwner` lifecycle、実 filesystem、実 VM の完全統合はない。
 
 ## local test で確認したこと
 
@@ -47,7 +47,7 @@ cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-target
 | entropy | `SequenceRandom`（`[0x01; 16]` などの決定的な値） |
 | durable ledger（orchestrator 経由） | `InMemoryIdentityLedger` と `FailingLedger` |
 
-`tests/production_adapters.rs` が示すのは identity が adapter を貫通することだけ。Firecracker が起動すること、dm-verity や seccomp が適用されること、実 `AF_VSOCK` socket が bind すること、guest 内で capfs が動くことは、いずれも示していない。
+`tests/production_adapters.rs` が示すのは identity が adapter を貫通することだけ。Firecracker が起動すること、dm-verity や seccomp が適用されること、guest 内で capfs が動くことは、いずれも示していない。Broker の per-port Unix listener と closed request の往復だけは別の opt-in KVM test で確認する。
 
 ### 検査があるのに test が無いもの
 

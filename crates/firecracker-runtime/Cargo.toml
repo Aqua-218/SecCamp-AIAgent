@@ -14,9 +14,12 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+authority-core = { path = "../authority-core" }
+egress-protocol = { path = "../egress-protocol" }
 rustix = { version = "1.1.4", features = ["fs"] }
 sha2 = "0.10.9"
 socket2 = { version = "0.6.5", features = ["all"] }
 
 [dev-dependencies]
+egress-broker = { path = "../egress-broker" }
 tempfile = "3.27.0"

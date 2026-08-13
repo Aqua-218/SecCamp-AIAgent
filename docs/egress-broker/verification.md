@@ -30,6 +30,7 @@
 | clock を connection ごとではなく request ごとに読む | `each_request_on_one_connection_reads_the_clock_again` |
 | peer CID が一致しない stream を、guest を読まずに落とす | `serve_expected_peer` の CID 検査 test |
 | 1 connection が host の request 上限で止まる | `connection_stops_at_the_host_request_bound` |
+| Firecracker guest が host Broker に 1 request を送り canonical authorization rejection を受ける | opt-in `real_firecracker_guest_reaches_host_broker_over_vsock` |
 
 ## 実行コマンド
 
@@ -43,12 +44,12 @@ cargo clippy --manifest-path crates/egress-broker/Cargo.toml --all-targets -- -D
 
 ## 未検証の境界
 
-この crate の local test は外部ネットワークへ接続せず、実 secret を読み込まず、`AF_VSOCK` を bind しない。したがって、次はこの test 結果からは言えない。
+この crate の local test は外部ネットワークへ接続せず、実 secret を読み込まず、`AF_VSOCK` を bind しない。一方、repository の root 権限 opt-in test は Firecracker が guest-to-host connection を転送する per-port Unix socket を bind し、guest→Broker の canonical rejection を確認する。したがって、次はこの test 結果からは言えない。
 
-- 実 `AF_VSOCK` の guest/host 接続と長時間 stream
+- 長時間 stream、並行接続、Firecracker 以外の実 `AF_VSOCK` transport
 - 実 DNS、DNS rebinding、外部 HTTPS の certificate/SNI と redirect
 - 実 GitHub API、`EGRESS_GITHUB_TOKEN`、provider 側の ref race
-- guest supervisor から Broker までの end-to-end 統合
+- guest supervisor が発行した capability から Broker までの end-to-end 統合
 
 これらを実施していない段階で、Host Egress Broker 全体や full isolation が完成したとは扱わない。
 

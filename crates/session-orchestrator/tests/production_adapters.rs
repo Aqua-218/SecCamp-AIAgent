@@ -451,7 +451,13 @@ impl BrokerServiceListener for Listener {
 impl VsockListenerFactory for ListenerFactory {
     type Listener = Listener;
 
-    fn bind(&self, _host_cid: u32, _port: u32, _backlog: i32) -> io::Result<Self::Listener> {
+    fn bind(
+        &self,
+        _identity: &SessionIdentity,
+        _host_cid: u32,
+        _port: u32,
+        _backlog: i32,
+    ) -> io::Result<Self::Listener> {
         self.log.binds.fetch_add(1, Ordering::SeqCst);
         record_event(&self.log.lifecycle, "broker-bind");
         Ok(Listener {

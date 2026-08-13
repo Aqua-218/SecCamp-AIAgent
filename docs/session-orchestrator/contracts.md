@@ -131,7 +131,7 @@ orchestrator は前段の cleanup が失敗しても、後段の safe な cleanu
 
 ## 検証状態
 
-この契約の state machine test に加え、production adapter composition test は実 `CapabilityKernel`、Broker / Firecracker / workspace adapter を同じ startup/stop 経路へ接続する。外部 command、filesystem、API、listener は test double であり、実 capfs mount、実 `AF_VSOCK`、実 Firecracker、特権 guest isolation の end-to-end test はまだない。
+この契約の state machine test に加え、production adapter composition test は実 `CapabilityKernel`、Broker / Firecracker / workspace adapter を同じ startup/stop 経路へ接続する。外部 command、filesystem、API は test double である。Broker の Firecracker per-port Unix listener と closed request は別の opt-in KVM test で確認するが、実 capfs mount、実 `SessionOwner` lifecycle、特権 guest isolation の end-to-end test はまだない。
 
 ## 保証範囲外
 

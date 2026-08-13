@@ -1,4 +1,4 @@
-//! Host-owned Broker service lifecycle for one session-scoped `AF_VSOCK` endpoint.
+//! Host-owned Broker service lifecycle for one session-scoped guest endpoint.
 //!
 //! A successful lease means that the listener is bound, the session runtime is
 //! built, and its worker thread is owned by this backend. The listener and
@@ -8,8 +8,11 @@
 
 use std::{
     io::{self, Read, Write},
+    net::Shutdown,
     num::NonZeroUsize,
+    os::unix::net::{UnixListener, UnixStream},
     panic::{self, AssertUnwindSafe},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -25,6 +28,7 @@ use egress_broker::{
     server::{ConnectionCloseReason, RequestDispatcher, ServerError, serve_connection},
     transport::{AfVsockListener, TransportError, VsockShutdownHandle, VsockStream},
 };
+use firecracker_runtime::firecracker_guest_port_path;
 
 use crate::{
     BackendError, BrokerBackend as OrchestratorBrokerBackend, BrokerLease, SessionIdentity,
@@ -65,7 +69,7 @@ pub trait BrokerServiceListener: Send + 'static {
     /// Owner-only shutdown capability for an accepted stream.
     type Shutdown: BrokerStreamShutdown;
 
-    /// Attempts to accept one kernel-authenticated peer without blocking.
+    /// Attempts to accept one transport-authenticated peer without blocking.
     ///
     /// `Ok(None)` means no peer is currently pending.
     ///
@@ -95,18 +99,143 @@ impl BrokerServiceListener for AfVsockListener {
     }
 }
 
+/// A nonblocking Firecracker guest-initiated vsock endpoint.
+///
+/// Firecracker maps a guest connection to host CID 2 and port `P` onto a Unix
+/// socket named `<vsock_uds_path>_P`. The base UDS path is session-scoped and
+/// selected only from the verified Firecracker configuration; the guest never
+/// supplies it. The expected CID is therefore a host-owned binding to that
+/// exact microVM rather than a value read from the Unix socket peer record.
+#[derive(Debug)]
+pub struct FirecrackerUnixListener {
+    listener: UnixListener,
+    expected_guest_cid: u32,
+    path: PathBuf,
+}
+
+impl FirecrackerUnixListener {
+    /// Binds the exact Unix socket Firecracker forwards guest port `port` to.
+    ///
+    /// The caller must provision a unique private parent directory for every
+    /// session and clean it only after the listener and Firecracker have both
+    /// stopped. Existing paths are rejected rather than unlinked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the path is invalid, already occupied, or the
+    /// Unix socket cannot be bound and made nonblocking.
+    pub fn bind_nonblocking(
+        vsock_uds_path: impl AsRef<Path>,
+        expected_guest_cid: u32,
+        port: u32,
+    ) -> io::Result<Self> {
+        let path = firecracker_guest_port_path(vsock_uds_path.as_ref(), port).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid Firecracker guest Broker socket: {error}"),
+            )
+        })?;
+        let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            expected_guest_cid,
+            path,
+        })
+    }
+
+    /// Returns the exact host Unix socket path exposed for this guest port.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Attempts one guest-initiated Firecracker connection without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the nonblocking accept fails for a reason other
+    /// than no pending connection.
+    pub fn try_accept_peer(&self) -> io::Result<Option<(u32, FirecrackerUnixStream)>> {
+        match self.listener.accept() {
+            Ok((stream, _)) => Ok(Some((
+                self.expected_guest_cid,
+                FirecrackerUnixStream { stream },
+            ))),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// One guest-to-host stream forwarded by Firecracker's per-port Unix socket.
+#[derive(Debug)]
+pub struct FirecrackerUnixStream {
+    stream: UnixStream,
+}
+
+impl Read for FirecrackerUnixStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buffer)
+    }
+}
+
+impl Write for FirecrackerUnixStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// Owner-only cancellation capability for one Firecracker-forwarded stream.
+#[derive(Debug)]
+pub struct FirecrackerUnixShutdown {
+    stream: UnixStream,
+}
+
+impl BrokerStreamShutdown for FirecrackerUnixShutdown {
+    fn shutdown(&self) -> io::Result<()> {
+        self.stream.shutdown(Shutdown::Both)
+    }
+}
+
+impl BrokerServiceListener for FirecrackerUnixListener {
+    type Stream = FirecrackerUnixStream;
+    type Shutdown = FirecrackerUnixShutdown;
+
+    fn try_accept_peer(&self) -> io::Result<Option<(u32, Self::Stream)>> {
+        self.try_accept_peer()
+    }
+
+    fn shutdown_handle(stream: &Self::Stream) -> io::Result<Self::Shutdown> {
+        stream
+            .stream
+            .try_clone()
+            .map(|stream| FirecrackerUnixShutdown { stream })
+    }
+}
+
 /// Creates one nonblocking host-bound listener for a Broker service.
 pub trait VsockListenerFactory {
     /// Listener type returned after a successful bind.
     type Listener: BrokerServiceListener;
 
-    /// Binds a listener to the exact host CID, port, and backlog supplied by
-    /// the backend.
+    /// Binds a listener to the exact session identity, host CID, port, and
+    /// backlog supplied by the backend.
     ///
     /// # Errors
     ///
     /// Returns the underlying bind error when the listener cannot be created.
-    fn bind(&self, host_cid: u32, port: u32, backlog: i32) -> io::Result<Self::Listener>;
+    fn bind(
+        &self,
+        identity: &SessionIdentity,
+        host_cid: u32,
+        port: u32,
+        backlog: i32,
+    ) -> io::Result<Self::Listener>;
 }
 
 /// Production listener factory backed by a nonblocking Linux `AF_VSOCK` socket.
@@ -116,8 +245,79 @@ pub struct AfVsockListenerFactory;
 impl VsockListenerFactory for AfVsockListenerFactory {
     type Listener = AfVsockListener;
 
-    fn bind(&self, host_cid: u32, port: u32, backlog: i32) -> io::Result<Self::Listener> {
+    fn bind(
+        &self,
+        _identity: &SessionIdentity,
+        host_cid: u32,
+        port: u32,
+        backlog: i32,
+    ) -> io::Result<Self::Listener> {
         AfVsockListener::bind_nonblocking(host_cid, port, backlog)
+    }
+}
+
+type FirecrackerVsockPathForSession =
+    dyn Fn(&SessionIdentity) -> Result<PathBuf, BackendError> + Send + Sync;
+
+/// Factory for Firecracker's guest-initiated per-port Unix socket transport.
+#[derive(Clone)]
+pub struct FirecrackerUnixListenerFactory {
+    vsock_path_for_session: Arc<FirecrackerVsockPathForSession>,
+    expected_guest_cid: u32,
+}
+
+impl std::fmt::Debug for FirecrackerUnixListenerFactory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FirecrackerUnixListenerFactory")
+            .field("vsock_path_for_session", &"<host-owned>")
+            .field("expected_guest_cid", &self.expected_guest_cid)
+            .finish()
+    }
+}
+
+impl FirecrackerUnixListenerFactory {
+    /// Seals one fixed verified Firecracker UDS path and guest CID.
+    #[must_use]
+    pub fn new(vsock_uds_path: impl Into<PathBuf>, expected_guest_cid: u32) -> Self {
+        let vsock_uds_path = vsock_uds_path.into();
+        Self::for_session(move |_| Ok(vsock_uds_path.clone()), expected_guest_cid)
+    }
+
+    /// Seals a host-owned function that derives the Firecracker UDS path for
+    /// the exact session identity before the listener is bound.
+    #[must_use]
+    pub fn for_session(
+        vsock_path_for_session: impl Fn(&SessionIdentity) -> Result<PathBuf, BackendError>
+        + Send
+        + Sync
+        + 'static,
+        expected_guest_cid: u32,
+    ) -> Self {
+        Self {
+            vsock_path_for_session: Arc::new(vsock_path_for_session),
+            expected_guest_cid,
+        }
+    }
+}
+
+impl VsockListenerFactory for FirecrackerUnixListenerFactory {
+    type Listener = FirecrackerUnixListener;
+
+    fn bind(
+        &self,
+        identity: &SessionIdentity,
+        _host_cid: u32,
+        port: u32,
+        _backlog: i32,
+    ) -> io::Result<Self::Listener> {
+        let vsock_uds_path = (self.vsock_path_for_session)(identity).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("deriving Firecracker Broker UDS for session failed: {error}"),
+            )
+        })?;
+        FirecrackerUnixListener::bind_nonblocking(&vsock_uds_path, self.expected_guest_cid, port)
     }
 }
 
@@ -287,11 +487,11 @@ pub enum BrokerWorkerExit {
         /// Original transport failure.
         message: String,
     },
-    /// The kernel-reported peer CID did not match the host-selected CID.
+    /// The transport-reported peer CID did not match the host-selected CID.
     UnexpectedPeer {
         /// Host-selected CID.
         expected: u32,
-        /// Kernel-reported CID.
+        /// Transport-reported CID.
         received: u32,
     },
     /// The accepted stream could not produce an owner-only shutdown handle.
@@ -315,7 +515,11 @@ pub enum BrokerWorkerStatus {
 }
 
 /// A Broker backend using the production `AF_VSOCK` listener factory.
-pub type ProductionBrokerBackend<R> = BrokerBackend<AfVsockListenerFactory, R>;
+/// Production Firecracker Broker backend using its per-guest-port Unix transport.
+pub type ProductionBrokerBackend<R> = BrokerBackend<FirecrackerUnixListenerFactory, R>;
+
+/// Direct kernel `AF_VSOCK` backend for non-Firecracker environments.
+pub type KernelVsockBrokerBackend<R> = BrokerBackend<AfVsockListenerFactory, R>;
 
 type StreamShutdownSlot<F> =
     Arc<Mutex<Option<<<F as VsockListenerFactory>::Listener as BrokerServiceListener>::Shutdown>>>;
@@ -619,9 +823,9 @@ where
 
         let listener = self
             .listener_factory
-            .bind(self.host_cid, self.port, self.backlog)
+            .bind(identity, self.host_cid, self.port, self.backlog)
             .map_err(|error| {
-                BackendError::new(format!("host AF_VSOCK listener bind failed: {error}"))
+                BackendError::new(format!("host Broker listener bind failed: {error}"))
             })?;
         let runtime = self.runtime_factory.build(identity)?;
         let cancellation = BrokerCancellation::new();
@@ -701,12 +905,12 @@ impl<R> BrokerBackend<AfVsockListenerFactory, R>
 where
     R: BrokerRuntimeFactory<VsockStream>,
 {
-    /// Creates a production transport backend with a caller-supplied runtime factory.
+    /// Creates a direct kernel `AF_VSOCK` backend with a caller-supplied runtime factory.
     ///
     /// # Errors
     ///
     /// Returns [`BackendError`] when transport configuration is invalid.
-    pub fn production(
+    pub fn kernel_vsock(
         runtime_factory: R,
         host_cid: u32,
         expected_guest_cid: u32,
@@ -715,6 +919,46 @@ where
     ) -> Result<Self, BackendError> {
         Self::new(
             AfVsockListenerFactory,
+            runtime_factory,
+            host_cid,
+            expected_guest_cid,
+            port,
+            backlog,
+        )
+    }
+}
+
+impl<R> BrokerBackend<FirecrackerUnixListenerFactory, R>
+where
+    R: BrokerRuntimeFactory<FirecrackerUnixStream>,
+{
+    /// Creates a Firecracker guest-initiated Unix transport backend.
+    ///
+    /// `host_cid` remains part of the external endpoint record and must be the
+    /// Firecracker-defined host CID 2. Firecracker routes this endpoint through
+    /// the verified per-session UDS path rather than a host kernel `AF_VSOCK` bind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the endpoint configuration is invalid.
+    pub fn firecracker(
+        runtime_factory: R,
+        vsock_path_for_session: impl Fn(&SessionIdentity) -> Result<PathBuf, BackendError>
+        + Send
+        + Sync
+        + 'static,
+        host_cid: u32,
+        expected_guest_cid: u32,
+        port: u32,
+        backlog: i32,
+    ) -> Result<Self, BackendError> {
+        if host_cid != MIN_HOST_CID {
+            return Err(BackendError::new(format!(
+                "invalid Firecracker host CID {host_cid}: expected {MIN_HOST_CID}",
+            )));
+        }
+        Self::new(
+            FirecrackerUnixListenerFactory::for_session(vsock_path_for_session, expected_guest_cid),
             runtime_factory,
             host_cid,
             expected_guest_cid,
@@ -878,12 +1122,14 @@ fn unknown_lease_error(operation: &str) -> BackendError {
 mod tests {
     use std::{
         io::{self, Cursor},
+        os::unix::net::UnixStream,
+        path::Path,
         sync::{
             Arc, Condvar, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use egress_broker::server::ConnectionCloseReason;
@@ -891,8 +1137,9 @@ mod tests {
     use super::{
         BrokerBackend, BrokerCancellation, BrokerConnectionExit, BrokerRuntime,
         BrokerRuntimeFactory, BrokerServiceListener, BrokerStreamShutdown, BrokerWorkerExit,
-        BrokerWorkerStatus, DROP_JOIN_POLL_INTERVAL, DropJoinAction, VsockListenerFactory,
-        drop_join_action, successful_connection_exit,
+        BrokerWorkerStatus, DROP_JOIN_POLL_INTERVAL, DropJoinAction, FirecrackerUnixListener,
+        FirecrackerUnixListenerFactory, VsockListenerFactory, drop_join_action,
+        firecracker_guest_port_path, successful_connection_exit,
     };
     use crate::{
         BackendError, BrokerBackend as OrchestratorBrokerBackend, BrokerLease, BrokerSessionId,
@@ -975,7 +1222,13 @@ mod tests {
     impl VsockListenerFactory for FakeListenerFactory {
         type Listener = FakeListener;
 
-        fn bind(&self, host_cid: u32, port: u32, backlog: i32) -> io::Result<Self::Listener> {
+        fn bind(
+            &self,
+            _identity: &SessionIdentity,
+            host_cid: u32,
+            port: u32,
+            backlog: i32,
+        ) -> io::Result<Self::Listener> {
             self.calls
                 .lock()
                 .expect("fake bind call lock must not be poisoned")
@@ -1128,6 +1381,70 @@ mod tests {
                 .expect("gate wait must not be poisoned")
                 .0;
         }
+    }
+
+    #[test]
+    fn firecracker_listener_uses_the_exact_guest_port_socket_and_host_owned_cid() {
+        let root = std::env::temp_dir().join(format!(
+            "so-vsock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("test clock must follow the epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir(&root).expect("test socket root must be creatable");
+        let session = identity(0x40);
+        let base = root.join(format!("{}.vsock", session.workspace_id()));
+        let factory_root = root.clone();
+        let factory = FirecrackerUnixListenerFactory::for_session(
+            move |bound_identity| {
+                Ok(factory_root.join(format!("{}.vsock", bound_identity.workspace_id())))
+            },
+            42,
+        );
+        let listener = factory
+            .bind(&session, 2, 18_081, 1)
+            .expect("exact session-derived Firecracker guest socket must bind");
+        assert_eq!(
+            listener.path(),
+            root.join(format!("{}.vsock_18081", session.workspace_id()))
+        );
+        assert!(
+            listener
+                .try_accept_peer()
+                .expect("nonblocking listener must poll")
+                .is_none()
+        );
+
+        let _client = UnixStream::connect(listener.path())
+            .expect("guest fixture must connect through the exact derived socket");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (peer, stream) = loop {
+            match listener
+                .try_accept_peer()
+                .expect("exact listener must accept the fixture")
+            {
+                Some(accepted) => break accepted,
+                None if Instant::now() < deadline => thread::yield_now(),
+                None => panic!("Firecracker listener did not accept before timeout"),
+            }
+        };
+        assert_eq!(peer, 42);
+        let shutdown = FirecrackerUnixListener::shutdown_handle(&stream)
+            .expect("accepted stream must yield an owner-only shutdown handle");
+        shutdown
+            .shutdown()
+            .expect("owner-only shutdown handle must interrupt the stream");
+
+        drop(stream);
+        drop(listener);
+        std::fs::remove_file(firecracker_guest_port_path(&base, 18_081).expect("path is valid"))
+            .expect("test socket must be removable");
+        std::fs::remove_dir(root).expect("test socket root must be removable");
+        assert!(firecracker_guest_port_path(Path::new("relative.vsock"), 18_081).is_err());
+        assert!(firecracker_guest_port_path(Path::new("/tmp/../vsock"), 18_081).is_err());
+        assert!(firecracker_guest_port_path(Path::new("/tmp/vsock"), 0).is_err());
     }
 
     fn release_runtime(gate: &Arc<(Mutex<BlockState>, Condvar)>) {

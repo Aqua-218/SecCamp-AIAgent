@@ -12,7 +12,7 @@
 
 - **実装済み:** 型、API、production adapter のコードが repository にある。
 - **mock/contract 検証済み:** fake、mock、module test、local contract test で境界を確認した。
-- **実機未検証:** Firecracker の guest control 以外の特権 kernel 操作、実 jailer、snapshot restore、Broker の host listener、外部 DNS/HTTPS/provider、guest-to-host egress end-to-end。
+- **実機未検証:** Firecracker の guest control / closed Broker rejection 以外の特権 kernel 操作、実 jailer、snapshot restore、外部 DNS/HTTPS/provider、guest supervisor による capability egress end-to-end。
 
 ## 全体の依存関係
 
@@ -83,7 +83,7 @@ mock backend の成功/失敗順序、capability 不足の事前拒否、Landloc
 
 `egress-broker` は frame、canonical CBOR、session/replay、budget、最終 `CapabilityKernel` 認可、typed adapter の順で要求を処理する。公開 HTTPS は `GET`/`HEAD`、HTTPS port 443、DNS 応答全体の public-only、redirect ごとの再検査、32 MiB host cap、5 hop、10 秒接続 timeout、60 秒 total timeout を適用する。GitHub は `PublishBranch` と `CreatePullRequest` のみを受け、前者には host-side expected-old/new plan と `force: false` を要求する。
 
-mock/contract 検証は完了している。実 `AF_VSOCK`、実 DNS、外部 HTTPS、実 GitHub API、`EGRESS_GITHUB_TOKEN` を使った provider、guest supervisor からの end-to-end dispatch は未検証である。詳細は [Host Egress Broker](../egress-broker/README.md) を参照する。
+mock/contract 検証は完了している。opt-in KVM test は Firecracker guest-to-host per-port Unix socket、canonical request、host Broker の `NotAuthorized` response、adapter 非実行を確認する。実 DNS、外部 HTTPS、実 GitHub API、`EGRESS_GITHUB_TOKEN` を使った provider、guest supervisor からの capability dispatch は未検証である。詳細は [Host Egress Broker](../egress-broker/README.md) を参照する。
 
 ## 6. Firecracker runtime
 
@@ -91,7 +91,7 @@ mock/contract 検証は完了している。実 `AF_VSOCK`、実 DNS、外部 HT
 
 launch は `RuntimeState::WorkloadStopped` で戻り、restore は `IdentityRegenerated` で止まる。`inject_identity` が成功して初めて `IdentityInjected`、`start_workload` が成功して `Running` へ進む。artifact、workspace、verity、jailer、API failure には rollback がある。
 
-fake command/filesystem/API/identity source による contract test と local Unix socket HTTP exchange に加え、[`verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は実 Firecracker process、実 dm-verity device、guest kernel、guest `AF_VSOCK` control channel を通す。jailer が作る namespace/cgroup、snapshot/restore、workspace drive、VM escape、CapabilityKernel/capfs を含む guest supervisor は未検証である。したがって Phase 6 は「identity gate を持つ VM boot を実証済み」だが「VM 隔離全体が完成」ではない。
+fake command/filesystem/API/identity source による contract test と local Unix socket HTTP exchange に加え、[`verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は実 Firecracker process、実 dm-verity device、guest kernel、guest `AF_VSOCK` control channel、guest-to-host Broker port を通す。jailer が作る namespace/cgroup、snapshot/restore、workspace drive、VM escape、CapabilityKernel/capfs を含む guest supervisor は未検証である。したがって Phase 6 は「identity gate と閉じた Broker round trip を持つ VM boot を実証済み」だが「VM 隔離全体が完成」ではない。
 
 ## 7. Supervisor / session orchestrator
 

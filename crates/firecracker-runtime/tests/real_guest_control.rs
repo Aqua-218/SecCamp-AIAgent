@@ -7,23 +7,61 @@
 
 use std::{
     env,
-    os::unix::fs::FileTypeExt,
+    num::{NonZeroU64, NonZeroUsize},
+    os::unix::{fs::FileTypeExt, net::UnixListener},
     path::Path,
     process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
+use authority_core::{
+    capability::{CapId, IssuerId, SubjectId},
+    github::{GitHubAuthority, GitHubRequest},
+    http::{HttpFetchAuthority, HttpFetchRequest},
+    kernel::CapabilityKernel,
+    state::CapabilityState,
+    time::MonotonicTime,
+};
+use egress_broker::{
+    dispatch::{
+        BrokerDispatcher, DispatchContext, PublicDispatchAdapter, default_github_response_cap,
+    },
+    github::{GitHubAdapter, GitHubAdapterError, GitHubResponse},
+    public_fetch::{FetchError, PublicResponse},
+    server::{ConnectionCloseReason, ConnectionReport, serve_connection},
+};
+use egress_protocol::{budget::SessionBudgetLimits, session::BrokerSessionId};
 use firecracker_runtime::{
     ApiClient, ApiRequest, FirecrackerVsockApiClient, HttpMethod, IdentityBundle, IdentityId,
-    RuntimeError, UnixApiClient,
+    RuntimeError, UnixApiClient, firecracker_guest_port_path,
     guest_control::{GuestControlAction, GuestControlRequest},
 };
 use tempfile::TempDir;
 
 const GUEST_CID: u32 = 42;
 const GUEST_CONTROL_PORT: u32 = 18_080;
+const GUEST_BROKER_PORT: u32 = 18_081;
 const API_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy)]
+enum GuestWorkload {
+    Sleep,
+    BrokerProbe,
+}
+
+impl GuestWorkload {
+    const fn arguments(self) -> &'static str {
+        match self {
+            Self::Sleep => "sleep 600",
+            Self::BrokerProbe => "--port 18081",
+        }
+    }
+}
 
 struct RealFirecracker {
     process: Child,
@@ -147,29 +185,29 @@ fn wait_for_guest_vsock(vsock: &Path) {
     }
 }
 
-#[test]
-#[ignore = "requires KVM, Firecracker, and a guest-control rootfs"]
-fn real_firecracker_guest_control_enforces_identity_gate_over_vsock() {
-    let firecracker = required_path("REAL_FIRECRACKER_BIN");
-    let kernel = required_path("REAL_FIRECRACKER_KERNEL");
-    let rootfs = required_path("REAL_FIRECRACKER_ROOTFS");
-    let vm = RealFirecracker::start(&firecracker);
-    let mut api = UnixApiClient::new(vm.api_socket()).expect("real API path must be valid");
+fn configure_and_start_real_vm(
+    api: &mut UnixApiClient,
+    vm: &RealFirecracker,
+    kernel: &Path,
+    rootfs: &Path,
+    workload: GuestWorkload,
+) {
     put(
-        &mut api,
+        api,
         "/machine-config",
         r#"{"vcpu_count":1,"mem_size_mib":256}"#.to_owned(),
     );
     put(
-        &mut api,
+        api,
         "/boot-source",
         format!(
-            r#"{{"kernel_image_path":"{}","boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/usr/local/libexec/guest-control-init -- --port {GUEST_CONTROL_PORT} --workload /usr/local/libexec/guest-workload sleep 600"}}"#,
-            kernel.display()
+            r#"{{"kernel_image_path":"{}","boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/usr/local/libexec/guest-control-init -- --port {GUEST_CONTROL_PORT} --workload /usr/local/libexec/guest-workload {}"}}"#,
+            kernel.display(),
+            workload.arguments(),
         ),
     );
     put(
-        &mut api,
+        api,
         "/drives/rootfs",
         format!(
             r#"{{"drive_id":"rootfs","path_on_host":"{}","is_root_device":true,"is_read_only":true}}"#,
@@ -178,7 +216,7 @@ fn real_firecracker_guest_control_enforces_identity_gate_over_vsock() {
     );
     let vsock = vm.vsock_socket();
     put(
-        &mut api,
+        api,
         "/vsock",
         format!(
             r#"{{"guest_cid":{GUEST_CID},"uds_path":"{}"}}"#,
@@ -186,10 +224,107 @@ fn real_firecracker_guest_control_enforces_identity_gate_over_vsock() {
         ),
     );
     put(
-        &mut api,
+        api,
         "/actions",
         r#"{"action_type":"InstanceStart"}"#.to_owned(),
     );
+}
+
+struct NeverPublicAdapter(Arc<AtomicUsize>);
+
+impl PublicDispatchAdapter for NeverPublicAdapter {
+    fn fetch(
+        &self,
+        _request: &HttpFetchRequest,
+        _authority: &HttpFetchAuthority,
+    ) -> Result<PublicResponse, FetchError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(FetchError::OperationRejected)
+    }
+}
+
+struct NeverGitHubAdapter(Arc<AtomicUsize>);
+
+impl GitHubAdapter for NeverGitHubAdapter {
+    fn execute(
+        &mut self,
+        _request_id: egress_protocol::session::BrokerRequestId,
+        _request: &GitHubRequest,
+        _authority: &GitHubAuthority,
+        _max_response_bytes: u64,
+    ) -> Result<GitHubResponse, GitHubAdapterError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(GitHubAdapterError::NotAuthorized)
+    }
+}
+
+fn serve_probe_connection(
+    listener: &UnixListener,
+    public_calls: Arc<AtomicUsize>,
+    github_calls: Arc<AtomicUsize>,
+) -> Result<ConnectionReport, String> {
+    let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("real-vsock-test")));
+    let mut dispatcher = BrokerDispatcher::new_in_memory(
+        kernel,
+        NeverPublicAdapter(public_calls),
+        NeverGitHubAdapter(github_calls),
+        BrokerSessionId::new([7; 16]),
+        NonZeroUsize::new(1).expect("fixed replay capacity must be non-zero"),
+        SessionBudgetLimits::new(
+            NonZeroU64::new(1).expect("fixed request budget must be non-zero"),
+            1_024,
+            NonZeroUsize::new(1).expect("fixed concurrent budget must be non-zero"),
+        ),
+        default_github_response_cap(),
+    );
+    let identity = DispatchContext {
+        caller: SubjectId::new("unissued-probe-subject"),
+        capability: CapId::new("unissued-probe-capability"),
+        now: MonotonicTime::from_ticks(0),
+    };
+    let deadline = Instant::now() + API_WAIT;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let mut ticks = 0_u64;
+                let mut clock = || {
+                    ticks = ticks
+                        .checked_add(1)
+                        .expect("test monotonic ticks must not overflow");
+                    MonotonicTime::from_ticks(ticks)
+                };
+                return serve_connection(
+                    stream,
+                    &mut dispatcher,
+                    &identity,
+                    &mut clock,
+                    NonZeroUsize::new(1).expect("fixed connection request limit must be non-zero"),
+                )
+                .map_err(|error| format!("serving guest Broker request: {error}"));
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err("guest did not connect to host Broker before timeout".to_owned());
+            }
+            Err(error) => return Err(format!("accepting guest Broker connection: {error}")),
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires KVM, Firecracker, and a guest-control rootfs"]
+fn real_firecracker_guest_control_enforces_identity_gate_over_vsock() {
+    let firecracker = required_path("REAL_FIRECRACKER_BIN");
+    let kernel = required_path("REAL_FIRECRACKER_KERNEL");
+    let rootfs = required_path("REAL_FIRECRACKER_ROOTFS");
+    let vm = RealFirecracker::start(&firecracker);
+    let mut api = UnixApiClient::new(vm.api_socket()).expect("real API path must be valid");
+    let vsock = vm.vsock_socket();
+    configure_and_start_real_vm(&mut api, &vm, &kernel, &rootfs, GuestWorkload::Sleep);
 
     wait_for_guest_vsock(&vsock);
     let request = guest_request();
@@ -228,4 +363,69 @@ fn real_firecracker_guest_control_enforces_identity_gate_over_vsock() {
         retried_start.body,
         request.canonical_acknowledgement(GuestControlAction::StartWorkload)
     );
+}
+
+#[test]
+#[ignore = "requires KVM, Firecracker, a guest Broker probe rootfs, and a host Unix socket"]
+fn real_firecracker_guest_reaches_host_broker_over_vsock() {
+    let firecracker = required_path("REAL_FIRECRACKER_BIN");
+    let kernel = required_path("REAL_FIRECRACKER_KERNEL");
+    let rootfs = required_path("REAL_FIRECRACKER_ROOTFS");
+    let public_calls = Arc::new(AtomicUsize::new(0));
+    let github_calls = Arc::new(AtomicUsize::new(0));
+    let vm = RealFirecracker::start(&firecracker);
+    let vsock = vm.vsock_socket();
+    let broker_socket = firecracker_guest_port_path(&vsock, GUEST_BROKER_PORT)
+        .expect("real Firecracker vsock path must derive one exact guest port socket");
+    let listener = UnixListener::bind(&broker_socket)
+        .expect("host must bind the exact Firecracker guest Broker socket");
+    listener
+        .set_nonblocking(true)
+        .expect("host Broker listener must become nonblocking");
+    let broker = thread::spawn({
+        let public_calls = Arc::clone(&public_calls);
+        let github_calls = Arc::clone(&github_calls);
+        move || serve_probe_connection(&listener, public_calls, github_calls)
+    });
+
+    let mut api = UnixApiClient::new(vm.api_socket()).expect("real API path must be valid");
+    configure_and_start_real_vm(&mut api, &vm, &kernel, &rootfs, GuestWorkload::BrokerProbe);
+    wait_for_guest_vsock(&vsock);
+    let request = guest_request();
+    let mut client = FirecrackerVsockApiClient::new(&vsock, GUEST_CID, GUEST_CONTROL_PORT)
+        .expect("exact real guest endpoint must be valid");
+    let injected = client
+        .request(&ApiRequest {
+            method: HttpMethod::Put,
+            path: GuestControlAction::InjectIdentity.path().to_owned(),
+            body: request.canonical_body(),
+        })
+        .expect("identity injection must reach the real guest");
+    assert_eq!(
+        injected.body,
+        request.canonical_acknowledgement(GuestControlAction::InjectIdentity)
+    );
+    let started = client
+        .request(&ApiRequest {
+            method: HttpMethod::Put,
+            path: GuestControlAction::StartWorkload.path().to_owned(),
+            body: request.canonical_body(),
+        })
+        .expect("guest Broker probe must be released after identity injection");
+    assert_eq!(
+        started.body,
+        request.canonical_acknowledgement(GuestControlAction::StartWorkload)
+    );
+
+    let report = broker
+        .join()
+        .expect("host Broker thread must not panic")
+        .expect("host Broker must serve the guest probe");
+    assert_eq!(report.requests_served(), 1);
+    assert_eq!(
+        report.close_reason(),
+        ConnectionCloseReason::RequestLimitReached
+    );
+    assert_eq!(public_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(github_calls.load(Ordering::SeqCst), 0);
 }

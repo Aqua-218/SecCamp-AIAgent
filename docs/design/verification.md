@@ -54,7 +54,7 @@ flowchart LR
 | namespace race | loom + stress test | rename、unlink、open handle の競合 | 限定的 test、全 interleaving は未検証 |
 | link 対応 | 実 mount の攻撃テスト | 解決後 path での認可、root 脱出の拒否、rename 後の再解決、alias を持つ inode の全名前認可 | 深い chain と cycle（kernel の `ELOOP` に委譲）、体系的な backing 差し替え |
 | SSRF | resolver / redirect test | 非公開宛先と rebinding の拒否 | fake resolver/connector、実 DNS は未検証 |
-| Host Egress Broker | module/contract test | frame、replay、budget、typed dispatch、公開 HTTPS、GitHub plan | mock/contract 検証済み、実 `AF_VSOCK`/外部 provider は未検証 |
+| Host Egress Broker | module/contract test + opt-in KVM test | frame、replay、budget、typed dispatch、公開 HTTPS、GitHub plan | Firecracker guest-to-host canonical rejection は実機確認、外部 provider は未検証 |
 | runtime isolation | mock backend + capability detection | ordered apply/rollback と policy validation | mock 検証済み、privileged apply は未検証 |
 | Firecracker runtime | fake command/filesystem/API + Unix socket test + opt-in KVM test | artifact、jailer/API 順序、snapshot state、identity/workload gate | 実 Firecracker + dm-verity + guest `AF_VSOCK` identity gate を確認。jailer / snapshot restore は未検証 |
 | Supervisor | protocol module test + `FakeResources` | identity binding、subject lifecycle、handle cleanup | mock/contract 検証済み、Linux resource は未検証 |
@@ -83,7 +83,7 @@ Direct-I/O FUSE adapterのmodule testは、許可範囲と祖先だけのmetadat
 
 ### Host Egress Broker
 
-`egress-broker` は deterministic fake で bounded transport、canonical CBOR dispatch、session/replay binding、budget、最終 `CapabilityKernel` 認可、DNS answer の全体検査、redirect ごとの再解決、response streaming cap、GitHub の expected-old plan、typed rate-limit metadata を検査する。`FramedTransport` は `Cursor` を使い、`PublicFetcher` は fake resolver/connector、GitHub adapter は fake provider を使うため、これらは mock/contract 検証である。実 `AF_VSOCK`、実 DNS、外部 HTTPS、実 GitHub API、guest-to-host の end-to-end は未検証である。詳細は [Host Egress Broker](../egress-broker/README.md) と [検証対応表](../egress-broker/verification.md) を参照する。
+`egress-broker` は deterministic fake で bounded transport、canonical CBOR dispatch、session/replay binding、budget、最終 `CapabilityKernel` 認可、DNS answer の全体検査、redirect ごとの再解決、response streaming cap、GitHub の expected-old plan、typed rate-limit metadata を検査する。`FramedTransport` は `Cursor` を使い、`PublicFetcher` は fake resolver/connector、GitHub adapter は fake provider を使うため、これらは mock/contract 検証である。加えて opt-in KVM test は Firecracker guest から host per-port Unix socket を通り、実 `BrokerDispatcher` が canonical `NotAuthorized` を返すまでを確認する。実 DNS、外部 HTTPS、実 GitHub API、guest supervisor による capability dispatch は未検証である。詳細は [Host Egress Broker](../egress-broker/README.md) と [検証対応表](../egress-broker/verification.md) を参照する。
 
 ### runtime isolation
 
@@ -91,7 +91,7 @@ Direct-I/O FUSE adapterのmodule testは、許可範囲と祖先だけのmetadat
 
 ### Firecracker runtime
 
-`firecracker-runtime` の test は artifact digest、mutable `latest` path、network device、workspace overlap、jailer/verity/API の順序、API error rollback、snapshot fingerprint、stale/duplicate identity、identity injection 前の workload gate を fake boundary で検査する。さらに [`verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は static PID 1 image を作り、実 dm-verity mapper を read-only で開き、実 Firecracker を boot して guest `AF_VSOCK` control channel の `409` gate、identity injection、workload release を確認する。`Runtime::launch` の jailer、workspace drive、snapshot/restore、VM escape は未検証である。詳細は [Firecracker runtime](../firecracker-runtime/README.md) を参照する。
+`firecracker-runtime` の test は artifact digest、mutable `latest` path、network device、workspace overlap、jailer/verity/API の順序、API error rollback、snapshot fingerprint、stale/duplicate identity、identity injection 前の workload gate を fake boundary で検査する。さらに [`verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は static PID 1 image を作り、実 dm-verity mapper を read-only で開き、実 Firecracker を boot して guest `AF_VSOCK` control channel の `409` gate、identity injection、workload release、guest-to-host Broker canonical rejection を確認する。`Runtime::launch` の jailer、workspace drive、snapshot/restore、VM escape は未検証である。詳細は [Firecracker runtime](../firecracker-runtime/README.md) を参照する。
 
 ### Supervisor
 
@@ -99,7 +99,7 @@ wire module test は version、closed tag、4 KiB size、field length、body len
 
 ### Session orchestrator
 
-state-machine test は mock backend の call log と lease を使い、workspace -> Broker -> VM -> capability -> workload の commit 順、各 failure の rollback、VM kill failure 時の workspace isolation 保留、snapshot identity rejection、identity reuse、foreign lease、二重 start、stop retry を検査する。production adapter composition test は実 `CapabilityKernel` と Broker / Firecracker / workspace adapter を同じ経路へ接続し、外部 command、filesystem、API、listener を test double にする。したがって adapter 間の identity と cleanup 契約は検証するが、実 Firecracker、実 Broker/vsock、実 capfs mount、特権 isolation の検証ではない。詳細は [Session orchestrator](../session-orchestrator/README.md) を参照する。
+state-machine test は mock backend の call log と lease を使い、workspace -> Broker -> VM -> capability -> workload の commit 順、各 failure の rollback、VM kill failure 時の workspace isolation 保留、snapshot identity rejection、identity reuse、foreign lease、二重 start、stop retry を検査する。production adapter composition test は実 `CapabilityKernel` と Broker / Firecracker / workspace adapter を同じ経路へ接続し、外部 command、filesystem、API を test double にする。Broker の Firecracker per-port Unix listener は module test と opt-in KVM test で確認するが、実 `SessionOwner` lifecycle、実 capfs mount、特権 isolation は未検証である。詳細は [Session orchestrator](../session-orchestrator/README.md) を参照する。
 
 link の test は実 mount 上で `symlink(2)` / `readlink(2)` / `link(2)` を通し、target が repository の外へ出る形を作らせないこと、alias を持つ inode が全ての名前で認可されることを確認する（[symlink](capfs.md#symlink-は-registry-が-target-を所有する)、[hard link](capfs.md#hard-link-は全ての名前で認可することで閉じる)）。深い chain と cycle は kernel 自身の `ELOOP` に委ねており、独自の test は置いていない。
 

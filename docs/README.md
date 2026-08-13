@@ -88,7 +88,7 @@ flowchart TB
 | `authority-core` | [Authority core](authority-core/README.md) | 権限の表現、委譲判定、状態、revoke、監査。Rust と Lean の二重実装 | unit / property / loom / Lean 定理 / 共通 corpus |
 | `capfs` | [capfs](capfs/README.md) | backing root、namespace registry、node table、Direct-I/O FUSE adapter | 実 mount test を含む。実 VM 内での動作は未検証 |
 | `egress-protocol` | [Broker session envelope](egress-protocol/session-envelopes.md)、[Canonical CBOR](egress-protocol/canonical-cbor.md) | bounded frame、canonical CBOR、session と sequence、budget | module test |
-| `egress-broker` | [Host Egress Broker](egress-broker/README.md) | AF_VSOCK frame、replay、budget、公開 HTTPS、型付き GitHub adapter | fake resolver / connector / provider。実 vsock、外部 DNS / HTTPS / GitHub は未検証 |
+| `egress-broker` | [Host Egress Broker](egress-broker/README.md) | frame、replay、budget、公開 HTTPS、型付き GitHub adapter | fake resolver / connector / provider。Firecracker guest-to-host の canonical rejection は opt-in 実機 test、外部 DNS / HTTPS / GitHub は未検証 |
 | `firecracker-runtime` | [Firecracker runtime](firecracker-runtime/README.md) | artifact 固定、dm-verity、jailer、API 順序、snapshot / restore、identity gate、guest-control PID 1 | 実 Firecracker + dm-verity + guest `AF_VSOCK` identity gate を opt-in test で確認。jailer / snapshot restore は未検証 |
 | `runtime-isolation` | [runtime-isolation](runtime-isolation/README.md) | exec 直前の 13 step。namespace、mount、cgroup、Landlock、capability、seccomp | mock backend と純粋関数。実 syscall は未検証 |
 | `supervisor` | [Supervisor adapter](supervisor/README.md) | 認証済み connection の subject binding、wire protocol、subject lifecycle | `CapabilityKernel` と `FakeResources`。Linux resource と実 socket は未検証 |

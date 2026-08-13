@@ -118,7 +118,7 @@ flowchart BT
 
 灰色の 3 つは、どの crate からも依存されていない。`firecracker-runtime` と `runtime-isolation` は `authority-core` すら参照せず、前者は `rustix` と `sha2`、後者は `libc` だけで立っている。
 
-host daemon は無く、guest の CapabilityKernel / capfs / supervisor / runtime-isolation を一つの session として組み立てる init も無い。[`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は例外で、実 VM 内の identity/workload gate 専用 PID 1 である。任意 command、credential、authority body を host から受け取らないため、配置図の guest supervisor の代替ではない。
+deployable host daemon は無く、guest の CapabilityKernel / capfs / supervisor / runtime-isolation を一つの session として組み立てる init も無い。host 側には `ProductionSessionRuntimeBuilder` があるが、これは library composition root である。[`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は実 VM 内の identity/workload gate 専用 PID 1 であり、任意 command、credential、authority body を host から受け取らないため、配置図の guest supervisor の代替ではない。
 
 これは書き忘れではなく順序の結果で、[実装順序](implementation-plan.md)が「Authority core と capfs をホスト上で確定してから統合する」という並びを選んでいる。ただし、そのぶん「crate 単体の test が通ること」と「システムが動くこと」の距離は、依存グラフを見ただけでは分からない。
 

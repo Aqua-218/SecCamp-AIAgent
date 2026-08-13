@@ -96,7 +96,7 @@ connection 単位の責務が 1 関数に収まっている。何回読むか、
 
 ## 正確な保証範囲
 
-- 実 `AF_VSOCK` の bind / accept は未検証。test は in-memory の stream を使う。
+- direct kernel `AF_VSOCK` の bind / accept は未検証。module test は in-memory の stream を使うが、repository の opt-in KVM test は Firecracker が転送する Unix stream を使い、実 `BrokerDispatcher` の 1 request / 1 canonical rejection を確認する。
 - peer CID の照合は `accept_peer` が返す値に依存する。kernel から正しく取れることは、この crate では確認していない。
 - `ConnectionReport` は `requests_served` と `accounting_invariant_closed` を返すが、これを使った運用側の処理は無い。
 - timeout も idle 検出も無い。`max_requests` 回読み切るか、失敗するまで connection は開いたまま。

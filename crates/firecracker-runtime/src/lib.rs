@@ -192,6 +192,42 @@ pub struct VsockConfig {
     pub uds_path: PathBuf,
 }
 
+/// Returns the host Unix socket path for a guest-initiated Firecracker vsock port.
+///
+/// Firecracker forwards a guest connection to host CID 2 and port `P` to the
+/// socket whose filename is `<vsock_uds_path>_P`. The base path remains
+/// session-owned configuration; this helper only derives the fixed port suffix
+/// and never opens or removes a socket.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::InvalidConfig`] if the UDS path is not absolute and
+/// safe to compose, or the port is wildcard or zero.
+pub fn firecracker_guest_port_path(
+    vsock_uds_path: impl AsRef<Path>,
+    port: u32,
+) -> Result<PathBuf, RuntimeError> {
+    let vsock_uds_path = vsock_uds_path.as_ref();
+    validate_absolute_path("Firecracker vsock UDS", vsock_uds_path)?;
+    if port == 0 || port == u32::MAX {
+        return Err(RuntimeError::InvalidConfig(
+            "Firecracker guest port must be explicit and non-zero".to_owned(),
+        ));
+    }
+    let file_name = vsock_uds_path.file_name().ok_or_else(|| {
+        RuntimeError::InvalidConfig("Firecracker vsock UDS path must name a socket file".to_owned())
+    })?;
+    if file_name.is_empty() {
+        return Err(RuntimeError::InvalidConfig(
+            "Firecracker vsock UDS path must name a non-empty socket file".to_owned(),
+        ));
+    }
+    let mut derived_name = file_name.to_os_string();
+    derived_name.push("_");
+    derived_name.push(port.to_string());
+    Ok(vsock_uds_path.with_file_name(derived_name))
+}
+
 /// Namespace switches that jailer must create for the Firecracker process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)] // Each field maps to an independent jailer namespace switch.

@@ -9,6 +9,7 @@
 use std::{
     error::Error,
     fmt, fs,
+    io::{Read, Write},
     num::{NonZeroU64, NonZeroUsize},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -25,7 +26,6 @@ use egress_broker::{
     dispatch::{BrokerDispatcher, DispatchContext, PublicDispatchAdapter},
     durable::DurableSessionConfig,
     github::GitHubAdapter,
-    transport::VsockStream,
 };
 use egress_protocol::{
     budget::SessionBudgetLimits, session::BrokerSessionId as WireBrokerSessionId,
@@ -41,6 +41,12 @@ use firecracker_runtime::{
 
 #[cfg(test)]
 use firecracker_runtime::{ApiClient, ApiRequest};
+
+#[cfg(test)]
+use firecracker_runtime::firecracker_guest_port_path;
+
+#[cfg(test)]
+use crate::egress_backend::FirecrackerUnixStream;
 
 use crate::{
     BackendError, BrokerLease, BrokerSessionId, CapabilityId, CapabilityLease,
@@ -1207,6 +1213,7 @@ impl ProductionSessionRuntimeBuilder {
             self.config.firecracker.runtime.workspace.source.clone(),
             jail_root,
         );
+        let broker_runtime_config = self.config.firecracker.runtime.clone();
         let deferred = DeferredFirecrackerFactory::new(
             firecracker_factory,
             runtime_filesystem,
@@ -1229,8 +1236,12 @@ impl ProductionSessionRuntimeBuilder {
             limits: self.config.broker_limits,
         };
         let endpoint = self.config.broker_endpoint;
-        let broker = BrokerBackend::production(
+        let broker = BrokerBackend::firecracker(
             broker_runtime_factory,
+            move |identity| {
+                rebind_runtime_config(&broker_runtime_config, *identity)
+                    .map(|config| config.vsock.uds_path)
+            },
             endpoint.host_cid,
             endpoint.expected_guest_cid,
             endpoint.port,
@@ -1684,7 +1695,10 @@ struct ProductionBrokerRuntimeFactory {
     limits: ProductionBrokerLimits,
 }
 
-impl BrokerRuntimeFactory<VsockStream> for ProductionBrokerRuntimeFactory {
+impl<S> BrokerRuntimeFactory<S> for ProductionBrokerRuntimeFactory
+where
+    S: Read + Write + Send + 'static,
+{
     type Runtime = BuiltBrokerRuntime<Box<dyn FnMut() -> MonotonicTime + Send>>;
 
     fn build(&self, identity: &SessionIdentity) -> Result<Self::Runtime, BackendError> {
@@ -3609,9 +3623,10 @@ mod tests {
         };
         assert_eq!(Arc::strong_count(&kernel), 2);
 
-        let runtime = factory
-            .build(&exact_identity)
-            .expect("an exact prepared dispatcher must build");
+        let runtime = <ProductionBrokerRuntimeFactory as BrokerRuntimeFactory<
+            FirecrackerUnixStream,
+        >>::build(&factory, &exact_identity)
+        .expect("an exact prepared dispatcher must build");
         assert_eq!(Arc::strong_count(&kernel), 3);
         let observed = observed
             .lock()
@@ -3663,10 +3678,11 @@ mod tests {
             limits: broker_limits(),
         };
 
-        let error = factory
-            .build(&exact_identity)
-            .err()
-            .expect("factory-controlled WAL precreation must fail closed");
+        let error = <ProductionBrokerRuntimeFactory as BrokerRuntimeFactory<
+            FirecrackerUnixStream,
+        >>::build(&factory, &exact_identity)
+        .err()
+        .expect("factory-controlled WAL precreation must fail closed");
         assert!(
             error
                 .to_string()
@@ -3704,6 +3720,28 @@ mod tests {
         assert_eq!(client.guest_cid(), config.vsock.guest_cid);
         assert_eq!(client.guest_port(), endpoint.port);
         assert_ne!(client.uds_path(), template.vsock.uds_path);
+    }
+
+    #[test]
+    fn production_broker_port_uses_the_rebound_session_vsock_endpoint() {
+        let root = TestDirectory::new();
+        let template = runtime_config(&root.0);
+        let config =
+            rebind_runtime_config(&template, identity(0x43)).expect("session config must rebind");
+        let broker_port = 19_001;
+        let endpoint = firecracker_guest_port_path(&config.vsock.uds_path, broker_port)
+            .expect("rebound Firecracker UDS must derive a Broker endpoint");
+        let template_endpoint = firecracker_guest_port_path(&template.vsock.uds_path, broker_port)
+            .expect("template Firecracker UDS must derive an endpoint");
+
+        assert_eq!(
+            endpoint,
+            config
+                .vsock
+                .uds_path
+                .with_file_name(format!("vsock.sock_{broker_port}"))
+        );
+        assert_ne!(endpoint, template_endpoint);
     }
 
     #[test]

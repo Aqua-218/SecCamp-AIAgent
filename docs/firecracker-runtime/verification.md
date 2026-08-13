@@ -80,7 +80,7 @@ symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` �
 
 ### 実 Firecracker / dm-verity / guest `AF_VSOCK`（opt-in）
 
-[`scripts/ci/verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は pinned kernel と base rootfs から static `guest-control-init` を含む squashfs image を作り、その image を実 `veritysetup open` で read-only mapper として開く。mapper を root disk にした実 Firecracker に対して、[`real_firecracker_guest_control_enforces_identity_gate_over_vsock`](../../crates/firecracker-runtime/tests/real_guest_control.rs) が次を確認する。
+[`scripts/ci/verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は pinned kernel と base rootfs から static `guest-control-init` と固定 workload を含む squashfs image を作り、その image を実 `veritysetup open` で read-only mapper として開く。mapper を root disk にした実 Firecracker に対して、[`real_firecracker_guest_control_enforces_identity_gate_over_vsock`](../../crates/firecracker-runtime/tests/real_guest_control.rs) と [`real_firecracker_guest_reaches_host_broker_over_vsock`](../../crates/firecracker-runtime/tests/real_guest_control.rs) が次を確認する。
 
 | 境界 | 実際に確認すること |
 |---|---|
@@ -89,8 +89,10 @@ symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` �
 | identity gate | identity 注入前の workload start は `409 Conflict` になる |
 | identity injection | 5 個の session-bound identity を canonical JSON で注入し、guest の canonical ACK を返す |
 | workload release | identity 注入後の start だけが canonical ACK を返し、image に固定した workload を起動する |
+| guest-to-host Broker | Firecracker が guest の CID 2 / port 18081 接続を session UDS の `_18081` socket へ転送し、host Broker が canonical request に `NotAuthorized` を返す |
+| effect exclusion | 未発行 capability では public / GitHub adapter が一度も呼ばれない |
 
-この test は `Runtime::launch` を経由せず、Firecracker REST API を直接構成する。従って guest control の実境界は確認するが、runtime の jailer / workspace / snapshot lifecycle を実証する test ではない。
+この test は `Runtime::launch` を経由せず、Firecracker REST API を直接構成する。従って guest control と guest-to-host Broker transport の実境界は確認するが、runtime の jailer / workspace / snapshot lifecycle を実証する test ではない。
 
 ## 実行コマンド
 

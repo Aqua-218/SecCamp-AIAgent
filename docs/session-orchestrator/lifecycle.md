@@ -117,7 +117,7 @@ clone_workspace が成功
 - `validate_workspace` の `CrossSessionLease` 経路と、その rollback は test 済み。`LeaseIdentityMismatch` 側の分岐は未検証。
 - `StopError::Cleanup` が空の failure vector を持つ場合（flag が false で lease が `None`）は、`Stopping` に永久に固着する。structural には防いでいない。test も無い。
 - `rollback_failures` の完全性を確認する test が無い。gate で飛ばされた stage は failure に現れないが、その挙動を固定した test が無い。
-- production adapter の test は外部境界を全部 fake に置き換えている。identity が adapter を貫通することは示すが、Firecracker が起動すること、dm-verity や seccomp が適用されること、実 `AF_VSOCK` が bind することは示さない。
+- production adapter の composition test は外部 command/filesystem/API を fake に置き換えている。identity が adapter を貫通することは示すが、Firecracker が起動すること、dm-verity や seccomp が適用されることは示さない。Broker の Firecracker per-port Unix listenerは別の module / opt-in KVM test で確認する。
 - `SessionOrchestrator::new` は default type parameter で process-local ledger を選ぶ。production host が `new_durable` を忘れても compile は通り、contract test も全部通る。
 
 ## 変更時の確認点

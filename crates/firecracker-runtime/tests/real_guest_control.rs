@@ -70,7 +70,7 @@ impl GuestWorkload {
         match self {
             Self::Sleep => "sleep 600",
             Self::CgroupProbe => {
-                r#"-c \"/usr/bin/mount -t cgroup2 -o nosuid,nodev,noexec none /sys/fs/cgroup; printf 'cgroup-probe-proc:\\n'; /usr/bin/cat /proc/cgroups; printf 'cgroup-probe-controllers: '; /usr/bin/cat /sys/fs/cgroup/cgroup.controllers; /usr/bin/sleep 600\""#
+                r#"-c \"/usr/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup; printf 'cgroup-probe-proc:\\n'; /usr/bin/cat /proc/cgroups; printf 'cgroup-probe-controllers: '; /usr/bin/cat /sys/fs/cgroup/cgroup.controllers; /usr/bin/sleep 600\""#
             }
             Self::BrokerProbe => "--port 18081",
             Self::RuntimeBrokerProbe => {

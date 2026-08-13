@@ -13,8 +13,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     error::Error,
-    ffi::OsString,
-    fmt, fs, io,
+    ffi::{OsStr, OsString},
+    fmt, fs,
+    io::{self, Read, Write},
+    os::unix::{fs::PermissionsExt, net::UnixListener},
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     thread::sleep,
@@ -22,6 +24,7 @@ use std::{
 };
 
 use authority_core::{capability::SubjectId, handle::HandleId};
+use rustix::net::sockopt::socket_peercred;
 
 use crate::{
     capfs_resources::CapfsHostResources,
@@ -35,6 +38,10 @@ use crate::{
 /// How long a stopped workload is given to leave its cgroup before stop reports failure.
 const WORKLOAD_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKLOAD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const WORKLOAD_START_TIMEOUT: Duration = Duration::from_secs(10);
+const ISOLATED_WORKLOAD_CGROUP: &str = "workload";
+const START_GATE_READY: &[u8; 5] = b"ready";
+const START_GATE_RELEASE: [u8; 1] = [1];
 
 /// Environment variable carrying the subject's `CapFS` mount point to its workload.
 pub const WORKLOAD_MOUNTPOINT_ENV: &str = "CAPFS_MOUNTPOINT";
@@ -43,6 +50,164 @@ pub const WORKLOAD_CONTROL_SOCKET_ENV: &str = "SUPERVISOR_CONTROL_SOCKET";
 /// Environment variable carrying the subject identity to its workload.
 pub const WORKLOAD_SUBJECT_ENV: &str = "SUPERVISOR_SUBJECT";
 
+/// Immutable process and filesystem limits for every isolated workload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadIsolationLimits {
+    tmpfs_target: PathBuf,
+    tmpfs_size_bytes: u64,
+    memory_max_bytes: u64,
+    pids_max: u64,
+    user_id: u32,
+    group_id: u32,
+}
+
+impl WorkloadIsolationLimits {
+    /// Creates the explicit limits the fixed isolation launcher receives.
+    #[must_use]
+    pub fn new(
+        tmpfs_target: impl Into<PathBuf>,
+        tmpfs_size_bytes: u64,
+        memory_max_bytes: u64,
+        pids_max: u64,
+        user_id: u32,
+        group_id: u32,
+    ) -> Self {
+        Self {
+            tmpfs_target: tmpfs_target.into(),
+            tmpfs_size_bytes,
+            memory_max_bytes,
+            pids_max,
+            user_id,
+            group_id,
+        }
+    }
+}
+
+/// Fixed inputs for the expendable `workload-isolation-launcher` process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadIsolationConfig {
+    launcher: PathBuf,
+    rootfs_source: PathBuf,
+    rootfs_mount_target: PathBuf,
+    old_root: PathBuf,
+    workspace_target: PathBuf,
+    limits: WorkloadIsolationLimits,
+}
+
+impl WorkloadIsolationConfig {
+    /// Creates one complete static isolation policy for a guest supervisor.
+    #[must_use]
+    pub fn new(
+        launcher: impl Into<PathBuf>,
+        rootfs_source: impl Into<PathBuf>,
+        rootfs_mount_target: impl Into<PathBuf>,
+        old_root: impl Into<PathBuf>,
+        workspace_target: impl Into<PathBuf>,
+        limits: WorkloadIsolationLimits,
+    ) -> Self {
+        Self {
+            launcher: launcher.into(),
+            rootfs_source: rootfs_source.into(),
+            rootfs_mount_target: rootfs_mount_target.into(),
+            old_root: old_root.into(),
+            workspace_target: workspace_target.into(),
+            limits,
+        }
+    }
+
+    fn launcher_arguments(&self, launch: &IsolatedWorkloadLaunch<'_>) -> Vec<OsString> {
+        let mut arguments = Vec::with_capacity(42 + launch.workload_arguments.len());
+        append_argument(&mut arguments, "--rootfs-source", &self.rootfs_source);
+        append_argument(
+            &mut arguments,
+            "--rootfs-mount-target",
+            &self.rootfs_mount_target,
+        );
+        append_argument(&mut arguments, "--old-root", &self.old_root);
+        append_argument(
+            &mut arguments,
+            "--workspace-source",
+            launch.workspace_source,
+        );
+        append_argument(&mut arguments, "--workspace-target", &self.workspace_target);
+        append_argument(&mut arguments, "--tmpfs-target", &self.limits.tmpfs_target);
+        append_argument(
+            &mut arguments,
+            "--tmpfs-size-bytes",
+            self.limits.tmpfs_size_bytes.to_string(),
+        );
+        append_argument(&mut arguments, "--cgroup-root", launch.cgroup_root);
+        append_argument(&mut arguments, "--cgroup-name", ISOLATED_WORKLOAD_CGROUP);
+        append_argument(
+            &mut arguments,
+            "--memory-max-bytes",
+            self.limits.memory_max_bytes.to_string(),
+        );
+        append_argument(
+            &mut arguments,
+            "--pids-max",
+            self.limits.pids_max.to_string(),
+        );
+        append_argument(
+            &mut arguments,
+            "--host-uid",
+            self.limits.user_id.to_string(),
+        );
+        append_argument(
+            &mut arguments,
+            "--host-gid",
+            self.limits.group_id.to_string(),
+        );
+        append_argument(&mut arguments, "--start-gate", launch.start_gate);
+        append_argument(&mut arguments, "--landlock-read-only", "/");
+        append_argument(
+            &mut arguments,
+            "--landlock-writable",
+            &self.workspace_target,
+        );
+        append_argument(
+            &mut arguments,
+            "--env",
+            format!("{WORKLOAD_SUBJECT_ENV}={}", launch.subject.as_str()),
+        );
+        append_argument(
+            &mut arguments,
+            "--env",
+            format!(
+                "{WORKLOAD_MOUNTPOINT_ENV}={}",
+                self.workspace_target.display()
+            ),
+        );
+        append_argument(
+            &mut arguments,
+            "--env",
+            format!(
+                "{WORKLOAD_CONTROL_SOCKET_ENV}={}",
+                launch.control_path.display()
+            ),
+        );
+        append_argument(&mut arguments, "--program", launch.workload_program);
+        arguments.push(OsString::from("--"));
+        arguments.extend_from_slice(launch.workload_arguments);
+        arguments
+    }
+}
+
+struct IsolatedWorkloadLaunch<'a> {
+    workspace_source: &'a Path,
+    cgroup_root: &'a Path,
+    start_gate: &'a Path,
+    subject: &'a SubjectId,
+    control_path: &'a Path,
+    workload_program: &'a Path,
+    workload_arguments: &'a [OsString],
+}
+
+fn append_argument(arguments: &mut Vec<OsString>, flag: &str, value: impl AsRef<OsStr>) {
+    arguments.push(OsString::from(flag));
+    arguments.push(value.as_ref().to_owned());
+}
+
 /// Static host configuration shared by every subject in one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxHostConfig {
@@ -50,6 +215,7 @@ pub struct LinuxHostConfig {
     control_socket_directory: PathBuf,
     workload_program: PathBuf,
     workload_arguments: Vec<OsString>,
+    isolation: WorkloadIsolationConfig,
     workload_credential: SubjectCredential,
 }
 
@@ -57,13 +223,15 @@ impl LinuxHostConfig {
     /// Describes where subject resources are created and what a workload runs.
     ///
     /// `cgroup_parent` must be an existing cgroup v2 directory the supervisor may create leaves
-    /// in. `control_socket_directory` must be an existing directory the supervisor owns.
+    /// in. `control_socket_directory` must be an existing directory the supervisor owns. The
+    /// workload always runs through `isolation`; this adapter has no direct-spawn mode.
     #[must_use]
     pub fn new(
         cgroup_parent: impl Into<PathBuf>,
         control_socket_directory: impl Into<PathBuf>,
         workload_program: impl Into<PathBuf>,
         workload_arguments: impl IntoIterator<Item = OsString>,
+        isolation: WorkloadIsolationConfig,
         workload_credential: SubjectCredential,
     ) -> Self {
         Self {
@@ -71,6 +239,7 @@ impl LinuxHostConfig {
             control_socket_directory: control_socket_directory.into(),
             workload_program: workload_program.into(),
             workload_arguments: workload_arguments.into_iter().collect(),
+            isolation,
             workload_credential,
         }
     }
@@ -85,6 +254,8 @@ pub enum LinuxHostError {
     InvalidSubjectName(SubjectId),
     /// A configured directory does not exist or is not a directory.
     MissingDirectory(PathBuf),
+    /// The guest supervisor lacks the privilege required to own workload isolation resources.
+    SupervisorNotRoot,
     /// An operating-system operation failed.
     Io {
         /// What the adapter was doing.
@@ -107,6 +278,8 @@ pub enum LinuxHostError {
         /// Handle identity involved.
         handle: HandleId,
     },
+    /// A root-owned child did not complete the start-gate handshake.
+    StartGate(String),
 }
 
 impl fmt::Display for LinuxHostError {
@@ -127,6 +300,9 @@ impl fmt::Display for LinuxHostError {
                 "host directory must already exist: {}",
                 path.display()
             ),
+            Self::SupervisorNotRoot => {
+                formatter.write_str("guest supervisor must run as root to own isolation resources")
+            }
             Self::Io { action, source } => write!(formatter, "{action} failed: {source}"),
             Self::ControlSocket(error) => error.fmt(formatter),
             Self::ForeignToken(kind) => {
@@ -142,6 +318,7 @@ impl fmt::Display for LinuxHostError {
             Self::HandleState { reason, handle } => {
                 write!(formatter, "handle `{}` {reason}", handle.as_str())
             }
+            Self::StartGate(message) => write!(formatter, "workload start gate failed: {message}"),
         }
     }
 }
@@ -192,6 +369,56 @@ fn validate_owned_directory(path: &Path) -> Result<(), LinuxHostError> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(LinuxHostError::MissingDirectory(path.to_owned()));
     }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(LinuxHostError::InvalidPath(path.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_absolute_lexical_path(path: &Path) -> Result<(), LinuxHostError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err(LinuxHostError::InvalidPath(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn validate_executable(path: &Path) -> Result<(), LinuxHostError> {
+    validate_absolute_lexical_path(path)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| io_error("inspecting workload isolation launcher", source))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err(LinuxHostError::InvalidPath(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn validate_isolation_config(config: &WorkloadIsolationConfig) -> Result<(), LinuxHostError> {
+    validate_executable(&config.launcher)?;
+    for path in [
+        &config.rootfs_source,
+        &config.rootfs_mount_target,
+        &config.old_root,
+        &config.workspace_target,
+        &config.limits.tmpfs_target,
+    ] {
+        validate_absolute_lexical_path(path)?;
+    }
+    if config.limits.tmpfs_size_bytes == 0
+        || config.limits.tmpfs_size_bytes > (1_u64 << 30)
+        || config.limits.memory_max_bytes == 0
+        || config.limits.pids_max == 0
+    {
+        return Err(LinuxHostError::StartGate(
+            "isolation limits must be positive and tmpfs must not exceed 1 GiB".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -209,6 +436,81 @@ struct SubjectWorkload {
     subject: SubjectId,
     cgroup: CgroupHandle,
     child: Child,
+    start_gate: Option<WorkloadStartGate>,
+}
+
+/// Parent-owned gate that prevents an expendable launcher from entering isolation too early.
+struct WorkloadStartGate {
+    listener: UnixListener,
+    path: PathBuf,
+}
+
+impl WorkloadStartGate {
+    fn bind(directory: &Path, subject: &SubjectId) -> Result<Self, LinuxHostError> {
+        let name = resource_name(subject)?;
+        let path = directory.join(format!("{name}.start-gate.sock"));
+        let listener = UnixListener::bind(&path)
+            .map_err(|source| io_error("binding workload start gate", source))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|source| io_error("restricting workload start gate", source))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|source| io_error("making workload start gate nonblocking", source))?;
+        Ok(Self { listener, path })
+    }
+
+    fn release(&self) -> Result<(), LinuxHostError> {
+        let deadline = Instant::now() + WORKLOAD_START_TIMEOUT;
+        loop {
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
+                    let peer = socket_peercred(&stream)
+                        .map_err(|error| LinuxHostError::StartGate(error.to_string()))?;
+                    if peer.uid.as_raw() != 0 || peer.gid.as_raw() != 0 {
+                        return Err(LinuxHostError::StartGate(
+                            "start-gate peer is not the root-owned launcher".to_owned(),
+                        ));
+                    }
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .map_err(|source| {
+                            io_error("setting workload start-gate read timeout", source)
+                        })?;
+                    let mut ready = [0_u8; START_GATE_READY.len()];
+                    stream.read_exact(&mut ready).map_err(|source| {
+                        io_error("reading workload start-gate readiness", source)
+                    })?;
+                    if ready != *START_GATE_READY {
+                        return Err(LinuxHostError::StartGate(
+                            "start-gate peer sent an invalid readiness marker".to_owned(),
+                        ));
+                    }
+                    stream
+                        .write_all(&START_GATE_RELEASE)
+                        .map_err(|source| io_error("releasing workload start gate", source))?;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(LinuxHostError::StartGate(format!(
+                            "root-owned launcher did not connect within {} seconds",
+                            WORKLOAD_START_TIMEOUT.as_secs()
+                        )));
+                    }
+                    sleep(WORKLOAD_POLL_INTERVAL);
+                }
+                Err(source) => return Err(io_error("accepting workload start gate", source)),
+            }
+        }
+    }
+
+    fn remove(&self) -> Result<(), LinuxHostError> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(io_error("removing workload start gate", source)),
+        }
+    }
 }
 
 /// Real Linux host resources for one session's subjects.
@@ -241,8 +543,13 @@ impl LinuxHostResources {
     /// Returns [`LinuxHostError`] when the cgroup parent or control-socket directory is not an
     /// existing, absolute, non-symlink directory.
     pub fn new(config: LinuxHostConfig) -> Result<Self, LinuxHostError> {
+        if rustix::process::geteuid().as_raw() != 0 {
+            return Err(LinuxHostError::SupervisorNotRoot);
+        }
         validate_owned_directory(&config.cgroup_parent)?;
         validate_owned_directory(&config.control_socket_directory)?;
+        validate_absolute_lexical_path(&config.workload_program)?;
+        validate_isolation_config(&config.isolation)?;
         Ok(Self {
             config,
             next_token: 0,
@@ -420,6 +727,7 @@ impl CapfsHostResources for LinuxHostResources {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn start_workload(
         &mut self,
         subject: &SubjectId,
@@ -454,20 +762,38 @@ impl CapfsHostResources for LinuxHostResources {
             return ResourceAcquisition::NoEffect(LinuxHostError::AlreadyOwned("workload"));
         }
 
-        let mut command = Command::new(&self.config.workload_program);
+        let start_gate =
+            match WorkloadStartGate::bind(&self.config.control_socket_directory, subject) {
+                Ok(start_gate) => start_gate,
+                Err(error) => return ResourceAcquisition::NoEffect(error),
+            };
+
+        let launch = IsolatedWorkloadLaunch {
+            workspace_source: mountpoint,
+            cgroup_root: &cgroup_path,
+            start_gate: &start_gate.path,
+            subject,
+            control_path: &control_path,
+            workload_program: &self.config.workload_program,
+            workload_arguments: &self.config.workload_arguments,
+        };
+        let launcher_arguments = self.config.isolation.launcher_arguments(&launch);
+
+        let mut command = Command::new(&self.config.isolation.launcher);
         command
-            .args(&self.config.workload_arguments)
+            .args(launcher_arguments)
             .env_clear()
-            .env(WORKLOAD_SUBJECT_ENV, subject.as_str())
-            .env(WORKLOAD_MOUNTPOINT_ENV, mountpoint)
-            .env(WORKLOAD_CONTROL_SOCKET_ENV, &control_path)
-            .current_dir(mountpoint)
+            .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                let gate_cleanup = start_gate.remove();
+                if let Err(gate_error) = gate_cleanup {
+                    return ResourceAcquisition::EffectUnknown(gate_error);
+                }
                 return ResourceAcquisition::NoEffect(io_error("spawning the workload", error));
             }
         };
@@ -482,6 +808,7 @@ impl CapfsHostResources for LinuxHostResources {
                 subject: subject.clone(),
                 cgroup,
                 child,
+                start_gate: Some(start_gate),
             },
         );
         let pid = self
@@ -495,7 +822,43 @@ impl CapfsHostResources for LinuxHostResources {
             };
         }
         match cgroup_populated(&cgroup_path) {
-            Ok(true) => ResourceAcquisition::Acquired(handle),
+            Ok(true) => {
+                let release = self
+                    .workloads
+                    .get(&handle)
+                    .and_then(|owned| owned.start_gate.as_ref())
+                    .ok_or_else(|| LinuxHostError::StartGate("start gate disappeared".to_owned()))
+                    .and_then(WorkloadStartGate::release);
+                if let Err(error) = release {
+                    return ResourceAcquisition::CleanupRequired {
+                        resource: handle,
+                        error,
+                    };
+                }
+                let Some(start_gate) = self
+                    .workloads
+                    .get_mut(&handle)
+                    .and_then(|owned| owned.start_gate.take())
+                else {
+                    return ResourceAcquisition::CleanupRequired {
+                        resource: handle,
+                        error: LinuxHostError::StartGate("start gate disappeared".to_owned()),
+                    };
+                };
+                match start_gate.remove() {
+                    Ok(()) => ResourceAcquisition::Acquired(handle),
+                    Err(error) => {
+                        self.workloads
+                            .get_mut(&handle)
+                            .expect("issued workload token must remain live")
+                            .start_gate = Some(start_gate);
+                        ResourceAcquisition::CleanupRequired {
+                            resource: handle,
+                            error,
+                        }
+                    }
+                }
+            }
             // The workload exited before confinement could be observed. Its exit is not proof
             // that it did nothing, so the caller still owns a workload it must stop.
             Ok(false) => ResourceAcquisition::CleanupRequired {
@@ -538,6 +901,12 @@ impl CapfsHostResources for LinuxHostResources {
             ));
         }
         if let Err(error) = Self::wait_for_empty_cgroup(&path, &owned.subject) {
+            self.workloads.insert(workload, owned);
+            return ResourceMutation::CleanupRequired(error);
+        }
+        if let Some(start_gate) = owned.start_gate.take()
+            && let Err(error) = start_gate.remove()
+        {
             self.workloads.insert(workload, owned);
             return ResourceMutation::CleanupRequired(error);
         }
@@ -609,6 +978,17 @@ mod tests {
         socket_directory: PathBuf,
     }
 
+    fn test_isolation_config() -> WorkloadIsolationConfig {
+        WorkloadIsolationConfig::new(
+            std::env::current_exe().expect("test executable path must resolve"),
+            "/",
+            "/mnt/rootfs",
+            "/mnt/rootfs/.old-root",
+            "/workspace",
+            WorkloadIsolationLimits::new("/tmp", 1024 * 1024, 1024 * 1024, 8, 1000, 1000),
+        )
+    }
+
     impl Fixture {
         /// Returns a fixture, or `None` on a host without a writable cgroup v2 hierarchy.
         fn new(label: &str) -> Option<Self> {
@@ -630,6 +1010,7 @@ mod tests {
                 &self.socket_directory,
                 program,
                 arguments.iter().map(|argument| OsString::from(*argument)),
+                test_isolation_config(),
                 SubjectCredential::new(
                     rustix::process::geteuid().as_raw(),
                     rustix::process::getegid().as_raw(),
@@ -646,53 +1027,40 @@ mod tests {
     }
 
     #[test]
-    fn a_confined_workload_is_stopped_with_every_descendant() {
-        let Some(fixture) = Fixture::new("workload") else {
-            return;
-        };
-        let mut host =
-            LinuxHostResources::new(fixture.config("/bin/sh", &["-c", "sleep 300 & wait"]))
-                .expect("validated host config must build");
+    fn isolation_launcher_arguments_bind_each_dynamic_resource() {
+        let config = Fixture::new("arguments")
+            .expect("test fixture must be creatable")
+            .config("/usr/local/libexec/guest-workload", &["--fixed"]);
         let subject = SubjectId::new("subject-a");
-
-        let ResourceAcquisition::Acquired(cgroup) = host.create_cgroup(&subject) else {
-            panic!("cgroup creation must succeed");
+        let launch = IsolatedWorkloadLaunch {
+            workspace_source: Path::new("/run/capfs/subject-a"),
+            cgroup_root: Path::new("/sys/fs/cgroup/subject-a"),
+            start_gate: Path::new("/run/supervisor/subject-a.start-gate.sock"),
+            subject: &subject,
+            control_path: Path::new("/run/supervisor/subject-a.sock"),
+            workload_program: &config.workload_program,
+            workload_arguments: &config.workload_arguments,
         };
-        let ResourceAcquisition::Acquired(control) = host.open_control_fd(&subject) else {
-            panic!("control socket must bind");
-        };
-        let mountpoint = fixture.socket_directory.clone();
-        let ResourceAcquisition::Acquired(workload) =
-            host.start_workload(&subject, cgroup, MountHandle::new(1), &mountpoint, control)
-        else {
-            panic!("workload must start inside its cgroup");
-        };
-
-        let procs = fs::read_to_string(fixture.cgroup_parent.join("subject-a/cgroup.procs"))
-            .expect("cgroup.procs must be readable");
-        assert!(
-            procs.lines().count() >= 1,
-            "the workload must be confined before start returns"
-        );
-
-        assert!(matches!(
-            host.stop_workload(workload, cgroup),
-            ResourceMutation::Applied
-        ));
-        assert!(
-            !cgroup_populated(&fixture.cgroup_parent.join("subject-a"))
-                .expect("cgroup must remain readable"),
-            "cgroup.kill must take the whole subtree, not just the recorded PID"
-        );
-        assert!(matches!(
-            host.close_control_fd(control),
-            ResourceMutation::Applied
-        ));
-        assert!(matches!(
-            host.remove_cgroup(cgroup),
-            ResourceMutation::Applied
-        ));
-        assert!(!fixture.cgroup_parent.join("subject-a").exists());
+        let arguments = config.isolation.launcher_arguments(&launch);
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                OsString::from("--workspace-source"),
+                OsString::from("/run/capfs/subject-a"),
+            ]
+        }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                OsString::from("--cgroup-root"),
+                OsString::from("/sys/fs/cgroup/subject-a"),
+            ]
+        }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                OsString::from("--start-gate"),
+                OsString::from("/run/supervisor/subject-a.start-gate.sock"),
+            ]
+        }));
+        assert_eq!(arguments.last(), Some(&OsString::from("--fixed")));
     }
 
     #[test]
@@ -829,6 +1197,7 @@ mod tests {
             std::env::temp_dir(),
             "/bin/true",
             [],
+            test_isolation_config(),
             SubjectCredential::new(0, 0),
         );
         assert!(matches!(
@@ -841,6 +1210,7 @@ mod tests {
             std::env::temp_dir(),
             "/bin/true",
             [],
+            test_isolation_config(),
             SubjectCredential::new(0, 0),
         );
         assert!(matches!(

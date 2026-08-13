@@ -29,6 +29,7 @@ pub mod firecracker_workspace;
 pub mod production_runtime;
 pub mod recovery;
 pub mod session_owner;
+pub mod system_egress;
 
 use std::{
     collections::BTreeSet,

@@ -1593,6 +1593,7 @@ dependencies = [
  "authority-core",
  "capfs",
  "fuser",
+ "runtime-isolation",
  "rustix",
  "tempfile",
 ]

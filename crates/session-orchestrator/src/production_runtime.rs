@@ -2213,7 +2213,7 @@ mod tests {
         ApiResponse, CgroupConfig, CgroupVersion, CommandOutput, CommandRunner, CommandSpec,
         DmVerityConfig, FileSystem, HostIsolationConfig, JailerConfig, NamespaceConfig,
         PinnedArtifact, ProcessHandle, ProcessOwnership, SeccompConfig, Sha256Digest, VsockConfig,
-        WorkspaceConfig, sha256,
+        WorkspaceConfig, WorkspaceImageConfig, sha256,
     };
 
     use super::*;
@@ -2235,6 +2235,7 @@ mod tests {
     struct ExecutionCapture {
         block_binding: Option<(PathBuf, PathBuf)>,
         cloned_workspace: Option<(PathBuf, PathBuf)>,
+        workspace_image: Option<(PathBuf, PathBuf, u64)>,
         ownership: Option<ProcessOwnership>,
         restored_resources: Option<(PathBuf, PathBuf, u32)>,
     }
@@ -2309,6 +2310,19 @@ mod tests {
                 .lock()
                 .expect("execution capture must not be poisoned")
                 .cloned_workspace = Some((source.to_owned(), destination.to_owned()));
+            Ok(())
+        }
+
+        fn create_workspace_image(
+            &mut self,
+            workspace: &Path,
+            image: &Path,
+            size_bytes: u64,
+        ) -> Result<(), RuntimeError> {
+            self.capture
+                .lock()
+                .expect("execution capture must not be poisoned")
+                .workspace_image = Some((workspace.to_owned(), image.to_owned(), size_bytes));
             Ok(())
         }
 
@@ -2643,6 +2657,10 @@ mod tests {
                 source: root.join("workspace-source"),
                 clone_root: jail_root.join("workspace"),
                 clone_id: clone_id.to_owned(),
+                image: WorkspaceImageConfig {
+                    formatter: artifact(root.join("mke2fs-v1")),
+                    size_bytes: 64 * 1024 * 1024,
+                },
             },
             jailer: artifact(root.join("jailer-v1")),
             jailer_config: JailerConfig {
@@ -3395,6 +3413,9 @@ mod tests {
         let expected_mapper = format!("session-root-{workspace_id}");
         let expected_cgroup = cgroup_parent().join(&workspace_id);
         let expected_workspace = jail_root.join("workspace").join(&workspace_id);
+        let expected_workspace_image = jail_root
+            .join("workspace")
+            .join(format!("{workspace_id}.ext4"));
 
         assert_eq!(prepared.dm_verity.mapper_name, expected_mapper);
         assert_eq!(prepared.isolation.cgroup.path, expected_cgroup);
@@ -3452,6 +3473,14 @@ mod tests {
             Some((template.workspace.source.clone(), expected_workspace))
         );
         assert_eq!(
+            capture.workspace_image,
+            Some((
+                prepared.workspace.clone_path(),
+                expected_workspace_image.clone(),
+                prepared.workspace.image.size_bytes,
+            ))
+        );
+        assert_eq!(
             capture
                 .ownership
                 .as_ref()
@@ -3461,7 +3490,7 @@ mod tests {
         assert_eq!(
             capture.restored_resources,
             Some((
-                Path::new("/workspace").join(&workspace_id),
+                Path::new("/workspace").join(format!("{workspace_id}.ext4")),
                 PathBuf::from("/run/vsock.sock"),
                 prepared.vsock.guest_cid,
             ))

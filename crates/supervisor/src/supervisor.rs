@@ -868,6 +868,30 @@ where
         operation(&mut self.resources, &mut self.callers)
     }
 
+    /// Replaces a bootstrap channel with one freshly accepted subject channel.
+    ///
+    /// The caller must arrange for `identity` to be bound by the transport before invoking this
+    /// method. This is used exactly once after the fixed workload has crossed its isolation
+    /// boundary: its preconnected control descriptor is accepted by the supervisor and supersedes
+    /// the short-lived bootstrap connection that authorized setup. Any request on the old channel
+    /// then fails the record's exact connection comparison in [`Self::dispatch_wire`].
+    pub fn bind_accepted_connection(
+        &mut self,
+        identity: ConnectionIdentity,
+    ) -> SupervisorResult<K::Error, R::Error, C::Error, SubjectId> {
+        let subject = self
+            .callers
+            .resolve(&identity)
+            .map_err(SupervisorError::Caller)?;
+        self.ensure_running(&subject)?;
+        let record = self
+            .subjects
+            .get_mut(&subject)
+            .ok_or_else(|| SupervisorError::UnknownSubject(subject.clone()))?;
+        record.connection = identity;
+        Ok(subject)
+    }
+
     /// Creates a subject transaction and exposes it only after workload start succeeds.
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     pub fn create_subject(

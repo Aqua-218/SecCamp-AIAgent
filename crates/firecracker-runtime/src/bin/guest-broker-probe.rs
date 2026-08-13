@@ -38,21 +38,25 @@ enum Transport {
 }
 
 fn main() -> std::process::ExitCode {
-    match run() {
+    let mut stage = 1;
+    match run(&mut stage) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("guest-broker-probe: {error}");
-            std::process::ExitCode::FAILURE
+            std::process::ExitCode::from(stage)
         }
     }
 }
 
-fn run() -> Result<(), String> {
+fn run(stage: &mut u8) -> Result<(), String> {
+    *stage = 2;
     let transport = parse_transport(env::args().skip(1))?;
+    *stage = 3;
     let session = match transport {
         Transport::Inherited => broker_session_from_environment()?,
         Transport::DirectVsock(_) => PROBE_SESSION,
     };
+    *stage = 4;
     let request = CanonicalBrokerRequest::new(
         session,
         0,
@@ -73,12 +77,16 @@ fn run() -> Result<(), String> {
     )
     .map_err(|error| format!("framing fixed probe request: {error}"))?;
 
+    *stage = 6;
     let mut channel = File::from(open_transport(transport)?);
+    *stage = 7;
     channel
         .write_all(&frame.encode())
         .map_err(|error| format!("writing fixed probe frame: {error}"))?;
 
+    *stage = 8;
     let response = read_response(&mut channel)?;
+    *stage = 9;
     if response.request() != PROBE_REQUEST {
         return Err("host response did not bind the fixed probe request".to_owned());
     }

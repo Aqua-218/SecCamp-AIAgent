@@ -58,3 +58,16 @@ secret_detection:
     access: developer
     paths:
       - reports/gitleaks.sarif
+
+supply_chain_inventory:
+  stage: security
+  timeout: 15m
+  script:
+    - scripts/ci/install-release-tools.sh
+    - scripts/ci/run.sh supply-chain-inventory
+  artifacts:
+    when: always
+    expire_in: 30 days
+    access: developer
+    paths:
+      - reports/workspace-sbom.spdx.json

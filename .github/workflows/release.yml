@@ -93,9 +93,35 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  publish:
-    name: Publish GitHub Release
+  # Verification is a stage of its own rather than a step inside publish, so the
+  # assets are proven before anything holds a token that can write a release.
+  verify:
+    name: Verify release assets
     needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Check out release automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Download attested release candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-${{ env.RELEASE_TAG }}
+          path: dist
+      - name: Verify checksums
+        run: scripts/ci/verify-release.sh
+
+  publish:
+    name: Publish through the protected environment
+    needs: [package, verify]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment:
@@ -117,7 +143,12 @@ jobs:
         with:
           name: release-${{ env.RELEASE_TAG }}
           path: dist
-      - name: Verify checksums
+      - name: Verify checksums before publishing
         run: scripts/ci/verify-release.sh
       - name: Publish idempotently
         run: scripts/ci/publish-github-release.sh "${RELEASE_TAG}"
+      # There is no separate `record` job here on purpose. On GitHub the release
+      # record is the Release object this step creates, so splitting it out would
+      # add a job that either does nothing or re-does the publish. GitLab needs
+      # two calls for the same outcome and therefore has two jobs; ci/gates.yml
+      # records that asymmetry in the record stage's why_platform.

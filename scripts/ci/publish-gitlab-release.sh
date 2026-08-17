@@ -17,10 +17,9 @@ if [[ ! -f dist/release.env ]]; then
   exit 1
 fi
 
-set -a
-# shellcheck disable=SC1091
-source dist/release.env
-set +a
+# shellcheck source=scripts/ci/release-metadata-lib.sh
+source "${repository_root}/scripts/ci/release-metadata-lib.sh"
+release_metadata_load dist/release.env
 
 if [[ "${CI_COMMIT_TAG}" != "${RELEASE_TAG}" ]]; then
   printf 'release metadata tag does not match CI_COMMIT_TAG\n' >&2

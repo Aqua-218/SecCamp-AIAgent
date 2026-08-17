@@ -701,9 +701,7 @@ impl LinuxHostResources {
                 Ok(Some(_)) => return Ok(()),
                 Ok(None) if Instant::now() < deadline => sleep(WORKLOAD_POLL_INTERVAL),
                 Ok(None) => {
-                    return Err(LinuxHostError::WorkloadStopTimeout {
-                        subject: subject.clone(),
-                    });
+                    return Err(LinuxHostError::WorkloadStopTimeout(subject.clone()));
                 }
                 Err(error) => return Err(io_error("reaping the workload launcher", error)),
             }

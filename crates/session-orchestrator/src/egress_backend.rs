@@ -11,7 +11,7 @@ use std::{
     net::Shutdown,
     num::NonZeroUsize,
     os::unix::{
-        fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt, chown},
         net::{UnixListener, UnixStream},
     },
     panic::{self, AssertUnwindSafe},
@@ -238,8 +238,16 @@ impl FirecrackerUnixListener {
         reject_existing_socket_path(&path)?;
         let listener = UnixListener::bind(&path)?;
         let setup = (|| {
+            // Firecracker initiates the per-port Unix connection after the jailer has dropped to
+            // its configured UID/GID.  Make the socket accessible to exactly that principal;
+            // a root-owned 0600 socket silently resets every otherwise-authentic guest stream.
+            chown(
+                &path,
+                Some(expected_peer_credentials.uid),
+                Some(expected_peer_credentials.gid),
+            )?;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-            validate_bound_socket(&path)?;
+            validate_bound_socket(&path, expected_peer_credentials)?;
             listener.set_nonblocking(true)
         })();
         if let Err(error) = setup {
@@ -391,25 +399,30 @@ fn reject_existing_socket_path(path: &Path) -> io::Result<()> {
     }
 }
 
-fn validate_bound_socket(path: &Path) -> io::Result<()> {
+fn validate_bound_socket(
+    path: &Path,
+    expected_owner: FirecrackerPeerCredentials,
+) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_socket()
+        || metadata.nlink() != 1
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "bound Firecracker guest Broker path is not a socket",
+            "bound Firecracker guest Broker path is not one singly-linked socket inode",
         ));
     }
-    if metadata.mode() & 0o022 != 0 {
+    if metadata.mode() & 0o777 != 0o600 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "bound Firecracker guest Broker socket is group/world-writable",
+            "bound Firecracker guest Broker socket does not have exact mode 0600",
         ));
     }
-    let effective_uid = effective_uid()?;
-    if metadata.uid() != 0 && metadata.uid() != effective_uid {
+    if metadata.uid() != expected_owner.uid || metadata.gid() != expected_owner.gid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "bound Firecracker guest Broker socket has untrusted owner",
+            "bound Firecracker guest Broker socket does not have the configured Firecracker owner",
         ));
     }
     Ok(())

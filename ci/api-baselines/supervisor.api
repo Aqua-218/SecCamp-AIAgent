@@ -1,0 +1,520 @@
+pub mod supervisor
+pub enum supervisor::CapfsBuildError
+pub supervisor::CapfsBuildError::Audit(authority_core::audit::AuditError)
+pub supervisor::CapfsBuildError::InvalidPlan(supervisor::CapfsPlanError)
+pub supervisor::CapfsBuildError::Kernel(authority_core::kernel::CapabilityKernelError)
+pub supervisor::CapfsBuildError::KernelNotPristine
+pub supervisor::CapfsBuildError::RepositoryHealth(capfs::namespace::NamespaceError)
+impl core::error::Error for supervisor::CapfsBuildError
+pub fn supervisor::CapfsBuildError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for supervisor::CapfsBuildError
+pub fn supervisor::CapfsBuildError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum supervisor::CapfsPlanError
+pub supervisor::CapfsPlanError::DuplicateCapability(authority_core::capability::CapId)
+pub supervisor::CapfsPlanError::DuplicateMountInstance(capfs::read_only::MountInstanceId)
+pub supervisor::CapfsPlanError::DuplicateMountpoint(std::path::PathBuf)
+pub supervisor::CapfsPlanError::DuplicateSubject(authority_core::capability::SubjectId)
+pub supervisor::CapfsPlanError::EmptyFileEffects(authority_core::capability::SubjectId)
+pub supervisor::CapfsPlanError::EmptyIdentity(&'static str)
+pub supervisor::CapfsPlanError::GrantSubjectMismatch
+pub supervisor::CapfsPlanError::GrantSubjectMismatch::granted: authority_core::capability::SubjectId
+pub supervisor::CapfsPlanError::GrantSubjectMismatch::planned: authority_core::capability::SubjectId
+pub supervisor::CapfsPlanError::MountpointAlreadyMounted(std::path::PathBuf)
+pub supervisor::CapfsPlanError::MountpointIo
+pub supervisor::CapfsPlanError::MountpointIo::operation: &'static str
+pub supervisor::CapfsPlanError::MountpointIo::path: std::path::PathBuf
+pub supervisor::CapfsPlanError::MountpointIo::source: std::io::error::Error
+pub supervisor::CapfsPlanError::MountpointNotDirectory(std::path::PathBuf)
+pub supervisor::CapfsPlanError::MountpointNotEmpty(std::path::PathBuf)
+pub supervisor::CapfsPlanError::MountpointOverlapsBacking
+pub supervisor::CapfsPlanError::MountpointOverlapsBacking::backing: std::path::PathBuf
+pub supervisor::CapfsPlanError::MountpointOverlapsBacking::mountpoint: std::path::PathBuf
+pub supervisor::CapfsPlanError::NonFileAuthority(authority_core::capability::SubjectId)
+pub supervisor::CapfsPlanError::RepositoryMismatch
+pub supervisor::CapfsPlanError::RepositoryMismatch::granted: authority_core::repository::RepoId
+pub supervisor::CapfsPlanError::RepositoryMismatch::imported: authority_core::repository::RepoId
+pub supervisor::CapfsPlanError::UnmountHelperIo
+pub supervisor::CapfsPlanError::UnmountHelperIo::path: std::path::PathBuf
+pub supervisor::CapfsPlanError::UnmountHelperIo::source: std::io::error::Error
+pub supervisor::CapfsPlanError::UnmountHelperNotAbsolute(std::path::PathBuf)
+pub supervisor::CapfsPlanError::UnmountHelperNotExecutable(std::path::PathBuf)
+impl core::error::Error for supervisor::CapfsPlanError
+pub fn supervisor::CapfsPlanError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for supervisor::CapfsPlanError
+pub fn supervisor::CapfsPlanError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum supervisor::CapfsResourceError<E>
+pub supervisor::CapfsResourceError::Capability(authority_core::kernel::CapabilityKernelError)
+pub supervisor::CapfsResourceError::Filesystem(capfs::read_only::CapabilityFilesystemError)
+pub supervisor::CapfsResourceError::Host(E)
+pub supervisor::CapfsResourceError::Io
+pub supervisor::CapfsResourceError::Io::operation: &'static str
+pub supervisor::CapfsResourceError::Io::path: std::path::PathBuf
+pub supervisor::CapfsResourceError::Io::source: std::io::error::Error
+pub supervisor::CapfsResourceError::MountHandleExhausted
+pub supervisor::CapfsResourceError::MountSubjectAlreadyIssued(authority_core::capability::SubjectId)
+pub supervisor::CapfsResourceError::MountSubjectMismatch
+pub supervisor::CapfsResourceError::MountSubjectMismatch::mounted: authority_core::capability::SubjectId
+pub supervisor::CapfsResourceError::MountSubjectMismatch::requested: authority_core::capability::SubjectId
+pub supervisor::CapfsResourceError::ReadinessBypassed(std::path::PathBuf)
+pub supervisor::CapfsResourceError::RepositoryHealth(capfs::namespace::NamespaceError)
+pub supervisor::CapfsResourceError::UnknownMountHandle(supervisor::MountHandle)
+pub supervisor::CapfsResourceError::UnknownMountSubject(authority_core::capability::SubjectId)
+impl<E: core::error::Error + 'static> core::error::Error for supervisor::CapfsResourceError<E>
+pub fn supervisor::CapfsResourceError<E>::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl<E: core::fmt::Display> core::fmt::Display for supervisor::CapfsResourceError<E>
+pub fn supervisor::CapfsResourceError<E>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum supervisor::CleanupStep
+pub supervisor::CleanupStep::BeginClose
+pub supervisor::CleanupStep::CloseControlFd
+pub supervisor::CleanupStep::CloseHandle
+pub supervisor::CleanupStep::FinishClose
+pub supervisor::CleanupStep::RemoveCgroup
+pub supervisor::CleanupStep::StopWorkload
+pub supervisor::CleanupStep::Unmount
+pub enum supervisor::ControlSocketError
+pub supervisor::ControlSocketError::BindingCapacityExceeded
+pub supervisor::ControlSocketError::Decode(supervisor::WireDecodeError)
+pub supervisor::ControlSocketError::Encode(alloc::string::String)
+pub supervisor::ControlSocketError::InvalidBacklog
+pub supervisor::ControlSocketError::InvalidBacklog::requested: i32
+pub supervisor::ControlSocketError::InvalidPath(std::path::PathBuf)
+pub supervisor::ControlSocketError::InvalidTimeout
+pub supervisor::ControlSocketError::InvalidTimeout::kind: supervisor::ControlSocketTimeoutKind
+pub supervisor::ControlSocketError::InvalidTimeout::requested: core::time::Duration
+pub supervisor::ControlSocketError::Io(std::io::error::Error)
+pub supervisor::ControlSocketError::PeerClosed
+pub supervisor::ControlSocketError::Rebind(supervisor::ConnectionRebindError)
+pub supervisor::ControlSocketError::ReceiveTimeout
+pub supervisor::ControlSocketError::RequestTooLarge
+pub supervisor::ControlSocketError::RequestTooLarge::received: usize
+pub supervisor::ControlSocketError::SendTimeout
+pub supervisor::ControlSocketError::SocketIdExhausted
+impl core::convert::From<rustix::backend::io::errno::Errno> for supervisor::ControlSocketError
+pub fn supervisor::ControlSocketError::from(rustix::backend::io::errno::Errno) -> Self
+impl core::error::Error for supervisor::ControlSocketError
+pub fn supervisor::ControlSocketError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for supervisor::ControlSocketError
+pub fn supervisor::ControlSocketError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum supervisor::ControlSocketTimeoutKind
+pub supervisor::ControlSocketTimeoutKind::Receive
+pub supervisor::ControlSocketTimeoutKind::Send
+pub enum supervisor::CredentialResolveError
+pub supervisor::CredentialResolveError::ForeignCredential
+pub supervisor::CredentialResolveError::ForeignCredential::actual: supervisor::SubjectCredential
+pub supervisor::CredentialResolveError::ForeignCredential::expected: supervisor::SubjectCredential
+pub supervisor::CredentialResolveError::ForeignCredential::socket_id: u64
+pub supervisor::CredentialResolveError::Unbound
+pub supervisor::CredentialResolveError::Unbound::socket_id: u64
+impl core::error::Error for supervisor::CredentialResolveError
+impl core::fmt::Display for supervisor::CredentialResolveError
+pub fn supervisor::CredentialResolveError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum supervisor::DispatchResponse
+pub supervisor::DispatchResponse::HandleClosed
+pub supervisor::DispatchResponse::SubjectClosed
+impl core::convert::From<supervisor::DispatchResponse> for supervisor::WireResponse
+pub fn supervisor::WireResponse::from(supervisor::DispatchResponse) -> Self
+pub enum supervisor::LinuxHostError
+pub supervisor::LinuxHostError::AlreadyOwned(&'static str)
+pub supervisor::LinuxHostError::ControlSocket(supervisor::ControlSocketError)
+pub supervisor::LinuxHostError::ForeignToken(&'static str)
+pub supervisor::LinuxHostError::HandleState
+pub supervisor::LinuxHostError::HandleState::handle: authority_core::handle::HandleId
+pub supervisor::LinuxHostError::HandleState::reason: &'static str
+pub supervisor::LinuxHostError::InvalidPath(std::path::PathBuf)
+pub supervisor::LinuxHostError::InvalidSubjectName(authority_core::capability::SubjectId)
+pub supervisor::LinuxHostError::Io
+pub supervisor::LinuxHostError::Io::action: &'static str
+pub supervisor::LinuxHostError::Io::source: std::io::error::Error
+pub supervisor::LinuxHostError::MissingDirectory(std::path::PathBuf)
+pub supervisor::LinuxHostError::StartGate(alloc::string::String)
+pub supervisor::LinuxHostError::SupervisorNotRoot
+pub supervisor::LinuxHostError::WorkloadStopTimeout(authority_core::capability::SubjectId)
+impl core::error::Error for supervisor::LinuxHostError
+pub fn supervisor::LinuxHostError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for supervisor::LinuxHostError
+pub fn supervisor::LinuxHostError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum supervisor::OperationFailure<KE, RE>
+pub supervisor::OperationFailure::Invariant(&'static str)
+pub supervisor::OperationFailure::Kernel(KE)
+pub supervisor::OperationFailure::Resource(supervisor::ResourceFailure<RE>)
+pub supervisor::OperationFailure::UnresolvedEffect
+pub enum supervisor::RefusalCode
+pub supervisor::RefusalCode::Malformed
+pub supervisor::RefusalCode::NotPermitted
+pub supervisor::RefusalCode::Unavailable
+impl core::fmt::Display for supervisor::RefusalCode
+pub fn supervisor::RefusalCode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum supervisor::ResourceAcquisition<T, E>
+pub supervisor::ResourceAcquisition::Acquired(T)
+pub supervisor::ResourceAcquisition::CleanupRequired
+pub supervisor::ResourceAcquisition::CleanupRequired::error: E
+pub supervisor::ResourceAcquisition::CleanupRequired::resource: T
+pub supervisor::ResourceAcquisition::EffectUnknown(E)
+pub supervisor::ResourceAcquisition::NoEffect(E)
+pub enum supervisor::ResourceFailure<E>
+pub supervisor::ResourceFailure::CleanupRequired(E)
+pub supervisor::ResourceFailure::EffectUnknown(E)
+pub supervisor::ResourceFailure::NoEffect(E)
+pub enum supervisor::ResourceMutation<E>
+pub supervisor::ResourceMutation::Applied
+pub supervisor::ResourceMutation::CleanupRequired(E)
+pub supervisor::ResourceMutation::EffectUnknown(E)
+pub supervisor::ResourceMutation::NoEffect(E)
+pub enum supervisor::SetupStep
+pub supervisor::SetupStep::CreateCgroup
+pub supervisor::SetupStep::Mount
+pub supervisor::SetupStep::OpenControlFd
+pub supervisor::SetupStep::OpenHandle
+pub supervisor::SetupStep::RegisterHandle
+pub supervisor::SetupStep::RegisterSubject
+pub supervisor::SetupStep::StartWorkload
+pub enum supervisor::SubjectLifecycle
+pub supervisor::SubjectLifecycle::Closed
+pub supervisor::SubjectLifecycle::Closing
+pub supervisor::SubjectLifecycle::Creating
+pub supervisor::SubjectLifecycle::Running
+pub enum supervisor::SupervisorError<KE, RE, CE>
+pub supervisor::SupervisorError::Caller(CE)
+pub supervisor::SupervisorError::CleanupBlocked
+pub supervisor::SupervisorError::CleanupBlocked::failures: alloc::vec::Vec<supervisor::CleanupFailure<KE, RE>>
+pub supervisor::SupervisorError::CleanupBlocked::subject: authority_core::capability::SubjectId
+pub supervisor::SupervisorError::CleanupFailed
+pub supervisor::SupervisorError::CleanupFailed::failures: alloc::vec::Vec<supervisor::CleanupFailure<KE, RE>>
+pub supervisor::SupervisorError::CleanupFailed::subject: authority_core::capability::SubjectId
+pub supervisor::SupervisorError::ConnectionNotBoundToSubject
+pub supervisor::SupervisorError::ConnectionNotBoundToSubject::identity: supervisor::ConnectionIdentity
+pub supervisor::SupervisorError::ConnectionNotBoundToSubject::subject: authority_core::capability::SubjectId
+pub supervisor::SupervisorError::ConnectionSubjectMismatch
+pub supervisor::SupervisorError::ConnectionSubjectMismatch::bound: authority_core::capability::SubjectId
+pub supervisor::SupervisorError::ConnectionSubjectMismatch::requested: authority_core::capability::SubjectId
+pub supervisor::SupervisorError::DuplicateSubject(authority_core::capability::SubjectId)
+pub supervisor::SupervisorError::GrantSubjectMismatch
+pub supervisor::SupervisorError::GrantSubjectMismatch::granted: authority_core::capability::SubjectId
+pub supervisor::SupervisorError::GrantSubjectMismatch::requested: authority_core::capability::SubjectId
+pub supervisor::SupervisorError::HandleNotOwned
+pub supervisor::SupervisorError::HandleNotOwned::caller: authority_core::capability::SubjectId
+pub supervisor::SupervisorError::HandleNotOwned::handle: authority_core::handle::HandleId
+pub supervisor::SupervisorError::Kernel(KE)
+pub supervisor::SupervisorError::KernelNotPristine
+pub supervisor::SupervisorError::Resource(supervisor::ResourceFailure<RE>)
+pub supervisor::SupervisorError::SetupFailed
+pub supervisor::SupervisorError::SetupFailed::primary: supervisor::OperationFailure<KE, RE>
+pub supervisor::SupervisorError::SetupFailed::rollback: alloc::vec::Vec<supervisor::CleanupFailure<KE, RE>>
+pub supervisor::SupervisorError::SetupFailed::step: supervisor::SetupStep
+pub supervisor::SupervisorError::SetupFailed::subject: authority_core::capability::SubjectId
+pub supervisor::SupervisorError::StaleHandle(authority_core::handle::HandleId)
+pub supervisor::SupervisorError::SubjectClosed(authority_core::capability::SubjectId)
+pub supervisor::SupervisorError::SubjectClosing(authority_core::capability::SubjectId)
+pub supervisor::SupervisorError::SubjectNotRunning(authority_core::capability::SubjectId)
+pub supervisor::SupervisorError::UnknownSubject(authority_core::capability::SubjectId)
+pub supervisor::SupervisorError::Wire(supervisor::WireDecodeError)
+impl<KE, RE, CE> supervisor::SupervisorError<KE, RE, CE>
+pub const fn supervisor::SupervisorError<KE, RE, CE>::refusal(&self) -> supervisor::RefusalCode
+impl<KE, RE, CE> core::error::Error for supervisor::SupervisorError<KE, RE, CE> where KE: core::error::Error + 'static, RE: core::error::Error + 'static, CE: core::error::Error + 'static
+impl<KE: core::fmt::Display + core::fmt::Debug, RE: core::fmt::Display + core::fmt::Debug, CE: core::fmt::Display> core::fmt::Display for supervisor::SupervisorError<KE, RE, CE>
+pub fn supervisor::SupervisorError<KE, RE, CE>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum supervisor::WireDecodeError
+pub supervisor::WireDecodeError::InvalidField(&'static str)
+pub supervisor::WireDecodeError::LengthMismatch
+pub supervisor::WireDecodeError::LengthMismatch::actual: usize
+pub supervisor::WireDecodeError::LengthMismatch::declared: usize
+pub supervisor::WireDecodeError::TooLarge
+pub supervisor::WireDecodeError::TooLarge::actual: usize
+pub supervisor::WireDecodeError::TrailingBytes
+pub supervisor::WireDecodeError::Truncated
+pub supervisor::WireDecodeError::UnknownTag(u8)
+pub supervisor::WireDecodeError::UnsupportedVersion(u8)
+impl core::error::Error for supervisor::WireDecodeError
+impl core::fmt::Display for supervisor::WireDecodeError
+pub fn supervisor::WireDecodeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum supervisor::WireEncodeError
+pub supervisor::WireEncodeError::EmptyField(&'static str)
+pub supervisor::WireEncodeError::FieldTooLarge(&'static str)
+pub supervisor::WireEncodeError::TooLarge
+impl core::error::Error for supervisor::WireEncodeError
+impl core::fmt::Display for supervisor::WireEncodeError
+pub fn supervisor::WireEncodeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum supervisor::WireRequest
+pub supervisor::WireRequest::CloseHandle
+pub supervisor::WireRequest::CloseHandle::claimed_subject: authority_core::capability::SubjectId
+pub supervisor::WireRequest::CloseHandle::handle: authority_core::handle::HandleId
+pub supervisor::WireRequest::CloseSubject
+pub supervisor::WireRequest::CloseSubject::claimed_subject: authority_core::capability::SubjectId
+impl supervisor::WireRequest
+pub fn supervisor::WireRequest::decode(&[u8]) -> core::result::Result<Self, supervisor::WireDecodeError>
+pub fn supervisor::WireRequest::encode(&self) -> core::result::Result<alloc::vec::Vec<u8>, supervisor::WireEncodeError>
+pub enum supervisor::WireResponse
+pub supervisor::WireResponse::HandleClosed
+pub supervisor::WireResponse::Refused(supervisor::RefusalCode)
+pub supervisor::WireResponse::SubjectClosed
+impl supervisor::WireResponse
+pub fn supervisor::WireResponse::decode(&[u8]) -> core::result::Result<Self, supervisor::WireDecodeError>
+pub fn supervisor::WireResponse::encode(&self) -> core::result::Result<alloc::vec::Vec<u8>, supervisor::WireEncodeError>
+impl core::convert::From<supervisor::DispatchResponse> for supervisor::WireResponse
+pub fn supervisor::WireResponse::from(supervisor::DispatchResponse) -> Self
+pub struct supervisor::AcceptedControlConnection
+impl supervisor::AcceptedControlConnection
+pub const fn supervisor::AcceptedControlConnection::identity(&self) -> supervisor::ConnectionIdentity
+pub fn supervisor::AcceptedControlConnection::receive_request(&self) -> core::result::Result<supervisor::WireRequest, supervisor::ControlSocketError>
+pub fn supervisor::AcceptedControlConnection::send_response(&self, supervisor::WireResponse) -> core::result::Result<(), supervisor::ControlSocketError>
+pub struct supervisor::CallerBindingError
+impl core::error::Error for supervisor::CallerBindingError
+impl core::fmt::Display for supervisor::CallerBindingError
+pub fn supervisor::CallerBindingError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct supervisor::CapfsMountPlan
+impl supervisor::CapfsMountPlan
+pub const fn supervisor::CapfsMountPlan::capability(&self) -> &authority_core::capability::CapId
+pub const fn supervisor::CapfsMountPlan::grant(&self) -> &authority_core::state::CapabilityGrant
+pub const fn supervisor::CapfsMountPlan::mount_instance(&self) -> &capfs::read_only::MountInstanceId
+pub fn supervisor::CapfsMountPlan::mountpoint(&self) -> &std::path::Path
+pub fn supervisor::CapfsMountPlan::new(authority_core::capability::SubjectId, capfs::read_only::MountInstanceId, authority_core::capability::CapId, authority_core::state::CapabilityGrant, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub const fn supervisor::CapfsMountPlan::subject(&self) -> &authority_core::capability::SubjectId
+pub struct supervisor::CapfsRuntimeConfig
+impl supervisor::CapfsRuntimeConfig
+pub fn supervisor::CapfsRuntimeConfig::new(authority_core::state::CapabilityState, authority_core::durable_audit::DurableAuditLog, capfs::backing::ImportedRepository, alloc::sync::Arc<dyn capfs::read_only::AuthorizationClock>, supervisor::CapfsUnmountStrategy, alloc::vec::Vec<supervisor::CapfsMountPlan>) -> Self
+pub struct supervisor::CapfsRuntimeManager<B>
+impl<B> supervisor::CapfsRuntimeManager<B>
+pub fn supervisor::CapfsRuntimeManager<B>::into_supervisor<C>(self, C) -> core::result::Result<supervisor::CapfsSupervisor<B, C>, supervisor::CapfsSupervisorError<B, C>> where B: supervisor::CapfsHostResources, C: supervisor::CallerResolver
+pub fn supervisor::CapfsRuntimeManager<B>::new(B, supervisor::CapfsRuntimeConfig) -> core::result::Result<Self, supervisor::CapfsBuildError>
+pub struct supervisor::CapfsRuntimeResources<B>
+impl<B> supervisor::CapfsRuntimeResources<B>
+pub fn supervisor::CapfsRuntimeResources<B>::active_mount_count(&self) -> usize
+pub fn supervisor::CapfsRuntimeResources<B>::drain_failures(&self) -> &[alloc::string::String]
+pub const fn supervisor::CapfsRuntimeResources<B>::host(&self) -> &B
+pub const fn supervisor::CapfsRuntimeResources<B>::host_mut(&mut self) -> &mut B
+impl<B> core::fmt::Debug for supervisor::CapfsRuntimeResources<B> where B: core::fmt::Debug
+pub fn supervisor::CapfsRuntimeResources<B>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<B> core::ops::drop::Drop for supervisor::CapfsRuntimeResources<B>
+pub fn supervisor::CapfsRuntimeResources<B>::drop(&mut self)
+impl<B> supervisor::RuntimeResources for supervisor::CapfsRuntimeResources<B> where B: supervisor::CapfsHostResources
+pub type supervisor::CapfsRuntimeResources<B>::Error = supervisor::CapfsResourceError<<B as supervisor::CapfsHostResources>::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::close_control_fd(&mut self, supervisor::ControlFdHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::close_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::create_cgroup(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::CgroupHandle, Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::mount_capfs(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::MountHandle, Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::open_control_fd(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::ControlFdHandle, Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::open_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::remove_cgroup(&mut self, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::start_workload(&mut self, &authority_core::capability::SubjectId, supervisor::CgroupHandle, supervisor::MountHandle, supervisor::ControlFdHandle) -> supervisor::ResourceAcquisition<supervisor::WorkloadHandle, Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::stop_workload(&mut self, supervisor::WorkloadHandle, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::unmount_capfs(&mut self, supervisor::MountHandle) -> supervisor::ResourceMutation<Self::Error>
+pub struct supervisor::CapfsUnmountStrategy
+impl supervisor::CapfsUnmountStrategy
+pub fn supervisor::CapfsUnmountStrategy::helper(impl core::convert::Into<std::path::PathBuf>) -> Self
+pub const fn supervisor::CapfsUnmountStrategy::kernel() -> Self
+pub struct supervisor::CgroupHandle(_)
+impl supervisor::CgroupHandle
+pub const fn supervisor::CgroupHandle::new(u64) -> Self
+pub struct supervisor::CleanupFailure<KE, RE>
+pub supervisor::CleanupFailure::cause: supervisor::OperationFailure<KE, RE>
+pub supervisor::CleanupFailure::step: supervisor::CleanupStep
+pub struct supervisor::ConnectionIdentity
+impl supervisor::ConnectionIdentity
+pub const fn supervisor::ConnectionIdentity::new(u64, u32, u32, u32) -> Self
+pub const fn supervisor::ConnectionIdentity::peer_gid(self) -> u32
+pub const fn supervisor::ConnectionIdentity::peer_pid(self) -> u32
+pub const fn supervisor::ConnectionIdentity::peer_uid(self) -> u32
+pub const fn supervisor::ConnectionIdentity::socket_id(self) -> u64
+pub struct supervisor::ConnectionRebindError
+impl core::error::Error for supervisor::ConnectionRebindError
+impl core::fmt::Display for supervisor::ConnectionRebindError
+pub fn supervisor::ConnectionRebindError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct supervisor::ControlFdHandle(_)
+impl supervisor::ControlFdHandle
+pub const fn supervisor::ControlFdHandle::new(u64) -> Self
+pub struct supervisor::ControlSocketTimeouts
+impl supervisor::ControlSocketTimeouts
+pub const fn supervisor::ControlSocketTimeouts::new(core::time::Duration, core::time::Duration) -> Self
+pub const fn supervisor::ControlSocketTimeouts::receive(self) -> core::time::Duration
+pub const fn supervisor::ControlSocketTimeouts::send(self) -> core::time::Duration
+pub fn supervisor::ControlSocketTimeouts::try_new(core::time::Duration, core::time::Duration) -> core::result::Result<Self, supervisor::ControlSocketError>
+impl core::default::Default for supervisor::ControlSocketTimeouts
+pub fn supervisor::ControlSocketTimeouts::default() -> Self
+pub struct supervisor::LinuxHostConfig
+impl supervisor::LinuxHostConfig
+pub fn supervisor::LinuxHostConfig::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, impl core::iter::traits::collect::IntoIterator<Item = std::ffi::os_str::OsString>, supervisor::WorkloadIsolationConfig, supervisor::SubjectCredential) -> Self
+pub struct supervisor::LinuxHostResources
+impl supervisor::LinuxHostResources
+pub fn supervisor::LinuxHostResources::control_listener(&mut self, &authority_core::capability::SubjectId) -> core::option::Option<&mut supervisor::SubjectControlListener>
+pub fn supervisor::LinuxHostResources::control_socket_path(&self, &authority_core::capability::SubjectId) -> core::option::Option<std::path::PathBuf>
+pub fn supervisor::LinuxHostResources::new(supervisor::LinuxHostConfig) -> core::result::Result<Self, supervisor::LinuxHostError>
+pub fn supervisor::LinuxHostResources::prepare_control_listener(&mut self, &authority_core::capability::SubjectId) -> core::result::Result<supervisor::ControlFdHandle, supervisor::LinuxHostError>
+impl core::fmt::Debug for supervisor::LinuxHostResources
+pub fn supervisor::LinuxHostResources::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl supervisor::CapfsHostResources for supervisor::LinuxHostResources
+pub type supervisor::LinuxHostResources::Error = supervisor::LinuxHostError
+pub fn supervisor::LinuxHostResources::close_control_fd(&mut self, supervisor::ControlFdHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::LinuxHostResources::close_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::LinuxHostResources::create_cgroup(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::CgroupHandle, Self::Error>
+pub fn supervisor::LinuxHostResources::open_control_fd(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::ControlFdHandle, Self::Error>
+pub fn supervisor::LinuxHostResources::open_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::LinuxHostResources::remove_cgroup(&mut self, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::LinuxHostResources::start_workload(&mut self, &authority_core::capability::SubjectId, supervisor::CgroupHandle, supervisor::MountHandle, &std::path::Path, supervisor::ControlFdHandle) -> supervisor::ResourceAcquisition<supervisor::WorkloadHandle, Self::Error>
+pub fn supervisor::LinuxHostResources::stop_workload(&mut self, supervisor::WorkloadHandle, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+pub struct supervisor::MountHandle(_)
+impl supervisor::MountHandle
+pub const fn supervisor::MountHandle::new(u64) -> Self
+pub struct supervisor::ResourceError(pub alloc::string::String)
+impl core::error::Error for supervisor::ResourceError
+impl core::fmt::Display for supervisor::ResourceError
+pub fn supervisor::ResourceError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct supervisor::StaticCallerResolver
+impl supervisor::StaticCallerResolver
+pub fn supervisor::StaticCallerResolver::bind(&mut self, supervisor::ConnectionIdentity, authority_core::capability::SubjectId) -> core::result::Result<(), authority_core::capability::SubjectId>
+pub const fn supervisor::StaticCallerResolver::new() -> Self
+impl supervisor::CallerResolver for supervisor::StaticCallerResolver
+pub type supervisor::StaticCallerResolver::Error = supervisor::CallerBindingError
+pub fn supervisor::StaticCallerResolver::resolve(&self, &supervisor::ConnectionIdentity) -> core::result::Result<authority_core::capability::SubjectId, Self::Error>
+pub struct supervisor::SubjectControlListener
+impl supervisor::SubjectControlListener
+pub fn supervisor::SubjectControlListener::accept(&mut self, &mut supervisor::SubjectCredentialResolver) -> core::result::Result<supervisor::AcceptedControlConnection, supervisor::ControlSocketError>
+pub fn supervisor::SubjectControlListener::bind(impl core::convert::Into<std::path::PathBuf>, authority_core::capability::SubjectId, supervisor::SubjectCredential, i32) -> core::result::Result<Self, supervisor::ControlSocketError>
+pub fn supervisor::SubjectControlListener::bind_with_timeouts(impl core::convert::Into<std::path::PathBuf>, authority_core::capability::SubjectId, supervisor::SubjectCredential, i32, supervisor::ControlSocketTimeouts) -> core::result::Result<Self, supervisor::ControlSocketError>
+pub fn supervisor::SubjectControlListener::path(&self) -> &std::path::Path
+pub const fn supervisor::SubjectControlListener::subject(&self) -> &authority_core::capability::SubjectId
+impl core::ops::drop::Drop for supervisor::SubjectControlListener
+pub fn supervisor::SubjectControlListener::drop(&mut self)
+pub struct supervisor::SubjectCredential
+impl supervisor::SubjectCredential
+pub const fn supervisor::SubjectCredential::gid(self) -> u32
+pub const fn supervisor::SubjectCredential::new(u32, u32) -> Self
+pub const fn supervisor::SubjectCredential::uid(self) -> u32
+impl core::fmt::Display for supervisor::SubjectCredential
+pub fn supervisor::SubjectCredential::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct supervisor::SubjectCredentialResolver
+impl supervisor::SubjectCredentialResolver
+pub fn supervisor::SubjectCredentialResolver::bind(&mut self, u64, authority_core::capability::SubjectId, supervisor::SubjectCredential) -> core::result::Result<(), supervisor::ConnectionRebindError>
+pub fn supervisor::SubjectCredentialResolver::is_empty(&self) -> bool
+pub fn supervisor::SubjectCredentialResolver::len(&self) -> usize
+pub const fn supervisor::SubjectCredentialResolver::new() -> Self
+pub fn supervisor::SubjectCredentialResolver::release(&mut self, u64) -> core::option::Option<authority_core::capability::SubjectId>
+impl core::default::Default for supervisor::SubjectCredentialResolver
+pub fn supervisor::SubjectCredentialResolver::default() -> Self
+impl supervisor::CallerResolver for supervisor::SubjectCredentialResolver
+pub type supervisor::SubjectCredentialResolver::Error = supervisor::CredentialResolveError
+pub fn supervisor::SubjectCredentialResolver::resolve(&self, &supervisor::ConnectionIdentity) -> core::result::Result<authority_core::capability::SubjectId, Self::Error>
+pub struct supervisor::Supervisor<K, R, C>
+impl<K, R, C> supervisor::Supervisor<K, R, C> where K: supervisor::AuthorityKernel, R: supervisor::RuntimeResources, C: supervisor::CallerResolver
+pub fn supervisor::Supervisor<K, R, C>::bind_accepted_connection(&mut self, supervisor::ConnectionIdentity) -> core::result::Result<authority_core::capability::SubjectId, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::close_handle(&mut self, &supervisor::ConnectionIdentity, &authority_core::handle::HandleId) -> core::result::Result<(), supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::create_subject(&mut self, authority_core::state::Subject, supervisor::ConnectionIdentity) -> core::result::Result<(), supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::derive(&self, &supervisor::ConnectionIdentity, &authority_core::capability::CapId, authority_core::state::CapabilityGrant, authority_core::time::MonotonicTime) -> core::result::Result<authority_core::capability::CapId, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::dispatch_request(&mut self, &supervisor::ConnectionIdentity, supervisor::WireRequest) -> core::result::Result<supervisor::DispatchResponse, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::dispatch_wire(&mut self, &supervisor::ConnectionIdentity, &[u8]) -> core::result::Result<supervisor::DispatchResponse, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::issue_root(&self, &authority_core::capability::SubjectId, authority_core::state::CapabilityGrant) -> core::result::Result<authority_core::capability::CapId, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::lifecycle(&self, &authority_core::capability::SubjectId) -> core::result::Result<supervisor::SubjectLifecycle, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::new(K, R, C) -> core::result::Result<Self, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::open_handle(&mut self, &supervisor::ConnectionIdentity, authority_core::handle::HandleId, authority_core::handle::ObjectId) -> core::result::Result<(), supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub const fn supervisor::Supervisor<K, R, C>::resources(&self) -> &R
+pub fn supervisor::Supervisor<K, R, C>::resources_mut(&mut self) -> &mut R
+pub fn supervisor::Supervisor<K, R, C>::revoke(&self, &supervisor::ConnectionIdentity, &authority_core::capability::CapId) -> core::result::Result<authority_core::state::RevocationStatus, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::shutdown_subject(&mut self, &authority_core::capability::SubjectId) -> core::result::Result<(), supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::with_resources_and_callers<T>(&mut self, impl core::ops::function::FnOnce(&mut R, &mut C) -> T) -> T
+pub struct supervisor::WorkloadHandle(_)
+impl supervisor::WorkloadHandle
+pub const fn supervisor::WorkloadHandle::new(u64) -> Self
+pub struct supervisor::WorkloadIsolationConfig
+impl supervisor::WorkloadIsolationConfig
+pub fn supervisor::WorkloadIsolationConfig::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, supervisor::WorkloadIsolationLimits, std::os::fd::raw::RawFd, impl core::convert::Into<alloc::string::String>) -> Self
+pub struct supervisor::WorkloadIsolationLimits
+impl supervisor::WorkloadIsolationLimits
+pub fn supervisor::WorkloadIsolationLimits::new(impl core::convert::Into<std::path::PathBuf>, u64, u64, u64, u32, u32) -> Self
+pub const supervisor::DEFAULT_CONTROL_RECEIVE_TIMEOUT: core::time::Duration
+pub const supervisor::DEFAULT_CONTROL_SEND_TIMEOUT: core::time::Duration
+pub const supervisor::MAX_CONTROL_SOCKET_BACKLOG: i32
+pub const supervisor::MAX_CONTROL_SOCKET_TIMEOUT: core::time::Duration
+pub const supervisor::MAX_WIRE_REQUEST_BYTES: usize
+pub const supervisor::MAX_WIRE_RESPONSE_BYTES: usize
+pub const supervisor::WORKLOAD_MOUNTPOINT_ENV: &str
+pub const supervisor::WORKLOAD_SUBJECT_ENV: &str
+pub trait supervisor::AuthorityKernel
+pub type supervisor::AuthorityKernel::Error: core::error::Error + core::marker::Send + core::marker::Sync + 'static
+pub fn supervisor::AuthorityKernel::begin_subject_close(&self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectCloseStatus, Self::Error>
+pub fn supervisor::AuthorityKernel::close_handle(&self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> core::result::Result<authority_core::state::HandleCloseStatus, Self::Error>
+pub fn supervisor::AuthorityKernel::derive(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId, authority_core::state::CapabilityGrant, authority_core::time::MonotonicTime) -> core::result::Result<authority_core::capability::CapId, Self::Error>
+pub fn supervisor::AuthorityKernel::finish_subject_close(&self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectFinishStatus, Self::Error>
+pub fn supervisor::AuthorityKernel::is_pristine(&self) -> core::result::Result<bool, Self::Error>
+pub fn supervisor::AuthorityKernel::issue_root(&self, authority_core::state::CapabilityGrant) -> core::result::Result<authority_core::capability::CapId, Self::Error>
+pub fn supervisor::AuthorityKernel::open_handle(&self, &authority_core::handle::HandleId) -> core::result::Result<core::option::Option<authority_core::handle::OpenHandle>, Self::Error>
+pub fn supervisor::AuthorityKernel::register_open_handle(&self, authority_core::handle::OpenHandle) -> core::result::Result<(), Self::Error>
+pub fn supervisor::AuthorityKernel::register_subject(&self, authority_core::state::Subject) -> core::result::Result<(), Self::Error>
+pub fn supervisor::AuthorityKernel::revoke(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId) -> core::result::Result<authority_core::state::RevocationStatus, Self::Error>
+impl supervisor::AuthorityKernel for alloc::sync::Arc<authority_core::kernel::CapabilityKernel>
+pub type alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::Error = authority_core::kernel::CapabilityKernelError
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::begin_subject_close(&self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectCloseStatus, Self::Error>
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::close_handle(&self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> core::result::Result<authority_core::state::HandleCloseStatus, Self::Error>
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::derive(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId, authority_core::state::CapabilityGrant, authority_core::time::MonotonicTime) -> core::result::Result<authority_core::capability::CapId, Self::Error>
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::finish_subject_close(&self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectFinishStatus, Self::Error>
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::is_pristine(&self) -> core::result::Result<bool, Self::Error>
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::issue_root(&self, authority_core::state::CapabilityGrant) -> core::result::Result<authority_core::capability::CapId, Self::Error>
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::open_handle(&self, &authority_core::handle::HandleId) -> core::result::Result<core::option::Option<authority_core::handle::OpenHandle>, Self::Error>
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::register_open_handle(&self, authority_core::handle::OpenHandle) -> core::result::Result<(), Self::Error>
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::register_subject(&self, authority_core::state::Subject) -> core::result::Result<(), Self::Error>
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::revoke(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId) -> core::result::Result<authority_core::state::RevocationStatus, Self::Error>
+impl supervisor::AuthorityKernel for authority_core::kernel::CapabilityKernel
+pub type authority_core::kernel::CapabilityKernel::Error = authority_core::kernel::CapabilityKernelError
+pub fn authority_core::kernel::CapabilityKernel::begin_subject_close(&self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectCloseStatus, Self::Error>
+pub fn authority_core::kernel::CapabilityKernel::close_handle(&self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> core::result::Result<authority_core::state::HandleCloseStatus, Self::Error>
+pub fn authority_core::kernel::CapabilityKernel::derive(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId, authority_core::state::CapabilityGrant, authority_core::time::MonotonicTime) -> core::result::Result<authority_core::capability::CapId, Self::Error>
+pub fn authority_core::kernel::CapabilityKernel::finish_subject_close(&self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectFinishStatus, Self::Error>
+pub fn authority_core::kernel::CapabilityKernel::is_pristine(&self) -> core::result::Result<bool, Self::Error>
+pub fn authority_core::kernel::CapabilityKernel::issue_root(&self, authority_core::state::CapabilityGrant) -> core::result::Result<authority_core::capability::CapId, Self::Error>
+pub fn authority_core::kernel::CapabilityKernel::open_handle(&self, &authority_core::handle::HandleId) -> core::result::Result<core::option::Option<authority_core::handle::OpenHandle>, Self::Error>
+pub fn authority_core::kernel::CapabilityKernel::register_open_handle(&self, authority_core::handle::OpenHandle) -> core::result::Result<(), Self::Error>
+pub fn authority_core::kernel::CapabilityKernel::register_subject(&self, authority_core::state::Subject) -> core::result::Result<(), Self::Error>
+pub fn authority_core::kernel::CapabilityKernel::revoke(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId) -> core::result::Result<authority_core::state::RevocationStatus, Self::Error>
+pub trait supervisor::CallerResolver
+pub type supervisor::CallerResolver::Error: core::error::Error + core::marker::Send + core::marker::Sync + 'static
+pub fn supervisor::CallerResolver::resolve(&self, &supervisor::ConnectionIdentity) -> core::result::Result<authority_core::capability::SubjectId, Self::Error>
+impl supervisor::CallerResolver for supervisor::StaticCallerResolver
+pub type supervisor::StaticCallerResolver::Error = supervisor::CallerBindingError
+pub fn supervisor::StaticCallerResolver::resolve(&self, &supervisor::ConnectionIdentity) -> core::result::Result<authority_core::capability::SubjectId, Self::Error>
+impl supervisor::CallerResolver for supervisor::SubjectCredentialResolver
+pub type supervisor::SubjectCredentialResolver::Error = supervisor::CredentialResolveError
+pub fn supervisor::SubjectCredentialResolver::resolve(&self, &supervisor::ConnectionIdentity) -> core::result::Result<authority_core::capability::SubjectId, Self::Error>
+pub trait supervisor::CapfsHostResources
+pub type supervisor::CapfsHostResources::Error: core::error::Error + core::marker::Send + core::marker::Sync + 'static
+pub fn supervisor::CapfsHostResources::close_control_fd(&mut self, supervisor::ControlFdHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsHostResources::close_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsHostResources::create_cgroup(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::CgroupHandle, Self::Error>
+pub fn supervisor::CapfsHostResources::open_control_fd(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::ControlFdHandle, Self::Error>
+pub fn supervisor::CapfsHostResources::open_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsHostResources::remove_cgroup(&mut self, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsHostResources::start_workload(&mut self, &authority_core::capability::SubjectId, supervisor::CgroupHandle, supervisor::MountHandle, &std::path::Path, supervisor::ControlFdHandle) -> supervisor::ResourceAcquisition<supervisor::WorkloadHandle, Self::Error>
+pub fn supervisor::CapfsHostResources::stop_workload(&mut self, supervisor::WorkloadHandle, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+impl supervisor::CapfsHostResources for supervisor::LinuxHostResources
+pub type supervisor::LinuxHostResources::Error = supervisor::LinuxHostError
+pub fn supervisor::LinuxHostResources::close_control_fd(&mut self, supervisor::ControlFdHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::LinuxHostResources::close_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::LinuxHostResources::create_cgroup(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::CgroupHandle, Self::Error>
+pub fn supervisor::LinuxHostResources::open_control_fd(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::ControlFdHandle, Self::Error>
+pub fn supervisor::LinuxHostResources::open_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::LinuxHostResources::remove_cgroup(&mut self, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::LinuxHostResources::start_workload(&mut self, &authority_core::capability::SubjectId, supervisor::CgroupHandle, supervisor::MountHandle, &std::path::Path, supervisor::ControlFdHandle) -> supervisor::ResourceAcquisition<supervisor::WorkloadHandle, Self::Error>
+pub fn supervisor::LinuxHostResources::stop_workload(&mut self, supervisor::WorkloadHandle, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+pub trait supervisor::RuntimeResources
+pub type supervisor::RuntimeResources::Error: core::error::Error + core::marker::Send + core::marker::Sync + 'static
+pub fn supervisor::RuntimeResources::close_control_fd(&mut self, supervisor::ControlFdHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::RuntimeResources::close_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::RuntimeResources::create_cgroup(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::CgroupHandle, Self::Error>
+pub fn supervisor::RuntimeResources::mount_capfs(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::MountHandle, Self::Error>
+pub fn supervisor::RuntimeResources::open_control_fd(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::ControlFdHandle, Self::Error>
+pub fn supervisor::RuntimeResources::open_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::RuntimeResources::remove_cgroup(&mut self, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::RuntimeResources::start_workload(&mut self, &authority_core::capability::SubjectId, supervisor::CgroupHandle, supervisor::MountHandle, supervisor::ControlFdHandle) -> supervisor::ResourceAcquisition<supervisor::WorkloadHandle, Self::Error>
+pub fn supervisor::RuntimeResources::stop_workload(&mut self, supervisor::WorkloadHandle, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::RuntimeResources::unmount_capfs(&mut self, supervisor::MountHandle) -> supervisor::ResourceMutation<Self::Error>
+impl<B> supervisor::RuntimeResources for supervisor::CapfsRuntimeResources<B> where B: supervisor::CapfsHostResources
+pub type supervisor::CapfsRuntimeResources<B>::Error = supervisor::CapfsResourceError<<B as supervisor::CapfsHostResources>::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::close_control_fd(&mut self, supervisor::ControlFdHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::close_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::create_cgroup(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::CgroupHandle, Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::mount_capfs(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::MountHandle, Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::open_control_fd(&mut self, &authority_core::capability::SubjectId) -> supervisor::ResourceAcquisition<supervisor::ControlFdHandle, Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::open_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::remove_cgroup(&mut self, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::start_workload(&mut self, &authority_core::capability::SubjectId, supervisor::CgroupHandle, supervisor::MountHandle, supervisor::ControlFdHandle) -> supervisor::ResourceAcquisition<supervisor::WorkloadHandle, Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::stop_workload(&mut self, supervisor::WorkloadHandle, supervisor::CgroupHandle) -> supervisor::ResourceMutation<Self::Error>
+pub fn supervisor::CapfsRuntimeResources<B>::unmount_capfs(&mut self, supervisor::MountHandle) -> supervisor::ResourceMutation<Self::Error>
+pub type supervisor::CapfsSupervisor<B, C> = supervisor::Supervisor<alloc::sync::Arc<authority_core::kernel::CapabilityKernel>, supervisor::CapfsRuntimeResources<B>, C>
+pub type supervisor::CapfsSupervisorError<B, C> = supervisor::SupervisorError<authority_core::kernel::CapabilityKernelError, supervisor::CapfsResourceError<<B as supervisor::CapfsHostResources>::Error>, <C as supervisor::CallerResolver>::Error>

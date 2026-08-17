@@ -578,7 +578,7 @@ impl LinuxHostResources {
     pub fn control_listener(&mut self, subject: &SubjectId) -> Option<&mut SubjectControlListener> {
         self.controls
             .values_mut()
-            .find(|control| control.subject == *subject)
+            .find(|control| control.subject == *subject && control.listener.is_open())
             .map(|control| &mut control.listener)
     }
 
@@ -798,19 +798,18 @@ impl CapfsHostResources for LinuxHostResources {
     }
 
     fn close_control_fd(&mut self, control: ControlFdHandle) -> ResourceMutation<Self::Error> {
-        let Some(owned) = self.controls.remove(&control) else {
+        let Some(owned) = self.controls.get_mut(&control) else {
             return ResourceMutation::Applied;
         };
-        let path = owned.listener.path().to_path_buf();
         // The socket is closed before its name is removed, so no peer can connect to a listener
         // that is no longer bound to a subject.
-        drop(owned);
-        match fs::remove_file(&path) {
-            Ok(()) => ResourceMutation::Applied,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => ResourceMutation::Applied,
-            Err(error) => {
-                ResourceMutation::CleanupRequired(io_error("removing the control socket", error))
+        owned.listener.close_fd_preserving_path();
+        match owned.listener.remove_owned_socket_node() {
+            Ok(()) => {
+                self.controls.remove(&control);
+                ResourceMutation::Applied
             }
+            Err(error) => ResourceMutation::CleanupRequired(LinuxHostError::ControlSocket(error)),
         }
     }
 
@@ -1210,6 +1209,51 @@ mod tests {
         ));
         assert!(matches!(
             host.remove_cgroup(cgroup),
+            ResourceMutation::Applied
+        ));
+    }
+
+    #[test]
+    fn control_socket_cleanup_retains_token_until_stale_node_is_removed() {
+        let Some(fixture) = Fixture::new("control-retry") else {
+            return;
+        };
+        let mut host = LinuxHostResources::new(fixture.config("/bin/true", &[]))
+            .expect("validated host config must build");
+        let subject = SubjectId::new("subject-a");
+        let ResourceAcquisition::Acquired(control) = host.open_control_fd(&subject) else {
+            panic!("control socket must bind");
+        };
+        let path = host
+            .control_socket_path(&subject)
+            .expect("valid subject must have a control socket path");
+        let moved_path = fixture.socket_directory.join("moved.sock");
+
+        // Replacing the node makes the first unlink fail closed. The token must remain owned so
+        // a retry can remove the original node after the path is restored.
+        fs::rename(&path, &moved_path).expect("socket node must be movable");
+        fs::write(&path, b"replacement").expect("replacement node must be creatable");
+        assert!(matches!(
+            host.close_control_fd(control),
+            ResourceMutation::CleanupRequired(LinuxHostError::ControlSocket(
+                ControlSocketError::InvalidPath(_)
+            ))
+        ));
+        assert!(
+            host.control_listener(&subject).is_none(),
+            "a closed descriptor must not be exposed while unlink is pending"
+        );
+        assert!(path.exists(), "failed cleanup must retain the stale node");
+
+        fs::remove_file(&path).expect("replacement node must be removable");
+        fs::rename(&moved_path, &path).expect("original socket node must be restored");
+        assert!(matches!(
+            host.close_control_fd(control),
+            ResourceMutation::Applied
+        ));
+        assert!(!path.exists(), "retry must remove the stale socket node");
+        assert!(matches!(
+            host.close_control_fd(control),
             ResourceMutation::Applied
         ));
     }

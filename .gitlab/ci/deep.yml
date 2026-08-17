@@ -1,9 +1,13 @@
-# The system-stage gates. Both need a host this project cannot rent from a
-# shared runner pool: one boots a real Firecracker microVM over /dev/kvm, the
-# other applies the isolation transaction as root and asks the kernel what it
-# enforces. Neither is allowed to report a skip as a pass, so both run on a
-# schedule or on demand rather than on every merge request, where a missing
-# device would either block every merge or teach everyone to ignore a failure.
+# The protected deep evidence gates need hosts this project cannot rent from a
+# shared runner pool: one directly boots a real Firecracker guest-control VM,
+# one drives Runtime::launch through the real jailer, one mounts CapFS through
+# /dev/fuse, one exercises an isolated HTTPS fixture, one exercises the typed
+# provider against an acknowledged disposable repository, and one applies the
+# isolation transaction as root and asks the kernel what it enforces. None is
+# allowed to report a skip as a pass: the evidence gates run on protected
+# schedules or on-demand pipelines, while the mutating provider gate is
+# web/API-only. They are not attached to merge requests, where a missing device
+# would either block every merge or teach everyone to ignore a failure.
 #
 # The runner tags are repository configuration; docs/ci-cd.md records what each
 # host must provide.
@@ -11,6 +15,11 @@
 .deep_rules:
   rules:
     - if: $CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "api"
+
+.external_provider_rules:
+  rules:
     - if: $CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "web"
     - if: $CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "api"
 
@@ -125,6 +134,58 @@ real_vm:
     - ephemeral
   script:
     - scripts/ci/verify-real-guest-control.sh
+
+real_runtime_lifecycle:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 60m
+  interruptible: false
+  tags:
+    - kvm
+    - ephemeral
+  script:
+    - scripts/ci/run.sh real-runtime-lifecycle
+
+real_capfs:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 30m
+  interruptible: false
+  tags:
+    - privileged
+    - ephemeral
+  script:
+    - scripts/ci/run.sh real-capfs
+
+egress_real_https:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: security
+  timeout: 30m
+  interruptible: false
+  tags:
+    - privileged
+    - ephemeral
+  script:
+    - scripts/ci/run.sh real-public-https
+
+external_provider_smoke:
+  extends:
+    - .rust_job
+    - .external_provider_rules
+  stage: security
+  timeout: 30m
+  interruptible: false
+  tags:
+    - external
+    - ephemeral
+  script:
+    - scripts/ci/run.sh live-github
 
 privileged_isolation:
   extends:

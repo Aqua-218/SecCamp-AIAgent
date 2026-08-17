@@ -15,6 +15,16 @@ readonly checker="${repository_root}/scripts/ci/check-doc-consistency.sh"
 readonly valid_manifest="${repository_root}/docs/verification-status.yml"
 readonly missing_evidence="${repository_root}/ci/fixtures/verification-status-missing-evidence.yml"
 readonly invalid_status="${repository_root}/ci/fixtures/verification-status-invalid-status.yml"
+yq_bin="${CI_TOOLS_DIR:-${repository_root}/.ci-tools}/bin/yq"
+if [[ ! -x "${yq_bin}" ]]; then
+  yq_bin="$(command -v yq || true)"
+fi
+readonly fixture_dir="$(mktemp -d)"
+
+cleanup() {
+  rm -rf -- "${fixture_dir}"
+}
+trap cleanup EXIT
 
 failures=0
 checks=0
@@ -36,8 +46,17 @@ expect_failure() {
   fi
 }
 
+mutated_manifest() {
+  local name="$1" expression="$2" path
+  path="${fixture_dir}/${name}.yml"
+  cp -- "${valid_manifest}" "${path}"
+  "${yq_bin}" eval -i "${expression}" "${path}"
+  printf '%s\n' "${path}"
+}
+
 [[ -x "${checker}" ]] || fail "checker is not executable: ${checker}"
 [[ -f "${valid_manifest}" ]] || fail "valid manifest is missing: ${valid_manifest}"
+[[ -n "${yq_bin}" ]] || fail 'yq is required for manifest mutation tests'
 
 expect_failure \
   'missing evidence fixture' \
@@ -46,7 +65,37 @@ expect_failure \
 expect_failure \
   'invalid status fixture' \
   "${invalid_status}" \
-  'expected verified or unverified'
+  'expected verified, unverified, or blocked'
+
+missing_metadata="$(mutated_manifest missing-metadata 'del(.claims[0].prerequisites)')"
+expect_failure \
+  'missing prerequisite metadata' \
+  "${missing_metadata}" \
+  'prerequisites: required sequence is missing'
+
+ignored_cargo="$(mutated_manifest ignored-cargo '.claims[0].evidence.commands = ["cargo test --locked -p authority-core --all-targets -- --ignored"] | .claims[0].gate.commands = ["cargo test --locked -p authority-core --all-targets -- --ignored"]')"
+expect_failure \
+  'direct ignored cargo evidence' \
+  "${ignored_cargo}" \
+  'verified cargo evidence cannot use an ignored'
+
+path_only="$(mutated_manifest path-only '.claims[0].evidence.commands = ["crates/authority-core/tests"] | .claims[0].gate.commands = ["crates/authority-core/tests"]')"
+expect_failure \
+  'path-only evidence' \
+  "${path_only}" \
+  'unsupported evidence command boundary'
+
+shell_fragment="$(mutated_manifest shell-fragment '.claims[0].evidence.commands = ["cargo test --locked -p authority-core --all-targets || true"] | .claims[0].gate.commands = ["cargo test --locked -p authority-core --all-targets || true"]')"
+expect_failure \
+  'shell fragment evidence' \
+  "${shell_fragment}" \
+  'command must be one non-empty, single-line argv shape'
+
+blocked_without_reason="$(mutated_manifest blocked-without-reason '.claims[0].status = "blocked" | .claims[0].residual_reasons = []')"
+expect_failure \
+  'blocked claim without residual reason' \
+  "${blocked_without_reason}" \
+  'unverified or blocked claims require a reason'
 
 checks=$((checks + 1))
 first_output="$(${checker} "${valid_manifest}")"

@@ -20,10 +20,9 @@ if [[ -z "${GITHUB_REPOSITORY:-}" ]]; then
   exit 2
 fi
 
-set -a
-# shellcheck disable=SC1091
-source dist/release.env
-set +a
+# shellcheck source=scripts/ci/release-metadata-lib.sh
+source "${repository_root}/scripts/ci/release-metadata-lib.sh"
+release_metadata_load dist/release.env
 
 if [[ "${release_tag}" != "${RELEASE_TAG}" ]]; then
   printf 'release metadata tag does not match requested tag\n' >&2
@@ -42,6 +41,18 @@ if ! gh release view "${release_tag}" > /dev/null 2>&1; then
     --title "${release_tag}" \
     --generate-notes
 fi
+
+expected_asset_names="$(printf '%s\n' "${release_assets[@]}" | sort)"
+readonly expected_asset_names
+remote_asset_names="$(gh api "${release_api}" --jq '.assets[].name' | sort)"
+readonly remote_asset_names
+while IFS= read -r remote_name; do
+  [[ -z "${remote_name}" ]] && continue
+  if ! grep -Fxq -- "${remote_name}" <<< "${expected_asset_names}"; then
+    printf 'existing release contains an undeclared asset: %s\n' "${remote_name}" >&2
+    exit 1
+  fi
+done <<< "${remote_asset_names}"
 
 # Compare every existing asset before mutating the release.
 for asset_name in "${release_assets[@]}"; do
@@ -76,6 +87,14 @@ for asset_name in "${release_assets[@]}"; do
     gh release upload "${release_tag}" "${local_asset}"
   fi
 done
+
+
+final_asset_names="$(gh api "${release_api}" --jq '.assets[].name' | sort)"
+readonly final_asset_names
+if [[ "${final_asset_names}" != "${expected_asset_names}" ]]; then
+  printf 'published release does not contain the exact declared asset set\n' >&2
+  exit 1
+fi
 
 if [[ "$(gh release view "${release_tag}" --json isDraft --jq '.isDraft')" == "true" ]]; then
   gh release edit "${release_tag}" --draft=false

@@ -27,7 +27,7 @@ use authority_core::{
 };
 use egress_broker::{
     dispatch::{BrokerDispatcher, DispatchContext, PublicDispatchAdapter},
-    durable::DurableSessionConfig,
+    durable::{DurableSessionConfig, MAX_DURABLE_BROKER_WAL_BYTES},
     github::GitHubAdapter,
     transport::DeadlineStream,
 };
@@ -172,6 +172,11 @@ pub const MAX_PRODUCTION_BROKER_CONNECTION_REQUESTS: usize = 4096;
 
 /// Hard upper bound for concurrent requests admitted by one production Broker session.
 pub const MAX_PRODUCTION_BROKER_CONCURRENT_REQUESTS: usize = 256;
+
+/// Maximum cumulative response budget that leaves at least half of the durable WAL for request,
+/// settlement, checksum, and crash-recovery framing overhead.
+pub const MAX_PRODUCTION_BROKER_RESPONSE_BUDGET_BYTES: u64 =
+    MAX_DURABLE_BROKER_WAL_BYTES / 2;
 
 /// Durable replay, budget, and connection ceilings for one Broker session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1971,6 +1976,12 @@ fn validate_production_broker_limits(
         return Err(ProductionBuildError::InvalidConfig(
             "Broker response budgets and provider cap must be non-zero".to_owned(),
         ));
+    }
+    if limits.budget_response_bytes > MAX_PRODUCTION_BROKER_RESPONSE_BUDGET_BYTES {
+        return Err(ProductionBuildError::InvalidConfig(format!(
+            "Broker response budget {} exceeds the durable-WAL-safe maximum {MAX_PRODUCTION_BROKER_RESPONSE_BUDGET_BYTES}",
+            limits.budget_response_bytes
+        )));
     }
     if limits.replay_capacity.get() > MAX_PRODUCTION_BROKER_REPLAY_CAPACITY {
         return Err(ProductionBuildError::InvalidConfig(format!(

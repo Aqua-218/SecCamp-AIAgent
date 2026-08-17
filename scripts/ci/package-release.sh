@@ -43,6 +43,7 @@ fi
 
 readonly target_triple="x86_64-unknown-linux-gnu"
 readonly host_triple="$(rustc -vV | awk '/^host:/ { print $2 }')"
+readonly build_target_directory="${RELEASE_TARGET_DIR:-${repository_root}/target}"
 readonly artifact_stem="authority-corpus-${release_tag}-${target_triple}"
 readonly archive_name="${artifact_stem}.tar.gz"
 readonly source_revision="$(git rev-parse HEAD)"
@@ -60,11 +61,20 @@ if [[ "${host_triple}" != "${target_triple}" ]]; then
     "${host_triple}" "${target_triple}" >&2
   exit 1
 fi
+if [[ ! "${build_target_directory}" = /* || "${build_target_directory}" == "/" ]]; then
+  printf 'RELEASE_TARGET_DIR must be an absolute non-root path: %s\n' \
+    "${build_target_directory}" >&2
+  exit 1
+fi
 
-mkdir -p -- dist "${package_root}/bin"
-cargo build --release --locked --target "${target_triple}" \
+# `dist` contains only generated release assets. Recreate it so an old archive
+# cannot satisfy a dry-run or leak into a later publication.
+rm -rf -- "${repository_root}/dist"
+mkdir -p -- "${repository_root}/dist" "${package_root}/bin"
+CARGO_TARGET_DIR="${build_target_directory}" \
+  cargo build --release --locked --target "${target_triple}" \
   --package authority-core --bin authority-corpus
-install -m 0755 "target/${target_triple}/release/authority-corpus" \
+install -m 0755 "${build_target_directory}/${target_triple}/release/authority-corpus" \
   "${package_root}/bin/authority-corpus"
 install -m 0644 LICENSE "${package_root}/LICENSE"
 
@@ -87,10 +97,10 @@ tar \
   --owner=0 \
   --group=0 \
   --numeric-owner \
-  -czf "dist/${archive_name}" \
+  -czf "${repository_root}/dist/${archive_name}" \
   -C "${staging_root}" "${artifact_stem}"
 
-cat > dist/release.env <<EOF
+cat > "${repository_root}/dist/release.env" <<EOF
 RELEASE_TAG=${release_tag}
 ARTIFACT_STEM=${artifact_stem}
 ARCHIVE_NAME=${archive_name}
@@ -101,4 +111,4 @@ SOURCE_REVISION=${source_revision}
 SOURCE_EPOCH=${source_epoch}
 EOF
 
-printf '%s\n' "dist/${archive_name}"
+printf '%s\n' "${repository_root}/dist/${archive_name}"

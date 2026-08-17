@@ -1,0 +1,79 @@
+name: Deep verification
+run-name: Deep / ${{ github.event_name }} / ${{ github.ref_name }}
+
+# The system-stage gates. Both need a host this project cannot rent from a
+# hosted runner pool: one boots a real Firecracker microVM over /dev/kvm, the
+# other applies the isolation transaction as root and asks the kernel what it
+# enforces. Neither is allowed to report a skip as a pass, so both are scheduled
+# rather than attached to pull requests, where a missing device would either
+# block every merge or teach everyone to ignore a yellow check.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:17 UTC daily, offset off the hour so the queue is not shared with every
+    # other project's midnight cron.
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deep-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  real_vm:
+    name: Real Firecracker VM verification
+    # Requires /dev/kvm, /dev/vhost-vsock, and veritysetup. Runner labels are
+    # repository configuration; docs/ci-cd.md records what the host must provide.
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Verify guest control and Broker over a real microVM
+        run: scripts/ci/verify-real-guest-control.sh
+
+  privileged_isolation:
+    name: Privileged runtime isolation verification
+    # Requires root and a cgroup v2 root that delegates memory and pids. No KVM.
+    runs-on: [self-hosted, linux, x64, privileged]
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Apply the 13 isolation steps and question the kernel
+        run: scripts/ci/run.sh privileged-isolation
+
+  deep_complete:
+    name: Deep verification complete
+    if: ${{ always() }}
+    needs:
+      - real_vm
+      - privileged_isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Enforce every system gate
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          jq -e 'all(.[]; .result == "success")' <<< "${NEEDS_JSON}"

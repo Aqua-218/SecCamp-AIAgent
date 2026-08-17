@@ -94,6 +94,32 @@ case "${command_name}" in
     mkdir -p -- reports
     cargo deny --format json check advisories bans licenses sources 2> reports/cargo-deny.json
     ;;
+  privileged-isolation)
+    scripts/ci/verify-privileged-isolation.sh
+    ;;
+  repository-policy)
+    scripts/ci/check-adr-index.sh
+    scripts/ci/check-verification-traceability.sh
+    scripts/ci/check-codeowners-coverage.sh
+    scripts/ci/check-repository-hygiene.sh
+    scripts/ci/check-lean-hygiene.sh
+    scripts/ci/collect-pin-inventory.sh
+    ;;
+  crate-isolation)
+    scripts/ci/check-crate-isolation.sh
+    ;;
+  release-dry-run)
+    scripts/ci/check-release-dry-run.sh
+    ;;
+  reproducibility)
+    scripts/ci/check-release-reproducibility.sh
+    ;;
+  supply-chain-inventory)
+    scripts/ci/collect-supply-chain-inventory.sh
+    ;;
+  cross-targets)
+    scripts/ci/check-cross-targets.sh
+    ;;
   *)
     printf 'unknown command: %s\n' "${command_name}" >&2
     exit 2

@@ -334,8 +334,8 @@ impl SessionReplayGuard {
     ///
     /// Returns [`EnvelopeError::PayloadHashMismatch`] when `payload` is not
     /// the exact byte sequence bound by `envelope`. Otherwise returns the same
-    /// session, ordering, identity, capacity, and exhaustion errors as
-    /// [`Self::accept`].
+    /// session, ordering, identity, capacity, and exhaustion errors as the
+    /// internal replay-admission path.
     pub fn accept_payload(
         &mut self,
         envelope: BrokerEnvelope,

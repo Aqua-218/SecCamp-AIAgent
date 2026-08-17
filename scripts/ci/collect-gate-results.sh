@@ -9,9 +9,10 @@
 #   --from-needs   GitHub Actions. Reads `toJSON(needs)` from NEEDS_JSON. The
 #                  job id equals the gate id by manifest rule, and a matrix job
 #                  already reports one aggregate result.
-#   --from-dir     GitLab CI. Reads the `reports/gates/*.result` files that each
-#                  job writes as its final script line, so a job that failed
-#                  before that line leaves no evidence of success behind.
+#   --from-dir     Reads repository-owned result receipts.
+#   --from-gitlab-api
+#                  Reads the immutable current-pipeline job set from GitLab and
+#                  collapses matrix instances to their manifest gate.
 #
 # Output is `<gate-id><TAB><result>` on stdout, one gate per line.
 
@@ -38,6 +39,10 @@ while [[ "$#" -gt 0 ]]; do
       source_mode='dir'
       source_dir="$2"
       shift 2
+      ;;
+    --from-gitlab-api)
+      source_mode='gitlab-api'
+      shift
       ;;
     --output)
       [[ "$#" -ge 2 ]] || {
@@ -76,9 +81,49 @@ collect_from_dir() {
   done < <(find "${source_dir}" -type f -name '*.result' -print0 | sort -z)
 }
 
+collect_from_gitlab_api() {
+  for variable in CI_API_V4_URL CI_PROJECT_ID CI_PIPELINE_ID CI_JOB_TOKEN; do
+    [[ -n "${!variable:-}" ]] || {
+      printf '%s is required for --from-gitlab-api\n' "${variable}" >&2
+      exit 2
+    }
+  done
+  local jobs_file
+  jobs_file="$(mktemp)"
+  trap 'rm -f -- "${jobs_file}"' RETURN
+  curl --fail-with-body --silent --show-error --location \
+    --connect-timeout 15 --max-time 30 \
+    --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+    "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/pipelines/${CI_PIPELINE_ID}/jobs?per_page=100&include_retried=false" \
+    > "${jobs_file}"
+  jq --exit-status 'type == "array" and length < 100' "${jobs_file}" > /dev/null || {
+    printf 'GitLab job response is malformed or hit the one-page safety limit\n' >&2
+    exit 1
+  }
+
+  while IFS=$'\t' read -r gate_name platform_name; do
+    statuses="$(jq -r --arg name "${platform_name}" '
+      .[] | select((.name == $name) or (.name | startswith($name + ":"))) | .status
+    ' "${jobs_file}")"
+    [[ -n "${statuses}" ]] || continue
+    if grep -Evqx 'success' <<< "${statuses}"; then
+      if grep -Eqx 'failed|canceled' <<< "${statuses}"; then
+        printf '%s\tfailure\n' "${gate_name}"
+      elif grep -Evqx 'skipped' <<< "${statuses}"; then
+        printf '%s\tincomplete\n' "${gate_name}"
+      else
+        printf '%s\tskipped\n' "${gate_name}"
+      fi
+    else
+      printf '%s\tsuccess\n' "${gate_name}"
+    fi
+  done < <(yq eval -r '.gates[] | select(.status == "implemented" and .gitlab != null) | [.id, .gitlab] | @tsv' ci/gates.yml)
+}
+
 case "${source_mode}" in
   needs) collected="$(collect_from_needs)" ;;
   dir) collected="$(collect_from_dir)" ;;
+  gitlab-api) collected="$(collect_from_gitlab_api)" ;;
   *)
     printf 'exactly one of --from-needs or --from-dir is required\n' >&2
     exit 2

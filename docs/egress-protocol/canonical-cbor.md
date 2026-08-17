@@ -34,7 +34,7 @@ flowchart LR
 | 4 | 32-byte byte string | `SHA-256(payload)` |
 | 5 | byte string | 下表の canonical operation CBOR bytes |
 
-`CanonicalBrokerRequest::decode` は、index 4 の値と index 5 の bytes から導出した hash が違えば reject する。成功時に得られる `BrokerEnvelope` は、この同じ hash を持つ。つまり replay guard が比較する identity と、実際に decode した operation の bytes がずれない。
+`CanonicalBrokerRequest::decode` は、index 4 の値と index 5 の bytes から導出した hash が違えば reject する。成功時に得られる `BrokerEnvelope` は、`from_canonical_payload` でこの同じ bytes から hash を導出する。つまり replay guard が比較する identity と、実際に decode した operation の bytes がずれない。独自 ingress では同じ binding を `SessionReplayGuard::accept_payload` で再検査する。
 
 payload の唯一の item は、次のどちらかである。
 

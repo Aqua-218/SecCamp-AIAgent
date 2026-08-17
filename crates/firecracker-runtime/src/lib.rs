@@ -53,6 +53,11 @@ pub const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 /// Maximum bytes read into memory from any pinned executable or boot artifact.
 pub const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum bytes hashed from one persisted snapshot state or memory file.
+///
+/// This is deliberately larger than the maximum supported guest memory and workspace image, but
+/// finite so a misconfigured FIFO/device or unexpectedly huge file cannot pin the session owner.
+pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_BOOT_ARGS_BYTES: usize = 4 * 1024;
 /// Guest PID 1 required by the identity gate.
 pub const REQUIRED_GUEST_INIT: &str = "/usr/local/libexec/guest-control-init";
@@ -2146,6 +2151,52 @@ fn digest_file(path: &Path) -> Result<Sha256Digest, RuntimeError> {
     digest_reader(File::open(path).map_err(RuntimeError::from)?)
 }
 
+fn digest_bounded_regular_file(
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<Sha256Digest, RuntimeError> {
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| RuntimeError::Io(error.to_string()))?;
+    let mut file = File::from(descriptor);
+    let metadata = file.metadata().map_err(RuntimeError::from)?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "digest input must be a singly-linked regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > maximum_bytes {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "digest input exceeds {maximum_bytes}-byte safety limit: {}",
+            path.display()
+        )));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let count = file.read(&mut buffer).map_err(RuntimeError::from)?;
+        if count == 0 {
+            return Ok(Sha256Digest(hasher.finalize().into()));
+        }
+        total = total.checked_add(count as u64).ok_or_else(|| {
+            RuntimeError::InvalidConfig("digest input length overflow".to_owned())
+        })?;
+        if total > maximum_bytes {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "digest input grew beyond {maximum_bytes}-byte safety limit: {}",
+                path.display()
+            )));
+        }
+        hasher.update(&buffer[..count]);
+    }
+}
+
 fn digest_reader(mut reader: impl Read) -> Result<Sha256Digest, RuntimeError> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -3527,7 +3578,7 @@ impl FileSystem for RealFileSystem {
     }
 
     fn digest(&mut self, path: &Path) -> Result<Sha256Digest, RuntimeError> {
-        digest_file(path)
+        digest_bounded_regular_file(path, MAX_SNAPSHOT_FILE_BYTES)
     }
 
     fn bind_block_device(
@@ -6017,6 +6068,30 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+
+    #[test]
+    fn production_snapshot_digest_rejects_symlinks_and_oversized_files() {
+        let directory = unique_test_path("snapshot-digest-boundary");
+        fs::create_dir(&directory).expect("digest test directory");
+        let target = directory.join("target");
+        fs::write(&target, b"snapshot").expect("digest target");
+        let link = directory.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("digest symlink");
+        let oversized = directory.join("oversized");
+        File::create(&oversized)
+            .and_then(|file| file.set_len(MAX_SNAPSHOT_FILE_BYTES + 1))
+            .expect("sparse oversized fixture");
+
+        let mut filesystem = RealFileSystem::new();
+        assert!(filesystem.digest(&link).is_err());
+        assert!(filesystem.digest(&oversized).is_err());
+        assert_eq!(filesystem.digest(&target), Ok(sha256(b"snapshot")));
+
+        fs::remove_file(link).expect("remove symlink");
+        fs::remove_file(oversized).expect("remove sparse fixture");
+        fs::remove_file(target).expect("remove target");
+        fs::remove_dir(directory).expect("remove fixture directory");
+    }
 
     #[test]
     fn cgroup_parent_components_accept_the_standard_systemd_hierarchy() {

@@ -118,13 +118,13 @@ flowchart LR
 
 | 境界 | 実装済み | mock/contract 検証済み | 実機・外部統合の状態 |
 |---|---|---|---|
-| Authority core と audit | typed authority、状態遷移、`auth_epoch`、in-memory audit、`DurableAuditLog` の WAL/receipt | Rust/Lean 共通 corpus、property test、loom、durable audit contract test | 複数 process の journal owner 調整、実 provider との receipt reconciliation は未検証 |
-| capfs | preflight、namespace/node table、link を含む Direct-I/O FUSE adapter | module/contract test と環境依存の実 mount test | 全 interleaving の loom、敵対的 backing 差し替え、隔離層との end-to-end は未検証 |
-| `egress-broker` | bounded transport、typed dispatch、DNS/IP policy、公開 HTTPS、型付き GitHub adapter | fake resolver/connector/provider による module test | 実KVMのguest-to-host Broker rejectionを確認。外部 DNS/HTTPS/GitHub APIは未検証 |
-| `runtime-isolation` | policy validation、`LinuxBackend`、13 段階の ordered apply/rollback | mock backend test、host capability detection、privileged syscall probe | staged rootfsへの実applyを確認。post-exec、rootfs `/`、rollbackは未検証 |
-| `firecracker-runtime` | artifact pin、dm-verity/jailer/API 順序、workspace、snapshot/restore、identity/workload gate | fake boundary test、local Unix socket HTTP exchange、opt-in KVM test | 実 Firecracker + dm-verity + v2 guest gate + guest-to-host Brokerを確認。jailer / snapshot restore は未検証 |
-| `supervisor` | connection-to-subject binding、bounded wire protocol、subject/handle lifecycle | `CapabilityKernel` + `FakeResources`、local socket、opt-in KVM runtime image | guest supervisor/isolation launcher/Broker channelを実KVMで確認。CapFS全effectは未検証 |
-| `session-orchestrator` | durable 128-bit identity ledger、lease binding、Authority/Broker/Firecracker/workspace production adapter | mock state-machine test、test-double 境界までの production adapter composition | 実 command/filesystem/vsock、guest capfs/isolation、実 VM は未検証 |
+| Authority core と audit | typed authority、状態遷移、`auth_epoch`、in-memory audit、`DurableAuditLog` の WAL/receipt | Rust/Lean 共通 corpus、property test、loom、durable audit contract／cross-process test | provider receipt reconciliationは実装済み。live external providerの実行だけblocked |
+| capfs | preflight、namespace/node table、link を含む Direct-I/O FUSE adapter | module/contract、実mount 22件、KVM guest全13 effect | bounded race／backing差し替えも確認。全interleavingは有限テストの範囲外 |
+| `egress-broker` | bounded transport、typed dispatch、DNS/IP policy、公開 HTTPS、型付き GitHub adapter | fake境界 + 実DNS/TLS/SNI/rebinding + KVM Broker | live GitHub APIだけoperator credential不在でblocked |
+| `runtime-isolation` | policy validation、`LinuxBackend`、13 段階の ordered apply/rollback | mock backend、privileged syscall／production launcher post-exec probe、KVM guest | staged rootfsの実apply／rollbackとreadonly guest rootの`/` branchを確認 |
+| `firecracker-runtime` | artifact pin、dm-verity/jailer/API 順序、workspace、snapshot/restore、identity/workload gate | fake境界、local Unix socket、実lifecycle／KVM test | 実Firecracker、jailer、dm-verity、snapshot capture／restore、guest-to-host Brokerを確認 |
+| `supervisor` | connection-to-subject binding、bounded wire protocol、subject/handle lifecycle | `CapabilityKernel` + `FakeResources`、local／実kernel resource、KVM runtime image | guest supervisor／isolation／Broker／全13 CapFS effectを確認 |
+| `session-orchestrator` | durable 128-bit identity ledger、lease binding、Authority/Broker/Firecracker/workspace production adapter | mock state-machine + production composition + KVM SessionOwner | 実command/filesystem/vsock、guest isolation、全effect、stop／cleanupを確認 |
 
 この表の「実装済み」は、該当 crate の API と実装が repository にあることを意味する。「mock/contract 検証済み」は、特権 kernel、外部 network、provider、実 VM を通っていない test の結果である。
 

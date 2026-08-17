@@ -17,15 +17,18 @@ readonly elan_binary_sha256="840179e70803ef373c2ec53342d6a45ea7d022533e4145489fc
 readonly elan_archive="${downloads}/elan-${elan_version}-x86_64-unknown-linux-gnu.tar.gz"
 readonly elan_url="https://github.com/leanprover/elan/releases/download/v${elan_version}/elan-x86_64-unknown-linux-gnu.tar.gz"
 readonly lean_toolchain="$(tr -d '[:space:]' < "${repository_root}/lean/lean-toolchain")"
-readonly lean_toolchain_directory="${elan_home}/toolchains/leanprover--lean4---v4.16.0"
 readonly lean_toolchain_tree_sha256="36e9994285883e24c1874cecfcb39e4bb0b2726ca076902f9416c2487f619cb1"
+
+[[ "${lean_toolchain}" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+:v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || { printf '%s\n' 'Lean toolchain file has an unsupported value' >&2; exit 2; }
+lean_toolchain_directory_name="${lean_toolchain//\//--}"
+lean_toolchain_directory_name="${lean_toolchain_directory_name//:/---}"
+readonly lean_toolchain_directory_name
+readonly lean_toolchain_directory="${elan_home}/toolchains/${lean_toolchain_directory_name}"
 
 # shellcheck source=scripts/ci/install-binary-tool-lib.sh
 source "${repository_root}/scripts/ci/install-binary-tool-lib.sh"
-binary_install_init
-
-[[ "${lean_toolchain}" == "leanprover/lean4:v4.16.0" ]] \
-  || binary_install_die "Lean toolchain pin changed without a reviewed tree digest"
+binary_install_init "${tools_root}" "${tool_bin}" "${downloads}"
 
 binary_fetch_pinned "elan ${elan_version}" "${elan_url}" "${elan_archive}" \
   "${elan_archive_sha256}"

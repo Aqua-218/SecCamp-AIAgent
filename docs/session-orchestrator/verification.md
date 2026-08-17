@@ -6,7 +6,7 @@
 
 > **対象読者:** orchestrator の実装者、レビュー担当者、実機で統合 test を回す人
 
-test は 3 系統ある。mock backend による state machine test、durable ledger を直接叩く test、production adapter の composition test。加えて Broker の Firecracker per-port Unix listener は module test と repository の opt-in KVM test で確認する。実 `SessionOwner` lifecycle、実 filesystem、実 VM の完全統合はない。
+test には、mock backend による state machine test、durable ledger を直接叩く test、production adapter の composition test、実機専用の production `SessionOwner` KVM gate がある。通常の test では最後の gate を実行せず、要求された Linux/KVM host で wrapper を明示的に起動する。
 
 ## local test で確認したこと
 
@@ -24,8 +24,14 @@ test は 3 系統ある。mock backend による state machine test、durable le
 | stop の retry が未完了 stage だけを実行する | mock backend |
 | ledger の header / record checksum、truncation、sequence 連続性 | 実 file を使う直接 test |
 | 同一 process からの二重 open が拒否される | 実 file を使う直接 test |
+| `new_durable` の実 `start_session` が最初の backend effect より前に7 identityをcommitし、stop後も再openできる | `tests/ledger.rs` の実 durable orchestrator probe |
+| record-sync前後の crash 相当 staged tail、rename/length drift 後の poison と再試行拒否、write/sync fault 後の poison と reopen | `tests/ledger.rs` の実 file fault test + `lib.rs` の private deterministic seam |
+| cross-process contention と owner process kill 後の stale lock 再取得 | `tests/ledger.rs` の child process test |
+| request/header/file の capacity hard bound、最大件数ちょうどの実データ commit、malformed header/symlink/non-regular-file fail-closed | `tests/ledger.rs` の実 file test |
+| Linux kernel entropy source からの16 byte読出し、public `new_durable` の all-zero bounded retry/fail-closed | `tests/ledger.rs` の `OsEntropy` / durable orchestrator tests |
 | identity の 32 桁 hex 表現 | 単体 |
 | workspace clone、listener 所有、snapshot binding、Firecracker identity 注入、Authority subject の閉包 | production adapter composition test（全境界 fake） |
+| production `SessionOwner` の build → 実 Firecracker snapshot restore → guest readiness → `Continue` poll → stop → `Closed` | `real_production_lifecycle.rs`（実 `Runtime`、jailer、dm-verity、filesystem、AF_VSOCK、durable Broker、guest supervisor。`REAL_SESSION_OWNER_LIFECYCLE=1` の ignored gate） |
 
 ## 実行コマンド
 
@@ -35,33 +41,60 @@ cargo test --manifest-path crates/session-orchestrator/Cargo.toml
 cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-targets -- -D warnings
 ```
 
+## 実機 production lifecycle gate
+
+次の wrapper は、固定された Firecracker/jailer、guest kernel、guest runtime image、seccomp
+filter を用意し、`ProductionSessionRuntimeBuilder` から実 `SessionOwner` を構築する。
+guest-control の identity injection と guest supervisor readiness が確認されてから workload
+を解放し、`Continue` の Broker health poll、外部 stop、`Closed` までを一つの test で通す。
+stop 後は subject 操作の durable audit、identity ledger、recovery journal、Broker WAL を再度
+読み、VM、cgroup leaf、dm-verity mapper、jail、API/vsock socket、workspace clone/image が
+残っていないことを検査する。
+
+```bash
+scripts/ci/verify-real-session-owner.sh
+```
+
+これは root、x86_64 KVM、`/dev/vhost-vsock`、cgroup-v2、dm-verity、`mksquashfs`、および
+guest kernel build toolchain を必要とする。jailer が chroot 内で Firecracker を実行できるよう、
+既定の staging は短い `/root/so.XXXXXX`（private かつ実行可能な mount）に作り、wrapper は
+mount flags と statfs、および全 ancestor の所有者・mode を検査して `noexec` や共有 writable
+の候補を fail closed で拒否する。`REAL_SESSION_TEMP_PARENT` で別の専用 parent を指定する
+場合も、同じ検査を通過する必要がある。egress adapter は意図的に closed/rejecting で、
+外部 HTTP/GitHub provider の到達性や mutation はこの gate の対象外である。guest 内の
+CapFS/supervisor が readiness まで進むことは確認するが、全ての file effect、FUSE/OS の
+意味論、外部 provider の安全性をこの test だけで証明するものではない。
+
 ## 未検証の境界
 
 ### test double が代わりに立っているもの
 
 | 本来の依存 | 代替 |
 |---|---|
-| Firecracker、jailer、dm-verity | `TestRunner`、`TestApi` |
-| filesystem | `TestFileSystem` |
+| Firecracker、jailer、dm-verity | `TestRunner`、`TestApi`（通常の composition test） |
+| filesystem | `TestFileSystem`（通常の composition test） |
 | `AF_VSOCK` listener | `ListenerFactory` |
 | entropy | `SequenceRandom`（`[0x01; 16]` などの決定的な値） |
-| durable ledger（orchestrator 経由） | `InMemoryIdentityLedger` と `FailingLedger` |
+| durable ledger（通常の state-machine test） | `InMemoryIdentityLedger` と `FailingLedger`。実 durable path は下記 `tests/ledger.rs` |
 
-`tests/production_adapters.rs` が示すのは identity が adapter を貫通することだけ。Firecracker が起動すること、dm-verity や seccomp が適用されること、guest 内で capfs が動くことは、いずれも示していない。Broker の per-port Unix listener と closed request の往復だけは別の opt-in KVM test で確認する。
+`tests/production_adapters.rs` が示すのは identity が adapter を貫通することだけ。実機 gate は
+Firecracker 起動、dm-verity/seccomp、guest-control の identity gate、guest supervisor readiness、
+Broker listener の生存、依存順 cleanup までを追加で確認する。ただし Broker の egress は closed
+であり、外部 provider の接続・mutation、任意の CapFS effect と OS/FUSE の全挙動は示さない。
 
 ### 検査があるのに test が無いもの
 
 | 対象 | 何が未検証か |
 |---|---|
 | `validate_workspace` | `CrossSessionLease` 経路と、その clone 解放は `foreign_workspace_lease_isolates_the_clone_before_returning` で検証済み。`LeaseIdentityMismatch` 側の分岐は未検証 |
-| `SessionOrchestrator::new_durable` | どの test からも呼ばれていない。durable ledger を orchestrator 経由で動かす経路が皆無 |
-| ledger の crash consistency | record の sync と header の write の間で落とす fault injection が無い。「header の commit 範囲外に trailing bytes」の分岐は未到達（既存 test は `set_len` で `Truncated` に当たる） |
-| `poisoned` 経路 | 実 `DurableIdentityLedger` で起こす test が無い。mock が `WriteFailed` / `SyncFailed` を返すだけ |
-| `CapacityExceeded` | 定数の値を assert しているのみ。append 時、file size、header 宣言件数の 3 つの bound すべて未実行 |
-| stale lock の回収 | 既存 test は同一 process から 2 回 open するので `/proc` を一度も見ない。cross-process の排他も、死んだ所有者からの復旧も未検証 |
-| 並行性 | 2 thread も 2 process も `open` / `reserve_batch` を競わせていない。排他は sidecar file と `create_new` に依存していて、contention 下で未検証 |
-| `OsEntropy` | 実行する test が無い。`/dev/urandom` を開くこと、16 bytes 読むこと、予測不可能であることのいずれも未確認 |
-| ledger の error variant | `Symlink`、`NotRegularFile`、`UnsupportedVersion`、file 内 `Duplicate`、非連続 sequence、未知 kind tag、非ゼロ reserved がすべて未到達 |
+| `SessionOrchestrator::new_durable` | public integration test は実 `start_session` の7 record commit、backend effect前のfile state、stop後のreopenを固定する。実 `SessionOwner` / production builder の経路は別の ignored gateに依存する |
+| ledger の crash consistency | valid staged tail の再open破棄、部分 tail、header redundancy、rename/length drift、write/sync fault は実 file と private deterministic seam で固定した。ledger 自身に rename syscall はなく、path replacement は実 `fs::rename` で検証する |
+| `poisoned` 経路 | rename/length drift と write/sync syscall failure 後の typed error、同一 handle の `Unavailable`、reopen 後の safe reuse/duplicate rejection を固定した。header sync は syscall が実際に header を反映してから失敗する場合もあるため、reopen の両結果を安全条件として検証する |
+| `CapacityExceeded` | request batch、header declared count、file size の3 hard bound に加え、最大件数ちょうどを実データで埋めた成功、次 record の拒否、reopen 後の件数を固定した |
+| stale lock の回収 | child processをkillした後のkernel lock再取得、stable lock inode、cross-process `Locked`を実行済み。異常終了がOS以外の外部ロック実装を含むことは保証しない |
+| 並行性 | 2 process の `open` contention は固定した。lock保持中に2つのwriterが同時にreserve成功する競合試験は、exclusive openで成立しないため未実行 |
+| `OsEntropy` | Linux `/dev/urandom` のopenと16 bytes読出し、2回の値がall-zeroでないこと、public allocation の all-zero bounded retry と persistent-zero typed failure、entropy I/O failure の typed propagation を固定した。予測不可能性や kernel/host entropy品質は証明せず、host OS RNG を TCB とする |
+| ledger の error variant | `Symlink`、`NotRegularFile`、`UnsupportedVersion`、`Corrupt`、`Truncated`、`Duplicate`、`CapacityExceeded`、`PathIdentityChanged`、`LengthChanged`、`Unavailable`、未知kind、非連続 sequence、非ゼロ reserved は実行済み |
 | 空 failure の `StopError::Cleanup` | flag が false で lease が `None` の場合に `Stopping` へ永久固着する。structural に防いでおらず test も無い |
 | `rollback_failures` の完全性 | index 0 しか確認していない test が 1 本。gate で飛ばした stage が failure に現れないことを固定する test が無い |
 | `LifecycleState` の中間値 | `state()` から観測できないため、`WorkspaceCloned` 等を確認する test は存在しえない |
@@ -72,9 +105,11 @@ snapshot image を一度も読まない。`SnapshotDescriptor` は呼び出し�
 
 ledger の CRC-32 は MAC ではない。file に書ける者は record を削除して CRC を計算し直せる。防御は filesystem permission と advisory な sidecar lock だけ。
 
-ledger file は `O_NOFOLLOW` なしで開く。open 前後の 2 回の検査は別の syscall で、後者は fd が regular file であることを見るが同一 inode であることは見ない。
+Linux では ledger と lock を `O_NOFOLLOW` 付きの held parent-directory descriptor 相対で開く。open 前後の検査は別の syscall なので、parent/fileの交換競合を完全には原子的に証明せず、held descriptor と device/inode の再検証で fail closed にする。
 
-mock test が全部通っても、VM 実起動や full isolation の完成とは判断しない。この方針は [docs/README.md](../README.md) の宣言に従う。
+mock test が全部通っても、VM 実起動や full isolation の完成とは判断しない。実機 gate が通っても、
+その保証範囲は上記の明示された lifecycle と cleanup に限る。この方針は [docs/README.md](../README.md)
+の宣言に従う。
 
 ## 関連
 

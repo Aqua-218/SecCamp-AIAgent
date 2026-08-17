@@ -117,10 +117,13 @@ case "${command_name}" in
   audit)
     mkdir -p -- reports
     cargo audit --json > reports/cargo-audit.json
+    cargo audit --file fuzz/Cargo.lock --json > reports/cargo-audit-fuzz.json
     ;;
   deny)
     mkdir -p -- reports
     cargo deny --format json check advisories bans licenses sources 2> reports/cargo-deny.json
+    cargo deny --manifest-path fuzz/Cargo.toml --format json \
+      check advisories bans licenses sources 2> reports/cargo-deny-fuzz.json
     ;;
   privileged-isolation)
     scripts/ci/verify-privileged-isolation.sh

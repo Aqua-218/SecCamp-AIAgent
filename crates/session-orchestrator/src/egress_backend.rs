@@ -11,7 +11,7 @@ use std::{
     net::Shutdown,
     num::NonZeroUsize,
     os::unix::{
-        fs::{MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     panic::{self, AssertUnwindSafe},
@@ -29,9 +29,12 @@ use authority_core::time::MonotonicTime;
 use egress_broker::{
     dispatch::DispatchContext,
     server::{ConnectionCloseReason, RequestDispatcher, ServerError, serve_connection},
-    transport::{AfVsockListener, TransportError, VsockShutdownHandle, VsockStream},
+    transport::{
+        AfVsockListener, DeadlineStream, TransportError, VsockShutdownHandle, VsockStream,
+    },
 };
 use firecracker_runtime::firecracker_guest_port_path;
+use rustix::net::sockopt::socket_peercred;
 
 use crate::{
     BackendError, BrokerBackend as OrchestratorBrokerBackend, BrokerLease, SessionIdentity,
@@ -45,6 +48,66 @@ const VMADDR_PORT_ANY: u32 = u32::MAX;
 const DEFAULT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 const DROP_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_REJECTED_PEERS_PER_ACCEPT_POLL: usize = 64;
+
+/// Kernel-reported credentials expected from Firecracker's forwarded Unix
+/// socket peer.
+///
+/// UID and GID are mandatory. A PID can be supplied when the process identity
+/// is known before listener creation; otherwise the listener still verifies
+/// the kernel credential pair and the private socket ancestry. The legacy
+/// Firecracker constructors do not have this boundary and therefore fail
+/// closed before binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FirecrackerPeerCredentials {
+    uid: u32,
+    gid: u32,
+    pid: Option<u32>,
+}
+
+impl FirecrackerPeerCredentials {
+    /// Creates an expected UID/GID pair. The values are host configuration,
+    /// never derived from the connecting guest.
+    #[must_use]
+    pub const fn new(uid: u32, gid: u32) -> Self {
+        Self {
+            uid,
+            gid,
+            pid: None,
+        }
+    }
+
+    /// Adds an optional exact Firecracker process PID check.
+    #[must_use]
+    pub const fn with_pid(mut self, pid: u32) -> Self {
+        self.pid = Some(pid);
+        self
+    }
+
+    /// Returns the configured UID.
+    #[must_use]
+    pub const fn uid(self) -> u32 {
+        self.uid
+    }
+
+    /// Returns the configured GID.
+    #[must_use]
+    pub const fn gid(self) -> u32 {
+        self.gid
+    }
+
+    /// Returns the optional configured process PID.
+    #[must_use]
+    pub const fn pid(self) -> Option<u32> {
+        self.pid
+    }
+
+    fn matches(self, actual: Self) -> bool {
+        self.uid == actual.uid
+            && self.gid == actual.gid
+            && self.pid.is_none_or(|pid| Some(pid) == actual.pid)
+    }
+}
 
 /// Interrupts both directions of one accepted Broker stream.
 pub trait BrokerStreamShutdown: Send + 'static {
@@ -107,12 +170,15 @@ impl BrokerServiceListener for AfVsockListener {
 /// Firecracker maps a guest connection to host CID 2 and port `P` onto a Unix
 /// socket named `<vsock_uds_path>_P`. The base UDS path is session-scoped and
 /// selected only from the verified Firecracker configuration; the guest never
-/// supplies it. The expected CID is therefore a host-owned binding to that
-/// exact microVM rather than a value read from the Unix socket peer record.
+/// supplies it. Before the expected CID is attached, Linux `SO_PEERCRED` must
+/// match the host-configured Firecracker UID/GID and optional PID. The CID is
+/// therefore a host-owned binding to that exact microVM, never a value inferred
+/// from an arbitrary Unix client.
 #[derive(Debug)]
 pub struct FirecrackerUnixListener {
     listener: UnixListener,
     expected_guest_cid: u32,
+    expected_peer_credentials: FirecrackerPeerCredentials,
     path: PathBuf,
 }
 
@@ -128,10 +194,39 @@ impl FirecrackerUnixListener {
     /// Returns an I/O error if the path is invalid, already occupied, or the
     /// Unix socket cannot be bound and made nonblocking.
     pub fn bind_nonblocking(
+        _vsock_uds_path: impl AsRef<Path>,
+        _expected_guest_cid: u32,
+        _port: u32,
+    ) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Firecracker Unix listener requires explicit expected peer credentials",
+        ))
+    }
+
+    /// Binds the exact Firecracker guest-port socket with an explicit kernel
+    /// peer credential policy.
+    ///
+    /// The old [`Self::bind_nonblocking`] constructor intentionally remains a
+    /// fail-closed compatibility boundary because it cannot attest which
+    /// host process owns an accepted Unix stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the path ancestry is unsafe, the socket already
+    /// exists, credentials are unavailable, or the socket cannot be bound.
+    pub fn bind_nonblocking_with_peer_credentials(
         vsock_uds_path: impl AsRef<Path>,
         expected_guest_cid: u32,
         port: u32,
+        expected_peer_credentials: FirecrackerPeerCredentials,
     ) -> io::Result<Self> {
+        if expected_peer_credentials.pid == Some(0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected Firecracker peer PID must be non-zero",
+            ));
+        }
         let path = firecracker_guest_port_path(vsock_uds_path.as_ref(), port).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -139,12 +234,15 @@ impl FirecrackerUnixListener {
             )
         })?;
         validate_private_socket_parent(&path)?;
+        reject_existing_socket_path(&path)?;
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        validate_bound_socket(&path)?;
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener,
             expected_guest_cid,
+            expected_peer_credentials,
             path,
         })
     }
@@ -160,15 +258,37 @@ impl FirecrackerUnixListener {
     /// # Errors
     ///
     /// Returns an I/O error if the nonblocking accept fails for a reason other
-    /// than no pending connection.
+    /// than no pending connection. At most a bounded batch of unauthenticated
+    /// clients is drained per call so cancellation remains observable under a
+    /// direct-client flood.
     pub fn try_accept_peer(&self) -> io::Result<Option<(u32, FirecrackerUnixStream)>> {
-        match self.listener.accept() {
-            Ok((stream, _)) => Ok(Some((
-                self.expected_guest_cid,
-                FirecrackerUnixStream { stream },
-            ))),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error),
+        let mut rejected = 0_usize;
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    let accepted = match peer_credentials(&stream) {
+                        Ok(actual) => self.expected_peer_credentials.matches(actual),
+                        Err(_) => false,
+                    };
+                    if !accepted {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        // A direct Unix client must not terminate the listener;
+                        // continue draining already-pending clients and leave
+                        // the endpoint available for the real Firecracker.
+                        rejected += 1;
+                        if rejected >= MAX_REJECTED_PEERS_PER_ACCEPT_POLL {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    return Ok(Some((
+                        self.expected_guest_cid,
+                        FirecrackerUnixStream { stream },
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) => return Err(error),
+            }
         }
     }
 }
@@ -180,20 +300,109 @@ fn validate_private_socket_parent(path: &Path) -> io::Result<()> {
             "Firecracker guest Broker socket has no parent directory",
         )
     })?;
-    let metadata = std::fs::symlink_metadata(parent)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    let effective_uid = effective_uid()?;
+    let mut current = Some(parent);
+    while let Some(directory) = current {
+        let metadata = std::fs::symlink_metadata(directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Firecracker guest Broker socket ancestor is not a non-symlink directory: {}",
+                    directory.display()
+                ),
+            ));
+        }
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Firecracker guest Broker socket ancestor is group/world-writable: {}",
+                    directory.display()
+                ),
+            ));
+        }
+        if metadata.uid() != 0 && metadata.uid() != effective_uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Firecracker guest Broker socket ancestor has untrusted owner: {}",
+                    directory.display()
+                ),
+            ));
+        }
+        current = directory.parent();
+    }
+    Ok(())
+}
+
+fn reject_existing_socket_path(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Firecracker guest Broker socket path already exists",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_bound_socket(path: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Firecracker guest Broker socket parent must be a non-symlink directory",
+            io::ErrorKind::InvalidData,
+            "bound Firecracker guest Broker path is not a socket",
         ));
     }
     if metadata.mode() & 0o022 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "Firecracker guest Broker socket parent must not be group- or world-writable",
+            "bound Firecracker guest Broker socket is group/world-writable",
+        ));
+    }
+    let effective_uid = effective_uid()?;
+    if metadata.uid() != 0 && metadata.uid() != effective_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "bound Firecracker guest Broker socket has untrusted owner",
         ));
     }
     Ok(())
+}
+
+fn effective_uid() -> io::Result<u32> {
+    std::fs::read_to_string("/proc/self/status")?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Uid:")
+                .and_then(|values| values.split_ascii_whitespace().nth(1))
+                .and_then(|value| value.parse::<u32>().ok())
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "effective UID unavailable"))
+}
+
+#[cfg(target_os = "linux")]
+fn peer_credentials(stream: &UnixStream) -> io::Result<FirecrackerPeerCredentials> {
+    let credentials = socket_peercred(stream).map_err(io::Error::from)?;
+    let pid = u32::try_from(credentials.pid.as_raw_pid()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unix peer credentials reported an invalid PID",
+        )
+    })?;
+    Ok(
+        FirecrackerPeerCredentials::new(credentials.uid.as_raw(), credentials.gid.as_raw())
+            .with_pid(pid),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_credentials(_stream: &UnixStream) -> io::Result<FirecrackerPeerCredentials> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Firecracker Unix peer credentials require Linux SO_PEERCRED",
+    ))
 }
 
 /// One guest-to-host stream forwarded by Firecracker's per-port Unix socket.
@@ -215,6 +424,16 @@ impl Write for FirecrackerUnixStream {
 
     fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
+    }
+}
+
+impl DeadlineStream for FirecrackerUnixStream {
+    fn set_read_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.stream.set_read_timeout(Some(timeout))
+    }
+
+    fn set_write_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.stream.set_write_timeout(Some(timeout))
     }
 }
 
@@ -292,6 +511,7 @@ type FirecrackerVsockPathForSession =
 pub struct FirecrackerUnixListenerFactory {
     vsock_path_for_session: Arc<FirecrackerVsockPathForSession>,
     expected_guest_cid: u32,
+    expected_peer_credentials: Option<FirecrackerPeerCredentials>,
 }
 
 impl std::fmt::Debug for FirecrackerUnixListenerFactory {
@@ -300,6 +520,7 @@ impl std::fmt::Debug for FirecrackerUnixListenerFactory {
             .debug_struct("FirecrackerUnixListenerFactory")
             .field("vsock_path_for_session", &"<host-owned>")
             .field("expected_guest_cid", &self.expected_guest_cid)
+            .field("expected_peer_credentials", &self.expected_peer_credentials)
             .finish()
     }
 }
@@ -310,6 +531,22 @@ impl FirecrackerUnixListenerFactory {
     pub fn new(vsock_uds_path: impl Into<PathBuf>, expected_guest_cid: u32) -> Self {
         let vsock_uds_path = vsock_uds_path.into();
         Self::for_session(move |_| Ok(vsock_uds_path.clone()), expected_guest_cid)
+    }
+
+    /// Seals one fixed verified Firecracker UDS path and explicit peer
+    /// credentials.
+    #[must_use]
+    pub fn new_with_peer_credentials(
+        vsock_uds_path: impl Into<PathBuf>,
+        expected_guest_cid: u32,
+        expected_peer_credentials: FirecrackerPeerCredentials,
+    ) -> Self {
+        let vsock_uds_path = vsock_uds_path.into();
+        Self::for_session_with_peer_credentials(
+            move |_| Ok(vsock_uds_path.clone()),
+            expected_guest_cid,
+            expected_peer_credentials,
+        )
     }
 
     /// Seals a host-owned function that derives the Firecracker UDS path for
@@ -325,6 +562,25 @@ impl FirecrackerUnixListenerFactory {
         Self {
             vsock_path_for_session: Arc::new(vsock_path_for_session),
             expected_guest_cid,
+            expected_peer_credentials: None,
+        }
+    }
+
+    /// Seals a session-derived path and the required Firecracker peer
+    /// credential boundary.
+    #[must_use]
+    pub fn for_session_with_peer_credentials(
+        vsock_path_for_session: impl Fn(&SessionIdentity) -> Result<PathBuf, BackendError>
+        + Send
+        + Sync
+        + 'static,
+        expected_guest_cid: u32,
+        expected_peer_credentials: FirecrackerPeerCredentials,
+    ) -> Self {
+        Self {
+            vsock_path_for_session: Arc::new(vsock_path_for_session),
+            expected_guest_cid,
+            expected_peer_credentials: Some(expected_peer_credentials),
         }
     }
 }
@@ -345,7 +601,18 @@ impl VsockListenerFactory for FirecrackerUnixListenerFactory {
                 format!("deriving Firecracker Broker UDS for session failed: {error}"),
             )
         })?;
-        FirecrackerUnixListener::bind_nonblocking(&vsock_uds_path, self.expected_guest_cid, port)
+        let expected_peer_credentials = self.expected_peer_credentials.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Firecracker Broker bind requires explicit expected peer credentials",
+            )
+        })?;
+        FirecrackerUnixListener::bind_nonblocking_with_peer_credentials(
+            &vsock_uds_path,
+            self.expected_guest_cid,
+            port,
+            expected_peer_credentials,
+        )
     }
 }
 
@@ -970,6 +1237,33 @@ where
     ///
     /// Returns [`BackendError`] when the endpoint configuration is invalid.
     pub fn firecracker(
+        _runtime_factory: R,
+        _vsock_path_for_session: impl Fn(&SessionIdentity) -> Result<PathBuf, BackendError>
+        + Send
+        + Sync
+        + 'static,
+        _host_cid: u32,
+        _expected_guest_cid: u32,
+        _port: u32,
+        _backlog: i32,
+    ) -> Result<Self, BackendError> {
+        Err(BackendError::new(
+            "Firecracker Broker construction requires explicit SO_PEERCRED UID/GID configuration; use firecracker_with_peer_credentials",
+        ))
+    }
+
+    /// Creates a Firecracker backend with the required kernel peer credential
+    /// boundary for the Firecracker process.
+    ///
+    /// The credential policy is checked on every accepted Unix stream before
+    /// the guest CID is attached to it. A direct Unix client with another UID,
+    /// GID, or configured PID is discarded and does not stop the listener.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] when the endpoint or transport configuration is
+    /// invalid.
+    pub fn firecracker_with_peer_credentials(
         runtime_factory: R,
         vsock_path_for_session: impl Fn(&SessionIdentity) -> Result<PathBuf, BackendError>
         + Send
@@ -979,6 +1273,7 @@ where
         expected_guest_cid: u32,
         port: u32,
         backlog: i32,
+        expected_peer_credentials: FirecrackerPeerCredentials,
     ) -> Result<Self, BackendError> {
         if host_cid != MIN_HOST_CID {
             return Err(BackendError::new(format!(
@@ -986,7 +1281,11 @@ where
             )));
         }
         Self::new(
-            FirecrackerUnixListenerFactory::for_session(vsock_path_for_session, expected_guest_cid),
+            FirecrackerUnixListenerFactory::for_session_with_peer_credentials(
+                vsock_path_for_session,
+                expected_guest_cid,
+                expected_peer_credentials,
+            ),
             runtime_factory,
             host_cid,
             expected_guest_cid,
@@ -1149,18 +1448,18 @@ fn unknown_lease_error(operation: &str) -> BackendError {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{self, Cursor},
+        io::{self, Cursor, Read},
         os::unix::{
             fs::{MetadataExt as _, PermissionsExt as _},
             net::UnixStream,
         },
-        path::Path,
+        path::{Path, PathBuf},
         sync::{
             Arc, Condvar, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant},
     };
 
     use egress_broker::server::ConnectionCloseReason;
@@ -1168,9 +1467,9 @@ mod tests {
     use super::{
         BrokerBackend, BrokerCancellation, BrokerConnectionExit, BrokerRuntime,
         BrokerRuntimeFactory, BrokerServiceListener, BrokerStreamShutdown, BrokerWorkerExit,
-        BrokerWorkerStatus, DROP_JOIN_POLL_INTERVAL, DropJoinAction, FirecrackerUnixListener,
-        FirecrackerUnixListenerFactory, VsockListenerFactory, drop_join_action,
-        firecracker_guest_port_path, successful_connection_exit,
+        BrokerWorkerStatus, DROP_JOIN_POLL_INTERVAL, DropJoinAction, FirecrackerPeerCredentials,
+        FirecrackerUnixListener, FirecrackerUnixListenerFactory, VsockListenerFactory,
+        drop_join_action, firecracker_guest_port_path, successful_connection_exit,
     };
     use crate::{
         BackendError, BrokerBackend as OrchestratorBrokerBackend, BrokerLease, BrokerSessionId,
@@ -1414,27 +1713,41 @@ mod tests {
         }
     }
 
+    fn short_socket_root(label: &str) -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let tag = label
+            .bytes()
+            .next()
+            .filter(u8::is_ascii_alphanumeric)
+            .map_or('x', char::from);
+        std::env::current_dir()
+            .expect("test workspace must be available")
+            .join(format!(
+                "v{tag}{:x}{:x}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+    }
+
     #[test]
     fn firecracker_listener_uses_the_exact_guest_port_socket_and_host_owned_cid() {
-        let root = std::env::temp_dir().join(format!(
-            "so-vsock-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("test clock must follow the epoch")
-                .as_nanos(),
-        ));
+        let root = short_socket_root("bind");
         std::fs::create_dir(&root).expect("test socket root must be creatable");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
             .expect("test socket root must be private");
+        let root_metadata = std::fs::metadata(&root).expect("test root metadata");
+        let expected_peer_credentials =
+            FirecrackerPeerCredentials::new(root_metadata.uid(), root_metadata.gid())
+                .with_pid(std::process::id());
         let session = identity(0x40);
         let base = root.join(format!("{}.vsock", session.workspace_id()));
         let factory_root = root.clone();
-        let factory = FirecrackerUnixListenerFactory::for_session(
+        let factory = FirecrackerUnixListenerFactory::for_session_with_peer_credentials(
             move |bound_identity| {
                 Ok(factory_root.join(format!("{}.vsock", bound_identity.workspace_id())))
             },
             42,
+            expected_peer_credentials,
         );
         let listener = factory
             .bind(&session, 2, 18_081, 1)
@@ -1501,6 +1814,163 @@ mod tests {
             .expect("insecure test root must become removable");
         std::fs::remove_dir(insecure_root).expect("insecure test root must be removable");
         std::fs::remove_dir(root).expect("test socket root must be removable");
+    }
+
+    #[test]
+    fn firecracker_peer_credentials_reject_wrong_uid_and_pid() {
+        let actual = FirecrackerPeerCredentials::new(1000, 1000).with_pid(42);
+        assert!(actual.matches(actual));
+        assert!(!FirecrackerPeerCredentials::new(1001, 1000).matches(actual));
+        assert!(
+            !FirecrackerPeerCredentials::new(1000, 1000)
+                .with_pid(43)
+                .matches(actual)
+        );
+        assert_eq!(actual.uid(), 1000);
+        assert_eq!(actual.gid(), 1000);
+        assert_eq!(actual.pid(), Some(42));
+    }
+
+    #[test]
+    fn firecracker_listener_rejects_wrong_pid_and_remains_usable() {
+        let root = short_socket_root("peer");
+        std::fs::create_dir(&root).expect("test socket root must be creatable");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("test socket root must be private");
+        let metadata = std::fs::metadata(&root).expect("test root metadata");
+        let expected = FirecrackerPeerCredentials::new(metadata.uid(), metadata.gid())
+            .with_pid(std::process::id().wrapping_add(1));
+        let path = root.join("firecracker.vsock");
+        let mut listener = FirecrackerUnixListener::bind_nonblocking_with_peer_credentials(
+            &path, 42, 18_082, expected,
+        )
+        .expect("explicit peer policy must allow binding");
+
+        let mut wrong_client = UnixStream::connect(listener.path()).expect("wrong client connects");
+        wrong_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("wrong client timeout must apply");
+        assert!(
+            listener
+                .try_accept_peer()
+                .expect("wrong peer rejection must not kill listener")
+                .is_none(),
+            "wrong peer must not be accepted"
+        );
+        let mut closed = [0_u8; 1];
+        assert_eq!(
+            wrong_client
+                .read(&mut closed)
+                .expect("rejected peer must observe orderly close"),
+            0
+        );
+
+        // The test process itself is the accepted peer for the second
+        // connection. Changing only the host-owned expected policy models a
+        // listener that survives an unauthenticated direct client.
+        listener.expected_peer_credentials =
+            FirecrackerPeerCredentials::new(metadata.uid(), metadata.gid())
+                .with_pid(std::process::id());
+        let _correct_client =
+            UnixStream::connect(listener.path()).expect("correct client connects");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let accepted = loop {
+            match listener
+                .try_accept_peer()
+                .expect("listener must remain usable after rejection")
+            {
+                Some(accepted) => break accepted,
+                None if Instant::now() < deadline => thread::yield_now(),
+                None => panic!("listener did not accept the second peer"),
+            }
+        };
+        assert_eq!(accepted.0, 42);
+        drop(accepted.1);
+        drop(listener);
+        std::fs::remove_file(firecracker_guest_port_path(&path, 18_082).expect("path is valid"))
+            .expect("test socket must be removable");
+        std::fs::remove_dir(root).expect("test socket root must be removable");
+    }
+
+    #[test]
+    fn firecracker_socket_ancestry_rejects_symlink_and_world_writable_parent() {
+        let root = short_socket_root("ancestor");
+        std::fs::create_dir(&root).expect("test root must be creatable");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("test root must be private");
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir(&target).expect("target must be creatable");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink fixture must be creatable");
+        let credentials = FirecrackerPeerCredentials::new(
+            std::fs::metadata(&root).expect("root metadata").uid(),
+            std::fs::metadata(&root).expect("root metadata").gid(),
+        );
+        assert!(
+            FirecrackerUnixListener::bind_nonblocking_with_peer_credentials(
+                link.join("session.vsock"),
+                42,
+                18_083,
+                credentials,
+            )
+            .is_err()
+        );
+
+        let unsafe_parent = root.join("unsafe");
+        std::fs::create_dir(&unsafe_parent).expect("unsafe parent must be creatable");
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o777))
+            .expect("unsafe parent mode must be configurable");
+        assert!(
+            FirecrackerUnixListener::bind_nonblocking_with_peer_credentials(
+                unsafe_parent.join("session.vsock"),
+                42,
+                18_084,
+                credentials,
+            )
+            .is_err()
+        );
+
+        let replaced_socket = root.join("replaced.vsock_18085");
+        let replacement_target = root.join("replacement-target");
+        std::fs::write(&replacement_target, b"not a socket")
+            .expect("replacement target must be creatable");
+        std::os::unix::fs::symlink(&replacement_target, &replaced_socket)
+            .expect("replacement symlink must be creatable");
+        assert!(
+            FirecrackerUnixListener::bind_nonblocking_with_peer_credentials(
+                root.join("replaced.vsock"),
+                42,
+                18_085,
+                credentials,
+            )
+            .is_err()
+        );
+        assert!(
+            std::fs::symlink_metadata(&replaced_socket)
+                .expect("replacement symlink must remain")
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::set_permissions(&unsafe_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("unsafe parent must become removable");
+        std::fs::remove_dir(&unsafe_parent).expect("unsafe parent must be removable");
+        std::fs::remove_file(&replaced_socket).expect("replacement symlink must be removable");
+        std::fs::remove_file(&replacement_target).expect("replacement target must be removable");
+        std::fs::remove_file(&link).expect("symlink fixture must be removable");
+        std::fs::remove_dir(&target).expect("target must be removable");
+        std::fs::remove_dir(root).expect("test root must be removable");
+    }
+
+    #[test]
+    fn legacy_firecracker_factory_fails_closed_without_peer_credentials() {
+        let factory = FirecrackerUnixListenerFactory::for_session(
+            |_| Ok(PathBuf::from("/private/firecracker.vsock")),
+            42,
+        );
+        let error = factory
+            .bind(&identity(0x41), 2, 18_085, 1)
+            .expect_err("legacy factory must require peer credentials");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     fn release_runtime(gate: &Arc<(Mutex<BlockState>, Condvar)>) {

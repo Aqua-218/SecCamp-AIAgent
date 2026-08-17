@@ -84,7 +84,7 @@ impl GuestWorkload {
             }
             Self::BrokerProbe => "--port 18081",
             Self::RuntimeBrokerProbe => {
-                "--workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port 18081 --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository workspace --file-effects read-data,list-directory,write-data --path-prefix /"
+                "--workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port 18081 --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository workspace --file-effects read-data,list-directory,write-data,truncate,create-file,create-directory,remove-file,remove-directory,rename,set-metadata,read-link,create-symlink,create-hard-link --path-prefix /"
             }
         }
     }
@@ -205,6 +205,16 @@ fn bound_guest_request() -> GuestControlRequest {
             FileEffect::ReadData,
             FileEffect::ListDirectory,
             FileEffect::WriteData,
+            FileEffect::Truncate,
+            FileEffect::CreateFile,
+            FileEffect::CreateDirectory,
+            FileEffect::RemoveFile,
+            FileEffect::RemoveDirectory,
+            FileEffect::Rename,
+            FileEffect::SetMetadata,
+            FileEffect::ReadLink,
+            FileEffect::CreateSymlink,
+            FileEffect::CreateHardLink,
         ]),
         PathPattern::Prefix(CanonicalPath::root()),
     ));

@@ -361,6 +361,8 @@ pub firecracker_runtime::Snapshot::snapshot_digest: firecracker_runtime::Sha256D
 pub firecracker_runtime::Snapshot::snapshot_path: std::path::PathBuf
 impl firecracker_runtime::Snapshot
 pub fn firecracker_runtime::Snapshot::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, firecracker_runtime::Sha256Digest, firecracker_runtime::Sha256Digest, firecracker_runtime::Sha256Digest, alloc::vec::Vec<firecracker_runtime::IdentityId>) -> Self
+pub fn firecracker_runtime::Snapshot::new_bound(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, firecracker_runtime::Sha256Digest, firecracker_runtime::Sha256Digest, firecracker_runtime::Sha256Digest, authority_core::policy::AuthorityPolicyDigest, alloc::vec::Vec<firecracker_runtime::IdentityId>) -> Self
+pub const fn firecracker_runtime::Snapshot::policy_digest(&self) -> core::option::Option<authority_core::policy::AuthorityPolicyDigest>
 pub struct firecracker_runtime::SystemIdentitySource
 impl firecracker_runtime::IdentitySource for firecracker_runtime::SystemIdentitySource
 pub fn firecracker_runtime::SystemIdentitySource::generate(&mut self) -> core::result::Result<firecracker_runtime::IdentityId, firecracker_runtime::RuntimeError>
@@ -377,6 +379,7 @@ pub struct firecracker_runtime::VerifiedSnapshot
 impl firecracker_runtime::VerifiedSnapshot
 pub const fn firecracker_runtime::VerifiedSnapshot::artifact_fingerprint(&self) -> firecracker_runtime::Sha256Digest
 pub fn firecracker_runtime::VerifiedSnapshot::memory_path(&self) -> &std::path::Path
+pub const fn firecracker_runtime::VerifiedSnapshot::policy_digest(&self) -> core::option::Option<authority_core::policy::AuthorityPolicyDigest>
 pub fn firecracker_runtime::VerifiedSnapshot::snapshot_path(&self) -> &std::path::Path
 pub struct firecracker_runtime::VsockConfig
 pub firecracker_runtime::VsockConfig::guest_cid: u32

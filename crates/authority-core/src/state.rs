@@ -15,6 +15,22 @@ use crate::{
     time::{MonotonicTime, TimeWindow},
 };
 
+/// Maximum subjects retained by one session state.
+///
+/// Closed subjects remain recorded permanently so their identities cannot be
+/// silently rebound. Admission fails at this bound; records are never evicted.
+pub const MAX_SUBJECTS_PER_SESSION: usize = 1_048_576;
+/// Maximum capability identities retained by one session state.
+///
+/// The same bound covers issued capabilities and their revocation tombstones.
+pub const MAX_CAPABILITIES_PER_SESSION: usize = 1_048_576;
+/// Maximum handle identities retained by one session state.
+///
+/// Closed handle identities remain reserved for replay/no-reuse protection.
+pub const MAX_HANDLES_PER_SESSION: usize = 1_048_576;
+/// Maximum number of capability nodes in one delegation ancestry.
+pub const MAX_DELEGATION_DEPTH: usize = 64;
+
 /// The immutable authority ceiling assigned to one subject.
 ///
 /// Capability issuance may narrow this envelope but can never expand it. The
@@ -246,6 +262,8 @@ impl AuthorizationEpoch {
 pub enum CapabilityStateError {
     /// A subject with this identity is already registered.
     DuplicateSubject(SubjectId),
+    /// The session has reached its permanent subject identity bound.
+    SubjectCountExceeded,
     /// A new subject refers to a parent that is not registered.
     UnknownParentSubject(SubjectId),
     /// A capability grant names a subject that is not registered.
@@ -258,6 +276,8 @@ pub enum CapabilityStateError {
     SubjectHasOpenHandles(SubjectId),
     /// A handle identity was already used earlier in this session.
     HandleIdAlreadyIssued(HandleId),
+    /// The session has reached its permanent handle identity bound.
+    HandleCountExceeded,
     /// A transition refers to a handle identity never issued in this session.
     UnknownHandle(HandleId),
     /// A subject tried to close a handle owned by a different subject.
@@ -291,12 +311,16 @@ pub enum CapabilityStateError {
     ParentChainInactive(CapId),
     /// The parent does not permit further delegation.
     ParentNotDelegable(CapId),
+    /// The parent ancestry is already at the maximum delegation depth.
+    DelegationDepthExceeded(CapId),
     /// The proposed authority is not contained by the parent capability.
     GrantExceedsParent(CapId),
     /// The proposed authority is not contained by the target subject's envelope.
     GrantExceedsEnvelope(SubjectId),
     /// The session-local capability ID sequence has no remaining values.
     CapabilityIdExhausted,
+    /// The session has reached its permanent capability identity bound.
+    CapabilityCountExceeded,
     /// The authorization epoch cannot advance without wrapping.
     AuthorizationEpochExhausted,
 }
@@ -307,6 +331,10 @@ impl fmt::Display for CapabilityStateError {
             Self::DuplicateSubject(subject) => {
                 write!(formatter, "subject `{subject}` is already registered")
             }
+            Self::SubjectCountExceeded => write!(
+                formatter,
+                "session subject identity limit of {MAX_SUBJECTS_PER_SESSION} was reached"
+            ),
             Self::UnknownParentSubject(subject) => {
                 write!(formatter, "parent subject `{subject}` is not registered")
             }
@@ -325,6 +353,10 @@ impl fmt::Display for CapabilityStateError {
             Self::HandleIdAlreadyIssued(handle) => {
                 write!(formatter, "handle `{handle}` was already issued")
             }
+            Self::HandleCountExceeded => write!(
+                formatter,
+                "session handle identity limit of {MAX_HANDLES_PER_SESSION} was reached"
+            ),
             Self::UnknownHandle(handle) => {
                 write!(formatter, "handle `{handle}` was not issued by this state")
             }
@@ -361,6 +393,10 @@ impl fmt::Display for CapabilityStateError {
             Self::ParentNotDelegable(parent) => {
                 write!(formatter, "parent capability `{parent}` is not delegable")
             }
+            Self::DelegationDepthExceeded(parent) => write!(
+                formatter,
+                "parent capability `{parent}` is at the maximum delegation depth of {MAX_DELEGATION_DEPTH}"
+            ),
             Self::GrantExceedsParent(parent) => write!(
                 formatter,
                 "requested capability authority exceeds parent `{parent}`"
@@ -372,6 +408,10 @@ impl fmt::Display for CapabilityStateError {
             Self::CapabilityIdExhausted => {
                 formatter.write_str("session-local capability ID sequence is exhausted")
             }
+            Self::CapabilityCountExceeded => write!(
+                formatter,
+                "session capability identity limit of {MAX_CAPABILITIES_PER_SESSION} was reached"
+            ),
             Self::AuthorizationEpochExhausted => {
                 formatter.write_str("session-local authorization epoch is exhausted")
             }
@@ -457,8 +497,10 @@ impl CapabilityState {
     /// # Errors
     ///
     /// Returns [`CapabilityStateError::DuplicateSubject`] if the identity is
-    /// already present, or [`CapabilityStateError::UnknownParentSubject`] if a
-    /// parent link does not resolve to an existing subject.
+    /// already present, [`CapabilityStateError::UnknownParentSubject`] if a
+    /// parent link does not resolve to an existing subject, or
+    /// [`CapabilityStateError::SubjectCountExceeded`] if the permanent
+    /// identity bound is full.
     pub fn register_subject(&mut self, subject: Subject) -> Result<(), CapabilityStateError> {
         if self.subjects.contains_key(subject.id()) {
             return Err(CapabilityStateError::DuplicateSubject(subject.id().clone()));
@@ -470,6 +512,9 @@ impl CapabilityState {
         }
         if let Some(parent) = subject.parent() {
             self.ensure_subject_running(parent)?;
+        }
+        if self.subjects.len() >= MAX_SUBJECTS_PER_SESSION {
+            return Err(CapabilityStateError::SubjectCountExceeded);
         }
 
         let subject_id = subject.id().clone();
@@ -524,13 +569,18 @@ impl CapabilityState {
     /// # Errors
     ///
     /// Returns an error when the owner is unknown or not running, or when the
-    /// handle identity has ever been issued in this session.
+    /// handle identity has ever been issued in this session. Admission also
+    /// fails with [`CapabilityStateError::HandleCountExceeded`] when the
+    /// permanent handle identity bound is full.
     pub fn register_open_handle(&mut self, handle: OpenHandle) -> Result<(), CapabilityStateError> {
         self.ensure_subject_running(handle.subject())?;
         if self.issued_handle_owners.contains_key(handle.id()) {
             return Err(CapabilityStateError::HandleIdAlreadyIssued(
                 handle.id().clone(),
             ));
+        }
+        if self.issued_handle_owners.len() >= MAX_HANDLES_PER_SESSION {
+            return Err(CapabilityStateError::HandleCountExceeded);
         }
 
         self.issued_handle_owners
@@ -594,7 +644,8 @@ impl CapabilityState {
     /// # Errors
     ///
     /// Returns an error if the target subject is unknown, the grant exceeds its
-    /// envelope, or the session-local ID sequence is exhausted.
+    /// envelope, the session-local identity bound is full, or the session-local
+    /// ID sequence is exhausted.
     pub fn issue_root(&mut self, grant: CapabilityGrant) -> Result<CapId, CapabilityStateError> {
         self.validate_envelope(&grant)?;
         self.issue(grant, None)
@@ -615,8 +666,8 @@ impl CapabilityState {
     /// # Errors
     ///
     /// Returns an error if the target subject is unknown, the grant exceeds
-    /// its envelope, the identity is empty, or the identity was already
-    /// issued.
+    /// its envelope, the session-local identity bound is full, the identity is
+    /// empty, or the identity was already issued.
     pub fn issue_root_with_id(
         &mut self,
         capability_id: CapId,
@@ -629,6 +680,7 @@ impl CapabilityState {
                 capability_id,
             ));
         }
+        self.ensure_capability_capacity()?;
 
         Ok(self.issue_with_id(grant, None, capability_id))
     }
@@ -643,7 +695,9 @@ impl CapabilityState {
     ///
     /// Returns an error unless the parent exists, is held by `caller`, has an
     /// active ancestor chain at `now`, permits delegation, contains the grant,
-    /// and the target subject's static envelope also contains the grant.
+    /// and the target subject's static envelope also contains the grant. The
+    /// parent ancestry may contain at most `MAX_DELEGATION_DEPTH` capability
+    /// nodes.
     pub fn derive(
         &mut self,
         caller: &SubjectId,
@@ -673,6 +727,11 @@ impl CapabilityState {
             || !authority_body_below(grant.authority(), parent.authority())
         {
             return Err(CapabilityStateError::GrantExceedsParent(parent_id.clone()));
+        }
+        if self.delegation_depth(parent_id) >= MAX_DELEGATION_DEPTH {
+            return Err(CapabilityStateError::DelegationDepthExceeded(
+                parent_id.clone(),
+            ));
         }
 
         self.validate_envelope(&grant)?;
@@ -905,6 +964,7 @@ impl CapabilityState {
         grant: CapabilityGrant,
         parent: Option<CapId>,
     ) -> Result<CapId, CapabilityStateError> {
+        self.ensure_capability_capacity()?;
         let capability_id = self.allocate_capability_id()?;
         Ok(self.issue_with_id(grant, parent, capability_id))
     }
@@ -948,6 +1008,36 @@ impl CapabilityState {
         }
     }
 
+    fn ensure_capability_capacity(&self) -> Result<(), CapabilityStateError> {
+        if self.issued_ids.len() >= MAX_CAPABILITIES_PER_SESSION {
+            Err(CapabilityStateError::CapabilityCountExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn delegation_depth(&self, capability: &CapId) -> usize {
+        let mut current = Some(capability);
+        let mut depth = 0_usize;
+        let mut visited = BTreeSet::new();
+
+        while let Some(current_id) = current {
+            if !visited.insert(current_id.clone()) {
+                return MAX_DELEGATION_DEPTH.saturating_add(1);
+            }
+            depth = depth.saturating_add(1);
+            if depth > MAX_DELEGATION_DEPTH {
+                return depth;
+            }
+            current = self
+                .capabilities
+                .get(current_id)
+                .and_then(|value| value.metadata().parent());
+        }
+
+        depth
+    }
+
     fn allocate_capability_id(&mut self) -> Result<CapId, CapabilityStateError> {
         let mut sequence = self
             .next_capability_sequence
@@ -978,7 +1068,7 @@ impl CapabilityState {
 mod tests {
     use super::{
         AuthorizationEpoch, CapabilityGrant, CapabilityState, CapabilityStateError,
-        RevocationStatus, StaticAuthorityEnvelope, Subject,
+        MAX_DELEGATION_DEPTH, RevocationStatus, StaticAuthorityEnvelope, Subject,
     };
     use crate::{
         capability::{AuthorityBody, CapId, IssuerId, SubjectId},
@@ -1056,6 +1146,56 @@ mod tests {
             .expect("first capability identity allocation must succeed");
 
         assert!(!state.is_pristine());
+    }
+
+    #[test]
+    fn delegation_depth_is_rejected_before_state_mutation() {
+        let holder = SubjectId::new("holder");
+        let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+            .expect("test bounds must form a non-empty time window");
+        let authority = AuthorityBody::File(FileAuthority::new(
+            RepoId::new("workspace"),
+            FileEffects::from_effects([FileEffect::ReadData]),
+            PathPattern::Prefix(CanonicalPath::root()),
+        ));
+        let envelope = StaticAuthorityEnvelope::new(validity, authority.clone());
+        let mut state = CapabilityState::new(IssuerId::new("session-issuer"));
+        state
+            .register_subject(Subject::new(holder.clone(), envelope))
+            .expect("holder registration must succeed");
+
+        let mut parent = state
+            .issue_root(
+                CapabilityGrant::new(holder.clone(), validity, authority.clone())
+                    .with_delegable(true),
+            )
+            .expect("root issuance must succeed");
+        for _ in 1..MAX_DELEGATION_DEPTH {
+            parent = state
+                .derive(
+                    &holder,
+                    &parent,
+                    CapabilityGrant::new(holder.clone(), validity, authority.clone())
+                        .with_delegable(true),
+                    MonotonicTime::from_ticks(1),
+                )
+                .expect("delegation below the depth limit must succeed");
+        }
+
+        let issued_count = state.issued_ids.len();
+        let capability_count = state.capabilities.len();
+        let error = state
+            .derive(
+                &holder,
+                &parent,
+                CapabilityGrant::new(holder.clone(), validity, authority).with_delegable(true),
+                MonotonicTime::from_ticks(1),
+            )
+            .expect_err("delegation at the depth limit must be rejected");
+
+        assert_eq!(error, CapabilityStateError::DelegationDepthExceeded(parent));
+        assert_eq!(state.issued_ids.len(), issued_count);
+        assert_eq!(state.capabilities.len(), capability_count);
     }
 
     // Requirement: an authorization epoch must never wrap to a stale value.

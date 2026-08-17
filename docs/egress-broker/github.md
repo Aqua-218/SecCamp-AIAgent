@@ -99,6 +99,30 @@ repository の route と branch component は、長さと文字種を検査し�
 
 `provider_response_over_budget_is_rejected_at_the_typed_boundary` があるとおり、provider の応答が session budget を超える場合は型付き境界で拒否する。budget の消費は公開 HTTPS と同じ枠で、GitHub 操作だけ無制限になることはない。
 
+## 実 GitHub の opt-in smoke
+
+実 endpoint、実 rustls client、実 credential、実 GitHub response を確認するための ignored test と gate を用意している。
+
+```bash
+scripts/ci/verify-live-github.sh
+```
+
+この gate は次の環境変数を全て要求する。不足、空値、object ID の形式不正、repository への acknowledgement 不一致は provider を呼ぶ前に exit 2 で止まる。token の値は標準出力・標準エラー・コマンドラインへ出さない。
+
+| 環境変数 | 用途 |
+|---|---|
+| `EGRESS_GITHUB_TOKEN` | host-only GitHub credential。test は `RustlsGitHubProvider::from_environment` だけで読む |
+| `EGRESS_GITHUB_INSTALLATION_ID` | exact GitHub App installation identity |
+| `EGRESS_GITHUB_DISPOSABLE_REPOSITORY` | mutation 対象の exact `owner/name` |
+| `EGRESS_GITHUB_BASE_BRANCH` / `EGRESS_GITHUB_HEAD_BRANCH` | exact base/head branch |
+| `EGRESS_GITHUB_EXPECTED_OLD_OBJECT` | `PublishBranch` の expected-old object（40/64 hex） |
+| `EGRESS_GITHUB_NEW_OBJECT` | `PublishBranch` の new object（40/64 hex） |
+| `EGRESS_GITHUB_DISPOSABLE_ACK` | `I_UNDERSTAND_DISPOSABLE_REPOSITORY:<owner/name>` の完全一致 |
+
+ignored test は guest-facing raw HTTP を使わず、`TypedGitHubAdapter<RustlsGitHubProvider, ...>` に exact request、opaque credential handle、host plan を渡す。`PublishBranch` は `force: false` と expected-old を使い、stale な expected-old なら `ProviderConflict` を型付きで確認する。expected-old が現在値なら disposable branch の更新が起こり得る。続く `CreatePullRequest` は typed success を確認し、実 pull request を作成する。
+
+GitHub API の権限と既存状態をこの repository から安全に準備・削除する経路は持たないため、自動 cleanup は行わない。operator は専用 disposable repository、既存の base/head state、既存 pull request が無いことを確認し、終了後に branch / pull request を手動で cleanup する。保護された credential と実行ログを用意してこの gate を走らせるまで、live provider は verified と扱わない。
+
 ## 何が助かるのか
 
 token の権限全体ではなく 2 操作分だけが guest に見える。新しい GitHub 操作を追加するには、authority の enum、adapter の変換、provider の実装を全部書く必要があり、設定変更では増えない。
@@ -109,10 +133,10 @@ token の権限全体ではなく 2 操作分だけが guest に見える。新�
 
 ## 正確な保証範囲
 
-`TypedGitHubAdapter` と fake provider による module test で、opaque credential、publish plan、rate-limit metadata、provider 呼び出し前の拒否、branch route の encoding、応答 budget を検証している。
+`TypedGitHubAdapter` と fake provider による module test で、opaque credential、publish plan、rate-limit metadata、provider 呼び出し前の拒否、branch route の encoding、応答 budget を検証している。credential validator の欠損 / 制御文字拒否と、provider `Debug` / typed error の token redact も local test で確認している。
 
-- 実 GitHub API と接続していない。`RustlsGitHubProvider` の実 endpoint、認証、応答形式は未検証。
-- 実環境変数と実 credential を使う test は無い。token の読み込み経路は実行していない。
+- ignored `live_github_disposable_repository_smoke` と `scripts/ci/verify-live-github.sh` は実 GitHub API、認証、応答形式、expected-old conflict、typed pull-request success を検査する。ただし、保護された disposable credential を使った実行 evidence はこの checkout には無く、live provider の status は未検証のままである。
+- 実環境変数と実 credential の読み込み経路は、必要な環境変数を揃えた opt-in gate のみが実行する。通常の local test は token を読まない。
 - expected-old object の比較は provider 側の実装に依存する。この adapter は plan の有無と形式しか見ていない。
 - GitHub 側の権限がこの authority より狭い場合、操作は API で失敗する。adapter は事前に検出しない。
 - `force: false` が実際に効くことは GitHub の API 仕様に依存する。

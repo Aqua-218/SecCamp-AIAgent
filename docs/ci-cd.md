@@ -30,6 +30,7 @@ The release boundary is deliberately limited to the artifact this repository can
 | SAST and secrets | CodeQL, Semgrep, Gitleaks | Semgrep, Gitleaks | Extended Rust data-flow analysis on GitHub, repository-specific static rules, and full-history secret detection |
 | Supply-chain posture | Weekly OpenSSF Scorecard | Administratively managed | Scheduled repository posture report on GitHub |
 | System verification | `Real Firecracker VM verification`, `Privileged runtime isolation verification` | `real_vm`, `privileged_isolation` | Scheduled only, on hosts that a shared runner pool cannot provide. See [Privileged runners](#privileged-runners) |
+| Deep correctness and performance | `Miri undefined-behaviour check`, `Sanitizer run`, `Mutation testing`, `Fuzz targets`, `Benchmark regression` | `miri`, `sanitizers`, `mutation`, `fuzz`, `benchmarks` | Scheduled nightly and on demand. Miri is restricted to pure test modules, sanitizers run the protocol test binary, mutation/fuzz selections are bounded, and the benchmark gate measures capability decisions against a committed noise-aware baseline. Privileged FUSE layers are reported separately and are not treated as a standard hosted pass |
 | Release | `Trusted Release` | tag pipeline package/verify/publish/release stages | Re-run all gates, build deterministic archive, generate SPDX SBOM and checksums, attest or sign, verify, then publish through a protected environment |
 
 GitHub exposes truthful fan-in checks named `CI complete`, `Security complete`, and `Deep verification complete`. A failed, cancelled, or skipped required dependency makes the corresponding fan-in fail. GitLab uses ordered stages and does not permit failures on any gate.
@@ -43,7 +44,7 @@ GitHub exposes truthful fan-in checks named `CI complete`, `Security complete`, 
 
 The distinction is load-bearing. Without it a gate that runs on every pipeline and a gate that exists only as an intention read identically, `check-pipeline-parity.sh` can never pass, and the claim that both platforms implement the same gates cannot be true. `plan-pipeline.sh` reports planned gates as `planned` rather than `unavailable`, because those are different statements: one says nobody has built the gate, the other says this platform cannot host a gate that does exist. `check-gate-results.sh` fails if any result is observed for a planned gate, so a job cannot appear without the manifest being promoted alongside it.
 
-Promoting a gate is one field change plus the job it now demands. 32 gates are implemented and 7 are planned; the manifest lists what each planned one is waiting for. Each of the seven needs something that does not exist yet rather than something that was skipped: a pinned nightly toolchain (`miri`, `sanitizers`), a tool nothing installs (`api_surface`, `mutation`), source that has never been written (`fuzz` has no fuzz targets, `benchmarks` has no benches and no baseline to regress against), or a decision about how much history each platform should fetch before a check can read more than the tip commit (`commit_policy`).
+Promoting a gate is one field change plus the job it now demands. The manifest now has 39 implemented gates and no planned gates. The nightly gates use one pinned toolchain, execute non-empty supported subsets, and fail closed when a selection, baseline, corpus, or tool is missing. The benchmark gate deliberately measures the pure capability decision path; `/dev/fuse` availability is printed as operational evidence rather than converted into a fake green result.
 
 No planned gate is given a job that trivially succeeds. An empty gate is worse than a missing one: it reports the same green as a real check while proving nothing, and it removes the pressure to build the thing it stands in for.
 
@@ -68,7 +69,7 @@ GitHub label names are declared in [`.github/actionlint.yaml`](../.github/action
 
 - Rust is repository-pinned by `rust-toolchain.toml`; all Cargo commands use `--locked`.
 - Lean is repository-pinned by `lean/lean-toolchain`. The elan bootstrap archive is version- and SHA-256-pinned before execution.
-- nextest, cargo-audit, cargo-deny, cargo-llvm-cov, actionlint, ShellCheck, yq, Syft, and Cosign are installed at exact versions. Downloaded standalone binaries are verified by SHA-256.
+- nextest, cargo-audit, cargo-deny, cargo-llvm-cov, cargo-public-api, cargo-mutants, cargo-fuzz, actionlint, ShellCheck, yq, Syft, and Cosign are installed at exact versions. Miri and sanitizer jobs use the separately pinned nightly toolchain. Downloaded standalone binaries are verified by SHA-256.
 - Every third-party GitHub Action reference is a full 40-character commit SHA. Every CI container is pinned by digest.
 - Cargo caches contain registries and compiled CI tools, never build outputs or release artifacts. Cache poisoning therefore cannot bypass a source rebuild.
 - Dependabot proposes weekly Cargo and GitHub Actions updates. `CODEOWNERS` requires repository-owner review for pipeline and supply-chain policy changes.
@@ -164,7 +165,7 @@ Replace the host, group, project, and tag with the values for the publishing pro
 
 ## Release invariants and recovery
 
-The release archive contains the versioned binary, the complete `AGPL-3.0-only` license text, and `BUILD-METADATA.json`. The metadata identifies the immutable source revision and gives a direct URL for downloading its corresponding source. Archive entries are sorted, ownership is normalized to root, and timestamps come from the source commit. The SPDX namespace and creation time are likewise normalized to source data. Two builds from the same commit and toolchain therefore produce identical archive and SBOM bytes.
+The release archive contains the versioned binary, the complete `AGPL-3.0-only` license text, and `BUILD-METADATA.json`. The metadata identifies the immutable source revision and gives a direct URL for downloading its corresponding source. Archive entries are sorted, ownership is normalized to root, and timestamps come from the source commit. The SPDX namespace and creation time are likewise normalized to source data. The reproducibility gate uses two empty, independent Cargo target directories and compares the archive, SPDX document, checksum manifest, and release metadata byte for byte; a cached first build therefore cannot masquerade as a rebuild.
 
 A failed package or signature job publishes nothing. A failed protected publication can be retried because both publisher scripts are idempotent. If a release asset already exists with different bytes, the job stops and requires investigation; deleting or replacing a published asset is intentionally not automated. Rollback means publishing a new patch version, not mutating an existing release.
 

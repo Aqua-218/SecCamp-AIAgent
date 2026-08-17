@@ -6,7 +6,16 @@
 //! in any broker operation. Branch publishing requires a host-supplied
 //! expected-old/new object pair and always uses a non-force update.
 
-use std::{collections::BTreeMap, error::Error, fmt, io::Read, time::Duration};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fmt,
+    fs::{self, File},
+    io::Read,
+    os::unix::fs::MetadataExt as _,
+    path::{Component, Path, PathBuf},
+    time::Duration,
+};
 
 use authority_core::github::{
     GitHubAuthority, GitHubOperation, GitHubRequest, InstallationId, github_matches,
@@ -18,6 +27,7 @@ use egress_protocol::{
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use reqwest::blocking::{Client, Response};
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 /// Hard upper bound for any provider response retained by the broker.
 pub const MAX_GITHUB_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -643,7 +653,67 @@ impl Error for GitHubAdapterError {}
 /// A production provider using Reqwest's rustls backend and fixed GitHub routes.
 pub struct RustlsGitHubProvider {
     client: Client,
-    token: String,
+    token: Zeroizing<String>,
+}
+
+fn read_systemd_credential(path: &Path) -> Result<Zeroizing<String>, GitHubProviderError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err(GitHubProviderError::Transport);
+    }
+    let parent = path.parent().ok_or(GitHubProviderError::Transport)?;
+    let mut current = PathBuf::from("/");
+    for component in parent.components().skip(1) {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|_| GitHubProviderError::Transport)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(GitHubProviderError::Transport);
+        }
+    }
+    let before = fs::symlink_metadata(path).map_err(|_| GitHubProviderError::Transport)?;
+    if before.file_type().is_symlink()
+        || !before.is_file()
+        || before.nlink() != 1
+        || before.len() == 0
+        || before.len() > 4096
+    {
+        return Err(GitHubProviderError::Transport);
+    }
+    let mut file = File::open(path).map_err(|_| GitHubProviderError::Transport)?;
+    let opened = file.metadata().map_err(|_| GitHubProviderError::Transport)?;
+    if !opened.is_file()
+        || opened.dev() != before.dev()
+        || opened.ino() != before.ino()
+        || opened.nlink() != 1
+    {
+        return Err(GitHubProviderError::Transport);
+    }
+    let mut token = Zeroizing::new(String::new());
+    file.by_ref()
+        .take(4097)
+        .read_to_string(&mut token)
+        .map_err(|_| GitHubProviderError::Transport)?;
+    if token.len() > 4096 {
+        return Err(GitHubProviderError::Transport);
+    }
+    if token.ends_with('\n') {
+        token.pop();
+        if token.ends_with('\r') {
+            token.pop();
+        }
+    }
+    let after = fs::symlink_metadata(path).map_err(|_| GitHubProviderError::Transport)?;
+    if after.file_type().is_symlink()
+        || after.dev() != opened.dev()
+        || after.ino() != opened.ino()
+        || after.len() != opened.len()
+    {
+        return Err(GitHubProviderError::Transport);
+    }
+    Ok(token)
 }
 
 impl fmt::Debug for RustlsGitHubProvider {
@@ -666,8 +736,15 @@ impl RustlsGitHubProvider {
     /// Returns [`GitHubProviderError::Transport`] if the rustls client cannot
     /// be constructed or the host-only variable is absent.
     pub fn from_environment() -> Result<Self, GitHubProviderError> {
-        let token =
-            std::env::var("EGRESS_GITHUB_TOKEN").map_err(|_| GitHubProviderError::Transport)?;
+        let token = match std::env::var("EGRESS_GITHUB_TOKEN") {
+            Ok(token) => Zeroizing::new(token),
+            Err(_) => {
+                let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+                    .map(PathBuf::from)
+                    .ok_or(GitHubProviderError::Transport)?;
+                read_systemd_credential(&directory.join("github-token"))?
+            }
+        };
         if token.is_empty()
             || token.len() > 4096
             || token.bytes().any(|byte| byte.is_ascii_control())

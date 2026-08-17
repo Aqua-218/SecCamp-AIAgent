@@ -643,15 +643,10 @@ impl SubjectControlListener {
             }
         };
         // The node exists only after bind, so its mode is narrowed before anything can connect.
-        let setup = chmodat(
-            CWD,
-            &path,
-            Mode::RUSR | Mode::WUSR,
-            AtFlags::empty(),
-        )
-        .map_err(ControlSocketError::from)
-        .and_then(|()| inspect_owned_socket(&path, parent_identity).map(|_| ()))
-        .and_then(|()| listen(&socket, backlog).map_err(ControlSocketError::from));
+        let setup = chmodat(CWD, &path, Mode::RUSR | Mode::WUSR, AtFlags::empty())
+            .map_err(ControlSocketError::from)
+            .and_then(|()| inspect_owned_socket(&path, parent_identity).map(|_| ()))
+            .and_then(|()| listen(&socket, backlog).map_err(ControlSocketError::from));
         if let Err(error) = setup {
             remove_owned_socket(&path, path_identity);
             return Err(error);

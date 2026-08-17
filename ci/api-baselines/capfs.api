@@ -1,0 +1,456 @@
+pub mod capfs
+pub mod capfs::backing
+pub enum capfs::backing::ExternalAliasPolicy
+pub capfs::backing::ExternalAliasPolicy::Materialize
+pub capfs::backing::ExternalAliasPolicy::Materialize::max_total_bytes: u64
+pub capfs::backing::ExternalAliasPolicy::Reject
+pub enum capfs::backing::RejectedObjectKind
+pub capfs::backing::RejectedObjectKind::BlockDevice
+pub capfs::backing::RejectedObjectKind::CharacterDevice
+pub capfs::backing::RejectedObjectKind::Fifo
+pub capfs::backing::RejectedObjectKind::Socket
+pub capfs::backing::RejectedObjectKind::Unknown
+impl core::fmt::Display for capfs::backing::RejectedObjectKind
+pub fn capfs::backing::RejectedObjectKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum capfs::backing::RepositoryPreflightError
+pub capfs::backing::RepositoryPreflightError::DepthLimitExceeded
+pub capfs::backing::RepositoryPreflightError::DepthLimitExceeded::limit: usize
+pub capfs::backing::RepositoryPreflightError::DepthLimitExceeded::path: authority_core::path::CanonicalPath
+pub capfs::backing::RepositoryPreflightError::EntryChangedDuringScan(authority_core::path::CanonicalPath)
+pub capfs::backing::RepositoryPreflightError::EntryLimitExceeded(core::num::nonzero::NonZeroUsize)
+pub capfs::backing::RepositoryPreflightError::EscapingSymlinkTarget
+pub capfs::backing::RepositoryPreflightError::EscapingSymlinkTarget::path: authority_core::path::CanonicalPath
+pub capfs::backing::RepositoryPreflightError::EscapingSymlinkTarget::target: alloc::string::String
+pub capfs::backing::RepositoryPreflightError::ExternalHardLink
+pub capfs::backing::RepositoryPreflightError::ExternalHardLink::inode: u64
+pub capfs::backing::RepositoryPreflightError::ExternalHardLink::link_count: u32
+pub capfs::backing::RepositoryPreflightError::ExternalHardLink::names_in_repository: alloc::vec::Vec<authority_core::path::CanonicalPath>
+pub capfs::backing::RepositoryPreflightError::InvalidCanonicalPath
+pub capfs::backing::RepositoryPreflightError::InvalidCanonicalPath::path: std::path::PathBuf
+pub capfs::backing::RepositoryPreflightError::InvalidCanonicalPath::source: authority_core::path::InvalidPathSegment
+pub capfs::backing::RepositoryPreflightError::Io
+pub capfs::backing::RepositoryPreflightError::Io::operation: &'static str
+pub capfs::backing::RepositoryPreflightError::Io::path: std::path::PathBuf
+pub capfs::backing::RepositoryPreflightError::Io::source: std::io::error::Error
+pub capfs::backing::RepositoryPreflightError::MaterializationBudgetExceeded
+pub capfs::backing::RepositoryPreflightError::MaterializationBudgetExceeded::path: authority_core::path::CanonicalPath
+pub capfs::backing::RepositoryPreflightError::MaterializationBudgetExceeded::remaining: u64
+pub capfs::backing::RepositoryPreflightError::MaterializationBudgetExceeded::required: u64
+pub capfs::backing::RepositoryPreflightError::NestedMount(authority_core::path::CanonicalPath)
+pub capfs::backing::RepositoryPreflightError::NonUtf8Name
+pub capfs::backing::RepositoryPreflightError::NonUtf8Name::name: std::ffi::os_str::OsString
+pub capfs::backing::RepositoryPreflightError::NonUtf8Name::parent: authority_core::path::CanonicalPath
+pub capfs::backing::RepositoryPreflightError::NonUtf8SymlinkTarget
+pub capfs::backing::RepositoryPreflightError::NonUtf8SymlinkTarget::path: authority_core::path::CanonicalPath
+pub capfs::backing::RepositoryPreflightError::NonUtf8SymlinkTarget::target: std::ffi::os_str::OsString
+pub capfs::backing::RepositoryPreflightError::RequiredMetadataUnavailable
+pub capfs::backing::RepositoryPreflightError::RequiredMetadataUnavailable::field: &'static str
+pub capfs::backing::RepositoryPreflightError::RequiredMetadataUnavailable::path: std::path::PathBuf
+pub capfs::backing::RepositoryPreflightError::RootChangedDuringOpen(std::path::PathBuf)
+pub capfs::backing::RepositoryPreflightError::RootNotDirectory(std::path::PathBuf)
+pub capfs::backing::RepositoryPreflightError::UnsupportedObject
+pub capfs::backing::RepositoryPreflightError::UnsupportedObject::kind: capfs::backing::RejectedObjectKind
+pub capfs::backing::RepositoryPreflightError::UnsupportedObject::path: authority_core::path::CanonicalPath
+pub capfs::backing::RepositoryPreflightError::UnsupportedSymlinkTarget
+pub capfs::backing::RepositoryPreflightError::UnsupportedSymlinkTarget::path: authority_core::path::CanonicalPath
+pub capfs::backing::RepositoryPreflightError::UnsupportedSymlinkTarget::source: capfs::namespace::InvalidSymlinkTarget
+impl core::convert::From<capfs::backing::RepositoryPreflightError> for capfs::backing::RepositoryStartupError
+pub fn capfs::backing::RepositoryStartupError::from(capfs::backing::RepositoryPreflightError) -> Self
+impl core::error::Error for capfs::backing::RepositoryPreflightError
+pub fn capfs::backing::RepositoryPreflightError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for capfs::backing::RepositoryPreflightError
+pub fn capfs::backing::RepositoryPreflightError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum capfs::backing::RepositoryStartupError
+pub capfs::backing::RepositoryStartupError::AlreadyOpen
+pub capfs::backing::RepositoryStartupError::AlreadyOpen::repository: authority_core::repository::RepoId
+pub capfs::backing::RepositoryStartupError::AlreadyOpen::root: std::path::PathBuf
+pub capfs::backing::RepositoryStartupError::LeaseRegistryUnavailable
+pub capfs::backing::RepositoryStartupError::Namespace(capfs::namespace::NamespaceError)
+pub capfs::backing::RepositoryStartupError::Preflight(capfs::backing::RepositoryPreflightError)
+impl core::convert::From<capfs::backing::RepositoryPreflightError> for capfs::backing::RepositoryStartupError
+pub fn capfs::backing::RepositoryStartupError::from(capfs::backing::RepositoryPreflightError) -> Self
+impl core::convert::From<capfs::namespace::NamespaceError> for capfs::backing::RepositoryStartupError
+pub fn capfs::backing::RepositoryStartupError::from(capfs::namespace::NamespaceError) -> Self
+impl core::error::Error for capfs::backing::RepositoryStartupError
+pub fn capfs::backing::RepositoryStartupError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for capfs::backing::RepositoryStartupError
+pub fn capfs::backing::RepositoryStartupError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct capfs::backing::ImportedRepository
+impl capfs::backing::ImportedRepository
+pub fn capfs::backing::ImportedRepository::backing(&self) -> &capfs::backing::ValidatedRepository
+pub fn capfs::backing::ImportedRepository::from_validated(authority_core::repository::RepoId, capfs::backing::ValidatedRepository) -> core::result::Result<Self, capfs::backing::RepositoryStartupError>
+pub fn capfs::backing::ImportedRepository::into_parts(self) -> (authority_core::repository::RepoId, alloc::sync::Arc<capfs::backing::ValidatedRepository>, alloc::sync::Arc<capfs::namespace::NamespaceRegistry>)
+pub fn capfs::backing::ImportedRepository::namespace(&self) -> &capfs::namespace::NamespaceRegistry
+pub fn capfs::backing::ImportedRepository::open(authority_core::repository::RepoId, impl core::convert::AsRef<std::path::Path>, capfs::backing::PreflightLimits) -> core::result::Result<Self, capfs::backing::RepositoryStartupError>
+pub const fn capfs::backing::ImportedRepository::repository(&self) -> &authority_core::repository::RepoId
+pub struct capfs::backing::MaterializedAlias
+impl capfs::backing::MaterializedAlias
+pub const fn capfs::backing::MaterializedAlias::additional_names(&self) -> usize
+pub const fn capfs::backing::MaterializedAlias::bytes(&self) -> u64
+pub const fn capfs::backing::MaterializedAlias::path(&self) -> &authority_core::path::CanonicalPath
+pub struct capfs::backing::PreflightLimits
+impl capfs::backing::PreflightLimits
+pub const fn capfs::backing::PreflightLimits::external_aliases(self) -> capfs::backing::ExternalAliasPolicy
+pub const fn capfs::backing::PreflightLimits::max_depth(self) -> usize
+pub const fn capfs::backing::PreflightLimits::max_entries(self) -> core::num::nonzero::NonZeroUsize
+pub const fn capfs::backing::PreflightLimits::new(core::num::nonzero::NonZeroUsize, usize) -> Self
+pub const fn capfs::backing::PreflightLimits::rejecting_external_aliases(self) -> Self
+pub const fn capfs::backing::PreflightLimits::with_external_alias_bytes(self, u64) -> Self
+pub struct capfs::backing::RepositoryEntry
+impl capfs::backing::RepositoryEntry
+pub const fn capfs::backing::RepositoryEntry::inode(&self) -> u64
+pub const fn capfs::backing::RepositoryEntry::kind(&self) -> capfs::namespace::NamespaceObjectKind
+pub const fn capfs::backing::RepositoryEntry::path(&self) -> &authority_core::path::CanonicalPath
+pub const fn capfs::backing::RepositoryEntry::spec(&self) -> &capfs::namespace::NamespaceObjectSpec
+pub struct capfs::backing::ValidatedRepository
+impl capfs::backing::ValidatedRepository
+pub fn capfs::backing::ValidatedRepository::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
+pub fn capfs::backing::ValidatedRepository::canonical_root(&self) -> &std::path::Path
+pub const fn capfs::backing::ValidatedRepository::entries(&self) -> &[capfs::backing::RepositoryEntry]
+pub fn capfs::backing::ValidatedRepository::materialized_aliases(&self) -> &[capfs::backing::MaterializedAlias]
+pub fn capfs::backing::ValidatedRepository::open(impl core::convert::AsRef<std::path::Path>, capfs::backing::PreflightLimits) -> core::result::Result<Self, capfs::backing::RepositoryPreflightError>
+pub const fn capfs::backing::ValidatedRepository::root_mount_id(&self) -> u64
+pub const capfs::backing::DEFAULT_MATERIALIZED_ALIAS_BYTES: u64
+pub mod capfs::filesystem
+pub enum capfs::filesystem::CapabilityFilesystemError
+pub capfs::filesystem::CapabilityFilesystemError::MissingNamespaceRoot
+pub capfs::filesystem::CapabilityFilesystemError::Namespace(capfs::namespace::NamespaceError)
+pub capfs::filesystem::CapabilityFilesystemError::RepositoryMismatch
+pub capfs::filesystem::CapabilityFilesystemError::RepositoryMismatch::authority: authority_core::repository::RepoId
+pub capfs::filesystem::CapabilityFilesystemError::RepositoryMismatch::imported: authority_core::repository::RepoId
+impl core::convert::From<capfs::namespace::NamespaceError> for capfs::read_only::CapabilityFilesystemError
+pub fn capfs::read_only::CapabilityFilesystemError::from(capfs::namespace::NamespaceError) -> Self
+impl core::error::Error for capfs::read_only::CapabilityFilesystemError
+pub fn capfs::read_only::CapabilityFilesystemError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for capfs::read_only::CapabilityFilesystemError
+pub fn capfs::read_only::CapabilityFilesystemError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct capfs::filesystem::CapabilityFilesystem
+impl capfs::read_only::CapabilityFilesystem
+pub fn capfs::read_only::CapabilityFilesystem::new(capfs::backing::ImportedRepository, alloc::sync::Arc<authority_core::kernel::CapabilityKernel>, capfs::read_only::MountAuthority, alloc::sync::Arc<dyn capfs::read_only::AuthorizationClock>) -> core::result::Result<Self, capfs::read_only::CapabilityFilesystemError>
+impl core::fmt::Debug for capfs::read_only::CapabilityFilesystem
+pub fn capfs::read_only::CapabilityFilesystem::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl fuser::Filesystem for capfs::read_only::CapabilityFilesystem
+pub fn capfs::read_only::CapabilityFilesystem::create(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, u32, u32, i32, fuser::reply::ReplyCreate)
+pub fn capfs::read_only::CapabilityFilesystem::destroy(&mut self)
+pub fn capfs::read_only::CapabilityFilesystem::forget(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, u64)
+pub fn capfs::read_only::CapabilityFilesystem::getattr(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, core::option::Option<fuser::ll::request::FileHandle>, fuser::reply::ReplyAttr)
+pub fn capfs::read_only::CapabilityFilesystem::init(&mut self, &fuser::request_param::Request, &mut fuser::KernelConfig) -> std::io::error::Result<()>
+pub fn capfs::read_only::CapabilityFilesystem::link(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::reply::ReplyEntry)
+pub fn capfs::read_only::CapabilityFilesystem::lookup(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::reply::ReplyEntry)
+pub fn capfs::read_only::CapabilityFilesystem::mkdir(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, u32, u32, fuser::reply::ReplyEntry)
+pub fn capfs::read_only::CapabilityFilesystem::mknod(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, u32, u32, u32, fuser::reply::ReplyEntry)
+pub fn capfs::read_only::CapabilityFilesystem::open(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::open_flags::OpenFlags, fuser::reply::ReplyOpen)
+pub fn capfs::read_only::CapabilityFilesystem::opendir(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::open_flags::OpenFlags, fuser::reply::ReplyOpen)
+pub fn capfs::read_only::CapabilityFilesystem::read(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::FileHandle, u64, u32, fuser::open_flags::OpenFlags, core::option::Option<fuser::ll::request::LockOwner>, fuser::reply::ReplyData)
+pub fn capfs::read_only::CapabilityFilesystem::readdir(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::FileHandle, u64, fuser::reply::ReplyDirectory)
+pub fn capfs::read_only::CapabilityFilesystem::readlink(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::reply::ReplyData)
+pub fn capfs::read_only::CapabilityFilesystem::release(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::FileHandle, fuser::open_flags::OpenFlags, core::option::Option<fuser::ll::request::LockOwner>, bool, fuser::reply::ReplyEmpty)
+pub fn capfs::read_only::CapabilityFilesystem::releasedir(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::FileHandle, fuser::open_flags::OpenFlags, fuser::reply::ReplyEmpty)
+pub fn capfs::read_only::CapabilityFilesystem::rename(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::rename_flags::RenameFlags, fuser::reply::ReplyEmpty)
+pub fn capfs::read_only::CapabilityFilesystem::rmdir(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::reply::ReplyEmpty)
+pub fn capfs::read_only::CapabilityFilesystem::setattr(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, core::option::Option<u32>, core::option::Option<u32>, core::option::Option<u32>, core::option::Option<u64>, core::option::Option<fuser::ll::TimeOrNow>, core::option::Option<fuser::ll::TimeOrNow>, core::option::Option<std::time::SystemTime>, core::option::Option<fuser::ll::request::FileHandle>, core::option::Option<std::time::SystemTime>, core::option::Option<std::time::SystemTime>, core::option::Option<std::time::SystemTime>, core::option::Option<fuser::bsd_file_flags::BsdFileFlags>, fuser::reply::ReplyAttr)
+pub fn capfs::read_only::CapabilityFilesystem::symlink(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, &std::path::Path, fuser::reply::ReplyEntry)
+pub fn capfs::read_only::CapabilityFilesystem::unlink(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::reply::ReplyEmpty)
+pub fn capfs::read_only::CapabilityFilesystem::write(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::FileHandle, u64, &[u8], fuser::ll::flags::write_flags::WriteFlags, fuser::open_flags::OpenFlags, core::option::Option<fuser::ll::request::LockOwner>, fuser::reply::ReplyWrite)
+pub struct capfs::filesystem::MountAuthority
+impl capfs::read_only::MountAuthority
+pub const fn capfs::read_only::MountAuthority::capability(&self) -> &authority_core::capability::CapId
+pub const fn capfs::read_only::MountAuthority::mount(&self) -> &capfs::read_only::MountInstanceId
+pub const fn capfs::read_only::MountAuthority::new(capfs::read_only::MountInstanceId, authority_core::capability::SubjectId, authority_core::capability::CapId, authority_core::repository::RepoId) -> Self
+pub const fn capfs::read_only::MountAuthority::repository(&self) -> &authority_core::repository::RepoId
+pub const fn capfs::read_only::MountAuthority::subject(&self) -> &authority_core::capability::SubjectId
+pub struct capfs::filesystem::MountInstanceId(_)
+impl capfs::read_only::MountInstanceId
+pub fn capfs::read_only::MountInstanceId::as_str(&self) -> &str
+pub fn capfs::read_only::MountInstanceId::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::fmt::Display for capfs::read_only::MountInstanceId
+pub fn capfs::read_only::MountInstanceId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub trait capfs::filesystem::AuthorizationClock: core::marker::Send + core::marker::Sync + 'static
+pub fn capfs::filesystem::AuthorizationClock::now(&self) -> authority_core::time::MonotonicTime
+impl capfs::read_only::AuthorizationClock for authority_core::time::MonotonicTime
+pub fn authority_core::time::MonotonicTime::now(&self) -> authority_core::time::MonotonicTime
+pub fn capfs::filesystem::mount_config() -> fuser::mnt::mount_options::Config
+pub fn capfs::filesystem::spawn_mount(capfs::read_only::CapabilityFilesystem, impl core::convert::AsRef<std::path::Path>) -> std::io::error::Result<fuser::session::BackgroundSession>
+pub mod capfs::namespace
+pub enum capfs::namespace::InvalidSymlinkTargetReason
+pub capfs::namespace::InvalidSymlinkTargetReason::Absolute
+pub capfs::namespace::InvalidSymlinkTargetReason::ContainsNul
+pub capfs::namespace::InvalidSymlinkTargetReason::Empty
+pub capfs::namespace::InvalidSymlinkTargetReason::InteriorParent
+pub capfs::namespace::InvalidSymlinkTargetReason::InvalidSegment(authority_core::path::InvalidPathSegment)
+pub capfs::namespace::InvalidSymlinkTargetReason::TooLong
+impl core::fmt::Display for capfs::namespace::InvalidSymlinkTargetReason
+pub fn capfs::namespace::InvalidSymlinkTargetReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum capfs::namespace::NamespaceError
+pub capfs::namespace::NamespaceError::AmbiguousObjectPath(authority_core::handle::ObjectId)
+pub capfs::namespace::NamespaceError::CannotAliasKind
+pub capfs::namespace::NamespaceError::CannotAliasKind::kind: capfs::namespace::NamespaceObjectKind
+pub capfs::namespace::NamespaceError::CannotAliasKind::object: authority_core::handle::ObjectId
+pub capfs::namespace::NamespaceError::CannotModifyRoot
+pub capfs::namespace::NamespaceError::DestinationInsideSource
+pub capfs::namespace::NamespaceError::DirectoryGenerationChanged
+pub capfs::namespace::NamespaceError::DirectoryGenerationChanged::actual: capfs::namespace::NamespaceGeneration
+pub capfs::namespace::NamespaceError::DirectoryGenerationChanged::expected: capfs::namespace::NamespaceGeneration
+pub capfs::namespace::NamespaceError::DirectoryNotEmpty(authority_core::handle::ObjectId)
+pub capfs::namespace::NamespaceError::InconsistentAliasGroup(authority_core::path::CanonicalPath)
+pub capfs::namespace::NamespaceError::InvalidChildName(authority_core::path::InvalidPathSegment)
+pub capfs::namespace::NamespaceError::InvalidManifestRoot
+pub capfs::namespace::NamespaceError::InvalidSymlinkTarget(capfs::namespace::InvalidSymlinkTarget)
+pub capfs::namespace::NamespaceError::InvariantViolation
+pub capfs::namespace::NamespaceError::LockPoisoned
+pub capfs::namespace::NamespaceError::MissingParent(authority_core::path::CanonicalPath)
+pub capfs::namespace::NamespaceError::NamespaceGenerationExhausted
+pub capfs::namespace::NamespaceError::NoOpenHandle(authority_core::handle::ObjectId)
+pub capfs::namespace::NamespaceError::ObjectIdExhausted
+pub capfs::namespace::NamespaceError::OpenHandleCountExhausted(authority_core::handle::ObjectId)
+pub capfs::namespace::NamespaceError::OpenHandleInSubtree(authority_core::handle::ObjectId)
+pub capfs::namespace::NamespaceError::ParentNotDirectory(authority_core::path::CanonicalPath)
+pub capfs::namespace::NamespaceError::PathOccupied(authority_core::path::CanonicalPath)
+pub capfs::namespace::NamespaceError::RepositoryInDoubt
+pub capfs::namespace::NamespaceError::SymlinkTargetEscapes(capfs::namespace::SymlinkTargetEscape)
+pub capfs::namespace::NamespaceError::UnknownObject(authority_core::handle::ObjectId)
+pub capfs::namespace::NamespaceError::UnknownPath(authority_core::path::CanonicalPath)
+impl core::convert::From<capfs::namespace::InvalidSymlinkTarget> for capfs::namespace::NamespaceError
+pub fn capfs::namespace::NamespaceError::from(capfs::namespace::InvalidSymlinkTarget) -> Self
+impl core::convert::From<capfs::namespace::NamespaceError> for capfs::backing::RepositoryStartupError
+pub fn capfs::backing::RepositoryStartupError::from(capfs::namespace::NamespaceError) -> Self
+impl core::convert::From<capfs::namespace::NamespaceError> for capfs::read_only::CapabilityFilesystemError
+pub fn capfs::read_only::CapabilityFilesystemError::from(capfs::namespace::NamespaceError) -> Self
+impl core::convert::From<capfs::namespace::SymlinkTargetEscape> for capfs::namespace::NamespaceError
+pub fn capfs::namespace::NamespaceError::from(capfs::namespace::SymlinkTargetEscape) -> Self
+impl core::error::Error for capfs::namespace::NamespaceError
+pub fn capfs::namespace::NamespaceError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for capfs::namespace::NamespaceError
+pub fn capfs::namespace::NamespaceError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<E> core::convert::From<capfs::namespace::NamespaceError> for capfs::namespace::NamespaceOperationError<E>
+pub fn capfs::namespace::NamespaceOperationError<E>::from(capfs::namespace::NamespaceError) -> Self
+pub enum capfs::namespace::NamespaceExecutorOutcome<T, E>
+pub capfs::namespace::NamespaceExecutorOutcome::Committed(T)
+pub capfs::namespace::NamespaceExecutorOutcome::CommittedWithError(E)
+pub capfs::namespace::NamespaceExecutorOutcome::FailedBeforeCommit(E)
+impl<T, E> core::convert::From<core::result::Result<T, E>> for capfs::namespace::NamespaceExecutorOutcome<T, E>
+pub fn capfs::namespace::NamespaceExecutorOutcome<T, E>::from(core::result::Result<T, E>) -> Self
+pub enum capfs::namespace::NamespaceObjectKind
+pub capfs::namespace::NamespaceObjectKind::Directory
+pub capfs::namespace::NamespaceObjectKind::RegularFile
+pub capfs::namespace::NamespaceObjectKind::Symlink
+pub enum capfs::namespace::NamespaceObjectSpec
+pub capfs::namespace::NamespaceObjectSpec::Directory
+pub capfs::namespace::NamespaceObjectSpec::RegularFile
+pub capfs::namespace::NamespaceObjectSpec::Symlink(capfs::namespace::SymlinkTarget)
+impl capfs::namespace::NamespaceObjectSpec
+pub const fn capfs::namespace::NamespaceObjectSpec::kind(&self) -> capfs::namespace::NamespaceObjectKind
+pub const fn capfs::namespace::NamespaceObjectSpec::target(&self) -> core::option::Option<&capfs::namespace::SymlinkTarget>
+pub enum capfs::namespace::NamespaceOperationError<E>
+pub capfs::namespace::NamespaceOperationError::Executor(E)
+pub capfs::namespace::NamespaceOperationError::Namespace(capfs::namespace::NamespaceError)
+impl<E: core::error::Error + 'static> core::error::Error for capfs::namespace::NamespaceOperationError<E>
+pub fn capfs::namespace::NamespaceOperationError<E>::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl<E: core::fmt::Display> core::fmt::Display for capfs::namespace::NamespaceOperationError<E>
+pub fn capfs::namespace::NamespaceOperationError<E>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<E> core::convert::From<capfs::namespace::NamespaceError> for capfs::namespace::NamespaceOperationError<E>
+pub fn capfs::namespace::NamespaceOperationError<E>::from(capfs::namespace::NamespaceError) -> Self
+pub struct capfs::namespace::AliasGroup(_)
+impl capfs::namespace::AliasGroup
+pub const fn capfs::namespace::AliasGroup::new(u64) -> Self
+pub struct capfs::namespace::InvalidSymlinkTarget
+impl capfs::namespace::InvalidSymlinkTarget
+pub fn capfs::namespace::InvalidSymlinkTarget::literal(&self) -> &str
+pub const fn capfs::namespace::InvalidSymlinkTarget::reason(&self) -> capfs::namespace::InvalidSymlinkTargetReason
+impl core::convert::From<capfs::namespace::InvalidSymlinkTarget> for capfs::namespace::NamespaceError
+pub fn capfs::namespace::NamespaceError::from(capfs::namespace::InvalidSymlinkTarget) -> Self
+impl core::error::Error for capfs::namespace::InvalidSymlinkTarget
+pub fn capfs::namespace::InvalidSymlinkTarget::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for capfs::namespace::InvalidSymlinkTarget
+pub fn capfs::namespace::InvalidSymlinkTarget::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct capfs::namespace::ManifestEntry
+impl capfs::namespace::ManifestEntry
+pub const fn capfs::namespace::ManifestEntry::new(authority_core::path::CanonicalPath, capfs::namespace::NamespaceObjectSpec, capfs::namespace::AliasGroup) -> Self
+pub const fn capfs::namespace::ManifestEntry::path(&self) -> &authority_core::path::CanonicalPath
+pub const fn capfs::namespace::ManifestEntry::spec(&self) -> &capfs::namespace::NamespaceObjectSpec
+pub struct capfs::namespace::NamespaceChild<'a>
+impl<'a> capfs::namespace::NamespaceChild<'a>
+pub fn capfs::namespace::NamespaceChild<'a>::name(&self) -> core::option::Option<&'a str>
+pub const fn capfs::namespace::NamespaceChild<'a>::object(&self) -> &'a capfs::namespace::NamespaceObject
+pub const fn capfs::namespace::NamespaceChild<'a>::path(&self) -> &'a authority_core::path::CanonicalPath
+pub struct capfs::namespace::NamespaceGeneration(_)
+impl capfs::namespace::NamespaceGeneration
+pub const fn capfs::namespace::NamespaceGeneration::as_u64(self) -> u64
+pub const fn capfs::namespace::NamespaceGeneration::initial() -> Self
+pub struct capfs::namespace::NamespaceMove
+impl capfs::namespace::NamespaceMove
+pub const fn capfs::namespace::NamespaceMove::destination(&self) -> &authority_core::path::CanonicalPath
+pub const fn capfs::namespace::NamespaceMove::expected_link_count(&self) -> usize
+pub const fn capfs::namespace::NamespaceMove::kind(&self) -> capfs::namespace::NamespaceObjectKind
+pub const fn capfs::namespace::NamespaceMove::object(&self) -> &authority_core::handle::ObjectId
+pub const fn capfs::namespace::NamespaceMove::source(&self) -> &authority_core::path::CanonicalPath
+pub struct capfs::namespace::NamespaceObject
+impl capfs::namespace::NamespaceObject
+pub const fn capfs::namespace::NamespaceObject::expected_link_count(&self) -> usize
+pub const fn capfs::namespace::NamespaceObject::id(&self) -> &authority_core::handle::ObjectId
+pub const fn capfs::namespace::NamespaceObject::is_aliased(&self) -> bool
+pub const fn capfs::namespace::NamespaceObject::kind(&self) -> capfs::namespace::NamespaceObjectKind
+pub const fn capfs::namespace::NamespaceObject::link_target(&self) -> core::option::Option<&capfs::namespace::SymlinkTarget>
+pub const fn capfs::namespace::NamespaceObject::open_handle_count(&self) -> u64
+pub fn capfs::namespace::NamespaceObject::paths(&self) -> impl core::iter::traits::iterator::Iterator<Item = &authority_core::path::CanonicalPath> + core::clone::Clone
+pub const fn capfs::namespace::NamespaceObject::primary_path(&self) -> &authority_core::path::CanonicalPath
+pub struct capfs::namespace::NamespaceObjectCreation<T>
+impl<T> capfs::namespace::NamespaceObjectCreation<T>
+pub fn capfs::namespace::NamespaceObjectCreation<T>::into_parts(self) -> (authority_core::handle::ObjectId, T)
+pub const fn capfs::namespace::NamespaceObjectCreation<T>::object(&self) -> &authority_core::handle::ObjectId
+pub const fn capfs::namespace::NamespaceObjectCreation<T>::value(&self) -> &T
+pub struct capfs::namespace::NamespaceRegistry
+impl capfs::namespace::NamespaceRegistry
+pub fn capfs::namespace::NamespaceRegistry::close_object<T, E>(&self, &authority_core::handle::ObjectId, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject) -> core::result::Result<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::create_child<T, E>(&self, &authority_core::handle::ObjectId, &str, capfs::namespace::NamespaceObjectSpec, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject, &capfs::namespace::NamespaceObject) -> core::result::Result<T, E>) -> core::result::Result<capfs::namespace::NamespaceObjectCreation<T>, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::create_child_with_commit_outcome<T, E>(&self, &authority_core::handle::ObjectId, &str, capfs::namespace::NamespaceObjectSpec, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject, &capfs::namespace::NamespaceObject) -> capfs::namespace::NamespaceExecutorOutcome<T, E>) -> core::result::Result<capfs::namespace::NamespaceObjectCreation<T>, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::create_object<T, E>(&self, authority_core::path::CanonicalPath, capfs::namespace::NamespaceObjectSpec, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject) -> core::result::Result<T, E>) -> core::result::Result<capfs::namespace::NamespaceObjectCreation<T>, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::create_object_with_commit_outcome<T, E>(&self, authority_core::path::CanonicalPath, capfs::namespace::NamespaceObjectSpec, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject) -> capfs::namespace::NamespaceExecutorOutcome<T, E>) -> core::result::Result<capfs::namespace::NamespaceObjectCreation<T>, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::create_open_child<T, E>(&self, &authority_core::handle::ObjectId, &str, capfs::namespace::NamespaceObjectSpec, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject, &capfs::namespace::NamespaceObject) -> core::result::Result<T, E>) -> core::result::Result<capfs::namespace::NamespaceObjectCreation<T>, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::create_open_child_with_commit_outcome<T, E>(&self, &authority_core::handle::ObjectId, &str, capfs::namespace::NamespaceObjectSpec, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject, &capfs::namespace::NamespaceObject) -> capfs::namespace::NamespaceExecutorOutcome<T, E>) -> core::result::Result<capfs::namespace::NamespaceObjectCreation<T>, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::generation(&self) -> core::result::Result<capfs::namespace::NamespaceGeneration, capfs::namespace::NamespaceError>
+pub fn capfs::namespace::NamespaceRegistry::is_in_doubt(&self) -> bool
+pub fn capfs::namespace::NamespaceRegistry::link_child<T, E>(&self, &authority_core::handle::ObjectId, &str, &authority_core::handle::ObjectId, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject, &capfs::namespace::NamespaceObject, &authority_core::path::CanonicalPath) -> core::result::Result<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::link_child_with_commit_outcome<T, E>(&self, &authority_core::handle::ObjectId, &str, &authority_core::handle::ObjectId, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject, &capfs::namespace::NamespaceObject, &authority_core::path::CanonicalPath) -> capfs::namespace::NamespaceExecutorOutcome<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::new() -> Self
+pub fn capfs::namespace::NamespaceRegistry::object_at_path_snapshot(&self, &authority_core::path::CanonicalPath) -> core::result::Result<core::option::Option<capfs::namespace::NamespaceObject>, capfs::namespace::NamespaceError>
+pub fn capfs::namespace::NamespaceRegistry::object_count(&self) -> core::result::Result<usize, capfs::namespace::NamespaceError>
+pub fn capfs::namespace::NamespaceRegistry::object_snapshot(&self, &authority_core::handle::ObjectId) -> core::result::Result<core::option::Option<capfs::namespace::NamespaceObject>, capfs::namespace::NamespaceError>
+pub fn capfs::namespace::NamespaceRegistry::open_object<T, E>(&self, &authority_core::handle::ObjectId, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject) -> core::result::Result<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::open_object_with_commit_outcome<T, E>(&self, &authority_core::handle::ObjectId, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject) -> capfs::namespace::NamespaceExecutorOutcome<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::remove_child<T, E>(&self, &authority_core::handle::ObjectId, &str, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject, &capfs::namespace::NamespaceObject, &authority_core::path::CanonicalPath) -> core::result::Result<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::remove_child_with_commit_outcome<T, E>(&self, &authority_core::handle::ObjectId, &str, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject, &capfs::namespace::NamespaceObject, &authority_core::path::CanonicalPath) -> capfs::namespace::NamespaceExecutorOutcome<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::remove_object<T, E>(&self, &authority_core::handle::ObjectId, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject) -> core::result::Result<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::remove_object_with_commit_outcome<T, E>(&self, &authority_core::handle::ObjectId, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject) -> capfs::namespace::NamespaceExecutorOutcome<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::rename_child<T, E>(&self, &authority_core::handle::ObjectId, &str, &authority_core::handle::ObjectId, &str, impl core::ops::function::FnOnce(&capfs::namespace::RenamePlan) -> core::result::Result<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::rename_child_with_commit_outcome<T, E>(&self, &authority_core::handle::ObjectId, &str, &authority_core::handle::ObjectId, &str, impl core::ops::function::FnOnce(&capfs::namespace::RenamePlan) -> capfs::namespace::NamespaceExecutorOutcome<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::rename_subtree<T, E>(&self, &authority_core::path::CanonicalPath, authority_core::path::CanonicalPath, impl core::ops::function::FnOnce(&capfs::namespace::RenamePlan) -> core::result::Result<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::rename_subtree_with_commit_outcome<T, E>(&self, &authority_core::path::CanonicalPath, authority_core::path::CanonicalPath, impl core::ops::function::FnOnce(&capfs::namespace::RenamePlan) -> capfs::namespace::NamespaceExecutorOutcome<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::with_child<T, E>(&self, &authority_core::handle::ObjectId, &str, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject) -> core::result::Result<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::with_directory_children<T, E>(&self, &authority_core::handle::ObjectId, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject, &capfs::namespace::NamespaceObject, &[capfs::namespace::NamespaceChild<'_>]) -> core::result::Result<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::with_directory_children_at_generation<T, E>(&self, &authority_core::handle::ObjectId, capfs::namespace::NamespaceGeneration, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject, &capfs::namespace::NamespaceObject, &[capfs::namespace::NamespaceChild<'_>]) -> core::result::Result<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+pub fn capfs::namespace::NamespaceRegistry::with_object<T, E>(&self, &authority_core::handle::ObjectId, impl core::ops::function::FnOnce(&capfs::namespace::NamespaceObject) -> core::result::Result<T, E>) -> core::result::Result<T, capfs::namespace::NamespaceOperationError<E>>
+impl core::default::Default for capfs::namespace::NamespaceRegistry
+pub fn capfs::namespace::NamespaceRegistry::default() -> Self
+pub struct capfs::namespace::RenamePlan
+impl capfs::namespace::RenamePlan
+pub const fn capfs::namespace::RenamePlan::destination(&self) -> &authority_core::path::CanonicalPath
+pub const fn capfs::namespace::RenamePlan::moved_objects(&self) -> &[capfs::namespace::NamespaceMove]
+pub const fn capfs::namespace::RenamePlan::source(&self) -> &authority_core::path::CanonicalPath
+pub struct capfs::namespace::SymlinkTarget
+impl capfs::namespace::SymlinkTarget
+pub fn capfs::namespace::SymlinkTarget::as_str(&self) -> &str
+pub fn capfs::namespace::SymlinkTarget::new(impl core::convert::Into<alloc::string::String>) -> core::result::Result<Self, capfs::namespace::InvalidSymlinkTarget>
+pub const fn capfs::namespace::SymlinkTarget::parent_count(&self) -> usize
+pub fn capfs::namespace::SymlinkTarget::resolve_from(&self, &authority_core::path::CanonicalPath) -> core::result::Result<authority_core::path::CanonicalPath, capfs::namespace::SymlinkTargetEscape>
+pub struct capfs::namespace::SymlinkTargetEscape
+impl capfs::namespace::SymlinkTargetEscape
+pub const fn capfs::namespace::SymlinkTargetEscape::link(&self) -> &authority_core::path::CanonicalPath
+pub fn capfs::namespace::SymlinkTargetEscape::target(&self) -> &str
+impl core::convert::From<capfs::namespace::SymlinkTargetEscape> for capfs::namespace::NamespaceError
+pub fn capfs::namespace::NamespaceError::from(capfs::namespace::SymlinkTargetEscape) -> Self
+impl core::error::Error for capfs::namespace::SymlinkTargetEscape
+impl core::fmt::Display for capfs::namespace::SymlinkTargetEscape
+pub fn capfs::namespace::SymlinkTargetEscape::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub const capfs::namespace::MAX_SYMLINK_TARGET_BYTES: usize
+pub mod capfs::node
+pub enum capfs::node::ForgetOutcome
+pub capfs::node::ForgetOutcome::Removed(authority_core::handle::ObjectId)
+pub capfs::node::ForgetOutcome::Retained(capfs::node::NodeBinding)
+pub enum capfs::node::NodeTableError
+pub capfs::node::NodeTableError::CannotForgetRoot
+pub capfs::node::NodeTableError::ForgetCountExceedsLookupCount
+pub capfs::node::NodeTableError::ForgetCountExceedsLookupCount::current: u64
+pub capfs::node::NodeTableError::ForgetCountExceedsLookupCount::node: capfs::node::NodeId
+pub capfs::node::NodeTableError::ForgetCountExceedsLookupCount::requested: u64
+pub capfs::node::NodeTableError::InvariantViolation
+pub capfs::node::NodeTableError::LockPoisoned
+pub capfs::node::NodeTableError::LookupCountExhausted(capfs::node::NodeId)
+pub capfs::node::NodeTableError::NodeIdExhausted
+pub capfs::node::NodeTableError::UnknownNode(capfs::node::NodeId)
+impl core::error::Error for capfs::node::NodeTableError
+impl core::fmt::Display for capfs::node::NodeTableError
+pub fn capfs::node::NodeTableError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct capfs::node::NodeBinding
+impl capfs::node::NodeBinding
+pub const fn capfs::node::NodeBinding::lookup_count(&self) -> u64
+pub const fn capfs::node::NodeBinding::node(&self) -> capfs::node::NodeId
+pub const fn capfs::node::NodeBinding::object(&self) -> &authority_core::handle::ObjectId
+pub struct capfs::node::NodeId(_)
+impl capfs::node::NodeId
+pub const capfs::node::NodeId::ROOT: Self
+pub const fn capfs::node::NodeId::as_u64(self) -> u64
+pub const fn capfs::node::NodeId::new(u64) -> core::option::Option<Self>
+impl core::fmt::Display for capfs::node::NodeId
+pub fn capfs::node::NodeId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct capfs::node::NodeTable
+impl capfs::node::NodeTable
+pub fn capfs::node::NodeTable::binding(&self, capfs::node::NodeId) -> core::result::Result<capfs::node::NodeBinding, capfs::node::NodeTableError>
+pub fn capfs::node::NodeTable::forget(&self, capfs::node::NodeId, core::num::nonzero::NonZeroU64) -> core::result::Result<capfs::node::ForgetOutcome, capfs::node::NodeTableError>
+pub fn capfs::node::NodeTable::live_nodes(&self) -> core::result::Result<alloc::vec::Vec<capfs::node::NodeId>, capfs::node::NodeTableError>
+pub fn capfs::node::NodeTable::new(authority_core::capability::SubjectId, authority_core::handle::ObjectId) -> Self
+pub fn capfs::node::NodeTable::node_count(&self) -> core::result::Result<usize, capfs::node::NodeTableError>
+pub fn capfs::node::NodeTable::node_for_object(&self, &authority_core::handle::ObjectId) -> core::result::Result<core::option::Option<capfs::node::NodeId>, capfs::node::NodeTableError>
+pub fn capfs::node::NodeTable::remember_lookup(&self, &authority_core::handle::ObjectId) -> core::result::Result<capfs::node::NodeBinding, capfs::node::NodeTableError>
+pub fn capfs::node::NodeTable::resolve(&self, capfs::node::NodeId) -> core::result::Result<authority_core::handle::ObjectId, capfs::node::NodeTableError>
+pub const fn capfs::node::NodeTable::subject(&self) -> &authority_core::capability::SubjectId
+pub mod capfs::read_only
+pub enum capfs::read_only::CapabilityFilesystemError
+pub capfs::read_only::CapabilityFilesystemError::MissingNamespaceRoot
+pub capfs::read_only::CapabilityFilesystemError::Namespace(capfs::namespace::NamespaceError)
+pub capfs::read_only::CapabilityFilesystemError::RepositoryMismatch
+pub capfs::read_only::CapabilityFilesystemError::RepositoryMismatch::authority: authority_core::repository::RepoId
+pub capfs::read_only::CapabilityFilesystemError::RepositoryMismatch::imported: authority_core::repository::RepoId
+impl core::convert::From<capfs::namespace::NamespaceError> for capfs::read_only::CapabilityFilesystemError
+pub fn capfs::read_only::CapabilityFilesystemError::from(capfs::namespace::NamespaceError) -> Self
+impl core::error::Error for capfs::read_only::CapabilityFilesystemError
+pub fn capfs::read_only::CapabilityFilesystemError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for capfs::read_only::CapabilityFilesystemError
+pub fn capfs::read_only::CapabilityFilesystemError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct capfs::read_only::CapabilityFilesystem
+impl capfs::read_only::CapabilityFilesystem
+pub fn capfs::read_only::CapabilityFilesystem::new(capfs::backing::ImportedRepository, alloc::sync::Arc<authority_core::kernel::CapabilityKernel>, capfs::read_only::MountAuthority, alloc::sync::Arc<dyn capfs::read_only::AuthorizationClock>) -> core::result::Result<Self, capfs::read_only::CapabilityFilesystemError>
+impl core::fmt::Debug for capfs::read_only::CapabilityFilesystem
+pub fn capfs::read_only::CapabilityFilesystem::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl fuser::Filesystem for capfs::read_only::CapabilityFilesystem
+pub fn capfs::read_only::CapabilityFilesystem::create(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, u32, u32, i32, fuser::reply::ReplyCreate)
+pub fn capfs::read_only::CapabilityFilesystem::destroy(&mut self)
+pub fn capfs::read_only::CapabilityFilesystem::forget(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, u64)
+pub fn capfs::read_only::CapabilityFilesystem::getattr(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, core::option::Option<fuser::ll::request::FileHandle>, fuser::reply::ReplyAttr)
+pub fn capfs::read_only::CapabilityFilesystem::init(&mut self, &fuser::request_param::Request, &mut fuser::KernelConfig) -> std::io::error::Result<()>
+pub fn capfs::read_only::CapabilityFilesystem::link(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::reply::ReplyEntry)
+pub fn capfs::read_only::CapabilityFilesystem::lookup(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::reply::ReplyEntry)
+pub fn capfs::read_only::CapabilityFilesystem::mkdir(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, u32, u32, fuser::reply::ReplyEntry)
+pub fn capfs::read_only::CapabilityFilesystem::mknod(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, u32, u32, u32, fuser::reply::ReplyEntry)
+pub fn capfs::read_only::CapabilityFilesystem::open(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::open_flags::OpenFlags, fuser::reply::ReplyOpen)
+pub fn capfs::read_only::CapabilityFilesystem::opendir(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::open_flags::OpenFlags, fuser::reply::ReplyOpen)
+pub fn capfs::read_only::CapabilityFilesystem::read(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::FileHandle, u64, u32, fuser::open_flags::OpenFlags, core::option::Option<fuser::ll::request::LockOwner>, fuser::reply::ReplyData)
+pub fn capfs::read_only::CapabilityFilesystem::readdir(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::FileHandle, u64, fuser::reply::ReplyDirectory)
+pub fn capfs::read_only::CapabilityFilesystem::readlink(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::reply::ReplyData)
+pub fn capfs::read_only::CapabilityFilesystem::release(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::FileHandle, fuser::open_flags::OpenFlags, core::option::Option<fuser::ll::request::LockOwner>, bool, fuser::reply::ReplyEmpty)
+pub fn capfs::read_only::CapabilityFilesystem::releasedir(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::FileHandle, fuser::open_flags::OpenFlags, fuser::reply::ReplyEmpty)
+pub fn capfs::read_only::CapabilityFilesystem::rename(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::rename_flags::RenameFlags, fuser::reply::ReplyEmpty)
+pub fn capfs::read_only::CapabilityFilesystem::rmdir(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::reply::ReplyEmpty)
+pub fn capfs::read_only::CapabilityFilesystem::setattr(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, core::option::Option<u32>, core::option::Option<u32>, core::option::Option<u32>, core::option::Option<u64>, core::option::Option<fuser::ll::TimeOrNow>, core::option::Option<fuser::ll::TimeOrNow>, core::option::Option<std::time::SystemTime>, core::option::Option<fuser::ll::request::FileHandle>, core::option::Option<std::time::SystemTime>, core::option::Option<std::time::SystemTime>, core::option::Option<std::time::SystemTime>, core::option::Option<fuser::bsd_file_flags::BsdFileFlags>, fuser::reply::ReplyAttr)
+pub fn capfs::read_only::CapabilityFilesystem::symlink(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, &std::path::Path, fuser::reply::ReplyEntry)
+pub fn capfs::read_only::CapabilityFilesystem::unlink(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, &std::ffi::os_str::OsStr, fuser::reply::ReplyEmpty)
+pub fn capfs::read_only::CapabilityFilesystem::write(&self, &fuser::request_param::Request, fuser::ll::request::INodeNo, fuser::ll::request::FileHandle, u64, &[u8], fuser::ll::flags::write_flags::WriteFlags, fuser::open_flags::OpenFlags, core::option::Option<fuser::ll::request::LockOwner>, fuser::reply::ReplyWrite)
+pub struct capfs::read_only::MountAuthority
+impl capfs::read_only::MountAuthority
+pub const fn capfs::read_only::MountAuthority::capability(&self) -> &authority_core::capability::CapId
+pub const fn capfs::read_only::MountAuthority::mount(&self) -> &capfs::read_only::MountInstanceId
+pub const fn capfs::read_only::MountAuthority::new(capfs::read_only::MountInstanceId, authority_core::capability::SubjectId, authority_core::capability::CapId, authority_core::repository::RepoId) -> Self
+pub const fn capfs::read_only::MountAuthority::repository(&self) -> &authority_core::repository::RepoId
+pub const fn capfs::read_only::MountAuthority::subject(&self) -> &authority_core::capability::SubjectId
+pub struct capfs::read_only::MountInstanceId(_)
+impl capfs::read_only::MountInstanceId
+pub fn capfs::read_only::MountInstanceId::as_str(&self) -> &str
+pub fn capfs::read_only::MountInstanceId::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::fmt::Display for capfs::read_only::MountInstanceId
+pub fn capfs::read_only::MountInstanceId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub trait capfs::read_only::AuthorizationClock: core::marker::Send + core::marker::Sync + 'static
+pub fn capfs::read_only::AuthorizationClock::now(&self) -> authority_core::time::MonotonicTime
+impl capfs::read_only::AuthorizationClock for authority_core::time::MonotonicTime
+pub fn authority_core::time::MonotonicTime::now(&self) -> authority_core::time::MonotonicTime
+pub fn capfs::read_only::mount_config() -> fuser::mnt::mount_options::Config
+pub fn capfs::read_only::spawn_mount(capfs::read_only::CapabilityFilesystem, impl core::convert::AsRef<std::path::Path>) -> std::io::error::Result<fuser::session::BackgroundSession>

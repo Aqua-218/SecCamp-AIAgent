@@ -13,6 +13,8 @@ pipeline_self_test:
   script:
     - scripts/ci/install-pipeline-tools.sh
     - scripts/ci/test-pipeline-planner.sh
+    - scripts/ci/run.sh commit-policy-self-test
+    - scripts/ci/tests/test-mutation-gate.sh
 
 adr_index:
   stage: validate
@@ -25,6 +27,14 @@ verification_traceability:
   timeout: 10m
   script:
     - scripts/ci/check-verification-traceability.sh
+
+commit_policy:
+  stage: validate
+  timeout: 10m
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - scripts/ci/run.sh commit-policy
 
 codeowners_coverage:
   stage: validate
@@ -83,7 +93,10 @@ docs_policy:
   stage: validate
   timeout: 10m
   script:
-    - scripts/ci/run.sh docs-policy
+    - scripts/ci/install-pipeline-tools.sh
+    - scripts/ci/check-docs.sh
+    - scripts/ci/check-doc-consistency.sh
+    - scripts/ci/tests/test-doc-consistency.sh
 
 toolchain_consistency:
   stage: validate
@@ -114,9 +127,19 @@ rust_quality:
     - scripts/ci/run.sh clippy
     - scripts/ci/run.sh docs
 
+api_surface:
+  extends: .rust_job
+  stage: validate
+  timeout: 30m
+  script:
+    - scripts/ci/install-cargo-tools.sh public-api
+    - scripts/ci/run.sh api-surface
+
 cross_targets:
   extends: .rust_job
   stage: validate
   timeout: 30m
   script:
+    - scripts/ci/install-pipeline-tools.sh
+    - scripts/ci/install-cross-tools.sh
     - scripts/ci/run.sh cross-targets

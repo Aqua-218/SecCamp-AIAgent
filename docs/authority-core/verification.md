@@ -279,7 +279,7 @@ scripts/check-authority-corpus.sh
 
 残る限界は、corpus が有限であることと、schema v1 が variant ごとの専用 row を追加する形で拡張されていることである。新しい authority variant を追加するときは、両 runner、typed dispatch、corpus、Lean theorem を同じ変更で拡張する。既存 row の field order を壊す変更では header の version を上げる。
 
-なお、共通corpus自体はrevokeを検証しない。逐次revokeと祖先失効はstateful test、単一・compound effectとdirect / ancestor revokeの同期境界はloomで検査している。現在のloom modelはopen handle、rename、unlink、複数revoke、4 thread以上を含まない。Direct-I/O filesystem adapterは実mountでread / write / truncate / metadata / readdir-after-revokeに加え、create / remove / renameとdirectory stream restartを検査する。変更系operationとrevokeを同時に競合させる統合・攻撃testは今後の境界である。
+なお、共通corpus自体はrevokeを検証しない。逐次revokeと祖先失効はstateful test、単一・compound effectとdirect / ancestor revokeの同期境界はloomで検査している。Direct-I/O filesystem adapterは実mountでread / write / truncate / metadata / readdir-after-revokeに加え、create / remove / rename、directory stream restart、write/revoke線形化を検査する。さらにbounded integration raceがwrite/open/close/rename/unlink/revokeを同時実行する。これは全thread数・全scheduler interleavingの証明ではない。
 
 ## 変更時の確認点
 

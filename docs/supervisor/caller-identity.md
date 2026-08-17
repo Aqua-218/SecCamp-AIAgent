@@ -136,8 +136,8 @@ socket は bind 直後に mode 0600 へ絞る。node が出来るのは bind の
 
 - `StaticCallerResolver` は in-memory の map で、実 socket の peer credential を読まない。test と小さな host adapter 用である。
 - `SubjectControlListener` は実 `SOCK_SEQPACKET` socket に対して module test で検証済み。実 `SO_PEERCRED` の取得、socket ID の単調割り当てと非再利用、4 KiB 超 datagram の decode 前拒否、mode 0600、絶対 path 以外の拒否を確認している。
-- guest VM の中で実際に agent process が接続する end-to-end は未検証である。uid/gid を偽装した peer からの接続は、test process が別 uid を作れないため resolver 単体でしか確認していない。
-- `SubjectControlListener` を `Supervisor::create_subject` の connection 引数へ接続する host 側の組み立ては、この crate に無い。
+- guest VM内の`guest-supervisor-init`からproduction listener／Supervisor／isolation launcher／workloadへ至るcompositionはKVM gateで確認済み。uid/gidを偽装したpeerの負試験は別uid processを使うhost module testの範囲に限られる。
+- `SubjectControlListener`を`Supervisor::create_subject`へ接続する組み立ては`guest-supervisor-init`にあり、実guest imageで起動確認する。
 - `ConnectionNotBoundToSubject`、`CallerBindingError`、`GrantSubjectMismatch`、`DuplicateSubject`、親の非 Running gate、`derive` の非 holder 拒否は supervisor level の test で確認している。
 - `revoke` の caller/lifecycle gate は supervisor が行い、対象 capability の holder 検査は authority kernel が行う。非 holder の拒否を `root_derive_and_revoke_use_typed_authority_kernel_transitions` で確認している。
 - `CloseHandle` の foreign subject 拒否と `CloseSubject` の claim 無視は wire 経路で確認している。前者は runtime adapter に到達しないこと、後者は caller 自身だけが閉じることまで assert する。

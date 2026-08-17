@@ -1,0 +1,454 @@
+pub mod firecracker_runtime
+pub mod firecracker_runtime::guest_control
+pub enum firecracker_runtime::guest_control::GuestControlAction
+pub firecracker_runtime::guest_control::GuestControlAction::InjectIdentity
+pub firecracker_runtime::guest_control::GuestControlAction::InjectIdentityBound
+pub firecracker_runtime::guest_control::GuestControlAction::StartWorkload
+pub firecracker_runtime::guest_control::GuestControlAction::StartWorkloadBound
+impl firecracker_runtime::guest_control::GuestControlAction
+pub const firecracker_runtime::guest_control::GuestControlAction::InjectIdentityV2: Self
+pub const firecracker_runtime::guest_control::GuestControlAction::StartWorkloadV2: Self
+pub fn firecracker_runtime::guest_control::GuestControlAction::from_path(&str) -> core::option::Option<Self>
+pub const fn firecracker_runtime::guest_control::GuestControlAction::is_bound(self) -> bool
+pub const fn firecracker_runtime::guest_control::GuestControlAction::path(self) -> &'static str
+impl core::convert::From<firecracker_runtime::guest_control::GuestControlAction> for firecracker_runtime::guest_control::GuestControlOutcome
+pub fn firecracker_runtime::guest_control::GuestControlOutcome::from(firecracker_runtime::guest_control::GuestControlAction) -> Self
+pub enum firecracker_runtime::guest_control::GuestControlError
+pub firecracker_runtime::guest_control::GuestControlError::ChallengeReused
+pub firecracker_runtime::guest_control::GuestControlError::IdentityMismatch
+pub firecracker_runtime::guest_control::GuestControlError::IdentityNotInjected
+pub firecracker_runtime::guest_control::GuestControlError::InvalidIdentity(alloc::string::String)
+pub firecracker_runtime::guest_control::GuestControlError::InvalidPolicyDigest(alloc::string::String)
+pub firecracker_runtime::guest_control::GuestControlError::MalformedBody
+pub firecracker_runtime::guest_control::GuestControlError::NonCanonicalBody
+pub firecracker_runtime::guest_control::GuestControlError::PolicyDigestMismatch
+pub firecracker_runtime::guest_control::GuestControlError::UnsupportedPolicyEncodingVersion(u16)
+pub firecracker_runtime::guest_control::GuestControlError::VersionMismatch
+impl core::error::Error for firecracker_runtime::guest_control::GuestControlError
+impl core::fmt::Display for firecracker_runtime::guest_control::GuestControlError
+pub fn firecracker_runtime::guest_control::GuestControlError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum firecracker_runtime::guest_control::GuestControlIoError
+pub firecracker_runtime::guest_control::GuestControlIoError::BodyTooLarge
+pub firecracker_runtime::guest_control::GuestControlIoError::HeaderTooLarge
+pub firecracker_runtime::guest_control::GuestControlIoError::Io(std::io::error::Error)
+pub firecracker_runtime::guest_control::GuestControlIoError::MalformedHttp
+impl core::error::Error for firecracker_runtime::guest_control::GuestControlIoError
+pub fn firecracker_runtime::guest_control::GuestControlIoError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for firecracker_runtime::guest_control::GuestControlIoError
+pub fn firecracker_runtime::guest_control::GuestControlIoError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum firecracker_runtime::guest_control::GuestControlOutcome
+pub firecracker_runtime::guest_control::GuestControlOutcome::IdentityInjected
+pub firecracker_runtime::guest_control::GuestControlOutcome::WorkloadStarted
+impl core::convert::From<firecracker_runtime::guest_control::GuestControlAction> for firecracker_runtime::guest_control::GuestControlOutcome
+pub fn firecracker_runtime::guest_control::GuestControlOutcome::from(firecracker_runtime::guest_control::GuestControlAction) -> Self
+pub enum firecracker_runtime::guest_control::GuestControlState
+pub firecracker_runtime::guest_control::GuestControlState::AwaitingIdentity
+pub firecracker_runtime::guest_control::GuestControlState::IdentityInjected(firecracker_runtime::guest_control::GuestControlRequest)
+pub firecracker_runtime::guest_control::GuestControlState::WorkloadStarted(firecracker_runtime::guest_control::GuestControlRequest)
+impl firecracker_runtime::guest_control::GuestControlState
+pub fn firecracker_runtime::guest_control::GuestControlState::apply(&mut self, firecracker_runtime::guest_control::GuestControlAction, firecracker_runtime::guest_control::GuestControlRequest) -> core::result::Result<alloc::string::String, firecracker_runtime::guest_control::GuestControlError>
+pub struct firecracker_runtime::guest_control::GuestControlHttpResponse
+impl firecracker_runtime::guest_control::GuestControlHttpResponse
+pub fn firecracker_runtime::guest_control::GuestControlHttpResponse::body(&self) -> &str
+pub const fn firecracker_runtime::guest_control::GuestControlHttpResponse::outcome(&self) -> core::option::Option<firecracker_runtime::guest_control::GuestControlOutcome>
+pub const fn firecracker_runtime::guest_control::GuestControlHttpResponse::status(&self) -> u16
+pub struct firecracker_runtime::guest_control::GuestControlRequest
+impl firecracker_runtime::guest_control::GuestControlRequest
+pub fn firecracker_runtime::guest_control::GuestControlRequest::canonical_acknowledgement(&self, firecracker_runtime::guest_control::GuestControlAction) -> alloc::string::String
+pub fn firecracker_runtime::guest_control::GuestControlRequest::canonical_body(&self) -> alloc::string::String
+pub fn firecracker_runtime::guest_control::GuestControlRequest::canonical_bound_acknowledgement(&self, firecracker_runtime::guest_control::GuestControlAction) -> alloc::string::String
+pub fn firecracker_runtime::guest_control::GuestControlRequest::canonical_bound_body(&self) -> alloc::string::String
+pub fn firecracker_runtime::guest_control::GuestControlRequest::canonical_v2_body(&self) -> alloc::string::String
+pub const fn firecracker_runtime::guest_control::GuestControlRequest::challenge(&self) -> firecracker_runtime::IdentityId
+pub const fn firecracker_runtime::guest_control::GuestControlRequest::identities(&self) -> &firecracker_runtime::IdentityBundle
+pub const fn firecracker_runtime::guest_control::GuestControlRequest::is_bound(&self) -> bool
+pub fn firecracker_runtime::guest_control::GuestControlRequest::new(firecracker_runtime::IdentityId, firecracker_runtime::IdentityBundle) -> core::result::Result<Self, firecracker_runtime::guest_control::GuestControlError>
+pub fn firecracker_runtime::guest_control::GuestControlRequest::new_bound(firecracker_runtime::IdentityId, firecracker_runtime::IdentityBundle, authority_core::policy::AuthorityPolicyDigest) -> core::result::Result<Self, firecracker_runtime::guest_control::GuestControlError>
+pub fn firecracker_runtime::guest_control::GuestControlRequest::new_v2(firecracker_runtime::IdentityId, firecracker_runtime::IdentityBundle, authority_core::policy::AuthorityPolicyDigest) -> core::result::Result<Self, firecracker_runtime::guest_control::GuestControlError>
+pub fn firecracker_runtime::guest_control::GuestControlRequest::parse_bound_canonical(&str) -> core::result::Result<Self, firecracker_runtime::guest_control::GuestControlError>
+pub fn firecracker_runtime::guest_control::GuestControlRequest::parse_canonical(&str) -> core::result::Result<Self, firecracker_runtime::guest_control::GuestControlError>
+pub const fn firecracker_runtime::guest_control::GuestControlRequest::policy_digest(&self) -> core::option::Option<authority_core::policy::AuthorityPolicyDigest>
+pub const fn firecracker_runtime::guest_control::GuestControlRequest::policy_encoding_version(&self) -> core::option::Option<u16>
+pub struct firecracker_runtime::guest_control::GuestControlServer
+impl firecracker_runtime::guest_control::GuestControlServer
+pub fn firecracker_runtime::guest_control::GuestControlServer::handle(&mut self, &str, &str, &[u8]) -> firecracker_runtime::guest_control::GuestControlHttpResponse
+pub const fn firecracker_runtime::guest_control::GuestControlServer::new() -> Self
+pub fn firecracker_runtime::guest_control::GuestControlServer::serve_once<S: std::io::Read + std::io::Write>(&mut self, &mut S) -> core::result::Result<firecracker_runtime::guest_control::GuestControlHttpResponse, firecracker_runtime::guest_control::GuestControlIoError>
+pub fn firecracker_runtime::guest_control::GuestControlServer::serve_once_with<S: std::io::Read + std::io::Write, F>(&mut self, &mut S, F) -> core::result::Result<firecracker_runtime::guest_control::GuestControlHttpResponse, firecracker_runtime::guest_control::GuestControlIoError> where F: core::ops::function::FnOnce() -> std::io::error::Result<()>
+pub fn firecracker_runtime::guest_control::GuestControlServer::serve_once_with_identity<S: std::io::Read + std::io::Write, F>(&mut self, &mut S, F) -> core::result::Result<firecracker_runtime::guest_control::GuestControlHttpResponse, firecracker_runtime::guest_control::GuestControlIoError> where F: core::ops::function::FnOnce(&firecracker_runtime::guest_control::GuestControlRequest) -> std::io::error::Result<()>
+pub const fn firecracker_runtime::guest_control::GuestControlServer::state(&self) -> &firecracker_runtime::guest_control::GuestControlState
+pub const firecracker_runtime::guest_control::MAX_GUEST_CONTROL_BODY_BYTES: usize
+pub const firecracker_runtime::guest_control::MAX_GUEST_CONTROL_HEADER_BYTES: usize
+pub mod firecracker_runtime::recovery
+pub enum firecracker_runtime::recovery::RecoveryStage
+pub firecracker_runtime::recovery::RecoveryStage::CgroupEmpty
+pub firecracker_runtime::recovery::RecoveryStage::Complete
+pub firecracker_runtime::recovery::RecoveryStage::IdentityReserved
+pub firecracker_runtime::recovery::RecoveryStage::JailRemoved
+pub firecracker_runtime::recovery::RecoveryStage::MapperClosed
+pub firecracker_runtime::recovery::RecoveryStage::ProvisioningReleased
+pub struct firecracker_runtime::recovery::FirecrackerRecovery<B>
+impl<B> firecracker_runtime::recovery::FirecrackerRecovery<B> where B: firecracker_runtime::recovery::FirecrackerRecoveryBackend
+pub fn firecracker_runtime::recovery::FirecrackerRecovery<B>::begin(&firecracker_runtime::recovery::SessionResourceOwnership, firecracker_runtime::Sha256Digest, firecracker_runtime::recovery::RecoveryStage) -> core::result::Result<firecracker_runtime::recovery::RecoveryProgress, firecracker_runtime::recovery::RecoveryError>
+pub fn firecracker_runtime::recovery::FirecrackerRecovery<B>::into_inner(self) -> B
+pub const fn firecracker_runtime::recovery::FirecrackerRecovery<B>::new(B) -> Self
+pub fn firecracker_runtime::recovery::FirecrackerRecovery<B>::recover_next<P>(&mut self, &firecracker_runtime::recovery::SessionResourceOwnership, firecracker_runtime::recovery::RecoveryProgress, &mut P) -> core::result::Result<firecracker_runtime::recovery::RecoveryStage, firecracker_runtime::recovery::RecoveryError> where P: firecracker_runtime::recovery::ProvisioningRecovery
+pub struct firecracker_runtime::recovery::LinuxFirecrackerRecovery
+impl firecracker_runtime::recovery::LinuxFirecrackerRecovery
+pub fn firecracker_runtime::recovery::LinuxFirecrackerRecovery::new(firecracker_runtime::recovery::RecoveryTools) -> core::result::Result<Self, firecracker_runtime::RuntimeError>
+impl firecracker_runtime::recovery::FirecrackerRecoveryBackend for firecracker_runtime::recovery::LinuxFirecrackerRecovery
+pub fn firecracker_runtime::recovery::LinuxFirecrackerRecovery::recover_cgroup(&mut self, &firecracker_runtime::recovery::SessionResourceOwnership) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::recovery::LinuxFirecrackerRecovery::recover_jail(&mut self, &firecracker_runtime::recovery::SessionResourceOwnership) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::recovery::LinuxFirecrackerRecovery::recover_mapper(&mut self, &firecracker_runtime::recovery::SessionResourceOwnership) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub struct firecracker_runtime::recovery::RecoveryError
+impl firecracker_runtime::recovery::RecoveryError
+pub const fn firecracker_runtime::recovery::RecoveryError::pending_stage(&self) -> firecracker_runtime::recovery::RecoveryStage
+pub const fn firecracker_runtime::recovery::RecoveryError::source_error(&self) -> &firecracker_runtime::RuntimeError
+impl core::error::Error for firecracker_runtime::recovery::RecoveryError
+pub fn firecracker_runtime::recovery::RecoveryError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for firecracker_runtime::recovery::RecoveryError
+pub fn firecracker_runtime::recovery::RecoveryError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct firecracker_runtime::recovery::RecoveryProgress
+impl firecracker_runtime::recovery::RecoveryProgress
+pub const fn firecracker_runtime::recovery::RecoveryProgress::stage(&self) -> firecracker_runtime::recovery::RecoveryStage
+pub struct firecracker_runtime::recovery::RecoveryTools
+impl firecracker_runtime::recovery::RecoveryTools
+pub const fn firecracker_runtime::recovery::RecoveryTools::new(firecracker_runtime::PinnedArtifact, firecracker_runtime::PinnedArtifact) -> Self
+pub struct firecracker_runtime::recovery::SessionResourceOwnership
+impl firecracker_runtime::recovery::SessionResourceOwnership
+pub fn firecracker_runtime::recovery::SessionResourceOwnership::cgroup_path(&self) -> std::path::PathBuf
+pub const fn firecracker_runtime::recovery::SessionResourceOwnership::config_fingerprint(&self) -> firecracker_runtime::Sha256Digest
+pub fn firecracker_runtime::recovery::SessionResourceOwnership::from_runtime_config(&firecracker_runtime::RuntimeConfig) -> core::result::Result<Self, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::recovery::SessionResourceOwnership::jail_path(&self) -> std::path::PathBuf
+pub fn firecracker_runtime::recovery::SessionResourceOwnership::jail_root(&self) -> &std::path::Path
+pub fn firecracker_runtime::recovery::SessionResourceOwnership::mapper_name(&self) -> &str
+pub fn firecracker_runtime::recovery::SessionResourceOwnership::workspace(&self) -> &std::path::Path
+pub trait firecracker_runtime::recovery::FirecrackerRecoveryBackend
+pub fn firecracker_runtime::recovery::FirecrackerRecoveryBackend::recover_cgroup(&mut self, &firecracker_runtime::recovery::SessionResourceOwnership) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::recovery::FirecrackerRecoveryBackend::recover_jail(&mut self, &firecracker_runtime::recovery::SessionResourceOwnership) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::recovery::FirecrackerRecoveryBackend::recover_mapper(&mut self, &firecracker_runtime::recovery::SessionResourceOwnership) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+impl firecracker_runtime::recovery::FirecrackerRecoveryBackend for firecracker_runtime::recovery::LinuxFirecrackerRecovery
+pub fn firecracker_runtime::recovery::LinuxFirecrackerRecovery::recover_cgroup(&mut self, &firecracker_runtime::recovery::SessionResourceOwnership) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::recovery::LinuxFirecrackerRecovery::recover_jail(&mut self, &firecracker_runtime::recovery::SessionResourceOwnership) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::recovery::LinuxFirecrackerRecovery::recover_mapper(&mut self, &firecracker_runtime::recovery::SessionResourceOwnership) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub trait firecracker_runtime::recovery::ProvisioningRecovery
+pub fn firecracker_runtime::recovery::ProvisioningRecovery::release_provisioning(&mut self, &firecracker_runtime::recovery::SessionResourceOwnership) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub enum firecracker_runtime::CgroupVersion
+pub firecracker_runtime::CgroupVersion::V2
+pub enum firecracker_runtime::HttpMethod
+pub firecracker_runtime::HttpMethod::Delete
+pub firecracker_runtime::HttpMethod::Get
+pub firecracker_runtime::HttpMethod::Patch
+pub firecracker_runtime::HttpMethod::Post
+pub firecracker_runtime::HttpMethod::Put
+pub enum firecracker_runtime::RuntimeError
+pub firecracker_runtime::RuntimeError::Api(alloc::string::String)
+pub firecracker_runtime::RuntimeError::ApiStatus
+pub firecracker_runtime::RuntimeError::ApiStatus::body: alloc::string::String
+pub firecracker_runtime::RuntimeError::ApiStatus::path: alloc::string::String
+pub firecracker_runtime::RuntimeError::ApiStatus::status: u16
+pub firecracker_runtime::RuntimeError::ArtifactDigestMismatch
+pub firecracker_runtime::RuntimeError::ArtifactDigestMismatch::actual: firecracker_runtime::Sha256Digest
+pub firecracker_runtime::RuntimeError::ArtifactDigestMismatch::expected: firecracker_runtime::Sha256Digest
+pub firecracker_runtime::RuntimeError::ArtifactDigestMismatch::label: alloc::string::String
+pub firecracker_runtime::RuntimeError::ArtifactDigestMismatch::path: std::path::PathBuf
+pub firecracker_runtime::RuntimeError::Cleanup(alloc::string::String)
+pub firecracker_runtime::RuntimeError::Command(alloc::string::String)
+pub firecracker_runtime::RuntimeError::CommandFailed
+pub firecracker_runtime::RuntimeError::CommandFailed::program: alloc::string::String
+pub firecracker_runtime::RuntimeError::CommandFailed::status: i32
+pub firecracker_runtime::RuntimeError::CommandFailed::stderr: alloc::string::String
+pub firecracker_runtime::RuntimeError::InvalidConfig(alloc::string::String)
+pub firecracker_runtime::RuntimeError::InvalidIdentity(alloc::string::String)
+pub firecracker_runtime::RuntimeError::InvalidState
+pub firecracker_runtime::RuntimeError::InvalidState::actual: alloc::string::String
+pub firecracker_runtime::RuntimeError::InvalidState::expected: alloc::string::String
+pub firecracker_runtime::RuntimeError::Io(alloc::string::String)
+pub firecracker_runtime::RuntimeError::LatestArtifactPath
+pub firecracker_runtime::RuntimeError::LatestArtifactPath::label: alloc::string::String
+pub firecracker_runtime::RuntimeError::NetworkDeviceForbidden
+pub firecracker_runtime::RuntimeError::PolicyDigestMismatch
+pub firecracker_runtime::RuntimeError::PolicyDigestMismatch::actual: authority_core::policy::AuthorityPolicyDigest
+pub firecracker_runtime::RuntimeError::PolicyDigestMismatch::expected: authority_core::policy::AuthorityPolicyDigest
+pub firecracker_runtime::RuntimeError::PolicyDigestRequired
+pub firecracker_runtime::RuntimeError::Rollback
+pub firecracker_runtime::RuntimeError::Rollback::cleanup: alloc::string::String
+pub firecracker_runtime::RuntimeError::Rollback::operation: alloc::string::String
+pub firecracker_runtime::RuntimeError::SnapshotDigestMismatch
+pub firecracker_runtime::RuntimeError::SnapshotDigestMismatch::actual: firecracker_runtime::Sha256Digest
+pub firecracker_runtime::RuntimeError::SnapshotDigestMismatch::expected: firecracker_runtime::Sha256Digest
+pub firecracker_runtime::RuntimeError::SnapshotDigestMismatch::label: alloc::string::String
+pub firecracker_runtime::RuntimeError::SnapshotDigestMismatch::path: std::path::PathBuf
+pub firecracker_runtime::RuntimeError::StaleIdentity(alloc::string::String)
+pub firecracker_runtime::RuntimeError::StaleSnapshot(alloc::string::String)
+pub firecracker_runtime::RuntimeError::WorkspaceAlreadyExists(std::path::PathBuf)
+impl core::convert::From<std::io::error::Error> for firecracker_runtime::RuntimeError
+pub fn firecracker_runtime::RuntimeError::from(std::io::error::Error) -> Self
+impl core::error::Error for firecracker_runtime::RuntimeError
+impl core::fmt::Display for firecracker_runtime::RuntimeError
+pub fn firecracker_runtime::RuntimeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum firecracker_runtime::RuntimeState
+pub firecracker_runtime::RuntimeState::IdentityInjected
+pub firecracker_runtime::RuntimeState::IdentityRegenerated
+pub firecracker_runtime::RuntimeState::IdentityResumedAwaitingAck
+pub firecracker_runtime::RuntimeState::New
+pub firecracker_runtime::RuntimeState::RestoredStopped
+pub firecracker_runtime::RuntimeState::Running
+pub firecracker_runtime::RuntimeState::SnapshotPauseUnknown
+pub firecracker_runtime::RuntimeState::SnapshotPaused
+pub firecracker_runtime::RuntimeState::Snapshotted
+pub firecracker_runtime::RuntimeState::Stopped
+pub firecracker_runtime::RuntimeState::WorkloadStopped
+pub struct firecracker_runtime::ApiRequest
+pub firecracker_runtime::ApiRequest::body: alloc::string::String
+pub firecracker_runtime::ApiRequest::method: firecracker_runtime::HttpMethod
+pub firecracker_runtime::ApiRequest::path: alloc::string::String
+pub struct firecracker_runtime::ApiResponse
+pub firecracker_runtime::ApiResponse::body: alloc::string::String
+pub firecracker_runtime::ApiResponse::status: u16
+pub struct firecracker_runtime::CgroupConfig
+pub firecracker_runtime::CgroupConfig::cpu_period_micros: u64
+pub firecracker_runtime::CgroupConfig::cpu_quota_micros: u64
+pub firecracker_runtime::CgroupConfig::memory_max_bytes: u64
+pub firecracker_runtime::CgroupConfig::path: std::path::PathBuf
+pub struct firecracker_runtime::CommandOutput
+pub firecracker_runtime::CommandOutput::status: i32
+pub firecracker_runtime::CommandOutput::stderr: alloc::vec::Vec<u8>
+pub firecracker_runtime::CommandOutput::stdout: alloc::vec::Vec<u8>
+pub struct firecracker_runtime::CommandSpec
+pub firecracker_runtime::CommandSpec::args: alloc::vec::Vec<alloc::string::String>
+pub firecracker_runtime::CommandSpec::expected_digest: core::option::Option<firecracker_runtime::Sha256Digest>
+pub firecracker_runtime::CommandSpec::program: std::path::PathBuf
+pub struct firecracker_runtime::DmVerityConfig
+pub firecracker_runtime::DmVerityConfig::data_device: std::path::PathBuf
+pub firecracker_runtime::DmVerityConfig::hash_device: std::path::PathBuf
+pub firecracker_runtime::DmVerityConfig::jailed_device_path: std::path::PathBuf
+pub firecracker_runtime::DmVerityConfig::mapper_name: alloc::string::String
+pub firecracker_runtime::DmVerityConfig::root_hash: firecracker_runtime::Sha256Digest
+pub struct firecracker_runtime::FirecrackerVsockApiClient
+impl firecracker_runtime::FirecrackerVsockApiClient
+pub const fn firecracker_runtime::FirecrackerVsockApiClient::guest_cid(&self) -> u32
+pub const fn firecracker_runtime::FirecrackerVsockApiClient::guest_port(&self) -> u32
+pub fn firecracker_runtime::FirecrackerVsockApiClient::new(impl core::convert::Into<std::path::PathBuf>, u32, u32) -> core::result::Result<Self, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FirecrackerVsockApiClient::uds_path(&self) -> &std::path::Path
+pub fn firecracker_runtime::FirecrackerVsockApiClient::with_timeout(self, core::time::Duration) -> core::result::Result<Self, firecracker_runtime::RuntimeError>
+impl firecracker_runtime::ApiClient for firecracker_runtime::FirecrackerVsockApiClient
+pub fn firecracker_runtime::FirecrackerVsockApiClient::request(&mut self, &firecracker_runtime::ApiRequest) -> core::result::Result<firecracker_runtime::ApiResponse, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FirecrackerVsockApiClient::verify_restore_resources(&mut self, &std::path::Path, &std::path::Path, u32) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub struct firecracker_runtime::HostIsolationConfig
+pub firecracker_runtime::HostIsolationConfig::cgroup: firecracker_runtime::CgroupConfig
+pub firecracker_runtime::HostIsolationConfig::namespaces: firecracker_runtime::NamespaceConfig
+pub firecracker_runtime::HostIsolationConfig::seccomp: firecracker_runtime::SeccompConfig
+pub struct firecracker_runtime::IdentityBundle
+pub firecracker_runtime::IdentityBundle::capability_id: firecracker_runtime::IdentityId
+pub firecracker_runtime::IdentityBundle::request_id: firecracker_runtime::IdentityId
+pub firecracker_runtime::IdentityBundle::session_id: firecracker_runtime::IdentityId
+pub firecracker_runtime::IdentityBundle::subject_id: firecracker_runtime::IdentityId
+pub firecracker_runtime::IdentityBundle::vm_id: firecracker_runtime::IdentityId
+impl firecracker_runtime::IdentityBundle
+pub fn firecracker_runtime::IdentityBundle::new(firecracker_runtime::IdentityId, firecracker_runtime::IdentityId, firecracker_runtime::IdentityId, firecracker_runtime::IdentityId, firecracker_runtime::IdentityId) -> core::result::Result<Self, firecracker_runtime::RuntimeError>
+pub struct firecracker_runtime::IdentityId(_)
+impl firecracker_runtime::IdentityId
+pub fn firecracker_runtime::IdentityId::from_hex(&str) -> core::result::Result<Self, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::IdentityId::to_hex(self) -> alloc::string::String
+pub struct firecracker_runtime::JailerConfig
+pub firecracker_runtime::JailerConfig::cgroup_version: firecracker_runtime::CgroupVersion
+pub firecracker_runtime::JailerConfig::chroot_base_dir: std::path::PathBuf
+pub firecracker_runtime::JailerConfig::gid: u32
+pub firecracker_runtime::JailerConfig::uid: u32
+pub struct firecracker_runtime::NamespaceConfig
+pub firecracker_runtime::NamespaceConfig::ipc: bool
+pub firecracker_runtime::NamespaceConfig::mount: bool
+pub firecracker_runtime::NamespaceConfig::network: bool
+pub firecracker_runtime::NamespaceConfig::pid: bool
+pub firecracker_runtime::NamespaceConfig::user: bool
+pub firecracker_runtime::NamespaceConfig::uts: bool
+pub struct firecracker_runtime::PinnedArtifact
+pub firecracker_runtime::PinnedArtifact::digest: firecracker_runtime::Sha256Digest
+pub firecracker_runtime::PinnedArtifact::path: std::path::PathBuf
+impl firecracker_runtime::PinnedArtifact
+pub fn firecracker_runtime::PinnedArtifact::new(impl core::convert::Into<std::path::PathBuf>, firecracker_runtime::Sha256Digest) -> Self
+pub struct firecracker_runtime::ProcessHandle
+pub firecracker_runtime::ProcessHandle::pid: u32
+pub struct firecracker_runtime::ProcessOwnership
+pub firecracker_runtime::ProcessOwnership::cgroup_path: std::path::PathBuf
+pub firecracker_runtime::ProcessOwnership::firecracker_digest: firecracker_runtime::Sha256Digest
+pub firecracker_runtime::ProcessOwnership::firecracker_executable: std::path::PathBuf
+pub struct firecracker_runtime::RealCommandRunner
+impl firecracker_runtime::RealCommandRunner
+pub fn firecracker_runtime::RealCommandRunner::new() -> Self
+impl core::default::Default for firecracker_runtime::RealCommandRunner
+pub fn firecracker_runtime::RealCommandRunner::default() -> Self
+impl core::ops::drop::Drop for firecracker_runtime::RealCommandRunner
+pub fn firecracker_runtime::RealCommandRunner::drop(&mut self)
+impl firecracker_runtime::CommandRunner for firecracker_runtime::RealCommandRunner
+pub fn firecracker_runtime::RealCommandRunner::run(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::CommandOutput, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::start(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::start_owned(&mut self, &firecracker_runtime::CommandSpec, &firecracker_runtime::ProcessOwnership) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::stop(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::verify_running(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::verify_verity(&mut self, &firecracker_runtime::PinnedArtifact, &firecracker_runtime::DmVerityConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub struct firecracker_runtime::RealFileSystem
+impl firecracker_runtime::RealFileSystem
+pub fn firecracker_runtime::RealFileSystem::new() -> Self
+impl firecracker_runtime::FileSystem for firecracker_runtime::RealFileSystem
+pub fn firecracker_runtime::RealFileSystem::bind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::clone_workspace(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::create_workspace_image(&mut self, &std::path::Path, &std::path::Path, u64) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::digest(&mut self, &std::path::Path) -> core::result::Result<firecracker_runtime::Sha256Digest, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::read(&mut self, &std::path::Path) -> core::result::Result<alloc::vec::Vec<u8>, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::remove_workspace(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::unbind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::verify_block_device_binding(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub struct firecracker_runtime::Runtime<C, F, A, G, I>
+impl<C, F, A, G, I> firecracker_runtime::Runtime<C, F, A, G, I> where C: firecracker_runtime::CommandRunner, F: firecracker_runtime::FileSystem, A: firecracker_runtime::ApiClient, G: firecracker_runtime::ApiClient, I: firecracker_runtime::IdentitySource
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::create_snapshot(&mut self, &mut firecracker_runtime::RuntimeInstance, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> core::result::Result<firecracker_runtime::VerifiedSnapshot, firecracker_runtime::RuntimeError>
+pub const fn firecracker_runtime::Runtime<C, F, A, G, I>::has_pending_cleanup(&self) -> bool
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::inject_identity(&mut self, &mut firecracker_runtime::RuntimeInstance) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::inject_identity_bound(&mut self, &mut firecracker_runtime::RuntimeInstance, authority_core::policy::AuthorityPolicyDigest) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::launch(&mut self, &firecracker_runtime::RuntimeConfig) -> core::result::Result<firecracker_runtime::RuntimeInstance, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::new(C, F, A, G, I) -> Self
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::restore(&mut self, &firecracker_runtime::RuntimeConfig, &firecracker_runtime::VerifiedSnapshot) -> core::result::Result<firecracker_runtime::RuntimeInstance, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::restore_with_identities(&mut self, &firecracker_runtime::RuntimeConfig, &firecracker_runtime::VerifiedSnapshot, firecracker_runtime::IdentityBundle) -> core::result::Result<firecracker_runtime::RuntimeInstance, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::restore_with_identity_bundle(&mut self, &firecracker_runtime::RuntimeConfig, &firecracker_runtime::VerifiedSnapshot, firecracker_runtime::IdentityBundle) -> core::result::Result<firecracker_runtime::RuntimeInstance, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::retry_pending_cleanup(&mut self) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::shutdown(&mut self, &mut firecracker_runtime::RuntimeInstance, &firecracker_runtime::RuntimeConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::start_workload(&mut self, &mut firecracker_runtime::RuntimeInstance) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::verify_snapshot(&mut self, &firecracker_runtime::RuntimeConfig, firecracker_runtime::Snapshot) -> core::result::Result<firecracker_runtime::VerifiedSnapshot, firecracker_runtime::RuntimeError>
+impl<C, F, A, G, I> core::ops::drop::Drop for firecracker_runtime::Runtime<C, F, A, G, I>
+pub fn firecracker_runtime::Runtime<C, F, A, G, I>::drop(&mut self)
+pub struct firecracker_runtime::RuntimeConfig
+pub firecracker_runtime::RuntimeConfig::api_socket: std::path::PathBuf
+pub firecracker_runtime::RuntimeConfig::boot_args: alloc::string::String
+pub firecracker_runtime::RuntimeConfig::dm_verity: firecracker_runtime::DmVerityConfig
+pub firecracker_runtime::RuntimeConfig::firecracker: firecracker_runtime::PinnedArtifact
+pub firecracker_runtime::RuntimeConfig::isolation: firecracker_runtime::HostIsolationConfig
+pub firecracker_runtime::RuntimeConfig::jailer: firecracker_runtime::PinnedArtifact
+pub firecracker_runtime::RuntimeConfig::jailer_config: firecracker_runtime::JailerConfig
+pub firecracker_runtime::RuntimeConfig::kernel: firecracker_runtime::PinnedArtifact
+pub firecracker_runtime::RuntimeConfig::memory_mib: u32
+pub firecracker_runtime::RuntimeConfig::network_devices: alloc::vec::Vec<alloc::string::String>
+pub firecracker_runtime::RuntimeConfig::rootfs: firecracker_runtime::PinnedArtifact
+pub firecracker_runtime::RuntimeConfig::vcpu_count: u32
+pub firecracker_runtime::RuntimeConfig::verity_hash: firecracker_runtime::PinnedArtifact
+pub firecracker_runtime::RuntimeConfig::veritysetup: firecracker_runtime::PinnedArtifact
+pub firecracker_runtime::RuntimeConfig::vsock: firecracker_runtime::VsockConfig
+pub firecracker_runtime::RuntimeConfig::workspace: firecracker_runtime::WorkspaceConfig
+impl firecracker_runtime::RuntimeConfig
+pub fn firecracker_runtime::RuntimeConfig::snapshot_fingerprint(&self) -> firecracker_runtime::Sha256Digest
+pub fn firecracker_runtime::RuntimeConfig::validate(&self) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub struct firecracker_runtime::RuntimeInstance
+impl firecracker_runtime::RuntimeInstance
+pub const fn firecracker_runtime::RuntimeInstance::identities(&self) -> core::option::Option<&firecracker_runtime::IdentityBundle>
+pub fn firecracker_runtime::RuntimeInstance::mapper_name(&self) -> &str
+pub const fn firecracker_runtime::RuntimeInstance::policy_digest(&self) -> core::option::Option<authority_core::policy::AuthorityPolicyDigest>
+pub const fn firecracker_runtime::RuntimeInstance::state(&self) -> firecracker_runtime::RuntimeState
+pub fn firecracker_runtime::RuntimeInstance::workspace(&self) -> &std::path::Path
+pub struct firecracker_runtime::SeccompConfig
+pub firecracker_runtime::SeccompConfig::blocked_syscalls: alloc::vec::Vec<alloc::string::String>
+pub firecracker_runtime::SeccompConfig::filter: firecracker_runtime::PinnedArtifact
+pub struct firecracker_runtime::Sha256Digest(_)
+impl firecracker_runtime::Sha256Digest
+pub const fn firecracker_runtime::Sha256Digest::as_bytes(self) -> [u8; 32]
+pub const fn firecracker_runtime::Sha256Digest::from_bytes([u8; 32]) -> Self
+pub fn firecracker_runtime::Sha256Digest::from_hex(&str) -> core::result::Result<Self, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::Sha256Digest::to_hex(self) -> alloc::string::String
+pub struct firecracker_runtime::Snapshot
+pub firecracker_runtime::Snapshot::artifact_fingerprint: firecracker_runtime::Sha256Digest
+pub firecracker_runtime::Snapshot::memory_digest: firecracker_runtime::Sha256Digest
+pub firecracker_runtime::Snapshot::memory_path: std::path::PathBuf
+pub firecracker_runtime::Snapshot::snapshot_digest: firecracker_runtime::Sha256Digest
+pub firecracker_runtime::Snapshot::snapshot_path: std::path::PathBuf
+impl firecracker_runtime::Snapshot
+pub fn firecracker_runtime::Snapshot::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, firecracker_runtime::Sha256Digest, firecracker_runtime::Sha256Digest, firecracker_runtime::Sha256Digest, alloc::vec::Vec<firecracker_runtime::IdentityId>) -> Self
+pub struct firecracker_runtime::SystemIdentitySource
+impl firecracker_runtime::IdentitySource for firecracker_runtime::SystemIdentitySource
+pub fn firecracker_runtime::SystemIdentitySource::generate(&mut self) -> core::result::Result<firecracker_runtime::IdentityId, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::SystemIdentitySource::guest_control_challenge(&mut self, &firecracker_runtime::IdentityBundle) -> core::result::Result<firecracker_runtime::IdentityId, firecracker_runtime::RuntimeError>
+pub struct firecracker_runtime::UnixApiClient
+impl firecracker_runtime::UnixApiClient
+pub fn firecracker_runtime::UnixApiClient::new(impl core::convert::Into<std::path::PathBuf>) -> core::result::Result<Self, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::UnixApiClient::socket_path(&self) -> &std::path::Path
+pub fn firecracker_runtime::UnixApiClient::with_timeout(self, core::time::Duration) -> core::result::Result<Self, firecracker_runtime::RuntimeError>
+impl firecracker_runtime::ApiClient for firecracker_runtime::UnixApiClient
+pub fn firecracker_runtime::UnixApiClient::request(&mut self, &firecracker_runtime::ApiRequest) -> core::result::Result<firecracker_runtime::ApiResponse, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::UnixApiClient::verify_restore_resources(&mut self, &std::path::Path, &std::path::Path, u32) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub struct firecracker_runtime::VerifiedSnapshot
+impl firecracker_runtime::VerifiedSnapshot
+pub const fn firecracker_runtime::VerifiedSnapshot::artifact_fingerprint(&self) -> firecracker_runtime::Sha256Digest
+pub fn firecracker_runtime::VerifiedSnapshot::memory_path(&self) -> &std::path::Path
+pub fn firecracker_runtime::VerifiedSnapshot::snapshot_path(&self) -> &std::path::Path
+pub struct firecracker_runtime::VsockConfig
+pub firecracker_runtime::VsockConfig::guest_cid: u32
+pub firecracker_runtime::VsockConfig::uds_path: std::path::PathBuf
+pub struct firecracker_runtime::WorkspaceConfig
+pub firecracker_runtime::WorkspaceConfig::clone_id: alloc::string::String
+pub firecracker_runtime::WorkspaceConfig::clone_root: std::path::PathBuf
+pub firecracker_runtime::WorkspaceConfig::image: firecracker_runtime::WorkspaceImageConfig
+pub firecracker_runtime::WorkspaceConfig::source: std::path::PathBuf
+impl firecracker_runtime::WorkspaceConfig
+pub fn firecracker_runtime::WorkspaceConfig::clone_path(&self) -> std::path::PathBuf
+pub fn firecracker_runtime::WorkspaceConfig::image_path(&self) -> std::path::PathBuf
+pub struct firecracker_runtime::WorkspaceImageConfig
+pub firecracker_runtime::WorkspaceImageConfig::formatter: firecracker_runtime::PinnedArtifact
+pub firecracker_runtime::WorkspaceImageConfig::size_bytes: u64
+pub const firecracker_runtime::MAX_ARTIFACT_BYTES: u64
+pub const firecracker_runtime::MAX_COMMAND_OUTPUT_BYTES: usize
+pub const firecracker_runtime::MAX_HTTP_BODY_BYTES: usize
+pub const firecracker_runtime::MAX_MANAGED_CHILDREN: usize
+pub const firecracker_runtime::MAX_SNAPSHOT_FILE_BYTES: u64
+pub const firecracker_runtime::MAX_WORKSPACE_BYTES: u64
+pub const firecracker_runtime::MAX_WORKSPACE_DEPTH: usize
+pub const firecracker_runtime::MAX_WORKSPACE_ENTRIES: usize
+pub const firecracker_runtime::MAX_WORKSPACE_IMAGE_BYTES: u64
+pub const firecracker_runtime::MIN_WORKSPACE_IMAGE_BYTES: u64
+pub const firecracker_runtime::REQUIRED_GUEST_INIT: &str
+pub trait firecracker_runtime::ApiClient
+pub fn firecracker_runtime::ApiClient::request(&mut self, &firecracker_runtime::ApiRequest) -> core::result::Result<firecracker_runtime::ApiResponse, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::ApiClient::verify_restore_resources(&mut self, &std::path::Path, &std::path::Path, u32) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+impl firecracker_runtime::ApiClient for firecracker_runtime::FirecrackerVsockApiClient
+pub fn firecracker_runtime::FirecrackerVsockApiClient::request(&mut self, &firecracker_runtime::ApiRequest) -> core::result::Result<firecracker_runtime::ApiResponse, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FirecrackerVsockApiClient::verify_restore_resources(&mut self, &std::path::Path, &std::path::Path, u32) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+impl firecracker_runtime::ApiClient for firecracker_runtime::UnixApiClient
+pub fn firecracker_runtime::UnixApiClient::request(&mut self, &firecracker_runtime::ApiRequest) -> core::result::Result<firecracker_runtime::ApiResponse, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::UnixApiClient::verify_restore_resources(&mut self, &std::path::Path, &std::path::Path, u32) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub trait firecracker_runtime::CommandRunner
+pub fn firecracker_runtime::CommandRunner::run(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::CommandOutput, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::CommandRunner::start(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::CommandRunner::start_owned(&mut self, &firecracker_runtime::CommandSpec, &firecracker_runtime::ProcessOwnership) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::CommandRunner::stop(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::CommandRunner::verify_running(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::CommandRunner::verify_verity(&mut self, &firecracker_runtime::PinnedArtifact, &firecracker_runtime::DmVerityConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+impl firecracker_runtime::CommandRunner for firecracker_runtime::RealCommandRunner
+pub fn firecracker_runtime::RealCommandRunner::run(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::CommandOutput, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::start(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::start_owned(&mut self, &firecracker_runtime::CommandSpec, &firecracker_runtime::ProcessOwnership) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::stop(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::verify_running(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::verify_verity(&mut self, &firecracker_runtime::PinnedArtifact, &firecracker_runtime::DmVerityConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub trait firecracker_runtime::FileSystem
+pub fn firecracker_runtime::FileSystem::bind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FileSystem::clone_workspace(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FileSystem::create_workspace_image(&mut self, &std::path::Path, &std::path::Path, u64) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FileSystem::digest(&mut self, &std::path::Path) -> core::result::Result<firecracker_runtime::Sha256Digest, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FileSystem::read(&mut self, &std::path::Path) -> core::result::Result<alloc::vec::Vec<u8>, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FileSystem::remove_workspace(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FileSystem::unbind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FileSystem::verify_block_device_binding(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+impl firecracker_runtime::FileSystem for firecracker_runtime::RealFileSystem
+pub fn firecracker_runtime::RealFileSystem::bind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::clone_workspace(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::create_workspace_image(&mut self, &std::path::Path, &std::path::Path, u64) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::digest(&mut self, &std::path::Path) -> core::result::Result<firecracker_runtime::Sha256Digest, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::read(&mut self, &std::path::Path) -> core::result::Result<alloc::vec::Vec<u8>, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::remove_workspace(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::unbind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::verify_block_device_binding(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub trait firecracker_runtime::IdentitySource
+pub fn firecracker_runtime::IdentitySource::generate(&mut self) -> core::result::Result<firecracker_runtime::IdentityId, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::IdentitySource::guest_control_challenge(&mut self, &firecracker_runtime::IdentityBundle) -> core::result::Result<firecracker_runtime::IdentityId, firecracker_runtime::RuntimeError>
+impl firecracker_runtime::IdentitySource for firecracker_runtime::SystemIdentitySource
+pub fn firecracker_runtime::SystemIdentitySource::generate(&mut self) -> core::result::Result<firecracker_runtime::IdentityId, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::SystemIdentitySource::guest_control_challenge(&mut self, &firecracker_runtime::IdentityBundle) -> core::result::Result<firecracker_runtime::IdentityId, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::firecracker_guest_port_path(impl core::convert::AsRef<std::path::Path>, u32) -> core::result::Result<std::path::PathBuf, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::sha256(&[u8]) -> firecracker_runtime::Sha256Digest

@@ -657,7 +657,9 @@ fn validate_procfs_identity(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("reading guest PID 1 namespace identity: {error}"))?;
     if self_namespace != init_namespace {
         return Err(format!(
-            "guest procfs exposes PID 1 from a different namespace ({init_namespace:?}) than the supervisor ({self_namespace:?})"
+            "guest procfs exposes PID 1 from a different namespace ({}) than the supervisor ({})",
+            init_namespace.display(),
+            self_namespace.display()
         ));
     }
     Ok(())

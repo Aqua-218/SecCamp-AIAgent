@@ -79,7 +79,7 @@ frame の境界は [transport 契約](../egress-broker/transport.md)、operation
 ## 特に注意する点
 
 - `SessionReplayGuard` の `capacity` は **session の生涯合計** であって窓ではない。`accepted` は挿入されるだけで、eviction も expiry も無い。使い切ると session は永久に固着する。実質的に「1 session が発行できる Broker request の最大数」を決めている。
-- `SessionReplayGuard` は payload hash が payload を hash したものかを検証しない。`BrokerEnvelope::new` は `pub const` で任意の 32 bytes を受ける。binding は `cbor.rs` の 1 箇所でしか強制されない。
+- `BrokerEnvelope::from_canonical_payload` は wire payload から hash を導出し、`SessionReplayGuard::accept_payload` は受理前に payload/hash binding を再検査する。raw hash constructor と payload 無しの admission は crate-private なので、外部 transport が payload と digest を別々に組み立てることはできない。production Broker も decoder の exact payload を再検査する。
 - restore で新しい `BrokerSessionId` を取ることは、この crate では強制していない。`SessionReplayGuard::new` は無条件に sequence を 0 に戻し、table を空にする。古い session ID を再利用すると、全 sequence と全 request ID が replay に開く。
 - `SessionBudget::start` が拒否するのは**現在 active な** request ID だけ。`complete` や `abort` の後は同じ ID が再び使える。session 全体での一意性は replay guard だけが持つ。
 - `SessionBudgetLimits::response_bytes` は `NonZeroU64` ではない。他 2 つと違って 0 が合法。

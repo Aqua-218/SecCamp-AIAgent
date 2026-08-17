@@ -20,6 +20,7 @@ use std::{
     fmt, io,
     os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use authority_core::capability::SubjectId;
@@ -27,7 +28,8 @@ use rustix::{
     fs::{AtFlags, CWD, Mode, chmodat},
     net::{
         AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType, accept, bind,
-        listen, recv, send, socket_with, sockopt::socket_peercred,
+        listen, recv, send, socket_with,
+        sockopt::{self, socket_peercred},
     },
 };
 
@@ -130,13 +132,87 @@ impl fmt::Display for CredentialResolveError {
 
 impl Error for CredentialResolveError {}
 
+/// Default receive deadline applied to every accepted production control socket.
+pub const DEFAULT_CONTROL_RECEIVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default send deadline applied to every accepted production control socket.
+pub const DEFAULT_CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum listen backlog accepted by the control listener.
+pub const MAX_CONTROL_SOCKET_BACKLOG: i32 = 128;
+/// Maximum receive or send timeout accepted by the control listener policy.
+pub const MAX_CONTROL_SOCKET_TIMEOUT: Duration = Duration::from_secs(300);
+/// Maximum number of simultaneously authenticated control connections.
+pub const MAX_CONTROL_CONNECTION_BINDINGS: usize = 4_096;
+
+/// Which accepted-socket operation a timeout policy configures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlSocketTimeoutKind {
+    /// The peer-to-supervisor receive operation.
+    Receive,
+    /// The supervisor-to-peer send operation.
+    Send,
+}
+
+/// Receive and send deadlines applied to every accepted control connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlSocketTimeouts {
+    receive: Duration,
+    send: Duration,
+}
+
+impl ControlSocketTimeouts {
+    /// Creates a timeout policy. Values are validated when a listener is bound.
+    #[must_use]
+    pub const fn new(receive: Duration, send: Duration) -> Self {
+        Self { receive, send }
+    }
+
+    /// Creates and validates a timeout policy before a listener is bound.
+    pub fn try_new(receive: Duration, send: Duration) -> Result<Self, ControlSocketError> {
+        let timeouts = Self::new(receive, send);
+        timeouts.validate().map(|()| timeouts)
+    }
+
+    /// Returns the bounded peer-to-supervisor receive deadline.
+    #[must_use]
+    pub const fn receive(self) -> Duration {
+        self.receive
+    }
+
+    /// Returns the bounded supervisor-to-peer send deadline.
+    #[must_use]
+    pub const fn send(self) -> Duration {
+        self.send
+    }
+
+    fn validate(self) -> Result<(), ControlSocketError> {
+        validate_timeout(self.receive, ControlSocketTimeoutKind::Receive)?;
+        validate_timeout(self.send, ControlSocketTimeoutKind::Send)
+    }
+}
+
+impl Default for ControlSocketTimeouts {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_CONTROL_RECEIVE_TIMEOUT,
+            DEFAULT_CONTROL_SEND_TIMEOUT,
+        )
+    }
+}
+
 /// Production resolver that binds each accepted connection to exactly one subject.
 ///
 /// A binding is created by the listener that accepted the connection, so the subject is a
 /// property of which socket the peer connected to, never of anything the peer sent.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct SubjectCredentialResolver {
     bindings: BTreeMap<u64, (SubjectId, SubjectCredential)>,
+    next_socket_id: u64,
+}
+
+impl Default for SubjectCredentialResolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SubjectCredentialResolver {
@@ -145,7 +221,26 @@ impl SubjectCredentialResolver {
     pub const fn new() -> Self {
         Self {
             bindings: BTreeMap::new(),
+            next_socket_id: 0,
         }
+    }
+
+    fn allocate(
+        &mut self,
+        subject: SubjectId,
+        credential: SubjectCredential,
+    ) -> Result<u64, ControlSocketError> {
+        if self.bindings.len() >= MAX_CONTROL_CONNECTION_BINDINGS {
+            return Err(ControlSocketError::BindingCapacityExceeded);
+        }
+        let socket_id = self.next_socket_id;
+        self.next_socket_id = self
+            .next_socket_id
+            .checked_add(1)
+            .ok_or(ControlSocketError::SocketIdExhausted)?;
+        self.bind(socket_id, subject, credential)
+            .map_err(ControlSocketError::Rebind)?;
+        Ok(socket_id)
     }
 
     /// Binds one accepted connection to the subject that owns its listening socket.
@@ -214,8 +309,22 @@ pub enum ControlSocketError {
     Io(io::Error),
     /// The listening path is not an absolute path the supervisor may own.
     InvalidPath(PathBuf),
+    /// The listen backlog is outside the positive hard cap.
+    InvalidBacklog {
+        /// Caller-supplied backlog.
+        requested: i32,
+    },
+    /// A receive or send timeout is zero or exceeds the hard cap.
+    InvalidTimeout {
+        /// Operation whose timeout is invalid.
+        kind: ControlSocketTimeoutKind,
+        /// Caller-supplied timeout.
+        requested: Duration,
+    },
     /// Accepted socket identities are exhausted for this listener.
     SocketIdExhausted,
+    /// The process-wide authenticated connection table reached its hard cap.
+    BindingCapacityExceeded,
     /// The accepted connection is already bound, which cannot happen for a fresh identity.
     Rebind(ConnectionRebindError),
     /// One datagram exceeded the bounded wire request size.
@@ -225,6 +334,10 @@ pub enum ControlSocketError {
     },
     /// The peer closed the connection instead of sending a request.
     PeerClosed,
+    /// The bounded receive deadline expired without a datagram.
+    ReceiveTimeout,
+    /// The bounded send deadline expired before the reply was accepted.
+    SendTimeout,
     /// The bounded request could not be decoded.
     Decode(WireDecodeError),
     /// The bounded reply could not be encoded.
@@ -240,9 +353,21 @@ impl fmt::Display for ControlSocketError {
                 "control socket path must be absolute and lexical: {}",
                 path.display()
             ),
+            Self::InvalidBacklog { requested } => write!(
+                formatter,
+                "control socket backlog {requested} must be between 1 and {MAX_CONTROL_SOCKET_BACKLOG}"
+            ),
+            Self::InvalidTimeout { kind, requested } => write!(
+                formatter,
+                "control socket {kind:?} timeout {requested:?} must be non-zero and at most {MAX_CONTROL_SOCKET_TIMEOUT:?}"
+            ),
             Self::SocketIdExhausted => {
-                formatter.write_str("control listener exhausted its accepted socket identities")
+                formatter.write_str("control resolver exhausted its accepted socket identities")
             }
+            Self::BindingCapacityExceeded => write!(
+                formatter,
+                "control resolver reached its {MAX_CONTROL_CONNECTION_BINDINGS}-connection cap"
+            ),
             Self::Rebind(error) => error.fmt(formatter),
             Self::RequestTooLarge { received } => write!(
                 formatter,
@@ -251,6 +376,10 @@ impl fmt::Display for ControlSocketError {
             Self::PeerClosed => {
                 formatter.write_str("control peer closed the connection before sending a request")
             }
+            Self::ReceiveTimeout => formatter
+                .write_str("control peer did not send a request before the receive deadline"),
+            Self::SendTimeout => formatter
+                .write_str("control peer did not accept the reply before the send deadline"),
             Self::Decode(error) => error.fmt(formatter),
             Self::Encode(message) => {
                 write!(formatter, "control reply could not be encoded: {message}")
@@ -266,9 +395,14 @@ impl Error for ControlSocketError {
             Self::Rebind(error) => Some(error),
             Self::Decode(error) => Some(error),
             Self::InvalidPath(_)
+            | Self::InvalidBacklog { .. }
+            | Self::InvalidTimeout { .. }
             | Self::SocketIdExhausted
+            | Self::BindingCapacityExceeded
             | Self::RequestTooLarge { .. }
             | Self::PeerClosed
+            | Self::ReceiveTimeout
+            | Self::SendTimeout
             | Self::Encode(_) => None,
         }
     }
@@ -277,6 +411,57 @@ impl Error for ControlSocketError {
 impl From<rustix::io::Errno> for ControlSocketError {
     fn from(error: rustix::io::Errno) -> Self {
         Self::Io(io::Error::from(error))
+    }
+}
+
+fn validate_backlog(backlog: i32) -> Result<(), ControlSocketError> {
+    if (1..=MAX_CONTROL_SOCKET_BACKLOG).contains(&backlog) {
+        Ok(())
+    } else {
+        Err(ControlSocketError::InvalidBacklog { requested: backlog })
+    }
+}
+
+fn validate_timeout(
+    timeout: Duration,
+    kind: ControlSocketTimeoutKind,
+) -> Result<(), ControlSocketError> {
+    if !timeout.is_zero() && timeout <= MAX_CONTROL_SOCKET_TIMEOUT {
+        Ok(())
+    } else {
+        Err(ControlSocketError::InvalidTimeout {
+            kind,
+            requested: timeout,
+        })
+    }
+}
+
+fn apply_socket_timeouts(
+    socket: &OwnedFd,
+    timeouts: ControlSocketTimeouts,
+) -> Result<(), ControlSocketError> {
+    sockopt::set_socket_timeout(socket, sockopt::Timeout::Recv, Some(timeouts.receive()))?;
+    sockopt::set_socket_timeout(socket, sockopt::Timeout::Send, Some(timeouts.send()))?;
+    Ok(())
+}
+
+fn is_timeout_errno(error: rustix::io::Errno) -> bool {
+    error == rustix::io::Errno::AGAIN || error == rustix::io::Errno::WOULDBLOCK
+}
+
+fn receive_error(error: rustix::io::Errno) -> ControlSocketError {
+    if is_timeout_errno(error) {
+        ControlSocketError::ReceiveTimeout
+    } else {
+        ControlSocketError::Io(io::Error::from(error))
+    }
+}
+
+fn send_error(error: rustix::io::Errno) -> ControlSocketError {
+    if is_timeout_errno(error) {
+        ControlSocketError::SendTimeout
+    } else {
+        ControlSocketError::Io(io::Error::from(error))
     }
 }
 
@@ -290,7 +475,7 @@ pub struct SubjectControlListener {
     path: PathBuf,
     subject: SubjectId,
     credential: SubjectCredential,
-    next_socket_id: u64,
+    timeouts: ControlSocketTimeouts,
 }
 
 impl SubjectControlListener {
@@ -309,10 +494,33 @@ impl SubjectControlListener {
         credential: SubjectCredential,
         backlog: i32,
     ) -> Result<Self, ControlSocketError> {
+        Self::bind_with_timeouts(
+            path,
+            subject,
+            credential,
+            backlog,
+            ControlSocketTimeouts::default(),
+        )
+    }
+
+    /// Binds an owner-only control socket with explicit accepted-peer deadlines.
+    ///
+    /// This constructor is useful for deterministic tests and for deployments that need a
+    /// shorter or longer bounded peer budget. Production callers should normally use [`Self::bind`]
+    /// so the documented defaults remain visible at the call site.
+    pub fn bind_with_timeouts(
+        path: impl Into<PathBuf>,
+        subject: SubjectId,
+        credential: SubjectCredential,
+        backlog: i32,
+        timeouts: ControlSocketTimeouts,
+    ) -> Result<Self, ControlSocketError> {
         let path = path.into();
         if !path.is_absolute() || path.components().count() < 2 {
             return Err(ControlSocketError::InvalidPath(path));
         }
+        validate_backlog(backlog)?;
+        timeouts.validate()?;
         let address = SocketAddrUnix::new(&path)
             .map_err(|_| ControlSocketError::InvalidPath(path.clone()))?;
         let socket = socket_with(
@@ -330,7 +538,7 @@ impl SubjectControlListener {
             path,
             subject,
             credential,
-            next_socket_id: 0,
+            timeouts,
         })
     }
 
@@ -362,20 +570,14 @@ impl SubjectControlListener {
     ) -> Result<AcceptedControlConnection, ControlSocketError> {
         let socket = accept(&self.socket)?;
         let peer = socket_peercred(&socket)?;
-        let socket_id = self.next_socket_id;
-        self.next_socket_id = self
-            .next_socket_id
-            .checked_add(1)
-            .ok_or(ControlSocketError::SocketIdExhausted)?;
+        apply_socket_timeouts(&socket, self.timeouts)?;
+        let socket_id = resolver.allocate(self.subject.clone(), self.credential)?;
         let identity = ConnectionIdentity::new(
             socket_id,
             peer.pid.as_raw_nonzero().get().unsigned_abs(),
             peer.uid.as_raw(),
             peer.gid.as_raw(),
         );
-        resolver
-            .bind(socket_id, self.subject.clone(), self.credential)
-            .map_err(ControlSocketError::Rebind)?;
         Ok(AcceptedControlConnection { identity, socket })
     }
 }
@@ -406,7 +608,9 @@ impl AcceptedControlConnection {
     pub fn receive_request(&self) -> Result<WireRequest, ControlSocketError> {
         // One byte past the bound distinguishes "exactly at the bound" from "truncated".
         let mut buffer = [0_u8; MAX_WIRE_REQUEST_BYTES + 1];
-        let received = recv(self.socket.as_fd(), &mut buffer[..], RecvFlags::empty())?.0;
+        let received = recv(self.socket.as_fd(), &mut buffer[..], RecvFlags::empty())
+            .map_err(receive_error)?
+            .0;
         if received == 0 {
             return Err(ControlSocketError::PeerClosed);
         }
@@ -429,7 +633,7 @@ impl AcceptedControlConnection {
         let encoded = response
             .encode()
             .map_err(|error| ControlSocketError::Encode(error.to_string()))?;
-        let sent = send(self.socket.as_fd(), &encoded, SendFlags::empty())?;
+        let sent = send(self.socket.as_fd(), &encoded, SendFlags::empty()).map_err(send_error)?;
         if sent != encoded.len() {
             return Err(ControlSocketError::Io(io::Error::other(
                 "control reply was partially sent",
@@ -445,8 +649,10 @@ mod tests {
     use authority_core::handle::HandleId;
     use rustix::net::connect;
     use std::{
+        os::fd::OwnedFd,
         sync::atomic::{AtomicU64, Ordering},
         thread,
+        time::Duration,
     };
 
     fn socket_path(label: &str) -> PathBuf {
@@ -468,6 +674,12 @@ mod tests {
     }
 
     fn connect_and_send(path: &Path, payload: &[u8]) {
+        let client = connect_client(path);
+        rustix::net::send(&client, payload, rustix::net::SendFlags::empty())
+            .expect("test client must send one datagram");
+    }
+
+    fn connect_client(path: &Path) -> OwnedFd {
         let address = SocketAddrUnix::new(path).expect("test address must encode");
         let client = socket_with(
             AddressFamily::UNIX,
@@ -477,8 +689,7 @@ mod tests {
         )
         .expect("test client socket must be creatable");
         connect(&client, &address).expect("test client must connect");
-        rustix::net::send(&client, payload, rustix::net::SendFlags::empty())
-            .expect("test client must send one datagram");
+        client
     }
 
     #[test]
@@ -614,6 +825,45 @@ mod tests {
     }
 
     #[test]
+    fn resolver_rebind_failure_drops_accepted_socket_and_listener_remains_usable() {
+        let path = socket_path("rebind-cleanup");
+        let mut listener =
+            SubjectControlListener::bind(&path, SubjectId::new("subject-a"), self_credential(), 4)
+                .expect("listener must bind");
+        let mut resolver = SubjectCredentialResolver::new();
+        resolver
+            .bind(0, SubjectId::new("subject-a"), self_credential())
+            .expect("fixture binding must occupy the first identity");
+
+        let first_client = connect_client(&path);
+        assert!(matches!(
+            listener.accept(&mut resolver),
+            Err(ControlSocketError::Rebind(ConnectionRebindError {
+                socket_id: 0
+            }))
+        ));
+        drop(first_client);
+        assert_eq!(
+            resolver.release(0).as_ref().map(SubjectId::as_str),
+            Some("subject-a")
+        );
+
+        let encoded = WireRequest::CloseSubject {
+            claimed_subject: SubjectId::new("subject-a"),
+        }
+        .encode()
+        .expect("request must encode");
+        let client_path = path.clone();
+        let client = thread::spawn(move || connect_and_send(&client_path, &encoded));
+        let connection = listener
+            .accept(&mut resolver)
+            .expect("listener must remain usable after resolver rejection");
+        assert_eq!(connection.identity().socket_id(), 1);
+        client.join().expect("test client must finish");
+        drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
     fn listener_rejects_paths_it_cannot_own() {
         for path in ["relative/control.sock", "/"] {
             assert!(matches!(
@@ -626,6 +876,108 @@ mod tests {
                 Err(ControlSocketError::InvalidPath(_))
             ));
         }
+    }
+
+    #[test]
+    fn listener_rejects_zero_negative_and_excessive_backlogs() {
+        let path = socket_path("backlog");
+        for backlog in [0, -1, MAX_CONTROL_SOCKET_BACKLOG + 1] {
+            assert!(matches!(
+                SubjectControlListener::bind(
+                    &path,
+                    SubjectId::new("subject-a"),
+                    self_credential(),
+                    backlog,
+                ),
+                Err(ControlSocketError::InvalidBacklog { requested })
+                    if requested == backlog
+            ));
+            assert!(!path.exists(), "invalid backlog must not create a socket");
+        }
+    }
+
+    #[test]
+    fn listener_rejects_zero_and_excessive_timeouts_before_socket_creation() {
+        let path = socket_path("timeout-config");
+        for timeouts in [
+            ControlSocketTimeouts::new(Duration::ZERO, Duration::from_secs(1)),
+            ControlSocketTimeouts::new(
+                Duration::from_secs(1),
+                MAX_CONTROL_SOCKET_TIMEOUT + Duration::from_nanos(1),
+            ),
+        ] {
+            assert!(matches!(
+                SubjectControlListener::bind_with_timeouts(
+                    &path,
+                    SubjectId::new("subject-a"),
+                    self_credential(),
+                    4,
+                    timeouts,
+                ),
+                Err(ControlSocketError::InvalidTimeout { .. })
+            ));
+            assert!(!path.exists(), "invalid timeout must not create a socket");
+        }
+    }
+
+    #[test]
+    fn idle_peer_receive_timeout_is_typed_and_bounded() {
+        let path = socket_path("receive-timeout");
+        let mut listener = SubjectControlListener::bind_with_timeouts(
+            &path,
+            SubjectId::new("subject-a"),
+            self_credential(),
+            4,
+            ControlSocketTimeouts::new(Duration::from_millis(1), Duration::from_secs(1)),
+        )
+        .expect("listener must bind");
+        let client = connect_client(&path);
+        let mut resolver = SubjectCredentialResolver::new();
+        let connection = listener.accept(&mut resolver).expect("accept must succeed");
+        assert!(matches!(
+            connection.receive_request(),
+            Err(ControlSocketError::ReceiveTimeout)
+        ));
+        drop(client);
+        drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
+    fn blocked_peer_send_timeout_is_typed_and_bounded() {
+        let path = socket_path("send-timeout");
+        let mut listener = SubjectControlListener::bind_with_timeouts(
+            &path,
+            SubjectId::new("subject-a"),
+            self_credential(),
+            4,
+            ControlSocketTimeouts::new(Duration::from_secs(1), Duration::from_millis(1)),
+        )
+        .expect("listener must bind");
+        let client = connect_client(&path);
+        let mut resolver = SubjectCredentialResolver::new();
+        let connection = listener.accept(&mut resolver).expect("accept must succeed");
+
+        let filler = [0_u8; 4096];
+        let mut socket_send_timed_out = false;
+        for _ in 0..4096 {
+            match send(connection.socket.as_fd(), &filler, SendFlags::empty()) {
+                Ok(_) => {}
+                Err(error) if is_timeout_errno(error) => {
+                    socket_send_timed_out = true;
+                    break;
+                }
+                Err(error) => panic!("filler send failed unexpectedly: {error}"),
+            }
+        }
+        assert!(socket_send_timed_out, "fixture peer must stop reading");
+        assert!(matches!(
+            connection.send_response(WireResponse::Refused(
+                crate::protocol::RefusalCode::NotPermitted
+            )),
+            Err(ControlSocketError::SendTimeout)
+        ));
+        drop(client);
+        drop(std::fs::remove_file(&path));
     }
 
     #[test]

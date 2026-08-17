@@ -29,6 +29,149 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  miri:
+    name: Miri undefined-behaviour check / ${{ matrix.package }} / ${{ matrix.filter }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - package: authority-core
+            filter: "capability::tests"
+          - package: authority-core
+            filter: "file::tests"
+          - package: authority-core
+            filter: "github::tests"
+          - package: authority-core
+            filter: "http::tests"
+          - package: authority-core
+            filter: "path::tests"
+          - package: authority-core
+            filter: "policy::tests"
+          - package: authority-core
+            filter: "repository::tests"
+          - package: authority-core
+            filter: "state::tests"
+          - package: authority-core
+            filter: "time::tests"
+          - package: egress-protocol
+            filter: "budget::tests"
+          - package: egress-protocol
+            filter: "cbor::tests"
+          - package: egress-protocol
+            filter: "frame::tests"
+          - package: egress-protocol
+            filter: "operation::tests"
+          - package: egress-protocol
+            filter: "session::tests"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust and pinned nightly components
+        uses: ./.github/actions/setup-rust
+        with:
+          tool-groups: miri
+      - name: Run the supported pure Miri test subset
+        run: scripts/ci/run.sh miri "${{ matrix.package }}" "${{ matrix.filter }}"
+
+  sanitizers:
+    name: Sanitizer run / ${{ matrix.mode }} / ${{ matrix.package }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: address
+            package: egress-protocol
+          - mode: leak
+            package: egress-protocol
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust and pinned nightly components
+        uses: ./.github/actions/setup-rust
+        with:
+          tool-groups: sanitizers
+      - name: Run the instrumented protocol test binary
+        run: scripts/ci/run.sh sanitizers "${{ matrix.mode }}" "${{ matrix.package }}"
+
+  mutation:
+    name: Mutation testing / shard ${{ matrix.shard }} / ${{ matrix.package }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 1
+            package: authority-core
+          - shard: 2
+            package: egress-protocol
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust and cargo-mutants
+        uses: ./.github/actions/setup-rust
+        with:
+          tool-groups: mutation
+      - name: Run the bounded decision-kernel mutation selection
+        run: scripts/ci/run.sh mutation "${{ matrix.shard }}" "${{ matrix.package }}"
+
+  fuzz:
+    name: Fuzz targets / ${{ matrix.package }} / ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - package: egress-protocol
+            target: frame_decode
+          - package: egress-protocol
+            target: cbor_request_decode
+          - package: authority-core
+            target: canonical_path
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust, nightly, and cargo-fuzz
+        uses: ./.github/actions/setup-rust
+        with:
+          tool-groups: fuzz
+      - name: Fuzz the bounded parser target
+        run: scripts/ci/run.sh fuzz "${{ matrix.package }}" "${{ matrix.target }}"
+
+  benchmarks:
+    name: Benchmark regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Run the capability decision benchmark against its baseline
+        run: scripts/ci/run.sh benchmarks
+
   real_vm:
     name: Real Firecracker VM verification
     # Requires /dev/kvm, /dev/vhost-vsock, and veritysetup. Runner labels are
@@ -66,6 +209,11 @@ jobs:
     name: Deep verification complete
     if: ${{ always() }}
     needs:
+      - miri
+      - sanitizers
+      - mutation
+      - fuzz
+      - benchmarks
       - real_vm
       - privileged_isolation
     runs-on: ubuntu-24.04

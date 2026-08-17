@@ -67,7 +67,7 @@ authority 照合が DNS 再解決より前にある。authority 外への redire
 
 - redirect chain の全 hop が同じ authority の範囲に収まる必要がある。`docs.example` の authority で `cdn.example` へ redirect する host は取得できない。公開 web では珍しくない構成なので、実運用で当たる可能性がある。当たった場合は authority に host を追加するのであって、redirect の検査を緩めない。
 - reqwest の設定 1 つ（redirect policy を default に戻す）で、この決定が全部無効になる。設定が正しいことを test で固定していない。
-- DNS rebinding は `redirect_re_resolves_and_rejects_dns_rebinding_to_private_address` で、fake resolver が 2 回目に別の答えを返す経路までは確認している。実ネットワーク上では未検証。
+- DNS rebindingはfake resolver testに加え、privileged HTTPS gateが制御DNSのanswer切替、system resolver、redirect後の再解決、検査済みaddressへの接続を実socketで確認する。外部authoritative DNS／recursive cacheの全挙動までは対象外である。
 - `Location` の検査規則は `CanonicalUrlPath` と同じ。percent encoding と path 正規化を含む形は拒否する。両者がずれると redirect だけ通る path ができるので、[ADR 0001](0001-limit-path-patterns-to-exact-and-prefix.md) の segment 比較と同じ規則を共有している。
 - [ADR 0009](0009-reject-the-whole-dns-answer-on-any-non-public-address.md) と組で機能する。この決定だけでは、再解決した応答をどう検査するかが決まらない。
 

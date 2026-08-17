@@ -62,7 +62,7 @@ directory listing は cookie で位置を保持する。listing の途中で cre
 - `ObjectId` を引いてから現在 path を得る手順が、read ごとに走る。registry の lock 契約がこの頻度で呼ばれる前提になっている。
 - revoke の意味が「今から効く」になった。open handle の寿命に縛られない。
 - FUSE の `writeback_cache` や `auto_inval_data` といった最適化は使えない。将来これらを検討する場合、この ADR を `Superseded` にする必要がある。
-- 実 mount test はあるが、変更系 operation と revoke を同時に競合させる統合 test は無い。並行での実効性は未検証。
+- 実mountの`mounted_view_linearizes_backing_mutation_against_revoke`とhost concurrency gateが変更系operation／revokeのbounded raceを確認する。全scheduler interleavingを証明するものではない。
 
 ## 関連
 

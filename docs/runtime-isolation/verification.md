@@ -6,7 +6,7 @@
 
 > **対象読者:** runtime-isolation の実装者、レビュー担当者、特権環境で統合 test を回す人
 
-この crate の検証は 2 層ある。mock backend による順序制御・設定検査・BPF プログラムの形の確認と、実 kernel 上で 13 step を適用して境界を kernel に問い直す確認。前者だけでは「隔離が効いている」ことは言えないので、どちらの層で何が言えるのかを分けて書く。
+この crate の検証は 2 層ある。mock backend による順序制御・設定検査・BPF プログラムの形の確認と、実 kernel 上で 13 step を適用して境界を kernel に問い直す確認。guest 側には別に `guest-supervisor-init` → `LinuxHostResources` → `workload-isolation-launcher` の実装と opt-in Firecracker runtime-image test があるが、ここでの privileged probe とは別の証拠である。前者だけでは「隔離が効いている」ことは言えないので、どの層で何が言えるのかを分けて書く。
 
 ## local test で確認したこと
 
@@ -27,6 +27,8 @@
 | capability detection が不足理由を必ず添える | 実 host への query | `privileged_integration_prerequisites_are_reported_without_an_ignored_test` |
 
 test double は 1 つだけ。`IsolationBackend` を実装した記録型 mock が、呼ばれた step と順序を `Vec` に積む。この mock は syscall を一切呼ばず、失敗を注入するときも errno を捏造する。したがってこの層で言えるのは「順序と設定検査が仕様どおり」までで、`LinuxBackend` が kernel に何をさせるかは何も言えない。
+
+guest 起動側の protocol は別 crate の unit test で固定している。`supervisor/src/linux_host.rs` の `inherited_start_gate_accepts_only_its_socketpair_endpoint`、launcher の `start_gate_uses_exact_inherited_streams` / `exec_status_accepts_only_close_without_a_failure_marker`、PID 1 の readiness malformed/timeout tests が、他プロセスが pathname や任意 fd で gate を満たせないこと、exec failure を成功扱いしないこと、readiness を全 setup 後にだけ返すことを確認する。
 
 ## 特権環境で確認したこと
 
@@ -79,7 +81,7 @@ scripts/ci/verify-privileged-isolation.sh
 | unmount による rollback が実際に戻ること | 失敗を注入できたのは `Landlock` で、そこは `pivot_root` 後のため crate 自身が「戻せない」と申告する。確認できたのは cgroup の解放だけ | `Workspace` や `LimitedTmpfs` で失敗を注入し、child の mount namespace を外から観測する test |
 | 既に immutable な root を持つ guest 経路 (`rootfs.source == "/"`) | probe は staged rootfs 経路だけを通る。`/` 経路は `/run` と `/sys` の masking を含む別分岐 | 実 guest image を持つ VM 内での同等 probe |
 | workload を `execve` した後も境界が続くこと | probe は child 内で直接観測しており、exec を挟んでいない | 固定 workload binary を exec してから同じ観測を行う test |
-| 実 supervisor 経由の起動 | probe は `workload-isolation-launcher` ではなく API を直接使う。control channel と egress channel は `None` | 実 `AF_UNIX` control socket と `AF_VSOCK` egress fd を用意した統合 test |
+| privileged probe による実 supervisor 経由の起動 | host probe 自体は `workload-isolation-launcher` ではなく API を直接使う。別の opt-in KVM test は v2 guest gate、supervisor/launcher/Broker channel を通す | CapFS の全 effect と `Runtime::launch` lifecycle を同時に通す実KVM試験 |
 | x86_64 以外の syscall 番号 | `number()` が `None` を返すため `validate` が通らない | 対象 arch の番号表と、その arch での CI runner |
 
 mock test が全部通っても、VM 実起動や full isolation の完成とは判断しない。この方針は [docs/README.md](../README.md) の宣言に従う。特権 test が通ったことも、上の表の範囲を超えては主張しない。

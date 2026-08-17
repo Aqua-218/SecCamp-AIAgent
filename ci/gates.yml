@@ -5,7 +5,7 @@
 #
 #   scripts/ci/plan-pipeline.sh        decides which gates a given event must run
 #   scripts/ci/check-pipeline-parity.sh proves GitHub and GitLab both implement them
-#   scripts/ci/summarize-pipeline.sh   renders the executed plan into one report
+#   scripts/ci/check-gate-results.sh  reconciles the executed plan with results
 #
 # A gate that exists in a workflow but not here fails parity validation, and a
 # gate listed here that no platform implements fails it too. The manifest is the
@@ -20,6 +20,8 @@
 #   tier          fast | standard | deep
 #   scopes        Change scopes that make the gate relevant. A gate runs when any
 #                 of its scopes changed, or when the event carries no diff.
+#   events        Optional canonical pipeline events allowed to require this gate.
+#                 Omit for every event; an event outside this list is `skipped`.
 #   status        implemented | planned. See below; parity enforces both cases.
 #   github        GitHub Actions job id, or `null` when the platform cannot host it.
 #   gitlab        GitLab CI job name, or `null`.
@@ -60,7 +62,7 @@ tiers:
     description: >-
       Scheduled and manually dispatched only. Holds the nightly-toolchain gates,
       the KVM host gate, and the multi-minute analyses.
-    events: [schedule, workflow_dispatch]
+    events: [schedule, workflow_dispatch, web, api]
 
 # Change scopes. `plan-pipeline.sh` classifies every changed path into one or
 # more of these, and a gate runs when any of its declared scopes is present.
@@ -634,13 +636,72 @@ gates:
 
   # ------------------------------------------------------------------ system --
   - id: real_vm
-    title: Real Firecracker VM verification
+    title: Direct Firecracker guest-control verification
     stage: system
     tier: deep
     scopes: [rust]
     status: implemented
     github: real_vm
     gitlab: real_vm
+    workflow: deep.yml
+    include: deep.yml
+
+  - id: real_capfs
+    title: Real CapFS FUSE verification
+    stage: system
+    tier: deep
+    scopes: [rust]
+    status: implemented
+    github: real_capfs
+    gitlab: real_capfs
+    workflow: deep.yml
+    include: deep.yml
+
+  - id: real_runtime_lifecycle
+    title: Real Runtime lifecycle verification
+    stage: system
+    tier: deep
+    scopes: [rust]
+    status: implemented
+    github: real_runtime_lifecycle
+    gitlab: real_runtime_lifecycle
+    workflow: deep.yml
+    include: deep.yml
+
+  - id: egress_real_https
+    title: Real public HTTPS verification
+    stage: security
+    tier: deep
+    scopes: [rust]
+    status: implemented
+    github: egress_real_https
+    gitlab: egress_real_https
+    workflow: deep.yml
+    include: deep.yml
+
+  - id: session_owner_kvm
+    title: Full SessionOwner KVM verification
+    stage: system
+    tier: deep
+    scopes: [rust]
+    status: planned
+    github: null
+    gitlab: null
+    workflow: null
+    include: null
+    why_planned: >-
+      No executable protected KVM gate currently drives a real SessionOwner
+      lifecycle through CapFS, isolation, Firecracker, Broker, and recovery.
+
+  - id: external_provider_smoke
+    title: Protected external provider smoke
+    stage: security
+    tier: deep
+    scopes: [rust]
+    events: [workflow_dispatch, web, api]
+    status: implemented
+    github: external_provider_smoke
+    gitlab: external_provider_smoke
     workflow: deep.yml
     include: deep.yml
 

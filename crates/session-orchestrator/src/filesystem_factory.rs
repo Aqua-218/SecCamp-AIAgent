@@ -12,6 +12,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use authority_core::policy::AuthorityPolicyDigest;
 use firecracker_runtime::{
     FileSystem as _, PinnedArtifact, RealFileSystem, RuntimeConfig, Snapshot,
 };
@@ -38,6 +39,7 @@ const WORKSPACE_RELATIVE_PATH: &str = "workspace";
 pub struct SnapshotTemplate {
     state: PinnedArtifact,
     memory: PinnedArtifact,
+    policy_digest: AuthorityPolicyDigest,
 }
 
 /// Immutable kernel and seccomp sources copied into every session jail.
@@ -70,8 +72,16 @@ impl GuestArtifactTemplate {
 impl SnapshotTemplate {
     /// Creates the two immutable files that comprise a full Firecracker snapshot.
     #[must_use]
-    pub const fn new(state: PinnedArtifact, memory: PinnedArtifact) -> Self {
-        Self { state, memory }
+    pub const fn new(
+        state: PinnedArtifact,
+        memory: PinnedArtifact,
+        policy_digest: AuthorityPolicyDigest,
+    ) -> Self {
+        Self {
+            state,
+            memory,
+            policy_digest,
+        }
     }
 
     /// Returns the pinned state-file source.
@@ -84,6 +94,12 @@ impl SnapshotTemplate {
     #[must_use]
     pub const fn memory(&self) -> &PinnedArtifact {
         &self.memory
+    }
+
+    /// Returns the root policy baked into this immutable snapshot template.
+    #[must_use]
+    pub const fn policy_digest(&self) -> AuthorityPolicyDigest {
+        self.policy_digest
     }
 }
 
@@ -230,6 +246,11 @@ impl FilesystemFirecrackerFactory {
                 "session request uses a snapshot ID different from this factory",
             ));
         }
+        if request.policy_digest() != self.snapshot_template.policy_digest() {
+            return Err(BackendError::new(
+                "snapshot template policy digest does not match the exact session request",
+            ));
+        }
         if request.guest_control_port() == 0 || request.guest_control_port() == u32::MAX {
             return Err(BackendError::new(
                 "guest-control port must be explicit, non-zero, and non-wildcard",
@@ -318,12 +339,13 @@ impl FilesystemFirecrackerFactory {
             self.snapshot_template.memory(),
             request.memory_path(),
         )?;
-        Ok(Snapshot::new(
+        Ok(Snapshot::new_bound(
             request.snapshot_path(),
             request.memory_path(),
             config.snapshot_fingerprint(),
             self.snapshot_template.state().digest,
             self.snapshot_template.memory().digest,
+            self.snapshot_template.policy_digest(),
             Vec::new(),
         ))
     }

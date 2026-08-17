@@ -6,7 +6,7 @@
 
 > **対象読者:** supervisor の実装者、レビュー担当者、統合 test を書く人
 
-この crate の test は 2 種類ある。lifecycle と認可の contract test は `CapabilityKernel`（本物）と `FakeResources`（event log）と `StaticCallerResolver`（in-memory map）を組み合わせ、実 syscall を出さない。control socket と Linux host resource の module test は、実 `SOCK_SEQPACKET` socket、実 `SO_PEERCRED`、実 cgroup v2、実 process を使う。cgroup v2 が書けない host では後者だけ skip する。
+この crate の test は 3 種類ある。lifecycle と認可の contract test は `CapabilityKernel`（本物）と `FakeResources`（event log）と `StaticCallerResolver`（in-memory map）を組み合わせ、実 syscall を出さない。control socket と Linux host resource の module test は、実 `SOCK_SEQPACKET` socket、実 `SO_PEERCRED`、実 cgroup v2、実 process を使う。さらに `real_resources.rs` は ignored privileged integration test として、`resources_mut()` から production `LinuxHostResources` / `CapfsRuntimeResources` を直接観測し、実 FUSE mount、cgroup、descriptor、credential、cleanup retry を確認する。これは `Supervisor::create_subject` / `shutdown_subject` 全体や successful `start_workload` の証明ではない。通常の test では integration target を実行せず、`scripts/ci/verify-real-supervisor-resources.sh` が root と disposable mount namespace を確認した後にだけ実行する。前提を満たさない host では wrapper が exit 2 で停止する。
 
 ## local test で確認したこと
 
@@ -14,14 +14,22 @@
 |---|---|
 | 親の下に子 subject を作り、derive して revoke できる（成功経路のみ） | `root_derive_and_revoke_use_typed_authority_kernel_transitions` |
 | `claimed_subject` の詐称が無視され、caller 自身の handle が閉じる | `request_subject_spoof_is_ignored_in_favor_of_connection_identity` |
-| 認証済みの別 subject が他人の handle を閉じられない | `authenticated_foreign_subject_cannot_close_another_subjects_handle` |
+| 認証済みの別 subject が wire 経由で他人の handle を閉じられず、resource adapter に到達しない | `authenticated_foreign_subject_cannot_close_another_subjects_handle` |
+| `CloseSubject` の claim が別 subject を閉じず、connection caller 自身だけを閉じる | `close_subject_claim_cannot_close_a_foreign_subject` |
 | mount 失敗で確保済み resource だけを rollback し、subject を残さない | `partial_setup_rolls_back_already_acquired_resources` |
 | control 閉鎖の失敗時に mount と cgroup を意図的に保持し、retry で解放できる | `setup_rollback_retains_prerequisites_when_control_close_fails` |
 | unmount 失敗で `Closing` に留まり、新規要求を拒否し、retry で `Closed` になる | `cleanup_failure_keeps_subject_closing_and_blocks_new_requests` |
+| `begin_subject_close` の失敗で `Closing` に留まり、retry で authority と resource cleanup を完了する | `begin_close_failure_is_retryable_after_local_closing_transition` |
+| 外部 resource cleanup 後の `finish_subject_close` の失敗を保持し、retry で `Closed` にする | `finish_close_failure_is_retryable_after_external_cleanup` |
+| `stop_workload`、`remove_cgroup`、shutdown 中の `close_handle` の失敗を保持し、各 retry で依存 phase を再実行する | `stop_workload_failure_is_retained_and_retried_before_mount_cleanup`, `remove_cgroup_failure_is_retained_after_mount_cleanup_and_retried`, `close_handle_failure_is_retained_and_retried_before_unmount` |
+| 複数 cleanup phase が同時に失敗しても全 token を record に残し、次回 shutdown で matrix を消化する | `simultaneous_cleanup_failures_are_all_retained_for_one_retry_matrix` |
+| authority が `register_subject` と `start_workload` の間で変化した場合に workload を公開せず rollback する | `register_to_start_authority_mutation_fails_closed_and_rolls_back_resources` |
+| clean rollback 後の同じ `SubjectId` を永久予約し、再作成を adapter 前に拒否する | `clean_setup_rollback_permanently_reserves_subject_id` |
+| permanent registry の zero validation、subject exhaustion、rollback 後の exhaustion、handle close 後の exhaustion を adapter 前で拒否する | `zero_registry_capacity_is_rejected_during_supervisor_construction`, `subject_capacity_exhaustion_happens_before_the_resource_adapter`, `clean_rollback_consumes_subject_capacity_permanently`, `issued_handle_capacity_remains_exhausted_after_close_before_adapter_call` |
 | 同じ handle の 2 回目の close が `StaleHandle`、shutdown 後の要求が `SubjectClosed` | `stale_handle_and_post_close_requests_are_rejected` |
 | 閉じた `HandleId` の再 open が、adapter を呼ぶ前に `StaleHandle` になる | `closed_handle_id_cannot_be_reused` |
 | kernel 登録失敗と補償失敗が重なっても、ID が予約され、shutdown が runtime close を retry する | `failed_handle_registration_retains_runtime_cleanup_and_reserves_id` |
-| 未 bind の connection と非 Running の subject が revoke できない | `revoke_requires_a_bound_running_connection` |
+| 未 bind / 非 Running の connection が revoke できず、非 holder の revoke も kernel で拒否される | `revoke_requires_a_bound_running_connection`, `root_derive_and_revoke_use_typed_authority_kernel_transitions` |
 
 control socket は実 socket に対して確認する。
 
@@ -33,6 +41,7 @@ control socket は実 socket に対して確認する。
 | 未 bind の socket ID と、subject の credential と違う peer を拒否する | `resolution_fails_closed_for_unbound_and_foreign_credentials` |
 | 相対 path と root path を bind しない | `listener_rejects_paths_it_cannot_own` |
 | bind 直後の socket node が mode 0600 である | `bound_socket_is_owner_only` |
+| unlink に失敗した control socket の token を保持し、stale node の除去を retry できる | `control_socket_cleanup_retains_token_until_stale_node_is_removed` |
 
 実 Linux resource は実 cgroup v2 と実 process に対して確認する。
 
@@ -44,8 +53,9 @@ control socket は実 socket に対して確認する。
 | directory を抜け出せる subject 名を拒否する | `subject_names_that_could_escape_their_directory_are_refused` |
 | handle は subject ごとに追跡され、close は idempotent | `handles_are_tracked_per_subject_and_close_is_idempotent` |
 | 設定した directory が実在しなければ構築を拒否する | `host_config_requires_existing_owned_directories` |
+| production adapter が実 FUSE mount、cgroup、seqpacket credential、cgroup cleanup retry、record 再作成、handle 増減を観測可能にする | `scripts/ci/verify-real-supervisor-resources.sh` → `real_linux_host_resources_exercises_kernel_side_effects` |
 
-返信の形式も固定してある。
+返信の形式も固定してあり、bounded encoder/decoder と実 socket の datagram 送受信を確認する。
 
 | 境界 | test |
 |---|---|
@@ -53,10 +63,11 @@ control socket は実 socket に対して確認する。
 | 壊れた response を推測せず拒否する | `malformed_responses_are_rejected_rather_than_guessed` |
 | response が guest の学べる識別子を運ばない | `a_response_never_carries_an_identifier_a_guest_could_learn_from` |
 | 返信が 1 datagram として peer へ届く | `a_reply_reaches_the_peer_as_one_bounded_datagram` |
+| request/response の truncated、trailing、field 上限、datagram 上限を bounded decoder が拒否する | `decoder_rejects_invalid_utf8_and_truncated_fields`, `decoder_rejects_trailing_bytes_after_a_complete_request`, `encoder_and_decoder_accept_exact_field_limit`, `decoder_accepts_request_at_datagram_limit_before_schema_validation`, `decoder_accepts_response_at_datagram_limit_before_schema_validation` |
 
-spoof の test には注意点がある。詐称した `CloseHandle` は**拒否されるのではなく、caller 自身の handle を閉じる**。claim が捨てられることを示しているのであって、詐称に対する error 経路が存在するわけではない。
+spoof の test には注意点がある。詐称した `CloseHandle` は**拒否される**（対象 handle が caller の所有ではないため）。caller 自身の handle で claim だけを詐称した場合は、claim が捨てられ caller 自身の handle が閉じる。`CloseSubject` も同じく claim ではなく connection caller の subject だけを閉じる。
 
-`authenticated_foreign_subject_cannot_close_another_subjects_handle` は直接 API を呼ぶ。`dispatch_wire` は経由しない。`resources.close_handle` が呼ばれなかったことも assert していない。
+`authenticated_foreign_subject_cannot_close_another_subjects_handle` は `dispatch_wire` を経由し、`resources.close_handle` が呼ばれないことまで assert する。
 
 ### 拒否経路の test
 
@@ -80,6 +91,8 @@ spoof の test には注意点がある。詐称した `CloseHandle` は**拒否
 cargo fmt --manifest-path crates/supervisor/Cargo.toml -- --check
 cargo test --manifest-path crates/supervisor/Cargo.toml
 cargo clippy --manifest-path crates/supervisor/Cargo.toml --all-targets -- -D warnings
+# root + private mount namespace + cgroup v2 + /dev/fuse がある場合だけ
+scripts/ci/verify-real-supervisor-resources.sh
 ```
 
 ## 未検証の境界
@@ -112,18 +125,14 @@ event の順序 assertion が示すのは呼び出し順だけ。副作用は示
 
 | 対象 | 何が未検証か |
 |---|---|
-| `revoke` の所有権 | caller と lifecycle は test 済み。対象 capability を caller が保持しているかは検査も test も無い |
-| `CleanupStep::BeginClose` / `FinishClose` | kernel が `finish_subject_close` を拒否する経路、および `begin_subject_close` の `?` で subject が非 Running のまま止まる経路 |
-| cleanup 失敗の形 | `stop_workload` 失敗、`remove_cgroup` 失敗、shutdown 中の `close_handle` 失敗、複数 phase の同時失敗 |
-| `CloseSubject` の spoof | wire 経路で別 subject を落とせないことを直接示す test が無い。spoof の test は `CloseHandle` のみ |
-| protocol の境界値 | ちょうど 4096 bytes、ちょうど 256 bytes の field、`TrailingBytes`、`Truncated`。fuzz も property test も無い |
-| 並行性 | `AuthorityKernel` の method は `&self` を取り、`CapabilityKernel` は内部 lock を持つ。同じ kernel を共有する別コンポーネントが supervisor の step 間に状態を変える経路。特に `register_subject` と `start_workload` の間の窓 |
-| record 再作成 | clean rollback 後に同じ `SubjectId` を作り直したときの、supervisor 忘却 / kernel 記憶の食い違い |
-| 資源の増加 | `issued_handles` と `subjects` は追記のみで上限が無い |
+| cleanup の実環境 failure injection | FakeResources の retry matrix は test 済み。Linux adapter が `stop_workload` / `unmount` / cgroup removal / control unlink の各実 syscall failure を返した場合の全組み合わせは privileged test の境界外 |
+| 並行性 | register→start の authority close/revoke を snapshot で検出する test はあるが、`AuthorityKernel` を共有する外部 component の任意の interleaving を Supervisor が lock で直列化する保証はない |
+| supervisor record 再作成 | clean rollback 後の同じ `SubjectId` 再作成は永久予約で拒否する test 済み。kernel の durable entry を消して再利用する運用は提供しない |
+| 資源の増加 | `subjects` は既定 1024、`issued_handles` は既定 65536 の session 永久上限を持ち、zero validation / exhaustion / adapter 未到達を test 済み。異なる運用値と memory sizing は deployment 側の判断 |
 
 ### 到達不能な分岐
 
-「workload token はあるが cgroup token が無い」分岐は、public API からは到達できない。test も無い。
+「workload token はあるが cgroup token が無い」分岐は、public API からは到達できない。`create_subject` は cgroup ownership token を確認してから `start_workload` を呼び、内部 record は private で外部から token を組み替えられない。これは construction/API invariant としての non-goal であり、直接 token を注入する test は提供しない。unknown token を fail-closed にする production adapter の防御分岐は privileged integration test で別に確認する。
 
 ### 証明
 

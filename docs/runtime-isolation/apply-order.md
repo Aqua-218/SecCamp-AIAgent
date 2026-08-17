@@ -106,16 +106,43 @@ supervisor は `Rollback` を受け取ったら child を再利用せず終了�
 
 receipt に完了 step が順番どおり入るため、supervisor の audit event に添付すれば「exec 前の境界が完成した」ことの機械的な証拠になる。ログの文字列ではなく型で残るので、後から欠けた step を検出できる。
 
+## step 4 が step 7 の mount を用意する理由
+
+`MaskProc` は `/proc` の境界を所有する step だが、staged rootfs 経路ではその procfs 自体を step 4 で作る。kernel の制約による。
+
+user namespace の中で新しい procfs を mount するには、その mount namespace に完全に可視な procfs が既に存在していなければならない（`fs/namespace.c` の `mount_too_revealing`）。step 4 の `pivot_root` は継承した procfs を切り離すので、その後に新規 mount を試みると必ず `EPERM` になる。private な procfs を作れる時点は、継承 mount がまだ見えている step 4 しかない。
+
+```text
+step 4 で staging しない場合:
+  pivot_root で継承 procfs を切り離す -> step 7 で新規 mount -> EPERM で必ず失敗
+
+実際の順序:
+  step 4: 継承 procfs が見えているうちに staged rootfs へ private procfs を mount
+  step 7: その mount が procfs であり、必要な制限を全て持つことを kernel に問い直す
+```
+
+これは workspace と同じ形である。workspace の bind も step 4 で staging され、step 5 が hardening flag つきで remount して確定させる。`MaskProc` が境界の所有者であることは変わらず、mount flag を staging 時の呼び出しから推定せず `statfs` と `statvfs` で読み直すため、step 7 は実質的な検査であり続ける。
+
+既に immutable な root から起動した guest（`rootfs.source == "/"`）は pivot しないので継承 procfs を見失わない。この経路では `MaskProc` が従来どおり新しい procfs を mount する。
+
 ## 正確な保証範囲
 
-ここで保証しているのは、mock backend を使う限りにおいて、13 step が定義順に呼ばれ、失敗時に完了済み step が逆順に rollback されることだけ。
+mock backend が保証するのは、13 step が定義順に呼ばれ、失敗時に完了済み step が逆順に rollback されることだけ。
 
-次は保証していない。
+[`tests/privileged_isolation.rs`](../../crates/runtime-isolation/tests/privileged_isolation.rs) が実 kernel 上で 13 step を適用し、完成した境界の内側から観測することで、次を確認している。staged rootfs 経路、`execve` を挟まない場合に限る。
 
-- 実 kernel 上で各 step が意図どおりの境界を作ること。`LinuxBackend` の各操作は特権環境が要るため、この repository の test では実行していない。
-- rollback 可能と申告した step が、実際に元の状態へ戻ること。unmount の失敗経路は実機で確認していない。
-- exec 後の workload が境界を越えられないこと。これは step が正しく効いていることの帰結であって、この crate の test 対象ではない。
+- 13 step が実 syscall で完走し、launcher が `Ready` を受け取ること。
+- seccomp filter、Landlock ruleset、read-only rootfs、device masking、fd の一掃、capability の剥奪が、それぞれ kernel によって強制されていること。
+- 途中で失敗した step が launcher に正しく報告され、host 側の cgroup が解放されること。
+
+次は依然として保証していない。
+
+- unmount による rollback が実際に元の状態へ戻ること。失敗を注入できたのは `pivot_root` 後の `Landlock` で、そこは crate 自身が「戻せない」と申告する位置にある。確認できたのは cgroup の解放だけ。
+- `rootfs.source == "/"` の guest 経路。probe は staged rootfs 経路だけを通る。
+- exec 後の workload が境界を越えられないこと。probe は child 内で直接観測しており、exec を挟んでいない。
 - VM 境界。host から見た隔離は [firecracker-runtime](../firecracker-runtime/README.md) の担当。
+
+正確な線引きは [検証対応表](verification.md) にある。
 
 ## 変更時の確認点
 

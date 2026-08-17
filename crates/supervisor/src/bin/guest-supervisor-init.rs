@@ -108,6 +108,9 @@ struct MountInfo {
     mount_id: u64,
     major: u32,
     minor: u32,
+    root: Vec<u8>,
+    filesystem_type: Vec<u8>,
+    source: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -632,7 +635,32 @@ fn prepare_procfs(ownership: &mut MountOwnership) -> Result<(), String> {
             )
             .map_err(|error| format!("mounting guest procfs {}: {error}", path.display()))
         },
-    )
+    )?;
+    validate_procfs_identity(path)
+}
+
+fn validate_procfs_identity(path: &Path) -> Result<(), String> {
+    let mount = mount_info_for(path)?
+        .ok_or_else(|| format!("guest procfs {} has no mountinfo record", path.display()))?;
+    if mount.root != b"/" || mount.filesystem_type != b"proc" || mount.source != b"proc" {
+        return Err(format!(
+            "guest procfs {} is not a root proc mount (root {:?}, type {:?}, source {:?})",
+            path.display(),
+            String::from_utf8_lossy(&mount.root),
+            String::from_utf8_lossy(&mount.filesystem_type),
+            String::from_utf8_lossy(&mount.source)
+        ));
+    }
+    let self_namespace = fs::read_link("/proc/self/ns/pid")
+        .map_err(|error| format!("reading current PID namespace identity: {error}"))?;
+    let init_namespace = fs::read_link("/proc/1/ns/pid")
+        .map_err(|error| format!("reading guest PID 1 namespace identity: {error}"))?;
+    if self_namespace != init_namespace {
+        return Err(format!(
+            "guest procfs exposes PID 1 from a different namespace ({init_namespace:?}) than the supervisor ({self_namespace:?})"
+        ));
+    }
+    Ok(())
 }
 
 /// Verifies the guest-owned device namespace before consuming the workspace block device.
@@ -969,6 +997,9 @@ fn mount_info_for(path: &Path) -> Result<Option<MountInfo>, String> {
             mount_id,
             major,
             minor,
+            root: decode_mountinfo_path(fields[3])?,
+            filesystem_type: fields[separator + 1].to_vec(),
+            source: fields[separator + 2].to_vec(),
         };
         if found.is_some() {
             return Err(format!(

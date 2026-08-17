@@ -14,6 +14,105 @@
     - if: $CI_PIPELINE_SOURCE == "web"
     - if: $CI_PIPELINE_SOURCE == "api"
 
+miri:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: verify
+  timeout: 30m
+  parallel:
+    matrix:
+      - PACKAGE: ["authority-core"]
+        TEST_FILTER: ["capability::tests"]
+      - PACKAGE: ["authority-core"]
+        TEST_FILTER: ["file::tests"]
+      - PACKAGE: ["authority-core"]
+        TEST_FILTER: ["github::tests"]
+      - PACKAGE: ["authority-core"]
+        TEST_FILTER: ["http::tests"]
+      - PACKAGE: ["authority-core"]
+        TEST_FILTER: ["path::tests"]
+      - PACKAGE: ["authority-core"]
+        TEST_FILTER: ["policy::tests"]
+      - PACKAGE: ["authority-core"]
+        TEST_FILTER: ["repository::tests"]
+      - PACKAGE: ["authority-core"]
+        TEST_FILTER: ["state::tests"]
+      - PACKAGE: ["authority-core"]
+        TEST_FILTER: ["time::tests"]
+      - PACKAGE: ["egress-protocol"]
+        TEST_FILTER: ["budget::tests"]
+      - PACKAGE: ["egress-protocol"]
+        TEST_FILTER: ["cbor::tests"]
+      - PACKAGE: ["egress-protocol"]
+        TEST_FILTER: ["frame::tests"]
+      - PACKAGE: ["egress-protocol"]
+        TEST_FILTER: ["operation::tests"]
+      - PACKAGE: ["egress-protocol"]
+        TEST_FILTER: ["session::tests"]
+  script:
+    - scripts/ci/install-cargo-tools.sh miri
+    - scripts/ci/run.sh miri "$PACKAGE" "$TEST_FILTER"
+
+sanitizers:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: verify
+  timeout: 25m
+  parallel:
+    matrix:
+      - MODE: ["address"]
+        PACKAGE: ["egress-protocol"]
+      - MODE: ["leak"]
+        PACKAGE: ["egress-protocol"]
+  script:
+    - scripts/ci/install-cargo-tools.sh sanitizers
+    - scripts/ci/run.sh sanitizers "$MODE" "$PACKAGE"
+
+mutation:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: analyze
+  timeout: 35m
+  parallel:
+    matrix:
+      - SHARD: ["1"]
+        PACKAGE: ["authority-core"]
+      - SHARD: ["2"]
+        PACKAGE: ["egress-protocol"]
+  script:
+    - scripts/ci/install-cargo-tools.sh mutation
+    - scripts/ci/run.sh mutation "$SHARD" "$PACKAGE"
+
+fuzz:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: analyze
+  timeout: 25m
+  parallel:
+    matrix:
+      - PACKAGE: ["egress-protocol"]
+        TARGET: ["frame_decode"]
+      - PACKAGE: ["egress-protocol"]
+        TARGET: ["cbor_request_decode"]
+      - PACKAGE: ["authority-core"]
+        TARGET: ["canonical_path"]
+  script:
+    - scripts/ci/install-cargo-tools.sh fuzz
+    - scripts/ci/run.sh fuzz "$PACKAGE" "$TARGET"
+
+benchmarks:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: analyze
+  timeout: 20m
+  script:
+    - scripts/ci/run.sh benchmarks
+
 real_vm:
   extends:
     - .rust_job

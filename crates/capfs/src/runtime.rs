@@ -21,7 +21,7 @@ use rustix::{
 };
 
 use crate::{
-    backing::ValidatedRepository,
+    backing::{BackingIdentityError, ValidatedRepository},
     namespace::{NamespaceObject, NamespaceObjectKind, RenamePlan, SymlinkTarget},
 };
 
@@ -164,6 +164,14 @@ pub(crate) enum RuntimeBackingError {
         path: CanonicalPath,
     },
     NestedMount(CanonicalPath),
+    /// The descriptor names a different inode than the imported namespace.
+    ObjectIdentityChanged {
+        path: CanonicalPath,
+        expected: u64,
+        actual: u64,
+    },
+    /// The object-to-inode registry was unavailable or had no imported entry.
+    IdentityRegistryUnavailable(CanonicalPath),
     TimestampOutOfRange(CanonicalPath),
     #[allow(dead_code)]
     PathNotDirectChild {
@@ -189,6 +197,7 @@ pub(crate) enum RuntimeBackingError {
 }
 
 impl fmt::Display for RuntimeBackingError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io {
@@ -236,6 +245,20 @@ impl fmt::Display for RuntimeBackingError {
             Self::NestedMount(path) => write!(
                 formatter,
                 "backing object `{}` crossed the repository mount boundary",
+                DisplayCanonicalPath(path)
+            ),
+            Self::ObjectIdentityChanged {
+                path,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "backing object `{}` changed inode from {expected} to {actual}",
+                DisplayCanonicalPath(path)
+            ),
+            Self::IdentityRegistryUnavailable(path) => write!(
+                formatter,
+                "backing object identity for `{}` is unavailable",
                 DisplayCanonicalPath(path)
             ),
             Self::TimestampOutOfRange(path) => write!(
@@ -455,11 +478,9 @@ impl ValidatedRepository {
             fchmod(&fd, permissions.mode()).map_err(|error| {
                 runtime_io_error("set creation permissions", child.primary_path(), error)
             })?;
-            let metadata = validate_runtime_metadata(
-                self,
-                child,
-                metadata_for_fd(&fd, child.primary_path())?,
-            )?;
+            let raw_metadata = metadata_for_fd(&fd, child.primary_path())?;
+            let metadata = validate_new_runtime_metadata(self, child, raw_metadata)?;
+            remember_created_inode(self, child, raw_metadata.stx_ino)?;
             Ok((
                 OpenedBackingFile {
                     fd,
@@ -503,11 +524,10 @@ impl ValidatedRepository {
             fchmod(&child_fd, permissions.mode()).map_err(|error| {
                 runtime_io_error("set creation permissions", child.primary_path(), error)
             })?;
-            validate_runtime_metadata(
-                self,
-                child,
-                metadata_for_fd(&child_fd, child.primary_path())?,
-            )
+            let raw_metadata = metadata_for_fd(&child_fd, child.primary_path())?;
+            let metadata = validate_new_runtime_metadata(self, child, raw_metadata)?;
+            remember_created_inode(self, child, raw_metadata.stx_ino)?;
+            Ok(metadata)
         })();
 
         rollback_created_entry_on_error(&parent_fd, child, child_name, AtFlags::REMOVEDIR, result)
@@ -534,21 +554,31 @@ impl ValidatedRepository {
             object.kind(),
             object.expected_link_count(),
         )?;
+        let expected_inode = expected_inode_for_object(self, object)?;
+        map_identity_error(
+            self.stage_path_removal(removed_path, expected_inode),
+            removed_path,
+        )?;
         let (flags, operation) = match object.kind() {
             NamespaceObjectKind::Directory => (AtFlags::REMOVEDIR, "remove directory"),
             NamespaceObjectKind::RegularFile => (AtFlags::empty(), "remove regular file"),
             NamespaceObjectKind::Symlink => (AtFlags::empty(), "remove symbolic link"),
         };
-        unlinkat(&parent_fd, child_name, flags)
-            .map_err(|error| runtime_io_error(operation, removed_path, error))
+        match unlinkat(&parent_fd, child_name, flags) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.restore_path_removal(removed_path, expected_inode);
+                Err(runtime_io_error(operation, removed_path, error))
+            }
+        }
     }
 
     /// Executes one validated no-replace subtree rename.
     ///
     /// The complete plan, both parent directories, and every moved backing
-    /// object are validated before `renameat2`. The `NOREPLACE` syscall is the
-    /// final fallible step, which preserves the namespace executor contract:
-    /// `Err` means the backing rename did not commit, and `Ok` means it did.
+    /// object are validated before `renameat2`. The path identity registry is
+    /// staged before the syscall and restored if `NOREPLACE` fails. The
+    /// `NOREPLACE` syscall remains the backing linearization point.
     #[allow(dead_code)]
     pub(crate) fn rename_runtime_subtree(
         &self,
@@ -589,18 +619,36 @@ impl ValidatedRepository {
             drop(fd);
         }
 
-        renameat_with(
+        let path_moves = plan
+            .moved_objects()
+            .iter()
+            .map(|movement| {
+                Ok((
+                    movement.source().clone(),
+                    movement.destination().clone(),
+                    expected_inode_for_id(self, movement.object(), movement.source())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, RuntimeBackingError>>()?;
+        map_identity_error(self.stage_path_moves(&path_moves), plan.source())?;
+
+        match renameat_with(
             &source_parent_fd,
             source_name,
             &destination_parent_fd,
             destination_name,
             RenameFlags::NOREPLACE,
-        )
-        .map_err(|error| RuntimeBackingError::RenameIo {
-            source: plan.source().clone(),
-            destination: plan.destination().clone(),
-            cause: io::Error::from_raw_os_error(error.raw_os_error()),
-        })
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.restore_path_moves(&path_moves);
+                Err(RuntimeBackingError::RenameIo {
+                    source: plan.source().clone(),
+                    destination: plan.destination().clone(),
+                    cause: io::Error::from_raw_os_error(error.raw_os_error()),
+                })
+            }
+        }
     }
 
     /// Replaces ordinary permission bits on one validated backing object.
@@ -772,11 +820,10 @@ impl ValidatedRepository {
                     path: child.primary_path().clone(),
                 });
             }
-            validate_runtime_metadata(
-                self,
-                child,
-                metadata_for_fd(&child_fd, child.primary_path())?,
-            )
+            let raw_metadata = metadata_for_fd(&child_fd, child.primary_path())?;
+            let metadata = validate_new_runtime_metadata(self, child, raw_metadata)?;
+            remember_created_inode(self, child, raw_metadata.stx_ino)?;
+            Ok(metadata)
         })();
 
         rollback_created_entry_on_error(&parent_fd, child, child_name, AtFlags::empty(), result)
@@ -838,10 +885,10 @@ impl ValidatedRepository {
         )
         .map_err(|error| runtime_io_error("open hard link source", source_path, error))?;
         let source_metadata = metadata_for_fd(&source_fd, source_path)?;
-        validate_runtime_metadata_for(
+        validate_runtime_object_at_path(
             self,
+            source,
             source_path,
-            source.kind(),
             existing_names,
             source_metadata,
         )?;
@@ -870,13 +917,16 @@ impl ValidatedRepository {
                     path: link_path.clone(),
                 });
             }
-            validate_runtime_metadata_for(
+            let inode = metadata.stx_ino;
+            let metadata = validate_runtime_metadata_fields(
                 self,
                 link_path,
                 source.kind(),
                 source.expected_link_count(),
                 metadata,
-            )
+            )?;
+            remember_created_path(self, link_path, inode)?;
+            Ok(metadata)
         })();
 
         rollback_created_path_on_error(&parent_fd, link_path, link_name, AtFlags::empty(), result)
@@ -1168,7 +1218,7 @@ fn metadata_for_fd(fd: impl AsFd, path: &CanonicalPath) -> Result<Statx, Runtime
     )
     .map_err(|error| runtime_io_error("inspect metadata", path, error))?;
     let available = StatxFlags::from_bits_retain(metadata.stx_mask);
-    if !available.contains(REQUIRED_METADATA) {
+    if !has_required_metadata(available) {
         return Err(RuntimeBackingError::RequiredMetadataUnavailable(
             path.clone(),
         ));
@@ -1176,18 +1226,166 @@ fn metadata_for_fd(fd: impl AsFd, path: &CanonicalPath) -> Result<Statx, Runtime
     Ok(metadata)
 }
 
+fn has_required_metadata(available: StatxFlags) -> bool {
+    available.contains(REQUIRED_METADATA)
+}
+
 fn validate_runtime_metadata(
     repository: &ValidatedRepository,
     object: &NamespaceObject,
     metadata: Statx,
 ) -> Result<BackingMetadata, RuntimeBackingError> {
+    validate_runtime_object_at_path(
+        repository,
+        object,
+        object.primary_path(),
+        object.expected_link_count(),
+        metadata,
+    )
+}
+
+/// Validates a preflighted object at one of its live names.
+fn validate_runtime_object_at_path(
+    repository: &ValidatedRepository,
+    object: &NamespaceObject,
+    path: &CanonicalPath,
+    expected_link_count: usize,
+    metadata: Statx,
+) -> Result<BackingMetadata, RuntimeBackingError> {
+    match repository.expected_inode(object.id()) {
+        Ok(Some(expected)) if expected != metadata.stx_ino => {
+            return Err(RuntimeBackingError::ObjectIdentityChanged {
+                path: path.clone(),
+                expected,
+                actual: metadata.stx_ino,
+            });
+        }
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => {
+            return Err(RuntimeBackingError::IdentityRegistryUnavailable(
+                path.clone(),
+            ));
+        }
+    }
     validate_runtime_metadata_for(
+        repository,
+        path,
+        object.kind(),
+        expected_link_count,
+        metadata,
+    )
+}
+
+/// Validates a descriptor returned by a creation syscall before publishing a
+/// new namespace object. Its identity is not in the startup registry yet; the
+/// caller records it only after kind, mount, link-count, and metadata checks.
+fn validate_new_runtime_metadata(
+    repository: &ValidatedRepository,
+    object: &NamespaceObject,
+    metadata: Statx,
+) -> Result<BackingMetadata, RuntimeBackingError> {
+    validate_runtime_metadata_fields(
         repository,
         object.primary_path(),
         object.kind(),
         object.expected_link_count(),
         metadata,
     )
+}
+
+fn expected_inode_for_object(
+    repository: &ValidatedRepository,
+    object: &NamespaceObject,
+) -> Result<u64, RuntimeBackingError> {
+    expected_inode_for_id(repository, object.id(), object.primary_path())
+}
+
+fn expected_inode_for_id(
+    repository: &ValidatedRepository,
+    object: &authority_core::handle::ObjectId,
+    path: &CanonicalPath,
+) -> Result<u64, RuntimeBackingError> {
+    match repository.expected_inode(object) {
+        Ok(Some(inode)) => Ok(inode),
+        Ok(None) | Err(_) => Err(RuntimeBackingError::IdentityRegistryUnavailable(
+            path.clone(),
+        )),
+    }
+}
+
+fn map_identity_error(
+    result: Result<(), BackingIdentityError>,
+    fallback_path: &CanonicalPath,
+) -> Result<(), RuntimeBackingError> {
+    result.map_err(|error| match error {
+        BackingIdentityError::RegistryPoisoned => {
+            RuntimeBackingError::IdentityRegistryUnavailable(fallback_path.clone())
+        }
+        BackingIdentityError::Mismatch {
+            path,
+            expected,
+            actual,
+        } => RuntimeBackingError::ObjectIdentityChanged {
+            path,
+            expected,
+            actual,
+        },
+        BackingIdentityError::Missing(path) => {
+            RuntimeBackingError::IdentityRegistryUnavailable(path)
+        }
+    })
+}
+
+fn remember_created_inode(
+    repository: &ValidatedRepository,
+    object: &NamespaceObject,
+    actual: u64,
+) -> Result<(), RuntimeBackingError> {
+    repository
+        .remember_inode(object.id(), object.primary_path(), actual)
+        .map_err(|error| match error {
+            BackingIdentityError::RegistryPoisoned => {
+                RuntimeBackingError::IdentityRegistryUnavailable(object.primary_path().clone())
+            }
+            BackingIdentityError::Mismatch {
+                path,
+                expected,
+                actual,
+            } => RuntimeBackingError::ObjectIdentityChanged {
+                path,
+                expected,
+                actual,
+            },
+            BackingIdentityError::Missing(path) => {
+                RuntimeBackingError::IdentityRegistryUnavailable(path)
+            }
+        })
+}
+
+fn remember_created_path(
+    repository: &ValidatedRepository,
+    path: &CanonicalPath,
+    actual: u64,
+) -> Result<(), RuntimeBackingError> {
+    repository
+        .remember_path_inode(path, actual)
+        .map_err(|error| match error {
+            BackingIdentityError::RegistryPoisoned => {
+                RuntimeBackingError::IdentityRegistryUnavailable(path.clone())
+            }
+            BackingIdentityError::Mismatch {
+                path,
+                expected,
+                actual,
+            } => RuntimeBackingError::ObjectIdentityChanged {
+                path,
+                expected,
+                actual,
+            },
+            BackingIdentityError::Missing(path) => {
+                RuntimeBackingError::IdentityRegistryUnavailable(path)
+            }
+        })
 }
 
 /// Rechecks that the inode behind a path is still the one the namespace records.
@@ -1197,6 +1395,37 @@ fn validate_runtime_metadata(
 /// the namespace, so the invariant is that the inode has exactly as many names
 /// as the registry knows about. A name capfs cannot see would still be caught.
 fn validate_runtime_metadata_for(
+    repository: &ValidatedRepository,
+    path: &CanonicalPath,
+    expected_kind: NamespaceObjectKind,
+    expected_link_count: usize,
+    metadata: Statx,
+) -> Result<BackingMetadata, RuntimeBackingError> {
+    match repository.expected_path_inode(path) {
+        Ok(Some(expected)) if expected != metadata.stx_ino => {
+            return Err(RuntimeBackingError::ObjectIdentityChanged {
+                path: path.clone(),
+                expected,
+                actual: metadata.stx_ino,
+            });
+        }
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => {
+            return Err(RuntimeBackingError::IdentityRegistryUnavailable(
+                path.clone(),
+            ));
+        }
+    }
+    validate_runtime_metadata_fields(
+        repository,
+        path,
+        expected_kind,
+        expected_link_count,
+        metadata,
+    )
+}
+
+fn validate_runtime_metadata_fields(
     repository: &ValidatedRepository,
     path: &CanonicalPath,
     expected_kind: NamespaceObjectKind,
@@ -1369,12 +1598,12 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use rustix::fs::{AtFlags, Timespec};
+    use rustix::fs::{AtFlags, StatxFlags, Timespec};
     use tempfile::tempdir;
 
     use super::{
         CreationPermissions, MetadataPermissions, MetadataTime, MetadataTimes, RuntimeBackingError,
-        exact_time_to_timespec, rollback_created_entry_on_error,
+        exact_time_to_timespec, has_required_metadata, rollback_created_entry_on_error,
     };
     use crate::{
         backing::{ImportedRepository, PreflightLimits},
@@ -1388,6 +1617,16 @@ mod tests {
 
     fn limits() -> PreflightLimits {
         PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 4)
+    }
+
+    // Requirement: runtime metadata must fail closed when MNT_ID is absent;
+    // otherwise a later descriptor check could not reject mount crossing.
+    #[test]
+    fn runtime_metadata_mask_rejects_missing_mount_id() {
+        assert!(!has_required_metadata(StatxFlags::BASIC_STATS));
+        assert!(has_required_metadata(
+            StatxFlags::BASIC_STATS | StatxFlags::MNT_ID
+        ));
     }
 
     #[test]
@@ -1895,6 +2134,54 @@ mod tests {
         );
     }
 
+    // Requirement: a successful removal releases the path identity so a later
+    // authorized creation at the same name can bind a fresh inode.
+    // Category: namespace/backing identity. Risk: high.
+    #[test]
+    fn runtime_remove_then_recreate_rebinds_the_path_identity() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        fs::write(directory.path().join("rebind.txt"), b"old")
+            .expect("initial file must be writable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let root = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+        namespace
+            .remove_child(root.id(), "rebind.txt", |parent, object, path| {
+                backing.remove_runtime_object(parent, object, path)
+            })
+            .expect("the original path must be removable");
+        assert!(!directory.path().join("rebind.txt").exists());
+
+        let creation = namespace
+            .create_child(
+                root.id(),
+                "rebind.txt",
+                NamespaceObjectSpec::RegularFile,
+                |parent, child| {
+                    backing.create_runtime_file(
+                        parent,
+                        child,
+                        CreationPermissions::from_requested_mode(0o600, 0),
+                    )
+                },
+            )
+            .expect("a fresh inode must be allowed at the removed path");
+        let (_object, (file, _metadata)) = creation.into_parts();
+        file.write_at(0, b"new")
+            .expect("the rebound descriptor must remain writable");
+        drop(file);
+        assert_eq!(
+            fs::read(directory.path().join("rebind.txt"))
+                .expect("the rebound file must be readable"),
+            b"new"
+        );
+    }
+
     #[test]
     fn runtime_create_rejects_a_non_direct_child_before_touching_backing() {
         let directory = tempdir().expect("temporary repository must be creatable");
@@ -2343,11 +2630,14 @@ mod tests {
             .expect_err("changed descendant kind must reject the entire rename");
         assert!(matches!(
             error,
-            NamespaceOperationError::Executor(RuntimeBackingError::ObjectKindChanged {
-                expected: NamespaceObjectKind::RegularFile,
-                actual: Some(NamespaceObjectKind::Directory),
-                ..
-            })
+            NamespaceOperationError::Executor(
+                RuntimeBackingError::ObjectIdentityChanged { .. }
+                    | RuntimeBackingError::ObjectKindChanged {
+                        expected: NamespaceObjectKind::RegularFile,
+                        actual: Some(NamespaceObjectKind::Directory),
+                        ..
+                    }
+            )
         ));
         assert!(directory.path().join("source/item.txt").is_dir());
         assert!(!directory.path().join("destination").exists());
@@ -2405,6 +2695,7 @@ mod tests {
             error,
             NamespaceOperationError::Executor(
                 RuntimeBackingError::Io { .. }
+                    | RuntimeBackingError::ObjectIdentityChanged { .. }
                     | RuntimeBackingError::ObjectKindChanged {
                         expected: NamespaceObjectKind::RegularFile,
                         actual: None | Some(NamespaceObjectKind::Symlink),
@@ -2804,6 +3095,75 @@ mod tests {
         ));
     }
 
+    // Requirement: an imported object remains bound to its startup inode even
+    // when an attacker replaces it with another object of the same kind.
+    // Category: backing identity. Risk: critical.
+    #[test]
+    fn runtime_open_rejects_a_same_kind_inode_replacement_after_preflight() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let file_path = directory.path().join("notes.txt");
+        fs::write(&file_path, b"safe").expect("test file must be writable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial regular file must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let path = CanonicalPath::new(["notes.txt"]).expect("test path must be canonical");
+        let object = namespace
+            .object_at_path_snapshot(&path)
+            .expect("namespace must remain readable")
+            .expect("manifest file must exist");
+
+        fs::rename(&file_path, directory.path().join("old.txt"))
+            .expect("the original file must be replaceable");
+        fs::write(&file_path, b"attacker").expect("replacement file must be writable");
+
+        assert!(matches!(
+            backing.open_runtime_file(&object),
+            Err(RuntimeBackingError::ObjectIdentityChanged { .. })
+        ));
+        assert_eq!(
+            fs::read(&file_path).expect("replacement file must remain readable"),
+            b"attacker"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("old.txt"))
+                .expect("the original inode must remain readable"),
+            b"safe"
+        );
+    }
+
+    // Requirement: directory-parent replacement is rejected even when the
+    // replacement has the same kind, preventing path-only mutation helpers
+    // from crossing into an unimported subtree.
+    // Category: backing identity. Risk: high.
+    #[test]
+    fn runtime_directory_metadata_rejects_a_same_kind_replacement_after_preflight() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let original = directory.path().join("src");
+        fs::create_dir(&original).expect("test directory must be creatable");
+        fs::write(original.join("safe.txt"), b"safe").expect("test file must be writable");
+        let imported =
+            ImportedRepository::open(RepoId::new("workspace"), directory.path(), limits())
+                .expect("initial directory must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let path = CanonicalPath::new(["src"]).expect("test path must be canonical");
+        let object = namespace
+            .object_at_path_snapshot(&path)
+            .expect("namespace must remain readable")
+            .expect("manifest directory must exist");
+
+        fs::rename(&original, directory.path().join("old-src"))
+            .expect("the original directory must be replaceable");
+        fs::create_dir(&original).expect("replacement directory must be creatable");
+        fs::write(original.join("attacker.txt"), b"attacker")
+            .expect("replacement content must be writable");
+
+        assert!(matches!(
+            backing.runtime_metadata(&object),
+            Err(RuntimeBackingError::ObjectIdentityChanged { .. })
+        ));
+    }
+
     #[test]
     fn runtime_metadata_rejects_a_hard_link_added_after_preflight() {
         let directory = tempdir().expect("temporary repository must be creatable");
@@ -2936,7 +3296,8 @@ mod tests {
             .expect("a replacement link must be creatable");
         assert!(matches!(
             backing.read_runtime_symlink(&record),
-            Err(RuntimeBackingError::SymlinkTargetChanged { .. })
+            Err(RuntimeBackingError::ObjectIdentityChanged { .. }
+                | RuntimeBackingError::SymlinkTargetChanged { .. })
         ));
     }
 

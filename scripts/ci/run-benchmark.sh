@@ -35,6 +35,7 @@ validate_output() {
 
   declare -A measured_ns=()
   declare -A spread_ns=()
+  declare -A expected_names=()
   local line name value unit spread spread_unit
   while IFS= read -r line; do
     [[ "${line}" =~ ^test[[:space:]]+ ]] || continue
@@ -59,6 +60,7 @@ validate_output() {
   while read -r name baseline threshold noise; do
     [[ -n "${name}" ]] || continue
     [[ "${name}" == \#* ]] && continue
+    expected_names["${name}"]=1
     if [[ ! "${baseline}" =~ ^[0-9]+$ || ! "${threshold}" =~ ^[0-9]+$ || ! "${noise}" =~ ^[0-9]+$ || "${baseline}" -le 0 ]]; then
       printf 'invalid benchmark baseline row: %s %s %s %s\n' "${name}" "${baseline}" "${threshold}" "${noise}" >&2
       failures=$((failures + 1))
@@ -88,6 +90,13 @@ validate_output() {
       failures=$((failures + 1))
     fi
   done < "${baseline_file}"
+
+  for name in "${!measured_ns[@]}"; do
+    if [[ -z "${expected_names[${name}]+present}" ]]; then
+      printf 'benchmark output contains an unbaselined measurement: %s\n' "${name}" >&2
+      failures=$((failures + 1))
+    fi
+  done
 
   (( failures == 0 )) || { printf 'benchmark gate failed: %d regression/contract error(s)\n' "${failures}" >&2; return 1; }
 }

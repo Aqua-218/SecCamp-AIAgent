@@ -111,6 +111,9 @@ pipeline_complete:
     - job: real_runtime_lifecycle
       artifacts: false
       optional: true
+    - job: session_owner_kvm
+      artifacts: false
+      optional: true
     - job: real_capfs
       artifacts: false
       optional: true

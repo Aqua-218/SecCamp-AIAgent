@@ -4,6 +4,8 @@ set -euo pipefail
 
 readonly repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly baseline_root="${repository_root}/ci/api-baselines"
+readonly tool_bin="${CI_TOOLS_DIR:-${repository_root}/.ci-tools}/cargo/bin"
+export PATH="${tool_bin}:${PATH}"
 readonly nightly_channel="$(awk -F'"' '/^readonly nightly_channel=/{ print $2; exit }' "${repository_root}/scripts/ci/install-nightly-toolchain.sh")"
 readonly temporary_root="$(mktemp -d)"
 trap 'rm -rf -- "${temporary_root}"' EXIT
@@ -35,7 +37,7 @@ fi
 cargo metadata --locked --format-version 1 > /dev/null
 
 mapfile -t packages < <(
-  cargo metadata --no-deps --format-version 1 \
+  cargo metadata --locked --no-deps --format-version 1 \
     | jq -r '.packages[] | select(any(.targets[]; (.kind | index("lib")) != null)) | .name' \
     | sort
 )

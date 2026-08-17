@@ -123,6 +123,9 @@ MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
 RemoveIPC=yes
 LimitNOFILE=65536
+LimitCORE=0
+KeyringMode=private
+ProtectProc=invisible
 ReadWritePaths=/var/lib/host-sessiond /run/host-sessiond /var/lib/host-sessiond/jailer /var/lib/host-sessiond/workspace-source
 
 [Install]

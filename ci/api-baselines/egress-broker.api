@@ -1,0 +1,537 @@
+pub mod egress_broker
+pub mod egress_broker::dispatch
+pub enum egress_broker::dispatch::AdapterError
+pub egress_broker::dispatch::AdapterError::GitHub(egress_broker::github::GitHubAdapterError)
+pub egress_broker::dispatch::AdapterError::OperationMismatch
+pub egress_broker::dispatch::AdapterError::Public(egress_broker::public_fetch::FetchError)
+pub enum egress_broker::dispatch::BrokerEffect
+pub egress_broker::dispatch::BrokerEffect::GitHub(egress_broker::github::GitHubResponse)
+pub egress_broker::dispatch::BrokerEffect::Public(egress_broker::public_fetch::PublicResponse)
+pub enum egress_broker::dispatch::BrokerOutcome
+pub egress_broker::dispatch::BrokerOutcome::Rejected(egress_broker::dispatch::BrokerRejection)
+pub egress_broker::dispatch::BrokerOutcome::Succeeded(egress_broker::dispatch::BrokerEffect)
+pub enum egress_broker::dispatch::BrokerRejection
+pub egress_broker::dispatch::BrokerRejection::AccountingInvariant
+pub egress_broker::dispatch::BrokerRejection::AuditUnavailable
+pub egress_broker::dispatch::BrokerRejection::Budget
+pub egress_broker::dispatch::BrokerRejection::CommittedButUnrecorded
+pub egress_broker::dispatch::BrokerRejection::GitHub(egress_broker::github::GitHubAdapterError)
+pub egress_broker::dispatch::BrokerRejection::NotAuthorized
+pub egress_broker::dispatch::BrokerRejection::OperationMismatch
+pub egress_broker::dispatch::BrokerRejection::PublicFetch(egress_broker::public_fetch::FetchError)
+pub enum egress_broker::dispatch::DispatchError
+pub egress_broker::dispatch::DispatchError::Cbor(egress_protocol::cbor::CborError)
+pub egress_broker::dispatch::DispatchError::DurableUnavailable
+pub egress_broker::dispatch::DispatchError::Envelope(egress_protocol::session::EnvelopeError)
+pub egress_broker::dispatch::DispatchError::Frame(egress_protocol::frame::FrameError)
+pub egress_broker::dispatch::DispatchError::MissingCachedOutcome(egress_protocol::session::BrokerRequestId)
+impl core::error::Error for egress_broker::dispatch::DispatchError
+impl core::fmt::Display for egress_broker::dispatch::DispatchError
+pub fn egress_broker::dispatch::DispatchError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum egress_broker::dispatch::ExecutorError
+pub egress_broker::dispatch::ExecutorError::Adapter(egress_broker::dispatch::AdapterError)
+pub egress_broker::dispatch::ExecutorError::AuditUnavailable
+pub egress_broker::dispatch::ExecutorError::CommittedButUnrecorded
+pub egress_broker::dispatch::ExecutorError::LockPoisoned
+pub egress_broker::dispatch::ExecutorError::NotAuthorized
+pub enum egress_broker::dispatch::TransportDispatchError
+pub egress_broker::dispatch::TransportDispatchError::Dispatch(egress_broker::dispatch::DispatchError)
+pub egress_broker::dispatch::TransportDispatchError::Transport(egress_broker::transport::TransportError)
+impl core::error::Error for egress_broker::dispatch::TransportDispatchError
+impl core::fmt::Display for egress_broker::dispatch::TransportDispatchError
+pub fn egress_broker::dispatch::TransportDispatchError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_broker::dispatch::BrokerDispatcher<E, P, G>
+impl<E, P, G> egress_broker::dispatch::BrokerDispatcher<E, P, G> where E: egress_broker::dispatch::CapabilityExecutor, P: egress_broker::dispatch::PublicDispatchAdapter, G: egress_broker::github::GitHubAdapter
+pub fn egress_broker::dispatch::BrokerDispatcher<E, P, G>::budget_usage(&self) -> egress_protocol::budget::SessionBudgetUsage
+pub fn egress_broker::dispatch::BrokerDispatcher<E, P, G>::dispatch_control_frame(&mut self, &egress_protocol::frame::ControlFrame, &egress_broker::dispatch::DispatchContext) -> core::result::Result<egress_broker::dispatch::BrokerResponse, egress_broker::dispatch::DispatchError>
+pub fn egress_broker::dispatch::BrokerDispatcher<E, P, G>::dispatch_frame(&mut self, &[u8], &egress_broker::dispatch::DispatchContext) -> core::result::Result<egress_broker::dispatch::BrokerResponse, egress_broker::dispatch::DispatchError>
+pub fn egress_broker::dispatch::BrokerDispatcher<E, P, G>::dispatch_transport<S>(&mut self, &mut egress_broker::transport::FramedTransport<S>, &egress_broker::dispatch::DispatchContext) -> core::result::Result<egress_broker::dispatch::BrokerResponse, egress_broker::dispatch::TransportDispatchError> where S: std::io::Read + std::io::Write
+pub fn egress_broker::dispatch::BrokerDispatcher<E, P, G>::new_durable(E, P, G, egress_broker::durable::DurableSessionConfig, u64, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, egress_broker::durable::DurableWalError>
+pub fn egress_broker::dispatch::BrokerDispatcher<E, P, G>::new_in_memory(E, P, G, egress_protocol::session::BrokerSessionId, core::num::nonzero::NonZeroUsize, egress_protocol::budget::SessionBudgetLimits, u64) -> Self
+pub fn egress_broker::dispatch::BrokerDispatcher<E, P, G>::open_durable(E, P, G, egress_broker::durable::DurableSessionConfig, u64, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, egress_broker::durable::DurableWalError>
+impl<E, P, G> egress_broker::server::RequestDispatcher for egress_broker::dispatch::BrokerDispatcher<E, P, G> where E: egress_broker::dispatch::CapabilityExecutor, P: egress_broker::dispatch::PublicDispatchAdapter, G: egress_broker::github::GitHubAdapter
+pub fn egress_broker::dispatch::BrokerDispatcher<E, P, G>::dispatch_request(&mut self, &egress_protocol::frame::ControlFrame, &egress_broker::dispatch::DispatchContext) -> core::result::Result<egress_broker::dispatch::BrokerResponse, egress_broker::dispatch::DispatchError>
+pub struct egress_broker::dispatch::BrokerResponse
+pub egress_broker::dispatch::BrokerResponse::outcome: egress_broker::dispatch::BrokerOutcome
+pub egress_broker::dispatch::BrokerResponse::request: egress_protocol::session::BrokerRequestId
+pub struct egress_broker::dispatch::DispatchContext
+pub egress_broker::dispatch::DispatchContext::caller: authority_core::capability::SubjectId
+pub egress_broker::dispatch::DispatchContext::capability: authority_core::capability::CapId
+pub egress_broker::dispatch::DispatchContext::now: authority_core::time::MonotonicTime
+pub trait egress_broker::dispatch::CapabilityExecutor
+pub fn egress_broker::dispatch::CapabilityExecutor::execute(&self, &egress_broker::dispatch::DispatchContext, &authority_core::capability::CapabilityRequest, &mut dyn core::ops::function::FnMut(&authority_core::capability::Capability) -> authority_core::kernel::EffectExecution<egress_broker::dispatch::BrokerEffect, egress_broker::dispatch::AdapterError>) -> core::result::Result<egress_broker::dispatch::BrokerEffect, egress_broker::dispatch::ExecutorError>
+impl egress_broker::dispatch::CapabilityExecutor for alloc::sync::Arc<authority_core::kernel::CapabilityKernel>
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::execute(&self, &egress_broker::dispatch::DispatchContext, &authority_core::capability::CapabilityRequest, &mut dyn core::ops::function::FnMut(&authority_core::capability::Capability) -> authority_core::kernel::EffectExecution<egress_broker::dispatch::BrokerEffect, egress_broker::dispatch::AdapterError>) -> core::result::Result<egress_broker::dispatch::BrokerEffect, egress_broker::dispatch::ExecutorError>
+impl egress_broker::dispatch::CapabilityExecutor for authority_core::kernel::CapabilityKernel
+pub fn authority_core::kernel::CapabilityKernel::execute(&self, &egress_broker::dispatch::DispatchContext, &authority_core::capability::CapabilityRequest, &mut dyn core::ops::function::FnMut(&authority_core::capability::Capability) -> authority_core::kernel::EffectExecution<egress_broker::dispatch::BrokerEffect, egress_broker::dispatch::AdapterError>) -> core::result::Result<egress_broker::dispatch::BrokerEffect, egress_broker::dispatch::ExecutorError>
+pub trait egress_broker::dispatch::PublicDispatchAdapter
+pub fn egress_broker::dispatch::PublicDispatchAdapter::fetch(&self, &authority_core::http::HttpFetchRequest, &authority_core::http::HttpFetchAuthority) -> core::result::Result<egress_broker::public_fetch::PublicResponse, egress_broker::public_fetch::FetchError>
+impl<R, C> egress_broker::dispatch::PublicDispatchAdapter for egress_broker::public_fetch::PublicFetcher<R, C> where R: egress_broker::public_fetch::Resolver, C: egress_broker::public_fetch::HttpsConnector
+pub fn egress_broker::public_fetch::PublicFetcher<R, C>::fetch(&self, &authority_core::http::HttpFetchRequest, &authority_core::http::HttpFetchAuthority) -> core::result::Result<egress_broker::public_fetch::PublicResponse, egress_broker::public_fetch::FetchError>
+pub const fn egress_broker::dispatch::default_github_response_cap() -> u64
+pub mod egress_broker::durable
+pub enum egress_broker::durable::BudgetSettlement
+pub egress_broker::durable::BudgetSettlement::Abort
+pub egress_broker::durable::BudgetSettlement::Complete
+pub egress_broker::durable::BudgetSettlement::Complete::response_bytes: u64
+pub egress_broker::durable::BudgetSettlement::NotStarted
+pub enum egress_broker::durable::DurableAcceptance
+pub egress_broker::durable::DurableAcceptance::ExactDuplicate(alloc::boxed::Box<egress_broker::durable::DurableRequest>)
+pub egress_broker::durable::DurableAcceptance::New
+pub enum egress_broker::durable::DurableRequestPhase
+pub egress_broker::durable::DurableRequestPhase::AcceptedPending
+pub egress_broker::durable::DurableRequestPhase::Final(egress_broker::durable::DurableCanonicalResponse)
+pub egress_broker::durable::DurableRequestPhase::RetryableBudget
+pub enum egress_broker::durable::DurableWalError
+pub egress_broker::durable::DurableWalError::Budget(egress_protocol::budget::SessionBudgetError)
+pub egress_broker::durable::DurableWalError::ChecksumMismatch
+pub egress_broker::durable::DurableWalError::ConfigurationMismatch
+pub egress_broker::durable::DurableWalError::ConfigurationMismatch::expected: egress_broker::durable::DurableSessionConfig
+pub egress_broker::durable::DurableWalError::ConfigurationMismatch::recovered: egress_broker::durable::DurableSessionConfig
+pub egress_broker::durable::DurableWalError::DurabilityUncertain(std::io::error::Error)
+pub egress_broker::durable::DurableWalError::InvalidMagic
+pub egress_broker::durable::DurableWalError::InvalidRecord(alloc::string::String)
+pub egress_broker::durable::DurableWalError::InvalidTransition
+pub egress_broker::durable::DurableWalError::InvalidTransition::request: egress_protocol::session::BrokerRequestId
+pub egress_broker::durable::DurableWalError::Io(std::io::error::Error)
+pub egress_broker::durable::DurableWalError::Locked
+pub egress_broker::durable::DurableWalError::NotRegularFile
+pub egress_broker::durable::DurableWalError::OutOfOrderSequence
+pub egress_broker::durable::DurableWalError::OutOfOrderSequence::expected: u64
+pub egress_broker::durable::DurableWalError::OutOfOrderSequence::received: u64
+pub egress_broker::durable::DurableWalError::PathIdentityChanged
+pub egress_broker::durable::DurableWalError::RecordTooLarge(usize)
+pub egress_broker::durable::DurableWalError::RequestCapacityExhausted
+pub egress_broker::durable::DurableWalError::RequestIdentityMismatch
+pub egress_broker::durable::DurableWalError::RequestIdentityMismatch::request: egress_protocol::session::BrokerRequestId
+pub egress_broker::durable::DurableWalError::Response(egress_protocol::response::ResponseCborError)
+pub egress_broker::durable::DurableWalError::ResponseChunk(egress_protocol::response::ResponseChunkError)
+pub egress_broker::durable::DurableWalError::ResponseRequestMismatch
+pub egress_broker::durable::DurableWalError::ResponseRequestMismatch::expected: egress_protocol::session::BrokerRequestId
+pub egress_broker::durable::DurableWalError::ResponseRequestMismatch::received: egress_protocol::session::BrokerRequestId
+pub egress_broker::durable::DurableWalError::Sealed
+pub egress_broker::durable::DurableWalError::SequenceExhausted
+pub egress_broker::durable::DurableWalError::SequenceMismatch
+pub egress_broker::durable::DurableWalError::SequenceMismatch::actual: u64
+pub egress_broker::durable::DurableWalError::SequenceMismatch::expected: u64
+pub egress_broker::durable::DurableWalError::Symlink
+pub egress_broker::durable::DurableWalError::TruncatedRecord
+pub egress_broker::durable::DurableWalError::UnknownRequest(egress_protocol::session::BrokerRequestId)
+pub egress_broker::durable::DurableWalError::UnsafeParentDirectory
+pub egress_broker::durable::DurableWalError::UnsafePermissions
+pub egress_broker::durable::DurableWalError::UnsafePermissions::mode: u32
+pub egress_broker::durable::DurableWalError::UnsupportedVersion(u16)
+pub egress_broker::durable::DurableWalError::WalTooLarge
+pub egress_broker::durable::DurableWalError::WalTooLarge::length: u64
+pub egress_broker::durable::DurableWalError::WalTooLarge::maximum: u64
+pub egress_broker::durable::DurableWalError::WrongOwner
+pub egress_broker::durable::DurableWalError::WrongOwner::actual: u32
+pub egress_broker::durable::DurableWalError::WrongOwner::expected: u32
+impl core::convert::From<std::io::error::Error> for egress_broker::durable::DurableWalError
+pub fn egress_broker::durable::DurableWalError::from(std::io::error::Error) -> Self
+impl core::error::Error for egress_broker::durable::DurableWalError
+pub fn egress_broker::durable::DurableWalError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for egress_broker::durable::DurableWalError
+pub fn egress_broker::durable::DurableWalError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_broker::durable::DurableBrokerView
+impl egress_broker::durable::DurableBrokerView
+pub fn egress_broker::durable::DurableBrokerView::budget(&self) -> egress_broker::durable::DurableBudgetSnapshot
+pub const fn egress_broker::durable::DurableBrokerView::config(&self) -> egress_broker::durable::DurableSessionConfig
+pub fn egress_broker::durable::DurableBrokerView::open(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, egress_broker::durable::DurableWalError>
+pub fn egress_broker::durable::DurableBrokerView::path(&self) -> &std::path::Path
+pub fn egress_broker::durable::DurableBrokerView::request(&self, egress_protocol::session::BrokerRequestId) -> core::option::Option<&egress_broker::durable::DurableRequest>
+pub fn egress_broker::durable::DurableBrokerView::requests(&self) -> &[egress_broker::durable::DurableRequest]
+pub fn egress_broker::durable::DurableBrokerView::restore_budget(&self) -> core::result::Result<egress_protocol::budget::SessionBudget, egress_broker::durable::DurableWalError>
+pub struct egress_broker::durable::DurableBrokerWal
+impl egress_broker::durable::DurableBrokerWal
+pub fn egress_broker::durable::DurableBrokerWal::accept(&mut self, egress_protocol::session::BrokerEnvelope, u64) -> core::result::Result<egress_broker::durable::DurableAcceptance, egress_broker::durable::DurableWalError>
+pub fn egress_broker::durable::DurableBrokerWal::create(impl core::convert::AsRef<std::path::Path>, egress_broker::durable::DurableSessionConfig) -> core::result::Result<Self, egress_broker::durable::DurableWalError>
+pub fn egress_broker::durable::DurableBrokerWal::finalize(&mut self, egress_protocol::session::BrokerRequestId, &egress_protocol::response::CanonicalBrokerResponse, egress_broker::durable::BudgetSettlement) -> core::result::Result<(), egress_broker::durable::DurableWalError>
+pub const fn egress_broker::durable::DurableBrokerWal::is_sealed(&self) -> bool
+pub fn egress_broker::durable::DurableBrokerWal::mark_retryable_budget(&mut self, egress_protocol::session::BrokerRequestId) -> core::result::Result<(), egress_broker::durable::DurableWalError>
+pub fn egress_broker::durable::DurableBrokerWal::open(impl core::convert::AsRef<std::path::Path>, egress_broker::durable::DurableSessionConfig) -> core::result::Result<Self, egress_broker::durable::DurableWalError>
+pub fn egress_broker::durable::DurableBrokerWal::path(&self) -> &std::path::Path
+pub fn egress_broker::durable::DurableBrokerWal::read_only_view(&self) -> core::result::Result<egress_broker::durable::DurableBrokerView, egress_broker::durable::DurableWalError>
+pub fn egress_broker::durable::DurableBrokerWal::reserve(&mut self, egress_protocol::session::BrokerRequestId) -> core::result::Result<(), egress_broker::durable::DurableWalError>
+pub struct egress_broker::durable::DurableBudgetSnapshot
+impl egress_broker::durable::DurableBudgetSnapshot
+pub fn egress_broker::durable::DurableBudgetSnapshot::active_reservations(&self) -> &[egress_broker::durable::DurableReservation]
+pub const fn egress_broker::durable::DurableBudgetSnapshot::committed_response_bytes(&self) -> u64
+pub const fn egress_broker::durable::DurableBudgetSnapshot::limits(&self) -> egress_protocol::budget::SessionBudgetLimits
+pub const fn egress_broker::durable::DurableBudgetSnapshot::reserved_response_bytes(&self) -> u64
+pub const fn egress_broker::durable::DurableBudgetSnapshot::started_requests(&self) -> u64
+pub struct egress_broker::durable::DurableCanonicalResponse
+impl egress_broker::durable::DurableCanonicalResponse
+pub const fn egress_broker::durable::DurableCanonicalResponse::response(&self) -> &egress_protocol::response::CanonicalBrokerResponse
+pub fn egress_broker::durable::DurableCanonicalResponse::wire_payloads(&self) -> &[alloc::vec::Vec<u8>]
+impl core::clone::Clone for egress_broker::durable::DurableCanonicalResponse
+pub fn egress_broker::durable::DurableCanonicalResponse::clone(&self) -> Self
+impl core::cmp::Eq for egress_broker::durable::DurableCanonicalResponse
+impl core::cmp::PartialEq for egress_broker::durable::DurableCanonicalResponse
+pub fn egress_broker::durable::DurableCanonicalResponse::eq(&self, &Self) -> bool
+pub struct egress_broker::durable::DurableRequest
+impl egress_broker::durable::DurableRequest
+pub const fn egress_broker::durable::DurableRequest::active_reservation(&self) -> core::option::Option<u64>
+pub const fn egress_broker::durable::DurableRequest::final_settlement(&self) -> core::option::Option<egress_broker::durable::BudgetSettlement>
+pub const fn egress_broker::durable::DurableRequest::payload_hash(&self) -> &[u8; 32]
+pub const fn egress_broker::durable::DurableRequest::phase(&self) -> &egress_broker::durable::DurableRequestPhase
+pub const fn egress_broker::durable::DurableRequest::request(&self) -> egress_protocol::session::BrokerRequestId
+pub const fn egress_broker::durable::DurableRequest::response_cap(&self) -> u64
+pub const fn egress_broker::durable::DurableRequest::sequence(&self) -> u64
+pub struct egress_broker::durable::DurableReservation
+impl egress_broker::durable::DurableReservation
+pub const fn egress_broker::durable::DurableReservation::request(self) -> egress_protocol::session::BrokerRequestId
+pub const fn egress_broker::durable::DurableReservation::response_cap(self) -> u64
+pub struct egress_broker::durable::DurableSessionConfig
+impl egress_broker::durable::DurableSessionConfig
+pub const fn egress_broker::durable::DurableSessionConfig::budget_limits(self) -> egress_protocol::budget::SessionBudgetLimits
+pub const fn egress_broker::durable::DurableSessionConfig::new(egress_protocol::session::BrokerSessionId, core::num::nonzero::NonZeroUsize, egress_protocol::budget::SessionBudgetLimits) -> Self
+pub const fn egress_broker::durable::DurableSessionConfig::replay_capacity(self) -> core::num::nonzero::NonZeroUsize
+pub const fn egress_broker::durable::DurableSessionConfig::session(self) -> egress_protocol::session::BrokerSessionId
+pub const egress_broker::durable::MAX_DURABLE_BROKER_WAL_BYTES: u64
+pub mod egress_broker::github
+pub enum egress_broker::github::CredentialError
+pub egress_broker::github::CredentialError::Unavailable
+pub enum egress_broker::github::GitHubAdapterError
+pub egress_broker::github::GitHubAdapterError::CommitUnknown(egress_broker::github::GitHubCommitUnknown)
+pub egress_broker::github::GitHubAdapterError::CredentialUnavailable
+pub egress_broker::github::GitHubAdapterError::InvalidProviderResponse
+pub egress_broker::github::GitHubAdapterError::MissingPublishPrecondition
+pub egress_broker::github::GitHubAdapterError::NotAuthorized
+pub egress_broker::github::GitHubAdapterError::ProviderConflict
+pub egress_broker::github::GitHubAdapterError::ProviderForbidden
+pub egress_broker::github::GitHubAdapterError::ProviderNotFound
+pub egress_broker::github::GitHubAdapterError::ProviderRejected
+pub egress_broker::github::GitHubAdapterError::ProviderServer
+pub egress_broker::github::GitHubAdapterError::ProviderServer::status: u16
+pub egress_broker::github::GitHubAdapterError::ProviderTransport
+pub egress_broker::github::GitHubAdapterError::ProviderUnauthorized
+pub egress_broker::github::GitHubAdapterError::RateLimited(egress_broker::github::RateLimitInfo)
+impl core::error::Error for egress_broker::github::GitHubAdapterError
+impl core::fmt::Display for egress_broker::github::GitHubAdapterError
+pub fn egress_broker::github::GitHubAdapterError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum egress_broker::github::GitHubProviderError
+pub egress_broker::github::GitHubProviderError::CommitUnknown
+pub egress_broker::github::GitHubProviderError::Conflict
+pub egress_broker::github::GitHubProviderError::Forbidden
+pub egress_broker::github::GitHubProviderError::InvalidResponse
+pub egress_broker::github::GitHubProviderError::NotFound
+pub egress_broker::github::GitHubProviderError::RateLimited(egress_broker::github::RateLimitInfo)
+pub egress_broker::github::GitHubProviderError::Server
+pub egress_broker::github::GitHubProviderError::Server::status: u16
+pub egress_broker::github::GitHubProviderError::Transport
+pub egress_broker::github::GitHubProviderError::Unauthorized
+pub struct egress_broker::github::CreatePullRequestInput
+impl egress_broker::github::CreatePullRequestInput
+pub const fn egress_broker::github::CreatePullRequestInput::request(&self) -> &authority_core::github::GitHubRequest
+pub struct egress_broker::github::CredentialHandle(_)
+impl egress_broker::github::CredentialHandle
+pub const fn egress_broker::github::CredentialHandle::from_host_id(u64) -> Self
+pub struct egress_broker::github::EnvironmentCredentialProvider
+impl egress_broker::github::EnvironmentCredentialProvider
+pub const fn egress_broker::github::EnvironmentCredentialProvider::new(authority_core::github::InstallationId, egress_broker::github::CredentialHandle) -> Self
+impl egress_broker::github::CredentialProvider for egress_broker::github::EnvironmentCredentialProvider
+pub fn egress_broker::github::EnvironmentCredentialProvider::credential_for(&self, &authority_core::github::InstallationId) -> core::result::Result<egress_broker::github::CredentialHandle, egress_broker::github::CredentialError>
+pub struct egress_broker::github::GitHubCommitUnknown
+pub struct egress_broker::github::GitHubResponse
+impl egress_broker::github::GitHubResponse
+pub const fn egress_broker::github::GitHubResponse::operation(&self) -> authority_core::github::GitHubOperation
+pub const fn egress_broker::github::GitHubResponse::response_bytes(&self) -> u64
+pub struct egress_broker::github::GitObjectId(_)
+impl egress_broker::github::GitObjectId
+pub fn egress_broker::github::GitObjectId::as_str(&self) -> &str
+pub fn egress_broker::github::GitObjectId::new(impl core::convert::AsRef<str>) -> core::result::Result<Self, egress_broker::github::InvalidGitObjectId>
+pub struct egress_broker::github::InvalidGitObjectId
+impl core::error::Error for egress_broker::github::InvalidGitObjectId
+impl core::fmt::Display for egress_broker::github::InvalidGitObjectId
+pub fn egress_broker::github::InvalidGitObjectId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_broker::github::PublishBranchInput
+impl egress_broker::github::PublishBranchInput
+pub const fn egress_broker::github::PublishBranchInput::plan(&self) -> &egress_broker::github::PublishBranchPlan
+pub const fn egress_broker::github::PublishBranchInput::request(&self) -> &authority_core::github::GitHubRequest
+pub struct egress_broker::github::PublishBranchPlan
+impl egress_broker::github::PublishBranchPlan
+pub const fn egress_broker::github::PublishBranchPlan::expected_old_object(&self) -> &egress_broker::github::GitObjectId
+pub const fn egress_broker::github::PublishBranchPlan::new(egress_broker::github::GitObjectId, egress_broker::github::GitObjectId) -> Self
+pub const fn egress_broker::github::PublishBranchPlan::new_object(&self) -> &egress_broker::github::GitObjectId
+pub struct egress_broker::github::RateLimitInfo
+pub egress_broker::github::RateLimitInfo::remaining: core::option::Option<u64>
+pub egress_broker::github::RateLimitInfo::reset_unix_seconds: core::option::Option<u64>
+pub egress_broker::github::RateLimitInfo::retry_after_seconds: core::option::Option<u64>
+pub struct egress_broker::github::RustlsGitHubProvider
+impl egress_broker::github::RustlsGitHubProvider
+pub fn egress_broker::github::RustlsGitHubProvider::from_environment() -> core::result::Result<Self, egress_broker::github::GitHubProviderError>
+impl core::fmt::Debug for egress_broker::github::RustlsGitHubProvider
+pub fn egress_broker::github::RustlsGitHubProvider::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl egress_broker::github::GitHubProvider for egress_broker::github::RustlsGitHubProvider
+pub fn egress_broker::github::RustlsGitHubProvider::create_pull_request(&mut self, &egress_broker::github::CreatePullRequestInput, egress_broker::github::CredentialHandle, u64) -> core::result::Result<egress_broker::github::GitHubResponse, egress_broker::github::GitHubProviderError>
+pub fn egress_broker::github::RustlsGitHubProvider::publish_branch(&mut self, &egress_broker::github::PublishBranchInput, egress_broker::github::CredentialHandle, u64) -> core::result::Result<egress_broker::github::GitHubResponse, egress_broker::github::GitHubProviderError>
+pub struct egress_broker::github::StaticCredentialProvider
+impl egress_broker::github::StaticCredentialProvider
+pub const fn egress_broker::github::StaticCredentialProvider::new(authority_core::github::InstallationId, egress_broker::github::CredentialHandle) -> Self
+impl egress_broker::github::CredentialProvider for egress_broker::github::StaticCredentialProvider
+pub fn egress_broker::github::StaticCredentialProvider::credential_for(&self, &authority_core::github::InstallationId) -> core::result::Result<egress_broker::github::CredentialHandle, egress_broker::github::CredentialError>
+pub struct egress_broker::github::StaticPublishPlanProvider
+impl egress_broker::github::StaticPublishPlanProvider
+pub fn egress_broker::github::StaticPublishPlanProvider::new(impl core::iter::traits::collect::IntoIterator<Item = (egress_protocol::session::BrokerRequestId, authority_core::github::GitHubRequest, egress_broker::github::PublishBranchPlan)>) -> Self
+impl egress_broker::github::PublishPlanProvider for egress_broker::github::StaticPublishPlanProvider
+pub fn egress_broker::github::StaticPublishPlanProvider::plan_for(&self, egress_protocol::session::BrokerRequestId, &authority_core::github::GitHubRequest) -> core::result::Result<egress_broker::github::PublishBranchPlan, egress_broker::github::GitHubAdapterError>
+pub struct egress_broker::github::TypedGitHubAdapter<P, C, O>
+impl<P, C, O> egress_broker::github::TypedGitHubAdapter<P, C, O> where P: egress_broker::github::GitHubProvider, C: egress_broker::github::CredentialProvider, O: egress_broker::github::PublishPlanProvider
+pub const fn egress_broker::github::TypedGitHubAdapter<P, C, O>::new(P, C, O) -> Self
+impl<P, C, O> egress_broker::github::GitHubAdapter for egress_broker::github::TypedGitHubAdapter<P, C, O> where P: egress_broker::github::GitHubProvider, C: egress_broker::github::CredentialProvider, O: egress_broker::github::PublishPlanProvider
+pub fn egress_broker::github::TypedGitHubAdapter<P, C, O>::execute(&mut self, egress_protocol::session::BrokerRequestId, &authority_core::github::GitHubRequest, &authority_core::github::GitHubAuthority, u64) -> core::result::Result<egress_broker::github::GitHubResponse, egress_broker::github::GitHubAdapterError>
+pub const egress_broker::github::MAX_GITHUB_RESPONSE_BYTES: u64
+pub trait egress_broker::github::CredentialProvider: core::marker::Send + core::marker::Sync
+pub fn egress_broker::github::CredentialProvider::credential_for(&self, &authority_core::github::InstallationId) -> core::result::Result<egress_broker::github::CredentialHandle, egress_broker::github::CredentialError>
+impl egress_broker::github::CredentialProvider for egress_broker::github::EnvironmentCredentialProvider
+pub fn egress_broker::github::EnvironmentCredentialProvider::credential_for(&self, &authority_core::github::InstallationId) -> core::result::Result<egress_broker::github::CredentialHandle, egress_broker::github::CredentialError>
+impl egress_broker::github::CredentialProvider for egress_broker::github::StaticCredentialProvider
+pub fn egress_broker::github::StaticCredentialProvider::credential_for(&self, &authority_core::github::InstallationId) -> core::result::Result<egress_broker::github::CredentialHandle, egress_broker::github::CredentialError>
+pub trait egress_broker::github::GitHubAdapter: core::marker::Send
+pub fn egress_broker::github::GitHubAdapter::execute(&mut self, egress_protocol::session::BrokerRequestId, &authority_core::github::GitHubRequest, &authority_core::github::GitHubAuthority, u64) -> core::result::Result<egress_broker::github::GitHubResponse, egress_broker::github::GitHubAdapterError>
+impl<P, C, O> egress_broker::github::GitHubAdapter for egress_broker::github::TypedGitHubAdapter<P, C, O> where P: egress_broker::github::GitHubProvider, C: egress_broker::github::CredentialProvider, O: egress_broker::github::PublishPlanProvider
+pub fn egress_broker::github::TypedGitHubAdapter<P, C, O>::execute(&mut self, egress_protocol::session::BrokerRequestId, &authority_core::github::GitHubRequest, &authority_core::github::GitHubAuthority, u64) -> core::result::Result<egress_broker::github::GitHubResponse, egress_broker::github::GitHubAdapterError>
+pub trait egress_broker::github::GitHubProvider: core::marker::Send
+pub fn egress_broker::github::GitHubProvider::create_pull_request(&mut self, &egress_broker::github::CreatePullRequestInput, egress_broker::github::CredentialHandle, u64) -> core::result::Result<egress_broker::github::GitHubResponse, egress_broker::github::GitHubProviderError>
+pub fn egress_broker::github::GitHubProvider::publish_branch(&mut self, &egress_broker::github::PublishBranchInput, egress_broker::github::CredentialHandle, u64) -> core::result::Result<egress_broker::github::GitHubResponse, egress_broker::github::GitHubProviderError>
+impl egress_broker::github::GitHubProvider for egress_broker::github::RustlsGitHubProvider
+pub fn egress_broker::github::RustlsGitHubProvider::create_pull_request(&mut self, &egress_broker::github::CreatePullRequestInput, egress_broker::github::CredentialHandle, u64) -> core::result::Result<egress_broker::github::GitHubResponse, egress_broker::github::GitHubProviderError>
+pub fn egress_broker::github::RustlsGitHubProvider::publish_branch(&mut self, &egress_broker::github::PublishBranchInput, egress_broker::github::CredentialHandle, u64) -> core::result::Result<egress_broker::github::GitHubResponse, egress_broker::github::GitHubProviderError>
+pub trait egress_broker::github::PublishPlanProvider: core::marker::Send + core::marker::Sync
+pub fn egress_broker::github::PublishPlanProvider::plan_for(&self, egress_protocol::session::BrokerRequestId, &authority_core::github::GitHubRequest) -> core::result::Result<egress_broker::github::PublishBranchPlan, egress_broker::github::GitHubAdapterError>
+impl egress_broker::github::PublishPlanProvider for egress_broker::github::StaticPublishPlanProvider
+pub fn egress_broker::github::StaticPublishPlanProvider::plan_for(&self, egress_protocol::session::BrokerRequestId, &authority_core::github::GitHubRequest) -> core::result::Result<egress_broker::github::PublishBranchPlan, egress_broker::github::GitHubAdapterError>
+pub mod egress_broker::ip_policy
+pub enum egress_broker::ip_policy::IpPolicyError
+pub egress_broker::ip_policy::IpPolicyError::DeniedAnswer
+pub egress_broker::ip_policy::IpPolicyError::EmptyAnswer
+impl core::error::Error for egress_broker::ip_policy::IpPolicyError
+impl core::fmt::Display for egress_broker::ip_policy::IpPolicyError
+pub fn egress_broker::ip_policy::IpPolicyError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum egress_broker::ip_policy::IpRangeError
+pub egress_broker::ip_policy::IpRangeError::PrefixTooLarge
+pub egress_broker::ip_policy::IpRangeError::PrefixTooLarge::max: u8
+pub egress_broker::ip_policy::IpRangeError::PrefixTooLarge::prefix_length: u8
+impl core::error::Error for egress_broker::ip_policy::IpRangeError
+impl core::fmt::Display for egress_broker::ip_policy::IpRangeError
+pub fn egress_broker::ip_policy::IpRangeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_broker::ip_policy::IpPolicy
+impl egress_broker::ip_policy::IpPolicy
+pub fn egress_broker::ip_policy::IpPolicy::is_host_denied(&self, core::net::ip_addr::IpAddr) -> bool
+pub fn egress_broker::ip_policy::IpPolicy::strict(impl core::iter::traits::collect::IntoIterator<Item = egress_broker::ip_policy::IpRange>) -> core::result::Result<Self, egress_broker::ip_policy::IpRangeError>
+pub fn egress_broker::ip_policy::IpPolicy::validate_dns_answer(&self, &[core::net::ip_addr::IpAddr]) -> core::result::Result<core::net::ip_addr::IpAddr, egress_broker::ip_policy::IpPolicyError>
+impl core::default::Default for egress_broker::ip_policy::IpPolicy
+pub fn egress_broker::ip_policy::IpPolicy::default() -> Self
+pub struct egress_broker::ip_policy::IpRange
+impl egress_broker::ip_policy::IpRange
+pub fn egress_broker::ip_policy::IpRange::contains(self, core::net::ip_addr::IpAddr) -> bool
+pub fn egress_broker::ip_policy::IpRange::new(core::net::ip_addr::IpAddr, u8) -> core::result::Result<Self, egress_broker::ip_policy::IpRangeError>
+pub mod egress_broker::public_fetch
+pub enum egress_broker::public_fetch::ConnectorError
+pub egress_broker::public_fetch::ConnectorError::ClientBuildFailed
+pub egress_broker::public_fetch::ConnectorError::InvalidLocationHeader
+pub egress_broker::public_fetch::ConnectorError::RequestFailed
+impl core::error::Error for egress_broker::public_fetch::ConnectorError
+impl core::fmt::Display for egress_broker::public_fetch::ConnectorError
+pub fn egress_broker::public_fetch::ConnectorError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum egress_broker::public_fetch::FetchError
+pub egress_broker::public_fetch::FetchError::Connect(egress_broker::public_fetch::ConnectorError)
+pub egress_broker::public_fetch::FetchError::InvalidResponse
+pub egress_broker::public_fetch::FetchError::IpPolicy(egress_broker::ip_policy::IpPolicyError)
+pub egress_broker::public_fetch::FetchError::MissingRedirectLocation
+pub egress_broker::public_fetch::FetchError::OperationRejected
+pub egress_broker::public_fetch::FetchError::OverallTimeout
+pub egress_broker::public_fetch::FetchError::RedirectLimitExceeded
+pub egress_broker::public_fetch::FetchError::RedirectRejected
+pub egress_broker::public_fetch::FetchError::Resolve(egress_broker::public_fetch::ResolveError)
+pub egress_broker::public_fetch::FetchError::ResponseRead
+pub egress_broker::public_fetch::FetchError::ResponseTooLarge
+pub egress_broker::public_fetch::FetchError::ResponseTooLarge::limit: u64
+impl core::error::Error for egress_broker::public_fetch::FetchError
+impl core::fmt::Display for egress_broker::public_fetch::FetchError
+pub fn egress_broker::public_fetch::FetchError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum egress_broker::public_fetch::ResolveError
+pub egress_broker::public_fetch::ResolveError::AnswerLimitExceeded
+pub egress_broker::public_fetch::ResolveError::LookupFailed
+pub egress_broker::public_fetch::ResolveError::Unavailable
+impl core::error::Error for egress_broker::public_fetch::ResolveError
+impl core::fmt::Display for egress_broker::public_fetch::ResolveError
+pub fn egress_broker::public_fetch::ResolveError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_broker::public_fetch::ConnectorResponse
+pub egress_broker::public_fetch::ConnectorResponse::body: alloc::boxed::Box<(dyn std::io::Read + core::marker::Send)>
+pub egress_broker::public_fetch::ConnectorResponse::location: core::option::Option<alloc::string::String>
+pub egress_broker::public_fetch::ConnectorResponse::status: u16
+impl core::fmt::Debug for egress_broker::public_fetch::ConnectorResponse
+pub fn egress_broker::public_fetch::ConnectorResponse::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_broker::public_fetch::FetchPolicy
+pub egress_broker::public_fetch::FetchPolicy::max_redirects: u8
+pub egress_broker::public_fetch::FetchPolicy::max_response_bytes: u64
+pub egress_broker::public_fetch::FetchPolicy::total_timeout: core::time::Duration
+impl core::default::Default for egress_broker::public_fetch::FetchPolicy
+pub fn egress_broker::public_fetch::FetchPolicy::default() -> Self
+pub struct egress_broker::public_fetch::FetchTarget
+impl egress_broker::public_fetch::FetchTarget
+pub fn egress_broker::public_fetch::FetchTarget::host(&self) -> &authority_core::http::CanonicalHost
+pub fn egress_broker::public_fetch::FetchTarget::path(&self) -> &authority_core::http::CanonicalUrlPath
+pub struct egress_broker::public_fetch::PublicFetcher<R, C>
+impl<R, C> egress_broker::public_fetch::PublicFetcher<R, C> where R: egress_broker::public_fetch::Resolver, C: egress_broker::public_fetch::HttpsConnector
+pub fn egress_broker::public_fetch::PublicFetcher<R, C>::fetch(&self, &authority_core::http::HttpFetchRequest, &authority_core::http::HttpFetchAuthority) -> core::result::Result<egress_broker::public_fetch::PublicResponse, egress_broker::public_fetch::FetchError>
+pub fn egress_broker::public_fetch::PublicFetcher<R, C>::new(R, C, egress_broker::ip_policy::IpPolicy, egress_broker::public_fetch::FetchPolicy) -> Self
+impl<R, C> egress_broker::dispatch::PublicDispatchAdapter for egress_broker::public_fetch::PublicFetcher<R, C> where R: egress_broker::public_fetch::Resolver, C: egress_broker::public_fetch::HttpsConnector
+pub fn egress_broker::public_fetch::PublicFetcher<R, C>::fetch(&self, &authority_core::http::HttpFetchRequest, &authority_core::http::HttpFetchAuthority) -> core::result::Result<egress_broker::public_fetch::PublicResponse, egress_broker::public_fetch::FetchError>
+pub struct egress_broker::public_fetch::PublicResponse
+impl egress_broker::public_fetch::PublicResponse
+pub fn egress_broker::public_fetch::PublicResponse::body(&self) -> &[u8]
+pub const fn egress_broker::public_fetch::PublicResponse::host(&self) -> &authority_core::http::CanonicalHost
+pub fn egress_broker::public_fetch::PublicResponse::new(u16, authority_core::http::CanonicalHost, authority_core::http::CanonicalUrlPath, alloc::vec::Vec<u8>) -> core::result::Result<Self, egress_broker::public_fetch::FetchError>
+pub const fn egress_broker::public_fetch::PublicResponse::path(&self) -> &authority_core::http::CanonicalUrlPath
+pub const fn egress_broker::public_fetch::PublicResponse::status(&self) -> u16
+pub struct egress_broker::public_fetch::RustlsHttpsConnector
+impl egress_broker::public_fetch::RustlsHttpsConnector
+pub const fn egress_broker::public_fetch::RustlsHttpsConnector::new(core::time::Duration) -> Self
+impl core::default::Default for egress_broker::public_fetch::RustlsHttpsConnector
+pub fn egress_broker::public_fetch::RustlsHttpsConnector::default() -> Self
+impl egress_broker::public_fetch::HttpsConnector for egress_broker::public_fetch::RustlsHttpsConnector
+pub fn egress_broker::public_fetch::RustlsHttpsConnector::send(&self, &egress_broker::public_fetch::FetchTarget, core::net::socket_addr::SocketAddr, authority_core::http::HttpFetchMethod, core::time::Duration) -> core::result::Result<egress_broker::public_fetch::ConnectorResponse, egress_broker::public_fetch::ConnectorError>
+pub struct egress_broker::public_fetch::SystemResolver
+impl egress_broker::public_fetch::Resolver for egress_broker::public_fetch::SystemResolver
+pub fn egress_broker::public_fetch::SystemResolver::resolve(&self, &authority_core::http::CanonicalHost) -> core::result::Result<alloc::vec::Vec<core::net::ip_addr::IpAddr>, egress_broker::public_fetch::ResolveError>
+pub const egress_broker::public_fetch::DEFAULT_MAX_REDIRECTS: u8
+pub const egress_broker::public_fetch::DEFAULT_MAX_RESPONSE_BYTES: u64
+pub const egress_broker::public_fetch::DNS_RESOLVER_QUEUE_CAPACITY: usize
+pub const egress_broker::public_fetch::DNS_RESOLVER_WORKER_COUNT: usize
+pub const egress_broker::public_fetch::HTTPS_PORT: u16
+pub const egress_broker::public_fetch::MAX_DNS_ANSWER_IPS: usize
+pub trait egress_broker::public_fetch::HttpsConnector: core::marker::Send + core::marker::Sync
+pub fn egress_broker::public_fetch::HttpsConnector::send(&self, &egress_broker::public_fetch::FetchTarget, core::net::socket_addr::SocketAddr, authority_core::http::HttpFetchMethod, core::time::Duration) -> core::result::Result<egress_broker::public_fetch::ConnectorResponse, egress_broker::public_fetch::ConnectorError>
+impl egress_broker::public_fetch::HttpsConnector for egress_broker::public_fetch::RustlsHttpsConnector
+pub fn egress_broker::public_fetch::RustlsHttpsConnector::send(&self, &egress_broker::public_fetch::FetchTarget, core::net::socket_addr::SocketAddr, authority_core::http::HttpFetchMethod, core::time::Duration) -> core::result::Result<egress_broker::public_fetch::ConnectorResponse, egress_broker::public_fetch::ConnectorError>
+pub trait egress_broker::public_fetch::Resolver: core::marker::Send + core::marker::Sync + 'static
+pub fn egress_broker::public_fetch::Resolver::resolve(&self, &authority_core::http::CanonicalHost) -> core::result::Result<alloc::vec::Vec<core::net::ip_addr::IpAddr>, egress_broker::public_fetch::ResolveError>
+impl egress_broker::public_fetch::Resolver for egress_broker::public_fetch::SystemResolver
+pub fn egress_broker::public_fetch::SystemResolver::resolve(&self, &authority_core::http::CanonicalHost) -> core::result::Result<alloc::vec::Vec<core::net::ip_addr::IpAddr>, egress_broker::public_fetch::ResolveError>
+pub mod egress_broker::server
+pub enum egress_broker::server::ConnectionCloseReason
+pub egress_broker::server::ConnectionCloseReason::AccountingInvariant
+pub egress_broker::server::ConnectionCloseReason::CommittedButUnrecorded
+pub egress_broker::server::ConnectionCloseReason::RequestLimitReached
+pub enum egress_broker::server::ServerError
+pub egress_broker::server::ServerError::Accept(std::io::error::Error)
+pub egress_broker::server::ServerError::Dispatch(egress_broker::dispatch::DispatchError)
+pub egress_broker::server::ServerError::Response(egress_protocol::response::ResponseCborError)
+pub egress_broker::server::ServerError::ResponseChunk(egress_protocol::response::ResponseChunkError)
+pub egress_broker::server::ServerError::Transport(egress_broker::transport::TransportError)
+pub egress_broker::server::ServerError::UnexpectedPeer
+pub egress_broker::server::ServerError::UnexpectedPeer::expected: u32
+pub egress_broker::server::ServerError::UnexpectedPeer::received: u32
+impl core::error::Error for egress_broker::server::ServerError
+impl core::fmt::Display for egress_broker::server::ServerError
+pub fn egress_broker::server::ServerError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_broker::server::ConnectionReport
+impl egress_broker::server::ConnectionReport
+pub const fn egress_broker::server::ConnectionReport::accounting_invariant_closed(self) -> bool
+pub const fn egress_broker::server::ConnectionReport::close_reason(self) -> egress_broker::server::ConnectionCloseReason
+pub const fn egress_broker::server::ConnectionReport::requests_served(self) -> usize
+pub trait egress_broker::server::RequestDispatcher
+pub fn egress_broker::server::RequestDispatcher::dispatch_request(&mut self, &egress_protocol::frame::ControlFrame, &egress_broker::dispatch::DispatchContext) -> core::result::Result<egress_broker::dispatch::BrokerResponse, egress_broker::dispatch::DispatchError>
+impl<E, P, G> egress_broker::server::RequestDispatcher for egress_broker::dispatch::BrokerDispatcher<E, P, G> where E: egress_broker::dispatch::CapabilityExecutor, P: egress_broker::dispatch::PublicDispatchAdapter, G: egress_broker::github::GitHubAdapter
+pub fn egress_broker::dispatch::BrokerDispatcher<E, P, G>::dispatch_request(&mut self, &egress_protocol::frame::ControlFrame, &egress_broker::dispatch::DispatchContext) -> core::result::Result<egress_broker::dispatch::BrokerResponse, egress_broker::dispatch::DispatchError>
+pub fn egress_broker::server::serve_connection<S, D, C>(S, &mut D, &egress_broker::dispatch::DispatchContext, &mut C, core::num::nonzero::NonZeroUsize) -> core::result::Result<egress_broker::server::ConnectionReport, egress_broker::server::ServerError> where S: std::io::Read + std::io::Write, D: egress_broker::server::RequestDispatcher + ?core::marker::Sized, C: core::ops::function::FnMut() -> authority_core::time::MonotonicTime
+pub fn egress_broker::server::serve_connection_with_policy<S, D, C>(S, egress_broker::transport::TransportPolicy, &mut D, &egress_broker::dispatch::DispatchContext, &mut C, core::num::nonzero::NonZeroUsize) -> core::result::Result<egress_broker::server::ConnectionReport, egress_broker::server::ServerError> where S: egress_broker::transport::DeadlineStream, D: egress_broker::server::RequestDispatcher + ?core::marker::Sized, C: core::ops::function::FnMut() -> authority_core::time::MonotonicTime
+pub fn egress_broker::server::serve_expected_peer<L, D, C>(&L, u32, &mut D, &egress_broker::dispatch::DispatchContext, &mut C, core::num::nonzero::NonZeroUsize) -> core::result::Result<egress_broker::server::ConnectionReport, egress_broker::server::ServerError> where L: egress_broker::transport::PeerBoundListener, D: egress_broker::server::RequestDispatcher + ?core::marker::Sized, C: core::ops::function::FnMut() -> authority_core::time::MonotonicTime
+pub fn egress_broker::server::serve_expected_peer_with_policy<L, D, C>(&L, u32, egress_broker::transport::TransportPolicy, &mut D, &egress_broker::dispatch::DispatchContext, &mut C, core::num::nonzero::NonZeroUsize) -> core::result::Result<egress_broker::server::ConnectionReport, egress_broker::server::ServerError> where L: egress_broker::transport::PeerBoundListener, <L as egress_broker::transport::PeerBoundListener>::Stream: egress_broker::transport::DeadlineStream, D: egress_broker::server::RequestDispatcher + ?core::marker::Sized, C: core::ops::function::FnMut() -> authority_core::time::MonotonicTime
+pub mod egress_broker::transport
+pub enum egress_broker::transport::DeadlineKind
+pub egress_broker::transport::DeadlineKind::Connection
+pub egress_broker::transport::DeadlineKind::Read
+pub egress_broker::transport::DeadlineKind::Write
+impl core::fmt::Display for egress_broker::transport::DeadlineKind
+pub fn egress_broker::transport::DeadlineKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum egress_broker::transport::TransportConfigError
+pub egress_broker::transport::TransportConfigError::TooLarge
+pub egress_broker::transport::TransportConfigError::TooLarge::field: &'static str
+pub egress_broker::transport::TransportConfigError::TooLarge::maximum: core::time::Duration
+pub egress_broker::transport::TransportConfigError::Zero
+pub egress_broker::transport::TransportConfigError::Zero::field: &'static str
+impl core::error::Error for egress_broker::transport::TransportConfigError
+impl core::fmt::Display for egress_broker::transport::TransportConfigError
+pub fn egress_broker::transport::TransportConfigError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum egress_broker::transport::TransportError
+pub egress_broker::transport::TransportError::Deadline(egress_broker::transport::DeadlineKind)
+pub egress_broker::transport::TransportError::Frame(egress_protocol::frame::FrameError)
+pub egress_broker::transport::TransportError::Io(std::io::error::Error)
+impl core::error::Error for egress_broker::transport::TransportError
+impl core::fmt::Display for egress_broker::transport::TransportError
+pub fn egress_broker::transport::TransportError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_broker::transport::AfVsockListener
+impl egress_broker::transport::AfVsockListener
+pub fn egress_broker::transport::AfVsockListener::bind(u32, u32, i32) -> std::io::error::Result<Self>
+pub fn egress_broker::transport::AfVsockListener::bind_nonblocking(u32, u32, i32) -> std::io::error::Result<Self>
+pub fn egress_broker::transport::AfVsockListener::bind_nonblocking_with_policy(u32, u32, i32, egress_broker::transport::TransportPolicy) -> std::io::error::Result<Self>
+pub fn egress_broker::transport::AfVsockListener::bind_with_policy(u32, u32, i32, egress_broker::transport::TransportPolicy) -> std::io::error::Result<Self>
+pub const fn egress_broker::transport::AfVsockListener::cid(&self) -> u32
+pub const fn egress_broker::transport::AfVsockListener::is_nonblocking(&self) -> bool
+pub const fn egress_broker::transport::AfVsockListener::port(&self) -> u32
+pub fn egress_broker::transport::AfVsockListener::try_accept(&self) -> std::io::error::Result<core::option::Option<egress_broker::transport::VsockStream>>
+pub fn egress_broker::transport::AfVsockListener::try_accept_peer(&self) -> std::io::error::Result<core::option::Option<(u32, egress_broker::transport::VsockStream)>>
+impl egress_broker::transport::PeerBoundListener for egress_broker::transport::AfVsockListener
+pub type egress_broker::transport::AfVsockListener::Stream = egress_broker::transport::VsockStream
+pub fn egress_broker::transport::AfVsockListener::accept_peer(&self) -> std::io::error::Result<(u32, Self::Stream)>
+impl egress_broker::transport::VsockListener for egress_broker::transport::AfVsockListener
+pub type egress_broker::transport::AfVsockListener::Stream = egress_broker::transport::VsockStream
+pub fn egress_broker::transport::AfVsockListener::accept(&self) -> std::io::error::Result<Self::Stream>
+pub struct egress_broker::transport::DeadlineFramedTransport<S>
+impl<S> egress_broker::transport::DeadlineFramedTransport<S> where S: egress_broker::transport::DeadlineStream
+pub fn egress_broker::transport::DeadlineFramedTransport<S>::new(S, egress_broker::transport::TransportPolicy) -> core::result::Result<Self, egress_broker::transport::TransportError>
+pub fn egress_broker::transport::DeadlineFramedTransport<S>::read_frame(&mut self) -> core::result::Result<egress_protocol::frame::ControlFrame, egress_broker::transport::TransportError>
+pub fn egress_broker::transport::DeadlineFramedTransport<S>::write_frame(&mut self, &egress_protocol::frame::ControlFrame) -> core::result::Result<(), egress_broker::transport::TransportError>
+pub struct egress_broker::transport::FramedTransport<S>
+impl<S> egress_broker::transport::FramedTransport<S> where S: std::io::Read + std::io::Write
+pub const fn egress_broker::transport::FramedTransport<S>::new(S) -> Self
+pub fn egress_broker::transport::FramedTransport<S>::read_frame(&mut self) -> core::result::Result<egress_protocol::frame::ControlFrame, egress_broker::transport::TransportError>
+pub fn egress_broker::transport::FramedTransport<S>::write_frame(&mut self, &egress_protocol::frame::ControlFrame) -> core::result::Result<(), egress_broker::transport::TransportError>
+pub struct egress_broker::transport::TransportPolicy
+impl egress_broker::transport::TransportPolicy
+pub const fn egress_broker::transport::TransportPolicy::connection_timeout(self) -> core::time::Duration
+pub fn egress_broker::transport::TransportPolicy::new(core::time::Duration, core::time::Duration, core::time::Duration) -> core::result::Result<Self, egress_broker::transport::TransportConfigError>
+pub const fn egress_broker::transport::TransportPolicy::read_timeout(self) -> core::time::Duration
+pub const fn egress_broker::transport::TransportPolicy::write_timeout(self) -> core::time::Duration
+impl core::default::Default for egress_broker::transport::TransportPolicy
+pub fn egress_broker::transport::TransportPolicy::default() -> Self
+pub struct egress_broker::transport::VsockShutdownHandle
+impl egress_broker::transport::VsockShutdownHandle
+pub fn egress_broker::transport::VsockShutdownHandle::shutdown(&self) -> std::io::error::Result<()>
+pub struct egress_broker::transport::VsockStream
+impl egress_broker::transport::VsockStream
+pub fn egress_broker::transport::VsockStream::shutdown_handle(&self) -> std::io::error::Result<egress_broker::transport::VsockShutdownHandle>
+impl egress_broker::transport::DeadlineStream for egress_broker::transport::VsockStream
+pub fn egress_broker::transport::VsockStream::set_read_timeout(&self, core::time::Duration) -> std::io::error::Result<()>
+pub fn egress_broker::transport::VsockStream::set_write_timeout(&self, core::time::Duration) -> std::io::error::Result<()>
+impl std::io::Read for egress_broker::transport::VsockStream
+pub fn egress_broker::transport::VsockStream::read(&mut self, &mut [u8]) -> std::io::error::Result<usize>
+impl std::io::Write for egress_broker::transport::VsockStream
+pub fn egress_broker::transport::VsockStream::flush(&mut self) -> std::io::error::Result<()>
+pub fn egress_broker::transport::VsockStream::write(&mut self, &[u8]) -> std::io::error::Result<usize>
+pub const egress_broker::transport::DEFAULT_CONNECTION_TIMEOUT: core::time::Duration
+pub const egress_broker::transport::DEFAULT_READ_TIMEOUT: core::time::Duration
+pub const egress_broker::transport::DEFAULT_WRITE_TIMEOUT: core::time::Duration
+pub const egress_broker::transport::MAX_TRANSPORT_TIMEOUT: core::time::Duration
+pub trait egress_broker::transport::DeadlineStream: std::io::Read + std::io::Write
+pub fn egress_broker::transport::DeadlineStream::set_read_timeout(&self, core::time::Duration) -> std::io::error::Result<()>
+pub fn egress_broker::transport::DeadlineStream::set_write_timeout(&self, core::time::Duration) -> std::io::error::Result<()>
+impl egress_broker::transport::DeadlineStream for egress_broker::transport::VsockStream
+pub fn egress_broker::transport::VsockStream::set_read_timeout(&self, core::time::Duration) -> std::io::error::Result<()>
+pub fn egress_broker::transport::VsockStream::set_write_timeout(&self, core::time::Duration) -> std::io::error::Result<()>
+pub trait egress_broker::transport::PeerBoundListener
+pub type egress_broker::transport::PeerBoundListener::Stream: std::io::Read + std::io::Write
+pub fn egress_broker::transport::PeerBoundListener::accept_peer(&self) -> std::io::error::Result<(u32, Self::Stream)>
+impl egress_broker::transport::PeerBoundListener for egress_broker::transport::AfVsockListener
+pub type egress_broker::transport::AfVsockListener::Stream = egress_broker::transport::VsockStream
+pub fn egress_broker::transport::AfVsockListener::accept_peer(&self) -> std::io::error::Result<(u32, Self::Stream)>
+pub trait egress_broker::transport::VsockListener
+pub type egress_broker::transport::VsockListener::Stream: std::io::Read + std::io::Write
+pub fn egress_broker::transport::VsockListener::accept(&self) -> std::io::error::Result<Self::Stream>
+impl egress_broker::transport::VsockListener for egress_broker::transport::AfVsockListener
+pub type egress_broker::transport::AfVsockListener::Stream = egress_broker::transport::VsockStream
+pub fn egress_broker::transport::AfVsockListener::accept(&self) -> std::io::error::Result<Self::Stream>

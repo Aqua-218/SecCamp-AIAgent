@@ -79,7 +79,7 @@ production の caller resolver と control socket は [`control_socket.rs`](../.
 
 cgroup、control socket、workload の実 Linux 実装は [`linux_host.rs`](../../crates/supervisor/src/linux_host.rs) の `LinuxHostResources` にある。subject ごとに cgroup v2 leaf を作り、`SOCK_SEQPACKET` の control socket を bind し、workload をその leaf に閉じ込めて起動し、停止時は `cgroup.kill` で subtree ごと落として reap する。capfs の実 mount と unmount は `CapfsRuntimeResources` が持つ。
 
-handle には OS object を持たせていない。subject の file は capfs mount 越しに触るので descriptor は guest 側にあり、host が知る必要があるのは「どの handle identity をまだ保持しているか」だけである。listener を subject の setup 経路へ結線する host 側の組み立てと、guest VM 内の agent process からの end-to-end も未検証である。
+handleにはOS objectを持たせていない。subjectのfileはcapfs mount越しに触るのでdescriptorはguest側にあり、hostが知る必要があるのは「どのhandle identityをまだ保持しているか」だけである。listenerをsubject setupへ結線するguest image compositionと、VM内の隔離workloadから全13 CapFS effect／Broker channelまでをKVM gateで確認済みである。
 
 主要な認可拒否経路と wire spoof、control socket cleanup retry は test 済みである。root と disposable mount namespace が使える環境では、`scripts/ci/verify-real-supervisor-resources.sh` が `resources_mut()` 経由で production `LinuxHostResources` / `CapfsRuntimeResources` を実 FUSE、cgroup、seqpacket credential と通して検証する。この gate は `Supervisor` の subject lifecycle 全体や successful workload start の証明ではない。register→start の authority mutation は production kernel の snapshot で fail closed するが、任意の外部 interleaving の直列化や実 guest VM の接続など残る境界は[検証対応表](verification.md)に記載する。
 

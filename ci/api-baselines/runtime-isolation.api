@@ -1,0 +1,326 @@
+pub mod runtime_isolation
+pub enum runtime_isolation::ChildExit
+pub runtime_isolation::ChildExit::Exited(i32)
+pub runtime_isolation::ChildExit::Signaled(i32)
+pub enum runtime_isolation::ChildProcessError
+pub runtime_isolation::ChildProcessError::AlreadyReaped
+pub runtime_isolation::ChildProcessError::InvalidChildPid
+pub runtime_isolation::ChildProcessError::InvalidStartupStatus(&'static str)
+pub runtime_isolation::ChildProcessError::InvalidWaitStatus
+pub runtime_isolation::ChildProcessError::Io
+pub runtime_isolation::ChildProcessError::Io::operation: &'static str
+pub runtime_isolation::ChildProcessError::Io::source: std::io::error::Error
+pub runtime_isolation::ChildProcessError::OwnershipUnavailable
+pub runtime_isolation::ChildProcessError::ReapTimedOut
+pub runtime_isolation::ChildProcessError::StartupAlreadyObserved
+pub runtime_isolation::ChildProcessError::StartupChannelClosed
+impl core::error::Error for runtime_isolation::ChildProcessError
+pub fn runtime_isolation::ChildProcessError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for runtime_isolation::ChildProcessError
+pub fn runtime_isolation::ChildProcessError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum runtime_isolation::ChildStartupStatus
+pub runtime_isolation::ChildStartupStatus::Failed(runtime_isolation::ChildStartupFailure)
+pub runtime_isolation::ChildStartupStatus::Ready(runtime_isolation::ChildStartupReady)
+pub enum runtime_isolation::IsolationError
+pub runtime_isolation::IsolationError::Backend(runtime_isolation::BackendError)
+pub runtime_isolation::IsolationError::CapabilityUnavailable(runtime_isolation::CapabilityReport)
+pub runtime_isolation::IsolationError::ChildHandoffRequired
+pub runtime_isolation::IsolationError::ForbiddenSyscall(runtime_isolation::Syscall)
+pub runtime_isolation::IsolationError::InvalidConfig(alloc::string::String)
+pub runtime_isolation::IsolationError::Rollback
+pub runtime_isolation::IsolationError::Rollback::failures: alloc::vec::Vec<runtime_isolation::BackendError>
+pub runtime_isolation::IsolationError::Rollback::original: runtime_isolation::BackendError
+pub runtime_isolation::IsolationError::TerminationRequired
+pub runtime_isolation::IsolationError::TerminationRequired::failures: alloc::vec::Vec<runtime_isolation::BackendError>
+pub runtime_isolation::IsolationError::TerminationRequired::original: runtime_isolation::BackendError
+pub runtime_isolation::IsolationError::UnsupportedSyscall(runtime_isolation::Syscall)
+impl core::error::Error for runtime_isolation::IsolationError
+impl core::fmt::Display for runtime_isolation::IsolationError
+pub fn runtime_isolation::IsolationError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum runtime_isolation::IsolationStep
+pub runtime_isolation::IsolationStep::CgroupV2
+pub runtime_isolation::IsolationStep::CloseInheritedFileDescriptors
+pub runtime_isolation::IsolationStep::DropCapabilities
+pub runtime_isolation::IsolationStep::IdentityMap
+pub runtime_isolation::IsolationStep::Landlock
+pub runtime_isolation::IsolationStep::LimitedTmpfs
+pub runtime_isolation::IsolationStep::MaskDevices
+pub runtime_isolation::IsolationStep::MaskProc
+pub runtime_isolation::IsolationStep::Namespaces
+pub runtime_isolation::IsolationStep::NoNewPrivs
+pub runtime_isolation::IsolationStep::ReadOnlyRootfs
+pub runtime_isolation::IsolationStep::Seccomp
+pub runtime_isolation::IsolationStep::Workspace
+impl core::fmt::Display for runtime_isolation::IsolationStep
+pub fn runtime_isolation::IsolationStep::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum runtime_isolation::SpawnOutcome<T>
+pub runtime_isolation::SpawnOutcome::Child(T)
+pub runtime_isolation::SpawnOutcome::Parent(runtime_isolation::IsolatedChildProcess)
+pub enum runtime_isolation::Syscall
+pub runtime_isolation::Syscall::Accept
+pub runtime_isolation::Syscall::Accept4
+pub runtime_isolation::Syscall::AddKey
+pub runtime_isolation::Syscall::ArchPrctl
+pub runtime_isolation::Syscall::Bind
+pub runtime_isolation::Syscall::Bpf
+pub runtime_isolation::Syscall::Brk
+pub runtime_isolation::Syscall::Capset
+pub runtime_isolation::Syscall::Chdir
+pub runtime_isolation::Syscall::Chroot
+pub runtime_isolation::Syscall::ClockGettime
+pub runtime_isolation::Syscall::Clone
+pub runtime_isolation::Syscall::Clone3
+pub runtime_isolation::Syscall::Close
+pub runtime_isolation::Syscall::Connect
+pub runtime_isolation::Syscall::DeleteModule
+pub runtime_isolation::Syscall::Execve
+pub runtime_isolation::Syscall::Execveat
+pub runtime_isolation::Syscall::Exit
+pub runtime_isolation::Syscall::ExitGroup
+pub runtime_isolation::Syscall::FanotifyInit
+pub runtime_isolation::Syscall::FanotifyMark
+pub runtime_isolation::Syscall::Fchmod
+pub runtime_isolation::Syscall::FinitModule
+pub runtime_isolation::Syscall::Fork
+pub runtime_isolation::Syscall::Fsconfig
+pub runtime_isolation::Syscall::Fsmount
+pub runtime_isolation::Syscall::Fsopen
+pub runtime_isolation::Syscall::Fspick
+pub runtime_isolation::Syscall::Fstat
+pub runtime_isolation::Syscall::Ftruncate
+pub runtime_isolation::Syscall::Futex
+pub runtime_isolation::Syscall::Getcwd
+pub runtime_isolation::Syscall::Getdents64
+pub runtime_isolation::Syscall::Getpid
+pub runtime_isolation::Syscall::Getrandom
+pub runtime_isolation::Syscall::Gettid
+pub runtime_isolation::Syscall::InitModule
+pub runtime_isolation::Syscall::IoUringEnter
+pub runtime_isolation::Syscall::IoUringRegister
+pub runtime_isolation::Syscall::IoUringSetup
+pub runtime_isolation::Syscall::Ioctl
+pub runtime_isolation::Syscall::Kcmp
+pub runtime_isolation::Syscall::KexecFileLoad
+pub runtime_isolation::Syscall::KexecLoad
+pub runtime_isolation::Syscall::Keyctl
+pub runtime_isolation::Syscall::Listen
+pub runtime_isolation::Syscall::Madvise
+pub runtime_isolation::Syscall::Mkdirat
+pub runtime_isolation::Syscall::Mknod
+pub runtime_isolation::Syscall::Mknodat
+pub runtime_isolation::Syscall::Mmap
+pub runtime_isolation::Syscall::Mount
+pub runtime_isolation::Syscall::MountSetattr
+pub runtime_isolation::Syscall::MoveMount
+pub runtime_isolation::Syscall::Mprotect
+pub runtime_isolation::Syscall::Munmap
+pub runtime_isolation::Syscall::NameToHandleAt
+pub runtime_isolation::Syscall::Newfstatat
+pub runtime_isolation::Syscall::OpenByHandleAt
+pub runtime_isolation::Syscall::OpenTree
+pub runtime_isolation::Syscall::Openat
+pub runtime_isolation::Syscall::PerfEventOpen
+pub runtime_isolation::Syscall::Personality
+pub runtime_isolation::Syscall::PidfdGetfd
+pub runtime_isolation::Syscall::PidfdOpen
+pub runtime_isolation::Syscall::PidfdSendSignal
+pub runtime_isolation::Syscall::PivotRoot
+pub runtime_isolation::Syscall::Poll
+pub runtime_isolation::Syscall::Prctl
+pub runtime_isolation::Syscall::Pread64
+pub runtime_isolation::Syscall::Prlimit64
+pub runtime_isolation::Syscall::ProcessMadvise
+pub runtime_isolation::Syscall::ProcessMrelease
+pub runtime_isolation::Syscall::ProcessVmReadv
+pub runtime_isolation::Syscall::ProcessVmWritev
+pub runtime_isolation::Syscall::Ptrace
+pub runtime_isolation::Syscall::Pwrite64
+pub runtime_isolation::Syscall::Read
+pub runtime_isolation::Syscall::Readlinkat
+pub runtime_isolation::Syscall::Reboot
+pub runtime_isolation::Syscall::Recvfrom
+pub runtime_isolation::Syscall::Recvmsg
+pub runtime_isolation::Syscall::Renameat
+pub runtime_isolation::Syscall::RequestKey
+pub runtime_isolation::Syscall::Rseq
+pub runtime_isolation::Syscall::RtSigaction
+pub runtime_isolation::Syscall::RtSigprocmask
+pub runtime_isolation::Syscall::RtSigreturn
+pub runtime_isolation::Syscall::SchedGetaffinity
+pub runtime_isolation::Syscall::SchedYield
+pub runtime_isolation::Syscall::Seccomp
+pub runtime_isolation::Syscall::Sendmsg
+pub runtime_isolation::Syscall::Sendto
+pub runtime_isolation::Syscall::SetRobustList
+pub runtime_isolation::Syscall::SetTidAddress
+pub runtime_isolation::Syscall::Setdomainname
+pub runtime_isolation::Syscall::Setfsgid
+pub runtime_isolation::Syscall::Setfsuid
+pub runtime_isolation::Syscall::Setgid
+pub runtime_isolation::Syscall::Setgroups
+pub runtime_isolation::Syscall::Sethostname
+pub runtime_isolation::Syscall::Setns
+pub runtime_isolation::Syscall::Setregid
+pub runtime_isolation::Syscall::Setresgid
+pub runtime_isolation::Syscall::Setresuid
+pub runtime_isolation::Syscall::Setreuid
+pub runtime_isolation::Syscall::Setuid
+pub runtime_isolation::Syscall::Shmat
+pub runtime_isolation::Syscall::Shmctl
+pub runtime_isolation::Syscall::Shmdt
+pub runtime_isolation::Syscall::Shmget
+pub runtime_isolation::Syscall::Sigaltstack
+pub runtime_isolation::Syscall::Socket
+pub runtime_isolation::Syscall::Socketpair
+pub runtime_isolation::Syscall::Statx
+pub runtime_isolation::Syscall::Swapoff
+pub runtime_isolation::Syscall::Swapon
+pub runtime_isolation::Syscall::Syslog
+pub runtime_isolation::Syscall::Umount2
+pub runtime_isolation::Syscall::Unlinkat
+pub runtime_isolation::Syscall::Unshare
+pub runtime_isolation::Syscall::Userfaultfd
+pub runtime_isolation::Syscall::Vfork
+pub runtime_isolation::Syscall::Wait4
+pub runtime_isolation::Syscall::Write
+impl core::fmt::Display for runtime_isolation::Syscall
+pub fn runtime_isolation::Syscall::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for runtime_isolation::Syscall
+pub type runtime_isolation::Syscall::Err = runtime_isolation::IsolationError
+pub fn runtime_isolation::Syscall::from_str(&str) -> core::result::Result<Self, Self::Err>
+pub struct runtime_isolation::BackendError
+pub runtime_isolation::BackendError::errno: core::option::Option<i32>
+pub runtime_isolation::BackendError::message: alloc::string::String
+pub runtime_isolation::BackendError::step: runtime_isolation::IsolationStep
+impl runtime_isolation::BackendError
+pub fn runtime_isolation::BackendError::new(runtime_isolation::IsolationStep, impl core::convert::Into<alloc::string::String>, core::option::Option<i32>) -> Self
+impl core::error::Error for runtime_isolation::BackendError
+impl core::fmt::Display for runtime_isolation::BackendError
+pub fn runtime_isolation::BackendError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct runtime_isolation::BindMountConfig
+impl runtime_isolation::BindMountConfig
+pub fn runtime_isolation::BindMountConfig::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub struct runtime_isolation::CapabilityReport
+pub runtime_isolation::CapabilityReport::cgroup_v2_available: bool
+pub runtime_isolation::CapabilityReport::landlock_abi: core::option::Option<u32>
+pub runtime_isolation::CapabilityReport::namespaces_available: bool
+pub runtime_isolation::CapabilityReport::reasons: alloc::vec::Vec<alloc::string::String>
+pub runtime_isolation::CapabilityReport::seccomp_available: bool
+impl runtime_isolation::CapabilityReport
+pub fn runtime_isolation::CapabilityReport::is_sufficient(&self, &runtime_isolation::IsolationConfig) -> bool
+pub fn runtime_isolation::CapabilityReport::supported(u32) -> Self
+pub fn runtime_isolation::CapabilityReport::unavailable<I, S>(I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub struct runtime_isolation::CgroupConfig
+impl runtime_isolation::CgroupConfig
+pub fn runtime_isolation::CgroupConfig::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<alloc::string::String>, u64, u64) -> Self
+pub struct runtime_isolation::ChildStartupFailure
+impl runtime_isolation::ChildStartupFailure
+pub fn runtime_isolation::ChildStartupFailure::detail(&self) -> &str
+pub const fn runtime_isolation::ChildStartupFailure::errno(&self) -> core::option::Option<i32>
+pub const fn runtime_isolation::ChildStartupFailure::rollback_failure_count(&self) -> u32
+pub const fn runtime_isolation::ChildStartupFailure::step(&self) -> runtime_isolation::IsolationStep
+pub const fn runtime_isolation::ChildStartupFailure::termination_required(&self) -> bool
+pub struct runtime_isolation::ChildStartupReady
+impl runtime_isolation::ChildStartupReady
+pub const fn runtime_isolation::ChildStartupReady::completed_steps() -> &'static [runtime_isolation::IsolationStep; 13]
+pub const fn runtime_isolation::ChildStartupReady::pid_namespace(self) -> runtime_isolation::NamespaceIdentity
+pub struct runtime_isolation::ControlChannelConfig
+impl runtime_isolation::ControlChannelConfig
+pub const fn runtime_isolation::ControlChannelConfig::fd(self) -> std::os::fd::raw::RawFd
+pub fn runtime_isolation::ControlChannelConfig::new(std::os::fd::raw::RawFd) -> core::result::Result<Self, runtime_isolation::IsolationError>
+pub struct runtime_isolation::EgressChannelConfig
+impl runtime_isolation::EgressChannelConfig
+pub const fn runtime_isolation::EgressChannelConfig::fd(self) -> std::os::fd::raw::RawFd
+pub fn runtime_isolation::EgressChannelConfig::new(std::os::fd::raw::RawFd) -> core::result::Result<Self, runtime_isolation::IsolationError>
+pub struct runtime_isolation::ExecStatusChannelConfig
+impl runtime_isolation::ExecStatusChannelConfig
+pub const fn runtime_isolation::ExecStatusChannelConfig::fd(self) -> std::os::fd::raw::RawFd
+pub fn runtime_isolation::ExecStatusChannelConfig::new(std::os::fd::raw::RawFd) -> core::result::Result<Self, runtime_isolation::IsolationError>
+pub struct runtime_isolation::IdentityMap
+impl runtime_isolation::IdentityMap
+pub const fn runtime_isolation::IdentityMap::new(u32, u32) -> Self
+pub struct runtime_isolation::IsolatedChildProcess
+impl runtime_isolation::IsolatedChildProcess
+pub const fn runtime_isolation::IsolatedChildProcess::pid(&self) -> core::num::nonzero::NonZeroU32
+pub const fn runtime_isolation::IsolatedChildProcess::pid_namespace(&self) -> runtime_isolation::NamespaceIdentity
+pub fn runtime_isolation::IsolatedChildProcess::pidfd(&self) -> core::result::Result<std::os::fd::owned::BorrowedFd<'_>, runtime_isolation::ChildProcessError>
+pub fn runtime_isolation::IsolatedChildProcess::terminate(&mut self) -> core::result::Result<runtime_isolation::ChildExit, runtime_isolation::ChildProcessError>
+pub fn runtime_isolation::IsolatedChildProcess::try_wait(&mut self) -> core::result::Result<core::option::Option<runtime_isolation::ChildExit>, runtime_isolation::ChildProcessError>
+pub fn runtime_isolation::IsolatedChildProcess::wait(&mut self) -> core::result::Result<runtime_isolation::ChildExit, runtime_isolation::ChildProcessError>
+pub fn runtime_isolation::IsolatedChildProcess::wait_for_startup(&mut self) -> core::result::Result<&runtime_isolation::ChildStartupStatus, runtime_isolation::ChildProcessError>
+impl core::ops::drop::Drop for runtime_isolation::IsolatedChildProcess
+pub fn runtime_isolation::IsolatedChildProcess::drop(&mut self)
+pub struct runtime_isolation::IsolationConfig
+impl runtime_isolation::IsolationConfig
+pub fn runtime_isolation::IsolationConfig::new(runtime_isolation::RootfsConfig, runtime_isolation::BindMountConfig, runtime_isolation::TmpfsConfig, runtime_isolation::CgroupConfig, runtime_isolation::LandlockConfig, runtime_isolation::SeccompPolicy, runtime_isolation::IdentityMap) -> Self
+pub fn runtime_isolation::IsolationConfig::validate(&self) -> core::result::Result<(), runtime_isolation::IsolationError>
+pub fn runtime_isolation::IsolationConfig::with_control_channel(self, runtime_isolation::ControlChannelConfig) -> Self
+pub fn runtime_isolation::IsolationConfig::with_egress_channel(self, runtime_isolation::EgressChannelConfig) -> Self
+pub fn runtime_isolation::IsolationConfig::with_exec_status_channel(self, runtime_isolation::ExecStatusChannelConfig) -> Self
+pub struct runtime_isolation::IsolationReceipt
+impl runtime_isolation::IsolationReceipt
+pub const fn runtime_isolation::IsolationReceipt::pid_namespace(&self) -> runtime_isolation::NamespaceIdentity
+pub fn runtime_isolation::IsolationReceipt::steps(&self) -> &[runtime_isolation::IsolationStep]
+pub struct runtime_isolation::LandlockConfig
+impl runtime_isolation::LandlockConfig
+pub fn runtime_isolation::LandlockConfig::new<I, J, P, Q>(u32, I, J) -> Self where I: core::iter::traits::collect::IntoIterator<Item = P>, J: core::iter::traits::collect::IntoIterator<Item = Q>, P: core::convert::Into<std::path::PathBuf>, Q: core::convert::Into<std::path::PathBuf>
+pub struct runtime_isolation::LinuxBackend
+impl runtime_isolation::LinuxBackend
+pub const fn runtime_isolation::LinuxBackend::new() -> Self
+impl core::default::Default for runtime_isolation::LinuxBackend
+pub fn runtime_isolation::LinuxBackend::default() -> Self
+impl core::ops::drop::Drop for runtime_isolation::LinuxBackend
+pub fn runtime_isolation::LinuxBackend::drop(&mut self)
+impl runtime_isolation::IsolationBackend for runtime_isolation::LinuxBackend
+pub fn runtime_isolation::LinuxBackend::apply_step(&mut self, OperationPermit, runtime_isolation::IsolationStep, &runtime_isolation::IsolationConfig) -> core::result::Result<(), runtime_isolation::BackendError>
+pub fn runtime_isolation::LinuxBackend::detect_capabilities(&mut self, &runtime_isolation::IsolationConfig) -> runtime_isolation::CapabilityReport
+pub fn runtime_isolation::LinuxBackend::prepare_namespaces(&mut self, OperationPermit, &runtime_isolation::IsolationConfig) -> core::result::Result<runtime_isolation::NamespacePreparation, runtime_isolation::BackendError>
+pub fn runtime_isolation::LinuxBackend::rollback_step(&mut self, OperationPermit, runtime_isolation::IsolationStep, &runtime_isolation::IsolationConfig) -> core::result::Result<(), runtime_isolation::BackendError>
+pub fn runtime_isolation::LinuxBackend::spawn_isolated<T, F>(&mut self, OperationPermit, runtime_isolation::NamespacePreparation, F) -> core::result::Result<runtime_isolation::SpawnOutcome<T>, runtime_isolation::BackendError> where F: core::ops::function::FnOnce(&mut Self, runtime_isolation::NamespacePreparation, ChildStartupNotifier) -> T
+pub fn runtime_isolation::LinuxBackend::verify_pid_namespace_child(&mut self, OperationPermit, runtime_isolation::NamespacePreparation) -> core::result::Result<runtime_isolation::PidNamespaceChild, runtime_isolation::BackendError>
+pub struct runtime_isolation::NamespaceIdentity
+impl runtime_isolation::NamespaceIdentity
+pub const fn runtime_isolation::NamespaceIdentity::device(self) -> u64
+pub const fn runtime_isolation::NamespaceIdentity::from_kernel(u64, u64) -> Self
+pub const fn runtime_isolation::NamespaceIdentity::inode(self) -> u64
+pub struct runtime_isolation::NamespacePreparation
+impl runtime_isolation::NamespacePreparation
+pub const fn runtime_isolation::NamespacePreparation::child(&self) -> runtime_isolation::NamespaceIdentity
+pub const fn runtime_isolation::NamespacePreparation::parent(&self) -> runtime_isolation::NamespaceIdentity
+pub struct runtime_isolation::PidNamespaceChild
+impl runtime_isolation::PidNamespaceChild
+pub const fn runtime_isolation::PidNamespaceChild::namespace(&self) -> runtime_isolation::NamespaceIdentity
+pub struct runtime_isolation::RootfsConfig
+impl runtime_isolation::RootfsConfig
+pub fn runtime_isolation::RootfsConfig::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub struct runtime_isolation::RuntimeIsolation
+impl runtime_isolation::RuntimeIsolation
+pub fn runtime_isolation::RuntimeIsolation::apply<B: runtime_isolation::IsolationBackend>(&mut B, &runtime_isolation::IsolationConfig) -> core::result::Result<runtime_isolation::IsolationReceipt, runtime_isolation::IsolationError>
+pub fn runtime_isolation::RuntimeIsolation::spawn_isolated<B, F, T>(&mut B, &runtime_isolation::IsolationConfig, F) -> core::result::Result<runtime_isolation::SpawnOutcome<T>, runtime_isolation::IsolationError> where B: runtime_isolation::IsolationBackend, F: core::ops::function::FnOnce(runtime_isolation::IsolationReceipt) -> T
+pub struct runtime_isolation::SeccompPolicy
+impl runtime_isolation::SeccompPolicy
+pub fn runtime_isolation::SeccompPolicy::allowed_syscalls(&self) -> &[runtime_isolation::Syscall]
+pub fn runtime_isolation::SeccompPolicy::allows(&self, runtime_isolation::Syscall) -> bool
+pub fn runtime_isolation::SeccompPolicy::conservative() -> Self
+pub fn runtime_isolation::SeccompPolicy::new<I>(I) -> core::result::Result<Self, runtime_isolation::IsolationError> where I: core::iter::traits::collect::IntoIterator<Item = runtime_isolation::Syscall>
+impl core::default::Default for runtime_isolation::SeccompPolicy
+pub fn runtime_isolation::SeccompPolicy::default() -> Self
+pub struct runtime_isolation::TmpfsConfig
+impl runtime_isolation::TmpfsConfig
+pub fn runtime_isolation::TmpfsConfig::new(impl core::convert::Into<std::path::PathBuf>, u64) -> Self
+pub trait runtime_isolation::IsolationBackend: private::Sealed
+pub fn runtime_isolation::IsolationBackend::apply_step(&mut self, private::OperationPermit, runtime_isolation::IsolationStep, &runtime_isolation::IsolationConfig) -> core::result::Result<(), runtime_isolation::BackendError>
+pub fn runtime_isolation::IsolationBackend::detect_capabilities(&mut self, &runtime_isolation::IsolationConfig) -> runtime_isolation::CapabilityReport
+pub fn runtime_isolation::IsolationBackend::prepare_namespaces(&mut self, private::OperationPermit, &runtime_isolation::IsolationConfig) -> core::result::Result<runtime_isolation::NamespacePreparation, runtime_isolation::BackendError>
+pub fn runtime_isolation::IsolationBackend::rollback_step(&mut self, private::OperationPermit, runtime_isolation::IsolationStep, &runtime_isolation::IsolationConfig) -> core::result::Result<(), runtime_isolation::BackendError>
+pub fn runtime_isolation::IsolationBackend::spawn_isolated<T, F>(&mut self, private::OperationPermit, runtime_isolation::NamespacePreparation, F) -> core::result::Result<runtime_isolation::SpawnOutcome<T>, runtime_isolation::BackendError> where Self: core::marker::Sized, F: core::ops::function::FnOnce(&mut Self, runtime_isolation::NamespacePreparation, ChildStartupNotifier) -> T
+pub fn runtime_isolation::IsolationBackend::verify_pid_namespace_child(&mut self, private::OperationPermit, runtime_isolation::NamespacePreparation) -> core::result::Result<runtime_isolation::PidNamespaceChild, runtime_isolation::BackendError>
+impl runtime_isolation::IsolationBackend for runtime_isolation::LinuxBackend
+pub fn runtime_isolation::LinuxBackend::apply_step(&mut self, OperationPermit, runtime_isolation::IsolationStep, &runtime_isolation::IsolationConfig) -> core::result::Result<(), runtime_isolation::BackendError>
+pub fn runtime_isolation::LinuxBackend::detect_capabilities(&mut self, &runtime_isolation::IsolationConfig) -> runtime_isolation::CapabilityReport
+pub fn runtime_isolation::LinuxBackend::prepare_namespaces(&mut self, OperationPermit, &runtime_isolation::IsolationConfig) -> core::result::Result<runtime_isolation::NamespacePreparation, runtime_isolation::BackendError>
+pub fn runtime_isolation::LinuxBackend::rollback_step(&mut self, OperationPermit, runtime_isolation::IsolationStep, &runtime_isolation::IsolationConfig) -> core::result::Result<(), runtime_isolation::BackendError>
+pub fn runtime_isolation::LinuxBackend::spawn_isolated<T, F>(&mut self, OperationPermit, runtime_isolation::NamespacePreparation, F) -> core::result::Result<runtime_isolation::SpawnOutcome<T>, runtime_isolation::BackendError> where F: core::ops::function::FnOnce(&mut Self, runtime_isolation::NamespacePreparation, ChildStartupNotifier) -> T
+pub fn runtime_isolation::LinuxBackend::verify_pid_namespace_child(&mut self, OperationPermit, runtime_isolation::NamespacePreparation) -> core::result::Result<runtime_isolation::PidNamespaceChild, runtime_isolation::BackendError>
+pub fn runtime_isolation::apply<B: runtime_isolation::IsolationBackend>(&mut B, &runtime_isolation::IsolationConfig) -> core::result::Result<runtime_isolation::IsolationReceipt, runtime_isolation::IsolationError>
+pub fn runtime_isolation::spawn_isolated<B, F, T>(&mut B, &runtime_isolation::IsolationConfig, F) -> core::result::Result<runtime_isolation::SpawnOutcome<T>, runtime_isolation::IsolationError> where B: runtime_isolation::IsolationBackend, F: core::ops::function::FnOnce(runtime_isolation::IsolationReceipt) -> T

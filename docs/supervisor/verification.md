@@ -84,6 +84,20 @@ cargo clippy --manifest-path crates/supervisor/Cargo.toml --all-targets -- -D wa
 
 ## 未検証の境界
 
+### guest kernel が満たさなければならない前提
+
+`guest-supervisor-init` は実 microVM 上で完走する。ただしそれは guest kernel が 3 つの条件を満たす場合に限る。いずれも Firecracker CI が公開する prebuilt kernel は満たさない。
+
+| 前提 | 無いとどうなるか |
+|---|---|
+| `CONFIG_FUSE_FS` | capfs の workspace mount が `ENODEV` になり、guest の全ファイル操作が始まらない |
+| Landlock ABI 3 以上（kernel 6.2 以降 + `CONFIG_SECURITY_LANDLOCK`） | isolation の capability detection が ABI を取得できず、workload を起動できない |
+| PCI 無効時に ACPI が読める kernel | Firecracker は virtio-mmio device を ACPI 経由で列挙する。upstream には `CONFIG_PCI` 無効時に ACPI table load が失敗する不具合が 6.12 LTS まで残っており、root device が見つからず panic する |
+
+[`build-guest-kernel.sh`](../../scripts/ci/build-guest-kernel.sh) が kernel.org の pin 済み source から 3 条件を満たす kernel を build する。3 つ目は [commit 済みの patch](../../guest/kernel/) で塞いでいる。
+
+`/dev/fuse` のノード自体は `ensure_fuse_device` が常に作れる。device node は major/minor を持つ inode に過ぎず、driver の有無とは無関係だからである。そのため FUSE の不在は以前 `CapFS` server の spawn 失敗（`ENODEV`）としてしか現れず、message は runtime directory の path を指していた。現在は `verify_kernel_supports_fuse` が procfs mount 直後に kernel 自身の filesystem 一覧を読み、authority を 1 つも作る前に原因を名指しして停止する。
+
 ### test double が代わりに立っているもの
 
 | 本来の依存 | 代替 | 省いていること |

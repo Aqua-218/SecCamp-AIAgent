@@ -22,11 +22,15 @@ use std::{
 
 use authority_core::{
     capability::{CapId, IssuerId, SubjectId},
+    file::{FileAuthority, FileEffect, FileEffects},
     github::{GitHubAuthority, GitHubRequest},
     http::{HttpFetchAuthority, HttpFetchRequest},
     kernel::CapabilityKernel,
+    path::{CanonicalPath, PathPattern},
+    policy::AuthorityPolicyDigest,
+    repository::RepoId,
     state::CapabilityState,
-    time::MonotonicTime,
+    time::{MonotonicTime, TimeWindow},
 };
 use egress_broker::{
     dispatch::{
@@ -64,17 +68,19 @@ enum GuestWorkload {
 impl GuestWorkload {
     const fn program(self) -> &'static str {
         match self {
-            Self::Sleep | Self::BrokerProbe => "/usr/local/libexec/guest-workload",
-            Self::CgroupProbe => "/usr/bin/dash",
+            Self::Sleep | Self::CgroupProbe => "/usr/bin/dash",
+            Self::BrokerProbe => "/usr/local/libexec/guest-workload",
             Self::RuntimeBrokerProbe => "/usr/local/libexec/guest-supervisor-init",
         }
     }
 
     const fn arguments(self) -> &'static str {
         match self {
-            Self::Sleep => "sleep 600",
+            Self::Sleep => {
+                r#"-c \"[ ${GUEST_SUPERVISOR_READINESS:-missing} = 1 ] || exit 126; printf guest-supervisor-ready/v1; exec /usr/local/libexec/sleep 600\""#
+            }
             Self::CgroupProbe => {
-                r#"-c \"/usr/bin/mount -t proc -o nosuid,nodev,noexec proc /proc; /usr/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup; printf 'cgroup-probe-proc:\\n'; /usr/bin/cat /proc/cgroups; printf 'cgroup-probe-controllers: '; /usr/bin/cat /sys/fs/cgroup/cgroup.controllers; /usr/bin/sleep 600\""#
+                r#"-c \"[ ${GUEST_SUPERVISOR_READINESS:-missing} = 1 ] || exit 126; printf guest-supervisor-ready/v1; exec 1>&2; /usr/bin/mount -t proc -o nosuid,nodev,noexec proc /proc; /usr/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup; printf 'cgroup-probe-proc:\\n'; /usr/bin/cat /proc/cgroups; printf 'cgroup-probe-controllers: '; /usr/bin/cat /sys/fs/cgroup/cgroup.controllers; /usr/bin/sleep 600\""#
             }
             Self::BrokerProbe => "--port 18081",
             Self::RuntimeBrokerProbe => {
@@ -183,6 +189,36 @@ fn guest_request() -> GuestControlRequest {
             identity(6),
         )
         .expect("test bundle identities must be distinct"),
+    )
+    .expect("test challenge must be independent")
+}
+
+fn bound_guest_request() -> GuestControlRequest {
+    let validity = TimeWindow::new(
+        MonotonicTime::from_ticks(0),
+        MonotonicTime::from_ticks(u64::MAX),
+    )
+    .expect("fixed guest validity must be non-empty");
+    let authority = authority_core::capability::AuthorityBody::File(FileAuthority::new(
+        RepoId::new("workspace"),
+        FileEffects::from_effects([
+            FileEffect::ReadData,
+            FileEffect::ListDirectory,
+            FileEffect::WriteData,
+        ]),
+        PathPattern::Prefix(CanonicalPath::root()),
+    ));
+    GuestControlRequest::new_bound(
+        identity(1),
+        IdentityBundle::new(
+            identity(2),
+            identity(3),
+            identity(4),
+            identity(5),
+            identity(6),
+        )
+        .expect("test bundle identities must be distinct"),
+        AuthorityPolicyDigest::for_root(validity, &authority, false),
     )
     .expect("test challenge must be independent")
 }
@@ -384,43 +420,43 @@ fn real_firecracker_guest_control_enforces_identity_gate_over_vsock() {
     configure_and_start_real_vm(&mut api, &vm, &kernel, &rootfs, GuestWorkload::Sleep, None);
 
     wait_for_guest_vsock(&vsock);
-    let request = guest_request();
+    let request = bound_guest_request();
     let mut client = FirecrackerVsockApiClient::new(&vsock, GUEST_CID, GUEST_CONTROL_PORT)
         .expect("exact real guest endpoint must be valid");
     let injected = client
         .request(&ApiRequest {
             method: HttpMethod::Put,
-            path: GuestControlAction::InjectIdentity.path().to_owned(),
-            body: request.canonical_body(),
+            path: GuestControlAction::InjectIdentityBound.path().to_owned(),
+            body: request.canonical_bound_body(),
         })
         .expect("identity injection must reach the real guest");
     assert_eq!(
         injected.body,
-        request.canonical_acknowledgement(GuestControlAction::InjectIdentity)
+        request.canonical_bound_acknowledgement(GuestControlAction::InjectIdentityBound)
     );
     let started = client
         .request(&ApiRequest {
             method: HttpMethod::Put,
-            path: GuestControlAction::StartWorkload.path().to_owned(),
-            body: request.canonical_body(),
+            path: GuestControlAction::StartWorkloadBound.path().to_owned(),
+            body: request.canonical_bound_body(),
         })
         .expect("workload release must reach the real guest");
     assert_eq!(
         started.body,
-        request.canonical_acknowledgement(GuestControlAction::StartWorkload),
+        request.canonical_bound_acknowledgement(GuestControlAction::StartWorkloadBound),
         "guest runtime failed to start; guest serial output:\n{}",
         vm.guest_serial_log(),
     );
     let retried_start = client
         .request(&ApiRequest {
             method: HttpMethod::Put,
-            path: GuestControlAction::StartWorkload.path().to_owned(),
-            body: request.canonical_body(),
+            path: GuestControlAction::StartWorkloadBound.path().to_owned(),
+            body: request.canonical_bound_body(),
         })
         .expect("a running image-configured workload must keep serving exact start retries");
     assert_eq!(
         retried_start.body,
-        request.canonical_acknowledgement(GuestControlAction::StartWorkload)
+        request.canonical_bound_acknowledgement(GuestControlAction::StartWorkloadBound)
     );
 }
 
@@ -526,30 +562,30 @@ fn real_firecracker_guest_reaches_host_broker_over_vsock() {
         None,
     );
     wait_for_guest_vsock(&vsock);
-    let request = guest_request();
+    let request = bound_guest_request();
     let mut client = FirecrackerVsockApiClient::new(&vsock, GUEST_CID, GUEST_CONTROL_PORT)
         .expect("exact real guest endpoint must be valid");
     let injected = client
         .request(&ApiRequest {
             method: HttpMethod::Put,
-            path: GuestControlAction::InjectIdentity.path().to_owned(),
-            body: request.canonical_body(),
+            path: GuestControlAction::InjectIdentityBound.path().to_owned(),
+            body: request.canonical_bound_body(),
         })
         .expect("identity injection must reach the real guest");
     assert_eq!(
         injected.body,
-        request.canonical_acknowledgement(GuestControlAction::InjectIdentity)
+        request.canonical_bound_acknowledgement(GuestControlAction::InjectIdentityBound)
     );
     let started = client
         .request(&ApiRequest {
             method: HttpMethod::Put,
-            path: GuestControlAction::StartWorkload.path().to_owned(),
-            body: request.canonical_body(),
+            path: GuestControlAction::StartWorkloadBound.path().to_owned(),
+            body: request.canonical_bound_body(),
         })
         .expect("guest Broker probe must be released after identity injection");
     assert_eq!(
         started.body,
-        request.canonical_acknowledgement(GuestControlAction::StartWorkload),
+        request.canonical_bound_acknowledgement(GuestControlAction::StartWorkloadBound),
         "guest runtime failed to start; guest serial output:\n{}",
         vm.guest_serial_log(),
     );
@@ -589,7 +625,7 @@ fn real_firecracker_guest_runtime_preserves_the_broker_channel_through_isolation
         let public_calls = Arc::clone(&public_calls);
         let github_calls = Arc::clone(&github_calls);
         move || {
-            // `guest_request` fixes the session identity to 00..03. Matching it here proves the
+            // `bound_guest_request` fixes the session identity to 00..03. Matching it here proves the
             // isolated workload uses the host-issued session rather than the probe's legacy ID.
             serve_probe_connection(
                 &listener,
@@ -610,30 +646,30 @@ fn real_firecracker_guest_runtime_preserves_the_broker_channel_through_isolation
         Some(&workspace),
     );
     wait_for_guest_vsock(&vsock);
-    let request = guest_request();
+    let request = bound_guest_request();
     let mut client = FirecrackerVsockApiClient::new(&vsock, GUEST_CID, GUEST_CONTROL_PORT)
         .expect("exact real guest endpoint must be valid");
     let injected = client
         .request(&ApiRequest {
             method: HttpMethod::Put,
-            path: GuestControlAction::InjectIdentity.path().to_owned(),
-            body: request.canonical_body(),
+            path: GuestControlAction::InjectIdentityBound.path().to_owned(),
+            body: request.canonical_bound_body(),
         })
         .expect("identity injection must reach the real guest");
     assert_eq!(
         injected.body,
-        request.canonical_acknowledgement(GuestControlAction::InjectIdentity)
+        request.canonical_bound_acknowledgement(GuestControlAction::InjectIdentityBound)
     );
     let started = client
         .request(&ApiRequest {
             method: HttpMethod::Put,
-            path: GuestControlAction::StartWorkload.path().to_owned(),
-            body: request.canonical_body(),
+            path: GuestControlAction::StartWorkloadBound.path().to_owned(),
+            body: request.canonical_bound_body(),
         })
         .expect("guest runtime must start only after identity injection");
     assert_eq!(
         started.body,
-        request.canonical_acknowledgement(GuestControlAction::StartWorkload),
+        request.canonical_bound_acknowledgement(GuestControlAction::StartWorkloadBound),
         "guest runtime failed to start; guest serial output:\n{}",
         vm.guest_serial_log(),
     );

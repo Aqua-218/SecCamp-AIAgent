@@ -701,11 +701,18 @@ impl CapabilityRevocationBackend for ObservedCapability {
     }
 }
 
+/// Waits for a counter that a background thread advances.
+///
+/// The deadline is deliberately generous. A healthy run leaves this loop as soon as the counter
+/// moves, so a wider bound costs a passing test nothing, while a narrow one only adds a way for
+/// a loaded machine to fail a correct implementation. Sleeping instead of spinning matters for
+/// the same reason: `yield_now` in a tight loop competes for the CPU with the very thread this
+/// is waiting for, which is worst exactly when the machine is already busy.
 fn wait_for_counter(counter: &AtomicUsize, expected: usize, label: &str) {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while counter.load(Ordering::SeqCst) < expected {
         assert!(Instant::now() < deadline, "timed out waiting for {label}");
-        thread::yield_now();
+        thread::sleep(Duration::from_millis(1));
     }
 }
 

@@ -76,3 +76,57 @@ for asset_name in "${release_assets[@]}"; do
       ;;
   esac
 done
+
+# GitLab's generic-package upload endpoint addresses one file at a time and
+# does not itself reject undeclared files already present in the version. Query
+# the package record after all idempotent uploads and require the registry-side
+# file set to equal the release contract exactly.
+packages_json="${publish_temp}/packages.json"
+packages_headers="${publish_temp}/packages.headers"
+curl --fail-with-body --silent --show-error --location \
+  --connect-timeout 15 \
+  --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+  --dump-header "${packages_headers}" \
+  --output "${packages_json}" \
+  --get \
+  --data-urlencode 'package_type=generic' \
+  --data-urlencode 'package_name=authority-corpus' \
+  --data-urlencode "package_version=${CI_COMMIT_TAG}" \
+  --data-urlencode 'per_page=100' \
+  "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages"
+
+if [[ "$(tr -d '\r' < "${packages_headers}" | awk -F': *' 'tolower($1) == "x-next-page" {print $2}' | tail -1)" != '' ]]; then
+  printf 'GitLab returned more package records than the bounded verification page\n' >&2
+  exit 1
+fi
+package_id="$(jq --raw-output \
+  --arg tag "${CI_COMMIT_TAG}" \
+  '[.[] | select(.package_type == "generic" and .name == "authority-corpus" and .version == $tag)]
+   | if length == 1 then .[0].id else empty end' \
+  "${packages_json}")"
+if [[ ! "${package_id}" =~ ^[0-9]+$ ]]; then
+  printf 'GitLab registry did not return exactly one matching generic package record\n' >&2
+  exit 1
+fi
+
+files_json="${publish_temp}/package-files.json"
+files_headers="${publish_temp}/package-files.headers"
+curl --fail-with-body --silent --show-error --location \
+  --connect-timeout 15 \
+  --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+  --dump-header "${files_headers}" \
+  --output "${files_json}" \
+  --get --data-urlencode 'per_page=100' \
+  "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/${package_id}/package_files"
+if [[ "$(tr -d '\r' < "${files_headers}" | awk -F': *' 'tolower($1) == "x-next-page" {print $2}' | tail -1)" != '' ]]; then
+  printf 'GitLab package contains more files than the bounded verification page\n' >&2
+  exit 1
+fi
+
+expected_files="$(printf '%s\n' "${release_assets[@]}" | sort)"
+actual_files="$(jq --raw-output '.[].file_name' "${files_json}" | sort)"
+if [[ "${actual_files}" != "${expected_files}" ]]; then
+  printf 'GitLab package file set differs from the declared release assets\n' >&2
+  diff -u <(printf '%s\n' "${expected_files}") <(printf '%s\n' "${actual_files}") >&2 || true
+  exit 1
+fi

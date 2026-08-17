@@ -8,7 +8,7 @@
 
 ## Status
 
-Proposed
+Accepted (2026-08-17)
 
 ## 背景と課題
 
@@ -68,7 +68,9 @@ snapshot clone を再利用しない。
 - v1 wire bytes は parser compatibility のため残せるが、production composition は unbound v1 を受理しない。
 - host root revoke だけを「guest revoke 完了」と呼べなくなる。orchestrator の cleanup receipt は host revoke と guest barrier/VM termination を別 stage で保持する。
 - guest ACK は可用性上の最適化であり、security fallback は cgroup ごとの VM termination である。
-- 実装が guest v2 verification、snapshot manifest binding、durable revoke intent、ACK/kill test を満たした時点で ADR を `Accepted` にする。
+- guest v2 verification、snapshot template/request/manifest の policy digest binding、起動前に
+  永続化される session recovery intent、host revoke 後の VM/cgroup termination barrier を実装した。
+  guest 応答に依存せず kill 確認まで cleanup を完了扱いにしないため、この決定を Accepted とする。
 
 ## 関連
 

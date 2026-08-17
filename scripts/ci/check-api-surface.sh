@@ -32,6 +32,7 @@ if [[ ! -d "${baseline_root}" ]]; then
   printf 'API baseline directory is missing: %s\n' "${baseline_root}" >&2
   exit 1
 fi
+cargo metadata --locked --format-version 1 > /dev/null
 
 mapfile -t packages < <(
   cargo metadata --no-deps --format-version 1 \
@@ -46,7 +47,7 @@ fi
 failures=0
 for package in "${packages[@]}"; do
   output_path="${temporary_root}/${package}.api"
-  baseline_path="${baseline_root}/${package}.sha256"
+  baseline_path="${baseline_root}/${package}.api"
   if [[ ! -f "${baseline_path}" ]]; then
     printf '%s: missing baseline; run %s --update intentionally\n' \
       "${package}" "$0" >&2
@@ -55,28 +56,22 @@ for package in "${packages[@]}"; do
   fi
 
   RUSTUP_TOOLCHAIN="${nightly_channel}" \
+  CARGO_NET_OFFLINE=true \
     cargo public-api --package "${package}" --simplified --simplified --simplified \
-      --color never > "${output_path}"
-  actual_digest="$(sha256sum "${output_path}" | awk '{print $1}')"
-  expected_digest="$(awk 'NF { print $1; exit }' "${baseline_path}")"
-  if [[ ! "${expected_digest}" =~ ^[0-9a-f]{64}$ ]]; then
-    printf '%s: malformed baseline digest in %s\n' "${package}" "${baseline_path}" >&2
-    failures=$((failures + 1))
-    continue
-  fi
+      --all-features --color never > "${output_path}"
 
-  if [[ "${actual_digest}" != "${expected_digest}" ]]; then
+  if ! cmp -s -- "${output_path}" "${baseline_path}"; then
     if [[ "${update}" == true ]]; then
-      printf '%s  %s\n' "${actual_digest}" "${package}" > "${baseline_path}"
-      printf '%s: baseline updated to %s\n' "${package}" "${actual_digest}"
+      cp -- "${output_path}" "${baseline_path}"
+      printf '%s: reviewable API baseline updated\n' "${package}"
     else
-      printf '%s: public API digest changed (expected %s, got %s)\n' \
-        "${package}" "${expected_digest}" "${actual_digest}" >&2
-      printf '  review the generated API and rerun: %s --update\n' "$0" >&2
+      printf '%s: public API changed; normalized diff follows\n' "${package}" >&2
+      diff -u -- "${baseline_path}" "${output_path}" >&2 || true
+      printf 'review the API diff and rerun intentionally: %s --update\n' "$0" >&2
       failures=$((failures + 1))
     fi
   else
-    printf '%s: public API matches baseline %s\n' "${package}" "${expected_digest}"
+    printf '%s: public API matches its reviewable baseline\n' "${package}"
   fi
   done
 

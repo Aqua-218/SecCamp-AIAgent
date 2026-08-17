@@ -173,8 +173,14 @@ pub supervisor::SubjectLifecycle::Closed
 pub supervisor::SubjectLifecycle::Closing
 pub supervisor::SubjectLifecycle::Creating
 pub supervisor::SubjectLifecycle::Running
+pub enum supervisor::SupervisorCapacity
+pub supervisor::SupervisorCapacity::IssuedHandles
+pub supervisor::SupervisorCapacity::Subjects
+impl core::fmt::Display for supervisor::SupervisorCapacity
+pub fn supervisor::SupervisorCapacity::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub enum supervisor::SupervisorError<KE, RE, CE>
 pub supervisor::SupervisorError::Caller(CE)
+pub supervisor::SupervisorError::CapacityExceeded(supervisor::SupervisorCapacity)
 pub supervisor::SupervisorError::CleanupBlocked
 pub supervisor::SupervisorError::CleanupBlocked::failures: alloc::vec::Vec<supervisor::CleanupFailure<KE, RE>>
 pub supervisor::SupervisorError::CleanupBlocked::subject: authority_core::capability::SubjectId
@@ -194,6 +200,7 @@ pub supervisor::SupervisorError::GrantSubjectMismatch::requested: authority_core
 pub supervisor::SupervisorError::HandleNotOwned
 pub supervisor::SupervisorError::HandleNotOwned::caller: authority_core::capability::SubjectId
 pub supervisor::SupervisorError::HandleNotOwned::handle: authority_core::handle::HandleId
+pub supervisor::SupervisorError::InvalidLimits(supervisor::SupervisorLimitsError)
 pub supervisor::SupervisorError::Kernel(KE)
 pub supervisor::SupervisorError::KernelNotPristine
 pub supervisor::SupervisorError::Resource(supervisor::ResourceFailure<RE>)
@@ -213,6 +220,11 @@ pub const fn supervisor::SupervisorError<KE, RE, CE>::refusal(&self) -> supervis
 impl<KE, RE, CE> core::error::Error for supervisor::SupervisorError<KE, RE, CE> where KE: core::error::Error + 'static, RE: core::error::Error + 'static, CE: core::error::Error + 'static
 impl<KE: core::fmt::Display + core::fmt::Debug, RE: core::fmt::Display + core::fmt::Debug, CE: core::fmt::Display> core::fmt::Display for supervisor::SupervisorError<KE, RE, CE>
 pub fn supervisor::SupervisorError<KE, RE, CE>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum supervisor::SupervisorLimitsError
+pub supervisor::SupervisorLimitsError::Zero(supervisor::SupervisorCapacity)
+impl core::error::Error for supervisor::SupervisorLimitsError
+impl core::fmt::Display for supervisor::SupervisorLimitsError
+pub fn supervisor::SupervisorLimitsError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub enum supervisor::WireDecodeError
 pub supervisor::WireDecodeError::InvalidField(&'static str)
 pub supervisor::WireDecodeError::LengthMismatch
@@ -257,6 +269,9 @@ impl supervisor::AcceptedControlConnection
 pub const fn supervisor::AcceptedControlConnection::identity(&self) -> supervisor::ConnectionIdentity
 pub fn supervisor::AcceptedControlConnection::receive_request(&self) -> core::result::Result<supervisor::WireRequest, supervisor::ControlSocketError>
 pub fn supervisor::AcceptedControlConnection::send_response(&self, supervisor::WireResponse) -> core::result::Result<(), supervisor::ControlSocketError>
+pub struct supervisor::AuthorityStartupSnapshot
+pub supervisor::AuthorityStartupSnapshot::authorization_epoch: authority_core::state::AuthorizationEpoch
+pub supervisor::AuthorityStartupSnapshot::status: authority_core::state::SubjectStatus
 pub struct supervisor::CallerBindingError
 impl core::error::Error for supervisor::CallerBindingError
 impl core::fmt::Display for supervisor::CallerBindingError
@@ -275,6 +290,7 @@ pub fn supervisor::CapfsRuntimeConfig::new(authority_core::state::CapabilityStat
 pub struct supervisor::CapfsRuntimeManager<B>
 impl<B> supervisor::CapfsRuntimeManager<B>
 pub fn supervisor::CapfsRuntimeManager<B>::into_supervisor<C>(self, C) -> core::result::Result<supervisor::CapfsSupervisor<B, C>, supervisor::CapfsSupervisorError<B, C>> where B: supervisor::CapfsHostResources, C: supervisor::CallerResolver
+pub fn supervisor::CapfsRuntimeManager<B>::into_supervisor_with_limits<C>(self, C, supervisor::SupervisorLimits) -> core::result::Result<supervisor::CapfsSupervisor<B, C>, supervisor::CapfsSupervisorError<B, C>> where B: supervisor::CapfsHostResources, C: supervisor::CallerResolver
 pub fn supervisor::CapfsRuntimeManager<B>::new(B, supervisor::CapfsRuntimeConfig) -> core::result::Result<Self, supervisor::CapfsBuildError>
 pub struct supervisor::CapfsRuntimeResources<B>
 impl<B> supervisor::CapfsRuntimeResources<B>
@@ -402,14 +418,25 @@ pub fn supervisor::Supervisor<K, R, C>::derive(&self, &supervisor::ConnectionIde
 pub fn supervisor::Supervisor<K, R, C>::dispatch_request(&mut self, &supervisor::ConnectionIdentity, supervisor::WireRequest) -> core::result::Result<supervisor::DispatchResponse, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
 pub fn supervisor::Supervisor<K, R, C>::dispatch_wire(&mut self, &supervisor::ConnectionIdentity, &[u8]) -> core::result::Result<supervisor::DispatchResponse, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
 pub fn supervisor::Supervisor<K, R, C>::issue_root(&self, &authority_core::capability::SubjectId, authority_core::state::CapabilityGrant) -> core::result::Result<authority_core::capability::CapId, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::issued_handle_count(&self) -> usize
+pub fn supervisor::Supervisor<K, R, C>::issued_subject_count(&self) -> usize
 pub fn supervisor::Supervisor<K, R, C>::lifecycle(&self, &authority_core::capability::SubjectId) -> core::result::Result<supervisor::SubjectLifecycle, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub const fn supervisor::Supervisor<K, R, C>::limits(&self) -> supervisor::SupervisorLimits
 pub fn supervisor::Supervisor<K, R, C>::new(K, R, C) -> core::result::Result<Self, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
+pub fn supervisor::Supervisor<K, R, C>::new_with_limits(K, R, C, supervisor::SupervisorLimits) -> core::result::Result<Self, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
 pub fn supervisor::Supervisor<K, R, C>::open_handle(&mut self, &supervisor::ConnectionIdentity, authority_core::handle::HandleId, authority_core::handle::ObjectId) -> core::result::Result<(), supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
 pub const fn supervisor::Supervisor<K, R, C>::resources(&self) -> &R
 pub fn supervisor::Supervisor<K, R, C>::resources_mut(&mut self) -> &mut R
 pub fn supervisor::Supervisor<K, R, C>::revoke(&self, &supervisor::ConnectionIdentity, &authority_core::capability::CapId) -> core::result::Result<authority_core::state::RevocationStatus, supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
 pub fn supervisor::Supervisor<K, R, C>::shutdown_subject(&mut self, &authority_core::capability::SubjectId) -> core::result::Result<(), supervisor::SupervisorError<<K as supervisor::AuthorityKernel>::Error, <R as supervisor::RuntimeResources>::Error, <C as supervisor::CallerResolver>::Error>>
 pub fn supervisor::Supervisor<K, R, C>::with_resources_and_callers<T>(&mut self, impl core::ops::function::FnOnce(&mut R, &mut C) -> T) -> T
+pub struct supervisor::SupervisorLimits
+impl supervisor::SupervisorLimits
+pub const fn supervisor::SupervisorLimits::max_issued_handles(self) -> usize
+pub const fn supervisor::SupervisorLimits::max_subjects(self) -> usize
+pub const fn supervisor::SupervisorLimits::new(usize, usize) -> Self
+impl core::default::Default for supervisor::SupervisorLimits
+pub fn supervisor::SupervisorLimits::default() -> Self
 pub struct supervisor::WorkloadHandle(_)
 impl supervisor::WorkloadHandle
 pub const fn supervisor::WorkloadHandle::new(u64) -> Self
@@ -421,6 +448,8 @@ impl supervisor::WorkloadIsolationLimits
 pub fn supervisor::WorkloadIsolationLimits::new(impl core::convert::Into<std::path::PathBuf>, u64, u64, u64, u32, u32) -> Self
 pub const supervisor::DEFAULT_CONTROL_RECEIVE_TIMEOUT: core::time::Duration
 pub const supervisor::DEFAULT_CONTROL_SEND_TIMEOUT: core::time::Duration
+pub const supervisor::DEFAULT_MAX_ISSUED_HANDLES: usize
+pub const supervisor::DEFAULT_MAX_SUBJECTS: usize
 pub const supervisor::MAX_CONTROL_SOCKET_BACKLOG: i32
 pub const supervisor::MAX_CONTROL_SOCKET_TIMEOUT: core::time::Duration
 pub const supervisor::MAX_WIRE_REQUEST_BYTES: usize
@@ -439,6 +468,7 @@ pub fn supervisor::AuthorityKernel::open_handle(&self, &authority_core::handle::
 pub fn supervisor::AuthorityKernel::register_open_handle(&self, authority_core::handle::OpenHandle) -> core::result::Result<(), Self::Error>
 pub fn supervisor::AuthorityKernel::register_subject(&self, authority_core::state::Subject) -> core::result::Result<(), Self::Error>
 pub fn supervisor::AuthorityKernel::revoke(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId) -> core::result::Result<authority_core::state::RevocationStatus, Self::Error>
+pub fn supervisor::AuthorityKernel::startup_snapshot(&self, &authority_core::capability::SubjectId) -> core::result::Result<core::option::Option<supervisor::AuthorityStartupSnapshot>, Self::Error>
 impl supervisor::AuthorityKernel for alloc::sync::Arc<authority_core::kernel::CapabilityKernel>
 pub type alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::Error = authority_core::kernel::CapabilityKernelError
 pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::begin_subject_close(&self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectCloseStatus, Self::Error>
@@ -451,6 +481,7 @@ pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::open_handle(&
 pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::register_open_handle(&self, authority_core::handle::OpenHandle) -> core::result::Result<(), Self::Error>
 pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::register_subject(&self, authority_core::state::Subject) -> core::result::Result<(), Self::Error>
 pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::revoke(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId) -> core::result::Result<authority_core::state::RevocationStatus, Self::Error>
+pub fn alloc::sync::Arc<authority_core::kernel::CapabilityKernel>::startup_snapshot(&self, &authority_core::capability::SubjectId) -> core::result::Result<core::option::Option<supervisor::AuthorityStartupSnapshot>, Self::Error>
 impl supervisor::AuthorityKernel for authority_core::kernel::CapabilityKernel
 pub type authority_core::kernel::CapabilityKernel::Error = authority_core::kernel::CapabilityKernelError
 pub fn authority_core::kernel::CapabilityKernel::begin_subject_close(&self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectCloseStatus, Self::Error>
@@ -463,6 +494,7 @@ pub fn authority_core::kernel::CapabilityKernel::open_handle(&self, &authority_c
 pub fn authority_core::kernel::CapabilityKernel::register_open_handle(&self, authority_core::handle::OpenHandle) -> core::result::Result<(), Self::Error>
 pub fn authority_core::kernel::CapabilityKernel::register_subject(&self, authority_core::state::Subject) -> core::result::Result<(), Self::Error>
 pub fn authority_core::kernel::CapabilityKernel::revoke(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId) -> core::result::Result<authority_core::state::RevocationStatus, Self::Error>
+pub fn authority_core::kernel::CapabilityKernel::startup_snapshot(&self, &authority_core::capability::SubjectId) -> core::result::Result<core::option::Option<supervisor::AuthorityStartupSnapshot>, Self::Error>
 pub trait supervisor::CallerResolver
 pub type supervisor::CallerResolver::Error: core::error::Error + core::marker::Send + core::marker::Sync + 'static
 pub fn supervisor::CallerResolver::resolve(&self, &supervisor::ConnectionIdentity) -> core::result::Result<authority_core::capability::SubjectId, Self::Error>

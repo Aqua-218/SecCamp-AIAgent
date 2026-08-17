@@ -410,9 +410,11 @@ const STARTUP_MESSAGE_VERSION: u8 = 1;
 const STARTUP_MESSAGE_LEN: usize = 32;
 const STARTUP_READY: u8 = 1;
 const STARTUP_FAILED: u8 = 2;
+const STARTUP_PROGRESS: u8 = 3;
 const TERMINATION_REQUIRED: u8 = 1;
 const ERRNO_UNAVAILABLE: i32 = i32::MIN;
 const STARTUP_FAILURE_DETAIL_LEN: usize = 16;
+const CHILD_STARTUP_TIMEOUT: Duration = Duration::from_secs(25);
 const DROP_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
@@ -507,6 +509,11 @@ pub enum ChildProcessError {
     StartupChannelClosed,
     /// The child supplied a malformed or contradictory status message.
     InvalidStartupStatus(&'static str),
+    /// The direct child did not complete isolation before the fixed startup deadline.
+    StartupTimedOut {
+        /// Last isolation step whose execution the child announced.
+        last_step: Option<IsolationStep>,
+    },
     /// The direct child has already been reaped through this handle.
     AlreadyReaped,
     /// The stored child PID cannot be represented by the host wait API.
@@ -552,6 +559,10 @@ impl fmt::Display for ChildProcessError {
             Self::InvalidStartupStatus(reason) => {
                 write!(formatter, "invalid child startup status: {reason}")
             }
+            Self::StartupTimedOut { last_step } => match last_step {
+                Some(step) => write!(formatter, "child startup timed out while applying {step}"),
+                None => formatter.write_str("child startup timed out before its first step"),
+            },
             Self::AlreadyReaped => formatter.write_str("isolation child was already reaped"),
             Self::InvalidChildPid => formatter.write_str("isolation child PID is invalid"),
             Self::InvalidWaitStatus => {
@@ -605,12 +616,36 @@ impl ChildStartupNotifier {
         self.write_message(encode_startup_failure(failure))
     }
 
-    fn write_message(self, message: [u8; STARTUP_MESSAGE_LEN]) -> Result<(), ChildProcessError> {
-        let mut writer = File::from(self.writer);
-        writer
-            .write_all(&message)
-            .map_err(|error| ChildProcessError::io("write child startup status", error))
+    fn report_progress(&mut self, step: IsolationStep) -> Result<(), ChildProcessError> {
+        let duplicate = self
+            .writer
+            .try_clone()
+            .map_err(|error| ChildProcessError::io("duplicate child startup status", error))?;
+        write_startup_message(&mut File::from(duplicate), encode_startup_progress(step))
     }
+
+    fn write_message(self, message: [u8; STARTUP_MESSAGE_LEN]) -> Result<(), ChildProcessError> {
+        write_startup_message(&mut File::from(self.writer), message)
+    }
+}
+
+fn write_startup_message(
+    writer: &mut impl Write,
+    message: [u8; STARTUP_MESSAGE_LEN],
+) -> Result<(), ChildProcessError> {
+    writer
+        .write_all(&message)
+        .map_err(|error| ChildProcessError::io("write child startup status", error))
+}
+
+fn encode_startup_progress(step: IsolationStep) -> [u8; STARTUP_MESSAGE_LEN] {
+    let mut message = [0_u8; STARTUP_MESSAGE_LEN];
+    message[..4].copy_from_slice(&STARTUP_MESSAGE_MAGIC);
+    message[4] = STARTUP_MESSAGE_VERSION;
+    message[5] = STARTUP_PROGRESS;
+    message[6] = step.wire_code();
+    message[8..12].copy_from_slice(&ERRNO_UNAVAILABLE.to_le_bytes());
+    message
 }
 
 fn encode_startup_ready(namespace: NamespaceIdentity) -> [u8; STARTUP_MESSAGE_LEN] {
@@ -680,20 +715,79 @@ fn encode_failure_detail(detail: &str) -> [u8; STARTUP_FAILURE_DETAIL_LEN] {
 
 fn read_startup_status(reader: OwnedFd) -> Result<ChildStartupStatus, ChildProcessError> {
     let mut reader = File::from(reader);
-    let mut message = [0_u8; STARTUP_MESSAGE_LEN];
-    reader.read_exact(&mut message).map_err(|error| {
-        if error.kind() == io::ErrorKind::UnexpectedEof {
-            ChildProcessError::StartupChannelClosed
-        } else {
-            ChildProcessError::io("read child startup status", error)
+    let deadline = Instant::now() + CHILD_STARTUP_TIMEOUT;
+    let mut last_step = None;
+    for _ in 0..=REQUIRED_STEPS.len() {
+        wait_for_startup_record(&reader, deadline, last_step)?;
+        let mut message = [0_u8; STARTUP_MESSAGE_LEN];
+        reader.read_exact(&mut message).map_err(|error| {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                ChildProcessError::StartupChannelClosed
+            } else {
+                ChildProcessError::io("read child startup status", error)
+            }
+        })?;
+        match decode_startup_message(message)? {
+            StartupMessage::Progress(step) => last_step = Some(step),
+            StartupMessage::Terminal(status) => return Ok(status),
         }
-    })?;
-    decode_startup_status(message)
+    }
+    Err(ChildProcessError::InvalidStartupStatus(
+        "too many child startup progress records",
+    ))
 }
 
+fn wait_for_startup_record(
+    reader: &File,
+    deadline: Instant,
+    last_step: Option<IsolationStep>,
+) -> Result<(), ChildProcessError> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ChildProcessError::StartupTimedOut { last_step });
+        }
+        let timeout = i32::try_from((deadline - now).as_millis()).unwrap_or(i32::MAX);
+        let mut descriptor = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: descriptor points to one initialized pollfd and the timeout is bounded.
+        let result = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result == 0 {
+            return Err(ChildProcessError::StartupTimedOut { last_step });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(ChildProcessError::io("poll child startup status", error));
+        }
+    }
+}
+
+enum StartupMessage {
+    Progress(IsolationStep),
+    Terminal(ChildStartupStatus),
+}
+
+#[cfg(test)]
 fn decode_startup_status(
     message: [u8; STARTUP_MESSAGE_LEN],
 ) -> Result<ChildStartupStatus, ChildProcessError> {
+    match decode_startup_message(message)? {
+        StartupMessage::Terminal(status) => Ok(status),
+        StartupMessage::Progress(_) => Err(ChildProcessError::InvalidStartupStatus(
+            "progress record is not a terminal startup status",
+        )),
+    }
+}
+
+fn decode_startup_message(
+    message: [u8; STARTUP_MESSAGE_LEN],
+) -> Result<StartupMessage, ChildProcessError> {
     if message[..4] != STARTUP_MESSAGE_MAGIC {
         return Err(ChildProcessError::InvalidStartupStatus(
             "message magic did not match",
@@ -744,19 +838,36 @@ fn decode_startup_status(
                     "ready message did not attest the final isolation step",
                 ));
             }
-            Ok(ChildStartupStatus::Ready(ChildStartupReady {
-                pid_namespace: NamespaceIdentity::from_kernel(device, inode),
-            }))
+            Ok(StartupMessage::Terminal(ChildStartupStatus::Ready(
+                ChildStartupReady {
+                    pid_namespace: NamespaceIdentity::from_kernel(device, inode),
+                },
+            )))
         }
-        STARTUP_FAILED => Ok(ChildStartupStatus::Failed(ChildStartupFailure {
-            step,
-            errno: (errno != ERRNO_UNAVAILABLE).then_some(errno),
-            rollback_failure_count,
-            termination_required: message[7] == TERMINATION_REQUIRED,
-            detail: message[12..28]
-                .try_into()
-                .expect("fixed status failure detail has the correct length"),
-        })),
+        STARTUP_FAILED => Ok(StartupMessage::Terminal(ChildStartupStatus::Failed(
+            ChildStartupFailure {
+                step,
+                errno: (errno != ERRNO_UNAVAILABLE).then_some(errno),
+                rollback_failure_count,
+                termination_required: message[7] == TERMINATION_REQUIRED,
+                detail: message[12..28]
+                    .try_into()
+                    .expect("fixed status failure detail has the correct length"),
+            },
+        ))),
+        STARTUP_PROGRESS => {
+            if message[7] != 0
+                || errno != ERRNO_UNAVAILABLE
+                || device != 0
+                || inode != 0
+                || rollback_failure_count != 0
+            {
+                return Err(ChildProcessError::InvalidStartupStatus(
+                    "progress record contains terminal status fields",
+                ));
+            }
+            Ok(StartupMessage::Progress(step))
+        }
         _ => Err(ChildProcessError::InvalidStartupStatus(
             "message kind is unknown",
         )),
@@ -1291,8 +1402,13 @@ impl RuntimeIsolation {
             .spawn_isolated(
                 private::OperationPermit::new(),
                 preparation,
-                |child_backend, child_preparation, startup_notifier| {
-                    match Self::enter_isolated_child(child_backend, config, child_preparation) {
+                |child_backend, child_preparation, mut startup_notifier| {
+                    match Self::enter_isolated_child(
+                        child_backend,
+                        config,
+                        child_preparation,
+                        &mut startup_notifier,
+                    ) {
                         Ok(receipt) => match startup_notifier.report_ready(&receipt) {
                             Ok(()) => Ok(workload_entry(receipt)),
                             Err(error) => Err(IsolationError::TerminationRequired {
@@ -1338,7 +1454,9 @@ impl RuntimeIsolation {
         backend: &mut B,
         config: &IsolationConfig,
         preparation: NamespacePreparation,
+        startup_notifier: &mut ChildStartupNotifier,
     ) -> Result<IsolationReceipt, IsolationError> {
+        report_startup_progress(startup_notifier, IsolationStep::Namespaces)?;
         let pid_namespace_child = match backend
             .verify_pid_namespace_child(private::OperationPermit::new(), preparation)
         {
@@ -1352,16 +1470,18 @@ impl RuntimeIsolation {
                 ));
             }
         };
-        Self::apply_child_transaction(backend, config, pid_namespace_child)
+        Self::apply_child_transaction(backend, config, pid_namespace_child, startup_notifier)
     }
 
     fn apply_child_transaction<B: IsolationBackend>(
         backend: &mut B,
         config: &IsolationConfig,
         pid_namespace_child: PidNamespaceChild,
+        startup_notifier: &mut ChildStartupNotifier,
     ) -> Result<IsolationReceipt, IsolationError> {
         let mut completed = vec![IsolationStep::Namespaces];
         for step in required_steps().into_iter().skip(1) {
+            report_startup_progress(startup_notifier, step)?;
             match backend.apply_step(private::OperationPermit::new(), step, config) {
                 Ok(()) => completed.push(step),
                 Err(original) => {
@@ -1409,6 +1529,22 @@ impl RuntimeIsolation {
     }
 }
 
+fn report_startup_progress(
+    notifier: &mut ChildStartupNotifier,
+    step: IsolationStep,
+) -> Result<(), IsolationError> {
+    notifier
+        .report_progress(step)
+        .map_err(|error| IsolationError::TerminationRequired {
+            original: BackendError::new(
+                step,
+                format!("report isolation progress to launcher: {error}"),
+                error.raw_os_error(),
+            ),
+            failures: Vec::new(),
+        })
+}
+
 /// Applies an isolation policy through the supplied backend.
 ///
 /// Aborts the current process when an irreversible operation may have been
@@ -1451,8 +1587,9 @@ mod tests {
     use super::{
         BackendError, ChildProcessError, ChildStartupReady, ChildStartupStatus,
         FORCE_PIDFD_TERMINATION_FAILURE, IsolatedChildProcess, IsolationError, IsolationStep,
-        NamespaceIdentity, REQUIRED_STEPS, STARTUP_MESSAGE_VERSION, decode_startup_status,
-        encode_startup_failure, encode_startup_ready,
+        NamespaceIdentity, REQUIRED_STEPS, STARTUP_MESSAGE_VERSION, StartupMessage,
+        decode_startup_message, decode_startup_status, encode_startup_failure,
+        encode_startup_progress, encode_startup_ready,
     };
 
     #[test]
@@ -1497,6 +1634,20 @@ mod tests {
         assert_eq!(failure.rollback_failure_count(), 1);
         assert!(failure.termination_required());
         assert_eq!(failure.detail(), "denied");
+    }
+
+    #[test]
+    fn progress_status_preserves_the_exact_in_progress_step_without_becoming_terminal() {
+        let message = decode_startup_message(encode_startup_progress(IsolationStep::Landlock))
+            .expect("internally encoded progress must decode");
+        assert!(matches!(
+            message,
+            StartupMessage::Progress(IsolationStep::Landlock)
+        ));
+        assert!(matches!(
+            decode_startup_status(encode_startup_progress(IsolationStep::Landlock)),
+            Err(ChildProcessError::InvalidStartupStatus(_))
+        ));
     }
 
     #[test]

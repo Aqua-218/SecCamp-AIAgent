@@ -5,12 +5,104 @@ pipeline_policy:
   script:
     - scripts/ci/install-pipeline-tools.sh
     - scripts/ci/validate-pipelines.sh
+    - scripts/ci/check-pipeline-parity.sh
+
+pipeline_self_test:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/install-pipeline-tools.sh
+    - scripts/ci/test-pipeline-planner.sh
+
+adr_index:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/check-adr-index.sh
+
+verification_traceability:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/check-verification-traceability.sh
+
+codeowners_coverage:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/check-codeowners-coverage.sh
+
+repository_hygiene:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/check-repository-hygiene.sh
+
+lean_hygiene:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/check-lean-hygiene.sh
+
+pin_inventory:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/collect-pin-inventory.sh
+  artifacts:
+    when: always
+    expire_in: 14 days
+    access: developer
+    paths:
+      - reports/pin-inventory.txt
+
+crate_isolation:
+  extends: .rust_job
+  stage: validate
+  timeout: 25m
+  script:
+    - scripts/ci/check-crate-isolation.sh
+
+release_dry_run:
+  extends: .rust_job
+  stage: validate
+  timeout: 30m
+  script:
+    - scripts/ci/install-release-tools.sh
+    - scripts/ci/run.sh release-dry-run
+
+reproducibility:
+  extends: .rust_job
+  stage: validate
+  timeout: 40m
+  script:
+    - scripts/ci/install-release-tools.sh
+    - scripts/ci/run.sh reproducibility
 
 docs_policy:
   stage: validate
   timeout: 10m
   script:
     - scripts/ci/run.sh docs-policy
+
+toolchain_consistency:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/check-toolchain-consistency.sh
+
+dependency_usage:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/check-dependency-usage.sh
+
+lockfile_integrity:
+  extends: .rust_job
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/check-lockfile-integrity.sh
 
 rust_quality:
   extends: .rust_job
@@ -21,3 +113,10 @@ rust_quality:
     - scripts/ci/run.sh check
     - scripts/ci/run.sh clippy
     - scripts/ci/run.sh docs
+
+cross_targets:
+  extends: .rust_job
+  stage: validate
+  timeout: 30m
+  script:
+    - scripts/ci/run.sh cross-targets

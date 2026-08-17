@@ -233,6 +233,8 @@ fn execute_workload(
     egress_broker_fd: i32,
     exec_status: &mut impl Write,
 ) -> Result<(), String> {
+    // `Command::exec` calls execve directly. Workload arguments are never passed through a shell,
+    // so metacharacters such as `;` and `$()` remain literal argv entries at the boundary.
     let error = Command::new(&config.program)
         .args(&config.arguments)
         .env_clear()

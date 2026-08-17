@@ -115,7 +115,7 @@ if [[ -f scripts/ci/install-nightly-toolchain.sh ]]; then
     grep -REn 'cargo \+nightly|rustup toolchain install nightly' \
       --include='*.yml' --include='*.yaml' --include='*.sh' \
       .github .gitlab scripts \
-      | grep -v '^scripts/ci/install-nightly-toolchain.sh:'
+      | grep -v -E '^scripts/ci/(install-nightly-toolchain|check-toolchain-consistency)\.sh:'
   )"; then
     while IFS= read -r offender; do
       fail "nightly toolchain named outside install-nightly-toolchain.sh: ${offender}"

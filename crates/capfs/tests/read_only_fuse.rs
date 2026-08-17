@@ -3,13 +3,19 @@
 #![cfg(target_os = "linux")]
 
 use std::{
+    env,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     num::NonZeroUsize,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use authority_core::{
@@ -22,7 +28,7 @@ use authority_core::{
     time::{MonotonicTime, TimeWindow},
 };
 use capfs::{
-    backing::{ImportedRepository, PreflightLimits},
+    backing::{ImportedRepository, PreflightLimits, RepositoryPreflightError, ValidatedRepository},
     filesystem::{CapabilityFilesystem, MountAuthority, MountInstanceId, spawn_mount},
 };
 use fuser::BackgroundSession;
@@ -37,6 +43,25 @@ type MountedDirectoryView = (
     CapId,
     BackgroundSession,
 );
+
+/// Keep normal workspace tests portable while making the privileged gate
+/// fail closed when FUSE is part of the required evidence.
+///
+/// The dedicated `verify-real-capfs.sh` gate sets `CAPFS_REQUIRE_FUSE=1`, so a
+/// missing device is an unavailable verification environment rather than a
+/// green test run. Hosted unit-test jobs leave the variable unset and retain
+/// the existing skip behavior for kernels without FUSE support.
+fn require_fuse_or_skip() -> bool {
+    if Path::new("/dev/fuse").exists() {
+        return true;
+    }
+    assert!(
+        env::var_os("CAPFS_REQUIRE_FUSE").is_none(),
+        "CAPFS_REQUIRE_FUSE is set but /dev/fuse is unavailable"
+    );
+    eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    false
+}
 
 fn mount_directory_view() -> MountedDirectoryView {
     let backing = tempdir().expect("temporary backing directory must be creatable");
@@ -116,8 +141,7 @@ fn mount_directory_view() -> MountedDirectoryView {
 // through capability authorization after revoke. Category: FUSE/security. Risk: critical.
 #[test]
 fn mounted_read_only_view_denies_read_after_revoke() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -214,8 +238,7 @@ fn mounted_read_only_view_denies_read_after_revoke() {
 // respective authorization checks. Category: FUSE/security. Risk: critical.
 #[test]
 fn mounted_view_denies_write_after_revoke() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -316,13 +339,166 @@ fn mounted_view_denies_write_after_revoke() {
     drop(session);
 }
 
+// Requirement: a real FUSE write that races with revoke is either linearized
+// before revoke returns or rejected, and no later write reaches the backing
+// file. Category: FUSE/revocation. Risk: critical.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mounted_view_linearizes_backing_mutation_against_revoke() {
+    if !require_fuse_or_skip() {
+        return;
+    }
+
+    let backing = tempdir().expect("temporary backing directory must be creatable");
+    let mountpoint = tempdir().expect("temporary mountpoint must be creatable");
+    let backing_file = backing.path().join("race.txt");
+    File::create(&backing_file).expect("race backing file must be creatable");
+    let repository = RepoId::new("workspace");
+    let imported = ImportedRepository::open(
+        repository.clone(),
+        backing.path(),
+        PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 1),
+    )
+    .expect("test backing must pass preflight");
+    let subject = SubjectId::new("fuse-race-subject");
+    let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+        .expect("test validity must be non-empty");
+    let effects = FileEffects::from_effects([FileEffect::ReadData, FileEffect::WriteData]);
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "fuse-race-session",
+    ))));
+    kernel
+        .register_subject(Subject::new(
+            subject.clone(),
+            StaticAuthorityEnvelope::new(
+                validity,
+                AuthorityBody::File(FileAuthority::new(
+                    repository.clone(),
+                    effects,
+                    PathPattern::Prefix(CanonicalPath::root()),
+                )),
+            ),
+        ))
+        .expect("test subject registration must succeed");
+    let capability = kernel
+        .issue_root(CapabilityGrant::new(
+            subject.clone(),
+            validity,
+            AuthorityBody::File(FileAuthority::new(
+                repository.clone(),
+                effects,
+                PathPattern::Exact(
+                    CanonicalPath::new(["race.txt"]).expect("test path must be canonical"),
+                ),
+            )),
+        ))
+        .expect("test capability issuance must succeed");
+    let filesystem = CapabilityFilesystem::new(
+        imported,
+        Arc::clone(&kernel),
+        MountAuthority::new(
+            MountInstanceId::new("fuse-race-integration"),
+            subject.clone(),
+            capability.clone(),
+            repository,
+        ),
+        Arc::new(MonotonicTime::from_ticks(5)),
+    )
+    .expect("filesystem must initialize");
+    let session = spawn_mount(filesystem, mountpoint.path()).expect("FUSE mount must succeed");
+
+    let start = Arc::new(Barrier::new(2));
+    let post_revoke = Arc::new(Barrier::new(2));
+    let revoking = Arc::new(AtomicBool::new(false));
+    let successful_writes = Arc::new(AtomicUsize::new(0));
+    let post_revoke_denied = Arc::new(AtomicBool::new(false));
+    let unexpected_error = Arc::new(AtomicBool::new(false));
+
+    let writer = OpenOptions::new()
+        .write(true)
+        .open(mountpoint.path().join("race.txt"))
+        .expect("WriteData must authorize the race handle");
+    let writer_revoking = Arc::clone(&revoking);
+    let writer_successes = Arc::clone(&successful_writes);
+    let writer_post_revoke = Arc::clone(&post_revoke);
+    let writer_post_revoke_thread = Arc::clone(&writer_post_revoke);
+    let writer_post_denied = Arc::clone(&post_revoke_denied);
+    let writer_unexpected = Arc::clone(&unexpected_error);
+    let writer_start = Arc::clone(&start);
+    let writer_thread = thread::spawn(move || {
+        writer_start.wait();
+        while !writer_revoking.load(Ordering::Acquire) {
+            match writer
+                .try_clone()
+                .and_then(|mut clone| clone.write_all(b"x"))
+            {
+                Ok(()) => {
+                    writer_successes.fetch_add(1, Ordering::AcqRel);
+                }
+                Err(_error) if writer_revoking.load(Ordering::Acquire) => break,
+                Err(error) => {
+                    eprintln!("unexpected concurrent FUSE write error: {error}");
+                    writer_unexpected.store(true, Ordering::Release);
+                    break;
+                }
+            }
+        }
+
+        writer_post_revoke_thread.wait();
+        let mut post_writer = writer;
+        writer_post_denied.store(
+            matches!(
+                post_writer.write_all(b"post-revoke"),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied
+            ),
+            Ordering::Release,
+        );
+    });
+
+    start.wait();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while successful_writes.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        successful_writes.load(Ordering::Acquire) > 0,
+        "the concurrent FUSE writer never reached the backing file"
+    );
+
+    // The writer stops starting new operations once this flag is set. A write
+    // already inside FUSE may finish, but revoke must wait for that shared
+    // authorization guard before it returns.
+    revoking.store(true, Ordering::Release);
+    kernel
+        .revoke_held_by(&subject, &capability)
+        .expect("test capability revoke must propagate through the live mount");
+    writer_post_revoke.wait();
+    writer_thread
+        .join()
+        .expect("concurrent FUSE writer must not panic");
+
+    assert!(!unexpected_error.load(Ordering::Acquire));
+    assert!(
+        post_revoke_denied.load(Ordering::Acquire),
+        "the same real FUSE handle must be denied after revoke returns"
+    );
+    assert_eq!(
+        fs::metadata(&backing_file)
+            .expect("backing file must remain inspectable")
+            .len(),
+        successful_writes.load(Ordering::Acquire) as u64,
+        "no backing mutation may occur after the revoke linearization point"
+    );
+
+    drop(session);
+}
+
 // Requirement: FUSE CREATE and MKDIR publish the shared namespace only after
 // their separate effects authorize the hardened backing operation. Category:
 // FUSE/create. Risk: critical.
 #[test]
 fn mounted_view_creates_files_and_directories_with_capability_effects() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -432,8 +608,7 @@ fn mounted_view_creates_files_and_directories_with_capability_effects() {
 // FUSE/mutation. Risk: critical.
 #[test]
 fn mounted_view_removes_and_renames_only_with_live_effects() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -541,8 +716,7 @@ fn mounted_view_removes_and_renames_only_with_live_effects() {
 // Category: FUSE/metadata. Risk: critical.
 #[test]
 fn mounted_view_authorizes_metadata_changes_and_rechecks_after_revoke() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -651,8 +825,7 @@ fn mounted_view_authorizes_metadata_changes_and_rechecks_after_revoke() {
 // children in canonical-name order. Category: FUSE/security. Risk: critical.
 #[test]
 fn mounted_directory_view_lists_only_its_authorized_prefix() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
     let (_backing, mountpoint, _kernel, _subject, _capability, session) = mount_directory_view();
@@ -682,8 +855,7 @@ fn mounted_directory_view_lists_only_its_authorized_prefix() {
 // request after revoke. Category: FUSE/security. Risk: critical.
 #[test]
 fn mounted_directory_stream_denies_readdir_after_revoke() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
     let (_backing, mountpoint, kernel, subject, capability, session) = mount_directory_view();
@@ -724,8 +896,7 @@ fn mounted_directory_stream_denies_readdir_after_revoke() {
 // FUSE/readdir. Risk: high.
 #[test]
 fn mounted_directory_stream_requires_restart_after_namespace_mutation() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
     let (_backing, mountpoint, _kernel, _subject, _capability, session) = mount_directory_view();
@@ -776,8 +947,7 @@ fn mounted_directory_stream_requires_restart_after_namespace_mutation() {
 // Category: FUSE/security. Risk: critical.
 #[test]
 fn mounted_view_denies_cached_read_after_subject_close() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -873,8 +1043,7 @@ fn mounted_view_denies_cached_read_after_subject_close() {
 // cache left to invalidate. Category: FUSE/lifecycle. Risk: high.
 #[test]
 fn revoke_after_unmount_reports_no_propagation_failure() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -915,8 +1084,7 @@ fn revoke_after_unmount_reports_no_propagation_failure() {
 // not safe to use. Category: FUSE/coherence. Risk: high.
 #[test]
 fn cached_read_handle_observes_writes_made_through_a_direct_handle() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -1097,8 +1265,7 @@ fn mount_with_effects(
 // on the link's own path. Category: FUSE/links. Risk: critical.
 #[test]
 fn mounted_view_creates_reads_and_follows_symlinks_inside_its_range() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -1170,8 +1337,7 @@ fn mounted_view_creates_reads_and_follows_symlinks_inside_its_range() {
 // FUSE/links. Risk: critical.
 #[test]
 fn mounted_view_refuses_symlink_targets_that_leave_the_repository() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -1220,12 +1386,211 @@ fn mounted_view_refuses_symlink_targets_that_leave_the_repository() {
     drop(mount.session);
 }
 
+// Requirement: a mounted object remains bound to its imported backing inode;
+// an out-of-band same-kind replacement or symlink substitution must fail
+// closed instead of serving the replacement. Category: FUSE/backing identity.
+// Risk: critical.
+#[test]
+fn mounted_view_rejects_backing_replacement_and_symlink_substitution() {
+    if !require_fuse_or_skip() {
+        return;
+    }
+
+    let mount = mount_with_effects(
+        "fuse-backing-replacement",
+        &[],
+        &[
+            FileEffect::ListDirectory,
+            FileEffect::ReadData,
+            FileEffect::ReadLink,
+        ],
+        |backing| {
+            fs::write(backing.join("replace.txt"), b"safe")
+                .expect("replacement target must be writable");
+            fs::write(backing.join("secret.txt"), b"secret")
+                .expect("outside content must be writable");
+            std::os::unix::fs::symlink("secret.txt", backing.join("link.txt"))
+                .expect("initial link must be creatable");
+        },
+    );
+
+    fs::rename(
+        mount.backing.path().join("replace.txt"),
+        mount.backing.path().join("old.txt"),
+    )
+    .expect("the imported regular file must be replaceable");
+    fs::write(mount.backing.path().join("replace.txt"), b"attacker")
+        .expect("the same-kind replacement must be writable");
+    let replacement = fs::read(mount.mountpoint.path().join("replace.txt"))
+        .expect_err("the mount must reject a same-kind backing inode replacement");
+    assert_eq!(
+        replacement.raw_os_error(),
+        Some(rustix::io::Errno::IO.raw_os_error()),
+        "unexpected replacement error: {replacement:?}"
+    );
+    assert_eq!(
+        fs::read(mount.backing.path().join("replace.txt"))
+            .expect("the replacement backing file must remain readable"),
+        b"attacker"
+    );
+
+    fs::remove_file(mount.backing.path().join("link.txt"))
+        .expect("the imported link must be replaceable");
+    std::os::unix::fs::symlink("/etc/passwd", mount.backing.path().join("link.txt"))
+        .expect("the hostile replacement link must be creatable");
+    let link_replacement = fs::read(mount.mountpoint.path().join("link.txt"))
+        .expect_err("the mount must reject a substituted symlink");
+    assert_eq!(
+        link_replacement.raw_os_error(),
+        Some(rustix::io::Errno::IO.raw_os_error()),
+        "unexpected symlink replacement error: {link_replacement:?}"
+    );
+    assert_eq!(
+        fs::read(mount.backing.path().join("secret.txt"))
+            .expect("the backing secret must remain readable"),
+        b"secret"
+    );
+
+    drop(mount.session);
+}
+
+// Requirement: bounded deep symlink resolution may succeed when contained,
+// while a symlink cycle must surface the kernel's ELOOP rather than escape the
+// repository. Category: FUSE/links. Risk: high.
+#[test]
+fn mounted_view_handles_deep_symlink_chains_and_cycles() {
+    if !require_fuse_or_skip() {
+        return;
+    }
+
+    let mount = mount_with_effects(
+        "fuse-symlink-chain",
+        &[],
+        &[
+            FileEffect::ListDirectory,
+            FileEffect::ReadData,
+            FileEffect::ReadLink,
+        ],
+        |backing| {
+            fs::write(backing.join("target.txt"), b"chain target")
+                .expect("chain target must be writable");
+            for index in 0..8 {
+                let target = if index == 7 {
+                    "target.txt".to_owned()
+                } else {
+                    format!("chain-{}.txt", index + 1)
+                };
+                std::os::unix::fs::symlink(target, backing.join(format!("chain-{index}.txt")))
+                    .expect("contained chain link must be creatable");
+            }
+            std::os::unix::fs::symlink("cycle-b", backing.join("cycle-a"))
+                .expect("cycle-a must be creatable");
+            std::os::unix::fs::symlink("cycle-a", backing.join("cycle-b"))
+                .expect("cycle-b must be creatable");
+        },
+    );
+
+    assert_eq!(
+        fs::read(mount.mountpoint.path().join("chain-0.txt"))
+            .expect("a bounded contained chain must resolve"),
+        b"chain target"
+    );
+    let cycle = fs::read(mount.mountpoint.path().join("cycle-a"))
+        .expect_err("a symlink cycle must not be followed indefinitely");
+    assert_eq!(
+        cycle.raw_os_error(),
+        Some(rustix::io::Errno::LOOP.raw_os_error()),
+        "a symlink cycle must report ELOOP, got {cycle:?}"
+    );
+
+    drop(mount.session);
+}
+
+// Requirement: a real nested FUSE mount inside the backing tree is rejected by
+// the second repository preflight through its differing MNT_ID. Category:
+// privileged preflight. Risk: critical.
+#[test]
+fn mounted_view_rejects_a_real_nested_mount_during_preflight() {
+    if !require_fuse_or_skip() {
+        return;
+    }
+
+    let backing = tempdir().expect("temporary backing directory must be creatable");
+    let nested = backing.path().join("nested");
+    fs::create_dir(&nested).expect("nested mount directory must be creatable");
+    fs::write(nested.join("hidden.txt"), b"nested").expect("nested content must be writable");
+    let repository = RepoId::new("workspace");
+    let imported = ImportedRepository::open(
+        repository.clone(),
+        backing.path(),
+        PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 2),
+    )
+    .expect("the unmounted backing tree must pass preflight");
+
+    let subject = SubjectId::new("fuse-nested-subject");
+    let validity = TimeWindow::new(MonotonicTime::from_ticks(0), MonotonicTime::from_ticks(10))
+        .expect("test validity must be non-empty");
+    let effects = FileEffects::from_effects([FileEffect::ListDirectory, FileEffect::ReadData]);
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "fuse-nested-session",
+    ))));
+    kernel
+        .register_subject(Subject::new(
+            subject.clone(),
+            StaticAuthorityEnvelope::new(
+                validity,
+                AuthorityBody::File(FileAuthority::new(
+                    repository.clone(),
+                    effects,
+                    PathPattern::Prefix(CanonicalPath::root()),
+                )),
+            ),
+        ))
+        .expect("test subject registration must succeed");
+    let capability = kernel
+        .issue_root(CapabilityGrant::new(
+            subject.clone(),
+            validity,
+            AuthorityBody::File(FileAuthority::new(
+                repository.clone(),
+                effects,
+                PathPattern::Prefix(CanonicalPath::root()),
+            )),
+        ))
+        .expect("test capability issuance must succeed");
+    let filesystem = CapabilityFilesystem::new(
+        imported,
+        Arc::clone(&kernel),
+        MountAuthority::new(
+            MountInstanceId::new("fuse-nested-integration"),
+            subject,
+            capability,
+            repository,
+        ),
+        Arc::new(MonotonicTime::from_ticks(5)),
+    )
+    .expect("filesystem must initialize");
+    let session = spawn_mount(filesystem, &nested).expect("nested FUSE mount must succeed");
+
+    let error = ValidatedRepository::open(
+        backing.path(),
+        PreflightLimits::new(NonZeroUsize::new(16).expect("limit must be non-zero"), 2),
+    )
+    .expect_err("preflight must reject the real nested mount");
+    assert!(matches!(
+        error,
+        RepositoryPreflightError::NestedMount(path)
+            if path == CanonicalPath::new(["nested"]).expect("test path must be canonical")
+    ));
+
+    drop(session);
+}
+
 // Requirement: SYMLINK and READLINK each require their own effect. Category:
 // FUSE/links. Risk: critical.
 #[test]
 fn mounted_view_gates_symlink_creation_and_reading_on_their_own_effects() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -1293,8 +1658,7 @@ fn mounted_view_gates_symlink_creation_and_reading_on_their_own_effects() {
 // FUSE/links. Risk: critical.
 #[test]
 fn mounted_view_creates_hard_links_only_within_its_authorized_range() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -1355,8 +1719,7 @@ fn mounted_view_creates_hard_links_only_within_its_authorized_range() {
 // cannot be used to widen access. Category: FUSE/links. Risk: critical.
 #[test]
 fn mounted_view_denies_an_inode_whose_other_name_is_out_of_range() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 
@@ -1414,8 +1777,7 @@ fn mounted_view_denies_an_inode_whose_other_name_is_out_of_range() {
 // rather than reported as unimplemented. Category: FUSE/links. Risk: high.
 #[test]
 fn mounted_view_refuses_device_and_fifo_creation_with_eperm() {
-    if !Path::new("/dev/fuse").exists() {
-        eprintln!("skipping FUSE integration test because /dev/fuse is unavailable");
+    if !require_fuse_or_skip() {
         return;
     }
 

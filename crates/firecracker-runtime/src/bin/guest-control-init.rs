@@ -34,7 +34,12 @@ const GUEST_POLICY_ENCODING_VERSION_ENV: &str = "GUEST_AUTHORITY_POLICY_ENCODING
 const SUPERVISOR_READINESS_ENV: &str = "GUEST_SUPERVISOR_READINESS";
 const SUPERVISOR_READINESS_REQUIRED: &str = "1";
 const SUPERVISOR_READY_MARKER: &[u8; 25] = b"guest-supervisor-ready/v1";
-const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const SUPERVISOR_ERROR_PREFIX: &[u8; 26] = b"guest-supervisor-error/v1:";
+const MAX_SUPERVISOR_ERROR_BYTES: usize = 768;
+// The supervisor performs real proc/cgroup/workspace mounts, starts kernel FUSE, and launches the
+// isolated workload before acknowledging readiness.  Keep this bounded but large enough for a
+// cold production guest rather than treating ordinary device startup as a five-second failure.
+const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug)]
 struct Config {
@@ -265,13 +270,38 @@ fn wait_for_supervisor_readiness_with_timeout(
         }
     }
     if marker == *SUPERVISOR_READY_MARKER {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "guest supervisor sent a malformed or foreign readiness marker",
-        ))
+        return Ok(());
     }
+    if marker == SUPERVISOR_ERROR_PREFIX[..marker.len()] {
+        let mut payload = Vec::with_capacity(MAX_SUPERVISOR_ERROR_BYTES + 1);
+        readiness
+            .take((MAX_SUPERVISOR_ERROR_BYTES + 1) as u64)
+            .read_to_end(&mut payload)?;
+        if payload.first() != Some(&b':') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guest supervisor sent a malformed startup-failure record",
+            ));
+        }
+        let diagnostic = payload[1..]
+            .iter()
+            .map(|byte| {
+                if byte.is_ascii_graphic() || *byte == b' ' {
+                    char::from(*byte)
+                } else {
+                    '?'
+                }
+            })
+            .collect::<String>();
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!("guest supervisor startup failure: {diagnostic}"),
+        ));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "guest supervisor sent a malformed or foreign readiness marker",
+    ))
 }
 
 fn workload_environment(request: &GuestControlRequest) -> Vec<(OsString, String)> {
@@ -410,6 +440,24 @@ mod tests {
         child
             .kill()
             .expect("malformed test child must be stoppable");
+        child.wait().expect("test child must be reaped");
+    }
+
+    #[test]
+    fn reports_a_bounded_supervisor_startup_failure_without_accepting_readiness() {
+        let (mut readiness, mut child) =
+            child_writing_readiness("guest-supervisor-error/v1:mounting procfs: EPERM", false);
+        let error = wait_for_supervisor_readiness_with_timeout(
+            &mut readiness,
+            &mut child,
+            Duration::from_secs(1),
+        )
+        .expect_err("a startup failure record must not satisfy readiness");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            error.to_string(),
+            "guest supervisor startup failure: mounting procfs: EPERM"
+        );
         child.wait().expect("test child must be reaped");
     }
 

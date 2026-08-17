@@ -3542,6 +3542,9 @@ mod tests {
         );
     }
 
+    // The scenario is one uninterrupted lifecycle: splitting it into helpers would hide the
+    // ordering this test exists to pin down.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn firecracker_backend_executes_the_exact_once_rebound_proven_config() {
         let root = TestDirectory::new();

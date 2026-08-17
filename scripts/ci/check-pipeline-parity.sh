@@ -36,6 +36,8 @@ readonly github_orchestration_jobs=(
   ci_complete
   security_complete
   deep_complete
+  standard_quality
+  standard_security
   pipeline_summary
   package
   verify

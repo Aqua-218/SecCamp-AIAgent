@@ -91,13 +91,15 @@ sequenceDiagram
 
 失敗時に local entry を消す「明らかな cleanup」を入れると、その ID が local では再び使えるようになる一方、kernel は永久に拒否する。retry すると kernel 側で失敗する。
 
-`issued_handles` は `BTreeMap<HandleId, SubjectId>` だが、**value は書かれるだけで読まれない。** 使われるのは `contains_key` だけ。所有権は kernel から読む。`close_handle` を `issued_handles` を見る形に書き換えると compile も既存 test も通るが、権威ある記録を supervisor の私的な表で置き換えることになる。両者が食い違う経路があることは test で示されている。
+`issued_handles` は `BTreeMap<HandleId, SubjectId>` だが、**value は書かれるだけで読まれない。** 使われるのは `contains_key` と容量計算だけ。所有権は kernel から読む。`close_handle` を `issued_handles` を見る形に書き換えると compile も既存 test も通るが、権威ある記録を supervisor の私的な表で置き換えることになる。両者が食い違う経路があることは test で示されている。
 
-## `close_handle` は失敗しても状態を変える
+## `close_handle` の失敗は効果分類に従う
 
-kernel が `AlreadyClosed` を返した場合、`close_handle` は `StaleHandle` を `Err` で返す。**しかしその前に両方の集合から entry を除去している。**
+resource adapter が `NoEffect`、`CleanupRequired`、`EffectUnknown` を返した場合、`close_handle` は typed error を返し、両方の集合を保持する。caller が retry できるよう、resource の状態が確定するまで authority record を変えない。
 
-`Err` を「何も起きなかった」と読むのは誤り。kernel が既に閉じていた handle について、supervisor 側の記録を kernel に合わせる操作が済んでいる。
+kernel が `AlreadyClosed` を返した場合だけ、`close_handle` は `StaleHandle` を `Err` で返し、**両方の集合から entry を除去する。** kernel が既に閉じていた handle について、supervisor 側の記録を kernel に合わせる操作が済んでいるためである。
+
+shutdown 中の resource close failure は `runtime_handles` に残り、次回の shutdown で再試行される。`close_handle_failure_is_retained_and_retried_before_unmount` と `simultaneous_cleanup_failures_are_all_retained_for_one_retry_matrix` がこの順序を固定している。
 
 ## 何が助かるのか
 
@@ -111,8 +113,8 @@ descriptor が漏れる経路が 1 つに絞られている。`runtime_handles` 
 - `HandleId` の非再利用は 1 supervisor session 内でのみ成り立つ。`issued_handles` は process 内の状態で、restart で消える。
 - kernel と supervisor の予約表が食い違う経路は 1 つだけ test されている。他の食い違い方は未検証。
 - `handles` にあって `runtime_handles` に無い状態を作る test が無い。この状態が subject を `Closing` に固着させることは、コードから読める性質であって検証済みではない。
-- shutdown 中の `close_handle` 失敗は未検証。
-- `issued_handles` と `subjects` は追記のみで、上限が無い。長期稼働の session では memory が単調に増える。
+- shutdown 中の `close_handle` 失敗は、resource token を保持し、unmount 前の retry で回復する経路を test 済み。実 descriptor の failure injection は privileged adapter の検証境界である。
+- `issued_handles` と `subjects` は追記のみだが、`SupervisorLimits` の session 永久上限（既定値は subjects 1024、issued handles 65536）を持つ。close や rollback で容量は戻らない。
 
 ## 変更時の確認点
 

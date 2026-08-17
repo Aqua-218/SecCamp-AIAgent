@@ -6,7 +6,7 @@
 
 > **対象読者:** firecracker-runtime の実装者、レビュー担当者、実機で統合 test を回す人
 
-この crate の test は 4 層に分かれる。fake adapter を使う lifecycle test、実 Unix socket と実プロセスを使う adapter test、実 filesystem を使う workspace test、KVM host で実 Firecracker を boot する opt-in test である。最後の層だけは root、`/dev/kvm`、`/dev/vhost-vsock`、device-mapper を要求し、通常の `cargo test` では実行しない。
+この crate の test は 4 層に分かれる。fake adapter を使う lifecycle test、実 Unix socket と実プロセスを使う adapter test、実 filesystem を使う workspace test、KVM host で実 Firecracker を boot する opt-in test である。最後の層だけは root、`/dev/kvm`、`/dev/vhost-vsock`、device-mapper、cgroup v2 を要求し、通常の `cargo test` では実行しない。実 Firecracker 層には、直接 API を構成する guest-control test と、production `Runtime::launch` を通る lifecycle gate の 2 本がある。
 
 ## local test で確認したこと
 
@@ -98,6 +98,22 @@ symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` �
 
 これらの test は `Runtime::launch` を経由せず、Firecracker REST API を直接構成する。PID 1 の gate は production と同じ v2 digest-bound identity/start path と exact ACK を使い、別の固定 runtime image は guest-supervisor-init → workload-isolation-launcher → Broker probe を実 KVM で通す。従って authority binding、guest composition、guest-to-host Broker transport の実境界は確認するが、runtime の jailer / snapshot lifecycleや CapFS の全 effect を実証する test ではない。
 
+### production `Runtime::launch` lifecycle（opt-in）
+
+[`scripts/ci/verify-real-runtime-lifecycle.sh`](../../scripts/ci/verify-real-runtime-lifecycle.sh) は、pinned Firecracker/jailer、pinned kernel、pinned seccomp compiler/filter、実 `veritysetup`、実 cgroup v2 を用意し、[`real_runtime_launches_and_cleans_real_jailer_lifecycle`](../../crates/firecracker-runtime/tests/real_runtime_lifecycle.rs) を `Runtime::launch` 経由で実行する。wrapper は必須であり、環境が使えない場合も test を skip せず、root、KVM、vhost-vsock、cgroup v2、device-mapper、pinned artifact の不足を明示して終了する。guest image はこの host-side gate 専用に static BusyBox から作る最小 squashfs で、guest の CapFS や workload policy の検証を兼ねない。
+
+| 境界 | 実際に確認すること |
+|---|---|
+| launch の経路 | fake adapter や直接 Firecracker API ではなく、production `Runtime::launch` → `RealCommandRunner` / `RealFileSystem` → jailer → Firecracker API を通る |
+| dm-verity | 実 `veritysetup` で mapping を開き、`status` で active かつ read-only の exact mapper を観測する |
+| workspace / drive | clone-specific workspace、ext4 workspace image、read-only root device の bind target が起動中に存在し、shutdown 後に消える |
+| jailer / executable identity | cgroup v2 leaf の task が pinned Firecracker digest の `/proc/<pid>/exe` を実行し、UID/GID が dedicated non-root identity である |
+| host isolation | Firecracker task の PID/mount namespace が host test process と異なり、`Seccomp: 2`、memory/cpu 上限、exact cgroup membership を観測する |
+| API sequence | `/machine-config`、`/boot-source`、rootfs/workspace drive、vsock、`InstanceStart` が `Runtime::launch` の順序で成立し、返却 state は `WorkloadStopped` である |
+| shutdown residue | process、cgroup leaf/parent、mapper、bind target、workspace image/clone、jailer root/instance directory が shutdown 後に残らない |
+
+この gate が示すのは、指定 host 上で resource ownership と jailer lifecycle が実際に成立し、shutdown が exact scope を回収することまでである。VM escape proof、seccomp の各 syscall deny の意味論、snapshot restore、guest CapFS の全 effect は含まない。
+
 ## 実行コマンド
 
 ```bash
@@ -107,18 +123,17 @@ cargo clippy --manifest-path crates/firecracker-runtime/Cargo.toml --all-targets
 
 # root、KVM、vhost-vsock、device-mapper がある Linux host でだけ実行する
 scripts/ci/verify-real-guest-control.sh
+scripts/ci/verify-real-runtime-lifecycle.sh
 ```
 
 ## 未検証の境界
 
 | 未検証の対象 | なぜ未検証か | 何があれば検証できる |
 |---|---|---|
-| 実 jailer の隔離効果 | 特権と cgroup v2 書き込みが必要 | 同上。加えて namespace / cgroup を外から観測する手段 |
+| VM escape を含む実 jailer の完全な隔離効果 | lifecycle gate は PID/mount namespace、UID、cgroup、seccomp installation を観測するが、攻撃者が escape できないことまでは証明しない | syscall deny と host boundary を含む hostile guest test |
 | snapshot / restore の実動作 | VM が無い | 実 VM |
-| `Runtime::launch` の実 lifecycle | opt-in test は REST API を直接使い、jailer / workspace / rollback を通さない | jailer と workspace drive を含む実 launch test |
 | guest CapFS の全 effect | runtime image test は guest supervisor / isolation launcher / Broker channel を通し、別の実KVM試験は v2 identity/start ACK を検証するが、CapFS 全操作は試さない | 各 CapFS operation と revoke を含む実 KVM test |
-| seccomp filter の中身 | 宣言の文字列比較のみ、filter を解析していない | filter を parse するか、実プロセスで syscall を試す test |
-| 実 `veritysetup` / `dmsetup` mapping と jailer 隔離効果 | pinned helper は no-follow・sealed memfd・環境消去で実行するが、local test は実 mapper/jailer を通さない | 実 `Runtime::launch` による mapper、jailer、workspace、rollback の検証 |
+| seccomp filter の deny 意味論 | lifecycle gate は pinned filter がロードされ `Seccomp: 2` になったことを確認するが、各 syscall の deny を試していない | filter を parse するか、実プロセスで各 syscall を試す test |
 
 test double は 4 種。`CommandRunner`、`FileSystem`、`ApiClient`（Firecracker 用と guest control 用）、`IdentitySource`。実 guest-control test は Firecracker API と guest control API の両方を production transport で置き換えるが、`Runtime::launch` が使う他の境界を置き換えるものではない。
 

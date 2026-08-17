@@ -99,8 +99,31 @@ fi
 declare -A github_expected=()
 declare -A gitlab_expected=()
 
-while IFS='|' read -r gate_id title github_job gitlab_job workflow include why_platform; do
+while IFS='|' read -r gate_id title github_job gitlab_job workflow include why_platform status why_planned; do
   [[ -n "${gate_id}" ]] || continue
+
+  case "${status}" in
+    implemented) ;;
+    planned)
+      # A planned gate is a design that nothing runs yet. Requiring it to have no
+      # job anywhere is what keeps the distinction honest: a half-built gate
+      # cannot sit in the manifest looking like a check that guards merges.
+      if [[ "${why_planned}" == 'null' || -z "${why_planned}" ]]; then
+        fail "${gate_id}: a planned gate must say what is missing in why_planned"
+      fi
+      for planned_field in "${github_job}" "${gitlab_job}" "${workflow}" "${include}"; do
+        if [[ "${planned_field}" != 'null' ]]; then
+          fail "${gate_id}: planned gates must declare no platform job, found ${planned_field}"
+          break
+        fi
+      done
+      continue
+      ;;
+    *)
+      fail "${gate_id}: status must be 'implemented' or 'planned', found '${status}'"
+      continue
+      ;;
+  esac
 
   if [[ "${github_job}" == 'null' && "${gitlab_job}" == 'null' ]]; then
     fail "${gate_id}: no platform implements this gate"
@@ -131,7 +154,7 @@ while IFS='|' read -r gate_id title github_job gitlab_job workflow include why_p
     gitlab_expected["${gitlab_job}"]="${include}|${gate_id}"
   fi
 done < <(yq eval \
-  '.gates[] | [.id, .title, (.github // "null"), (.gitlab // "null"), (.workflow // "null"), (.include // "null"), (.why_platform // "null")] | join("|")' \
+  '.gates[] | [.id, .title, (.github // "null"), (.gitlab // "null"), (.workflow // "null"), (.include // "null"), (.why_platform // "null"), (.status // "null"), (.why_planned // "null")] | join("|")' \
   "${manifest}")
 
 for gate_id in "${!github_expected[@]}"; do
@@ -217,15 +240,31 @@ done < <(find .gitlab/ci -type f -name '*.yml' -print0 | sort -z)
 
 # ------------------------------------------------------------- release stages --
 
-while IFS='|' read -r stage_id github_job gitlab_job; do
+# A release stage may be `null` on one platform when that platform reaches the
+# same outcome in fewer calls. It carries the same burden a gate does: say why,
+# and never be null on both.
+while IFS='|' read -r stage_id github_job gitlab_job why_platform; do
   [[ -n "${stage_id}" ]] || continue
-  if [[ "$(yq eval ".jobs | has(\"${github_job}\")" .github/workflows/release.yml)" != 'true' ]]; then
+
+  if [[ "${github_job}" == 'null' && "${gitlab_job}" == 'null' ]]; then
+    fail "release stage ${stage_id}: no platform implements this stage"
+    continue
+  fi
+
+  if [[ "${github_job}" == 'null' || "${gitlab_job}" == 'null' ]] \
+    && [[ "${why_platform}" == 'null' || -z "${why_platform}" ]]; then
+    fail "release stage ${stage_id}: a platform-specific stage must explain itself in why_platform"
+  fi
+
+  if [[ "${github_job}" != 'null' ]] \
+    && [[ "$(yq eval ".jobs | has(\"${github_job}\")" .github/workflows/release.yml)" != 'true' ]]; then
     fail "release stage ${stage_id}: no job '${github_job}' in .github/workflows/release.yml"
   fi
-  if [[ "$(yq eval "has(\"${gitlab_job}\")" .gitlab/ci/release.yml)" != 'true' ]]; then
+  if [[ "${gitlab_job}" != 'null' ]] \
+    && [[ "$(yq eval "has(\"${gitlab_job}\")" .gitlab/ci/release.yml)" != 'true' ]]; then
     fail "release stage ${stage_id}: no job '${gitlab_job}' in .gitlab/ci/release.yml"
   fi
-done < <(yq eval '.release_stages[] | [.id, .github, .gitlab] | join("|")' "${manifest}")
+done < <(yq eval '.release_stages[] | [.id, (.github // "null"), (.gitlab // "null"), (.why_platform // "null")] | join("|")' "${manifest}")
 
 # --------------------------------------------------------- structural policy --
 
@@ -245,14 +284,20 @@ while IFS= read -r -d '' workflow_file; do
 
   # A checkout that keeps the token in .git/config leaves it readable by every
   # later step, including anything a dependency's build script decides to run.
-  while IFS= read -r persist_value; do
-    [[ -n "${persist_value}" ]] || continue
-    if [[ "${persist_value}" != 'false' ]]; then
-      fail "${workflow_file}: actions/checkout must set persist-credentials: false"
-    fi
-  done < <(yq eval \
-    '[.jobs[].steps[]? | select(.uses // "" | test("^actions/checkout@")) | (.with.persist-credentials // "missing")] | .[]' \
-    "${workflow_file}")
+  #
+  # Counting rather than reading each value is deliberate. yq's `//` returns the
+  # right-hand side when the left is null *or false*, so the obvious
+  # `.with.persist-credentials // "missing"` reports a correctly hardened
+  # checkout as unset and can never distinguish it from a missing one.
+  checkout_steps="$(yq eval \
+    '[.jobs[].steps[]? | select(.uses // "" | test("^actions/checkout@"))] | length' \
+    "${workflow_file}")"
+  hardened_checkout_steps="$(yq eval \
+    '[.jobs[].steps[]? | select(.uses // "" | test("^actions/checkout@")) | select(.with["persist-credentials"] == false)] | length' \
+    "${workflow_file}")"
+  if [[ "${checkout_steps}" != "${hardened_checkout_steps}" ]]; then
+    fail "${workflow_file}: $((checkout_steps - hardened_checkout_steps)) of ${checkout_steps} actions/checkout steps do not set persist-credentials: false"
+  fi
 done < <(find .github/workflows -type f -name '*.yml' -print0 | sort -z)
 
 # The include graph must actually pull in every file that defines a job.
@@ -268,5 +313,7 @@ if [[ "${failures}" -gt 0 ]]; then
   exit 1
 fi
 
-printf 'pipeline parity: %d gate(s) implemented consistently on both platforms\n' \
-  "${#gate_ids[@]}"
+implemented_count="$(yq eval '[.gates[] | select(.status == "implemented")] | length' "${manifest}")"
+planned_count="$(yq eval '[.gates[] | select(.status == "planned")] | length' "${manifest}")"
+printf 'pipeline parity: %d gate(s) implemented consistently on both platforms, %d planned and running nowhere\n' \
+  "${implemented_count}" "${planned_count}"

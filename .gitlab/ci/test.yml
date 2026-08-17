@@ -31,7 +31,7 @@ loom:
   script:
     - scripts/ci/run.sh loom
 
-lean:
+lean_proofs:
   extends:
     - .rust_job
     - .lean_cache
@@ -40,6 +40,15 @@ lean:
   script:
     - scripts/ci/install-lean.sh
     - scripts/ci/run.sh lean
+
+differential_corpus:
+  extends:
+    - .rust_job
+    - .lean_cache
+  stage: test
+  timeout: 30m
+  script:
+    - scripts/ci/install-lean.sh
     - scripts/ci/run.sh differential
 
 coverage:

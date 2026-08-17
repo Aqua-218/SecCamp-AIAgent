@@ -35,6 +35,7 @@
 | peer CID が一致しない stream を、guest を読まずに落とす | `serve_expected_peer` の CID 検査 test |
 | 1 connection が host の request 上限で止まる | `connection_stops_at_the_host_request_bound` |
 | Firecracker guest が host Broker に 1 request を送り canonical authorization rejection を受ける | opt-in `real_firecracker_guest_reaches_host_broker_over_vsock` |
+| production SessionOwnerのguest Supervisor/CapFS/隔離後requestがdurable WALにFinal rejectionとして残る | `scripts/ci/verify-real-session-owner.sh` |
 | deadline-aware server | timeout 到達前に dispatch を呼ばず connection を閉じる | `deadline_error_closes_connection_before_dispatch` |
 
 ## privileged network namespace で確認したこと
@@ -82,7 +83,7 @@ scripts/ci/verify-live-github.sh
 - DNSSEC、複数 CNAME の chain、外部 Internet 上の HTTPS。privileged namespace test は制御 DNS の TTL 0/CNAME/answer 切替、OS resolver、certificate/SNI、redirect 後の再解決、検査済み address への接続までを実 kernel socket で確認する。
 - OS resolver (`getaddrinfo` / `ToSocketAddrs`) の内部処理や強制キャンセル。timeout 後の lookup は固定 worker 内で完了を待つため、`OverallTimeout` はキャンセルの証明ではない。
 - protected disposable scope での実 GitHub API、`EGRESS_GITHUB_TOKEN`、provider 側の ref race。ignored live smoke と gate は存在するが、この checkout では credential を使った実行 evidence が無い
-- guest supervisor が発行した capability から Broker までの end-to-end 統合
+- guest supervisorが発行したfile capabilityから全CapFS effectを経てBrokerのcanonical rejectionへ至るend-to-end統合はKVM gateで確認済み。guestから外部providerへ到達するauthorized mutationは、上記live credential gateがblockedのため未実行
 
 これらを実施していない段階で、Host Egress Broker 全体や full isolation が完成したとは扱わない。
 

@@ -2494,7 +2494,7 @@ mod tests {
             BrokerWireOutcome, BrokerWireRejection, CanonicalBrokerResponse,
             MAX_PUBLIC_WIRE_BODY_BYTES, PublicWireResponse,
         },
-        session::{BrokerEnvelope, BrokerRequestId, BrokerSessionId, PayloadHash},
+        session::{BrokerEnvelope, BrokerRequestId, BrokerSessionId},
     };
 
     use super::{
@@ -2541,11 +2541,11 @@ mod tests {
     }
 
     fn envelope(sequence: u64, value: u8) -> BrokerEnvelope {
-        BrokerEnvelope::new(
+        BrokerEnvelope::from_canonical_payload(
             config().session(),
             sequence,
             BrokerRequestId::new([value; 16]),
-            PayloadHash::of_canonical_payload(&[value]),
+            &[value],
         )
     }
 

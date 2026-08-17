@@ -8,7 +8,7 @@
 
 microVM を毎回 boot から起動すると数百 ms かかる。boot 済みの状態を snapshot しておき、session ごとに restore すれば、その時間を消せる。ただし restore は memory image をそのまま複製するので、素朴にやると全 session が同じ秘密を持つことになる。
 
-[`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) の 8 状態の lifecycle は、この問題を解くためにある。
+[`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) の lifecycle state machine は、この問題を解くためにある。snapshot pause の成功・不明状態も identity gate と同じ state machine に明示される。
 
 ## 何を防ぎたいのか
 
@@ -34,7 +34,10 @@ identity が衝突すると、audit record がどの session のものか判別�
 stateDiagram-v2
     [*] --> New
     New --> WorkloadStopped: launch()<br/>boot して gate で停止
-    WorkloadStopped --> Snapshotted: create_snapshot()
+    WorkloadStopped --> SnapshotPaused: pause acknowledgement
+    WorkloadStopped --> SnapshotPauseUnknown: pause response lost/error
+    SnapshotPaused --> Snapshotted: snapshot files written
+    SnapshotPaused --> Stopped: shutdown after snapshot failure
     Snapshotted --> RestoredStopped: restore の途中
     RestoredStopped --> IdentityRegenerated: 128-bit × 5 を再生成
     IdentityRegenerated --> IdentityInjected: guest へ注入
@@ -59,6 +62,12 @@ if instance.state != RuntimeState::WorkloadStopped {
 `create_snapshot` は `WorkloadStopped` 以外を拒否する。つまり workload が一度でも走った VM からは snapshot を取れない。
 
 理由は単純で、走った後の memory には session 固有のデータが混ざるから。identity だけなら再生成できるが、workload が読み込んだ file の内容や、確立済みの Broker session の状態までは追跡できない。「pre-session gate で止まっている VM だけが snapshot 元になれる」という制約にしておけば、snapshot に何が入っているかを考えなくて済む。
+
+## snapshot は pause acknowledgement 後だけ保存する
+
+`create_snapshot` は `WorkloadStopped` だけを受け付け、先に Firecracker の `PATCH /vm` (`{"state":"Paused"}`) の成功応答を受けて `SnapshotPaused` へ遷移する。その後で `PUT /snapshot/create` と snapshot/memory の digest を保存する。pause の応答が失われた場合は VM が pause 済みか分からないため `SnapshotPauseUnknown` にして、別の snapshot や workload 操作を許さず shutdown へ進む。snapshot の書き込み・hash が失敗しても paused state を通常の pre-session VM として再利用しない。
+
+restore は `/snapshot/load` に `resume_vm:false` を明示し、workspace/vsock の bind と実行確認を終えてから resume/identity acknowledgement の順へ進む。これにより、復元直後に workload gate が先に開く経路を作らない。local test では [`snapshot_pauses_vm_before_writing_snapshot_files`](../../crates/firecracker-runtime/tests/runtime.rs)、[`snapshot_create_failure_keeps_instance_explicitly_paused`](../../crates/firecracker-runtime/tests/runtime.rs)、[`snapshot_pause_failure_enters_unknown_state_and_does_not_create_snapshot`](../../crates/firecracker-runtime/tests/runtime.rs) がこれを固定する。
 
 ## fingerprint が違う snapshot は restore しない
 
@@ -98,7 +107,7 @@ restore が identity 検査で失敗した場合、`rollback` が jailer プロ�
 
 ## 何が助かるのか
 
-state が 8 個の enum になっているので、「この VM で workload を走らせてよいか」が 1 つの比較で判断できる。identity を注入したかどうかを別途追跡しなくてよい。
+state machine が pause/unknown と identity gate を明示するので、「この VM で workload を走らせてよいか」が 1 つの比較で判断できる。identity を注入したかどうかを別途追跡しなくてよい。
 
 snapshot 元を `WorkloadStopped` に限っているため、snapshot に何が含まれるかを都度検討する必要がない。含まれるのは常に「boot 直後、workload 実行前」の状態。
 
@@ -108,9 +117,9 @@ restore の失敗が resource を残さないので、retry が安全に書け�
 
 state 遷移と identity 検査は fake adapter を使う test で確認している。
 
-- [`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は実 VM で pre-session gate を提供し、[`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) は注入前の `start-workload` を拒否し、identity 注入後だけ固定 workload を release することを確認する。ただしこれは CapabilityKernel / capfs / runtime-isolation を起動する guest supervisor ではない。
-- 実機 test は raw boot の control channel を通す。`Runtime::restore` と snapshot の identity injection を同じ guest image で通したものではない。
-- 実 Firecracker の `/snapshot/load` が `resume_vm: true` でどう振る舞うかは未検証。
+- [`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は実 VM で pre-session gate を提供する。[`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) は注入前の start を拒否し、v2 policy digest 付き identity 注入後だけ固定 workload を release する。一方、opt-in guest runtime image は guest-supervisor-init、workload-isolation-launcher、Broker channel を通すため、PID 1 だけの test ではない。ただし CapFS の全 effect と `Runtime::launch` lifecycle は同時に証明しない。
+- 実機 test は raw boot の control channel と固定 guest runtime image を通すが、`Runtime::restore` と snapshot の identity injection を同じ production launch 経路で通したものではない。
+- 実 Firecracker で pause → snapshot create → `/snapshot/load` (`resume_vm:false`) → workspace/vsock bind → resume の一連動作は未検証。
 - `forbidden_identities` の一覧が「snapshot に焼き込まれた全 identity」を漏れなく含んでいることは、この crate では保証できない。一覧を作るのは snapshot を取る側。
 - entropy source の品質は `IdentitySource` の実装依存。`SystemIdentitySource` は host kernel の entropy device を使うが、その品質はここでは検証していない。
 - 同じ snapshot から restore した 2 台の VM が、identity 以外で区別できることは主張していない。memory の内容は同じ。

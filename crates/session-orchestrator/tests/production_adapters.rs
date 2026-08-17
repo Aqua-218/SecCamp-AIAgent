@@ -83,6 +83,7 @@ impl FileSystem for TestFileSystem {
             PathBuf::from("/test/firecracker"),
             PathBuf::from("/test/rootfs"),
             PathBuf::from("/test/verity"),
+            PathBuf::from("/usr/sbin/veritysetup"),
             PathBuf::from("/test/mke2fs"),
             PathBuf::from("/test/jailer"),
             jail_root.join("artifacts/kernel"),
@@ -266,6 +267,14 @@ impl CommandRunner for TestRunner {
         Ok(ProcessHandle { pid: self.next_pid })
     }
 
+    fn verify_verity(
+        &mut self,
+        _veritysetup: &PinnedArtifact,
+        _expected: &DmVerityConfig,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
     fn start_owned(
         &mut self,
         command: &CommandSpec,
@@ -370,12 +379,18 @@ impl ApiClient for TestApi {
         {
             return Err(RuntimeError::Api("test restore API failure".to_owned()));
         }
-        if request.path == "/actions/inject-identity" {
+        if matches!(
+            request.path.as_str(),
+            "/actions/inject-identity" | "/actions/inject-identity-v2"
+        ) {
             record_event(&self.lifecycle, "workload-release");
         }
-        let body = match request.path.as_str() {
-            "/actions/inject-identity" => Some("identity-injected"),
-            "/actions/start-workload" => Some("workload-started"),
+        let is_bound = request.body.starts_with("{\"version\":");
+        let body = match (request.path.as_str(), is_bound) {
+            ("/actions/inject-identity", false) => Some("identity-injected"),
+            ("/actions/inject-identity-v2", true) => Some("identity-injected-v2"),
+            ("/actions/start-workload", false) => Some("workload-started"),
+            ("/actions/start-workload-v2", true) => Some("workload-started-v2"),
             _ => None,
         }
         .map_or_else(String::new, |acknowledgement| {
@@ -860,11 +875,11 @@ fn assert_successful_restore_observations(
         .expect("explicit resume request must be present");
     let inject = requests
         .iter()
-        .position(|request| request.path == "/actions/inject-identity")
+        .position(|request| request.path == "/actions/inject-identity-v2")
         .expect("identity injection request must be present");
     let start = requests
         .iter()
-        .position(|request| request.path == "/actions/start-workload")
+        .position(|request| request.path == "/actions/start-workload-v2")
         .expect("workload start request must be present");
     assert!(resume < inject && inject < start);
 }
@@ -955,6 +970,7 @@ fn runtime_config() -> RuntimeConfig {
         ),
         rootfs: rootfs.clone(),
         verity_hash: artifact("/test/verity"),
+        veritysetup: artifact("/usr/sbin/veritysetup"),
         dm_verity: DmVerityConfig {
             data_device: rootfs.path.clone(),
             hash_device: PathBuf::from("/test/verity"),
@@ -1023,7 +1039,9 @@ fn runtime_config() -> RuntimeConfig {
         network_devices: Vec::new(),
         vcpu_count: 1,
         memory_mib: 128,
-        boot_args: "console=ttyS0".to_owned(),
+        boot_args:
+            "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init"
+                .to_owned(),
     }
 }
 

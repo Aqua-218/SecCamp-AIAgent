@@ -22,6 +22,14 @@ use capfs::namespace::{
     NamespaceOperationError, NamespaceRegistry,
 };
 
+/// How long a wait that is expected to succeed may take.
+///
+/// A healthy run returns as soon as the released writer reports, so a wide bound costs a passing
+/// test nothing. A narrow one only adds a way for a loaded machine to fail a correct
+/// implementation. The paired negative waits stay short on purpose: they assert that nothing
+/// arrives, and a slow machine can only make that more true.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BackingFailure;
 
@@ -419,7 +427,7 @@ fn child_lookup_holds_read_lock_against_concurrent_rename() {
     );
     assert_eq!(
         writer_done_receiver
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(COMPLETION_TIMEOUT)
             .expect("rename should finish after lookup releases"),
         Ok(())
     );
@@ -595,7 +603,7 @@ fn directory_listing_holds_read_lock_against_concurrent_rename() {
     );
     assert_eq!(
         writer_done_receiver
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(COMPLETION_TIMEOUT)
             .expect("rename should finish after listing releases"),
         Ok(())
     );
@@ -882,7 +890,7 @@ fn object_operation_holds_read_lock_against_concurrent_rename() {
     );
     assert_eq!(
         writer_done_receiver
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(COMPLETION_TIMEOUT)
             .expect("writer should finish after the reader releases"),
         Ok(())
     );

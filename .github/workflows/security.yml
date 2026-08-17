@@ -156,7 +156,7 @@ jobs:
           docker run --rm \
             --volume "${PWD}:/src" \
             --workdir /src \
-            docker.io/semgrep/semgrep:1.172.0@sha256:65dcd4408adda7c183a6b4550cb1e9b19f7f627a6fbb7e0559bd466bedc44d7b \
+            docker.io/semgrep/semgrep:1.172.0@sha256:a8298d1c09c84b9a0bbc75ec915e37023fc4657360b6dbfa645261d2353a366c \
             semgrep scan --config .semgrep.yml --error --metrics off \
             --exclude target --exclude lean/.lake \
             --json-output reports/semgrep.json crates

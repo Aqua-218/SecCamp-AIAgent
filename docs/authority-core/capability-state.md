@@ -133,6 +133,8 @@ Capability が存在する
 
 child 自身を `revoked` に複製して入れる必要はない。`is_effectively_active` と `authorizes` が親 link を root まで辿るため、祖先を1件 revoke すると全子孫が即座に inactive になる。Capability record と held relation は監査可能な履歴として残る。
 
+並行境界の `CapabilityKernel` に登録した `RevocationObserver` は、state lock を解放して revoke を確定した後、revoking call が return する前に通知される。すべての observer を順に呼び、最初の discard failure を caller に返すが、observer failure は既に確定した revoke を元に戻さない。したがって caller は `RevocationNotPropagated` を受けたら外部 cache を侵害状態として扱い、同じ capability の認可を retry してはならない。observer が failure を返しても kernel の後続 authorization は revoked state により deny される。
+
 subject shutdown と open handle の transition は[Subject lifecycle と open handle](subject-lifecycle-and-handles.md)、commit 時の attempt/effect record は[Attempt / effect audit](audit-records.md)で詳しく説明する。
 
 ## どんな数学が効いているのか
@@ -158,9 +160,9 @@ leaf ≤ root
 
 ## どう検証しているか
 
-[`crates/authority-core/tests/capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) は、11個の契約 test で各成功・拒否 transition と error、失敗時の atomicity、祖先 revoke、Capability/handle ID 非再利用、subject shutdown を確認する。`state.rs` 内には `u64::MAX` の最後の Capability ID と、authorization epoch の wraparound 拒否を確認する2 test がある。
+[`crates/authority-core/tests/capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) は、契約 test 群で各成功・拒否 transition と error、失敗時の atomicity、祖先 revoke、Capability/handle ID 非再利用、subject shutdown を確認する。`state.rs` 内には `u64::MAX` の最後の Capability ID と、authorization epoch の wraparound 拒否を確認する境界 test がある。
 
-[`crates/authority-core/tests/capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) は、1〜63操作の Derive/revoke 列を1,000 case 生成する。Rust state と独立した小さな参照モデルで各 transition の成否を比較し、毎回すべての発行済み Capability について次を再確認する。
+[`crates/authority-core/tests/capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) は、bounded な Derive/revoke 列を property test の設定した生成 budget で探索する。Rust state と独立した小さな参照モデルで各 transition の成否を比較し、毎回すべての発行済み Capability について次を再確認する。
 
 - metadata の subject・parent・`delegable` がモデルと一致する。
 - holder だけが ID を使用できる。

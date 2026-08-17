@@ -11,6 +11,7 @@
 pub mod guest_control;
 pub mod recovery;
 
+use authority_core::policy::AuthorityPolicyDigest;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::OsStr;
@@ -50,12 +51,22 @@ const HTTP_HEADER_LIMIT: usize = 64 * 1024;
 pub const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 /// Maximum number of bytes retained from either command output stream.
 pub const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+/// Maximum bytes read into memory from any pinned executable or boot artifact.
+pub const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_BOOT_ARGS_BYTES: usize = 4 * 1024;
+/// Guest PID 1 required by the identity gate.
+pub const REQUIRED_GUEST_INIT: &str = "/usr/local/libexec/guest-control-init";
 /// Maximum number of source filesystem entries copied into one workspace.
 pub const MAX_WORKSPACE_ENTRIES: usize = 100_000;
 /// Maximum source directory depth accepted during workspace cloning.
 pub const MAX_WORKSPACE_DEPTH: usize = 64;
 /// Maximum aggregate regular-file bytes copied into one workspace.
 pub const MAX_WORKSPACE_BYTES: u64 = 1 << 30;
+/// Maximum number of concurrently retained direct or owned child processes.
+///
+/// Pending and isolated ownership records consume the same admission budget
+/// until a successful [`CommandRunner::stop`] releases their table entry.
+pub const MAX_MANAGED_CHILDREN: usize = 256;
 /// Smallest raw ext4 image accepted for a cloned guest workspace.
 pub const MIN_WORKSPACE_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 /// Largest sparse raw ext4 image a session may provision.
@@ -343,6 +354,8 @@ pub struct RuntimeConfig {
     pub rootfs: PinnedArtifact,
     /// Pinned dm-verity hash image.
     pub verity_hash: PinnedArtifact,
+    /// Pinned `veritysetup` executable used for mapping open and close.
+    pub veritysetup: PinnedArtifact,
     /// Required dm-verity mapping.
     pub dm_verity: DmVerityConfig,
     /// Clone-specific workspace policy.
@@ -382,9 +395,11 @@ impl RuntimeConfig {
         validate_artifact("kernel", &self.kernel)?;
         validate_artifact("rootfs", &self.rootfs)?;
         validate_artifact("dm-verity hash image", &self.verity_hash)?;
+        validate_artifact("veritysetup", &self.veritysetup)?;
         validate_artifact("workspace image formatter", &self.workspace.image.formatter)?;
         validate_artifact("jailer", &self.jailer)?;
         validate_artifact("seccomp filter", &self.isolation.seccomp.filter)?;
+        validate_boot_args(&self.boot_args)?;
         validate_absolute_path("API socket", &self.api_socket)?;
         validate_absolute_path("jailer chroot base", &self.jailer_config.chroot_base_dir)?;
         validate_absolute_path("workspace source", &self.workspace.source)?;
@@ -588,6 +603,7 @@ impl RuntimeConfig {
         fingerprint_jail_artifact(&mut bytes, "kernel", self, &self.kernel);
         fingerprint_artifact(&mut bytes, "rootfs", &self.rootfs);
         fingerprint_artifact(&mut bytes, "verity_hash", &self.verity_hash);
+        fingerprint_artifact(&mut bytes, "veritysetup", &self.veritysetup);
         fingerprint_path(
             &mut bytes,
             "dm_verity.data_device",
@@ -827,6 +843,51 @@ fn validate_artifact(label: &str, artifact: &PinnedArtifact) -> Result<(), Runti
     Ok(())
 }
 
+fn validate_boot_args(boot_args: &str) -> Result<(), RuntimeError> {
+    if boot_args.is_empty()
+        || boot_args.len() > MAX_BOOT_ARGS_BYTES
+        || !boot_args.is_ascii()
+        || boot_args.contains('\0')
+    {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "boot args must be non-empty ASCII within {MAX_BOOT_ARGS_BYTES} bytes"
+        )));
+    }
+    let mut init_count = 0_usize;
+    let mut has_pci_off = false;
+    let mut has_reboot_k = false;
+    let mut has_panic_one = false;
+    for token in boot_args.split_ascii_whitespace() {
+        if let Some(init) = token.strip_prefix("init=") {
+            init_count += 1;
+            if init != REQUIRED_GUEST_INIT {
+                return Err(RuntimeError::InvalidConfig(format!(
+                    "guest init must be exactly {REQUIRED_GUEST_INIT}"
+                )));
+            }
+        }
+        if token.starts_with("rdinit=") {
+            return Err(RuntimeError::InvalidConfig(
+                "rdinit may not bypass the guest identity gate".to_owned(),
+            ));
+        }
+        has_pci_off |= token == "pci=off";
+        has_reboot_k |= token == "reboot=k";
+        has_panic_one |= token == "panic=1";
+    }
+    if init_count != 1 {
+        return Err(RuntimeError::InvalidConfig(
+            "boot args must contain exactly one guest-control init".to_owned(),
+        ));
+    }
+    if !(has_pci_off && has_reboot_k && has_panic_one) {
+        return Err(RuntimeError::InvalidConfig(
+            "boot args must require pci=off, reboot=k, and panic=1".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_absolute_path(label: &str, path: &Path) -> Result<(), RuntimeError> {
     if !path.is_absolute() {
         return Err(RuntimeError::InvalidConfig(format!(
@@ -897,6 +958,12 @@ pub struct CommandSpec {
     pub program: PathBuf,
     /// Positional arguments.
     pub args: Vec<String>,
+    /// Digest required from the exact executable bytes used by the production runner.
+    ///
+    /// When present, the production runner copies the opened, no-follow source into a sealed
+    /// executable memfd and executes that descriptor. The source path therefore cannot be swapped
+    /// between verification and `execve`.
+    pub expected_digest: Option<Sha256Digest>,
 }
 
 impl CommandSpec {
@@ -904,6 +971,15 @@ impl CommandSpec {
         Self {
             program: program.into(),
             args: args.into_iter().collect(),
+            expected_digest: None,
+        }
+    }
+
+    fn pinned(artifact: &PinnedArtifact, args: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            program: artifact.path.clone(),
+            args: args.into_iter().collect(),
+            expected_digest: Some(artifact.digest),
         }
     }
 }
@@ -951,6 +1027,25 @@ pub trait CommandRunner {
     ///
     /// Returns an adapter error when the process cannot be started.
     fn start(&mut self, command: &CommandSpec) -> Result<ProcessHandle, RuntimeError>;
+    /// Verifies that the live dm-verity mapper is bound to the requested immutable inputs.
+    ///
+    /// Production implementations must query the kernel-backed mapper through a pinned helper and
+    /// reject a foreign mapper name, data device, hash device, root hash, algorithm, block sizes,
+    /// mode, or verification status. The default is deliberately fail-closed so a new adapter
+    /// cannot silently omit this post-open check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the live mapper does not match `expected` exactly.
+    fn verify_verity(
+        &mut self,
+        _veritysetup: &PinnedArtifact,
+        _expected: &DmVerityConfig,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Command(
+            "command runner does not implement live dm-verity verification".to_owned(),
+        ))
+    }
     /// Starts a jailer and binds the resulting Firecracker task to an observable ownership scope.
     ///
     /// A returned handle retains cleanup ownership even when startup has not produced a live
@@ -1620,6 +1715,16 @@ impl RealCommandRunner {
         self.children.insert(pid, managed);
         ProcessHandle { pid }
     }
+
+    fn ensure_child_capacity(&self) -> Result<(), RuntimeError> {
+        if self.children.len() >= MAX_MANAGED_CHILDREN {
+            Err(RuntimeError::Command(format!(
+                "managed child limit of {MAX_MANAGED_CHILDREN} was reached"
+            )))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Default for RealCommandRunner {
@@ -1856,12 +1961,10 @@ fn monitor_command(
             return Err("execution deadline exceeded".to_owned());
         }
         match child.try_wait() {
-            Ok(Some(status)) => {
-                signal_process_group(pid).unwrap_or_else(|error| {
-                    abort_cleanup("stopping descendants of a completed command", &error)
-                });
-                return Ok(status);
-            }
+            // `try_wait` reaps the child.  Its PID/PGID can be reused immediately after this
+            // branch, so signalling the old process group here could kill an unrelated group.
+            // Descendants are stopped only while the unreaped leader still pins the identifier.
+            Ok(Some(status)) => return Ok(status),
             Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
             Err(error) => {
                 stop_process_group_until(child, pid, Instant::now() + PROCESS_STOP_TIMEOUT)
@@ -1920,10 +2023,33 @@ fn command_output_error(readers: &[BoundedReadResult; 2]) -> Option<String> {
     None
 }
 
+fn seal_command_executable(
+    command: &CommandSpec,
+) -> Result<Option<recovery::SealedExecutable>, RuntimeError> {
+    command
+        .expected_digest
+        .map(|digest| {
+            recovery::SealedExecutable::load(
+                "pinned command executable",
+                &PinnedArtifact::new(&command.program, digest),
+            )
+        })
+        .transpose()
+}
+
 fn spawn_detached(command: &CommandSpec) -> Result<Child, RuntimeError> {
-    let mut process = Command::new(&command.program);
+    let sealed = seal_command_executable(command)?;
+    let program = sealed.as_ref().map_or(
+        command.program.as_path(),
+        recovery::SealedExecutable::program,
+    );
+    let mut process = Command::new(program);
     process
         .args(&command.args)
+        // Host credentials belong to the Broker process. Firecracker, jailer,
+        // filesystem formatters, and device-mapper helpers receive no ambient
+        // environment from the daemon.
+        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -2038,7 +2164,9 @@ fn reap_launcher_until(
     deadline: Instant,
 ) -> Result<(), RuntimeError> {
     match launcher.try_wait() {
-        Ok(Some(_)) => signal_process_group(pid),
+        // Once `try_wait` has reaped the launcher, `pid` may already identify an unrelated
+        // process group.  Never signal by the stale numeric identifier in this branch.
+        Ok(Some(_)) => Ok(()),
         Ok(None) => stop_process_group_until(launcher, pid, deadline).map(|_| ()),
         Err(error) => Err(RuntimeError::Command(format!(
             "checking launcher {pid} failed: {error}"
@@ -2160,9 +2288,17 @@ fn stop_managed_child(
 impl CommandRunner for RealCommandRunner {
     fn run(&mut self, command: &CommandSpec) -> Result<CommandOutput, RuntimeError> {
         let deadline = Instant::now() + self.command_timeout;
-        let mut process = Command::new(&command.program);
+        let sealed = seal_command_executable(command)?;
+        let program = sealed.as_ref().map_or(
+            command.program.as_path(),
+            recovery::SealedExecutable::program,
+        );
+        let mut process = Command::new(program);
         process
             .args(&command.args)
+            // In particular, never inherit EGRESS_GITHUB_TOKEN or proxy
+            // configuration into privileged host-side helper processes.
+            .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2254,10 +2390,23 @@ impl CommandRunner for RealCommandRunner {
     }
 
     fn start(&mut self, command: &CommandSpec) -> Result<ProcessHandle, RuntimeError> {
+        self.ensure_child_capacity()?;
         let child = spawn_detached(command)?;
         let pid = child.id();
         self.children.insert(pid, ManagedChild::Direct(child));
         Ok(ProcessHandle { pid })
+    }
+
+    fn verify_verity(
+        &mut self,
+        veritysetup: &PinnedArtifact,
+        expected: &DmVerityConfig,
+    ) -> Result<(), RuntimeError> {
+        let output = self.run(&CommandSpec::pinned(
+            veritysetup,
+            ["status".to_owned(), expected.mapper_name.clone()],
+        ))?;
+        recovery::validate_live_verity_status(&output.stdout, expected)
     }
 
     #[allow(clippy::too_many_lines)] // Ownership setup and launch observation are one atomic gate.
@@ -2266,6 +2415,7 @@ impl CommandRunner for RealCommandRunner {
         command: &CommandSpec,
         ownership: &ProcessOwnership,
     ) -> Result<ProcessHandle, RuntimeError> {
+        self.ensure_child_capacity()?;
         validate_absolute_path("owned cgroup", &ownership.cgroup_path)?;
         validate_absolute_path(
             "owned Firecracker executable",
@@ -3340,7 +3490,40 @@ impl RealFileSystem {
 
 impl FileSystem for RealFileSystem {
     fn read(&mut self, path: &Path) -> Result<Vec<u8>, RuntimeError> {
-        fs::read(path).map_err(RuntimeError::from)
+        let descriptor = open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| RuntimeError::Io(error.to_string()))?;
+        let file = File::from(descriptor);
+        let metadata = file.metadata().map_err(RuntimeError::from)?;
+        if !metadata.is_file() {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "pinned artifact is not a regular file: {}",
+                path.display()
+            )));
+        }
+        if metadata.len() > MAX_ARTIFACT_BYTES {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "pinned artifact exceeds {MAX_ARTIFACT_BYTES}-byte safety limit: {}",
+                path.display()
+            )));
+        }
+        let capacity = usize::try_from(metadata.len()).map_err(|_| {
+            RuntimeError::InvalidConfig("pinned artifact length does not fit host size".to_owned())
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.take(MAX_ARTIFACT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(RuntimeError::from)?;
+        if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "pinned artifact grew beyond {MAX_ARTIFACT_BYTES}-byte safety limit: {}",
+                path.display()
+            )));
+        }
+        Ok(bytes)
     }
 
     fn digest(&mut self, path: &Path) -> Result<Sha256Digest, RuntimeError> {
@@ -3985,6 +4168,19 @@ pub enum RuntimeState {
     New,
     /// VM is booted at the pre-session gate and workload is stopped.
     WorkloadStopped,
+    /// The VM was paused successfully and the snapshot files are being written.
+    ///
+    /// This state is deliberately distinct from [`Self::WorkloadStopped`]: the latter means
+    /// that the guest workload gate is closed while the VM is running, whereas this state means
+    /// that Firecracker acknowledged the pause request.  A failed snapshot write leaves the
+    /// instance here so callers cannot accidentally treat it as an unpaused pre-session VM.
+    SnapshotPaused,
+    /// A snapshot pause request failed after it was sent and the VM state is therefore unknown.
+    ///
+    /// The runtime fails closed from this state: another snapshot or workload operation is not
+    /// permitted.  [`Runtime::shutdown`] remains available so the process can be terminated
+    /// without relying on the VM's unknown state.
+    SnapshotPauseUnknown,
     /// A pre-session snapshot has been created.
     Snapshotted,
     /// Snapshot is restored and the workload remains stopped.
@@ -4017,6 +4213,7 @@ pub struct RuntimeInstance {
     config_fingerprint: Sha256Digest,
     identities: Option<IdentityBundle>,
     guest_control_challenge: Option<IdentityId>,
+    guest_policy_digest: Option<AuthorityPolicyDigest>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4049,6 +4246,12 @@ impl RuntimeInstance {
     pub const fn identities(&self) -> Option<&IdentityBundle> {
         self.identities.as_ref()
     }
+
+    /// Returns the authority policy digest bound to guest-control v2, if any.
+    #[must_use]
+    pub const fn policy_digest(&self) -> Option<AuthorityPolicyDigest> {
+        self.guest_policy_digest
+    }
 }
 
 /// Runtime coordinator parametrized over all side-effecting boundaries.
@@ -4077,6 +4280,7 @@ struct PendingCleanup {
     verity_opened: bool,
     workspace: Option<PathBuf>,
     mapper_name: String,
+    veritysetup: PinnedArtifact,
 }
 
 #[derive(Clone, Copy)]
@@ -4087,6 +4291,7 @@ struct RollbackResources<'a> {
     workspace_cloned: bool,
     workspace: &'a Path,
     mapper_name: &'a str,
+    veritysetup: &'a PinnedArtifact,
     jailed_device: &'a Path,
 }
 
@@ -4207,6 +4412,7 @@ where
                 workspace: &workspace,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
+                veritysetup: &config.veritysetup,
             });
             return Err(with_cleanup(error, &cleanup));
         }
@@ -4219,6 +4425,7 @@ where
                 workspace: &workspace,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
+                veritysetup: &config.veritysetup,
             });
             return Err(with_cleanup(error, &cleanup));
         }
@@ -4228,8 +4435,9 @@ where
         let mut process = None;
 
         let result = (|| {
-            self.open_verity(config)?;
+            self.open_verity_mapping(config)?;
             verity_opened = true;
+            self.verify_open_verity(config)?;
             self.bind_verity_device(config)?;
             block_device_bound = true;
             self.verify_verity_binding(config)?;
@@ -4257,6 +4465,7 @@ where
                 config_fingerprint: config.instance_fingerprint(),
                 identities: None,
                 guest_control_challenge: None,
+                guest_policy_digest: None,
             })
         })();
         match result {
@@ -4270,13 +4479,20 @@ where
                     workspace: &workspace,
                     mapper_name: &config.dm_verity.mapper_name,
                     jailed_device: &config.dm_verity.jailed_device_path,
+                    veritysetup: &config.veritysetup,
                 });
                 Err(with_cleanup(error, &cleanup))
             }
         }
     }
 
-    /// Creates a snapshot only from a pre-session instance whose workload is stopped.
+    /// Pauses and creates a snapshot only from a pre-session instance whose workload is stopped.
+    ///
+    /// Firecracker keeps the VM paused after a successful snapshot.  If snapshot creation or
+    /// provenance hashing fails, the instance remains [`RuntimeState::SnapshotPaused`] so callers
+    /// must shut it down rather than accidentally reusing a partially captured VM.  If the pause
+    /// request itself fails, the state is [`RuntimeState::SnapshotPauseUnknown`] because a lost
+    /// response may have raced with Firecracker applying the transition.
     ///
     /// # Errors
     ///
@@ -4303,6 +4519,18 @@ where
             jail_relative_path(&instance.jail_root, "snapshot path", &snapshot_path)?;
         let memory_jail_path =
             jail_relative_path(&instance.jail_root, "snapshot memory path", &memory_path)?;
+        if let Err(error) = self.api_call(ApiRequest {
+            method: HttpMethod::Patch,
+            path: "/vm".to_owned(),
+            body: r#"{"state":"Paused"}"#.to_owned(),
+        }) {
+            // A transport failure is ambiguous: Firecracker may have applied the pause before
+            // the response was lost.  Keep an explicit unknown state instead of reporting the
+            // instance as the ordinary (running-VM, workload-gated) pre-session state.
+            instance.state = RuntimeState::SnapshotPauseUnknown;
+            return Err(error);
+        }
+        instance.state = RuntimeState::SnapshotPaused;
         self.api_call(ApiRequest {
             method: HttpMethod::Put,
             path: "/snapshot/create".to_owned(),
@@ -4390,6 +4618,7 @@ where
                 workspace: &workspace,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
+                veritysetup: &config.veritysetup,
             });
             return Err(with_cleanup(error, &cleanup));
         }
@@ -4402,6 +4631,7 @@ where
                 workspace: &workspace,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
+                veritysetup: &config.veritysetup,
             });
             return Err(with_cleanup(error, &cleanup));
         }
@@ -4410,8 +4640,9 @@ where
         let mut block_device_bound = false;
         let mut process = None;
         let result = (|| {
-            self.open_verity(config)?;
+            self.open_verity_mapping(config)?;
             verity_opened = true;
+            self.verify_open_verity(config)?;
             self.bind_verity_device(config)?;
             block_device_bound = true;
             self.verify_verity_binding(config)?;
@@ -4447,6 +4678,7 @@ where
                 config_fingerprint: config.instance_fingerprint(),
                 identities: Some(identities),
                 guest_control_challenge: None,
+                guest_policy_digest: None,
             })
         })();
         match result {
@@ -4460,6 +4692,7 @@ where
                     workspace: &workspace,
                     mapper_name: &config.dm_verity.mapper_name,
                     jailed_device: &config.dm_verity.jailed_device_path,
+                    veritysetup: &config.veritysetup,
                 });
                 Err(with_cleanup(error, &cleanup))
             }
@@ -4524,6 +4757,7 @@ where
                 workspace: &workspace,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
+                veritysetup: &config.veritysetup,
             });
             return Err(with_cleanup(error, &cleanup));
         }
@@ -4536,6 +4770,7 @@ where
                 workspace: &workspace,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
+                veritysetup: &config.veritysetup,
             });
             return Err(with_cleanup(error, &cleanup));
         }
@@ -4544,8 +4779,9 @@ where
         let mut block_device_bound = false;
         let mut process = None;
         let result = (|| {
-            self.open_verity(config)?;
+            self.open_verity_mapping(config)?;
             verity_opened = true;
+            self.verify_open_verity(config)?;
             self.bind_verity_device(config)?;
             block_device_bound = true;
             self.verify_verity_binding(config)?;
@@ -4579,6 +4815,7 @@ where
                 config_fingerprint: config.instance_fingerprint(),
                 identities: Some(identities),
                 guest_control_challenge: None,
+                guest_policy_digest: None,
             })
         })();
         match result {
@@ -4592,6 +4829,7 @@ where
                     workspace: &workspace,
                     mapper_name: &config.dm_verity.mapper_name,
                     jailed_device: &config.dm_verity.jailed_device_path,
+                    veritysetup: &config.veritysetup,
                 });
                 Err(with_cleanup(error, &cleanup))
             }
@@ -4612,6 +4850,9 @@ where
     /// Returns [`RuntimeError::InvalidState`] or [`RuntimeError::StaleIdentity`] when
     /// identities are not ready, or an API error when injection is rejected.
     pub fn inject_identity(&mut self, instance: &mut RuntimeInstance) -> Result<(), RuntimeError> {
+        if instance.guest_policy_digest.is_some() {
+            return Err(RuntimeError::PolicyDigestRequired);
+        }
         if !matches!(
             instance.state,
             RuntimeState::IdentityRegenerated | RuntimeState::IdentityResumedAwaitingAck
@@ -4660,6 +4901,82 @@ where
         Ok(())
     }
 
+    /// Injects regenerated identities while binding the guest to one authority policy digest.
+    ///
+    /// The digest is retained on the runtime instance before any resumable control call. A
+    /// retry after a lost response must therefore use the exact same digest; a different digest
+    /// cannot replace the request already associated with the restored VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::InvalidState`], [`RuntimeError::PolicyDigestMismatch`], or an API
+    /// error when the bound injection is not accepted.
+    pub fn inject_identity_bound(
+        &mut self,
+        instance: &mut RuntimeInstance,
+        policy_digest: AuthorityPolicyDigest,
+    ) -> Result<(), RuntimeError> {
+        if !matches!(
+            instance.state,
+            RuntimeState::IdentityRegenerated | RuntimeState::IdentityResumedAwaitingAck
+        ) {
+            return Err(RuntimeError::InvalidState {
+                expected: "IdentityRegenerated or IdentityResumedAwaitingAck".to_owned(),
+                actual: format!("{:?}", instance.state),
+            });
+        }
+        if let Some(existing) = instance.guest_policy_digest {
+            if existing != policy_digest {
+                return Err(RuntimeError::PolicyDigestMismatch {
+                    expected: existing,
+                    actual: policy_digest,
+                });
+            }
+        } else {
+            instance.guest_policy_digest = Some(policy_digest);
+        }
+        if instance.state == RuntimeState::IdentityRegenerated {
+            let identities = instance.identities.clone().ok_or_else(|| {
+                RuntimeError::StaleIdentity(
+                    "identity regeneration state has no identity bundle".to_owned(),
+                )
+            })?;
+            self.guest_control_challenge(instance, &identities)?;
+            self.api_call(ApiRequest {
+                method: HttpMethod::Patch,
+                path: "/vm".to_owned(),
+                body: r#"{"state":"Resumed"}"#.to_owned(),
+            })?;
+            instance.state = RuntimeState::IdentityResumedAwaitingAck;
+        }
+        self.command_runner.verify_running(instance.process)?;
+        let identities = instance.identities.clone().ok_or_else(|| {
+            RuntimeError::StaleIdentity("resumed VM has no identity bundle".to_owned())
+        })?;
+        let challenge = instance.guest_control_challenge.ok_or_else(|| {
+            RuntimeError::StaleIdentity("resumed VM has no guest-control challenge".to_owned())
+        })?;
+        let request =
+            guest_control::GuestControlRequest::new_bound(challenge, identities, policy_digest)
+                .map_err(|error| {
+                    RuntimeError::StaleIdentity(format!("invalid guest-control request: {error}"))
+                })?;
+        self.control_call_with_identity_ack(
+            ApiRequest {
+                method: HttpMethod::Put,
+                path: guest_control::GuestControlAction::InjectIdentityBound
+                    .path()
+                    .to_owned(),
+                body: request.canonical_bound_body(),
+            },
+            &request.canonical_bound_acknowledgement(
+                guest_control::GuestControlAction::InjectIdentityBound,
+            ),
+        )?;
+        instance.state = RuntimeState::IdentityInjected;
+        Ok(())
+    }
+
     /// Starts workload execution only after identity injection has succeeded.
     ///
     /// The guest must return the same challenge and five identities with a canonical
@@ -4685,19 +5002,42 @@ where
                 "identity-injected state has no guest-control challenge".to_owned(),
             )
         })?;
-        let request =
-            guest_control::GuestControlRequest::new(challenge, identities).map_err(|error| {
-                RuntimeError::StaleIdentity(format!("invalid guest-control request: {error}"))
-            })?;
+        let (action, body, acknowledgement) = if let Some(policy_digest) =
+            instance.guest_policy_digest
+        {
+            let request =
+                guest_control::GuestControlRequest::new_bound(challenge, identities, policy_digest)
+                    .map_err(|error| {
+                        RuntimeError::StaleIdentity(format!(
+                            "invalid guest-control request: {error}"
+                        ))
+                    })?;
+            (
+                guest_control::GuestControlAction::StartWorkloadBound,
+                request.canonical_bound_body(),
+                request.canonical_bound_acknowledgement(
+                    guest_control::GuestControlAction::StartWorkloadBound,
+                ),
+            )
+        } else {
+            let request = guest_control::GuestControlRequest::new(challenge, identities).map_err(
+                |error| {
+                    RuntimeError::StaleIdentity(format!("invalid guest-control request: {error}"))
+                },
+            )?;
+            (
+                guest_control::GuestControlAction::StartWorkload,
+                request.canonical_body(),
+                request.canonical_acknowledgement(guest_control::GuestControlAction::StartWorkload),
+            )
+        };
         self.control_call_with_identity_ack(
             ApiRequest {
                 method: HttpMethod::Put,
-                path: guest_control::GuestControlAction::StartWorkload
-                    .path()
-                    .to_owned(),
-                body: request.canonical_body(),
+                path: action.path().to_owned(),
+                body,
             },
-            &request.canonical_acknowledgement(guest_control::GuestControlAction::StartWorkload),
+            &acknowledgement,
         )?;
         instance.state = RuntimeState::Running;
         Ok(())
@@ -4752,7 +5092,7 @@ where
             && instance.block_device_state == BlockDeviceState::Unbound
             && instance.verity_opened
         {
-            match self.close_verity_mapper(&instance.mapper_name) {
+            match self.close_verity_mapper(&config.veritysetup, &instance.mapper_name) {
                 Ok(()) => instance.verity_opened = false,
                 Err(error) => failures.push(error.to_string()),
             }
@@ -4777,6 +5117,7 @@ where
             ("kernel", &config.kernel),
             ("rootfs", &config.rootfs),
             ("dm-verity hash image", &config.verity_hash),
+            ("veritysetup", &config.veritysetup),
             (
                 "workspace image formatter",
                 &config.workspace.image.formatter,
@@ -4808,8 +5149,8 @@ where
             &image,
             config.workspace.image.size_bytes,
         )?;
-        self.command_runner.run(&CommandSpec::new(
-            &config.workspace.image.formatter.path,
+        self.command_runner.run(&CommandSpec::pinned(
+            &config.workspace.image.formatter,
             [
                 "-F".to_owned(),
                 "-q".to_owned(),
@@ -4863,9 +5204,9 @@ where
         Ok(())
     }
 
-    fn open_verity(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
-        let command = CommandSpec::new(
-            "veritysetup",
+    fn open_verity_mapping(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
+        let command = CommandSpec::pinned(
+            &config.veritysetup,
             [
                 "open".to_owned(),
                 "--readonly".to_owned(),
@@ -4878,8 +5219,18 @@ where
         self.command_runner.run(&command).map(|_| ())
     }
 
-    fn close_verity_mapper(&mut self, mapper_name: &str) -> Result<(), RuntimeError> {
-        let command = CommandSpec::new("veritysetup", ["close".to_owned(), mapper_name.to_owned()]);
+    fn verify_open_verity(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
+        self.command_runner
+            .verify_verity(&config.veritysetup, &config.dm_verity)
+    }
+
+    fn close_verity_mapper(
+        &mut self,
+        veritysetup: &PinnedArtifact,
+        mapper_name: &str,
+    ) -> Result<(), RuntimeError> {
+        let command =
+            CommandSpec::pinned(veritysetup, ["close".to_owned(), mapper_name.to_owned()]);
         self.command_runner.run(&command).map(|_| ())
     }
 
@@ -4947,7 +5298,7 @@ where
             "--seccomp-filter".to_owned(),
             seccomp_filter.display().to_string(),
         ];
-        Ok(CommandSpec::new(&config.jailer.path, args))
+        Ok(CommandSpec::pinned(&config.jailer, args))
     }
 
     fn bind_restored_workspace(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
@@ -5105,6 +5456,7 @@ where
                 .workspace_cloned
                 .then(|| resources.workspace.to_path_buf()),
             mapper_name: resources.mapper_name.to_owned(),
+            veritysetup: resources.veritysetup.clone(),
         };
         let failures = self.cleanup_pending(&mut pending);
         if !pending.is_complete() {
@@ -5127,7 +5479,7 @@ where
             }
         }
         if pending.verity_opened {
-            match self.close_verity_mapper(&pending.mapper_name) {
+            match self.close_verity_mapper(&pending.veritysetup, &pending.mapper_name) {
                 Ok(()) => pending.verity_opened = false,
                 Err(error) => return vec![error.to_string()],
             }
@@ -5548,6 +5900,15 @@ pub enum RuntimeError {
     WorkspaceAlreadyExists(PathBuf),
     /// A restored identity is duplicated or present in snapshot state.
     StaleIdentity(String),
+    /// A bound policy digest was changed or an already-bound instance was sent through v1.
+    PolicyDigestMismatch {
+        /// Digest retained by the runtime instance.
+        expected: AuthorityPolicyDigest,
+        /// Digest supplied by the caller.
+        actual: AuthorityPolicyDigest,
+    },
+    /// A v1 identity injection was attempted for an instance that requires v2 binding.
+    PolicyDigestRequired,
     /// Snapshot metadata does not match the requested runtime configuration.
     StaleSnapshot(String),
     /// Identity encoding is invalid.
@@ -5627,6 +5988,14 @@ impl Display for RuntimeError {
                 )
             }
             Self::StaleIdentity(message) => write!(formatter, "stale identity rejected: {message}"),
+            Self::PolicyDigestMismatch { expected, actual } => write!(
+                formatter,
+                "guest policy digest mismatch: expected {expected}, got {actual}"
+            ),
+            Self::PolicyDigestRequired => write!(
+                formatter,
+                "bound guest identity injection requires the policy digest"
+            ),
             Self::StaleSnapshot(message) => write!(formatter, "stale snapshot rejected: {message}"),
             Self::InvalidIdentity(message) => write!(formatter, "invalid identity: {message}"),
             Self::Rollback { operation, cleanup } => {
@@ -5703,6 +6072,14 @@ mod tests {
 
         fn start(&mut self, _command: &CommandSpec) -> Result<ProcessHandle, RuntimeError> {
             Err(RuntimeError::Command("unexpected start".to_owned()))
+        }
+
+        fn verify_verity(
+            &mut self,
+            _veritysetup: &PinnedArtifact,
+            _expected: &DmVerityConfig,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
         }
 
         fn stop(&mut self, process: ProcessHandle) -> Result<(), RuntimeError> {
@@ -5791,6 +6168,7 @@ mod tests {
             kernel: test_artifact(jail_root.join("artifacts/kernel").to_str().unwrap()),
             rootfs: rootfs.clone(),
             verity_hash: test_artifact("/artifacts/verity"),
+            veritysetup: test_artifact("/usr/sbin/veritysetup"),
             dm_verity: DmVerityConfig {
                 data_device: rootfs.path,
                 hash_device: PathBuf::from("/artifacts/verity"),
@@ -5845,7 +6223,7 @@ mod tests {
             network_devices: Vec::new(),
             vcpu_count: 2,
             memory_mib: 256,
-            boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_owned(),
+            boot_args: format!("console=ttyS0 reboot=k panic=1 pci=off init={REQUIRED_GUEST_INIT}"),
         }
     }
 
@@ -5855,13 +6233,13 @@ mod tests {
         let mut runtime = cleanup_runtime([], []);
 
         runtime
-            .open_verity(&config)
+            .open_verity_mapping(&config)
             .expect("the mock command runner must accept dm-verity setup");
 
         assert_eq!(
             runtime.command_runner.events,
             [format!(
-                "run:veritysetup open --readonly {} {} {} {}",
+                "run:/usr/sbin/veritysetup open --readonly {} {} {} {}",
                 config.dm_verity.data_device.display(),
                 config.dm_verity.mapper_name,
                 config.dm_verity.hash_device.display(),
@@ -5896,6 +6274,14 @@ mod tests {
                 .borrow_mut()
                 .push(format!("start:{}", self.next_pid));
             Ok(ProcessHandle { pid: self.next_pid })
+        }
+
+        fn verify_verity(
+            &mut self,
+            _veritysetup: &PinnedArtifact,
+            _expected: &DmVerityConfig,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
         }
 
         fn start_owned(
@@ -6309,6 +6695,12 @@ mod tests {
         });
         assert_mutation_changes_fingerprint!("verity_hash.digest", |config: &mut RuntimeConfig| {
             config.verity_hash.digest = sha256(b"changed-verity");
+        });
+        assert_mutation_changes_fingerprint!("veritysetup.path", |config: &mut RuntimeConfig| {
+            config.veritysetup.path.push("changed");
+        });
+        assert_mutation_changes_fingerprint!("veritysetup.digest", |config: &mut RuntimeConfig| {
+            config.veritysetup.digest = sha256(b"changed-veritysetup");
         });
         assert_mutation_changes_fingerprint!(
             "dm_verity.data_device",
@@ -6896,6 +7288,79 @@ mod tests {
     }
 
     #[test]
+    fn bound_identity_retry_retains_the_exact_digest_and_uses_v2_paths() {
+        let config = test_config();
+        let (mut runtime, events) = lifecycle_runtime([], []);
+        let snapshot = runtime
+            .verify_snapshot(&config, test_snapshot(&config))
+            .expect("test snapshot provenance must verify");
+        let mut instance = runtime
+            .restore(&config, &snapshot)
+            .expect("restore must remain paused");
+        let digest = AuthorityPolicyDigest::from_hex(&"22".repeat(32))
+            .expect("test policy digest must be canonical");
+        let changed_digest = AuthorityPolicyDigest::from_hex(&"33".repeat(32))
+            .expect("changed test policy digest must be canonical");
+        let identities = instance.identities().expect("restore identities").clone();
+        let challenge = derive_guest_control_challenge(&identities)
+            .expect("test challenge must derive independently");
+        let request = guest_control::GuestControlRequest::new_bound(challenge, identities, digest)
+            .expect("bound request must be valid");
+        runtime
+            .guest_client
+            .response_bodies
+            .push_back(String::new());
+        assert!(matches!(
+            runtime.inject_identity_bound(&mut instance, digest),
+            Err(RuntimeError::StaleIdentity(message))
+                if message.contains("exact challenge and identity bundle")
+        ));
+        assert_eq!(instance.state(), RuntimeState::IdentityResumedAwaitingAck);
+        assert_eq!(instance.policy_digest(), Some(digest));
+        runtime
+            .guest_client
+            .response_bodies
+            .push_back(request.canonical_bound_acknowledgement(
+                guest_control::GuestControlAction::InjectIdentityBound,
+            ));
+        assert!(matches!(
+            runtime.inject_identity_bound(&mut instance, changed_digest),
+            Err(RuntimeError::PolicyDigestMismatch { expected, actual })
+                if expected == digest && actual == changed_digest
+        ));
+        runtime
+            .inject_identity_bound(&mut instance, digest)
+            .expect("exact digest retry must be accepted");
+        let started = guest_control::GuestControlRequest::new_bound(
+            challenge,
+            instance.identities().expect("identity bundle").clone(),
+            digest,
+        )
+        .expect("bound start request must be valid");
+        runtime
+            .guest_client
+            .response_bodies
+            .push_back(started.canonical_bound_acknowledgement(
+                guest_control::GuestControlAction::StartWorkloadBound,
+            ));
+        runtime
+            .start_workload(&mut instance)
+            .expect("bound workload start must use the retained digest");
+        assert_eq!(instance.state(), RuntimeState::Running);
+        let events = events.borrow();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("guest:Put:/actions/inject-identity-v2:"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("guest:Put:/actions/start-workload-v2:"))
+        );
+    }
+
+    #[test]
     fn opaque_success_cannot_release_a_restored_vm() {
         let config = test_config();
         let (mut runtime, events) = lifecycle_runtime([], []);
@@ -7082,6 +7547,7 @@ mod tests {
     #[test]
     fn pending_cleanup_keeps_verity_and_workspace_when_process_stop_fails() {
         let mut runtime = cleanup_runtime([true, false], std::iter::empty());
+        let veritysetup = test_artifact("/usr/sbin/veritysetup");
 
         let failures = runtime.rollback(RollbackResources {
             process: Some(ProcessHandle { pid: 42 }),
@@ -7091,6 +7557,7 @@ mod tests {
             workspace: Path::new("/workspace/session"),
             mapper_name: "session-root",
             jailed_device: Path::new("/jail/dev/rootfs"),
+            veritysetup: &veritysetup,
         });
         assert!(failures[0].contains("stop failed"));
         assert_eq!(runtime.command_runner.events, ["stop:42"]);
@@ -7102,7 +7569,11 @@ mod tests {
             .expect("retained cleanup must be retryable");
         assert_eq!(
             runtime.command_runner.events,
-            ["stop:42", "stop:42", "run:veritysetup close session-root"]
+            [
+                "stop:42",
+                "stop:42",
+                "run:/usr/sbin/veritysetup close session-root"
+            ]
         );
         assert_eq!(runtime.filesystem.events, ["remove:/workspace/session"]);
         assert!(!runtime.has_pending_cleanup());
@@ -7111,6 +7582,7 @@ mod tests {
     #[test]
     fn pending_cleanup_keeps_workspace_when_verity_close_fails() {
         let mut runtime = cleanup_runtime(std::iter::empty(), [true, false]);
+        let veritysetup = test_artifact("/usr/sbin/veritysetup");
 
         let failures = runtime.rollback(RollbackResources {
             process: Some(ProcessHandle { pid: 42 }),
@@ -7120,11 +7592,12 @@ mod tests {
             workspace: Path::new("/workspace/session"),
             mapper_name: "session-root",
             jailed_device: Path::new("/jail/dev/rootfs"),
+            veritysetup: &veritysetup,
         });
         assert!(failures[0].contains("close failed"));
         assert_eq!(
             runtime.command_runner.events,
-            ["stop:42", "run:veritysetup close session-root"]
+            ["stop:42", "run:/usr/sbin/veritysetup close session-root"]
         );
         assert!(runtime.filesystem.events.is_empty());
         assert!(runtime.has_pending_cleanup());
@@ -7136,12 +7609,48 @@ mod tests {
             runtime.command_runner.events,
             [
                 "stop:42",
-                "run:veritysetup close session-root",
-                "run:veritysetup close session-root"
+                "run:/usr/sbin/veritysetup close session-root",
+                "run:/usr/sbin/veritysetup close session-root"
             ]
         );
         assert_eq!(runtime.filesystem.events, ["remove:/workspace/session"]);
         assert!(!runtime.has_pending_cleanup());
+    }
+
+    #[test]
+    fn pinned_command_rejects_source_replacement_before_execution() {
+        let directory = unique_test_path("pinned-command-replacement");
+        fs::create_dir(&directory).expect("test directory must be creatable");
+        let executable = directory.join("tool");
+        fs::copy("/bin/true", &executable).expect("true executable must be copyable");
+        let digest = digest_file(&executable).expect("copied executable must be digestible");
+        let command = CommandSpec::pinned(&PinnedArtifact::new(&executable, digest), []);
+        fs::copy("/bin/false", &executable).expect("source path must be replaceable");
+
+        let error = RealCommandRunner::new()
+            .run(&command)
+            .expect_err("replaced pinned command must not execute");
+        assert!(matches!(error, RuntimeError::ArtifactDigestMismatch { .. }));
+        fs::remove_dir_all(directory).expect("test directory must be removable");
+    }
+
+    #[test]
+    fn sealed_command_executes_opened_bytes_after_source_replacement() {
+        let directory = unique_test_path("sealed-command-replacement");
+        fs::create_dir(&directory).expect("test directory must be creatable");
+        let executable = directory.join("tool");
+        fs::copy("/bin/true", &executable).expect("true executable must be copyable");
+        let digest = digest_file(&executable).expect("copied executable must be digestible");
+        let command = CommandSpec::pinned(&PinnedArtifact::new(&executable, digest), []);
+        let sealed = seal_command_executable(&command)
+            .expect("pinned executable must seal")
+            .expect("pinned command must produce a retained descriptor");
+        fs::copy("/bin/false", &executable).expect("source path must be replaceable");
+
+        RealCommandRunner::new()
+            .run(&CommandSpec::new(sealed.program(), []))
+            .expect("the exact opened true bytes must execute");
+        fs::remove_dir_all(directory).expect("test directory must be removable");
     }
 
     #[test]
@@ -7382,6 +7891,114 @@ mod tests {
     }
 
     #[test]
+    fn command_runner_child_admission_is_bounded_and_recovers_after_stop() {
+        let mut runner = RealCommandRunner::new();
+        let mut direct_children = Vec::with_capacity(MAX_MANAGED_CHILDREN - 2);
+        for _ in 0..(MAX_MANAGED_CHILDREN - 2) {
+            let child = spawn_detached(&CommandSpec::new("/bin/true", Vec::<String>::new()))
+                .expect("capacity fixture child must start");
+            let process = ProcessHandle { pid: child.id() };
+            runner
+                .children
+                .insert(process.pid, ManagedChild::Direct(child));
+            direct_children.push(process);
+        }
+
+        let pending_ownership = ProcessOwnership {
+            cgroup_path: unique_test_path("capacity-pending-cgroup"),
+            firecracker_executable: PathBuf::from("/bin/true"),
+            firecracker_digest: digest_file(Path::new("/bin/true"))
+                .expect("test executable must be digestible"),
+        };
+        let pending_launcher = spawn_detached(&CommandSpec::new("/bin/sleep", ["30".to_owned()]))
+            .expect("pending ownership fixture child must start");
+        let pending = ProcessHandle {
+            pid: pending_launcher.id(),
+        };
+        runner.children.insert(
+            pending.pid,
+            ManagedChild::PendingOwned {
+                launcher: pending_launcher,
+                ownership: pending_ownership,
+            },
+        );
+
+        let isolated_cgroup = unique_test_path("capacity-isolated-cgroup");
+        fs::create_dir(&isolated_cgroup).expect("fake cgroup directory must be creatable");
+        fs::write(isolated_cgroup.join("cgroup.procs"), b"")
+            .expect("fake cgroup task file must be creatable");
+        let isolated = fake_owned_process(&mut runner, &isolated_cgroup, Path::new("/bin/true"));
+        assert_eq!(runner.children.len(), MAX_MANAGED_CHILDREN);
+
+        let marker = unique_test_path("capacity-marker");
+        let command = CommandSpec::new(
+            "/bin/sh",
+            ["-c".to_owned(), format!("touch {}", marker.display())],
+        );
+        let error = runner
+            .start(&command)
+            .expect_err("direct admission must fail at the child limit");
+        assert!(
+            error
+                .to_string()
+                .contains("managed child limit of 256 was reached")
+        );
+        assert!(
+            !marker.exists(),
+            "the direct command must not spawn before capacity admission"
+        );
+
+        let error = runner
+            .start_owned(
+                &command,
+                &ProcessOwnership {
+                    cgroup_path: PathBuf::from("relative-cgroup"),
+                    firecracker_executable: PathBuf::from("relative-firecracker"),
+                    firecracker_digest: sha256(b"unused"),
+                },
+            )
+            .expect_err("owned admission must share the child limit");
+        assert!(
+            error
+                .to_string()
+                .contains("managed child limit of 256 was reached")
+        );
+        assert!(
+            !marker.exists(),
+            "the owned command must not validate or spawn before capacity admission"
+        );
+        assert_eq!(runner.children.len(), MAX_MANAGED_CHILDREN);
+
+        runner
+            .stop(pending)
+            .expect("stopping a pending launcher without a cgroup must release capacity");
+        runner
+            .stop(isolated)
+            .expect("stopping an isolated launcher with no tasks must release capacity");
+        assert_eq!(runner.children.len(), MAX_MANAGED_CHILDREN - 2);
+
+        let recovered = runner
+            .start(&CommandSpec::new("/bin/sleep", ["30".to_owned()]))
+            .expect("a successful stop must make one child slot available");
+        assert_eq!(runner.children.len(), MAX_MANAGED_CHILDREN - 1);
+        runner
+            .stop(recovered)
+            .expect("the recovered direct child must be stoppable");
+        assert_eq!(runner.children.len(), MAX_MANAGED_CHILDREN - 2);
+
+        for process in direct_children {
+            runner
+                .stop(process)
+                .expect("capacity fixture child must be reaped");
+        }
+        assert!(runner.children.is_empty());
+        fs::remove_file(isolated_cgroup.join("cgroup.procs"))
+            .expect("fake cgroup task file must be removable");
+        fs::remove_dir(isolated_cgroup).expect("fake cgroup directory must be removable");
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn runtime_drop_aborts_if_owned_process_cleanup_fails() {
         const CHILD_MARKER: &str = "FIRECRACKER_RUNTIME_DROP_ABORT_CHILD";
         if std::env::var_os(CHILD_MARKER).is_some() {
@@ -7392,6 +8009,7 @@ mod tests {
                 verity_opened: true,
                 workspace: Some(PathBuf::from("/workspace/session")),
                 mapper_name: "session-root".to_owned(),
+                veritysetup: test_artifact("/usr/sbin/veritysetup"),
             });
             drop(runtime);
             panic!("runtime drop must fail-stop while an owned process may remain live");

@@ -1217,7 +1217,8 @@ fn real_filesystem_owns_and_removes_the_workspace_block_image_with_its_clone() {
     let root = temporary_workspace("block-image");
     let source = root.join("source");
     let clone = root.join("clone-a");
-    let image = root.join("clone-a.ext4");
+    let image = root.join("workspace.ext4");
+    let non_snapshot_image = root.join("clone-a.ext4");
     fs::create_dir(&source).expect("source directory must be creatable");
     fs::write(source.join("workspace.txt"), b"workspace").expect("source file must be writable");
 
@@ -1225,6 +1226,12 @@ fn real_filesystem_owns_and_removes_the_workspace_block_image_with_its_clone() {
     filesystem
         .clone_workspace(&source, &clone)
         .expect("workspace clone must publish");
+    assert!(
+        filesystem
+            .create_workspace_image(&clone, &non_snapshot_image, MIN_WORKSPACE_IMAGE_BYTES)
+            .is_err()
+    );
+    assert!(!non_snapshot_image.exists());
     filesystem
         .create_workspace_image(&clone, &image, MIN_WORKSPACE_IMAGE_BYTES)
         .expect("owned clone must receive an exact-size block image");

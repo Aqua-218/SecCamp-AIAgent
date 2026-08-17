@@ -29,7 +29,7 @@ fail() {
 [[ -c /dev/vhost-vsock ]] || fail 'requires /dev/vhost-vsock'
 [[ "$(stat -fc '%T' /sys/fs/cgroup)" == cgroup2fs ]] || fail 'requires cgroup-v2'
 
-for command_name in awk cargo chmod dmsetup env file grep id install ln mkdir mkfs.ext4 mktemp mksquashfs realpath rm rmdir seq sha256sum sleep stat tar truncate uname unsquashfs veritysetup; do
+for command_name in awk cargo chmod dmsetup env file findmnt grep id install ln mkdir mkfs.ext4 mktemp mksquashfs realpath rm rmdir seq sha256sum sleep stat tar truncate umount uname unsquashfs veritysetup; do
   command -v "${command_name}" >/dev/null || fail "requires ${command_name}"
 done
 
@@ -124,18 +124,32 @@ RUSTFLAGS='-C target-feature=+crt-static' cargo build \
   --bin guest-broker-probe \
   --release \
   --locked
-cargo build \
+cargo rustc \
   --manifest-path "${repository_root}/Cargo.toml" \
   -p supervisor \
   --bin guest-supervisor-init \
   --release \
-  --locked
-cargo build \
+  --locked \
+  -- \
+  -C target-feature=+crt-static
+cargo rustc \
   --manifest-path "${repository_root}/Cargo.toml" \
   -p runtime-isolation \
   --bin workload-isolation-launcher \
   --release \
-  --locked
+  --locked \
+  -- \
+  -C target-feature=+crt-static
+
+for guest_binary in \
+  "${repository_root}/target/release/guest-control-init" \
+  "${repository_root}/target/release/guest-broker-probe" \
+  "${repository_root}/target/release/guest-supervisor-init" \
+  "${repository_root}/target/release/workload-isolation-launcher"; do
+  if ! file "${guest_binary}" | grep -Eq 'statically linked|static-pie linked'; then
+    fail "guest runtime binary must be statically linked: ${guest_binary}"
+  fi
+done
 
 staging="$(mktemp -d "${repository_root}/.real-session-owner.XXXXXX")"
 cleanup_state="${staging}/cleanup-state"
@@ -166,6 +180,9 @@ remove_cgroup() {
 cleanup() {
   local workspace_id=''
   local jailer_base=''
+  local cgroup=''
+  local mapper=''
+  local mount_target=''
   if [[ -f "${cleanup_state}" && ! -L "${cleanup_state}" ]]; then
     workspace_id="$(awk -F= '$1 == "workspace_id" {print $2}' "${cleanup_state}")"
     jailer_base="$(awk -F= '$1 == "jailer_base" {print $2}' "${cleanup_state}")"
@@ -177,8 +194,38 @@ cleanup() {
       rm -rf -- "${jailer_base}/firecracker/${workspace_id}"
     fi
   fi
-  remove_cgroup "${cleanup_cgroup_parent}/template"
-  remove_mapper "${cleanup_mapper_base}"
+
+  # A panic can happen before the Rust test publishes cleanup-state.  Enumerate only resources
+  # below this invocation's exact random root/name instead of relying on that hand-off file.
+  # Firecracker processes are killed first, then their rootfs bind mounts are detached before the
+  # dm-verity mappings are removed.
+  shopt -s nullglob
+  for cgroup in "${cleanup_cgroup_parent}"/*; do
+    case "${cgroup##*/}" in
+      template | [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+        remove_cgroup "${cgroup}"
+        ;;
+    esac
+  done
+  shopt -u nullglob
+
+  if [[ -n "${test_root}" ]]; then
+    while IFS= read -r mount_target; do
+      case "${mount_target}" in
+        "${test_root}"/*/jailer/firecracker/*/root/dev/rootfs)
+          umount -- "${mount_target}" >/dev/null 2>&1 || true
+          ;;
+      esac
+    done < <(findmnt -rn -o TARGET 2>/dev/null || true)
+  fi
+
+  while read -r mapper _; do
+    if [[ "${mapper}" == "${cleanup_mapper_base}" \
+      || "${mapper}" =~ ^${cleanup_mapper_base}-[0-9a-f]{32}$ ]]; then
+      remove_mapper "${mapper}"
+    fi
+  done < <(dmsetup ls --target verity --noheadings 2>/dev/null || true)
+
   rmdir -- "${cleanup_cgroup_parent}" >/dev/null 2>&1 || true
   if [[ -n "${test_root}" ]]; then
     rm -rf -- "${test_root}"
@@ -223,7 +270,7 @@ image_hash="${staging}/runtime.squashfs.hash"
   --isolation-launcher "${repository_root}/target/release/workload-isolation-launcher" \
   --agent-workload "${repository_root}/target/release/guest-broker-probe" \
   --repository workspace \
-  --file-effects read-data,list-directory,write-data \
+  --file-effects read-data,list-directory,write-data,truncate,create-file,create-directory,remove-file,remove-directory,rename,set-metadata,read-link,create-symlink,create-hard-link \
   --path-prefix / \
   --port 19002 \
   --broker-port 19001 \
@@ -256,5 +303,6 @@ REAL_SESSION_WORKSPACE_FORMATTER="$(realpath -e -- "$(command -v mkfs.ext4)")" \
     --locked \
     -- \
     --ignored \
+    --nocapture \
     --exact \
     real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_resource

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Runs opt-in Firecracker guest-control and guest-to-host Broker tests over real KVM, dm-verity,
-# and AF_VSOCK.
+# Runs opt-in Firecracker guest-control, cgroup-v2, and guest-to-host Broker tests over real KVM,
+# dm-verity, and AF_VSOCK.
 #
 # This is intentionally a privileged Linux verification job. It builds the static PID 1 from this
 # checkout and combines it with the pinned downloaded kernel/rootfs before making any VM. The
@@ -145,6 +145,19 @@ run_runtime_test() {
   [[ "${root_hash}" =~ ^[0-9a-f]{64}$ ]] || { printf '%s\n' 'guest runtime image did not emit one lower-case dm-verity root hash' >&2; exit 2; }
   veritysetup open "${image_rootfs}" "${mapper_name}" "${image_hash}" "${root_hash}"
   veritysetup status "${mapper_name}" | grep -q 'mode:        readonly'
+
+  REAL_FIRECRACKER_BIN="${firecracker}" \
+  REAL_FIRECRACKER_KERNEL="${kernel}" \
+  REAL_FIRECRACKER_ROOTFS="/dev/mapper/${mapper_name}" \
+  REAL_FIRECRACKER_WORKSPACE="${workspace_image}" \
+  cargo test \
+    --manifest-path "${repository_root}/Cargo.toml" \
+    -p firecracker-runtime \
+    --test real_guest_control \
+    --locked \
+    -- \
+    --ignored \
+    --exact real_firecracker_guest_cgroup_v2_exposes_required_controllers
 
   REAL_FIRECRACKER_BIN="${firecracker}" \
   REAL_FIRECRACKER_KERNEL="${kernel}" \

@@ -108,6 +108,18 @@ pipeline_complete:
     - job: real_vm
       artifacts: false
       optional: true
+    - job: real_runtime_lifecycle
+      artifacts: false
+      optional: true
+    - job: real_capfs
+      artifacts: false
+      optional: true
+    - job: egress_real_https
+      artifacts: false
+      optional: true
+    - job: external_provider_smoke
+      artifacts: false
+      optional: true
     - job: privileged_isolation
       artifacts: false
       optional: true

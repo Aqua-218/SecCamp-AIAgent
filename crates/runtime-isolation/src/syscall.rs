@@ -47,14 +47,30 @@ pub enum Syscall {
     Getcwd,
     /// Open a path relative to a directory descriptor.
     Openat,
+    /// Create a directory by path.
+    Mkdir,
     /// Create a directory relative to a directory descriptor.
     Mkdirat,
+    /// Remove a non-directory path.
+    Unlink,
     /// Remove a path relative to a directory descriptor.
     Unlinkat,
+    /// Remove an empty directory by path.
+    Rmdir,
+    /// Rename paths.
+    Rename,
     /// Rename paths relative to directory descriptors.
     Renameat,
+    /// Create a hard link relative to directory descriptors.
+    Linkat,
+    /// Create a symbolic link by path.
+    Symlink,
+    /// Read a symbolic-link target by path.
+    Readlink,
     /// Read a link target relative to a directory descriptor.
     Readlinkat,
+    /// Change file mode by path.
+    Chmod,
     /// Change file mode through a descriptor.
     Fchmod,
     /// Change the file size through a descriptor.
@@ -372,10 +388,18 @@ impl Syscall {
             Self::Chdir => 80,
             Self::Getcwd => 79,
             Self::Openat => 257,
+            Self::Mkdir => 83,
             Self::Mkdirat => 258,
+            Self::Unlink => 87,
             Self::Unlinkat => 263,
+            Self::Rmdir => 84,
+            Self::Rename => 82,
             Self::Renameat => 264,
+            Self::Linkat => 265,
+            Self::Symlink => 88,
+            Self::Readlink => 89,
             Self::Readlinkat => 267,
+            Self::Chmod => 90,
             Self::Fchmod => 91,
             Self::Ftruncate => 77,
             Self::Statx => 332,
@@ -440,10 +464,18 @@ impl FromStr for Syscall {
             "chdir" => Self::Chdir,
             "getcwd" => Self::Getcwd,
             "openat" => Self::Openat,
+            "mkdir" => Self::Mkdir,
             "mkdirat" => Self::Mkdirat,
+            "unlink" => Self::Unlink,
             "unlinkat" => Self::Unlinkat,
+            "rmdir" => Self::Rmdir,
+            "rename" => Self::Rename,
             "renameat" => Self::Renameat,
+            "linkat" => Self::Linkat,
+            "symlink" => Self::Symlink,
+            "readlink" => Self::Readlink,
             "readlinkat" => Self::Readlinkat,
+            "chmod" => Self::Chmod,
             "fchmod" => Self::Fchmod,
             "ftruncate" => Self::Ftruncate,
             "statx" => Self::Statx,
@@ -617,10 +649,18 @@ impl SeccompPolicy {
                 Syscall::Chdir,
                 Syscall::Getcwd,
                 Syscall::Openat,
+                Syscall::Mkdir,
                 Syscall::Mkdirat,
+                Syscall::Unlink,
                 Syscall::Unlinkat,
+                Syscall::Rmdir,
+                Syscall::Rename,
                 Syscall::Renameat,
+                Syscall::Linkat,
+                Syscall::Symlink,
+                Syscall::Readlink,
                 Syscall::Readlinkat,
+                Syscall::Chmod,
                 Syscall::Fchmod,
                 Syscall::Ftruncate,
                 Syscall::Statx,

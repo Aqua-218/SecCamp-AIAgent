@@ -48,15 +48,16 @@ binary_ensure_directory() {
 }
 
 binary_install_init() {
+  local tools_directory="$1" binary_directory="$2" download_directory="$3"
   binary_install_uid="$(id -u)"
   readonly binary_install_uid
   umask 077
-  binary_ensure_directory "${tools_root}" \
-    || binary_install_die "unsafe tools root: ${tools_root}"
-  binary_ensure_directory "${tool_bin}" \
-    || binary_install_die "unsafe tool bin: ${tool_bin}"
-  binary_ensure_directory "${downloads}" \
-    || binary_install_die "unsafe download cache: ${downloads}"
+  binary_ensure_directory "${tools_directory}" \
+    || binary_install_die "unsafe tools root: ${tools_directory}"
+  binary_ensure_directory "${binary_directory}" \
+    || binary_install_die "unsafe tool bin: ${binary_directory}"
+  binary_ensure_directory "${download_directory}" \
+    || binary_install_die "unsafe download cache: ${download_directory}"
 }
 
 binary_fetch_pinned() {

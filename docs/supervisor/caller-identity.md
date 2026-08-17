@@ -122,7 +122,7 @@ socket は bind 直後に mode 0600 へ絞る。node が出来るのは bind の
 
 `revoke` も他の authority 操作と同じく `ConnectionIdentity` を取り、`resolve_caller` と `ensure_running` を通る。以前は identity を取らず lifecycle も見ていなかったため、`&Supervisor` を持つコードなら session 内の任意の `CapId` を revoke できた。guest から到達できないのは `WireRequest` に revoke tag が無いからにすぎず、`protocol.rs` に 3 つ目の tag を足して `dispatch_wire` に match arm を書けば compile が通る状態だった。
 
-**tag を足すときは、その操作が caller 検査を通ることを確認する。** 現在は `revoke` を wire に出しても、caller 自身の connection と Running 状態が要求される。ただし「その capability の所有者であること」は依然として検査していない。
+**tag を足すときは、その操作が caller 検査を通ることを確認する。** 現在は `revoke` を wire に出しても、caller 自身の connection と Running 状態が要求され、authority kernel が capability の holder であることも検査する。
 
 `derive` にも非対称がある。`issue_root` は `grant.subject()` が引数の subject と一致することを確認するが、`derive` は確認しない。親を持つ caller は、その grant が対象 subject の静的 envelope に収まる限り、別 subject が保持する capability を発行できる。Authority Core の derive は対象が caller の子孫であることを要求しないので、この非対称が実際の契約になっている。
 
@@ -138,11 +138,9 @@ socket は bind 直後に mode 0600 へ絞る。node が出来るのは bind の
 - `SubjectControlListener` は実 `SOCK_SEQPACKET` socket に対して module test で検証済み。実 `SO_PEERCRED` の取得、socket ID の単調割り当てと非再利用、4 KiB 超 datagram の decode 前拒否、mode 0600、絶対 path 以外の拒否を確認している。
 - guest VM の中で実際に agent process が接続する end-to-end は未検証である。uid/gid を偽装した peer からの接続は、test process が別 uid を作れないため resolver 単体でしか確認していない。
 - `SubjectControlListener` を `Supervisor::create_subject` の connection 引数へ接続する host 側の組み立ては、この crate に無い。
-- `ConnectionNotBoundToSubject` に test が無い。2 つの `ConnectionIdentity` を 1 subject に bind して誤った channel から呼ぶ経路は未検証。
-- `CallerBindingError` にも supervisor level の test が無い。未 bind の connection から `dispatch_wire` / `derive` / `open_handle` / `close_handle` を呼ぶ経路は未検証。
-- `GrantSubjectMismatch` と `DuplicateSubject` にも test が無い。
-- `revoke` は caller と lifecycle を検査するが、その caller が対象 capability を保持していることは検査しない。wire から到達できないことが現在の防御。
-- spoof の test は `CloseHandle` だけを扱う。`CloseSubject` の wire 経路が別 subject を落とせないことを直接確認する test は無い。
+- `ConnectionNotBoundToSubject`、`CallerBindingError`、`GrantSubjectMismatch`、`DuplicateSubject`、親の非 Running gate、`derive` の非 holder 拒否は supervisor level の test で確認している。
+- `revoke` の caller/lifecycle gate は supervisor が行い、対象 capability の holder 検査は authority kernel が行う。非 holder の拒否を `root_derive_and_revoke_use_typed_authority_kernel_transitions` で確認している。
+- `CloseHandle` の foreign subject 拒否と `CloseSubject` の claim 無視は wire 経路で確認している。前者は runtime adapter に到達しないこと、後者は caller 自身だけが閉じることまで assert する。
 - `derive` の非対称が実際に悪用可能かは検証していない。
 
 ## 変更時の確認点
@@ -151,7 +149,7 @@ socket は bind 直後に mode 0600 へ絞る。node が出来るのは bind の
 - `protocol.rs` に tag を足すときは、`dispatch_wire` の match arm と caller 検査を同じ変更で書く。`revoke` を wire に出す場合は、caller と lifecycle の検査だけでは足りない。capability の所有権検査を先に足す。
 - caller を解決する新しい経路を書くときは、必ず `ensure_running` を通す。`resolve_caller` の `is_some_and` は、追跡していない subject を通す。
 - `derive` に `grant.subject()` の検査を足す場合、[Capability state](../authority-core/capability-state.md) の derive 契約と矛盾しないかを先に確認する。現在の非対称は意図された契約である。
-- `resources_mut()` は無制限の `&mut R` を返す。lifecycle の gate を全部迂回するので、production host から呼ばない。test での failure 注入用。
+- `resources_mut()` は無制限の `&mut R` を返す。production の `guest-supervisor-init` は bootstrap listener を setup transaction の前に予約するためだけに使い、通常の lifecycle mutation は `Supervisor` の gate 経由で行う。test では fault injection と privileged adapter の観測にも使う。
 
 ## 関連
 

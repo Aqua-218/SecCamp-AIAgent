@@ -130,7 +130,7 @@ header に到達しなかった batch は未 commit なので、その session a
 kernel の exclusive file lock を保持する。process 終了時は descriptor close により自動解放され、
 次 owner は同じ inode を開いて lock を取得する。
 
-2 つの orchestrator process が同じ ledger を書くと、それぞれが自分の `issued` と `next_sequence` を持ち、衝突する offset に append し、両方が同じ identity を free だと信じる。
+2 つの orchestrator process が同じ ledger を開こうとしても、stable sidecar の kernel lock を同時に保持できるのは一方だけである。後から来た process は `Locked` で停止し、両方が同じ offset に append する経路はこの所有境界を通過しない。
 
 lock file の path/inode、owner、mode、link count は取得時と append 前後に再検証する。同一 process、
 cross-process、crash 後の再取得、hardlink/cross-path alias は test で固定されている。advisory lock
@@ -162,17 +162,29 @@ on-disk format が固定長 record なので、破損した位置を offset で�
 
 ## 正確な保証範囲
 
-- unit test は redundant header の全1-byte tear、inactive slot 破損、committed record 破損、
-  valid staged tail、invalid suffix、path/length replacement、unsafe parent、ledger/lock symlink、
-  exact mode、同一/cross-process lock を実行する。
+- unit test と `tests/ledger.rs` は redundant header の全1-byte tear、inactive slot 破損、committed
+  record 破損、valid staged tail、invalid suffix、path/length replacement、unsafe parent、
+  ledger/lock symlink、unknown kind、非連続 sequence、reserved byte、exact mode、同一/cross-process
+  lock、stale lock再取得を実行する。
 - production composition は recovery intent を先に永続化し、その後の7 identity reservation と
   journal checkpoint を照合する。部分予約、foreign fingerprint、ledger と recovery history の不一致を
   owner 構築前に拒否する。
 - [`tests/ledger.rs`](../../crates/session-orchestrator/tests/ledger.rs) は public API の reopen、duplicate、
-  corrupt/truncated input、live second owner を固定する。`SessionOrchestrator::new_durable` も専用 ledger
-  を取得して初期状態を構築できることを unit test する。
-- entropy の「予測不可能性」は deterministic test では証明できない。production の `OsEntropy` は
-  host kernel の `/dev/urandom` から exact 16 bytes を読み、I/O failure と all-zero を拒否する。
+  corrupt/truncated input、live second owner、cross-process contention、stale lock、request/header/file の
+  capacity hard bound、最大件数ちょうどの実データ commit、staged-tail crash相当、rename/length後の poison、
+  non-regular-file path を固定する。`SessionOrchestrator::new_durable` は実 `start_session` で all-zero
+  identity を bounded retry し、7 identityを最初のbackend effectより前にcommitし、stop後に再openできること、
+  persistent all-zero source を typed entropy failure として fail closed することを検証する。
+- entropy の「予測不可能性」や kernel entropy の品質は deterministic test では証明できない。production の
+  `OsEntropy` は host kernel の `/dev/urandom` から exact 16 bytes を読むことを test し、kernel/host OS
+  RNG を TCB とする。allocation は all-zero value を identity ごとに bounded retry し、上限到達時は
+  `StartFailure::Entropy` にして ledger/backend effect を開始しない。entropy I/O failure も同じ typed
+  failure として即時伝播する。
+- `DurableIdentityLedger` の production path は通常の `File::write_all` / `File::sync_all` を使う。lib.rs の
+  private test-only seam は各 write/sync point を一度だけ deterministic に失敗させ、live handle を poison
+  して再試行を拒否し、drop/reopen 後に durable header の実状態だけを authoritative に扱うことを固定する。
+  ledger 自身には rename syscall がないため、path replacement の rename fault は実 `fs::rename` fixture で
+  検証する。production では fault seam は無効で、実 syscall がそのまま呼ばれる。
 - CRC-32 は偶発破損検出であり MAC ではない。host root または ledger owner が file を意図的に
   正しく再符号化する脅威は、filesystem ownership と host trust boundary の外側である。
 

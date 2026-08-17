@@ -140,9 +140,9 @@ termination を確認するまで intent を完了しない。この実装によ
 
 state 遷移と identity 検査は fake adapter を使う test で確認している。
 
-- [`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は実 VM で pre-session gate を提供する。[`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) は注入前の start を拒否し、v2 policy digest 付き identity 注入後だけ固定 workload を release する。一方、opt-in guest runtime image は guest-supervisor-init、workload-isolation-launcher、Broker channel を通すため、PID 1 だけの test ではない。ただし CapFS の全 effect と `Runtime::launch` lifecycle は同時に証明しない。
-- 実機 test は raw boot の control channel と固定 guest runtime image を通すが、`Runtime::restore` と snapshot の identity injection を同じ production launch 経路で通したものではない。
-- 実 Firecracker で pause → snapshot create → `/snapshot/load` (`resume_vm:false`) → workspace/vsock bind → resume の一連動作は未検証。
+- [`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は実 VM で pre-session gate を提供する。[`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) は注入前の start を拒否し、v2 policy digest 付き identity 注入後だけ固定 workload を release する。guest runtime image は guest-supervisor-init、workload-isolation-launcher、全13 CapFS effect、Broker channelまでを通す。さらに[`real_production_lifecycle`](../../crates/session-orchestrator/tests/real_production_lifecycle.rs)がclean snapshot capture/restoreから同じguest経路とproduction `SessionOwner` cleanupまでを一続きで実行する。
+- raw bootのcontrol channel試験に加え、production SessionOwner gateが`Runtime::restore`とsnapshotのidentity injectionを同じlaunch経路で通す。
+- 実Firecrackerでpause → snapshot create → `/snapshot/load` (`resume_vm:false`) → workspace/vsock bind → resumeの一連動作をSessionOwner gateで確認済み。
 - `forbidden_identities` の一覧が「snapshot に焼き込まれた全 identity」を漏れなく含んでいることは、この crate では保証できない。一覧を作るのは snapshot を取る側。
 - entropy source の品質は `IdentitySource` の実装依存。`SystemIdentitySource` は host kernel の entropy device を使うが、その品質はここでは検証していない。
 - 同じ snapshot から restore した 2 台の VM が、identity 以外で区別できることは主張していない。memory の内容は同じ。

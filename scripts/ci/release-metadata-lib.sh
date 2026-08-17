@@ -27,8 +27,7 @@ release_metadata_load() {
     value="${line#*=}"
     [[ "${line}" == *=* && "${key}" == "${expected_keys[index]}" && -n "${value}" ]] \
       || release_metadata_die "metadata field $((index + 1)) is malformed or out of order"
-    printf -v "${key}" '%s' "${value}"
-    export "${key}"
+    declare -gx "${key}=${value}"
     index=$((index + 1))
   done < "${metadata_path}"
   (( index == ${#expected_keys[@]} )) \

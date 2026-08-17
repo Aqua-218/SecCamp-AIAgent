@@ -71,6 +71,34 @@ declare -A seen_ids=()
 readonly allowed_statuses=' verified unverified '
 readonly allowed_scopes=' hosted privileged kvm external '
 
+repository_path_is_real() {
+  local relative="$1" current="${repository_root}" component
+  IFS='/' read -r -a components <<< "${relative}"
+  for component in "${components[@]}"; do
+    [[ -n "${component}" ]] || return 1
+    current="${current}/${component}"
+    [[ ! -L "${current}" ]] || return 1
+  done
+  [[ -e "${current}" ]]
+}
+
+check_evidence_command() {
+  local command_line="$1" label="$2" executable="${command_line%% *}"
+  case "${executable}" in
+    cargo)
+      [[ "${command_line}" == *' --locked '* || "${command_line}" == *' --locked' ]] \
+        || fail "${label}: cargo evidence must use --locked"
+      ;;
+    scripts/*)
+      if ! repository_path_is_real "${executable}" \
+        || [[ ! -f "${repository_root}/${executable}" || ! -x "${repository_root}/${executable}" ]]; then
+        fail "${label}: repository command is missing, symlinked, or not executable: ${executable}"
+      fi
+      ;;
+    *) fail "${label}: unsupported evidence command boundary: ${executable}" ;;
+  esac
+}
+
 check_string_array() {
   local index="$1" field="$2" label="$3"
   local array_type length item item_index
@@ -90,13 +118,15 @@ check_string_array() {
       fail "${label}[${item_index}]: entry is empty"
     elif [[ "${item}" == *$'\n'* || "${item}" == *$'\r'* ]]; then
       fail "${label}[${item_index}]: entry contains a line break"
+    elif [[ "${field}" == commands ]]; then
+      check_evidence_command "${item}" "${label}[${item_index}]"
     fi
   done
 }
 
 check_path_array() {
   local index="$1" field="$2" label="$3"
-  local array_type length item item_index resolved
+  local array_type length item item_index
   array_type="$(yq eval -r ".claims[${index}].evidence.${field} | type" "${manifest}")"
   if [[ "${array_type}" != '!!seq' ]]; then
     fail "${label}: expected a sequence"
@@ -119,9 +149,8 @@ check_path_array() {
       fail "${label}[${item_index}]: path must be repository-relative: ${item}"
       continue
     fi
-    resolved="${repository_root}/${item}"
-    if [[ ! -e "${resolved}" ]]; then
-      fail "${label}[${item_index}]: path does not exist: ${item}"
+    if ! repository_path_is_real "${item}"; then
+      fail "${label}[${item_index}]: path is missing or crosses a symlink: ${item}"
     fi
   done
 }

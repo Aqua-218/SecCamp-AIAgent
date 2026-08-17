@@ -63,6 +63,8 @@ const TMPFS_SUPER_MAGIC: i64 = 0x0102_1994;
 const PROC_SUPER_MAGIC: i64 = 0x9fa0;
 const WORKSPACE_DEVICE: &str = "/dev/vdb";
 const FUSE_DEVICE: &str = "/dev/fuse";
+/// The kernel's own list of mountable filesystems, used to prove FUSE is present.
+const PROC_FILESYSTEMS: &str = "/proc/filesystems";
 const FUSE_MAJOR: u32 = 10;
 const FUSE_MINOR: u32 = 229;
 const CGROUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -99,6 +101,9 @@ fn run() -> Result<(), String> {
     let identity = GuestIdentity::from_environment()?;
     prepare_device_directory()?;
     prepare_procfs()?;
+    // Ordered after procfs on purpose: the kernel's own filesystem list is the direct answer to
+    // whether FUSE exists, and it only becomes readable once procfs is mounted.
+    verify_kernel_supports_fuse()?;
     prepare_cgroup_hierarchy(&config.cgroup_parent)?;
     prepare_runtime_directory(&config.runtime_dir)?;
     let workspace = config.runtime_dir.join("workspace");
@@ -465,6 +470,34 @@ fn verify_runtime_devices() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Confirms the running kernel actually carries the FUSE driver.
+///
+/// `ensure_fuse_device` can always create the `/dev/fuse` node, because a device node is just an
+/// inode carrying a major and minor number. On a kernel built without `CONFIG_FUSE_FS` that node
+/// is inert: the `CapFS` server's later mount fails with `ENODEV` from deep inside a spawn, and
+/// the message names the runtime directory rather than the missing driver. Every guest file
+/// operation goes through that mount, so this is not a degraded mode — the session cannot start
+/// at all — and the reason should be stated once, here, before any authority exists.
+///
+/// `/proc/filesystems` is the kernel's own list of what it can mount, which makes it the direct
+/// answer rather than an inference from a build flag.
+fn verify_kernel_supports_fuse() -> Result<(), String> {
+    let filesystems = fs::read_to_string(PROC_FILESYSTEMS).map_err(|error| {
+        format!("reading supported guest filesystems from {PROC_FILESYSTEMS}: {error}")
+    })?;
+    if filesystems
+        .lines()
+        .any(|line| line.split_whitespace().last() == Some("fuse"))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "the guest kernel has no FUSE driver, so the CapFS workspace mount every file operation \
+         depends on cannot be created; rebuild or repin the guest kernel with CONFIG_FUSE_FS \
+         ({PROC_FILESYSTEMS} lists no fuse entry)"
+    ))
 }
 
 /// Creates the standard FUSE device node when the kernel has not populated it in devtmpfs.

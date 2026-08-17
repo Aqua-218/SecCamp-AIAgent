@@ -656,6 +656,24 @@ pub struct RustlsGitHubProvider {
     token: Zeroizing<String>,
 }
 
+const MAX_GITHUB_TOKEN_BYTES: usize = 4096;
+
+fn validate_token(token: Zeroizing<String>) -> Result<Zeroizing<String>, GitHubProviderError> {
+    if token.is_empty()
+        || token.len() > MAX_GITHUB_TOKEN_BYTES
+        || token.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(GitHubProviderError::Transport);
+    }
+    Ok(token)
+}
+
+fn validate_environment_token(
+    token: Option<String>,
+) -> Result<Zeroizing<String>, GitHubProviderError> {
+    validate_token(Zeroizing::new(token.ok_or(GitHubProviderError::Transport)?))
+}
+
 fn read_systemd_credential(path: &Path) -> Result<Zeroizing<String>, GitHubProviderError> {
     if !path.is_absolute()
         || path
@@ -699,7 +717,7 @@ fn read_systemd_credential(path: &Path) -> Result<Zeroizing<String>, GitHubProvi
         .take(4097)
         .read_to_string(&mut token)
         .map_err(|_| GitHubProviderError::Transport)?;
-    if token.len() > 4096 {
+    if token.len() > MAX_GITHUB_TOKEN_BYTES {
         return Err(GitHubProviderError::Transport);
     }
     if token.ends_with('\n') {
@@ -740,19 +758,13 @@ impl RustlsGitHubProvider {
     /// be constructed or the host-only variable is absent.
     pub fn from_environment() -> Result<Self, GitHubProviderError> {
         let token = if let Ok(token) = std::env::var("EGRESS_GITHUB_TOKEN") {
-            Zeroizing::new(token)
+            validate_environment_token(Some(token))?
         } else {
             let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
                 .map(PathBuf::from)
                 .ok_or(GitHubProviderError::Transport)?;
-            read_systemd_credential(&directory.join("github-token"))?
+            validate_token(read_systemd_credential(&directory.join("github-token"))?)?
         };
-        if token.is_empty()
-            || token.len() > 4096
-            || token.bytes().any(|byte| byte.is_ascii_control())
-        {
-            return Err(GitHubProviderError::Transport);
-        }
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -1086,7 +1098,10 @@ const fn is_safe_repo_byte(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        env,
+        sync::{Arc, Mutex},
+    };
 
     use authority_core::github::{
         BranchName, BranchPattern, GitHubAuthority, GitHubOperation, GitHubOperations,
@@ -1098,8 +1113,11 @@ mod tests {
     use super::{
         CredentialHandle, GitHubAdapter, GitHubAdapterError, GitHubProvider, GitHubProviderError,
         GitHubResponse, GitObjectId, MAX_GITHUB_RESPONSE_BYTES, PublishBranchPlan,
-        StaticCredentialProvider, StaticPublishPlanProvider, TypedGitHubAdapter,
+        RustlsGitHubProvider, StaticCredentialProvider, StaticPublishPlanProvider,
+        TypedGitHubAdapter, validate_environment_token,
     };
+    use reqwest::blocking::Client;
+    use zeroize::Zeroizing;
 
     fn request(operation: GitHubOperation) -> GitHubRequest {
         GitHubRequest::new(
@@ -1119,6 +1137,10 @@ mod tests {
             BranchPattern::Exact(BranchName::new("main").expect("fixture branch is valid")),
             BranchPattern::Prefix(BranchName::new("agents").expect("fixture branch is valid")),
         )
+    }
+
+    fn required_live_environment(name: &str) -> String {
+        env::var(name).unwrap_or_else(|_| panic!("live GitHub smoke requires {name}"))
     }
 
     struct MockProvider {
@@ -1410,5 +1432,149 @@ mod tests {
             super::parse_update_refs_response(br#"{"data":{"updateRefs":null}}"#),
             Err(GitHubProviderError::CommitUnknown)
         );
+    }
+
+    // Requirement: an absent or malformed host credential must fail before a
+    // provider client can be constructed. Category: credential/security.
+    #[test]
+    fn invalid_credential_environment_values_fail_closed() {
+        assert_eq!(
+            validate_environment_token(None),
+            Err(GitHubProviderError::Transport)
+        );
+        for value in [String::new(), "token\nwith-control".to_owned()] {
+            assert_eq!(
+                validate_environment_token(Some(value)),
+                Err(GitHubProviderError::Transport)
+            );
+        }
+        assert_eq!(
+            validate_environment_token(Some("token-value".to_owned()))
+                .expect("a non-empty printable credential should be accepted")
+                .as_str(),
+            "token-value"
+        );
+    }
+
+    // Requirement: token material is absent from provider debug output and
+    // typed adapter errors. Category: credential/redaction. Risk: critical.
+    #[test]
+    fn provider_debug_and_typed_errors_never_leak_the_token() {
+        let secret = "ghp_live_smoke_secret_that_must_not_escape";
+        let provider = RustlsGitHubProvider {
+            client: Client::builder()
+                .build()
+                .expect("test rustls client must build"),
+            token: Zeroizing::new(secret.to_owned()),
+        };
+        let debug = format!("{provider:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(secret));
+        let typed_error = GitHubAdapterError::ProviderUnauthorized;
+        assert!(!format!("{typed_error:?}").contains(secret));
+        assert!(!typed_error.to_string().contains(secret));
+    }
+
+    // Requirement: this is an explicit, operator-confirmed smoke over one
+    // disposable repository. It executes only the fixed typed adapter, never
+    // a caller-supplied URL, method, header, or body.
+    // Category: external-provider/security. Risk: critical.
+    #[test]
+    #[ignore = "requires an operator-provisioned disposable GitHub repository and token"]
+    #[allow(clippy::too_many_lines)]
+    fn live_github_disposable_repository_smoke() {
+        assert!(!required_live_environment("EGRESS_GITHUB_TOKEN").is_empty());
+        let installation =
+            InstallationId::new(required_live_environment("EGRESS_GITHUB_INSTALLATION_ID"));
+        let repository_name = required_live_environment("EGRESS_GITHUB_DISPOSABLE_REPOSITORY");
+        let base = BranchName::new(required_live_environment("EGRESS_GITHUB_BASE_BRANCH"))
+            .expect("EGRESS_GITHUB_BASE_BRANCH must be a valid branch name");
+        let head = BranchName::new(required_live_environment("EGRESS_GITHUB_HEAD_BRANCH"))
+            .expect("EGRESS_GITHUB_HEAD_BRANCH must be a valid branch name");
+        let expected_old = GitObjectId::new(required_live_environment(
+            "EGRESS_GITHUB_EXPECTED_OLD_OBJECT",
+        ))
+        .expect("EGRESS_GITHUB_EXPECTED_OLD_OBJECT must be a Git object ID");
+        let new_object = GitObjectId::new(required_live_environment("EGRESS_GITHUB_NEW_OBJECT"))
+            .expect("EGRESS_GITHUB_NEW_OBJECT must be a Git object ID");
+        let acknowledgement = required_live_environment("EGRESS_GITHUB_DISPOSABLE_ACK");
+        assert_eq!(
+            acknowledgement,
+            format!("I_UNDERSTAND_DISPOSABLE_REPOSITORY:{repository_name}"),
+            "the acknowledgement must name the exact disposable repository"
+        );
+        assert!(!repository_name.is_empty());
+
+        // Keep the token in the provider only. The adapter receives an opaque
+        // handle and the same fixed typed operation as a guest request.
+        let provider = RustlsGitHubProvider::from_environment()
+            .expect("EGRESS_GITHUB_TOKEN must be accepted by the rustls provider");
+        let repository = RepoId::new(repository_name);
+        let authority = GitHubAuthority::new(
+            installation.clone(),
+            repository.clone(),
+            GitHubOperations::from_operations([
+                GitHubOperation::PublishBranch,
+                GitHubOperation::CreatePullRequest,
+            ]),
+            BranchPattern::Exact(base.clone()),
+            BranchPattern::Exact(head.clone()),
+        );
+        let publish_request = GitHubRequest::new(
+            installation.clone(),
+            repository.clone(),
+            GitHubOperation::PublishBranch,
+            base.clone(),
+            head.clone(),
+        );
+        let pull_request = GitHubRequest::new(
+            installation.clone(),
+            repository,
+            GitHubOperation::CreatePullRequest,
+            base,
+            head,
+        );
+        let publish_id = BrokerRequestId::new([41; 16]);
+        let pull_id = BrokerRequestId::new([42; 16]);
+        let mut adapter = TypedGitHubAdapter::new(
+            provider,
+            super::EnvironmentCredentialProvider::new(
+                installation,
+                CredentialHandle::from_host_id(1),
+            ),
+            StaticPublishPlanProvider::new([(
+                publish_id,
+                publish_request.clone(),
+                PublishBranchPlan::new(new_object, expected_old),
+            )]),
+        );
+
+        // A stale expected-old object must become a typed conflict. If the
+        // operator supplied the current object instead, the same request may
+        // publish the disposable branch; either result remains non-force and
+        // is covered by the explicit acknowledgement and cleanup procedure.
+        match adapter.execute(
+            publish_id,
+            &publish_request,
+            &authority,
+            MAX_GITHUB_RESPONSE_BYTES,
+        ) {
+            Ok(response) => assert_eq!(response.operation(), GitHubOperation::PublishBranch),
+            Err(GitHubAdapterError::ProviderConflict) => {}
+            Err(error) => {
+                panic!("live PublishBranch returned an unexpected typed error: {error:?}")
+            }
+        }
+
+        let response = adapter
+            .execute(
+                pull_id,
+                &pull_request,
+                &authority,
+                MAX_GITHUB_RESPONSE_BYTES,
+            )
+            .expect("live CreatePullRequest must return a typed success");
+        assert_eq!(response.operation(), GitHubOperation::CreatePullRequest);
+        assert!(response.response_bytes() > 0);
     }
 }

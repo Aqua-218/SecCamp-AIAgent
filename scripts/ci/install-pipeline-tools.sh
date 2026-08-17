@@ -27,7 +27,7 @@ readonly yq_url="https://github.com/mikefarah/yq/releases/download/v${yq_version
 
 # shellcheck source=scripts/ci/install-binary-tool-lib.sh
 source "${repository_root}/scripts/ci/install-binary-tool-lib.sh"
-binary_install_init
+binary_install_init "${tools_root}" "${tool_bin}" "${downloads}"
 
 binary_fetch_pinned actionlint "${actionlint_url}" "${actionlint_archive}" "${actionlint_sha256}"
 binary_publish_archive_member actionlint "${actionlint_archive}" "${actionlint_sha256}" \

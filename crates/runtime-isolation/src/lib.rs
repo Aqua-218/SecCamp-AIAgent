@@ -145,7 +145,7 @@ mod tests {
                     let (reader, writer) = startup_pipe();
                     let child_result =
                         child_entry(self, preparation, ChildStartupNotifier::from_fd(writer));
-                    self.startup_messages.push(read_startup_message(reader));
+                    self.startup_messages.extend(read_startup_messages(reader));
                     Ok(SpawnOutcome::Child(child_result))
                 }
                 MockSpawnRole::Reject => {
@@ -227,13 +227,18 @@ mod tests {
         (reader, writer)
     }
 
-    fn read_startup_message(reader: OwnedFd) -> [u8; STARTUP_MESSAGE_LEN] {
+    fn read_startup_messages(reader: OwnedFd) -> Vec<[u8; STARTUP_MESSAGE_LEN]> {
         let mut reader = File::from(reader);
-        let mut message = [0_u8; STARTUP_MESSAGE_LEN];
-        reader
-            .read_exact(&mut message)
-            .expect("mock child must emit one complete startup message");
-        message
+        let mut messages = Vec::new();
+        loop {
+            let mut message = [0_u8; STARTUP_MESSAGE_LEN];
+            match reader.read_exact(&mut message) {
+                Ok(()) => messages.push(message),
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => panic!("reading mock child startup message: {error}"),
+            }
+        }
+        messages
     }
 
     fn assert_ready_message(message: &[u8; STARTUP_MESSAGE_LEN], namespace: NamespaceIdentity) {
@@ -353,9 +358,25 @@ mod tests {
         ];
         expected_events.extend(expected[1..].iter().copied().map(MockEvent::Apply));
         assert_eq!(backend.events, expected_events);
-        assert_eq!(backend.startup_messages.len(), 1);
+        assert_eq!(backend.startup_messages.len(), expected.len() + 1);
+        for (index, message) in backend
+            .startup_messages
+            .iter()
+            .take(expected.len())
+            .enumerate()
+        {
+            assert_common_startup_header(
+                message,
+                3,
+                u8::try_from(index).expect("required step index fits u8"),
+                0,
+            );
+        }
         assert_ready_message(
-            &backend.startup_messages[0],
+            backend
+                .startup_messages
+                .last()
+                .expect("terminal readiness message must exist"),
             NamespaceIdentity::from_kernel(4, 11),
         );
     }
@@ -445,8 +466,16 @@ mod tests {
         assert_eq!(backend.child_verifications, 1);
         assert!(backend.calls.is_empty());
         assert_eq!(backend.rollbacks, vec![IsolationStep::Namespaces]);
-        assert_eq!(backend.startup_messages.len(), 1);
-        assert_failure_message(&backend.startup_messages[0], 0, None, 0);
+        assert_eq!(backend.startup_messages.len(), 2);
+        assert_failure_message(
+            backend
+                .startup_messages
+                .last()
+                .expect("terminal failure message must exist"),
+            0,
+            None,
+            0,
+        );
         assert_eq!(
             backend.events,
             vec![
@@ -486,8 +515,15 @@ mod tests {
                 IsolationStep::Namespaces,
             ]
         );
-        assert_eq!(backend.startup_messages.len(), 1);
-        assert_failure_message(&backend.startup_messages[0], 9, None, 0);
+        assert_failure_message(
+            backend
+                .startup_messages
+                .last()
+                .expect("terminal failure message must exist"),
+            9,
+            None,
+            0,
+        );
     }
 
     #[test]
@@ -511,8 +547,15 @@ mod tests {
                 && failures[0].step == IsolationStep::Workspace
                 && failures[0].errno == Some(libc::EBUSY)
         ));
-        assert_eq!(backend.startup_messages.len(), 1);
-        assert_failure_message(&backend.startup_messages[0], 9, Some(libc::EACCES), 1);
+        assert_failure_message(
+            backend
+                .startup_messages
+                .last()
+                .expect("terminal failure message must exist"),
+            9,
+            Some(libc::EACCES),
+            1,
+        );
     }
 
     #[test]
@@ -591,6 +634,28 @@ mod tests {
         ] {
             let error = SeccompPolicy::new([syscall]).expect_err("forbidden syscall must fail");
             assert!(error.to_string().contains("forbidden"));
+        }
+    }
+
+    #[test]
+    fn conservative_seccomp_policy_covers_standard_library_capfs_operations() {
+        let policy = SeccompPolicy::conservative();
+        for syscall in [
+            Syscall::Mkdir,
+            Syscall::Openat,
+            Syscall::Chmod,
+            Syscall::Linkat,
+            Syscall::Symlink,
+            Syscall::Readlink,
+            Syscall::Rename,
+            Syscall::Ftruncate,
+            Syscall::Unlink,
+            Syscall::Rmdir,
+        ] {
+            assert!(
+                policy.allows(syscall),
+                "the fixed guest CapFS probe requires {syscall}"
+            );
         }
     }
 

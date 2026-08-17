@@ -330,7 +330,7 @@ plan="$(
   printf '"cross_targets":%s,' \
     "$(project_matrix '[.matrices.cross_targets.values[] | {"triple": .triple}]')"
   printf '"miri_packages":%s,' \
-    "$(project_matrix '[.matrices.miri_packages.values[] | {"package": .package}]')"
+    "$(project_matrix '[.matrices.miri_packages.values[] | {"package": .package, "filter": .filter}]')"
   printf '"sanitizer_modes":%s,' \
     "$(project_matrix '[.matrices.sanitizer_modes.values[] | {"mode": .mode, "package": .package}]')"
   printf '"fuzz_targets":%s,' \

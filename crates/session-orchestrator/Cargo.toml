@@ -15,3 +15,7 @@ authority-core = { path = "../authority-core" }
 egress-broker = { path = "../egress-broker" }
 egress-protocol = { path = "../egress-protocol" }
 firecracker-runtime = { path = "../firecracker-runtime" }
+rustix = { version = "1.1.4", features = ["net", "process"] }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "=0.3.18"

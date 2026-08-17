@@ -29,6 +29,45 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  standard_quality:
+    name: Re-run standard quality gates
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  standard_security:
+    name: Re-run standard security gates
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+  plan:
+    name: Plan deep gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      gates: ${{ steps.plan.outputs.gates }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Install pinned pipeline parser
+        run: scripts/ci/install-pipeline-tools.sh
+      - name: Materialize the manifest-owned deep plan
+        id: plan
+        env:
+          PLAN_EVENT: ${{ github.event_name }}
+          PLAN_PLATFORM: github
+          PLAN_TIER: deep
+        run: |
+          set -euo pipefail
+          scripts/ci/plan-pipeline.sh --workflow deep.yml --output plan.json >/dev/null
+          echo "gates=$(cat plan.json)" >> "${GITHUB_OUTPUT}"
+
   miri:
     name: Miri undefined-behaviour check / ${{ matrix.package }} / ${{ matrix.filter }}
     runs-on: ubuntu-24.04
@@ -176,7 +215,8 @@ jobs:
     name: Real Firecracker VM verification
     # Requires /dev/kvm, /dev/vhost-vsock, and veritysetup. Runner labels are
     # repository configuration; docs/ci-cd.md records what the host must provide.
-    runs-on: [self-hosted, linux, x64, kvm]
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, x64, kvm, ephemeral]
     timeout-minutes: 45
     steps:
       - name: Check out source
@@ -192,7 +232,8 @@ jobs:
   privileged_isolation:
     name: Privileged runtime isolation verification
     # Requires root and a cgroup v2 root that delegates memory and pids. No KVM.
-    runs-on: [self-hosted, linux, x64, privileged]
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, x64, privileged, ephemeral]
     timeout-minutes: 20
     steps:
       - name: Check out source
@@ -209,6 +250,9 @@ jobs:
     name: Deep verification complete
     if: ${{ always() }}
     needs:
+      - standard_quality
+      - standard_security
+      - plan
       - miri
       - sanitizers
       - mutation
@@ -219,9 +263,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Enforce every system gate
+      - name: Check out fan-in implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Reconcile observed jobs with the manifest plan
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          jq -e 'all(.[]; .result == "success")' <<< "${NEEDS_JSON}"
+          jq -e '.standard_quality.result == "success" and .standard_security.result == "success"' <<< "${NEEDS_JSON}"
+          printf '%s\n' '${{ needs.plan.outputs.gates }}' > plan.json
+          scripts/ci/collect-gate-results.sh --from-needs --output results.tsv >/dev/null
+          scripts/ci/check-gate-results.sh --plan plan.json --results results.tsv

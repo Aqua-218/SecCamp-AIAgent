@@ -308,6 +308,7 @@ pub enum GuestControlState {
 pub const MAX_GUEST_CONTROL_HEADER_BYTES: usize = 4 * 1024;
 /// Maximum accepted JSON body size on the guest-control endpoint.
 pub const MAX_GUEST_CONTROL_BODY_BYTES: usize = 1024;
+const MAX_WORKLOAD_ERROR_DIAGNOSTIC_BYTES: usize = MAX_GUEST_CONTROL_BODY_BYTES;
 
 /// Result of a successfully applied guest-control HTTP operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -491,13 +492,32 @@ impl GuestControlServer {
                     return Ok(result);
                 }
             };
-            if start_workload(accepted).is_err() {
-                result = response(503, String::new(), None);
+            if let Err(error) = start_workload(accepted) {
+                // The host is the only accepted peer. Bound and sanitize the image-controlled
+                // error so a failed image can be diagnosed without creating an unbounded or
+                // control-character-bearing response.
+                result = response(503, workload_error_diagnostic(&error), None);
             }
         }
         write_http_response(stream, &result)?;
         Ok(result)
     }
+}
+
+fn workload_error_diagnostic(error: &io::Error) -> String {
+    let mut diagnostic = format!("workload-start:{:?}:", error.kind());
+    for byte in error
+        .to_string()
+        .bytes()
+        .take(MAX_WORKLOAD_ERROR_DIAGNOSTIC_BYTES.saturating_sub(diagnostic.len()))
+    {
+        diagnostic.push(if byte.is_ascii_graphic() || byte == b' ' {
+            char::from(byte)
+        } else {
+            '?'
+        });
+    }
+    diagnostic
 }
 
 fn response(
@@ -1386,7 +1406,7 @@ mod tests {
             .expect("a rejected workload still receives an HTTP response");
         assert_eq!(response.status(), 503);
         assert_eq!(response.outcome(), None);
-        assert!(response.body().is_empty());
+        assert_eq!(response.body(), "workload-start:Other:workload unavailable");
     }
 
     #[test]

@@ -92,6 +92,12 @@ mod implementation {
     const NULL_DEVICE_MINOR: libc::c_uint = 3;
     const CLONE_INTO_CGROUP: u64 = 1_u64 << 33;
 
+    // This hook exists only in debug builds so the privileged integration probe can force a
+    // deterministic failure at a real mount boundary. Release builds do not compile the hook or
+    // read its environment variable, leaving the production backend's default behavior intact.
+    #[cfg(debug_assertions)]
+    const TEST_FAILURE_STEP_ENV: &str = "RUNTIME_ISOLATION_TEST_FAIL_STEP";
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct PidNamespaceObservation {
         current: NamespaceIdentity,
@@ -412,6 +418,10 @@ mod implementation {
             step: IsolationStep,
             config: &IsolationConfig,
         ) -> Result<(), BackendError> {
+            #[cfg(debug_assertions)]
+            if let Some(error) = test_failure_before_step(step) {
+                return Err(error);
+            }
             match step {
                 IsolationStep::Namespaces => Err(BackendError::new(
                     step,
@@ -493,6 +503,20 @@ mod implementation {
                 )),
             }
         }
+    }
+
+    #[cfg(debug_assertions)]
+    fn test_failure_before_step(step: IsolationStep) -> Option<BackendError> {
+        if step == IsolationStep::LimitedTmpfs
+            && std::env::var(TEST_FAILURE_STEP_ENV).ok().as_deref() == Some("limited-tmpfs")
+        {
+            return Some(BackendError::new(
+                step,
+                "debug-only privileged rollback fault injected before limited tmpfs mount",
+                None,
+            ));
+        }
+        None
     }
 
     impl LinuxBackend {

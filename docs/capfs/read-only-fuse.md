@@ -245,6 +245,8 @@ FUSE境界では内部構造を細かく漏らさず、失敗の種類を次の�
 
 [`crates/capfs/tests/read_only_fuse.rs`](../../crates/capfs/tests/read_only_fuse.rs) は実際にLinux FUSEへmountする。`allowed.txt`を開いて読んだ後にCapabilityをrevokeし、同じOS file descriptorで再度readして`PermissionDenied`になることを確認する。write testは`O_TRUNC` openでfileを空にし、writeを成功させた後にCapabilityをrevokeする。同じdescriptorからの次のwriteと`set_len`はともに`PermissionDenied`になり、backingの長さも変わらない。metadata testは同じdescriptorで`chmod`してordinary modeだけが反映されること、revoke後の次の`chmod`は`PermissionDenied`でbackingを変えないことを確認する。create testは`MKDIR`、writable `CREATE`、返却handleからのwriteを実mountで通し、parent directory fdを保持したままrevoke後に`mkdirat`すると、targetのlookup自体が`NotFound`となり削除に届かないことを確認する。mutation testはno-replace `RENAME`、`UNLINK`、`RMDIR`を実mountで通し、revoke後に同じparent fdからの`unlinkat`がtarget lookupで`NotFound`となることを確認する。同じmount上の権限外 siblingも`NotFound`になる。directory testでは、祖先directoryのlisting拒否、許可prefixのcanonical-name順 listingを確認する。さらに40 byteの`getdents` bufferで応答を1 entryずつに分け、1回目の`READDIR`後にrevokeして、同じdirectory fdからの2回目が`PermissionDenied`になること、同様に1回目の後で`CREATE`したstreamは2回目で`EAGAIN`になることを確認する。link testは実mount上で`symlink(2)`・`readlink(2)`・link経由のreadを通し、絶対target・root外へ出るtarget・名前付きcomponentの後ろに`..`を持つtargetが作られないこと、`CreateSymlink`と`ReadLink`がそれぞれ独立に要ること、`link(2)`が同一inodeへ2つ目の名前を作り許可範囲外へは作れないこと、**repository外にaliasを持つinodeは許可範囲内の名前からもread不能かつlistingに現れないこと**、`mknod(2)`が`EPERM`になることを確認する。
 
+同じ実mount suiteでは、`mounted_view_rejects_backing_replacement_and_symlink_substitution` が、import後に同種regular fileをrename＋再作成した置換と、symlinkを絶対targetへ置き換えたケースを`EIO`にし、replacementや外部内容を返さないことを確認する。`mounted_view_handles_deep_symlink_chains_and_cycles` は8段のcontained symlink chainを解決し、2-node cycleを`ELOOP`にする。`mounted_view_rejects_a_real_nested_mount_during_preflight` はbacking配下へ実FUSE mountを重ねた状態でfresh preflightを行い、nested mountを`NestedMount`として拒否する境界をrequired gateで確認する。
+
 実mount testは`/dev/fuse`が存在しない環境だけskipする。deviceが存在するのにmount設定や権限が壊れている場合はtest failureとして扱う。
 
 `crates/capfs/tests/concurrency.rs` のbounded contractは、実backing syscallを抽象化した
@@ -252,10 +254,11 @@ namespace / Capability境界で、write中のrevokeとopen / close / rename / un
 32 round検査する。成功したwriteはrevoke returnより後へ越境せず、revoke完了後のmutationは
 executorへ入らず、open countとauthority handle countはcloseでゼロへ戻る。
 
-実kernelが送るFORGETの全lifecycle、mount中の敵対的backing差し替え、実syscallを含む
-rename / writeの物理的な競合、複数thread FUSE sessionはこのunit contractの対象外である。
-実FUSE mount testは`/dev/fuse`がない環境では実行不能理由を標準エラーへ記録して終了し、
-deviceが存在するのにmount設定または権限が壊れている場合は失敗として扱う。
+実kernelが送るFORGETの全lifecycle、全長・全topologyのsymlink、連続するbacking差し替え
+race、実syscallを含む全rename / writeの物理的な競合、複数thread FUSE sessionはこのunit
+contractの対象外である。実FUSE mount testは`/dev/fuse`がない環境では実行不能理由を標準
+エラーへ記録して終了し、deviceが存在するのにmount設定または権限が壊れている場合は失敗
+として扱う。全21件をno-skipで走らせる証拠は`scripts/ci/verify-real-capfs.sh`に固定する。
 
 ## linkをどう認可するのか
 

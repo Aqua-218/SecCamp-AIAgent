@@ -78,7 +78,7 @@ flowchart TB
 | `public_fetch` | rustls HTTPS の `GET`/`HEAD`、redirect ごとの再検査、DNS 再解決、本文上限付き streaming |
 | `github` | 型付き provider 操作、opaque credential handle、publish の事前条件、型付きエラー |
 
-production adapter は Reqwest の rustls backend、redirect 無効、proxy 探索無効で構成される。unit test は resolver、connector、provider、credential、publish plan の fake を注入し、外部ネットワークへ接続せず、実 secret も読み込まない。transport には per-read/per-write と absolute connection deadline の API があるが、現行 `BuiltBrokerRuntime` は互換の plain `serve_connection` を使うため、production Firecracker UDS の absolute connection deadline wiring は未完了である。
+production adapter は Reqwest の rustls backend、redirect 無効、proxy 探索無効で構成される。unit test は resolver、connector、provider、credential、publish plan の fake を注入し、外部ネットワークへ接続せず、実 secret も読み込まない。production `BuiltBrokerRuntime` は `DeadlineStream` と `serve_connection_with_policy` を組み合わせ、per-read/per-write timeout と absolute connection deadline の両方を Firecracker UDS に適用する。
 
 ## セキュリティ境界
 

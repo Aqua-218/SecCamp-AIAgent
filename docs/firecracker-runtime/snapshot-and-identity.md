@@ -113,6 +113,23 @@ snapshot 元を `WorkloadStopped` に限っているため、snapshot に何が�
 
 restore の失敗が resource を残さないので、retry が安全に書ける。
 
+## guest-control v1 から v2 への移行契約
+
+| host / image | 結果 | 運用 |
+|---|---|---|
+| v2 production host + v2 image | policy version/digest を identity と同じ request/ACK に束縛し、guest が固定 policy から独立再計算した後だけ readiness を返す | 唯一の production 組み合わせ |
+| v2 production host + v1 image | v2 endpoint または canonical ACK が成立せず workload gate は閉じたまま | image を先に更新し、snapshot を再作成する |
+| legacy caller + v2 image | `guest-supervisor-init` に必須 policy 環境が無いため readiness 前に失敗する。production runtime は unbound lease/v1 start API も拒否する | legacy caller を production に戻さない |
+| legacy caller + legacy image | parser compatibility と hosted regression test のみ | production 対象外 |
+
+authority encoding version、guest repository/effect/path policy、guest init、kernel/rootfs、または
+seccomp を変更したら snapshot を再作成し、host と image を同じ release 単位で展開する。現行
+snapshot manifest の fingerprint は boot artifact を束縛するが policy digest 自体はまだ保持しない。
+このため誤った組み合わせは guest の独立 digest gate で fail closed するものの restore 後の遅い
+失敗になる。snapshot manifest での事前拒否と durable cross-domain revoke receipt は Proposed の
+[ADR 0018](../decisions/0018-bind-host-and-guest-authority-with-a-policy-digest-and-revocation-barrier.md)
+の残件であり、達成前に ADR を Accepted と扱わない。
+
 ## 正確な保証範囲
 
 state 遷移と identity 検査は fake adapter を使う test で確認している。

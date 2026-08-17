@@ -9,7 +9,7 @@ use crate::{IsolationError, SeccompPolicy};
 
 const MAX_TMPFS_BYTES: u64 = 1 << 30;
 const MAX_CGROUP_NAME_BYTES: usize = 255;
-const MIN_LANDLOCK_ABI: u32 = 3;
+const SUPPORTED_LANDLOCK_ABI: u32 = 3;
 
 /// A bind-mounted, read-only root filesystem.
 #[derive(Clone, Debug)]
@@ -120,6 +120,40 @@ impl EgressChannelConfig {
     }
 }
 
+/// A close-on-exec channel used only to prove that the workload reached `execve`.
+///
+/// The isolation child retains this descriptor through the descriptor sweep, but the descriptor
+/// must carry `FD_CLOEXEC`. A successful `execve` therefore closes it atomically; an `execve`
+/// failure writes a bounded failure marker before the isolated child exits. The channel is never
+/// exposed to the workload program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecStatusChannelConfig {
+    fd: RawFd,
+}
+
+impl ExecStatusChannelConfig {
+    /// Describes the nonstandard close-on-exec status descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IsolationError::InvalidConfig`] when `fd` overlaps standard input, output, or
+    /// error.
+    pub fn new(fd: RawFd) -> Result<Self, IsolationError> {
+        if fd < 3 {
+            return Err(InvalidConfig::message(
+                "the workload exec-status channel must not use a standard descriptor",
+            ));
+        }
+        Ok(Self { fd })
+    }
+
+    /// Returns the descriptor retained only until the workload is executed.
+    #[must_use]
+    pub const fn fd(self) -> RawFd {
+        self.fd
+    }
+}
+
 /// A bounded writable tmpfs mount.
 #[derive(Clone, Debug)]
 pub struct TmpfsConfig {
@@ -217,6 +251,7 @@ pub struct IsolationConfig {
     pub(crate) identity: IdentityMap,
     pub(crate) control_channel: Option<ControlChannelConfig>,
     pub(crate) egress_channel: Option<EgressChannelConfig>,
+    pub(crate) exec_status_channel: Option<ExecStatusChannelConfig>,
 }
 
 impl IsolationConfig {
@@ -240,6 +275,7 @@ impl IsolationConfig {
             identity,
             control_channel: None,
             egress_channel: None,
+            exec_status_channel: None,
         }
     }
 
@@ -254,6 +290,16 @@ impl IsolationConfig {
     #[must_use]
     pub fn with_egress_channel(mut self, egress_channel: EgressChannelConfig) -> Self {
         self.egress_channel = Some(egress_channel);
+        self
+    }
+
+    /// Retains one close-on-exec status channel until the workload reaches `execve`.
+    #[must_use]
+    pub fn with_exec_status_channel(
+        mut self,
+        exec_status_channel: ExecStatusChannelConfig,
+    ) -> Self {
+        self.exec_status_channel = Some(exec_status_channel);
         self
     }
 
@@ -292,14 +338,22 @@ impl IsolationConfig {
                 "Landlock writable paths must be inside the workspace target",
             ));
         }
-        if self.workspace.target == self.tmpfs.target
-            || self.workspace.target == Path::new("/proc")
-            || self.workspace.target == Path::new("/dev")
-            || self.tmpfs.target == Path::new("/proc")
-            || self.tmpfs.target == Path::new("/dev")
-        {
+        let workload_mounts = [
+            self.workspace.target.as_path(),
+            self.tmpfs.target.as_path(),
+            Path::new("/proc"),
+            Path::new("/dev"),
+            Path::new("/run"),
+            Path::new("/sys"),
+        ];
+        if workload_mounts.iter().enumerate().any(|(index, path)| {
+            workload_mounts
+                .iter()
+                .skip(index + 1)
+                .any(|candidate| paths_overlap(path, candidate))
+        }) {
             return Err(InvalidConfig::message(
-                "workspace, tmpfs, /proc, and /dev mount targets must be distinct",
+                "workspace, tmpfs, /proc, /dev, /run, and /sys mount targets must not overlap",
             ));
         }
         Ok(())
@@ -362,9 +416,9 @@ fn validate_cgroup(config: &CgroupConfig) -> Result<(), IsolationError> {
 }
 
 fn validate_landlock(config: &LandlockConfig) -> Result<(), IsolationError> {
-    if config.required_abi < MIN_LANDLOCK_ABI {
+    if config.required_abi != SUPPORTED_LANDLOCK_ABI {
         return Err(InvalidConfig::message(
-            "Landlock ABI 3 is required for truncate and refer enforcement",
+            "exactly Landlock ABI 3 is supported by this access-mask schema",
         ));
     }
     if config.read_only_paths.is_empty() || config.writable_paths.is_empty() {
@@ -380,6 +434,10 @@ fn validate_landlock(config: &LandlockConfig) -> Result<(), IsolationError> {
         validate_absolute_clean_path(path, "Landlock path")?;
     }
     Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
 }
 
 fn validate_absolute_clean_path(path: &Path, label: &str) -> Result<(), IsolationError> {
@@ -405,7 +463,24 @@ impl InvalidConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlChannelConfig, EgressChannelConfig};
+    use super::{
+        BindMountConfig, CgroupConfig, ControlChannelConfig, EgressChannelConfig,
+        ExecStatusChannelConfig, IdentityMap, IsolationConfig, LandlockConfig, RootfsConfig,
+        TmpfsConfig,
+    };
+    use crate::SeccompPolicy;
+
+    fn config(workspace: &str, tmpfs: &str, landlock_abi: u32) -> IsolationConfig {
+        IsolationConfig::new(
+            RootfsConfig::new("/rootfs", "/staging/rootfs", "/staging/rootfs/.old-root"),
+            BindMountConfig::new("/workspace-source", workspace),
+            TmpfsConfig::new(tmpfs, 4096),
+            CgroupConfig::new("/sys/fs/cgroup/agent", "session", 4096, 8),
+            LandlockConfig::new(landlock_abi, ["/"], [workspace]),
+            SeccompPolicy::conservative(),
+            IdentityMap::new(1000, 1000),
+        )
+    }
 
     #[test]
     fn refuses_control_channel_descriptors_that_overlap_standard_io() {
@@ -433,5 +508,40 @@ mod tests {
                 .fd(),
             3
         );
+    }
+
+    #[test]
+    fn refuses_exec_status_descriptors_that_overlap_standard_io() {
+        assert!(ExecStatusChannelConfig::new(2).is_err());
+        assert_eq!(
+            ExecStatusChannelConfig::new(3)
+                .expect("the first nonstandard descriptor must be accepted")
+                .fd(),
+            3
+        );
+    }
+
+    #[test]
+    fn accepts_only_the_landlock_abi_implemented_by_the_access_mask() {
+        assert!(config("/workspace", "/tmp", 3).validate().is_ok());
+        assert!(config("/workspace", "/tmp", 2).validate().is_err());
+        assert!(config("/workspace", "/tmp", 4).validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ancestor_and_descendant_mount_target_overlaps() {
+        for (workspace, tmpfs) in [
+            ("/workspace", "/workspace/tmp"),
+            ("/workspace/cache", "/workspace"),
+            ("/proc/agent", "/tmp"),
+            ("/workspace", "/dev/shm"),
+            ("/run/agent", "/tmp"),
+            ("/workspace", "/sys/agent"),
+        ] {
+            assert!(
+                config(workspace, tmpfs, 3).validate().is_err(),
+                "overlapping targets {workspace} and {tmpfs} must be rejected"
+            );
+        }
     }
 }

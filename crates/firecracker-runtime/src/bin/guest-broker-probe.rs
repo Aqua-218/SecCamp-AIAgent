@@ -10,16 +10,15 @@
 use std::{
     env,
     fs::File,
-    io::{Read, Write},
+    io::{self, Write},
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
 };
 
 use authority_core::http::{CanonicalHost, CanonicalUrlPath, HttpFetchMethod, HttpFetchRequest};
 use egress_protocol::{
-    cbor::CanonicalBrokerRequest,
-    frame::{CONTROL_FRAME_LENGTH_PREFIX_BYTES, ControlFrame, ValidatedFrameLength},
+    client::GuestBrokerClient,
     operation::BrokerOperation,
-    response::{BrokerWireOutcome, BrokerWireRejection, CanonicalBrokerResponse},
+    response::{BrokerWireOutcome, BrokerWireRejection},
     session::{BrokerRequestId, BrokerSessionId},
 };
 use socket2::{Domain, SockAddr, Socket, Type};
@@ -30,6 +29,9 @@ const PROBE_SESSION: BrokerSessionId = BrokerSessionId::new([7; 16]);
 const PROBE_REQUEST: BrokerRequestId = BrokerRequestId::new([8; 16]);
 const EGRESS_BROKER_FD_ENV: &str = "EGRESS_BROKER_FD";
 const EGRESS_BROKER_SESSION_ENV: &str = "EGRESS_BROKER_SESSION_ID";
+const SUPERVISOR_READINESS_ENV: &str = "GUEST_SUPERVISOR_READINESS";
+const SUPERVISOR_READINESS_REQUIRED: &str = "1";
+const SUPERVISOR_READY_MARKER: &[u8; 25] = b"guest-supervisor-ready/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Transport {
@@ -48,37 +50,28 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<(), String> {
+    signal_supervisor_readiness(
+        env::var(SUPERVISOR_READINESS_ENV).ok().as_deref(),
+        &mut io::stdout().lock(),
+    )?;
     let transport = parse_transport(env::args().skip(1))?;
     let session = match transport {
         Transport::Inherited => broker_session_from_environment()?,
         Transport::DirectVsock(_) => PROBE_SESSION,
     };
-    let request = CanonicalBrokerRequest::new(
-        session,
-        0,
-        PROBE_REQUEST,
-        BrokerOperation::PublicFetch(HttpFetchRequest::new(
-            HttpFetchMethod::Get,
-            CanonicalHost::new("broker-probe.invalid")
-                .map_err(|error| format!("constructing fixed probe host: {error}"))?,
-            CanonicalUrlPath::new("/")
-                .map_err(|error| format!("constructing fixed probe path: {error}"))?,
-            1_024,
-        )),
-    );
-    let frame = ControlFrame::new(
-        request
-            .encode()
-            .map_err(|error| format!("encoding fixed probe request: {error}"))?,
-    )
-    .map_err(|error| format!("framing fixed probe request: {error}"))?;
-
-    let mut channel = File::from(open_transport(transport)?);
-    channel
-        .write_all(&frame.encode())
-        .map_err(|error| format!("writing fixed probe frame: {error}"))?;
-
-    let response = read_response(&mut channel)?;
+    let operation = BrokerOperation::PublicFetch(HttpFetchRequest::new(
+        HttpFetchMethod::Get,
+        CanonicalHost::new("broker-probe.invalid")
+            .map_err(|error| format!("constructing fixed probe host: {error}"))?,
+        CanonicalUrlPath::new("/")
+            .map_err(|error| format!("constructing fixed probe path: {error}"))?,
+        1_024,
+    ));
+    let channel = File::from(open_transport(transport)?);
+    let mut client = GuestBrokerClient::new(channel, session);
+    let response = client
+        .execute_with_id(PROBE_REQUEST, operation)
+        .map_err(|error| format!("executing fixed probe request: {error}"))?;
     if response.request() != PROBE_REQUEST {
         return Err("host response did not bind the fixed probe request".to_owned());
     }
@@ -88,6 +81,22 @@ fn run() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn signal_supervisor_readiness(
+    requirement: Option<&str>,
+    output: &mut impl Write,
+) -> Result<(), String> {
+    match requirement {
+        None => Ok(()),
+        Some(SUPERVISOR_READINESS_REQUIRED) => output
+            .write_all(SUPERVISOR_READY_MARKER)
+            .and_then(|()| output.flush())
+            .map_err(|error| format!("signalling guest supervisor readiness: {error}")),
+        Some(_) => Err(format!(
+            "{SUPERVISOR_READINESS_ENV} must be exactly {SUPERVISOR_READINESS_REQUIRED} when present"
+        )),
+    }
 }
 
 fn parse_transport(mut arguments: impl Iterator<Item = String>) -> Result<Transport, String> {
@@ -174,22 +183,6 @@ fn broker_session_from_environment() -> Result<BrokerSessionId, String> {
     Ok(BrokerSessionId::new(bytes))
 }
 
-fn read_response(channel: &mut File) -> Result<CanonicalBrokerResponse, String> {
-    let mut prefix = [0_u8; CONTROL_FRAME_LENGTH_PREFIX_BYTES];
-    channel
-        .read_exact(&mut prefix)
-        .map_err(|error| format!("reading response frame prefix: {error}"))?;
-    let length = ValidatedFrameLength::from_network_prefix(prefix)
-        .map_err(|error| format!("validating response frame length: {error}"))?
-        .as_usize();
-    let mut payload = vec![0_u8; length];
-    channel
-        .read_exact(&mut payload)
-        .map_err(|error| format!("reading response frame payload: {error}"))?;
-    CanonicalBrokerResponse::decode(&payload)
-        .map_err(|error| format!("decoding canonical host response: {error}"))
-}
-
 fn usage() -> String {
     format!(
         "usage: guest-broker-probe [--port <1..{}>] (without --port requires the inherited Broker channel)",
@@ -199,7 +192,7 @@ fn usage() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Transport, parse_transport};
+    use super::{SUPERVISOR_READY_MARKER, Transport, parse_transport, signal_supervisor_readiness};
 
     #[test]
     fn accepts_one_explicit_non_wildcard_port() {
@@ -226,6 +219,31 @@ mod tests {
             vec!["--host".to_owned(), "18081".to_owned()],
         ] {
             assert!(parse_transport(arguments.into_iter()).is_err());
+        }
+    }
+
+    #[test]
+    fn signals_the_exact_guest_supervisor_readiness_marker_when_required() {
+        let mut output = Vec::new();
+        signal_supervisor_readiness(Some("1"), &mut output)
+            .expect("the exact readiness requirement must be accepted");
+        assert_eq!(output, SUPERVISOR_READY_MARKER);
+    }
+
+    #[test]
+    fn leaves_normal_probe_output_untouched_without_the_readiness_contract() {
+        let mut output = Vec::new();
+        signal_supervisor_readiness(None, &mut output)
+            .expect("an absent readiness requirement must remain compatible");
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn rejects_ambiguous_readiness_requirements_without_writing() {
+        for requirement in ["", "true", "01", "2"] {
+            let mut output = Vec::new();
+            assert!(signal_supervisor_readiness(Some(requirement), &mut output).is_err());
+            assert!(output.is_empty());
         }
     }
 }

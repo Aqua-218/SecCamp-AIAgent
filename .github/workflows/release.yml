@@ -106,7 +106,9 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      attestations: read
     env:
+      GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - name: Check out release automation
@@ -122,6 +124,12 @@ jobs:
           path: dist
       - name: Verify checksums
         run: scripts/ci/verify-release.sh
+      - name: Verify GitHub build provenance
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(find dist -maxdepth 1 -type f -name '*.tar.gz')
+          test "${#archives[@]}" -eq 1
+          gh attestation verify "${archives[0]}" --repo "${GITHUB_REPOSITORY}"
 
   publish:
     name: Publish through the protected environment

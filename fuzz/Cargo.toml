@@ -35,3 +35,17 @@ path = "fuzz_targets/canonical_path.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "response_decode"
+path = "fuzz_targets/response_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_accept"
+path = "fuzz_targets/session_accept.rs"
+test = false
+doc = false
+bench = false

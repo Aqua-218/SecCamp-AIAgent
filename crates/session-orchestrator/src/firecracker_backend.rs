@@ -294,6 +294,11 @@ where
                 "production Firecracker workload release requires a policy-bound capability lease",
             )
         })?;
+        if state.snapshot.policy_digest() != Some(policy_digest) {
+            return Err(BackendError::new(
+                "snapshot manifest policy digest does not match the capability lease",
+            ));
+        }
         let expected_capability = CapabilityLease::new_bound(
             identity.session_id(),
             identity.subject_id(),
@@ -883,12 +888,13 @@ mod tests {
         );
         let session_jail_root = runtime_jail_root(&config, &identity.workspace_id().to_string())
             .expect("test session jail root must resolve");
-        let snapshot = Snapshot::new(
+        let snapshot = Snapshot::new_bound(
             session_jail_root.join("snapshots/state"),
             session_jail_root.join("snapshots/memory"),
             config.snapshot_fingerprint(),
             sha256(&[]),
             sha256(&[]),
+            test_policy_digest(),
             Vec::new(),
         );
         let (vm, workload) = FirecrackerBackendFactory::new(
@@ -1040,6 +1046,40 @@ mod tests {
             error
                 .to_string()
                 .contains("requires a policy-bound capability lease")
+        );
+        assert!(
+            requests
+                .lock()
+                .expect("test API mutex must not be poisoned")
+                .iter()
+                .all(|request| !request.path.contains("identity"))
+        );
+    }
+
+    #[test]
+    fn workload_release_rejects_a_capability_from_another_snapshot_policy() {
+        let (mut vm, mut workload, identity, requests, _clones) = test_backends([]);
+        let workspace = WorkspaceLease::new(identity.session_id(), identity.workspace_id());
+        let broker = BrokerLease::new(identity.session_id(), identity.broker_session_id());
+        let vm_lease = vm
+            .start_vm(&snapshot_descriptor(), &identity, &workspace, &broker)
+            .expect("VM restore should succeed");
+        let other_policy = AuthorityPolicyDigest::from_hex(&"22".repeat(32))
+            .expect("different test policy digest must be canonical");
+        let capability = CapabilityLease::new_bound(
+            identity.session_id(),
+            identity.subject_id(),
+            identity.capability_id(),
+            other_policy,
+        );
+
+        let error = workload
+            .release_workload(&identity, &vm_lease, &capability)
+            .expect_err("a different snapshot policy must not reach guest control");
+        assert!(
+            error
+                .to_string()
+                .contains("snapshot manifest policy digest")
         );
         assert!(
             requests

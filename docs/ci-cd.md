@@ -17,19 +17,51 @@ The release boundary is deliberately limited to the artifact this repository can
 | Pipeline policy | `Continuous Integration / Pipeline policy` | `pipeline_policy` | Parse all YAML, lint Actions and shell, require full Action SHAs and container digests, reject broad permissions and suppressed failures |
 | Rust quality | `Rust quality gate` | `rust_quality` | Format, all-target/all-feature check, Clippy with warnings denied, rustdoc with warnings denied |
 | Rust tests | Four `Rust tests` jobs | Four `rust_tests` matrix jobs | Workspace split into four deterministic nextest shards with JUnit reports |
-| Specialized verification | `Rust doctests`, `Loom concurrency model`, `Lean proofs and differential corpus` | `rust_doctests`, `loom`, `lean` | Doctests, bounded concurrency exploration, Lean build, and the 150-case Rust/Lean decision corpus |
+| Repository invariants | `Toolchain consistency`, `Declared dependency usage`, `Lockfile integrity`, `Documentation policy`, `Repository hygiene`, `Pin inventory` | `toolchain_consistency`, `dependency_usage`, `lockfile_integrity`, `docs_policy`, `repository_hygiene`, `pin_inventory` | Pinned toolchains agree, every declared dependency is used, the lockfile matches the manifests, the documentation tree obeys its conventions, no tracked file is an unreviewable blob or a stray build output, and every pinned version and digest is collected into one reviewable list |
+| Claim traceability | `Decision record index`, `Verification page traceability`, `CODEOWNERS coverage`, `Lean proof hygiene` | `adr_index`, `verification_traceability`, `codeowners_coverage`, `lean_hygiene` | The decision log matches its index and numbers without a gap, every crate has a reachable verification page carrying its `未検証の境界` section, the paths that define the gates still require owner review, and no Lean proof contains a hole or an axiom |
+| Pipeline self-test | `Pipeline script self-test` | `pipeline_self_test` | Drives `plan-pipeline.sh` against inputs with known answers, so a planner bug cannot silently demote a gate to `skipped` and still pass the fan-in |
+| Dependency floor | `Per-crate isolation build` | `crate_isolation` | Every crate builds alone, and `authority-core` and `runtime-isolation` are proven to have no workspace crate beneath them |
+| Portability | `Cross-target check` | `cross_targets` | The workspace type-checks for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-gnu`, where libc spells `statfs::f_type` differently and syscall numbers change |
+| Delivery rehearsal | `Release dry run`, `Release reproducibility` | `release_dry_run`, `reproducibility` | The full package, SBOM, checksum, and verification path runs on every merge request instead of first running against an immutable tag; the archive is then rebuilt and required to be byte-identical |
+| Supply-chain record | `Supply-chain inventory` | `supply_chain_inventory` | An SPDX SBOM of everything the lockfile resolves to, so a future advisory can be matched against what was actually in the tree |
+| Specialized verification | `Rust doctests`, `Loom concurrency model`, `Lean proofs`, `Rust and Lean differential corpus` | `rust_doctests`, `loom`, `lean_proofs`, `differential_corpus` | Doctests, bounded concurrency exploration, Lean build, and the 150-case Rust/Lean decision corpus |
 | Coverage | `Workspace coverage` | `coverage` | LCOV, Cobertura, and summary artifacts; minimum line coverage is 75% |
-| Dependency assurance | `RustSec audit`, `Dependency policy` | `dependency_audit`, `dependency_policy` | Advisory audit plus license, source, and wildcard dependency policy |
+| Dependency assurance | `RustSec advisory audit`, `Dependency policy` | `dependency_audit`, `dependency_policy` | Advisory audit plus license, source, and wildcard dependency policy |
 | SAST and secrets | CodeQL, Semgrep, Gitleaks | Semgrep, Gitleaks | Extended Rust data-flow analysis on GitHub, repository-specific static rules, and full-history secret detection |
 | Supply-chain posture | Weekly OpenSSF Scorecard | Administratively managed | Scheduled repository posture report on GitHub |
+| System verification | `Real Firecracker VM verification`, `Privileged runtime isolation verification` | `real_vm`, `privileged_isolation` | Scheduled only, on hosts that a shared runner pool cannot provide. See [Privileged runners](#privileged-runners) |
 | Release | `Trusted Release` | tag pipeline package/verify/publish/release stages | Re-run all gates, build deterministic archive, generate SPDX SBOM and checksums, attest or sign, verify, then publish through a protected environment |
 
-GitHub exposes truthful fan-in checks named `CI complete` and `Security complete`. A failed, cancelled, or skipped required dependency makes the corresponding fan-in fail. GitLab uses ordered stages and does not permit failures on any gate.
+GitHub exposes truthful fan-in checks named `CI complete`, `Security complete`, and `Deep verification complete`. A failed, cancelled, or skipped required dependency makes the corresponding fan-in fail. GitLab uses ordered stages and does not permit failures on any gate.
+
+### Implemented and planned gates
+
+`ci/gates.yml` is both the plan and the record, so every gate carries a `status`.
+
+- `implemented` means a repository-owned script runs and both platforms call it. Parity requires the job to exist on every platform the gate does not explicitly excuse itself from with `why_platform`.
+- `planned` means the gate is designed but nothing runs yet. Parity requires it to have no job on either platform, and `why_planned` records what is missing.
+
+The distinction is load-bearing. Without it a gate that runs on every pipeline and a gate that exists only as an intention read identically, `check-pipeline-parity.sh` can never pass, and the claim that both platforms implement the same gates cannot be true. `plan-pipeline.sh` reports planned gates as `planned` rather than `unavailable`, because those are different statements: one says nobody has built the gate, the other says this platform cannot host a gate that does exist. `check-gate-results.sh` fails if any result is observed for a planned gate, so a job cannot appear without the manifest being promoted alongside it.
+
+Promoting a gate is one field change plus the job it now demands. 32 gates are implemented and 7 are planned; the manifest lists what each planned one is waiting for. Each of the seven needs something that does not exist yet rather than something that was skipped: a pinned nightly toolchain (`miri`, `sanitizers`), a tool nothing installs (`api_surface`, `mutation`), source that has never been written (`fuzz` has no fuzz targets, `benchmarks` has no benches and no baseline to regress against), or a decision about how much history each platform should fetch before a check can read more than the tip commit (`commit_policy`).
+
+No planned gate is given a job that trivially succeeds. An empty gate is worse than a missing one: it reports the same green as a real check while proving nothing, and it removes the pressure to build the thing it stands in for.
+
+### Privileged runners
+
+The two system-stage gates need hosts that hosted runner pools do not offer. Both run on a schedule or on demand, never on pull requests, because a host carrying either label runs repository code with elevated rights, and because a gate that silently skips when a device is missing teaches reviewers to ignore it.
+
+| Label | Host must provide | Gate |
+|---|---|---|
+| `kvm` | `/dev/kvm`, `/dev/vhost-vsock`, `veritysetup`, `busybox`, `mkfs.ext4` | Real Firecracker VM verification |
+| `privileged` | root, and a cgroup v2 root delegating `memory` and `pids` to its children. No KVM needed | Privileged runtime isolation verification |
+
+GitHub label names are declared in [`.github/actionlint.yaml`](../.github/actionlint.yaml) so the linter can tell a typo from a custom label; GitLab uses the same two names as runner tags. Neither script reports a skip as a pass: on a host missing the prerequisites they print what is absent and exit with a distinct status.
 
 ## Triggers and cancellation
 
-- GitHub runs CI and security on pull requests and `main`; CI also runs on `release/**`. Security runs weekly. Tags matching `v*.*.*` enter the release workflow, where a strict semantic-version check rejects invalid tags.
-- GitLab creates pipelines for merge requests, the default branch, tags, schedules, web runs, and API runs. New commits cancel only interruptible work. Package, verification, publication, and release jobs are never interrupted.
+- GitHub runs CI and security on pull requests and `main`; CI also runs on `release/**`. Security runs weekly. Deep verification runs daily at 03:17 UTC and on demand. Tags matching `v*.*.*` enter the release workflow, where a strict semantic-version check rejects invalid tags.
+- GitLab creates pipelines for merge requests, the default branch, tags, schedules, web runs, and API runs. New commits cancel only interruptible work. Package, verification, publication, release, and system-stage jobs are never interrupted.
 - GitHub pull-request concurrency cancels obsolete work. A release concurrency group never cancels an in-flight release.
 
 ## Toolchain and dependency controls

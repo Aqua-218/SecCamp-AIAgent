@@ -69,11 +69,11 @@ syscall は 1 つも呼ばない。namespace も cgroup も mount も `RuntimeRe
 | [wire protocol](wire-protocol.md) | [`protocol.rs`](../../crates/supervisor/src/protocol.rs) | datagram の形、閉じた tag 集合、decode の検査順序 |
 | [subject の setup と shutdown](subject-lifecycle.md) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | setup transaction、rollback、authority を先に落とす順序 |
 | [handle の lifecycle](handle-lifecycle.md) | [`supervisor.rs`](../../crates/supervisor/src/supervisor.rs) | 所有権検査の位置、2 つの集合、2 つの永久予約表 |
-| [検証対応表](verification.md) | — | contract test で見た範囲と、検査があるのに test が無い箇所 |
+| [検証対応表](verification.md) | — | contract test で見た範囲と、残る未検証境界 |
 
 ## 実装範囲と検証境界
 
-lifecycle、順序、rollback、handle の所有権はすべて `CapabilityKernel`（本物）と `FakeResources`（event log）を使う contract test で検証済み。
+lifecycle、順序、rollback、handle の所有権は `CapabilityKernel`（本物）と `FakeResources`（event log）を使う contract test で検証済み。`CleanupStep::BeginClose` / `FinishClose` の fault-injection retry も unit test で固定している。
 
 production の caller resolver と control socket は [`control_socket.rs`](../../crates/supervisor/src/control_socket.rs) にある。subject ごとの `SOCK_SEQPACKET` listener が `SO_PEERCRED` から `ConnectionIdentity` を組み立て、request bytes を読む前に subject を確定させる。実 socket を使った module test で検証済みである。
 
@@ -81,14 +81,15 @@ cgroup、control socket、workload の実 Linux 実装は [`linux_host.rs`](../.
 
 handle には OS object を持たせていない。subject の file は capfs mount 越しに触るので descriptor は guest 側にあり、host が知る必要があるのは「どの handle identity をまだ保持しているか」だけである。listener を subject の setup 経路へ結線する host 側の組み立てと、guest VM 内の agent process からの end-to-end も未検証である。
 
-検査があるのに test が無い箇所がいくつかある。`ConnectionNotBoundToSubject`、`GrantSubjectMismatch`、`DuplicateSubject`、親の非 Running gate、`derive` の拒否経路。詳細は[検証対応表](verification.md)。
+主要な認可拒否経路と wire spoof、control socket cleanup retry は test 済みである。root と disposable mount namespace が使える環境では、`scripts/ci/verify-real-supervisor-resources.sh` が `resources_mut()` 経由で production `LinuxHostResources` / `CapfsRuntimeResources` を実 FUSE、cgroup、seqpacket credential と通して検証する。この gate は `Supervisor` の subject lifecycle 全体や successful workload start の証明ではない。register→start の authority mutation は production kernel の snapshot で fail closed するが、任意の外部 interleaving の直列化や実 guest VM の接続など残る境界は[検証対応表](verification.md)に記載する。
 
 ## 特に注意する点
 
-- `revoke` は caller と lifecycle を検査するが、その caller が対象 capability を保持していることまでは検査しない。wire tag を足すときは所有権検査を先に足す。
+- `revoke` は caller と lifecycle を supervisor が検査し、対象 capability の holder であることを authority kernel が検査する。wire tag を足すときは両方の gate を維持する。
 - `issue_root` は grant の対象 subject を確認するが、`derive` は確認しない。この非対称は意図された契約である。
-- `resources_mut()` は無制限の `&mut R` を返し、この crate の gate を全部迂回する。test での failure 注入用で、production から呼ばない。
-- `DispatchResponse` に wire encoder が無い。返信の形式はまだ決まっていない。
+- `resources_mut()` は無制限の `&mut R` を返し、この crate の gate を全部迂回する。production の `guest-supervisor-init` は bootstrap listener の予約という setup 前の明示的な host 操作に限って使い、通常の lifecycle mutation は `Supervisor` の gate 経由で行う。fault injection と privileged adapter test でも使う。
+- `Supervisor::new` は subjects 1024 件、issued handles 65536 件の安全な session 永久上限を使う。`Supervisor::new_with_limits` / `CapfsRuntimeManager::into_supervisor_with_limits` で正の運用値を選べるが、閉じた identity は eviction されない。
+- `DispatchResponse` は `WireResponse` に変換され、bounded encoder/decoder と実 socket の datagram 送受信で検証される。
 
 ## 関連
 

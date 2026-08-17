@@ -181,7 +181,8 @@ pub const fn session_orchestrator::filesystem_factory::GuestArtifactTemplate::se
 pub struct session_orchestrator::filesystem_factory::SnapshotTemplate
 impl session_orchestrator::filesystem_factory::SnapshotTemplate
 pub const fn session_orchestrator::filesystem_factory::SnapshotTemplate::memory(&self) -> &firecracker_runtime::PinnedArtifact
-pub const fn session_orchestrator::filesystem_factory::SnapshotTemplate::new(firecracker_runtime::PinnedArtifact, firecracker_runtime::PinnedArtifact) -> Self
+pub const fn session_orchestrator::filesystem_factory::SnapshotTemplate::new(firecracker_runtime::PinnedArtifact, firecracker_runtime::PinnedArtifact, authority_core::policy::AuthorityPolicyDigest) -> Self
+pub const fn session_orchestrator::filesystem_factory::SnapshotTemplate::policy_digest(&self) -> authority_core::policy::AuthorityPolicyDigest
 pub const fn session_orchestrator::filesystem_factory::SnapshotTemplate::state(&self) -> &firecracker_runtime::PinnedArtifact
 pub mod session_orchestrator::firecracker_backend
 pub struct session_orchestrator::firecracker_backend::FirecrackerBackendFactory<C, F, A, G, I> where C: firecracker_runtime::CommandRunner, F: firecracker_runtime::FileSystem, A: firecracker_runtime::ApiClient, G: firecracker_runtime::ApiClient, I: firecracker_runtime::IdentitySource
@@ -263,6 +264,7 @@ pub session_orchestrator::production_runtime::SessionPreparationError::SnapshotF
 pub session_orchestrator::production_runtime::SessionPreparationError::SnapshotIdMismatch
 pub session_orchestrator::production_runtime::SessionPreparationError::SnapshotPathMismatch
 pub session_orchestrator::production_runtime::SessionPreparationError::SnapshotPathMismatch::resource: session_orchestrator::production_runtime::SnapshotResource
+pub session_orchestrator::production_runtime::SessionPreparationError::SnapshotPolicyMismatch
 impl core::error::Error for session_orchestrator::production_runtime::SessionPreparationError
 pub fn session_orchestrator::production_runtime::SessionPreparationError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for session_orchestrator::production_runtime::SessionPreparationError
@@ -325,7 +327,8 @@ impl session_orchestrator::production_runtime::SessionFirecrackerRequest
 pub const fn session_orchestrator::production_runtime::SessionFirecrackerRequest::guest_control_port(&self) -> u32
 pub const fn session_orchestrator::production_runtime::SessionFirecrackerRequest::identity(&self) -> session_orchestrator::SessionIdentity
 pub fn session_orchestrator::production_runtime::SessionFirecrackerRequest::memory_path(&self) -> &std::path::Path
-pub fn session_orchestrator::production_runtime::SessionFirecrackerRequest::new(session_orchestrator::SessionIdentity, firecracker_runtime::RuntimeConfig, session_orchestrator::SnapshotId, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, u32) -> Self
+pub fn session_orchestrator::production_runtime::SessionFirecrackerRequest::new(session_orchestrator::SessionIdentity, firecracker_runtime::RuntimeConfig, session_orchestrator::SnapshotId, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, u32, authority_core::policy::AuthorityPolicyDigest) -> Self
+pub const fn session_orchestrator::production_runtime::SessionFirecrackerRequest::policy_digest(&self) -> authority_core::policy::AuthorityPolicyDigest
 pub const fn session_orchestrator::production_runtime::SessionFirecrackerRequest::runtime_config(&self) -> &firecracker_runtime::RuntimeConfig
 pub const fn session_orchestrator::production_runtime::SessionFirecrackerRequest::snapshot_id(&self) -> session_orchestrator::SnapshotId
 pub fn session_orchestrator::production_runtime::SessionFirecrackerRequest::snapshot_path(&self) -> &std::path::Path

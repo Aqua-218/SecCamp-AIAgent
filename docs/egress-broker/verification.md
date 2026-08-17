@@ -51,7 +51,7 @@ cargo clippy --manifest-path crates/egress-broker/Cargo.toml --all-targets -- -D
 この crate の local test は外部ネットワークへ接続せず、実 secret を読み込まず、`AF_VSOCK` を bind しない。一方、repository の root 権限 opt-in test は Firecracker が guest-to-host connection を転送する per-port Unix socket を bind し、guest→Broker の canonical rejection を確認する。したがって、次はこの test 結果からは言えない。
 
 - 長時間 stream、並行接続、Firecracker 以外の実 `AF_VSOCK` transport
-- production `BuiltBrokerRuntime` が Firecracker-forwarded UDS で absolute connection deadline path を使うこと。stream の socket timeout 実装と deadline-aware server API は存在するが、現行 owner は plain compatibility path を使う。
+- Firecracker-forwarded UDS の長時間・高並行負荷。production owner が absolute deadline path を選ぶこと自体は hosted composition test と型境界で固定している。
 - 実 DNS、DNS rebinding、外部 HTTPS の certificate/SNI と redirect
 - OS resolver (`getaddrinfo` / `ToSocketAddrs`) の内部処理や強制キャンセル。timeout 後の lookup は固定 worker 内で完了を待つため、`OverallTimeout` はキャンセルの証明ではない。
 - 実 GitHub API、`EGRESS_GITHUB_TOKEN`、provider 側の ref race

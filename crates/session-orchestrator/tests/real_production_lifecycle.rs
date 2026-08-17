@@ -2,7 +2,7 @@
 //!
 //! This gate is intentionally ignored by ordinary unit-test runs.  The companion CI wrapper
 //! supplies pinned Firecracker/guest artifacts and executes it only on a Linux host with KVM,
-//! cgroup-v2, dm-verity, and AF_VSOCK.  Nothing in this test replaces Firecracker, the jailer,
+//! cgroup-v2, dm-verity, and `AF_VSOCK`.  Nothing in this test replaces Firecracker, the jailer,
 //! the filesystem, the guest-control client, or the production Broker listener with a test
 //! double.
 
@@ -13,7 +13,8 @@ use std::{
     io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use authority_core::{
@@ -29,10 +30,11 @@ use egress_broker::{
     public_fetch::{FetchError, PublicResponse},
 };
 use firecracker_runtime::{
-    CgroupConfig, CgroupVersion, DmVerityConfig, FirecrackerVsockApiClient, HostIsolationConfig,
-    JailerConfig, NamespaceConfig, PinnedArtifact, RealCommandRunner, RealFileSystem, Runtime,
-    RuntimeConfig, RuntimeState, SeccompConfig, SystemIdentitySource, UnixApiClient, VsockConfig,
-    WorkspaceConfig, WorkspaceImageConfig, sha256,
+    ApiClient, ApiRequest, CgroupConfig, CgroupVersion, DmVerityConfig, FirecrackerVsockApiClient,
+    HostIsolationConfig, HttpMethod, JailerConfig, NamespaceConfig, PinnedArtifact,
+    RealCommandRunner, RealFileSystem, Runtime, RuntimeConfig, RuntimeState, SeccompConfig,
+    SystemIdentitySource, UnixApiClient, VsockConfig, WorkspaceConfig, WorkspaceImageConfig,
+    sha256,
 };
 use session_orchestrator::{
     BackendError, DurableIdentityLedger, WorkspaceTemplateId,
@@ -65,8 +67,7 @@ struct TemporaryDirectory {
 impl TemporaryDirectory {
     fn new() -> Self {
         let parent = std::env::var_os("REAL_SESSION_TEMP_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/root"));
+            .map_or_else(|| PathBuf::from("/root"), PathBuf::from);
         let parent_metadata = fs::symlink_metadata(&parent)
             .unwrap_or_else(|error| panic!("real lifecycle temp root is not accessible: {error}"));
         assert!(
@@ -149,12 +150,23 @@ fn authority_grant() -> AuthorityRootGrant {
                 FileEffect::ReadData,
                 FileEffect::ListDirectory,
                 FileEffect::WriteData,
+                FileEffect::Truncate,
+                FileEffect::CreateFile,
+                FileEffect::CreateDirectory,
+                FileEffect::RemoveFile,
+                FileEffect::RemoveDirectory,
+                FileEffect::Rename,
+                FileEffect::SetMetadata,
+                FileEffect::ReadLink,
+                FileEffect::CreateSymlink,
+                FileEffect::CreateHardLink,
             ]),
             PathPattern::Prefix(CanonicalPath::root()),
         )),
     )
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn runtime_profile(
     root: &Path,
     firecracker: &Path,
@@ -213,9 +225,8 @@ fn runtime_profile(
         .sync_all()
         .expect("real workspace source marker must be durable");
 
-    let cgroup_parent = std::env::var_os("REAL_SESSION_CGROUP_PARENT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
+    let cgroup_parent = std::env::var_os("REAL_SESSION_CGROUP_PARENT").map_or_else(
+        || {
             PathBuf::from(format!(
                 "/sys/fs/cgroup/session-owner-real-{}-{}",
                 std::process::id(),
@@ -224,7 +235,9 @@ fn runtime_profile(
                     .expect("system clock must be after the Unix epoch")
                     .as_nanos()
             ))
-        });
+        },
+        PathBuf::from,
+    );
     fs::create_dir(&cgroup_parent).unwrap_or_else(|error| {
         panic!(
             "cannot create production session cgroup parent {}: {error}",
@@ -304,7 +317,7 @@ fn runtime_profile(
         vcpu_count: 1,
         memory_mib: GUEST_MEMORY_MIB,
         boot_args: format!(
-            "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/usr/local/libexec/guest-control-init -- --port {GUEST_CONTROL_PORT} --workload /usr/local/libexec/guest-supervisor-init -- --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port {BROKER_PORT} --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository workspace --file-effects read-data,list-directory,write-data --path-prefix /"
+            "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/usr/local/libexec/guest-control-init -- --port {GUEST_CONTROL_PORT} --workload /usr/local/libexec/guest-supervisor-init --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port {BROKER_PORT} --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository workspace --file-effects read-data,list-directory,write-data,truncate,create-file,create-directory,remove-file,remove-directory,rename,set-metadata,read-link,create-symlink,create-hard-link --path-prefix /"
         ),
     };
     (config, cgroup_parent, executable_parent)
@@ -338,6 +351,7 @@ fn capture_clean_snapshot(root: &Path, config: &RuntimeConfig) -> (PathBuf, Path
         )
     });
     assert_eq!(instance.state(), RuntimeState::WorkloadStopped);
+    wait_for_clean_guest_control_listener(config);
 
     let executable = config
         .firecracker
@@ -374,6 +388,61 @@ fn capture_clean_snapshot(root: &Path, config: &RuntimeConfig) -> (PathBuf, Path
     // Keep the private parent for the following production restore.  The production recovery
     // ledger requires that parent to pre-exist before it reserves a session identity.
     (state_source, memory_source)
+}
+
+fn wait_for_clean_guest_control_listener(config: &RuntimeConfig) {
+    let deadline = Instant::now() + API_TIMEOUT;
+    loop {
+        let mut probe = FirecrackerVsockApiClient::new(
+            &config.vsock.uds_path,
+            config.vsock.guest_cid,
+            GUEST_CONTROL_PORT,
+        )
+        .expect("template guest-control readiness endpoint must be valid");
+        let last_error = match probe.request(&ApiRequest {
+            method: HttpMethod::Get,
+            path: "/pre-session-readiness-probe".to_owned(),
+            body: String::new(),
+        }) {
+            Ok(response) if response.status == 405 => return,
+            Ok(response) => format!("unexpected HTTP status {}", response.status),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "clean guest-control listener did not become ready before snapshot: {last_error}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_completed_guest_effect_probe(
+    broker_wal: &Path,
+) -> egress_broker::durable::DurableBrokerView {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match egress_broker::durable::DurableBrokerView::open(broker_wal) {
+            Ok(view) => {
+                assert_eq!(
+                    view.requests().len(),
+                    1,
+                    "the Broker worker exited without the request that follows all 13 guest CapFS effects"
+                );
+                assert!(matches!(
+                    view.requests()[0].phase(),
+                    egress_broker::durable::DurableRequestPhase::Final(_)
+                ));
+                return view;
+            }
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "guest effect proof did not reach its durable Broker record before the deadline: {error}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 struct ClosedPublicAdapter;
@@ -421,6 +490,7 @@ impl PerSessionEgressFactory for ClosedEgressFactory {
 
 #[test]
 #[ignore = "requires root, KVM, cgroup-v2, dm-verity, AF_VSOCK, and pinned production guest artifacts"]
+#[allow(clippy::too_many_lines)]
 fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_resource() {
     assert_eq!(
         std::env::var("REAL_SESSION_OWNER_LIFECYCLE").as_deref(),
@@ -437,6 +507,7 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
     let formatter = required_file("REAL_SESSION_WORKSPACE_FORMATTER");
     let seccomp = required_file("REAL_SESSION_SECCOMP");
 
+    eprintln!("real session-owner phase: preparing template");
     let staging = TemporaryDirectory::new();
     let grant = authority_grant();
     let (template_runtime, _template_cgroup_parent, _executable_parent) = runtime_profile(
@@ -452,6 +523,7 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
     );
     let (snapshot_state, snapshot_memory) =
         capture_clean_snapshot(staging.path(), &template_runtime);
+    eprintln!("real session-owner phase: clean snapshot captured");
 
     let snapshot_id = session_orchestrator::SnapshotId::new([0xa5; session_orchestrator::ID_BYTES]);
     let firecracker_factory = FilesystemFirecrackerFactory::with_guest_artifacts(
@@ -506,10 +578,37 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
             .unwrap_or_else(|error| panic!("production session runtime build failed: {error}"));
     assert_eq!(runtime.state(), session_orchestrator::LifecycleState::Ready);
 
-    let started = runtime
-        .start(&grant)
-        .unwrap_or_else(|error| panic!("production SessionOwner start failed: {error}"));
+    eprintln!("real session-owner phase: starting production owner");
+    let started = match runtime.start(&grant) {
+        Ok(started) => started,
+        Err(start_error) => {
+            let mut cleanup_results = Vec::new();
+            for _ in 0..4 {
+                if matches!(
+                    runtime.state(),
+                    session_orchestrator::LifecycleState::Ready
+                        | session_orchestrator::LifecycleState::Closed
+                ) {
+                    break;
+                }
+                cleanup_results.push(format!("{:?}", runtime.stop()));
+            }
+            assert!(
+                matches!(
+                    runtime.state(),
+                    session_orchestrator::LifecycleState::Ready
+                        | session_orchestrator::LifecycleState::Closed
+                ),
+                "production SessionOwner start failed and bounded cleanup did not return to a resource-free state: {start_error}; cleanup={cleanup_results:?}"
+            );
+            panic!(
+                "production SessionOwner start failed after bounded cleanup completed: {start_error}; cleanup={cleanup_results:?}"
+            );
+        }
+    };
+    eprintln!("real session-owner phase: production owner running");
     let identity = started.identity();
+    let broker_wal = broker_wal_root.join(format!("{}.wal", identity.broker_session_id()));
     if let Some(path) = std::env::var_os("REAL_SESSION_CLEANUP_STATE") {
         fs::write(
             path,
@@ -539,6 +638,8 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
         .poll(OwnerPollRequest::Continue)
         .unwrap_or_else(|error| panic!("production SessionOwner Continue poll failed: {error}"));
     assert_eq!(polled, OwnerPollOutcome::Running(started));
+    let guest_effect_proof = wait_for_completed_guest_effect_probe(&broker_wal);
+    drop(guest_effect_proof);
 
     let workspace_id = identity.workspace_id().to_string();
     let executable_parent = template_runtime.jailer_config.chroot_base_dir.join(
@@ -561,15 +662,32 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
         template_runtime.dm_verity.mapper_name
     ));
     let workspace_clone = jail_root.join("workspace").join(&workspace_id);
-    let workspace_image = jail_root
-        .join("workspace")
-        .join(format!("{workspace_id}.ext4"));
+    let workspace_image = jail_root.join("workspace").join("workspace.ext4");
     let api_socket = jail_root.join("run/firecracker.sock");
     let vsock_socket = jail_root.join("run/vsock.sock");
 
-    let closed = runtime
-        .stop()
-        .unwrap_or_else(|error| panic!("production SessionOwner stop failed: {error}"));
+    eprintln!("real session-owner phase: stopping production owner");
+    let closed = match runtime.stop() {
+        Ok(closed) => closed,
+        Err(stop_error) => {
+            let mut cleanup_results = Vec::new();
+            for _ in 0..4 {
+                if runtime.state() == session_orchestrator::LifecycleState::Closed {
+                    break;
+                }
+                cleanup_results.push(format!("{:?}", runtime.stop()));
+            }
+            assert_eq!(
+                runtime.state(),
+                session_orchestrator::LifecycleState::Closed,
+                "production SessionOwner stop failed and bounded retry did not close it: {stop_error}; cleanup={cleanup_results:?}"
+            );
+            panic!(
+                "production SessionOwner stop needed a retry: {stop_error}; cleanup={cleanup_results:?}"
+            );
+        }
+    };
+    eprintln!("real session-owner phase: production owner closed");
     assert_eq!(
         closed,
         OwnerPollOutcome::Closed(ShutdownReason::ExternalRequest)
@@ -608,7 +726,6 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
         "production cgroup parent must be removed after owner stop"
     );
 
-    let broker_wal = broker_wal_root.join(format!("{}.wal", identity.broker_session_id()));
     assert!(
         broker_wal.is_file(),
         "durable Broker WAL must survive cleanup"
@@ -639,4 +756,5 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
         identity.broker_session_id().as_bytes(),
         "Broker WAL must remain bound to the stopped session identity"
     );
+    assert_eq!(broker_view.requests().len(), 1);
 }

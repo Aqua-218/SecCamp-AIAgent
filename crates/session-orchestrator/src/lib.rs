@@ -21,7 +21,9 @@
 //! する。v1 ledger は読み書き可能な互換モードで保持するが、自動形式変換は行わない。
 //! session の七つの identity は一つの batch として append され、`sync_all` が
 //! 成功するまで backend の副作用は開始されない。破損、切断、容量超過、
-//! write/sync failure は operator-readable な typed error になる。
+//! write/sync failure は operator-readable な typed error になる。identity source が
+//! all-zero value を返した場合は bounded retry の後に typed entropy failure として
+//! fail closed する。予測不可能性と kernel entropy の品質は host OS RNG を TCB とする。
 
 #![forbid(unsafe_code)]
 
@@ -55,6 +57,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 /// Width of every cryptographic session-scoped identity.
 pub const ID_BYTES: usize = 16;
+
+const MAX_ZERO_IDENTITY_RETRIES: usize = 8;
 
 macro_rules! fixed_identity {
     ($(#[$meta:meta])* $name:ident) => {
@@ -215,6 +219,78 @@ const PRIVATE_LEDGER_MODE: u32 = 0o600;
 const WRITE_BY_GROUP_OR_OTHER: u32 = 0o022;
 #[cfg(unix)]
 const STICKY_DIRECTORY: u32 = 0o1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerFaultPoint {
+    RecordWrite = 1,
+    RecordSync = 2,
+    HeaderWrite = 3,
+    HeaderSync = 4,
+}
+
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicU8};
+
+#[cfg(test)]
+static LEDGER_FAULT_POINT: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(test)]
+static LEDGER_FAULT_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+struct LedgerFaultGuard {
+    _serial: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+fn arm_ledger_fault(point: LedgerFaultPoint) -> LedgerFaultGuard {
+    let serial = LEDGER_FAULT_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("ledger fault serial lock must not be poisoned");
+    LEDGER_FAULT_POINT.store(point as u8, std::sync::atomic::Ordering::Release);
+    LedgerFaultGuard { _serial: serial }
+}
+
+#[cfg(test)]
+impl Drop for LedgerFaultGuard {
+    fn drop(&mut self) {
+        LEDGER_FAULT_POINT.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn consume_ledger_fault(point: LedgerFaultPoint) -> bool {
+    #[cfg(test)]
+    {
+        LEDGER_FAULT_POINT
+            .compare_exchange(
+                point as u8,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        let _ = point;
+        false
+    }
+}
+
+fn ledger_write(file: &mut File, bytes: &[u8], fault_point: LedgerFaultPoint) -> io::Result<()> {
+    if consume_ledger_fault(fault_point) {
+        return Err(io::Error::other("injected durable ledger write failure"));
+    }
+    file.write_all(bytes)
+}
+
+fn ledger_sync(file: &File, fault_point: LedgerFaultPoint) -> io::Result<()> {
+    if consume_ledger_fault(fault_point) {
+        return Err(io::Error::other("injected durable ledger sync failure"));
+    }
+    file.sync_all()
+}
 
 /// Operations reported by durable-ledger I/O failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -772,14 +848,17 @@ impl DurableIdentityLedger {
             let mut initial = [0_u8; LEDGER_V2_DATA_OFFSET];
             initial[..LEDGER_V2_HEADER_BYTES].copy_from_slice(&first_header);
             initial[LEDGER_V2_HEADER_BYTES..].copy_from_slice(&second_header);
-            file.write_all(&initial)
-                .map_err(|error| LedgerError::WriteFailed {
+            ledger_write(&mut file, &initial, LedgerFaultPoint::RecordWrite).map_err(|error| {
+                LedgerError::WriteFailed {
                     path: path.clone(),
                     message: error.to_string(),
-                })?;
-            file.sync_all().map_err(|error| LedgerError::SyncFailed {
-                path: path.clone(),
-                message: error.to_string(),
+                }
+            })?;
+            ledger_sync(&file, LedgerFaultPoint::RecordSync).map_err(|error| {
+                LedgerError::SyncFailed {
+                    path: path.clone(),
+                    message: error.to_string(),
+                }
             })?;
             validate_open_ledger(&directory, &file, Some(LEDGER_V2_DATA_OFFSET as u64))?;
             validate_open_lock(&directory, &lock.file)?;
@@ -866,7 +945,7 @@ impl DurableIdentityLedger {
                 // identity reusable.
                 file.set_len(committed_length)
                     .map_err(|error| LedgerError::io(LedgerOperation::Append, &path, &error))?;
-                file.sync_all()
+                ledger_sync(&file, LedgerFaultPoint::RecordSync)
                     .map_err(|error| LedgerError::io(LedgerOperation::Sync, &path, &error))?;
             }
             validate_open_ledger(&directory, &file, Some(committed_length))?;
@@ -972,7 +1051,7 @@ impl DurableIdentityLedger {
             self.poisoned = true;
             return Err(LedgerError::io(LedgerOperation::Append, &self.path, &error));
         }
-        if let Err(error) = self.file.write_all(encoded) {
+        if let Err(error) = ledger_write(&mut self.file, encoded, LedgerFaultPoint::RecordWrite) {
             self.poisoned = true;
             return Err(LedgerError::WriteFailed {
                 path: self.path.clone(),
@@ -982,7 +1061,7 @@ impl DurableIdentityLedger {
         // Persist records while the old header still defines the committed
         // prefix. Legacy files retain their original single-header behavior;
         // new files use reserve_redundant_v2 below.
-        if let Err(error) = self.file.sync_all() {
+        if let Err(error) = ledger_sync(&self.file, LedgerFaultPoint::RecordSync) {
             self.poisoned = true;
             return Err(LedgerError::SyncFailed {
                 path: self.path.clone(),
@@ -1004,14 +1083,14 @@ impl DurableIdentityLedger {
             ));
         }
         let header = ledger_header(new_records, committed_length);
-        if let Err(error) = self.file.write_all(&header) {
+        if let Err(error) = ledger_write(&mut self.file, &header, LedgerFaultPoint::HeaderWrite) {
             self.poisoned = true;
             return Err(LedgerError::WriteFailed {
                 path: self.path.clone(),
                 message: error.to_string(),
             });
         }
-        if let Err(error) = self.file.sync_all() {
+        if let Err(error) = ledger_sync(&self.file, LedgerFaultPoint::HeaderSync) {
             self.poisoned = true;
             return Err(LedgerError::SyncFailed {
                 path: self.path.clone(),
@@ -1043,7 +1122,7 @@ impl DurableIdentityLedger {
             self.poisoned = true;
             return Err(LedgerError::io(LedgerOperation::Append, &self.path, &error));
         }
-        if let Err(error) = self.file.write_all(encoded) {
+        if let Err(error) = ledger_write(&mut self.file, encoded, LedgerFaultPoint::RecordWrite) {
             self.poisoned = true;
             return Err(LedgerError::WriteFailed {
                 path: self.path.clone(),
@@ -1053,7 +1132,7 @@ impl DurableIdentityLedger {
         // The record batch is durable before either header advertises it.
         // A crash in the remainder of this method leaves an uncommitted tail
         // that open() can prove is staged and discard.
-        if let Err(error) = self.file.sync_all() {
+        if let Err(error) = ledger_sync(&self.file, LedgerFaultPoint::RecordSync) {
             self.poisoned = true;
             return Err(LedgerError::SyncFailed {
                 path: self.path.clone(),
@@ -1085,14 +1164,14 @@ impl DurableIdentityLedger {
             ));
         }
         let header = ledger_header_v2(next_slot, next_generation, committed_length);
-        if let Err(error) = self.file.write_all(&header) {
+        if let Err(error) = ledger_write(&mut self.file, &header, LedgerFaultPoint::HeaderWrite) {
             self.poisoned = true;
             return Err(LedgerError::WriteFailed {
                 path: self.path.clone(),
                 message: error.to_string(),
             });
         }
-        if let Err(error) = self.file.sync_all() {
+        if let Err(error) = ledger_sync(&self.file, LedgerFaultPoint::HeaderSync) {
             self.poisoned = true;
             return Err(LedgerError::SyncFailed {
                 path: self.path.clone(),
@@ -3220,7 +3299,18 @@ where
         let mut identities = [(IdentityKind::Session, [0_u8; ID_BYTES]); N];
         for (slot, kind) in identities.iter_mut().zip(kinds) {
             slot.0 = kind;
-            slot.1 = self.random.random_128().map_err(StartFailure::Entropy)?;
+            for attempt in 0..=MAX_ZERO_IDENTITY_RETRIES {
+                let bytes = self.random.random_128().map_err(StartFailure::Entropy)?;
+                if bytes != [0_u8; ID_BYTES] {
+                    slot.1 = bytes;
+                    break;
+                }
+                if attempt == MAX_ZERO_IDENTITY_RETRIES {
+                    return Err(StartFailure::Entropy(EntropyError::new(format!(
+                        "identity source returned an all-zero {kind} value after {MAX_ZERO_IDENTITY_RETRIES} retries"
+                    ))));
+                }
+            }
         }
         Ok(identities)
     }
@@ -3844,6 +3934,61 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn durable_ledger_write_and_sync_faults_poison_the_live_handle() {
+        for fault in [
+            LedgerFaultPoint::RecordWrite,
+            LedgerFaultPoint::RecordSync,
+            LedgerFaultPoint::HeaderWrite,
+            LedgerFaultPoint::HeaderSync,
+        ] {
+            let fixture = DurableLedgerFixture::new("fault-injection");
+            let identity = match fault {
+                LedgerFaultPoint::RecordWrite => [0x91; ID_BYTES],
+                LedgerFaultPoint::RecordSync => [0x92; ID_BYTES],
+                LedgerFaultPoint::HeaderWrite => [0x93; ID_BYTES],
+                LedgerFaultPoint::HeaderSync => [0x94; ID_BYTES],
+            };
+            let mut ledger = DurableIdentityLedger::open(&fixture.path).expect("ledger must open");
+            let first_error = {
+                let _fault = arm_ledger_fault(fault);
+                ledger
+                    .reserve(IdentityKind::Session, identity)
+                    .expect_err("injected durable fault must fail the reservation")
+            };
+            match fault {
+                LedgerFaultPoint::RecordWrite | LedgerFaultPoint::HeaderWrite => {
+                    assert!(matches!(first_error, LedgerError::WriteFailed { .. }));
+                }
+                LedgerFaultPoint::RecordSync | LedgerFaultPoint::HeaderSync => {
+                    assert!(matches!(first_error, LedgerError::SyncFailed { .. }));
+                }
+            }
+            assert!(matches!(
+                ledger.reserve(IdentityKind::Session, identity),
+                Err(LedgerError::Unavailable { .. })
+            ));
+            drop(ledger);
+
+            // A failed record barrier leaves no committed identity. A failed
+            // header barrier may have reached disk before the error; either
+            // result is safe only when reopen treats the durable header as
+            // authoritative and never permits a duplicate reservation.
+            let mut reopened =
+                DurableIdentityLedger::open(&fixture.path).expect("reopen must be fail closed");
+            if reopened.contains(identity) {
+                assert!(matches!(
+                    reopened.reserve(IdentityKind::Request, identity),
+                    Err(LedgerError::Duplicate { .. })
+                ));
+            } else {
+                reopened
+                    .reserve(IdentityKind::Request, identity)
+                    .expect("an uncommitted tail may be safely reused after reopen");
+            }
+        }
+    }
+
     #[derive(Debug, Default)]
     struct TestRandom(u8);
 
@@ -3852,6 +3997,65 @@ mod tests {
             self.0 = self.0.wrapping_add(1);
             Ok([self.0; ID_BYTES])
         }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedRandom {
+        values: Vec<Result<[u8; ID_BYTES], EntropyError>>,
+        next: usize,
+    }
+
+    impl CryptographicRandom for ScriptedRandom {
+        fn random_128(&mut self) -> Result<[u8; ID_BYTES], EntropyError> {
+            let value = self
+                .values
+                .get(self.next)
+                .cloned()
+                .unwrap_or_else(|| Err(EntropyError::new("scripted entropy exhausted")));
+            self.next += 1;
+            value
+        }
+    }
+
+    fn scripted_zero_random(zero_count: usize, value: u8) -> ScriptedRandom {
+        let mut values = vec![Ok([0_u8; ID_BYTES]); zero_count];
+        values.push(Ok([value; ID_BYTES]));
+        ScriptedRandom { values, next: 0 }
+    }
+
+    #[test]
+    fn draw_identities_retries_each_all_zero_value_with_a_bound() {
+        let mut orchestrator = SessionOrchestrator::new(scripted_zero_random(2, 0x9a));
+        let identities = orchestrator
+            .draw_identities([IdentityKind::Session])
+            .expect("a later non-zero draw must be accepted");
+        assert_eq!(identities, [(IdentityKind::Session, [0x9a; ID_BYTES])]);
+
+        let mut orchestrator = SessionOrchestrator::new(ScriptedRandom {
+            values: vec![Ok([0_u8; ID_BYTES]); MAX_ZERO_IDENTITY_RETRIES + 1],
+            next: 0,
+        });
+        let error = orchestrator
+            .draw_identities([IdentityKind::Vm])
+            .expect_err("persistent all-zero entropy must fail closed");
+        assert!(
+            matches!(error, StartFailure::Entropy(ref entropy) if entropy.message().contains("all-zero"))
+        );
+    }
+
+    #[test]
+    fn draw_identities_preserves_typed_entropy_failures_without_retrying_them() {
+        let mut orchestrator = SessionOrchestrator::new(ScriptedRandom {
+            values: vec![Err(EntropyError::new("entropy source unavailable"))],
+            next: 0,
+        });
+        let error = orchestrator
+            .draw_identities([IdentityKind::Session])
+            .expect_err("entropy I/O failure must fail closed");
+        assert!(matches!(
+            error,
+            StartFailure::Entropy(ref entropy) if entropy.message() == "entropy source unavailable"
+        ));
     }
 
     #[test]

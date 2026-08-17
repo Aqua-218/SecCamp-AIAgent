@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use authority_core::{
     capability::{AuthorityBody, CapId, SubjectId as AuthoritySubjectId},
     kernel::{CapabilityKernel, CapabilityKernelError},
+    policy::AuthorityPolicyDigest,
     state::{CapabilityGrant, StaticAuthorityEnvelope, Subject},
     time::TimeWindow,
 };
@@ -88,6 +89,13 @@ impl AuthorityRootGrant {
     #[must_use]
     pub const fn is_delegable(&self) -> bool {
         self.delegable
+    }
+
+    /// Returns the versioned digest that a guest must independently derive
+    /// from its immutable root policy before the workload gate is released.
+    #[must_use]
+    pub fn policy_digest(&self) -> AuthorityPolicyDigest {
+        AuthorityPolicyDigest::for_root(self.validity, &self.authority, self.delegable)
     }
 
     fn envelope(&self) -> StaticAuthorityEnvelope {
@@ -216,10 +224,11 @@ impl CapabilityBackend<AuthorityRootGrant> for AuthorityCoreBackend {
 
         let guest = Self::guest_binding(identity);
         let broker = self.broker_binding(identity);
-        let lease = CapabilityLease::new(
+        let lease = CapabilityLease::new_bound(
             identity.session_id(),
             identity.subject_id(),
             identity.capability_id(),
+            grant.policy_digest(),
         );
 
         self.register_and_issue(
@@ -512,6 +521,27 @@ mod tests {
     }
 
     #[test]
+    fn policy_digest_binds_only_the_guest_root_policy_axes() {
+        let base = grant();
+        let broker_changed = base.clone().with_broker_authority(broker_authority());
+        assert_eq!(base.policy_digest(), broker_changed.policy_digest());
+
+        let authority_changed = AuthorityRootGrant::new(
+            base.validity(),
+            AuthorityBody::File(FileAuthority::new(
+                RepoId::new("workspace"),
+                FileEffects::only(FileEffect::WriteData),
+                PathPattern::Prefix(CanonicalPath::new(["src"]).expect("test path must be valid")),
+            )),
+        )
+        .with_delegable(true);
+        assert_ne!(base.policy_digest(), authority_changed.policy_digest());
+
+        let nondelegable = AuthorityRootGrant::new(base.validity(), base.authority().clone());
+        assert_ne!(base.policy_digest(), nondelegable.policy_digest());
+    }
+
+    #[test]
     fn root_injection_uses_exact_lowercase_authority_ids_and_grant() {
         let mut backend = backend();
         let identity = identity();
@@ -527,6 +557,7 @@ mod tests {
             lease.capability_id().to_string(),
             "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
         );
+        assert_eq!(lease.policy_digest(), Some(grant().policy_digest()));
 
         let AuthorityBrokerBinding {
             caller: subject,

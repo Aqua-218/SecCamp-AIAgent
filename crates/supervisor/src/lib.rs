@@ -45,8 +45,10 @@ pub use protocol::{
     WireRequest, WireResponse,
 };
 pub use supervisor::{
-    AuthorityKernel, CallerBindingError, CallerResolver, CgroupHandle, CleanupFailure, CleanupStep,
-    ConnectionIdentity, ControlFdHandle, DispatchResponse, MountHandle, OperationFailure,
-    ResourceAcquisition, ResourceError, ResourceFailure, ResourceMutation, RuntimeResources,
-    SetupStep, StaticCallerResolver, SubjectLifecycle, Supervisor, SupervisorError, WorkloadHandle,
+    AuthorityKernel, AuthorityStartupSnapshot, CallerBindingError, CallerResolver, CgroupHandle,
+    CleanupFailure, CleanupStep, ConnectionIdentity, ControlFdHandle, DEFAULT_MAX_ISSUED_HANDLES,
+    DEFAULT_MAX_SUBJECTS, DispatchResponse, MountHandle, OperationFailure, ResourceAcquisition,
+    ResourceError, ResourceFailure, ResourceMutation, RuntimeResources, SetupStep,
+    StaticCallerResolver, SubjectLifecycle, Supervisor, SupervisorCapacity, SupervisorError,
+    SupervisorLimits, SupervisorLimitsError, WorkloadHandle,
 };

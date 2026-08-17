@@ -42,8 +42,9 @@ package_once() {
   mkdir -p -- "${destination}"
   # Copy the exact declared asset set. Wildcards could let stale files make a
   # supposedly reproducible build pass without producing the current release.
-  # shellcheck disable=SC1091
-  source dist/release.env
+  # shellcheck source=scripts/ci/release-metadata-lib.sh
+  source "${repository_root}/scripts/ci/release-metadata-lib.sh"
+  release_metadata_load dist/release.env
   cp -- \
     "dist/${ARCHIVE_NAME}" \
     "dist/${SBOM_NAME}" \

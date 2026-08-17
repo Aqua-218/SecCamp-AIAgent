@@ -186,8 +186,11 @@ fn built_in_denied_ranges() -> Result<Vec<IpRange>, IpRangeError> {
         (Ipv4Addr::new(172, 16, 0, 0), 12),
         (Ipv4Addr::new(192, 0, 0, 0), 24),
         (Ipv4Addr::new(192, 0, 2, 0), 24),
+        (Ipv4Addr::new(192, 31, 196, 0), 24),
+        (Ipv4Addr::new(192, 52, 193, 0), 24),
         (Ipv4Addr::new(192, 88, 99, 0), 24),
         (Ipv4Addr::new(192, 168, 0, 0), 16),
+        (Ipv4Addr::new(192, 175, 48, 0), 24),
         (Ipv4Addr::new(198, 18, 0, 0), 15),
         (Ipv4Addr::new(198, 51, 100, 0), 24),
         (Ipv4Addr::new(203, 0, 113, 0), 24),
@@ -201,11 +204,15 @@ fn built_in_denied_ranges() -> Result<Vec<IpRange>, IpRangeError> {
         (Ipv6Addr::new(0x0064, 0xff9b, 0, 0, 0, 0, 0, 0), 96),
         (Ipv6Addr::new(0x0064, 0xff9b, 0, 1, 0, 0, 0, 0), 48),
         (Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0), 64),
-        (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 32),
-        (Ipv6Addr::new(0x2001, 2, 0, 0, 0, 0, 0, 0), 48),
-        (Ipv6Addr::new(0x2001, 0x10, 0, 0, 0, 0, 0, 0), 28),
+        (Ipv6Addr::new(0x0100, 0, 0, 1, 0, 0, 0, 0), 64),
+        // The IANA IETF Protocol Assignments supernet contains Teredo, benchmarking, AMT,
+        // AS112, ORCHID, DETs, and their future more-specific registrations.
+        (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
         (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
         (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
+        (Ipv6Addr::new(0x2620, 0x004f, 0x8000, 0, 0, 0, 0, 0), 48),
+        (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
+        (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16),
         (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
         (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
         (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32),
@@ -301,6 +308,30 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 "DNS answer contains a private, special-purpose, or host-denied address"
+            );
+        }
+    }
+
+    #[test]
+    fn current_iana_special_purpose_registrations_are_all_denied() {
+        let policy = IpPolicy::default();
+        for address in [
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.175.48.1",
+            "100:0:0:1::1",
+            "2001:4:112::1",
+            "2001:20::1",
+            "2001:30::1",
+            "2620:4f:8000::1",
+            "3fff::1",
+            "5f00::1",
+        ] {
+            let address = address.parse().expect("IANA registry fixture must parse");
+            assert_eq!(
+                policy.validate_dns_answer(&[address]),
+                Err(IpPolicyError::DeniedAnswer),
+                "{address} must remain denied"
             );
         }
     }

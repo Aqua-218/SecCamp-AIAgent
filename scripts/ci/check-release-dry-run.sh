@@ -62,8 +62,9 @@ require_artifact 'release metadata' dist/release.env
 require_artifact 'checksum manifest' dist/SHA256SUMS
 
 archive_count="$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)"
-if [[ "${archive_count}" -eq 0 ]]; then
-  printf 'FAIL the rehearsal produced no release archive\n' >&2
+if [[ "${archive_count}" -ne 1 ]]; then
+  printf 'FAIL the rehearsal must produce exactly one release archive, found %s\n' \
+    "${archive_count}" >&2
   failures=$((failures + 1))
 fi
 

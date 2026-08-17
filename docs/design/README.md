@@ -120,10 +120,10 @@ flowchart LR
 |---|---|---|---|
 | Authority core と audit | typed authority、状態遷移、`auth_epoch`、in-memory audit、`DurableAuditLog` の WAL/receipt | Rust/Lean 共通 corpus、property test、loom、durable audit contract test | 複数 process の journal owner 調整、実 provider との receipt reconciliation は未検証 |
 | capfs | preflight、namespace/node table、link を含む Direct-I/O FUSE adapter | module/contract test と環境依存の実 mount test | 全 interleaving の loom、敵対的 backing 差し替え、隔離層との end-to-end は未検証 |
-| `egress-broker` | bounded transport、typed dispatch、DNS/IP policy、公開 HTTPS、型付き GitHub adapter | fake resolver/connector/provider による module test | 実 `AF_VSOCK`、外部 DNS/HTTPS/GitHub API、guest-to-host は未検証 |
-| `runtime-isolation` | policy validation、`LinuxBackend`、13 段階の ordered apply/rollback | mock backend test、host capability detection | privileged isolation apply、workload 実行中の escape test は未検証 |
-| `firecracker-runtime` | artifact pin、dm-verity/jailer/API 順序、workspace、snapshot/restore、identity/workload gate | fake boundary test、local Unix socket HTTP exchange、opt-in KVM test | 実 Firecracker + dm-verity + guest `AF_VSOCK` identity gate は確認。jailer / snapshot restore は未検証 |
-| `supervisor` | connection-to-subject binding、bounded wire protocol、subject/handle lifecycle | `CapabilityKernel` + `FakeResources` による test | Linux namespace/cgroup/mount、実 socket、guest supervisor は未検証 |
+| `egress-broker` | bounded transport、typed dispatch、DNS/IP policy、公開 HTTPS、型付き GitHub adapter | fake resolver/connector/provider による module test | 実KVMのguest-to-host Broker rejectionを確認。外部 DNS/HTTPS/GitHub APIは未検証 |
+| `runtime-isolation` | policy validation、`LinuxBackend`、13 段階の ordered apply/rollback | mock backend test、host capability detection、privileged syscall probe | staged rootfsへの実applyを確認。post-exec、rootfs `/`、rollbackは未検証 |
+| `firecracker-runtime` | artifact pin、dm-verity/jailer/API 順序、workspace、snapshot/restore、identity/workload gate | fake boundary test、local Unix socket HTTP exchange、opt-in KVM test | 実 Firecracker + dm-verity + v2 guest gate + guest-to-host Brokerを確認。jailer / snapshot restore は未検証 |
+| `supervisor` | connection-to-subject binding、bounded wire protocol、subject/handle lifecycle | `CapabilityKernel` + `FakeResources`、local socket、opt-in KVM runtime image | guest supervisor/isolation launcher/Broker channelを実KVMで確認。CapFS全effectは未検証 |
 | `session-orchestrator` | durable 128-bit identity ledger、lease binding、Authority/Broker/Firecracker/workspace production adapter | mock state-machine test、test-double 境界までの production adapter composition | 実 command/filesystem/vsock、guest capfs/isolation、実 VM は未検証 |
 
 この表の「実装済み」は、該当 crate の API と実装が repository にあることを意味する。「mock/contract 検証済み」は、特権 kernel、外部 network、provider、実 VM を通っていない test の結果である。

@@ -1,11 +1,15 @@
 name: Deep verification
 run-name: Deep / ${{ github.event_name }} / ${{ github.ref_name }}
 
-# The system-stage gates. Both need a host this project cannot rent from a
-# hosted runner pool: one boots a real Firecracker microVM over /dev/kvm, the
-# other applies the isolation transaction as root and asks the kernel what it
-# enforces. Neither is allowed to report a skip as a pass, so both are scheduled
-# rather than attached to pull requests, where a missing device would either
+# The protected deep evidence gates need hosts this project cannot rent from a
+# hosted runner pool: one directly boots a real Firecracker guest-control VM,
+# one drives Runtime::launch through the real jailer, one mounts CapFS through
+# /dev/fuse, one exercises an isolated HTTPS fixture, one exercises the typed
+# provider against an acknowledged disposable repository, and one applies the
+# isolation transaction as root and asks the kernel what it enforces. None is
+# allowed to report a skip as a pass: the evidence gates run on protected
+# schedules or dispatches, while the mutating provider gate is dispatch-only.
+# They are not attached to pull requests, where a missing device would either
 # block every merge or teach everyone to ignore a yellow check.
 
 on:
@@ -212,7 +216,7 @@ jobs:
         run: scripts/ci/run.sh benchmarks
 
   real_vm:
-    name: Real Firecracker VM verification
+    name: Direct Firecracker guest-control verification
     # Requires /dev/kvm, /dev/vhost-vsock, and veritysetup. Runner labels are
     # repository configuration; docs/ci-cd.md records what the host must provide.
     if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
@@ -228,6 +232,93 @@ jobs:
         uses: ./.github/actions/setup-rust
       - name: Verify guest control and Broker over a real microVM
         run: scripts/ci/verify-real-guest-control.sh
+
+  real_runtime_lifecycle:
+    name: Real Runtime lifecycle verification
+    # Requires root, KVM, vhost-vsock, cgroup-v2, dm-verity, and the pinned
+    # Firecracker jailer. A conditional skip is a fan-in failure when this gate
+    # is required by the protected deep plan.
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, x64, kvm, ephemeral]
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Verify Runtime::launch through the real jailer lifecycle
+        run: scripts/ci/run.sh real-runtime-lifecycle
+
+  real_capfs:
+    name: Real CapFS FUSE verification
+    # Requires root and a readable/writable /dev/fuse. The gate is protected so
+    # a hosted runner can never turn an unavailable mount boundary into green.
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, x64, privileged, ephemeral]
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Verify CapFS through the host FUSE kernel boundary
+        run: scripts/ci/run.sh real-capfs
+
+  egress_real_https:
+    name: Real public HTTPS verification
+    # Requires root for isolated mount and network namespaces. This is a
+    # disposable local HTTPS fixture, distinct from the protected live GitHub
+    # mutation gate, which is restricted to on-demand dispatches below.
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, x64, privileged, ephemeral]
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Verify DNS, TLS, SNI, and rebinding defenses
+        run: scripts/ci/run.sh real-public-https
+
+  external_provider_smoke:
+    name: Protected external provider smoke
+    # This job mutates only the explicitly acknowledged disposable repository.
+    # The protected environment supplies all credential and object identities;
+    # absent values make verify-live-github.sh fail before any request occurs.
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref_protected == true && github.event.repository.fork == false }}
+    environment: external-provider-smoke
+    runs-on: [self-hosted, linux, x64, ephemeral]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      EGRESS_GITHUB_TOKEN: ${{ secrets.EGRESS_GITHUB_TOKEN }}
+      EGRESS_GITHUB_INSTALLATION_ID: ${{ secrets.EGRESS_GITHUB_INSTALLATION_ID }}
+      EGRESS_GITHUB_DISPOSABLE_REPOSITORY: ${{ secrets.EGRESS_GITHUB_DISPOSABLE_REPOSITORY }}
+      EGRESS_GITHUB_BASE_BRANCH: ${{ secrets.EGRESS_GITHUB_BASE_BRANCH }}
+      EGRESS_GITHUB_HEAD_BRANCH: ${{ secrets.EGRESS_GITHUB_HEAD_BRANCH }}
+      EGRESS_GITHUB_EXPECTED_OLD_OBJECT: ${{ secrets.EGRESS_GITHUB_EXPECTED_OLD_OBJECT }}
+      EGRESS_GITHUB_NEW_OBJECT: ${{ secrets.EGRESS_GITHUB_NEW_OBJECT }}
+      EGRESS_GITHUB_DISPOSABLE_ACK: ${{ secrets.EGRESS_GITHUB_DISPOSABLE_ACK }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Verify the typed live GitHub provider path
+        run: scripts/ci/run.sh live-github
 
   privileged_isolation:
     name: Privileged runtime isolation verification
@@ -259,6 +350,10 @@ jobs:
       - fuzz
       - benchmarks
       - real_vm
+      - real_runtime_lifecycle
+      - real_capfs
+      - egress_real_https
+      - external_provider_smoke
       - privileged_isolation
     runs-on: ubuntu-24.04
     timeout-minutes: 5

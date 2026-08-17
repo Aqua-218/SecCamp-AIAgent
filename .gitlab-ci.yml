@@ -16,6 +16,7 @@ include:
   - local: .gitlab/ci/validate.yml
   - local: .gitlab/ci/test.yml
   - local: .gitlab/ci/security.yml
+  - local: .gitlab/ci/deep.yml
   - local: .gitlab/ci/release.yml
 
 stages:
@@ -23,6 +24,7 @@ stages:
   - test
   - analyze
   - security
+  - system
   - package
   - verify
   - publish

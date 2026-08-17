@@ -20,12 +20,29 @@
 #   tier          fast | standard | deep
 #   scopes        Change scopes that make the gate relevant. A gate runs when any
 #                 of its scopes changed, or when the event carries no diff.
+#   status        implemented | planned. See below; parity enforces both cases.
 #   github        GitHub Actions job id, or `null` when the platform cannot host it.
 #   gitlab        GitLab CI job name, or `null`.
 #   workflow      GitHub workflow file that defines the job.
 #   include       GitLab include file that defines the job.
 #   matrix        Optional matrix key from `matrices` below, expanded by the planner.
-#   why_platform  Required whenever `github` or `gitlab` is null.
+#   why_platform  Required whenever `github` or `gitlab` is null on an implemented gate.
+#   why_planned   Required on every planned gate. Says what is missing.
+#
+# Why `status` exists
+#
+# This manifest is the plan and the record at once, and those two roles disagree
+# unless the difference is written down. A gate listed here with no job behind it
+# used to read exactly like a gate that runs on every pipeline, so the parity
+# check could never pass and the claim "both platforms implement the same gates"
+# could never be true.
+#
+# `implemented` means a repository-owned script runs and both platforms call it;
+# parity requires the job to exist on every platform the gate does not explicitly
+# excuse itself from. `planned` means the gate is designed but nothing runs yet;
+# parity requires it to have no job anywhere, so a half-built gate cannot pass as
+# a real one, and `why_planned` records what is missing. Promoting a gate is
+# therefore one field change plus the job it now demands.
 
 version: 2
 
@@ -160,9 +177,10 @@ gates:
     stage: validate
     tier: fast
     scopes: [always]
+    status: implemented
     github: pipeline_policy
     gitlab: pipeline_policy
-    workflow: wf-validate.yml
+    workflow: ci.yml
     include: validate.yml
 
   - id: pipeline_self_test
@@ -170,9 +188,10 @@ gates:
     stage: validate
     tier: fast
     scopes: [always]
+    status: implemented
     github: pipeline_self_test
     gitlab: pipeline_self_test
-    workflow: wf-validate.yml
+    workflow: ci.yml
     include: validate.yml
 
   - id: docs_policy
@@ -180,9 +199,10 @@ gates:
     stage: validate
     tier: fast
     scopes: [always]
+    status: implemented
     github: docs_policy
     gitlab: docs_policy
-    workflow: wf-validate.yml
+    workflow: ci.yml
     include: validate.yml
 
   - id: adr_index
@@ -190,9 +210,10 @@ gates:
     stage: validate
     tier: fast
     scopes: [always]
+    status: implemented
     github: adr_index
     gitlab: adr_index
-    workflow: wf-validate.yml
+    workflow: ci.yml
     include: validate.yml
 
   - id: verification_traceability
@@ -200,9 +221,10 @@ gates:
     stage: validate
     tier: fast
     scopes: [rust, docs]
+    status: implemented
     github: verification_traceability
     gitlab: verification_traceability
-    workflow: wf-validate.yml
+    workflow: ci.yml
     include: validate.yml
 
   - id: commit_policy
@@ -210,19 +232,22 @@ gates:
     stage: validate
     tier: fast
     scopes: [always]
-    github: commit_policy
-    gitlab: commit_policy
-    workflow: wf-validate.yml
-    include: validate.yml
+    status: planned
+    why_planned: No script validates commit message shape; the convention lives only in review.
+    github: null
+    gitlab: null
+    workflow: null
+    include: null
 
   - id: repository_hygiene
     title: Repository hygiene
     stage: validate
     tier: fast
     scopes: [always]
+    status: implemented
     github: repository_hygiene
     gitlab: repository_hygiene
-    workflow: wf-validate.yml
+    workflow: ci.yml
     include: validate.yml
 
   - id: codeowners_coverage
@@ -230,9 +255,10 @@ gates:
     stage: validate
     tier: fast
     scopes: [always]
+    status: implemented
     github: codeowners_coverage
     gitlab: codeowners_coverage
-    workflow: wf-validate.yml
+    workflow: ci.yml
     include: validate.yml
 
   - id: toolchain_consistency
@@ -240,9 +266,10 @@ gates:
     stage: validate
     tier: fast
     scopes: [always]
+    status: implemented
     github: toolchain_consistency
     gitlab: toolchain_consistency
-    workflow: wf-validate.yml
+    workflow: ci.yml
     include: validate.yml
 
   - id: dependency_usage
@@ -250,9 +277,10 @@ gates:
     stage: validate
     tier: fast
     scopes: [rust]
+    status: implemented
     github: dependency_usage
     gitlab: dependency_usage
-    workflow: wf-validate.yml
+    workflow: ci.yml
     include: validate.yml
 
   - id: lockfile_integrity
@@ -260,9 +288,10 @@ gates:
     stage: validate
     tier: fast
     scopes: [rust]
+    status: implemented
     github: lockfile_integrity
     gitlab: lockfile_integrity
-    workflow: wf-validate.yml
+    workflow: ci.yml
     include: validate.yml
 
   - id: lean_hygiene
@@ -270,212 +299,238 @@ gates:
     stage: validate
     tier: fast
     scopes: [lean]
-    github: lean_hygiene
-    gitlab: lean_hygiene
-    workflow: wf-validate.yml
-    include: validate.yml
+    status: implemented
 
   # ----------------------------------------------------------------- quality --
+    github: lean_hygiene
+    gitlab: lean_hygiene
+    workflow: ci.yml
+    include: validate.yml
   - id: rust_quality
     title: Rust quality gate
     stage: quality
     tier: fast
     scopes: [rust]
+    status: implemented
     github: rust_quality
     gitlab: rust_quality
-    workflow: wf-quality.yml
-    include: quality.yml
+    workflow: ci.yml
+    include: validate.yml
 
   - id: api_surface
     title: Public API surface
     stage: quality
     tier: fast
     scopes: [rust]
-    github: api_surface
-    gitlab: api_surface
-    workflow: wf-quality.yml
-    include: quality.yml
+    status: planned
+    why_planned: cargo-public-api is not pinned in install-cargo-tools.sh and no baseline is committed.
+    github: null
+    gitlab: null
+    workflow: null
+    include: null
 
   - id: crate_isolation
     title: Per-crate isolation build
     stage: quality
     tier: standard
     scopes: [rust]
+    status: implemented
+    matrix: isolation_packages
     github: crate_isolation
     gitlab: crate_isolation
-    workflow: wf-quality.yml
-    include: quality.yml
-    matrix: isolation_packages
+    workflow: ci.yml
+    include: validate.yml
 
   - id: cross_targets
     title: Cross-target check
     stage: quality
     tier: standard
     scopes: [rust]
-    github: cross_targets
-    gitlab: cross_targets
-    workflow: wf-quality.yml
-    include: quality.yml
+    status: implemented
     matrix: cross_targets
 
   # -------------------------------------------------------------------- test --
+    github: cross_targets
+    gitlab: cross_targets
+    workflow: ci.yml
+    include: validate.yml
   - id: rust_tests
     title: Rust tests
     stage: test
     tier: fast
     scopes: [rust]
+    status: implemented
+    matrix: test_shards
     github: rust_tests
     gitlab: rust_tests
-    workflow: wf-test.yml
+    workflow: ci.yml
     include: test.yml
-    matrix: test_shards
 
   - id: rust_doctests
     title: Rust doctests
     stage: test
     tier: fast
     scopes: [rust]
-    github: rust_doctests
-    gitlab: rust_doctests
-    workflow: wf-test.yml
-    include: test.yml
+    status: implemented
 
   # ------------------------------------------------------------------ verify --
+    github: rust_doctests
+    gitlab: rust_doctests
+    workflow: ci.yml
+    include: test.yml
   - id: loom
     title: Loom concurrency model
     stage: verify
     tier: standard
     scopes: [rust]
+    status: implemented
     github: loom
     gitlab: loom
-    workflow: wf-verify.yml
-    include: verify.yml
+    workflow: ci.yml
+    include: test.yml
 
   - id: lean_proofs
     title: Lean proofs
     stage: verify
     tier: standard
     scopes: [rust, lean]
+    status: implemented
     github: lean_proofs
     gitlab: lean_proofs
-    workflow: wf-verify.yml
-    include: verify.yml
+    workflow: ci.yml
+    include: test.yml
 
   - id: differential_corpus
     title: Rust and Lean differential corpus
     stage: verify
     tier: standard
     scopes: [rust, lean]
+    status: implemented
     github: differential_corpus
     gitlab: differential_corpus
-    workflow: wf-verify.yml
-    include: verify.yml
+    workflow: ci.yml
+    include: test.yml
 
   - id: miri
     title: Miri undefined-behaviour check
     stage: verify
     tier: deep
     scopes: [rust]
-    github: miri
-    gitlab: miri
-    workflow: wf-verify.yml
-    include: verify.yml
+    status: planned
+    why_planned: Miri needs a pinned nightly toolchain that rust-toolchain.toml does not provide.
     matrix: miri_packages
+    github: null
+    gitlab: null
+    workflow: null
+    include: null
 
   - id: sanitizers
     title: Sanitizer run
     stage: verify
     tier: deep
     scopes: [rust]
-    github: sanitizers
-    gitlab: sanitizers
-    workflow: wf-verify.yml
-    include: verify.yml
+    status: planned
+    why_planned: Sanitizers need a pinned nightly toolchain that rust-toolchain.toml does not provide.
     matrix: sanitizer_modes
 
   # ----------------------------------------------------------------- analyze --
+    github: null
+    gitlab: null
+    workflow: null
+    include: null
   - id: coverage
     title: Workspace coverage
     stage: analyze
     tier: standard
     scopes: [rust]
+    status: implemented
     github: coverage
     gitlab: coverage
-    workflow: wf-analyze.yml
-    include: analyze.yml
+    workflow: ci.yml
+    include: test.yml
 
   - id: mutation
     title: Mutation testing
     stage: analyze
     tier: deep
     scopes: [rust]
-    github: mutation
-    gitlab: mutation
-    workflow: wf-analyze.yml
-    include: analyze.yml
+    status: planned
+    why_planned: cargo-mutants is not pinned in install-cargo-tools.sh.
     matrix: mutation_shards
+    github: null
+    gitlab: null
+    workflow: null
+    include: null
 
   - id: fuzz
     title: Fuzz targets
     stage: analyze
     tier: deep
     scopes: [rust]
-    github: fuzz
-    gitlab: fuzz
-    workflow: wf-analyze.yml
-    include: analyze.yml
+    status: planned
+    why_planned: The workspace contains no fuzz targets for the reserved matrix to run.
     matrix: fuzz_targets
+    github: null
+    gitlab: null
+    workflow: null
+    include: null
 
   - id: benchmarks
     title: Benchmark regression
     stage: analyze
     tier: deep
     scopes: [rust]
-    github: benchmarks
-    gitlab: benchmarks
-    workflow: wf-analyze.yml
-    include: analyze.yml
+    status: planned
+    why_planned: The workspace contains no benches and no committed baseline to regress against.
 
   # ---------------------------------------------------------------- delivery --
+    github: null
+    gitlab: null
+    workflow: null
+    include: null
   - id: release_dry_run
     title: Release dry run
     stage: delivery
     tier: standard
     scopes: [rust, pipeline]
+    status: implemented
     github: release_dry_run
     gitlab: release_dry_run
-    workflow: wf-delivery.yml
-    include: delivery.yml
+    workflow: ci.yml
+    include: validate.yml
 
   - id: reproducibility
     title: Release reproducibility
     stage: delivery
-    tier: deep
+    tier: standard
     scopes: [rust, pipeline]
-    github: reproducibility
-    gitlab: reproducibility
-    workflow: wf-delivery.yml
-    include: delivery.yml
+    status: implemented
 
   # ---------------------------------------------------------------- security --
+    github: reproducibility
+    gitlab: reproducibility
+    workflow: ci.yml
+    include: validate.yml
   - id: codeql
     title: CodeQL Rust analysis
     stage: security
     tier: standard
     scopes: [rust]
+    status: implemented
     github: codeql
     gitlab: null
+    workflow: security.yml
+    include: null
     why_platform: >-
       CodeQL is a GitHub Advanced Security product. GitLab covers the same
       surface with Semgrep plus the RustSec advisory audit.
-    workflow: security.yml
-    include: null
 
   - id: dependency_audit
     title: RustSec advisory audit
     stage: security
     tier: standard
     scopes: [rust]
+    status: implemented
     github: dependency_audit
     gitlab: dependency_audit
     workflow: security.yml
@@ -486,6 +541,7 @@ gates:
     stage: security
     tier: standard
     scopes: [rust]
+    status: implemented
     github: dependency_policy
     gitlab: dependency_policy
     workflow: security.yml
@@ -496,6 +552,7 @@ gates:
     stage: security
     tier: standard
     scopes: [rust, pipeline]
+    status: implemented
     github: sast
     gitlab: sast
     workflow: security.yml
@@ -506,6 +563,7 @@ gates:
     stage: security
     tier: standard
     scopes: [always]
+    status: implemented
     github: secrets
     gitlab: secret_detection
     workflow: security.yml
@@ -516,6 +574,7 @@ gates:
     stage: security
     tier: standard
     scopes: [rust, pipeline]
+    status: implemented
     github: supply_chain_inventory
     gitlab: supply_chain_inventory
     workflow: security.yml
@@ -526,13 +585,14 @@ gates:
     stage: security
     tier: deep
     scopes: [always]
+    status: implemented
     github: scorecard
     gitlab: null
+    workflow: security.yml
+    include: null
     why_platform: >-
       Scorecard scores GitHub repository administration. The equivalent GitLab
       controls are configured administratively and documented in docs/ci-cd.md.
-    workflow: security.yml
-    include: null
 
   # ------------------------------------------------------------------ system --
   - id: real_vm
@@ -540,6 +600,7 @@ gates:
     stage: system
     tier: deep
     scopes: [rust]
+    status: implemented
     github: real_vm
     gitlab: real_vm
     workflow: deep.yml
@@ -547,11 +608,23 @@ gates:
 
   - id: pin_inventory
     title: Pin inventory
-    stage: system
-    tier: deep
+    stage: validate
+    tier: fast
     scopes: [always]
+    status: implemented
     github: pin_inventory
     gitlab: pin_inventory
+    workflow: ci.yml
+    include: validate.yml
+
+  - id: privileged_isolation
+    title: Privileged runtime isolation verification
+    stage: system
+    tier: deep
+    scopes: [rust]
+    status: implemented
+    github: privileged_isolation
+    gitlab: privileged_isolation
     workflow: deep.yml
     include: deep.yml
 
@@ -573,5 +646,10 @@ release_stages:
     gitlab: publish_release
   - id: record
     title: Create the immutable release record
-    github: record
+    why_platform: >-
+      On GitHub the release record is the Release object that the publish stage
+      creates, so a separate job could only repeat the publish. GitLab needs one
+      call to upload assets and another to create the Release, and therefore has
+      a job for each.
+    github: null
     gitlab: create_release

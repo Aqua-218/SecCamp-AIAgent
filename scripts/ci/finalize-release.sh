@@ -7,15 +7,9 @@ readonly release_tool_bin="${CI_TOOLS_DIR:-${repository_root}/.ci-tools}/bin"
 export PATH="${release_tool_bin}:${PATH}"
 cd -- "${repository_root}"
 
-if [[ ! -f dist/release.env ]]; then
-  printf 'dist/release.env is missing\n' >&2
-  exit 1
-fi
-
-set -a
-# shellcheck disable=SC1091
-source dist/release.env
-set +a
+# shellcheck source=scripts/ci/release-metadata-lib.sh
+source "${repository_root}/scripts/ci/release-metadata-lib.sh"
+release_metadata_load dist/release.env
 
 readonly archive_path="dist/${ARCHIVE_NAME}"
 readonly sbom_path="dist/${SBOM_NAME}"
@@ -33,9 +27,24 @@ sed -E -i \
   -e "s#\"documentNamespace\":\"[^\"]+\"#\"documentNamespace\":\"${document_namespace}\"#" \
   -e "s#\"created\":\"[^\"]+\"#\"created\":\"${source_timestamp}\"#" \
   "${sbom_path}"
+
+expected_namespace="https://spdx.org/spdxdocs/${ARTIFACT_STEM}-${SOURCE_REVISION}"
+readonly expected_namespace
+jq --exit-status \
+  --arg name "${ARTIFACT_STEM}" \
+  --arg version "${RELEASE_TAG}" \
+  --arg namespace "${expected_namespace}" \
+  '(.spdxVersion == "SPDX-2.3") and
+   (.dataLicense == "CC0-1.0") and
+   (.SPDXID == "SPDXRef-DOCUMENT") and
+   (.name == $name) and
+   (.documentNamespace == $namespace) and
+   (.packages | type == "array" and length >= 1) and
+   (any(.packages[]; .name == $name and .versionInfo == $version))' \
+  "${sbom_path}" > /dev/null
 (
   cd -- dist
-  sha256sum "${ARCHIVE_NAME}" "${SBOM_NAME}" > "${CHECKSUM_NAME}"
+  sha256sum "${ARCHIVE_NAME}" "${SBOM_NAME}" release.env > "${CHECKSUM_NAME}"
 )
 
 if [[ "${SIGN_RELEASE:-false}" == "true" ]]; then

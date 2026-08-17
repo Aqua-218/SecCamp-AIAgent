@@ -39,7 +39,9 @@ readonly kernel_url="https://cdn.kernel.org/pub/linux/kernel/v6.x/${kernel_archi
 readonly kernel_config="${repository_root}/guest/kernel/linux-${kernel_version}-guest.config"
 readonly acpi_patch="${repository_root}/guest/kernel/0001-acpi-skip-pci-config-default-space-without-pci.patch"
 
-readonly install_root="${tools_root}/guest-kernel/${kernel_version}"
+build_recipe_digest="$({ sha256sum "${kernel_config}" "${acpi_patch}"; printf '%s\n' "${kernel_version}"; } | sha256sum | awk '{print $1}')"
+readonly build_recipe_digest
+readonly install_root="${tools_root}/guest-kernel/${kernel_version}/${build_recipe_digest}"
 readonly built_kernel="${install_root}/vmlinux-${kernel_version}"
 
 if [[ "$(uname -m)" != "x86_64" ]]; then
@@ -102,6 +104,10 @@ for required in CONFIG_FUSE_FS=y CONFIG_SECURITY_LANDLOCK=y CONFIG_ACPI=y; do
     exit 1
   }
 done
+grep -qE '^CONFIG_LSM="([^",]+,)*landlock(,[^"]+)*"$' "${source_tree}/.config" || {
+  printf '%s\n' 'guest kernel configuration does not enable Landlock in the boot LSM list' >&2
+  exit 1
+}
 
 make -C "${source_tree}" CC="${compiler}" HOSTCC="${compiler}" -j"$(nproc)" vmlinux > /dev/null
 

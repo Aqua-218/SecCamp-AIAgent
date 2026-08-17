@@ -330,6 +330,7 @@ pub enum egress_protocol::session::EnvelopeError
 pub egress_protocol::session::EnvelopeError::OutOfOrderSequence
 pub egress_protocol::session::EnvelopeError::OutOfOrderSequence::expected: u64
 pub egress_protocol::session::EnvelopeError::OutOfOrderSequence::received: u64
+pub egress_protocol::session::EnvelopeError::PayloadHashMismatch
 pub egress_protocol::session::EnvelopeError::RequestCapacityExhausted
 pub egress_protocol::session::EnvelopeError::RequestIdentityMismatch
 pub egress_protocol::session::EnvelopeError::RequestIdentityMismatch::request: egress_protocol::session::BrokerRequestId
@@ -342,7 +343,8 @@ impl core::fmt::Display for egress_protocol::session::EnvelopeError
 pub fn egress_protocol::session::EnvelopeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct egress_protocol::session::BrokerEnvelope
 impl egress_protocol::session::BrokerEnvelope
-pub const fn egress_protocol::session::BrokerEnvelope::new(egress_protocol::session::BrokerSessionId, u64, egress_protocol::session::BrokerRequestId, egress_protocol::session::PayloadHash) -> Self
+pub fn egress_protocol::session::BrokerEnvelope::binds_canonical_payload(&self, &[u8]) -> bool
+pub fn egress_protocol::session::BrokerEnvelope::from_canonical_payload(egress_protocol::session::BrokerSessionId, u64, egress_protocol::session::BrokerRequestId, &[u8]) -> Self
 pub const fn egress_protocol::session::BrokerEnvelope::payload_hash(&self) -> egress_protocol::session::PayloadHash
 pub const fn egress_protocol::session::BrokerEnvelope::request(&self) -> egress_protocol::session::BrokerRequestId
 pub const fn egress_protocol::session::BrokerEnvelope::sequence(&self) -> u64
@@ -361,7 +363,7 @@ pub const fn egress_protocol::session::PayloadHash::as_bytes(&self) -> &[u8; 32]
 pub fn egress_protocol::session::PayloadHash::of_canonical_payload(&[u8]) -> Self
 pub struct egress_protocol::session::SessionReplayGuard
 impl egress_protocol::session::SessionReplayGuard
-pub fn egress_protocol::session::SessionReplayGuard::accept(&mut self, egress_protocol::session::BrokerEnvelope) -> core::result::Result<egress_protocol::session::EnvelopeAcceptance, egress_protocol::session::EnvelopeError>
+pub fn egress_protocol::session::SessionReplayGuard::accept_payload(&mut self, egress_protocol::session::BrokerEnvelope, &[u8]) -> core::result::Result<egress_protocol::session::EnvelopeAcceptance, egress_protocol::session::EnvelopeError>
 pub fn egress_protocol::session::SessionReplayGuard::accepted_request_count(&self) -> usize
 pub const fn egress_protocol::session::SessionReplayGuard::new(egress_protocol::session::BrokerSessionId, core::num::nonzero::NonZeroUsize) -> Self
 pub const fn egress_protocol::session::SessionReplayGuard::next_sequence(&self) -> core::option::Option<u64>

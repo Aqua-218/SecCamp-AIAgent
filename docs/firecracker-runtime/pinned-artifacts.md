@@ -98,7 +98,7 @@ snapshot の互換性判定が 1 つの digest 比較になっているので、
 `verify_artifacts` は指定 path の digest を side effect の前に照合する。さらに、digest 付きで実行する host command と recovery tool は、実行時に `O_NOFOLLOW` で開いた regular file を sealed executable memfd へコピーし、`/proc/self/fd/<n>` を program として起動する。`RealCommandRunner` / detached launcher は ambient environment を `env_clear()` で消す。このため、以前の「照合後に path を再解決するため TOCTOU が残る」という説明は現状実装には当たらない。
 
 - digest 照合と memfd sealing は artifact の同一性を保証するが、artifact 自体の供給元・安全性は証明しない。信頼するのは供給元であり、この crate は同一性しか見ていない。
-- 実 `veritysetup` / `dmsetup` の mapping と hash-tree 検証、jailer 配下での実起動は未検証。pinned command の no-follow・memfd・環境消去は実装済みだが、実 helper と kernel mapper の効果まではこの crate の local test で証明していない。
+- 実`veritysetup`／`dmsetup`のmapping、hash-tree検証、jailer配下の起動はreal lifecycle／KVM gateで確認済み。pinned commandのno-follow・memfd・環境消去も実装・テスト済み。ただしartifact供給元、device-mapper、kernel実装そのものの正しさはTCBである。
 - `sha2` crate の実装の正しさは仮定している。test vector 2 本では、実装が壊れていないことの弱い証拠にしかならない。
 - config fingerprint の計算対象が「変わったら snapshot を無効にすべき全項目」を漏れなく含んでいることは、証明していない。
 

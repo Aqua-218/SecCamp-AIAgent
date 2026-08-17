@@ -12,7 +12,6 @@ workspace = true
 
 [dependencies]
 authority-core = { path = "../authority-core" }
-runtime-isolation = { path = "../runtime-isolation" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 capfs = { path = "../capfs" }

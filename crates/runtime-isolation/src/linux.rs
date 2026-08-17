@@ -60,6 +60,7 @@ mod implementation {
         | LANDLOCK_ACCESS_FS_REMOVE_FILE
         | LANDLOCK_ACCESS_FS_MAKE_DIR
         | LANDLOCK_ACCESS_FS_MAKE_REG
+        | LANDLOCK_ACCESS_FS_MAKE_SYM
         | LANDLOCK_ACCESS_FS_REFER
         | LANDLOCK_ACCESS_FS_TRUNCATE;
     /// `PROC_SUPER_MAGIC`, the `statfs` filesystem type that identifies a real procfs.
@@ -2621,12 +2622,11 @@ mod implementation {
         }
 
         #[test]
-        fn landlock_workspace_rights_do_not_include_special_file_creation() {
+        fn landlock_workspace_rights_allow_capfs_symlinks_but_not_special_files() {
             let special_file_creation = LANDLOCK_ACCESS_FS_MAKE_CHAR
                 | LANDLOCK_ACCESS_FS_MAKE_SOCK
                 | LANDLOCK_ACCESS_FS_MAKE_FIFO
-                | LANDLOCK_ACCESS_FS_MAKE_BLOCK
-                | LANDLOCK_ACCESS_FS_MAKE_SYM;
+                | LANDLOCK_ACCESS_FS_MAKE_BLOCK;
 
             assert_eq!(
                 LANDLOCK_ALL_ACCESS & LANDLOCK_ACCESS_FS_TRUNCATE,
@@ -2635,7 +2635,12 @@ mod implementation {
             assert_eq!(
                 LANDLOCK_WORKSPACE_ACCESS & special_file_creation,
                 0,
-                "workspace must not create devices, sockets, FIFOs, or symlinks"
+                "workspace must not create devices, sockets, or FIFOs"
+            );
+            assert_ne!(
+                LANDLOCK_WORKSPACE_ACCESS & LANDLOCK_ACCESS_FS_MAKE_SYM,
+                0,
+                "CapFS-authorized relative symlinks must pass the outer Landlock envelope"
             );
             assert_ne!(
                 LANDLOCK_WORKSPACE_ACCESS & LANDLOCK_ACCESS_FS_REFER,

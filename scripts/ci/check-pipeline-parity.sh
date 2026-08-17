@@ -47,6 +47,7 @@ readonly github_orchestration_jobs=(
 
 readonly gitlab_orchestration_jobs=(
   pipeline_plan
+  pipeline_complete
   pipeline_summary
   package_release
   verify_release
@@ -147,6 +148,21 @@ expect_matrix 'GitLab mutation' \
   '.matrices.mutation_shards.values | map({"shard": .shard, "package": .package})' \
   .gitlab/ci/deep.yml \
   '.mutation.parallel.matrix | map({"shard": (.SHARD[0] | tonumber), "package": .PACKAGE[0]})'
+
+expected_gitlab_fanin="$(
+  { printf 'pipeline_plan\n'; yq eval -r '.gates[] | select(.status == "implemented" and .gitlab != null) | .gitlab' "${manifest}"; } \
+    | sort
+)"
+actual_gitlab_fanin="$(
+  yq eval -r '.pipeline_complete.needs[].job' .gitlab/ci/complete.yml | sort
+)"
+if [[ "${actual_gitlab_fanin}" != "${expected_gitlab_fanin}" ]]; then
+  fail 'GitLab pipeline_complete needs do not equal the implemented manifest gate set'
+fi
+if [[ "$(yq eval -r '[.pipeline_complete.needs[] | select(.job != "pipeline_plan" and (.optional // false) == true) | .job] | sort | join(" ")' .gitlab/ci/complete.yml)" \
+  != "$(yq eval -r '[.gates[] | select(.status == "implemented" and .gitlab != null and .tier == "deep") | .gitlab] | sort | join(" ")' "${manifest}")" ]]; then
+  fail 'only deep GitLab fan-in dependencies may be optional'
+fi
 
 if ! grep -qF 'scripts/ci/run.sh test-package "${{ matrix.package }}"' .github/workflows/ci.yml \
   || ! grep -qF 'scripts/ci/run.sh test-package "$PACKAGE"' .gitlab/ci/test.yml; then

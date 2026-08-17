@@ -9,9 +9,10 @@
 use std::{
     env,
     ffi::OsString,
-    io,
+    io::{self, Read},
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
+    time::Duration,
 };
 
 use firecracker_runtime::guest_control::{
@@ -28,6 +29,12 @@ const GUEST_SESSION_ID_ENV: &str = "GUEST_IDENTITY_SESSION_ID";
 const GUEST_REQUEST_ID_ENV: &str = "GUEST_IDENTITY_REQUEST_ID";
 const GUEST_SUBJECT_ID_ENV: &str = "GUEST_IDENTITY_SUBJECT_ID";
 const GUEST_CAPABILITY_ID_ENV: &str = "GUEST_IDENTITY_CAPABILITY_ID";
+const GUEST_POLICY_DIGEST_ENV: &str = "GUEST_AUTHORITY_POLICY_DIGEST";
+const GUEST_POLICY_ENCODING_VERSION_ENV: &str = "GUEST_AUTHORITY_POLICY_ENCODING_VERSION";
+const SUPERVISOR_READINESS_ENV: &str = "GUEST_SUPERVISOR_READINESS";
+const SUPERVISOR_READINESS_REQUIRED: &str = "1";
+const SUPERVISOR_READY_MARKER: &[u8; 25] = b"guest-supervisor-ready/v1";
+const SUPERVISOR_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct Config {
@@ -150,15 +157,31 @@ fn start_workload(
     workload: &mut Option<Child>,
     request: &GuestControlRequest,
 ) -> io::Result<()> {
-    if workload.is_some() {
-        return Ok(());
+    if let Some(existing) = workload.as_mut() {
+        if existing.try_wait()?.is_none() {
+            return Ok(());
+        }
+        *workload = None;
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "configured guest supervisor exited before the start request was acknowledged",
+        ));
     }
+
+    let (mut readiness, supervisor_output) = Socket::pair(Domain::UNIX, Type::STREAM, None)?;
+    readiness.set_read_timeout(Some(SUPERVISOR_READY_TIMEOUT))?;
+    // `Stdio::from(OwnedFd)` transfers this endpoint to exactly the child that
+    // `spawn` returns. The parent retains only `readiness`; no pathname or
+    // process-global fd can satisfy the handshake.
+    supervisor_output.set_cloexec(false)?;
+    let supervisor_output = std::os::fd::OwnedFd::from(supervisor_output);
     let child = Command::new(&config.workload)
         .args(&config.workload_arguments)
         .env_clear()
         .envs(workload_environment(request))
+        .env(SUPERVISOR_READINESS_ENV, SUPERVISOR_READINESS_REQUIRED)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::from(supervisor_output))
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| {
@@ -168,13 +191,92 @@ fn start_workload(
             );
             error
         })?;
+
+    let mut child = child;
+    if let Err(error) = wait_for_supervisor_readiness(&mut readiness, &mut child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    if child.try_wait()?.is_some() {
+        let _ = child.wait();
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "configured guest supervisor exited immediately after readiness",
+        ));
+    }
     *workload = Some(child);
     Ok(())
 }
 
-fn workload_environment(request: &GuestControlRequest) -> [(OsString, String); 6] {
+fn wait_for_supervisor_readiness(readiness: &mut Socket, child: &mut Child) -> io::Result<()> {
+    wait_for_supervisor_readiness_with_timeout(readiness, child, SUPERVISOR_READY_TIMEOUT)
+}
+
+fn wait_for_supervisor_readiness_with_timeout(
+    readiness: &mut Socket,
+    child: &mut Child,
+    timeout: Duration,
+) -> io::Result<()> {
+    readiness.set_read_timeout(Some(timeout))?;
+    let mut marker = [0_u8; SUPERVISOR_READY_MARKER.len()];
+    let mut received = 0_usize;
+    while received < marker.len() {
+        match readiness.read(&mut marker[received..]) {
+            Ok(0) if received != 0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "guest supervisor closed a partial readiness marker",
+                ));
+            }
+            Ok(0) => {
+                let status = child.try_wait()?.map_or_else(
+                    || "without an observable exit status".to_owned(),
+                    |status| format!("with status {status}"),
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("guest supervisor exited before readiness {status}"),
+                ));
+            }
+            Ok(count) => received += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if let Some(status) = child.try_wait()? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        format!("guest supervisor exited before readiness ({status})"),
+                    ));
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "guest supervisor did not signal readiness within {} milliseconds",
+                        timeout.as_millis()
+                    ),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if marker == *SUPERVISOR_READY_MARKER {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guest supervisor sent a malformed or foreign readiness marker",
+        ))
+    }
+}
+
+fn workload_environment(request: &GuestControlRequest) -> Vec<(OsString, String)> {
     let identities = request.identities();
-    [
+    let mut environment = vec![
         (
             OsString::from(GUEST_CHALLENGE_ENV),
             request.challenge().to_hex(),
@@ -196,7 +298,17 @@ fn workload_environment(request: &GuestControlRequest) -> [(OsString, String); 6
             OsString::from(GUEST_CAPABILITY_ID_ENV),
             identities.capability_id.to_hex(),
         ),
-    ]
+    ];
+    if let (Some(version), Some(digest)) =
+        (request.policy_encoding_version(), request.policy_digest())
+    {
+        environment.push((
+            OsString::from(GUEST_POLICY_ENCODING_VERSION_ENV),
+            version.to_string(),
+        ));
+        environment.push((OsString::from(GUEST_POLICY_DIGEST_ENV), digest.to_hex()));
+    }
+    environment
 }
 
 fn reap_workload(workload: &mut Option<Child>) -> Result<(), String> {
@@ -218,6 +330,129 @@ fn reap_workload(workload: &mut Option<Child>) -> Result<(), String> {
 mod tests {
     use super::*;
     use firecracker_runtime::{IdentityBundle, IdentityId};
+
+    fn child_writing_readiness(payload: &'static str, hold_open: bool) -> (Socket, Child) {
+        let (readiness, child_output) =
+            Socket::pair(Domain::UNIX, Type::STREAM, None).expect("test socket pair");
+        child_output
+            .set_cloexec(false)
+            .expect("test child endpoint must be inherited");
+        let output = std::os::fd::OwnedFd::from(child_output);
+        let command = if hold_open {
+            "printf '%s' \"$READY_PAYLOAD\"; sleep 1".to_owned()
+        } else {
+            "printf '%s' \"$READY_PAYLOAD\"".to_owned()
+        };
+        let child = Command::new("/bin/sh")
+            .args(["-c", &command])
+            .env("READY_PAYLOAD", payload)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("test readiness child must spawn");
+        (readiness, child)
+    }
+
+    #[test]
+    fn accepts_exact_supervisor_readiness_after_child_setup() {
+        let (mut readiness, mut child) = child_writing_readiness(
+            std::str::from_utf8(SUPERVISOR_READY_MARKER).expect("marker is UTF-8"),
+            true,
+        );
+        wait_for_supervisor_readiness_with_timeout(
+            &mut readiness,
+            &mut child,
+            Duration::from_secs(1),
+        )
+        .expect("exact readiness marker must be accepted");
+        child.kill().expect("test child must be stoppable");
+        child.wait().expect("test child must be reaped");
+    }
+
+    #[test]
+    fn rejects_immediate_supervisor_exit_before_readiness() {
+        let (mut readiness, mut child) = child_writing_readiness("", false);
+        let error = wait_for_supervisor_readiness_with_timeout(
+            &mut readiness,
+            &mut child,
+            Duration::from_secs(1),
+        )
+        .expect_err("an exited supervisor must not satisfy readiness");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        child.wait().expect("test child must be reaped");
+    }
+
+    #[test]
+    fn rejects_missing_supervisor_readiness_at_the_deadline() {
+        let (mut readiness, mut child) = child_writing_readiness("", true);
+        let error = wait_for_supervisor_readiness_with_timeout(
+            &mut readiness,
+            &mut child,
+            Duration::from_millis(20),
+        )
+        .expect_err("a silent supervisor must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        child.kill().expect("silent test child must be stoppable");
+        child.wait().expect("test child must be reaped");
+    }
+
+    #[test]
+    fn rejects_malformed_or_foreign_supervisor_readiness() {
+        let (mut readiness, mut child) = child_writing_readiness("foreign-ready", true);
+        let error = wait_for_supervisor_readiness_with_timeout(
+            &mut readiness,
+            &mut child,
+            Duration::from_secs(1),
+        )
+        .expect_err("a foreign marker must not satisfy readiness");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        child
+            .kill()
+            .expect("malformed test child must be stoppable");
+        child.wait().expect("test child must be reaped");
+    }
+
+    #[test]
+    fn start_workload_ack_path_waits_for_the_exact_child_readiness_channel() {
+        let identity = |byte| {
+            IdentityId::from_hex(&format!("{byte:02x}").repeat(16))
+                .expect("test identity must be valid")
+        };
+        let request = GuestControlRequest::new(
+            identity(1),
+            IdentityBundle::new(
+                identity(2),
+                identity(3),
+                identity(4),
+                identity(5),
+                identity(6),
+            )
+            .expect("distinct test identities must form a bundle"),
+        )
+        .expect("challenge must not be inside the bundle");
+        let marker = std::str::from_utf8(SUPERVISOR_READY_MARKER).expect("marker is UTF-8");
+        let config = Config {
+            port: 18080,
+            workload: PathBuf::from("/bin/sh"),
+            workload_arguments: vec![
+                OsString::from("-c"),
+                OsString::from(format!("printf '%s' '{marker}'; sleep 1")),
+            ],
+        };
+        let mut workload = None;
+        start_workload(&config, &mut workload, &request)
+            .expect("start must wait for and receive child readiness");
+        let child = workload.as_mut().expect("successful start retains child");
+        assert!(
+            child
+                .try_wait()
+                .expect("child status must be readable")
+                .is_none()
+        );
+        child.kill().expect("test workload must be stoppable");
+        child.wait().expect("test workload must be reaped");
+    }
 
     #[test]
     fn accepts_the_kernel_init_argument_delimiter() {
@@ -286,6 +521,43 @@ mod tests {
         assert_eq!(
             environment[5],
             (OsString::from(GUEST_CAPABILITY_ID_ENV), "06".repeat(16))
+        );
+    }
+
+    #[test]
+    fn bound_workload_environment_carries_the_exact_policy_binding() {
+        let identity = |byte| {
+            IdentityId::from_hex(&format!("{byte:02x}").repeat(16))
+                .expect("test identity must be valid")
+        };
+        let digest = authority_core::policy::AuthorityPolicyDigest::from_hex(&"a5".repeat(32))
+            .expect("test digest must be valid");
+        let request = GuestControlRequest::new_bound(
+            identity(1),
+            IdentityBundle::new(
+                identity(2),
+                identity(3),
+                identity(4),
+                identity(5),
+                identity(6),
+            )
+            .expect("distinct test identities must form a bundle"),
+            digest,
+        )
+        .expect("challenge must not be inside the bundle");
+
+        let environment = workload_environment(&request);
+        assert_eq!(environment.len(), 8);
+        assert_eq!(
+            environment[6],
+            (
+                OsString::from(GUEST_POLICY_ENCODING_VERSION_ENV),
+                authority_core::policy::ROOT_POLICY_ENCODING_VERSION.to_string(),
+            )
+        );
+        assert_eq!(
+            environment[7],
+            (OsString::from(GUEST_POLICY_DIGEST_ENV), digest.to_hex())
         );
     }
 }

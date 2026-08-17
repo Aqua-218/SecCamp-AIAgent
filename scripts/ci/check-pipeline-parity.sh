@@ -94,6 +94,65 @@ if [[ "${manifest_packages}" != "${workspace_packages}" ]]; then
   printf '  workspace: %s\n' "${workspace_packages}" >&2
 fi
 
+# Matrix values are executable policy, not presentation. Compare every hand-written platform
+# expansion with the manifest projection so adding a crate, filter, mode, or fuzz target cannot
+# leave a green but narrower workflow behind.
+expect_matrix() {
+  local label="$1" expected_expression="$2" file="$3" actual_expression="$4"
+  local expected actual
+  expected="$(yq eval --output-format=json --indent=0 "${expected_expression}" "${manifest}")"
+  actual="$(yq eval --output-format=json --indent=0 "${actual_expression}" "${file}")"
+  if [[ "${expected}" != "${actual}" ]]; then
+    fail "${label} matrix differs from ci/gates.yml"
+  fi
+}
+
+expect_matrix 'GitHub Rust test' \
+  '.packages | to_entries | map({"shard": (.key + 1), "package": .value})' \
+  .github/workflows/ci.yml \
+  '.jobs.rust_tests.strategy.matrix.include | map({"shard": .shard, "package": .package})'
+expect_matrix 'GitLab Rust test' \
+  '.packages | to_entries | map({"shard": (.key + 1), "package": .value})' \
+  .gitlab/ci/test.yml \
+  '.rust_tests.parallel.matrix | map({"shard": (.SHARD[0] | tonumber), "package": .PACKAGE[0]})'
+expect_matrix 'GitHub Miri' \
+  '.matrices.miri_packages.values | map({"package": .package, "filter": .filter})' \
+  .github/workflows/deep.yml \
+  '.jobs.miri.strategy.matrix.include | map({"package": .package, "filter": .filter})'
+expect_matrix 'GitLab Miri' \
+  '.matrices.miri_packages.values | map({"package": .package, "filter": .filter})' \
+  .gitlab/ci/deep.yml \
+  '.miri.parallel.matrix | map({"package": .PACKAGE[0], "filter": .TEST_FILTER[0]})'
+expect_matrix 'GitHub sanitizer' \
+  '.matrices.sanitizer_modes.values | map({"mode": .mode, "package": .package})' \
+  .github/workflows/deep.yml \
+  '.jobs.sanitizers.strategy.matrix.include | map({"mode": .mode, "package": .package})'
+expect_matrix 'GitLab sanitizer' \
+  '.matrices.sanitizer_modes.values | map({"mode": .mode, "package": .package})' \
+  .gitlab/ci/deep.yml \
+  '.sanitizers.parallel.matrix | map({"mode": .MODE[0], "package": .PACKAGE[0]})'
+expect_matrix 'GitHub fuzz' \
+  '.matrices.fuzz_targets.values | map({"package": .package, "target": .target})' \
+  .github/workflows/deep.yml \
+  '.jobs.fuzz.strategy.matrix.include | map({"package": .package, "target": .target})'
+expect_matrix 'GitLab fuzz' \
+  '.matrices.fuzz_targets.values | map({"package": .package, "target": .target})' \
+  .gitlab/ci/deep.yml \
+  '.fuzz.parallel.matrix | map({"package": .PACKAGE[0], "target": .TARGET[0]})'
+expect_matrix 'GitHub mutation' \
+  '.matrices.mutation_shards.values | map({"shard": .shard, "package": .package})' \
+  .github/workflows/deep.yml \
+  '.jobs.mutation.strategy.matrix.include | map({"shard": .shard, "package": .package})'
+expect_matrix 'GitLab mutation' \
+  '.matrices.mutation_shards.values | map({"shard": .shard, "package": .package})' \
+  .gitlab/ci/deep.yml \
+  '.mutation.parallel.matrix | map({"shard": (.SHARD[0] | tonumber), "package": .PACKAGE[0]})'
+
+if ! grep -qF 'scripts/ci/run.sh test-package "${{ matrix.package }}"' .github/workflows/ci.yml \
+  || ! grep -qF 'scripts/ci/run.sh test-package "$PACKAGE"' .gitlab/ci/test.yml; then
+  fail 'Rust test matrices are not wired to their manifest package values'
+fi
+
 # -------------------------------------------------------- manifest -> platform --
 
 declare -A github_expected=()

@@ -15,9 +15,9 @@ mod implementation {
     use crate::backend::{ChildStartupNotifier, private::OperationPermit};
     use crate::{
         BackendError, BindMountConfig, CapabilityReport, CgroupConfig, ControlChannelConfig,
-        EgressChannelConfig, IdentityMap, IsolatedChildProcess, IsolationBackend, IsolationConfig,
-        IsolationStep, LandlockConfig, NamespaceIdentity, NamespacePreparation, PidNamespaceChild,
-        SeccompPolicy, SpawnOutcome,
+        EgressChannelConfig, ExecStatusChannelConfig, IdentityMap, IsolatedChildProcess,
+        IsolationBackend, IsolationConfig, IsolationStep, LandlockConfig, NamespaceIdentity,
+        NamespacePreparation, PidNamespaceChild, SeccompPolicy, SpawnOutcome,
     };
 
     const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
@@ -441,11 +441,15 @@ mod implementation {
                     if let Some(egress_channel) = config.egress_channel {
                         validate_egress_channel(step, egress_channel)?;
                     }
+                    if let Some(exec_status_channel) = config.exec_status_channel {
+                        validate_exec_status_channel(step, exec_status_channel)?;
+                    }
                     close_inherited_fds(
                         step,
                         notifier_fd,
                         config.control_channel,
                         config.egress_channel,
+                        config.exec_status_channel,
                     )
                 }
                 IsolationStep::Landlock => install_landlock(step, &config.landlock),
@@ -1786,11 +1790,34 @@ mod implementation {
         Ok(())
     }
 
+    fn validate_exec_status_channel(
+        step: IsolationStep,
+        exec_status_channel: ExecStatusChannelConfig,
+    ) -> Result<(), BackendError> {
+        let descriptor = exec_status_channel.fd();
+        if descriptor < FIRST_NONSTANDARD_FD {
+            return Err(BackendError::new(
+                step,
+                "workload exec-status channel overlapped a standard descriptor",
+                None,
+            ));
+        }
+        if !descriptor_has_cloexec(step, descriptor)? {
+            return Err(BackendError::new(
+                step,
+                "workload exec-status channel was not close-on-exec",
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     fn close_inherited_fds(
         step: IsolationStep,
         preserved_notifier_fd: RawFd,
         control_channel: Option<ControlChannelConfig>,
         egress_channel: Option<EgressChannelConfig>,
+        exec_status_channel: Option<ExecStatusChannelConfig>,
     ) -> Result<(), BackendError> {
         if preserved_notifier_fd < FIRST_NONSTANDARD_FD {
             return Err(BackendError::new(
@@ -1810,6 +1837,7 @@ mod implementation {
         for descriptor in [
             control_channel.map(ControlChannelConfig::fd),
             egress_channel.map(EgressChannelConfig::fd),
+            exec_status_channel.map(ExecStatusChannelConfig::fd),
         ]
         .into_iter()
         .flatten()
@@ -1927,11 +1955,12 @@ mod implementation {
 
     fn clone3_is_available() -> bool {
         // A null argument with a zero structure size cannot create a process. Implemented kernels
-        // reject it with EINVAL or EFAULT, while kernels without clone3 return ENOSYS.
+        // reject it with EINVAL or EFAULT. Any policy denial is unavailable to this process even
+        // when the running kernel implements clone3, so EPERM/EACCES must fail preflight too.
         // SAFETY: no valid clone arguments are provided, so this availability probe has no child.
         let result =
             unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<CloneArgs>(), 0_usize) };
-        result >= 0 || errno() != libc::ENOSYS
+        result == -1 && matches!(errno(), libc::EINVAL | libc::EFAULT)
     }
 
     fn combine_results(
@@ -2848,6 +2877,7 @@ mod implementation {
                 libc::STDERR_FILENO,
                 None,
                 None,
+                None,
             )
             .expect_err("a notifier may never overlap inherited standard IO");
 
@@ -2905,6 +2935,7 @@ mod implementation {
                         && close_inherited_fds(
                             IsolationStep::CloseInheritedFileDescriptors,
                             notifier_fd,
+                            None,
                             None,
                             None,
                         )

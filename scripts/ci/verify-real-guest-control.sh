@@ -75,12 +75,18 @@ run_real_test() {
   local image_rootfs="${staging}/${mode}.squashfs"
   local image_hash="${image_rootfs}.hash"
   local root_hash=''
+  local workload_name='guest-workload'
+
+  if [[ "${mode}" == control ]]; then
+    workload_name='sleep'
+  fi
 
   mapper_name="guest-control-ci-$$-${mode}"
   "${repository_root}/scripts/ci/build-guest-control-image.sh" \
     --base-rootfs "${base_rootfs}" \
     --guest-control-init "${repository_root}/target/release/guest-control-init" \
     --workload "${workload}" \
+    --workload-name "${workload_name}" \
     --port 18080 \
     --output-rootfs "${image_rootfs}" \
     --output-hash "${image_hash}"

@@ -145,7 +145,8 @@ struct RootBinding {
     guest_capability: CapId,
     broker_subject: AuthoritySubjectId,
     broker_capability: CapId,
-    status: BindingStatus,
+    guest_status: BindingStatus,
+    broker_status: BindingStatus,
 }
 
 /// Production `CapabilityBackend` adapter backed by Authority Core.
@@ -255,7 +256,8 @@ impl CapabilityBackend<AuthorityRootGrant> for AuthorityCoreBackend {
                 guest_capability: guest.capability,
                 broker_subject: broker.caller,
                 broker_capability: broker.capability,
-                status: BindingStatus::Active,
+                guest_status: BindingStatus::Active,
+                broker_status: BindingStatus::Active,
             },
         );
         Ok(lease)
@@ -282,21 +284,41 @@ impl CapabilityRevocationBackend for AuthorityCoreBackend {
             )));
         }
 
-        self.revoke_and_close(
+        let broker_result = self.revoke_and_close(
             &binding.broker_subject,
             &binding.broker_capability,
-            binding.status,
-        )?;
-        self.revoke_and_close(
+            binding.broker_status,
+        );
+        if broker_result.is_ok()
+            && let Some(binding) = self.bindings.get_mut(&lease.session_id())
+        {
+            binding.broker_status = BindingStatus::Closed;
+        }
+
+        // The guest and Broker are independent authority roots. Always attempt
+        // both closures: returning early after a Broker-side failure would
+        // leave guest authority live, while returning early after a guest-side
+        // failure would make a successful Broker closure indistinguishable
+        // from an unattempted one on retry.
+        let guest_result = self.revoke_and_close(
             &binding.guest_subject,
             &binding.guest_capability,
-            binding.status,
-        )?;
-
-        if let Some(binding) = self.bindings.get_mut(&lease.session_id()) {
-            binding.status = BindingStatus::Closed;
+            binding.guest_status,
+        );
+        if guest_result.is_ok()
+            && let Some(binding) = self.bindings.get_mut(&lease.session_id())
+        {
+            binding.guest_status = BindingStatus::Closed;
         }
-        Ok(())
+
+        match (broker_result, guest_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(broker), Ok(())) => Err(broker),
+            (Ok(()), Err(guest)) => Err(guest),
+            (Err(broker), Err(guest)) => Err(BackendError::new(format!(
+                "both root capability closures failed; Broker: {broker}; guest: {guest}"
+            ))),
+        }
     }
 }
 
@@ -340,6 +362,9 @@ impl AuthorityCoreBackend {
         capability: &CapId,
         status: BindingStatus,
     ) -> Result<(), BackendError> {
+        if status == BindingStatus::Closed {
+            return Ok(());
+        }
         self.kernel
             .revoke_held_by(subject, capability)
             .map_err(|error| revoke_error(subject, capability, status, "revoke", &error))?;
@@ -423,6 +448,7 @@ mod tests {
     use authority_core::{
         capability::{AuthorityRequest, CapabilityRequest, IssuerId},
         file::{FileAuthority, FileEffect, FileEffects, FileRequest},
+        handle::{HandleId, ObjectId, OpenHandle},
         http::{
             CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethod, HttpFetchMethods,
             HttpFetchRequest, UrlPathPattern,
@@ -679,6 +705,59 @@ mod tests {
                 .kernel()
                 .subject_status(&AuthorityCoreBackend::guest_binding(&identity).caller)
                 .expect("guest subject status lookup must succeed"),
+            Some(SubjectStatus::Closed)
+        );
+    }
+
+    #[test]
+    fn partial_root_close_records_progress_and_retry_finishes_only_the_failed_side() {
+        let mut backend = backend();
+        let identity = identity();
+        let lease = backend
+            .inject_root_capability(&identity, &grant())
+            .expect("root capability injection must succeed");
+        let broker = backend.broker_binding(&identity);
+        let handle_id = HandleId::new("broker-open-handle");
+        backend
+            .kernel()
+            .register_open_handle(OpenHandle::new(
+                handle_id.clone(),
+                broker.caller.clone(),
+                ObjectId::new("broker-object"),
+            ))
+            .expect("the broker test handle must register");
+
+        backend
+            .revoke_root_capability(&lease)
+            .expect_err("the open Broker handle must prevent only its final close");
+        assert_eq!(
+            backend
+                .kernel()
+                .subject_status(&AuthorityCoreBackend::guest_binding(&identity).caller)
+                .expect("guest status lookup must succeed"),
+            Some(SubjectStatus::Closed),
+            "guest closure must still complete after the independent Broker failure"
+        );
+        assert_eq!(
+            backend
+                .kernel()
+                .subject_status(&broker.caller)
+                .expect("broker status lookup must succeed"),
+            Some(SubjectStatus::Closing)
+        );
+
+        backend
+            .kernel()
+            .close_handle(&broker.caller, &handle_id)
+            .expect("the blocking handle must close");
+        backend
+            .revoke_root_capability(&lease)
+            .expect("retry must finish the remaining Broker close");
+        assert_eq!(
+            backend
+                .kernel()
+                .subject_status(&broker.caller)
+                .expect("broker status lookup must succeed"),
             Some(SubjectStatus::Closed)
         );
     }

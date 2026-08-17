@@ -22,8 +22,9 @@ pub use backend::{
     RuntimeIsolation, SpawnOutcome, apply, spawn_isolated,
 };
 pub use config::{
-    BindMountConfig, CgroupConfig, ControlChannelConfig, EgressChannelConfig, IdentityMap,
-    IsolationConfig, LandlockConfig, RootfsConfig, TmpfsConfig,
+    BindMountConfig, CgroupConfig, ControlChannelConfig, EgressChannelConfig,
+    ExecStatusChannelConfig, IdentityMap, IsolationConfig, LandlockConfig, RootfsConfig,
+    TmpfsConfig,
 };
 pub use linux::LinuxBackend;
 pub use syscall::{SeccompPolicy, Syscall};

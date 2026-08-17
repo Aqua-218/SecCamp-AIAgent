@@ -67,6 +67,18 @@ case "${command_name}" in
         ;;
     esac
     ;;
+  test-package)
+    if [[ "$#" -ne 1 ]]; then
+      printf 'test-package requires one manifest package name\n' >&2
+      exit 2
+    fi
+    if ! awk '/^packages:/{inside=1; next} inside && /^  - /{sub(/^  - /, ""); print; next} inside && !/^  - /{exit}' ci/gates.yml \
+      | grep -qxF -- "$1"; then
+      printf 'package is not declared by ci/gates.yml: %s\n' "$1" >&2
+      exit 2
+    fi
+    cargo nextest run --profile ci --locked --package "$1"
+    ;;
   doctest)
     cargo test --workspace --doc --all-features --locked
     ;;

@@ -20,7 +20,9 @@ readonly target="$2"
 case "${package}:${target}" in
   authority-core:canonical_path|\
   egress-protocol:cbor_request_decode|\
-  egress-protocol:frame_decode)
+  egress-protocol:frame_decode|\
+  egress-protocol:response_decode|\
+  egress-protocol:session_accept)
     ;;
   *)
     printf 'unsupported fuzz package/target pair: %s %s\n' "${package}" "${target}" >&2

@@ -148,6 +148,19 @@ real_runtime_lifecycle:
   script:
     - scripts/ci/run.sh real-runtime-lifecycle
 
+session_owner_kvm:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 75m
+  interruptible: false
+  tags:
+    - kvm
+    - ephemeral
+  script:
+    - scripts/ci/run.sh real-session-owner
+
 real_capfs:
   extends:
     - .rust_job

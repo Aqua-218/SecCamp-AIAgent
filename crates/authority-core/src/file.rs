@@ -38,6 +38,28 @@ pub enum FileEffect {
 }
 
 impl FileEffect {
+    /// The closed, wire-order effect universe.
+    ///
+    /// This array is the single source of truth for the effect tags used by
+    /// policy digests and durable audit payloads. New effects must be
+    /// appended, never inserted, because the numeric tag is part of the
+    /// durable compatibility contract.
+    pub const ALL: [Self; 13] = [
+        Self::ReadData,
+        Self::ListDirectory,
+        Self::WriteData,
+        Self::Truncate,
+        Self::CreateFile,
+        Self::CreateDirectory,
+        Self::RemoveFile,
+        Self::RemoveDirectory,
+        Self::Rename,
+        Self::SetMetadata,
+        Self::ReadLink,
+        Self::CreateSymlink,
+        Self::CreateHardLink,
+    ];
+
     /// The highest discriminant the [`FileEffects`] bitset can represent.
     ///
     /// New effects must be appended so that existing discriminants keep their
@@ -45,16 +67,53 @@ impl FileEffect {
     /// and renumbering would silently reinterpret past receipts.
     const MAX_DISCRIMINANT: u8 = 15;
 
+    /// Returns the stable durable/policy tag for this effect.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        self as u8
+    }
+
+    /// Decodes a stable durable/policy tag.
+    #[must_use]
+    pub const fn from_tag(tag: u8) -> Option<Self> {
+        let index = tag as usize;
+        if index < Self::ALL.len() {
+            Some(Self::ALL[index])
+        } else {
+            None
+        }
+    }
+
     const fn mask(self) -> u16 {
         const {
             assert!(
-                FileEffect::CreateHardLink as u8 <= FileEffect::MAX_DISCRIMINANT,
+                FileEffect::ALL[FileEffect::ALL.len() - 1].tag() <= FileEffect::MAX_DISCRIMINANT,
                 "FileEffects is a u16 bitset; the last effect must fit in it"
             );
         }
         1_u16 << (self as u8)
     }
 }
+
+// Keep the closed tag universe aligned with the enum discriminants. The
+// durable and policy encoders use `FileEffect::ALL`; these assertions make a
+// reorder or an accidental discriminant gap a compile-time failure rather
+// than a silent wire-format change.
+const _: () = {
+    assert!(FileEffect::ALL[0].tag() == 0);
+    assert!(FileEffect::ALL[1].tag() == 1);
+    assert!(FileEffect::ALL[2].tag() == 2);
+    assert!(FileEffect::ALL[3].tag() == 3);
+    assert!(FileEffect::ALL[4].tag() == 4);
+    assert!(FileEffect::ALL[5].tag() == 5);
+    assert!(FileEffect::ALL[6].tag() == 6);
+    assert!(FileEffect::ALL[7].tag() == 7);
+    assert!(FileEffect::ALL[8].tag() == 8);
+    assert!(FileEffect::ALL[9].tag() == 9);
+    assert!(FileEffect::ALL[10].tag() == 10);
+    assert!(FileEffect::ALL[11].tag() == 11);
+    assert!(FileEffect::ALL[12].tag() == 12);
+};
 
 /// A set of permitted file effects.
 ///
@@ -235,6 +294,17 @@ mod tests {
         assert!(!effects.contains(FileEffect::Rename));
         assert!(!effects.is_empty());
         assert!(FileEffects::empty().is_empty());
+    }
+
+    #[test]
+    fn file_effect_tags_are_exhaustive_and_reject_unknown_values() {
+        for (tag, effect) in FileEffect::ALL.into_iter().enumerate() {
+            let tag = u8::try_from(tag).expect("the closed effect set fits in a tag");
+            assert_eq!(effect.tag(), tag);
+            assert_eq!(FileEffect::from_tag(tag), Some(effect));
+        }
+        assert_eq!(FileEffect::from_tag(13), None);
+        assert_eq!(FileEffect::from_tag(u8::MAX), None);
     }
 
     #[test]

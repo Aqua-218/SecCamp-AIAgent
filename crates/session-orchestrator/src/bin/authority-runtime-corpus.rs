@@ -448,12 +448,8 @@ fn broker_rows() -> Result<Vec<String>, String> {
     let temporary = TemporaryWal::new("broker")?;
     let session = BrokerSessionId::new([0x31; 16]);
     let request = BrokerRequestId::new([0x32; 16]);
-    let envelope = BrokerEnvelope::from_canonical_payload(
-        session,
-        0,
-        request,
-        b"runtime-corpus-public-fetch",
-    );
+    let envelope =
+        BrokerEnvelope::from_canonical_payload(session, 0, request, b"runtime-corpus-public-fetch");
     let limits = SessionBudgetLimits::new(
         NonZeroU64::new(2).ok_or_else(|| "request limit must be non-zero".to_owned())?,
         2_500_000,

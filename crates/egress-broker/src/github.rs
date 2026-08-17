@@ -668,7 +668,8 @@ fn read_systemd_credential(path: &Path) -> Result<Zeroizing<String>, GitHubProvi
     let mut current = PathBuf::from("/");
     for component in parent.components().skip(1) {
         current.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&current).map_err(|_| GitHubProviderError::Transport)?;
+        let metadata =
+            fs::symlink_metadata(&current).map_err(|_| GitHubProviderError::Transport)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(GitHubProviderError::Transport);
         }
@@ -683,7 +684,9 @@ fn read_systemd_credential(path: &Path) -> Result<Zeroizing<String>, GitHubProvi
         return Err(GitHubProviderError::Transport);
     }
     let mut file = File::open(path).map_err(|_| GitHubProviderError::Transport)?;
-    let opened = file.metadata().map_err(|_| GitHubProviderError::Transport)?;
+    let opened = file
+        .metadata()
+        .map_err(|_| GitHubProviderError::Transport)?;
     if !opened.is_file()
         || opened.dev() != before.dev()
         || opened.ino() != before.ino()
@@ -736,14 +739,13 @@ impl RustlsGitHubProvider {
     /// Returns [`GitHubProviderError::Transport`] if the rustls client cannot
     /// be constructed or the host-only variable is absent.
     pub fn from_environment() -> Result<Self, GitHubProviderError> {
-        let token = match std::env::var("EGRESS_GITHUB_TOKEN") {
-            Ok(token) => Zeroizing::new(token),
-            Err(_) => {
-                let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
-                    .map(PathBuf::from)
-                    .ok_or(GitHubProviderError::Transport)?;
-                read_systemd_credential(&directory.join("github-token"))?
-            }
+        let token = if let Ok(token) = std::env::var("EGRESS_GITHUB_TOKEN") {
+            Zeroizing::new(token)
+        } else {
+            let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+                .map(PathBuf::from)
+                .ok_or(GitHubProviderError::Transport)?;
+            read_systemd_credential(&directory.join("github-token"))?
         };
         if token.is_empty()
             || token.len() > 4096
@@ -776,7 +778,7 @@ impl RustlsGitHubProvider {
         let repository = self
             .client
             .get(format!("https://api.github.com/repos/{route}"))
-            .bearer_auth(&self.token)
+            .bearer_auth(&*self.token)
             .send()
             .map_err(|_| GitHubProviderError::Transport)?;
         let repository_bytes = response_bytes(repository, response_limit)?;
@@ -792,7 +794,7 @@ impl RustlsGitHubProvider {
         let update = self
             .client
             .post("https://api.github.com/graphql")
-            .bearer_auth(&self.token)
+            .bearer_auth(&*self.token)
             .json(&serde_json::json!({
                 "query": "mutation UpdateRefs($repositoryId: ID!, $refUpdates: [RefUpdate!]!) { updateRefs(input: { repositoryId: $repositoryId, refUpdates: $refUpdates }) { clientMutationId } }",
                 "variables": {
@@ -834,7 +836,7 @@ impl RustlsGitHubProvider {
         let response = self
             .client
             .post(url)
-            .bearer_auth(&self.token)
+            .bearer_auth(&*self.token)
             .json(&serde_json::json!({
                 "title": "Automated pull request",
                 "base": input.request.base().to_string(),

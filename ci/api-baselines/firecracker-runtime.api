@@ -282,6 +282,7 @@ pub fn firecracker_runtime::RealCommandRunner::default() -> Self
 impl core::ops::drop::Drop for firecracker_runtime::RealCommandRunner
 pub fn firecracker_runtime::RealCommandRunner::drop(&mut self)
 impl firecracker_runtime::CommandRunner for firecracker_runtime::RealCommandRunner
+pub fn firecracker_runtime::RealCommandRunner::open_verity(&mut self, &firecracker_runtime::PinnedArtifact, &firecracker_runtime::DmVerityConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::run(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::CommandOutput, firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::start(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::start_owned(&mut self, &firecracker_runtime::CommandSpec, &firecracker_runtime::ProcessOwnership) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
@@ -296,7 +297,10 @@ pub fn firecracker_runtime::RealFileSystem::bind_block_device(&mut self, &std::p
 pub fn firecracker_runtime::RealFileSystem::clone_workspace(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::create_workspace_image(&mut self, &std::path::Path, &std::path::Path, u64) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::digest(&mut self, &std::path::Path) -> core::result::Result<firecracker_runtime::Sha256Digest, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::prepare_jailer_resources(&mut self, &std::path::Path, &std::path::Path, &std::path::Path, u32, u32) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::read(&mut self, &std::path::Path) -> core::result::Result<alloc::vec::Vec<u8>, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::register_jailer_root(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::remove_jail(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::remove_workspace(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::unbind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::verify_block_device_binding(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
@@ -416,6 +420,7 @@ impl firecracker_runtime::ApiClient for firecracker_runtime::UnixApiClient
 pub fn firecracker_runtime::UnixApiClient::request(&mut self, &firecracker_runtime::ApiRequest) -> core::result::Result<firecracker_runtime::ApiResponse, firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::UnixApiClient::verify_restore_resources(&mut self, &std::path::Path, &std::path::Path, u32) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub trait firecracker_runtime::CommandRunner
+pub fn firecracker_runtime::CommandRunner::open_verity(&mut self, &firecracker_runtime::PinnedArtifact, &firecracker_runtime::DmVerityConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::CommandRunner::run(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::CommandOutput, firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::CommandRunner::start(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::CommandRunner::start_owned(&mut self, &firecracker_runtime::CommandSpec, &firecracker_runtime::ProcessOwnership) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
@@ -423,6 +428,7 @@ pub fn firecracker_runtime::CommandRunner::stop(&mut self, firecracker_runtime::
 pub fn firecracker_runtime::CommandRunner::verify_running(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::CommandRunner::verify_verity(&mut self, &firecracker_runtime::PinnedArtifact, &firecracker_runtime::DmVerityConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 impl firecracker_runtime::CommandRunner for firecracker_runtime::RealCommandRunner
+pub fn firecracker_runtime::RealCommandRunner::open_verity(&mut self, &firecracker_runtime::PinnedArtifact, &firecracker_runtime::DmVerityConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::run(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::CommandOutput, firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::start(&mut self, &firecracker_runtime::CommandSpec) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::start_owned(&mut self, &firecracker_runtime::CommandSpec, &firecracker_runtime::ProcessOwnership) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
@@ -434,7 +440,10 @@ pub fn firecracker_runtime::FileSystem::bind_block_device(&mut self, &std::path:
 pub fn firecracker_runtime::FileSystem::clone_workspace(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::FileSystem::create_workspace_image(&mut self, &std::path::Path, &std::path::Path, u64) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::FileSystem::digest(&mut self, &std::path::Path) -> core::result::Result<firecracker_runtime::Sha256Digest, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FileSystem::prepare_jailer_resources(&mut self, &std::path::Path, &std::path::Path, &std::path::Path, u32, u32) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::FileSystem::read(&mut self, &std::path::Path) -> core::result::Result<alloc::vec::Vec<u8>, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FileSystem::register_jailer_root(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::FileSystem::remove_jail(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::FileSystem::remove_workspace(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::FileSystem::unbind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::FileSystem::verify_block_device_binding(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
@@ -443,7 +452,10 @@ pub fn firecracker_runtime::RealFileSystem::bind_block_device(&mut self, &std::p
 pub fn firecracker_runtime::RealFileSystem::clone_workspace(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::create_workspace_image(&mut self, &std::path::Path, &std::path::Path, u64) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::digest(&mut self, &std::path::Path) -> core::result::Result<firecracker_runtime::Sha256Digest, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::prepare_jailer_resources(&mut self, &std::path::Path, &std::path::Path, &std::path::Path, u32, u32) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::read(&mut self, &std::path::Path) -> core::result::Result<alloc::vec::Vec<u8>, firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::register_jailer_root(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealFileSystem::remove_jail(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::remove_workspace(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::unbind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealFileSystem::verify_block_device_binding(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>

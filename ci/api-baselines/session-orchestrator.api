@@ -1,0 +1,874 @@
+pub mod session_orchestrator
+pub mod session_orchestrator::authority_backend
+pub struct session_orchestrator::authority_backend::AuthorityBrokerBinding
+pub session_orchestrator::authority_backend::AuthorityBrokerBinding::caller: authority_core::capability::SubjectId
+pub session_orchestrator::authority_backend::AuthorityBrokerBinding::capability: authority_core::capability::CapId
+pub struct session_orchestrator::authority_backend::AuthorityCoreBackend
+impl session_orchestrator::authority_backend::AuthorityCoreBackend
+pub fn session_orchestrator::authority_backend::AuthorityCoreBackend::broker_binding(&self, &session_orchestrator::SessionIdentity) -> session_orchestrator::authority_backend::AuthorityBrokerBinding
+pub fn session_orchestrator::authority_backend::AuthorityCoreBackend::broker_executor(&self) -> alloc::sync::Arc<authority_core::kernel::CapabilityKernel>
+pub fn session_orchestrator::authority_backend::AuthorityCoreBackend::kernel(&self) -> &alloc::sync::Arc<authority_core::kernel::CapabilityKernel>
+pub fn session_orchestrator::authority_backend::AuthorityCoreBackend::new(alloc::sync::Arc<authority_core::kernel::CapabilityKernel>) -> Self
+impl session_orchestrator::CapabilityBackend<session_orchestrator::authority_backend::AuthorityRootGrant> for session_orchestrator::authority_backend::AuthorityCoreBackend
+pub fn session_orchestrator::authority_backend::AuthorityCoreBackend::inject_root_capability(&mut self, &session_orchestrator::SessionIdentity, &session_orchestrator::authority_backend::AuthorityRootGrant) -> core::result::Result<session_orchestrator::CapabilityLease, session_orchestrator::BackendError>
+impl session_orchestrator::CapabilityRevocationBackend for session_orchestrator::authority_backend::AuthorityCoreBackend
+pub fn session_orchestrator::authority_backend::AuthorityCoreBackend::revoke_root_capability(&mut self, &session_orchestrator::CapabilityLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub struct session_orchestrator::authority_backend::AuthorityRootGrant
+impl session_orchestrator::authority_backend::AuthorityRootGrant
+pub const fn session_orchestrator::authority_backend::AuthorityRootGrant::authority(&self) -> &authority_core::capability::AuthorityBody
+pub fn session_orchestrator::authority_backend::AuthorityRootGrant::broker_authority(&self) -> &authority_core::capability::AuthorityBody
+pub const fn session_orchestrator::authority_backend::AuthorityRootGrant::is_delegable(&self) -> bool
+pub const fn session_orchestrator::authority_backend::AuthorityRootGrant::new(authority_core::time::TimeWindow, authority_core::capability::AuthorityBody) -> Self
+pub fn session_orchestrator::authority_backend::AuthorityRootGrant::policy_digest(&self) -> authority_core::policy::AuthorityPolicyDigest
+pub const fn session_orchestrator::authority_backend::AuthorityRootGrant::validity(&self) -> authority_core::time::TimeWindow
+pub fn session_orchestrator::authority_backend::AuthorityRootGrant::with_broker_authority(self, authority_core::capability::AuthorityBody) -> Self
+pub const fn session_orchestrator::authority_backend::AuthorityRootGrant::with_delegable(self, bool) -> Self
+impl session_orchestrator::CapabilityBackend<session_orchestrator::authority_backend::AuthorityRootGrant> for session_orchestrator::authority_backend::AuthorityCoreBackend
+pub fn session_orchestrator::authority_backend::AuthorityCoreBackend::inject_root_capability(&mut self, &session_orchestrator::SessionIdentity, &session_orchestrator::authority_backend::AuthorityRootGrant) -> core::result::Result<session_orchestrator::CapabilityLease, session_orchestrator::BackendError>
+pub type session_orchestrator::authority_backend::AuthorityBackend = session_orchestrator::authority_backend::AuthorityCoreBackend
+pub type session_orchestrator::authority_backend::AuthorityRootSpec = session_orchestrator::authority_backend::AuthorityRootGrant
+pub mod session_orchestrator::egress_backend
+pub enum session_orchestrator::egress_backend::BrokerConnectionExit
+pub session_orchestrator::egress_backend::BrokerConnectionExit::AccountingInvariant
+pub session_orchestrator::egress_backend::BrokerConnectionExit::AccountingInvariant::requests_served: usize
+pub session_orchestrator::egress_backend::BrokerConnectionExit::Cancelled
+pub session_orchestrator::egress_backend::BrokerConnectionExit::CommittedButUnrecorded
+pub session_orchestrator::egress_backend::BrokerConnectionExit::CommittedButUnrecorded::requests_served: usize
+pub session_orchestrator::egress_backend::BrokerConnectionExit::EndOfStream
+pub session_orchestrator::egress_backend::BrokerConnectionExit::Failed
+pub session_orchestrator::egress_backend::BrokerConnectionExit::Failed::message: alloc::string::String
+pub session_orchestrator::egress_backend::BrokerConnectionExit::RequestLimitReached
+pub session_orchestrator::egress_backend::BrokerConnectionExit::RequestLimitReached::requests_served: usize
+pub enum session_orchestrator::egress_backend::BrokerWorkerExit
+pub session_orchestrator::egress_backend::BrokerWorkerExit::AcceptFailed
+pub session_orchestrator::egress_backend::BrokerWorkerExit::AcceptFailed::message: alloc::string::String
+pub session_orchestrator::egress_backend::BrokerWorkerExit::Cancelled
+pub session_orchestrator::egress_backend::BrokerWorkerExit::Connection(session_orchestrator::egress_backend::BrokerConnectionExit)
+pub session_orchestrator::egress_backend::BrokerWorkerExit::ExitChannelLost
+pub session_orchestrator::egress_backend::BrokerWorkerExit::Panicked
+pub session_orchestrator::egress_backend::BrokerWorkerExit::ShutdownHandleFailed
+pub session_orchestrator::egress_backend::BrokerWorkerExit::ShutdownHandleFailed::message: alloc::string::String
+pub session_orchestrator::egress_backend::BrokerWorkerExit::UnexpectedPeer
+pub session_orchestrator::egress_backend::BrokerWorkerExit::UnexpectedPeer::expected: u32
+pub session_orchestrator::egress_backend::BrokerWorkerExit::UnexpectedPeer::received: u32
+pub enum session_orchestrator::egress_backend::BrokerWorkerStatus
+pub session_orchestrator::egress_backend::BrokerWorkerStatus::Exited(session_orchestrator::egress_backend::BrokerWorkerExit)
+pub session_orchestrator::egress_backend::BrokerWorkerStatus::Running
+pub struct session_orchestrator::egress_backend::AfVsockListenerFactory
+impl session_orchestrator::egress_backend::VsockListenerFactory for session_orchestrator::egress_backend::AfVsockListenerFactory
+pub type session_orchestrator::egress_backend::AfVsockListenerFactory::Listener = egress_broker::transport::AfVsockListener
+pub fn session_orchestrator::egress_backend::AfVsockListenerFactory::bind(&self, &session_orchestrator::SessionIdentity, u32, u32, i32) -> std::io::error::Result<Self::Listener>
+pub struct session_orchestrator::egress_backend::BrokerBackend<F, R> where F: session_orchestrator::egress_backend::VsockListenerFactory, R: session_orchestrator::egress_backend::BrokerRuntimeFactory<<<F as session_orchestrator::egress_backend::VsockListenerFactory>::Listener as session_orchestrator::egress_backend::BrokerServiceListener>::Stream>
+impl<F, R> session_orchestrator::egress_backend::BrokerBackend<F, R> where F: session_orchestrator::egress_backend::VsockListenerFactory, R: session_orchestrator::egress_backend::BrokerRuntimeFactory<<<F as session_orchestrator::egress_backend::VsockListenerFactory>::Listener as session_orchestrator::egress_backend::BrokerServiceListener>::Stream>
+pub const fn session_orchestrator::egress_backend::BrokerBackend<F, R>::expected_guest_cid(&self) -> u32
+pub fn session_orchestrator::egress_backend::BrokerBackend<F, R>::new(F, R, u32, u32, u32, i32) -> core::result::Result<Self, session_orchestrator::BackendError>
+pub fn session_orchestrator::egress_backend::BrokerBackend<F, R>::poll_broker_status(&mut self, &session_orchestrator::BrokerLease) -> core::result::Result<session_orchestrator::egress_backend::BrokerWorkerStatus, session_orchestrator::BackendError>
+pub fn session_orchestrator::egress_backend::BrokerBackend<F, R>::with_timeouts(F, R, u32, u32, u32, i32, core::time::Duration, core::time::Duration) -> core::result::Result<Self, session_orchestrator::BackendError>
+impl<R> session_orchestrator::egress_backend::BrokerBackend<session_orchestrator::egress_backend::AfVsockListenerFactory, R> where R: session_orchestrator::egress_backend::BrokerRuntimeFactory<egress_broker::transport::VsockStream>
+pub fn session_orchestrator::egress_backend::BrokerBackend<session_orchestrator::egress_backend::AfVsockListenerFactory, R>::kernel_vsock(R, u32, u32, u32, i32) -> core::result::Result<Self, session_orchestrator::BackendError>
+impl<R> session_orchestrator::egress_backend::BrokerBackend<session_orchestrator::egress_backend::FirecrackerUnixListenerFactory, R> where R: session_orchestrator::egress_backend::BrokerRuntimeFactory<session_orchestrator::egress_backend::FirecrackerUnixStream>
+pub fn session_orchestrator::egress_backend::BrokerBackend<session_orchestrator::egress_backend::FirecrackerUnixListenerFactory, R>::firecracker(R, impl core::ops::function::Fn(&session_orchestrator::SessionIdentity) -> core::result::Result<std::path::PathBuf, session_orchestrator::BackendError> + core::marker::Send + core::marker::Sync + 'static, u32, u32, u32, i32) -> core::result::Result<Self, session_orchestrator::BackendError>
+pub fn session_orchestrator::egress_backend::BrokerBackend<session_orchestrator::egress_backend::FirecrackerUnixListenerFactory, R>::firecracker_with_peer_credentials(R, impl core::ops::function::Fn(&session_orchestrator::SessionIdentity) -> core::result::Result<std::path::PathBuf, session_orchestrator::BackendError> + core::marker::Send + core::marker::Sync + 'static, u32, u32, u32, i32, session_orchestrator::egress_backend::FirecrackerPeerCredentials) -> core::result::Result<Self, session_orchestrator::BackendError>
+impl<F, R> session_orchestrator::BrokerBackend for session_orchestrator::egress_backend::BrokerBackend<F, R> where F: session_orchestrator::egress_backend::VsockListenerFactory, R: session_orchestrator::egress_backend::BrokerRuntimeFactory<<<F as session_orchestrator::egress_backend::VsockListenerFactory>::Listener as session_orchestrator::egress_backend::BrokerServiceListener>::Stream>
+pub fn session_orchestrator::egress_backend::BrokerBackend<F, R>::close_broker_session(&mut self, &session_orchestrator::BrokerLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::egress_backend::BrokerBackend<F, R>::ensure_broker_session_running(&mut self, &session_orchestrator::BrokerLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::egress_backend::BrokerBackend<F, R>::establish_broker_session(&mut self, &session_orchestrator::SessionIdentity) -> core::result::Result<session_orchestrator::BrokerLease, session_orchestrator::BackendError>
+impl<F, R> session_orchestrator::session_owner::BrokerStatusBackend for session_orchestrator::egress_backend::BrokerBackend<F, R> where F: session_orchestrator::egress_backend::VsockListenerFactory, R: session_orchestrator::egress_backend::BrokerRuntimeFactory<<<F as session_orchestrator::egress_backend::VsockListenerFactory>::Listener as session_orchestrator::egress_backend::BrokerServiceListener>::Stream>
+pub fn session_orchestrator::egress_backend::BrokerBackend<F, R>::poll_broker_status(&mut self, &session_orchestrator::BrokerLease) -> core::result::Result<session_orchestrator::session_owner::BrokerRuntimeStatus, session_orchestrator::BackendError>
+pub struct session_orchestrator::egress_backend::BrokerCancellation
+impl session_orchestrator::egress_backend::BrokerCancellation
+pub fn session_orchestrator::egress_backend::BrokerCancellation::is_cancelled(&self) -> bool
+pub struct session_orchestrator::egress_backend::BuiltBrokerRuntime<C>
+impl<C> session_orchestrator::egress_backend::BuiltBrokerRuntime<C>
+pub fn session_orchestrator::egress_backend::BuiltBrokerRuntime<C>::new(alloc::boxed::Box<(dyn egress_broker::server::RequestDispatcher + core::marker::Send)>, egress_broker::dispatch::DispatchContext, C, core::num::nonzero::NonZeroUsize) -> Self
+impl<S, C> session_orchestrator::egress_backend::BrokerRuntime<S> for session_orchestrator::egress_backend::BuiltBrokerRuntime<C> where S: egress_broker::transport::DeadlineStream + core::marker::Send + 'static, C: core::ops::function::FnMut() -> authority_core::time::MonotonicTime + core::marker::Send + 'static
+pub fn session_orchestrator::egress_backend::BuiltBrokerRuntime<C>::serve(self, S, &session_orchestrator::egress_backend::BrokerCancellation) -> session_orchestrator::egress_backend::BrokerConnectionExit
+pub struct session_orchestrator::egress_backend::FirecrackerPeerCredentials
+impl session_orchestrator::egress_backend::FirecrackerPeerCredentials
+pub const fn session_orchestrator::egress_backend::FirecrackerPeerCredentials::gid(self) -> u32
+pub const fn session_orchestrator::egress_backend::FirecrackerPeerCredentials::new(u32, u32) -> Self
+pub const fn session_orchestrator::egress_backend::FirecrackerPeerCredentials::pid(self) -> core::option::Option<u32>
+pub const fn session_orchestrator::egress_backend::FirecrackerPeerCredentials::uid(self) -> u32
+pub const fn session_orchestrator::egress_backend::FirecrackerPeerCredentials::with_pid(self, u32) -> Self
+pub struct session_orchestrator::egress_backend::FirecrackerUnixListener
+impl session_orchestrator::egress_backend::FirecrackerUnixListener
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListener::bind_nonblocking(impl core::convert::AsRef<std::path::Path>, u32, u32) -> std::io::error::Result<Self>
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListener::bind_nonblocking_with_peer_credentials(impl core::convert::AsRef<std::path::Path>, u32, u32, session_orchestrator::egress_backend::FirecrackerPeerCredentials) -> std::io::error::Result<Self>
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListener::path(&self) -> &std::path::Path
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListener::try_accept_peer(&self) -> std::io::error::Result<core::option::Option<(u32, session_orchestrator::egress_backend::FirecrackerUnixStream)>>
+impl session_orchestrator::egress_backend::BrokerServiceListener for session_orchestrator::egress_backend::FirecrackerUnixListener
+pub type session_orchestrator::egress_backend::FirecrackerUnixListener::Shutdown = session_orchestrator::egress_backend::FirecrackerUnixShutdown
+pub type session_orchestrator::egress_backend::FirecrackerUnixListener::Stream = session_orchestrator::egress_backend::FirecrackerUnixStream
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListener::shutdown_handle(&Self::Stream) -> std::io::error::Result<Self::Shutdown>
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListener::try_accept_peer(&self) -> std::io::error::Result<core::option::Option<(u32, Self::Stream)>>
+pub struct session_orchestrator::egress_backend::FirecrackerUnixListenerFactory
+impl session_orchestrator::egress_backend::FirecrackerUnixListenerFactory
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListenerFactory::for_session(impl core::ops::function::Fn(&session_orchestrator::SessionIdentity) -> core::result::Result<std::path::PathBuf, session_orchestrator::BackendError> + core::marker::Send + core::marker::Sync + 'static, u32) -> Self
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListenerFactory::for_session_with_peer_credentials(impl core::ops::function::Fn(&session_orchestrator::SessionIdentity) -> core::result::Result<std::path::PathBuf, session_orchestrator::BackendError> + core::marker::Send + core::marker::Sync + 'static, u32, session_orchestrator::egress_backend::FirecrackerPeerCredentials) -> Self
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListenerFactory::new(impl core::convert::Into<std::path::PathBuf>, u32) -> Self
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListenerFactory::new_with_peer_credentials(impl core::convert::Into<std::path::PathBuf>, u32, session_orchestrator::egress_backend::FirecrackerPeerCredentials) -> Self
+impl core::fmt::Debug for session_orchestrator::egress_backend::FirecrackerUnixListenerFactory
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListenerFactory::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl session_orchestrator::egress_backend::VsockListenerFactory for session_orchestrator::egress_backend::FirecrackerUnixListenerFactory
+pub type session_orchestrator::egress_backend::FirecrackerUnixListenerFactory::Listener = session_orchestrator::egress_backend::FirecrackerUnixListener
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListenerFactory::bind(&self, &session_orchestrator::SessionIdentity, u32, u32, i32) -> std::io::error::Result<Self::Listener>
+pub struct session_orchestrator::egress_backend::FirecrackerUnixShutdown
+impl session_orchestrator::egress_backend::BrokerStreamShutdown for session_orchestrator::egress_backend::FirecrackerUnixShutdown
+pub fn session_orchestrator::egress_backend::FirecrackerUnixShutdown::shutdown(&self) -> std::io::error::Result<()>
+pub struct session_orchestrator::egress_backend::FirecrackerUnixStream
+impl egress_broker::transport::DeadlineStream for session_orchestrator::egress_backend::FirecrackerUnixStream
+pub fn session_orchestrator::egress_backend::FirecrackerUnixStream::set_read_timeout(&self, core::time::Duration) -> std::io::error::Result<()>
+pub fn session_orchestrator::egress_backend::FirecrackerUnixStream::set_write_timeout(&self, core::time::Duration) -> std::io::error::Result<()>
+impl std::io::Read for session_orchestrator::egress_backend::FirecrackerUnixStream
+pub fn session_orchestrator::egress_backend::FirecrackerUnixStream::read(&mut self, &mut [u8]) -> std::io::error::Result<usize>
+impl std::io::Write for session_orchestrator::egress_backend::FirecrackerUnixStream
+pub fn session_orchestrator::egress_backend::FirecrackerUnixStream::flush(&mut self) -> std::io::error::Result<()>
+pub fn session_orchestrator::egress_backend::FirecrackerUnixStream::write(&mut self, &[u8]) -> std::io::error::Result<usize>
+pub trait session_orchestrator::egress_backend::BrokerRuntime<S>: core::marker::Send + 'static
+pub fn session_orchestrator::egress_backend::BrokerRuntime::serve(self, S, &session_orchestrator::egress_backend::BrokerCancellation) -> session_orchestrator::egress_backend::BrokerConnectionExit
+impl<S, C> session_orchestrator::egress_backend::BrokerRuntime<S> for session_orchestrator::egress_backend::BuiltBrokerRuntime<C> where S: egress_broker::transport::DeadlineStream + core::marker::Send + 'static, C: core::ops::function::FnMut() -> authority_core::time::MonotonicTime + core::marker::Send + 'static
+pub fn session_orchestrator::egress_backend::BuiltBrokerRuntime<C>::serve(self, S, &session_orchestrator::egress_backend::BrokerCancellation) -> session_orchestrator::egress_backend::BrokerConnectionExit
+pub trait session_orchestrator::egress_backend::BrokerRuntimeFactory<S>: core::marker::Send + core::marker::Sync + 'static
+pub type session_orchestrator::egress_backend::BrokerRuntimeFactory::Runtime: session_orchestrator::egress_backend::BrokerRuntime<S>
+pub fn session_orchestrator::egress_backend::BrokerRuntimeFactory::build(&self, &session_orchestrator::SessionIdentity) -> core::result::Result<Self::Runtime, session_orchestrator::BackendError>
+pub fn session_orchestrator::egress_backend::BrokerRuntimeFactory::discard_unstarted(&self, &session_orchestrator::SessionIdentity) -> core::result::Result<(), session_orchestrator::BackendError>
+pub trait session_orchestrator::egress_backend::BrokerServiceListener: core::marker::Send + 'static
+pub type session_orchestrator::egress_backend::BrokerServiceListener::Shutdown: session_orchestrator::egress_backend::BrokerStreamShutdown
+pub type session_orchestrator::egress_backend::BrokerServiceListener::Stream: std::io::Read + std::io::Write + core::marker::Send + 'static
+pub fn session_orchestrator::egress_backend::BrokerServiceListener::shutdown_handle(&Self::Stream) -> std::io::error::Result<Self::Shutdown>
+pub fn session_orchestrator::egress_backend::BrokerServiceListener::try_accept_peer(&self) -> std::io::error::Result<core::option::Option<(u32, Self::Stream)>>
+impl session_orchestrator::egress_backend::BrokerServiceListener for egress_broker::transport::AfVsockListener
+pub type egress_broker::transport::AfVsockListener::Shutdown = egress_broker::transport::VsockShutdownHandle
+pub type egress_broker::transport::AfVsockListener::Stream = egress_broker::transport::VsockStream
+pub fn egress_broker::transport::AfVsockListener::shutdown_handle(&Self::Stream) -> std::io::error::Result<Self::Shutdown>
+pub fn egress_broker::transport::AfVsockListener::try_accept_peer(&self) -> std::io::error::Result<core::option::Option<(u32, Self::Stream)>>
+impl session_orchestrator::egress_backend::BrokerServiceListener for session_orchestrator::egress_backend::FirecrackerUnixListener
+pub type session_orchestrator::egress_backend::FirecrackerUnixListener::Shutdown = session_orchestrator::egress_backend::FirecrackerUnixShutdown
+pub type session_orchestrator::egress_backend::FirecrackerUnixListener::Stream = session_orchestrator::egress_backend::FirecrackerUnixStream
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListener::shutdown_handle(&Self::Stream) -> std::io::error::Result<Self::Shutdown>
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListener::try_accept_peer(&self) -> std::io::error::Result<core::option::Option<(u32, Self::Stream)>>
+pub trait session_orchestrator::egress_backend::BrokerStreamShutdown: core::marker::Send + 'static
+pub fn session_orchestrator::egress_backend::BrokerStreamShutdown::shutdown(&self) -> std::io::error::Result<()>
+impl session_orchestrator::egress_backend::BrokerStreamShutdown for egress_broker::transport::VsockShutdownHandle
+pub fn egress_broker::transport::VsockShutdownHandle::shutdown(&self) -> std::io::error::Result<()>
+impl session_orchestrator::egress_backend::BrokerStreamShutdown for session_orchestrator::egress_backend::FirecrackerUnixShutdown
+pub fn session_orchestrator::egress_backend::FirecrackerUnixShutdown::shutdown(&self) -> std::io::error::Result<()>
+pub trait session_orchestrator::egress_backend::VsockListenerFactory
+pub type session_orchestrator::egress_backend::VsockListenerFactory::Listener: session_orchestrator::egress_backend::BrokerServiceListener
+pub fn session_orchestrator::egress_backend::VsockListenerFactory::bind(&self, &session_orchestrator::SessionIdentity, u32, u32, i32) -> std::io::error::Result<Self::Listener>
+impl session_orchestrator::egress_backend::VsockListenerFactory for session_orchestrator::egress_backend::AfVsockListenerFactory
+pub type session_orchestrator::egress_backend::AfVsockListenerFactory::Listener = egress_broker::transport::AfVsockListener
+pub fn session_orchestrator::egress_backend::AfVsockListenerFactory::bind(&self, &session_orchestrator::SessionIdentity, u32, u32, i32) -> std::io::error::Result<Self::Listener>
+impl session_orchestrator::egress_backend::VsockListenerFactory for session_orchestrator::egress_backend::FirecrackerUnixListenerFactory
+pub type session_orchestrator::egress_backend::FirecrackerUnixListenerFactory::Listener = session_orchestrator::egress_backend::FirecrackerUnixListener
+pub fn session_orchestrator::egress_backend::FirecrackerUnixListenerFactory::bind(&self, &session_orchestrator::SessionIdentity, u32, u32, i32) -> std::io::error::Result<Self::Listener>
+pub type session_orchestrator::egress_backend::KernelVsockBrokerBackend<R> = session_orchestrator::egress_backend::BrokerBackend<session_orchestrator::egress_backend::AfVsockListenerFactory, R>
+pub type session_orchestrator::egress_backend::ProductionBrokerBackend<R> = session_orchestrator::egress_backend::BrokerBackend<session_orchestrator::egress_backend::FirecrackerUnixListenerFactory, R>
+pub mod session_orchestrator::filesystem_factory
+pub struct session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory
+impl session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory
+pub fn session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory::new(session_orchestrator::SnapshotId, firecracker_runtime::RuntimeConfig, session_orchestrator::filesystem_factory::SnapshotTemplate) -> Self
+pub const fn session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory::with_guest_artifacts(session_orchestrator::SnapshotId, firecracker_runtime::RuntimeConfig, session_orchestrator::filesystem_factory::GuestArtifactTemplate, session_orchestrator::filesystem_factory::SnapshotTemplate) -> Self
+impl session_orchestrator::production_runtime::PerSessionFirecrackerFactory for session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory
+pub fn session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory::prepare(&mut self, &session_orchestrator::production_runtime::SessionFirecrackerRequest) -> core::result::Result<session_orchestrator::production_runtime::PreparedFirecrackerSession, session_orchestrator::BackendError>
+pub fn session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory::recover_provisioning(&mut self, &session_orchestrator::production_runtime::SessionFirecrackerRecoveryRequest) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory::snapshot_id(&self) -> session_orchestrator::SnapshotId
+pub struct session_orchestrator::filesystem_factory::GuestArtifactTemplate
+impl session_orchestrator::filesystem_factory::GuestArtifactTemplate
+pub const fn session_orchestrator::filesystem_factory::GuestArtifactTemplate::kernel(&self) -> &firecracker_runtime::PinnedArtifact
+pub const fn session_orchestrator::filesystem_factory::GuestArtifactTemplate::new(firecracker_runtime::PinnedArtifact, firecracker_runtime::PinnedArtifact) -> Self
+pub const fn session_orchestrator::filesystem_factory::GuestArtifactTemplate::seccomp(&self) -> &firecracker_runtime::PinnedArtifact
+pub struct session_orchestrator::filesystem_factory::SnapshotTemplate
+impl session_orchestrator::filesystem_factory::SnapshotTemplate
+pub const fn session_orchestrator::filesystem_factory::SnapshotTemplate::memory(&self) -> &firecracker_runtime::PinnedArtifact
+pub const fn session_orchestrator::filesystem_factory::SnapshotTemplate::new(firecracker_runtime::PinnedArtifact, firecracker_runtime::PinnedArtifact) -> Self
+pub const fn session_orchestrator::filesystem_factory::SnapshotTemplate::state(&self) -> &firecracker_runtime::PinnedArtifact
+pub mod session_orchestrator::firecracker_backend
+pub struct session_orchestrator::firecracker_backend::FirecrackerBackendFactory<C, F, A, G, I> where C: firecracker_runtime::CommandRunner, F: firecracker_runtime::FileSystem, A: firecracker_runtime::ApiClient, G: firecracker_runtime::ApiClient, I: firecracker_runtime::IdentitySource
+impl<C, F, A, G, I> session_orchestrator::firecracker_backend::FirecrackerBackendFactory<C, F, A, G, I> where C: firecracker_runtime::CommandRunner, F: firecracker_runtime::FileSystem, A: firecracker_runtime::ApiClient, G: firecracker_runtime::ApiClient, I: firecracker_runtime::IdentitySource
+pub fn session_orchestrator::firecracker_backend::FirecrackerBackendFactory<C, F, A, G, I>::into_handles(self) -> session_orchestrator::firecracker_backend::FirecrackerBackends<C, F, A, G, I>
+pub fn session_orchestrator::firecracker_backend::FirecrackerBackendFactory<C, F, A, G, I>::new(firecracker_runtime::Runtime<C, F, A, G, I>, firecracker_runtime::RuntimeConfig, firecracker_runtime::Snapshot, session_orchestrator::SnapshotId) -> Self
+pub struct session_orchestrator::firecracker_backend::FirecrackerVmBackend<C, F, A, G, I> where C: firecracker_runtime::CommandRunner, F: firecracker_runtime::FileSystem, A: firecracker_runtime::ApiClient, G: firecracker_runtime::ApiClient, I: firecracker_runtime::IdentitySource
+impl<C, F, A, G, I> session_orchestrator::VmBackend for session_orchestrator::firecracker_backend::FirecrackerVmBackend<C, F, A, G, I> where C: firecracker_runtime::CommandRunner, F: firecracker_runtime::FileSystem, A: firecracker_runtime::ApiClient, G: firecracker_runtime::ApiClient, I: firecracker_runtime::IdentitySource
+pub fn session_orchestrator::firecracker_backend::FirecrackerVmBackend<C, F, A, G, I>::cleanup_failed_start(&mut self) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::firecracker_backend::FirecrackerVmBackend<C, F, A, G, I>::kill_vm(&mut self, &session_orchestrator::VmLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::firecracker_backend::FirecrackerVmBackend<C, F, A, G, I>::start_vm(&mut self, &session_orchestrator::SnapshotDescriptor, &session_orchestrator::SessionIdentity, &session_orchestrator::WorkspaceLease, &session_orchestrator::BrokerLease) -> core::result::Result<session_orchestrator::VmLease, session_orchestrator::BackendError>
+pub struct session_orchestrator::firecracker_backend::FirecrackerWorkloadBackend<C, F, A, G, I> where C: firecracker_runtime::CommandRunner, F: firecracker_runtime::FileSystem, A: firecracker_runtime::ApiClient, G: firecracker_runtime::ApiClient, I: firecracker_runtime::IdentitySource
+impl<C, F, A, G, I> session_orchestrator::WorkloadBackend for session_orchestrator::firecracker_backend::FirecrackerWorkloadBackend<C, F, A, G, I> where C: firecracker_runtime::CommandRunner, F: firecracker_runtime::FileSystem, A: firecracker_runtime::ApiClient, G: firecracker_runtime::ApiClient, I: firecracker_runtime::IdentitySource
+pub fn session_orchestrator::firecracker_backend::FirecrackerWorkloadBackend<C, F, A, G, I>::release_workload(&mut self, &session_orchestrator::SessionIdentity, &session_orchestrator::VmLease, &session_orchestrator::CapabilityLease) -> core::result::Result<session_orchestrator::WorkloadLease, session_orchestrator::BackendError>
+pub fn session_orchestrator::firecracker_backend::new_firecracker_backends<C, F, A, G, I>(firecracker_runtime::Runtime<C, F, A, G, I>, firecracker_runtime::RuntimeConfig, firecracker_runtime::Snapshot, session_orchestrator::SnapshotId) -> session_orchestrator::firecracker_backend::FirecrackerBackends<C, F, A, G, I> where C: firecracker_runtime::CommandRunner, F: firecracker_runtime::FileSystem, A: firecracker_runtime::ApiClient, G: firecracker_runtime::ApiClient, I: firecracker_runtime::IdentitySource
+pub type session_orchestrator::firecracker_backend::FirecrackerBackends<C, F, A, G, I> = (session_orchestrator::firecracker_backend::FirecrackerVmBackend<C, F, A, G, I>, session_orchestrator::firecracker_backend::FirecrackerWorkloadBackend<C, F, A, G, I>)
+pub mod session_orchestrator::firecracker_identity
+pub fn session_orchestrator::firecracker_identity::to_firecracker_identity_bundle(&session_orchestrator::SessionIdentity) -> core::result::Result<firecracker_runtime::IdentityBundle, firecracker_runtime::RuntimeError>
+pub mod session_orchestrator::firecracker_workspace
+pub struct session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>
+impl<F> firecracker_runtime::FileSystem for session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F> where F: firecracker_runtime::FileSystem
+pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::bind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::clone_workspace(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::create_workspace_image(&mut self, &std::path::Path, &std::path::Path, u64) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::read(&mut self, &std::path::Path) -> core::result::Result<alloc::vec::Vec<u8>, firecracker_runtime::RuntimeError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::remove_workspace(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::unbind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::verify_block_device_binding(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub struct session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackend<F>
+impl<F> session_orchestrator::WorkspaceBackend for session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackend<F> where F: firecracker_runtime::FileSystem
+pub fn session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackend<F>::clone_workspace(&mut self, &session_orchestrator::SessionIdentity, &session_orchestrator::WorkspaceTemplateId) -> core::result::Result<session_orchestrator::WorkspaceLease, session_orchestrator::BackendError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackend<F>::isolate_workspace(&mut self, &session_orchestrator::WorkspaceLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub struct session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackendFactory<F>
+impl<F> session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackendFactory<F>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackendFactory<F>::into_handles(self) -> session_orchestrator::firecracker_workspace::FirecrackerWorkspaceAdapters<F>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackendFactory<F>::new(F, session_orchestrator::WorkspaceTemplateId, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn session_orchestrator::firecracker_workspace::new_firecracker_workspace_adapters<F>(F, session_orchestrator::WorkspaceTemplateId, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> session_orchestrator::firecracker_workspace::FirecrackerWorkspaceAdapters<F>
+pub fn session_orchestrator::firecracker_workspace::new_firecracker_workspace_backends<F>(F, session_orchestrator::WorkspaceTemplateId, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>) -> session_orchestrator::firecracker_workspace::FirecrackerWorkspaceAdapters<F>
+pub type session_orchestrator::firecracker_workspace::FirecrackerWorkspaceAdapters<F> = (session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackend<F>, session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>)
+pub type session_orchestrator::firecracker_workspace::FirecrackerWorkspaceFactory<F> = session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackendFactory<F>
+pub type session_orchestrator::firecracker_workspace::FirecrackerWorkspaceFileSystem<F> = session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>
+pub mod session_orchestrator::production_runtime
+pub enum session_orchestrator::production_runtime::AuthorityAuditMode
+pub session_orchestrator::production_runtime::AuthorityAuditMode::CreateNew(std::path::PathBuf)
+pub session_orchestrator::production_runtime::AuthorityAuditMode::OpenExisting(std::path::PathBuf)
+pub enum session_orchestrator::production_runtime::ProductionBuildError
+pub session_orchestrator::production_runtime::ProductionBuildError::AuthorityAudit(authority_core::durable_audit::DurableAuditError)
+pub session_orchestrator::production_runtime::ProductionBuildError::AuthorityKernel(authority_core::audit::AuditError)
+pub session_orchestrator::production_runtime::ProductionBuildError::Broker(session_orchestrator::BackendError)
+pub session_orchestrator::production_runtime::ProductionBuildError::IdentityLedger(session_orchestrator::LedgerError)
+pub session_orchestrator::production_runtime::ProductionBuildError::InvalidConfig(alloc::string::String)
+pub session_orchestrator::production_runtime::ProductionBuildError::Recovery(alloc::boxed::Box<session_orchestrator::production_runtime::ProductionRecoveryError>)
+pub session_orchestrator::production_runtime::ProductionBuildError::Runtime(firecracker_runtime::RuntimeError)
+impl core::error::Error for session_orchestrator::production_runtime::ProductionBuildError
+pub fn session_orchestrator::production_runtime::ProductionBuildError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for session_orchestrator::production_runtime::ProductionBuildError
+pub fn session_orchestrator::production_runtime::ProductionBuildError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::production_runtime::ProductionRecoveryError
+pub session_orchestrator::production_runtime::ProductionRecoveryError::Firecracker(firecracker_runtime::recovery::RecoveryError)
+pub session_orchestrator::production_runtime::ProductionRecoveryError::IdentityMismatch(alloc::string::String)
+pub session_orchestrator::production_runtime::ProductionRecoveryError::Journal(session_orchestrator::recovery::SessionRecoveryError)
+pub session_orchestrator::production_runtime::ProductionRecoveryError::Runtime(firecracker_runtime::RuntimeError)
+impl core::error::Error for session_orchestrator::production_runtime::ProductionRecoveryError
+pub fn session_orchestrator::production_runtime::ProductionRecoveryError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for session_orchestrator::production_runtime::ProductionRecoveryError
+pub fn session_orchestrator::production_runtime::ProductionRecoveryError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::production_runtime::ProductionStartError
+pub session_orchestrator::production_runtime::ProductionStartError::AlreadyStarted
+pub session_orchestrator::production_runtime::ProductionStartError::Recovery(alloc::boxed::Box<session_orchestrator::production_runtime::ProductionRecoveryError>)
+pub session_orchestrator::production_runtime::ProductionStartError::Start(session_orchestrator::StartError)
+impl core::error::Error for session_orchestrator::production_runtime::ProductionStartError
+pub fn session_orchestrator::production_runtime::ProductionStartError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for session_orchestrator::production_runtime::ProductionStartError
+pub fn session_orchestrator::production_runtime::ProductionStartError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::production_runtime::SessionPreparationError
+pub session_orchestrator::production_runtime::SessionPreparationError::RuntimeConfig(firecracker_runtime::RuntimeError)
+pub session_orchestrator::production_runtime::SessionPreparationError::RuntimeConfigMismatch
+pub session_orchestrator::production_runtime::SessionPreparationError::SnapshotFingerprintMismatch
+pub session_orchestrator::production_runtime::SessionPreparationError::SnapshotIdMismatch
+pub session_orchestrator::production_runtime::SessionPreparationError::SnapshotPathMismatch
+pub session_orchestrator::production_runtime::SessionPreparationError::SnapshotPathMismatch::resource: session_orchestrator::production_runtime::SnapshotResource
+impl core::error::Error for session_orchestrator::production_runtime::SessionPreparationError
+pub fn session_orchestrator::production_runtime::SessionPreparationError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for session_orchestrator::production_runtime::SessionPreparationError
+pub fn session_orchestrator::production_runtime::SessionPreparationError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::production_runtime::SnapshotResource
+pub session_orchestrator::production_runtime::SnapshotResource::Memory
+pub session_orchestrator::production_runtime::SnapshotResource::State
+pub struct session_orchestrator::production_runtime::PreparedEgressSession
+impl session_orchestrator::production_runtime::PreparedEgressSession
+pub fn session_orchestrator::production_runtime::PreparedEgressSession::new<P, G, C>(&session_orchestrator::production_runtime::SessionEgressRequest, P, G, C) -> Self where P: egress_broker::dispatch::PublicDispatchAdapter + core::marker::Send + 'static, G: egress_broker::github::GitHubAdapter + 'static, C: core::ops::function::FnMut() -> authority_core::time::MonotonicTime + core::marker::Send + 'static
+pub struct session_orchestrator::production_runtime::PreparedFirecrackerSession
+impl session_orchestrator::production_runtime::PreparedFirecrackerSession
+pub fn session_orchestrator::production_runtime::PreparedFirecrackerSession::verify(&session_orchestrator::production_runtime::SessionFirecrackerRequest, firecracker_runtime::RuntimeConfig, firecracker_runtime::Snapshot, session_orchestrator::SnapshotId) -> core::result::Result<Self, session_orchestrator::production_runtime::SessionPreparationError>
+pub struct session_orchestrator::production_runtime::ProductionBrokerEndpoint
+impl session_orchestrator::production_runtime::ProductionBrokerEndpoint
+pub const fn session_orchestrator::production_runtime::ProductionBrokerEndpoint::new(u32, u32, u32, i32) -> Self
+pub struct session_orchestrator::production_runtime::ProductionBrokerLimits
+impl session_orchestrator::production_runtime::ProductionBrokerLimits
+pub const fn session_orchestrator::production_runtime::ProductionBrokerLimits::budget_concurrent(self) -> core::num::nonzero::NonZeroUsize
+pub const fn session_orchestrator::production_runtime::ProductionBrokerLimits::budget_requests(self) -> core::num::nonzero::NonZeroU64
+pub const fn session_orchestrator::production_runtime::ProductionBrokerLimits::budget_response_bytes(self) -> u64
+pub const fn session_orchestrator::production_runtime::ProductionBrokerLimits::github_response_cap(self) -> u64
+pub const fn session_orchestrator::production_runtime::ProductionBrokerLimits::max_connection_requests(self) -> core::num::nonzero::NonZeroUsize
+pub const fn session_orchestrator::production_runtime::ProductionBrokerLimits::new(core::num::nonzero::NonZeroUsize, core::num::nonzero::NonZeroU64, u64, core::num::nonzero::NonZeroUsize, u64, core::num::nonzero::NonZeroUsize) -> Self
+pub const fn session_orchestrator::production_runtime::ProductionBrokerLimits::replay_capacity(self) -> core::num::nonzero::NonZeroUsize
+pub struct session_orchestrator::production_runtime::ProductionDurabilityConfig
+impl session_orchestrator::production_runtime::ProductionDurabilityConfig
+pub fn session_orchestrator::production_runtime::ProductionDurabilityConfig::new(impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, session_orchestrator::production_runtime::AuthorityAuditMode, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub struct session_orchestrator::production_runtime::ProductionFirecrackerConfig
+impl session_orchestrator::production_runtime::ProductionFirecrackerConfig
+pub const fn session_orchestrator::production_runtime::ProductionFirecrackerConfig::new(firecracker_runtime::RuntimeConfig, firecracker_runtime::recovery::RecoveryTools) -> Self
+pub struct session_orchestrator::production_runtime::ProductionGuestControlEndpoint
+impl session_orchestrator::production_runtime::ProductionGuestControlEndpoint
+pub const fn session_orchestrator::production_runtime::ProductionGuestControlEndpoint::new(u32) -> Self
+pub struct session_orchestrator::production_runtime::ProductionSessionConfig
+impl session_orchestrator::production_runtime::ProductionSessionConfig
+pub const fn session_orchestrator::production_runtime::ProductionSessionConfig::new(session_orchestrator::production_runtime::ProductionDurabilityConfig, authority_core::capability::IssuerId, session_orchestrator::production_runtime::ProductionFirecrackerConfig, session_orchestrator::WorkspaceTemplateId, session_orchestrator::production_runtime::ProductionBrokerEndpoint, session_orchestrator::production_runtime::ProductionGuestControlEndpoint, session_orchestrator::production_runtime::ProductionBrokerLimits) -> Self
+pub struct session_orchestrator::production_runtime::ProductionSessionRuntime
+impl session_orchestrator::production_runtime::ProductionSessionRuntime
+pub fn session_orchestrator::production_runtime::ProductionSessionRuntime::active_session(&self) -> core::option::Option<session_orchestrator::SessionInfo>
+pub fn session_orchestrator::production_runtime::ProductionSessionRuntime::poll(&mut self, session_orchestrator::session_owner::OwnerPollRequest) -> core::result::Result<session_orchestrator::session_owner::OwnerPollOutcome, session_orchestrator::session_owner::OwnerPollError>
+pub fn session_orchestrator::production_runtime::ProductionSessionRuntime::start(&mut self, &session_orchestrator::authority_backend::AuthorityRootGrant) -> core::result::Result<session_orchestrator::SessionInfo, session_orchestrator::production_runtime::ProductionStartError>
+pub fn session_orchestrator::production_runtime::ProductionSessionRuntime::state(&self) -> session_orchestrator::LifecycleState
+pub fn session_orchestrator::production_runtime::ProductionSessionRuntime::stop(&mut self) -> core::result::Result<session_orchestrator::session_owner::OwnerPollOutcome, session_orchestrator::session_owner::OwnerPollError>
+pub struct session_orchestrator::production_runtime::ProductionSessionRuntimeBuilder
+impl session_orchestrator::production_runtime::ProductionSessionRuntimeBuilder
+pub fn session_orchestrator::production_runtime::ProductionSessionRuntimeBuilder::build(self) -> core::result::Result<session_orchestrator::production_runtime::ProductionSessionRuntime, session_orchestrator::production_runtime::ProductionBuildError>
+pub fn session_orchestrator::production_runtime::ProductionSessionRuntimeBuilder::new<F, E>(session_orchestrator::production_runtime::ProductionSessionConfig, F, E) -> Self where F: session_orchestrator::production_runtime::PerSessionFirecrackerFactory, E: session_orchestrator::production_runtime::PerSessionEgressFactory
+pub struct session_orchestrator::production_runtime::SessionEgressRequest
+impl session_orchestrator::production_runtime::SessionEgressRequest
+pub const fn session_orchestrator::production_runtime::SessionEgressRequest::identity(&self) -> session_orchestrator::SessionIdentity
+pub const fn session_orchestrator::production_runtime::SessionEgressRequest::new(session_orchestrator::SessionIdentity) -> Self
+pub struct session_orchestrator::production_runtime::SessionFirecrackerRecoveryRequest
+impl session_orchestrator::production_runtime::SessionFirecrackerRecoveryRequest
+pub const fn session_orchestrator::production_runtime::SessionFirecrackerRecoveryRequest::identity(&self) -> session_orchestrator::SessionIdentity
+pub const fn session_orchestrator::production_runtime::SessionFirecrackerRecoveryRequest::ownership(&self) -> &firecracker_runtime::recovery::SessionResourceOwnership
+pub const fn session_orchestrator::production_runtime::SessionFirecrackerRecoveryRequest::runtime_config(&self) -> &firecracker_runtime::RuntimeConfig
+pub struct session_orchestrator::production_runtime::SessionFirecrackerRequest
+impl session_orchestrator::production_runtime::SessionFirecrackerRequest
+pub const fn session_orchestrator::production_runtime::SessionFirecrackerRequest::guest_control_port(&self) -> u32
+pub const fn session_orchestrator::production_runtime::SessionFirecrackerRequest::identity(&self) -> session_orchestrator::SessionIdentity
+pub fn session_orchestrator::production_runtime::SessionFirecrackerRequest::memory_path(&self) -> &std::path::Path
+pub fn session_orchestrator::production_runtime::SessionFirecrackerRequest::new(session_orchestrator::SessionIdentity, firecracker_runtime::RuntimeConfig, session_orchestrator::SnapshotId, impl core::convert::Into<std::path::PathBuf>, impl core::convert::Into<std::path::PathBuf>, u32) -> Self
+pub const fn session_orchestrator::production_runtime::SessionFirecrackerRequest::runtime_config(&self) -> &firecracker_runtime::RuntimeConfig
+pub const fn session_orchestrator::production_runtime::SessionFirecrackerRequest::snapshot_id(&self) -> session_orchestrator::SnapshotId
+pub fn session_orchestrator::production_runtime::SessionFirecrackerRequest::snapshot_path(&self) -> &std::path::Path
+pub const session_orchestrator::production_runtime::MAX_PRODUCTION_BROKER_CONCURRENT_REQUESTS: usize
+pub const session_orchestrator::production_runtime::MAX_PRODUCTION_BROKER_CONNECTION_REQUESTS: usize
+pub const session_orchestrator::production_runtime::MAX_PRODUCTION_BROKER_REPLAY_CAPACITY: usize
+pub const session_orchestrator::production_runtime::MAX_PRODUCTION_BROKER_RESPONSE_BUDGET_BYTES: u64
+pub trait session_orchestrator::production_runtime::PerSessionEgressFactory: core::marker::Send + core::marker::Sync + 'static
+pub fn session_orchestrator::production_runtime::PerSessionEgressFactory::prepare(&self, &session_orchestrator::production_runtime::SessionEgressRequest) -> core::result::Result<session_orchestrator::production_runtime::PreparedEgressSession, session_orchestrator::BackendError>
+impl session_orchestrator::production_runtime::PerSessionEgressFactory for session_orchestrator::system_egress::SystemEgressFactory
+pub fn session_orchestrator::system_egress::SystemEgressFactory::prepare(&self, &session_orchestrator::production_runtime::SessionEgressRequest) -> core::result::Result<session_orchestrator::production_runtime::PreparedEgressSession, session_orchestrator::BackendError>
+pub trait session_orchestrator::production_runtime::PerSessionFirecrackerFactory: core::marker::Send + 'static
+pub fn session_orchestrator::production_runtime::PerSessionFirecrackerFactory::prepare(&mut self, &session_orchestrator::production_runtime::SessionFirecrackerRequest) -> core::result::Result<session_orchestrator::production_runtime::PreparedFirecrackerSession, session_orchestrator::BackendError>
+pub fn session_orchestrator::production_runtime::PerSessionFirecrackerFactory::recover_provisioning(&mut self, &session_orchestrator::production_runtime::SessionFirecrackerRecoveryRequest) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::production_runtime::PerSessionFirecrackerFactory::snapshot_id(&self) -> session_orchestrator::SnapshotId
+impl session_orchestrator::production_runtime::PerSessionFirecrackerFactory for session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory
+pub fn session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory::prepare(&mut self, &session_orchestrator::production_runtime::SessionFirecrackerRequest) -> core::result::Result<session_orchestrator::production_runtime::PreparedFirecrackerSession, session_orchestrator::BackendError>
+pub fn session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory::recover_provisioning(&mut self, &session_orchestrator::production_runtime::SessionFirecrackerRecoveryRequest) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::filesystem_factory::FilesystemFirecrackerFactory::snapshot_id(&self) -> session_orchestrator::SnapshotId
+pub mod session_orchestrator::recovery
+pub enum session_orchestrator::recovery::SessionRecoveryError
+pub session_orchestrator::recovery::SessionRecoveryError::AliasedFile
+pub session_orchestrator::recovery::SessionRecoveryError::AliasedFile::links: u64
+pub session_orchestrator::recovery::SessionRecoveryError::AliasedFile::path: std::path::PathBuf
+pub session_orchestrator::recovery::SessionRecoveryError::CapacityExceeded
+pub session_orchestrator::recovery::SessionRecoveryError::CapacityExceeded::max_records: u64
+pub session_orchestrator::recovery::SessionRecoveryError::CapacityExceeded::records: u64
+pub session_orchestrator::recovery::SessionRecoveryError::Corrupt
+pub session_orchestrator::recovery::SessionRecoveryError::Corrupt::offset: u64
+pub session_orchestrator::recovery::SessionRecoveryError::Corrupt::reason: alloc::string::String
+pub session_orchestrator::recovery::SessionRecoveryError::GenerationExhausted
+pub session_orchestrator::recovery::SessionRecoveryError::InvalidStageTransition
+pub session_orchestrator::recovery::SessionRecoveryError::InvalidStageTransition::current: session_orchestrator::recovery::SessionRecoveryStage
+pub session_orchestrator::recovery::SessionRecoveryError::InvalidStageTransition::requested: session_orchestrator::recovery::SessionRecoveryStage
+pub session_orchestrator::recovery::SessionRecoveryError::Io
+pub session_orchestrator::recovery::SessionRecoveryError::Io::message: alloc::string::String
+pub session_orchestrator::recovery::SessionRecoveryError::Io::operation: session_orchestrator::recovery::SessionRecoveryOperation
+pub session_orchestrator::recovery::SessionRecoveryError::Io::path: std::path::PathBuf
+pub session_orchestrator::recovery::SessionRecoveryError::LengthChanged
+pub session_orchestrator::recovery::SessionRecoveryError::LengthChanged::actual: u64
+pub session_orchestrator::recovery::SessionRecoveryError::LengthChanged::expected: u64
+pub session_orchestrator::recovery::SessionRecoveryError::LengthChanged::path: std::path::PathBuf
+pub session_orchestrator::recovery::SessionRecoveryError::Locked
+pub session_orchestrator::recovery::SessionRecoveryError::Locked::path: std::path::PathBuf
+pub session_orchestrator::recovery::SessionRecoveryError::NoPendingRecovery
+pub session_orchestrator::recovery::SessionRecoveryError::NotRegularFile
+pub session_orchestrator::recovery::SessionRecoveryError::NotRegularFile::path: std::path::PathBuf
+pub session_orchestrator::recovery::SessionRecoveryError::PathIdentityChanged
+pub session_orchestrator::recovery::SessionRecoveryError::PathIdentityChanged::path: std::path::PathBuf
+pub session_orchestrator::recovery::SessionRecoveryError::PendingRecovery
+pub session_orchestrator::recovery::SessionRecoveryError::PendingRecovery::identity: session_orchestrator::SessionIdentity
+pub session_orchestrator::recovery::SessionRecoveryError::PendingRecovery::stage: session_orchestrator::recovery::SessionRecoveryStage
+pub session_orchestrator::recovery::SessionRecoveryError::StaleLease
+pub session_orchestrator::recovery::SessionRecoveryError::Symlink
+pub session_orchestrator::recovery::SessionRecoveryError::Symlink::path: std::path::PathBuf
+pub session_orchestrator::recovery::SessionRecoveryError::Truncated
+pub session_orchestrator::recovery::SessionRecoveryError::Truncated::actual: usize
+pub session_orchestrator::recovery::SessionRecoveryError::Truncated::expected: usize
+pub session_orchestrator::recovery::SessionRecoveryError::Truncated::offset: u64
+pub session_orchestrator::recovery::SessionRecoveryError::Unavailable
+pub session_orchestrator::recovery::SessionRecoveryError::Unavailable::reason: alloc::string::String
+pub session_orchestrator::recovery::SessionRecoveryError::UnsafeParentDirectory
+pub session_orchestrator::recovery::SessionRecoveryError::UnsafeParentDirectory::path: std::path::PathBuf
+pub session_orchestrator::recovery::SessionRecoveryError::UnsafePermissions
+pub session_orchestrator::recovery::SessionRecoveryError::UnsafePermissions::mode: u32
+pub session_orchestrator::recovery::SessionRecoveryError::UnsafePermissions::path: std::path::PathBuf
+pub session_orchestrator::recovery::SessionRecoveryError::UnsupportedVersion
+pub session_orchestrator::recovery::SessionRecoveryError::UnsupportedVersion::version: u8
+pub session_orchestrator::recovery::SessionRecoveryError::WrongOwner
+pub session_orchestrator::recovery::SessionRecoveryError::WrongOwner::actual: u32
+pub session_orchestrator::recovery::SessionRecoveryError::WrongOwner::expected: u32
+pub session_orchestrator::recovery::SessionRecoveryError::WrongOwner::path: std::path::PathBuf
+impl core::error::Error for session_orchestrator::recovery::SessionRecoveryError
+impl core::fmt::Display for session_orchestrator::recovery::SessionRecoveryError
+pub fn session_orchestrator::recovery::SessionRecoveryError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::recovery::SessionRecoveryOperation
+pub session_orchestrator::recovery::SessionRecoveryOperation::Append
+pub session_orchestrator::recovery::SessionRecoveryOperation::DirectoryOpen
+pub session_orchestrator::recovery::SessionRecoveryOperation::DirectorySync
+pub session_orchestrator::recovery::SessionRecoveryOperation::HeaderWrite
+pub session_orchestrator::recovery::SessionRecoveryOperation::Lock
+pub session_orchestrator::recovery::SessionRecoveryOperation::Metadata
+pub session_orchestrator::recovery::SessionRecoveryOperation::Open
+pub session_orchestrator::recovery::SessionRecoveryOperation::Read
+pub session_orchestrator::recovery::SessionRecoveryOperation::Sync
+impl core::fmt::Display for session_orchestrator::recovery::SessionRecoveryOperation
+pub fn session_orchestrator::recovery::SessionRecoveryOperation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::recovery::SessionRecoveryStage
+pub session_orchestrator::recovery::SessionRecoveryStage::Abandoned
+pub session_orchestrator::recovery::SessionRecoveryStage::CgroupEmpty
+pub session_orchestrator::recovery::SessionRecoveryStage::Complete
+pub session_orchestrator::recovery::SessionRecoveryStage::IdentityReserved
+pub session_orchestrator::recovery::SessionRecoveryStage::Intent
+pub session_orchestrator::recovery::SessionRecoveryStage::JailRemoved
+pub session_orchestrator::recovery::SessionRecoveryStage::MapperClosed
+pub session_orchestrator::recovery::SessionRecoveryStage::ProvisioningReleased
+impl session_orchestrator::recovery::SessionRecoveryStage
+pub const fn session_orchestrator::recovery::SessionRecoveryStage::identity_was_reserved(self) -> bool
+impl core::fmt::Display for session_orchestrator::recovery::SessionRecoveryStage
+pub fn session_orchestrator::recovery::SessionRecoveryStage::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::recovery::DurableSessionRecoveryJournal
+impl session_orchestrator::recovery::DurableSessionRecoveryJournal
+pub fn session_orchestrator::recovery::DurableSessionRecoveryJournal::abandon(&mut self, &session_orchestrator::recovery::SessionRecoveryLease) -> core::result::Result<(), session_orchestrator::recovery::SessionRecoveryError>
+pub fn session_orchestrator::recovery::DurableSessionRecoveryJournal::checkpoint(&mut self, &session_orchestrator::recovery::SessionRecoveryLease, session_orchestrator::recovery::SessionRecoveryStage) -> core::result::Result<session_orchestrator::recovery::SessionRecoveryLease, session_orchestrator::recovery::SessionRecoveryError>
+pub fn session_orchestrator::recovery::DurableSessionRecoveryJournal::complete(&mut self, &session_orchestrator::recovery::SessionRecoveryLease) -> core::result::Result<(), session_orchestrator::recovery::SessionRecoveryError>
+pub fn session_orchestrator::recovery::DurableSessionRecoveryJournal::history(&self) -> &[session_orchestrator::recovery::SessionRecoveryHistory]
+pub fn session_orchestrator::recovery::DurableSessionRecoveryJournal::identity_reserved_intent_count(&self) -> usize
+pub fn session_orchestrator::recovery::DurableSessionRecoveryJournal::identity_reserved_intents(&self) -> impl core::iter::traits::iterator::Iterator<Item = session_orchestrator::recovery::SessionRecoveryIntent> + '_
+pub fn session_orchestrator::recovery::DurableSessionRecoveryJournal::intent_count(&self) -> usize
+pub fn session_orchestrator::recovery::DurableSessionRecoveryJournal::open(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, session_orchestrator::recovery::SessionRecoveryError>
+pub fn session_orchestrator::recovery::DurableSessionRecoveryJournal::path(&self) -> &std::path::Path
+pub const fn session_orchestrator::recovery::DurableSessionRecoveryJournal::pending(&self) -> core::option::Option<session_orchestrator::recovery::SessionRecoveryLease>
+pub fn session_orchestrator::recovery::DurableSessionRecoveryJournal::prepare(&mut self, session_orchestrator::recovery::SessionRecoveryIntent) -> core::result::Result<session_orchestrator::recovery::SessionRecoveryLease, session_orchestrator::recovery::SessionRecoveryError>
+pub struct session_orchestrator::recovery::SessionRecoveryHistory
+impl session_orchestrator::recovery::SessionRecoveryHistory
+pub const fn session_orchestrator::recovery::SessionRecoveryHistory::intent(self) -> session_orchestrator::recovery::SessionRecoveryIntent
+pub const fn session_orchestrator::recovery::SessionRecoveryHistory::stage(self) -> session_orchestrator::recovery::SessionRecoveryStage
+pub struct session_orchestrator::recovery::SessionRecoveryIntent
+impl session_orchestrator::recovery::SessionRecoveryIntent
+pub const fn session_orchestrator::recovery::SessionRecoveryIntent::config_fingerprint(self) -> firecracker_runtime::Sha256Digest
+pub fn session_orchestrator::recovery::SessionRecoveryIntent::identities(self) -> [(session_orchestrator::IdentityKind, [u8; 16]); 7]
+pub const fn session_orchestrator::recovery::SessionRecoveryIntent::identity(self) -> session_orchestrator::SessionIdentity
+pub const fn session_orchestrator::recovery::SessionRecoveryIntent::new(session_orchestrator::SessionIdentity, firecracker_runtime::Sha256Digest) -> Self
+pub struct session_orchestrator::recovery::SessionRecoveryLease
+impl session_orchestrator::recovery::SessionRecoveryLease
+pub const fn session_orchestrator::recovery::SessionRecoveryLease::intent(self) -> session_orchestrator::recovery::SessionRecoveryIntent
+pub const fn session_orchestrator::recovery::SessionRecoveryLease::stage(self) -> session_orchestrator::recovery::SessionRecoveryStage
+pub const session_orchestrator::recovery::MAX_SESSION_RECOVERY_RECORDS: usize
+pub mod session_orchestrator::session_owner
+pub enum session_orchestrator::session_owner::BrokerRuntimeStatus
+pub session_orchestrator::session_owner::BrokerRuntimeStatus::Exited
+pub session_orchestrator::session_owner::BrokerRuntimeStatus::Running
+pub enum session_orchestrator::session_owner::OwnerPollError
+pub session_orchestrator::session_owner::OwnerPollError::BrokerStatus
+pub session_orchestrator::session_owner::OwnerPollError::BrokerStatus::cleanup_error: core::option::Option<session_orchestrator::StopError>
+pub session_orchestrator::session_owner::OwnerPollError::BrokerStatus::error: session_orchestrator::BackendError
+pub session_orchestrator::session_owner::OwnerPollError::Cleanup
+pub session_orchestrator::session_owner::OwnerPollError::Cleanup::error: session_orchestrator::StopError
+pub session_orchestrator::session_owner::OwnerPollError::Cleanup::reason: session_orchestrator::session_owner::ShutdownReason
+pub session_orchestrator::session_owner::OwnerPollError::InvalidState(session_orchestrator::LifecycleState)
+impl session_orchestrator::session_owner::OwnerPollError
+pub const fn session_orchestrator::session_owner::OwnerPollError::cleanup_error(&self) -> core::option::Option<&session_orchestrator::StopError>
+pub const fn session_orchestrator::session_owner::OwnerPollError::shutdown_reason(&self) -> core::option::Option<session_orchestrator::session_owner::ShutdownReason>
+impl core::error::Error for session_orchestrator::session_owner::OwnerPollError
+pub fn session_orchestrator::session_owner::OwnerPollError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for session_orchestrator::session_owner::OwnerPollError
+pub fn session_orchestrator::session_owner::OwnerPollError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::session_owner::OwnerPollOutcome
+pub session_orchestrator::session_owner::OwnerPollOutcome::Closed(session_orchestrator::session_owner::ShutdownReason)
+pub session_orchestrator::session_owner::OwnerPollOutcome::Running(session_orchestrator::SessionInfo)
+pub enum session_orchestrator::session_owner::OwnerPollRequest
+pub session_orchestrator::session_owner::OwnerPollRequest::Continue
+pub session_orchestrator::session_owner::OwnerPollRequest::Stop
+pub enum session_orchestrator::session_owner::ShutdownReason
+pub session_orchestrator::session_owner::ShutdownReason::BrokerExited
+pub session_orchestrator::session_owner::ShutdownReason::BrokerStatusUnavailable
+pub session_orchestrator::session_owner::ShutdownReason::ExternalRequest
+pub session_orchestrator::session_owner::ShutdownReason::StartupRollback
+pub struct session_orchestrator::session_owner::SessionBackends<W, B, V, C, Work>
+impl<W, B, V, C, Work> session_orchestrator::session_owner::SessionBackends<W, B, V, C, Work>
+pub const fn session_orchestrator::session_owner::SessionBackends<W, B, V, C, Work>::new(W, B, V, C, Work) -> Self
+pub struct session_orchestrator::session_owner::SessionOwner<R, L, W, B, V, C, Work> where R: session_orchestrator::CryptographicRandom, L: session_orchestrator::IdentityLedger, W: session_orchestrator::WorkspaceBackend, B: session_orchestrator::session_owner::BrokerStatusBackend, V: session_orchestrator::VmBackend, C: session_orchestrator::CapabilityRevocationBackend, Work: session_orchestrator::WorkloadBackend
+impl<R, L, W, B, V, C, Work> session_orchestrator::session_owner::SessionOwner<R, L, W, B, V, C, Work> where R: session_orchestrator::CryptographicRandom, L: session_orchestrator::IdentityLedger, W: session_orchestrator::WorkspaceBackend, B: session_orchestrator::session_owner::BrokerStatusBackend, V: session_orchestrator::VmBackend, C: session_orchestrator::CapabilityRevocationBackend, Work: session_orchestrator::WorkloadBackend
+pub fn session_orchestrator::session_owner::SessionOwner<R, L, W, B, V, C, Work>::active_session(&self) -> core::option::Option<session_orchestrator::SessionInfo>
+pub const fn session_orchestrator::session_owner::SessionOwner<R, L, W, B, V, C, Work>::new(session_orchestrator::SessionOrchestrator<R, L>, session_orchestrator::session_owner::SessionBackends<W, B, V, C, Work>) -> Self
+pub fn session_orchestrator::session_owner::SessionOwner<R, L, W, B, V, C, Work>::poll(&mut self, session_orchestrator::session_owner::OwnerPollRequest) -> core::result::Result<session_orchestrator::session_owner::OwnerPollOutcome, session_orchestrator::session_owner::OwnerPollError>
+pub const fn session_orchestrator::session_owner::SessionOwner<R, L, W, B, V, C, Work>::shutdown_reason(&self) -> core::option::Option<session_orchestrator::session_owner::ShutdownReason>
+pub fn session_orchestrator::session_owner::SessionOwner<R, L, W, B, V, C, Work>::start<G>(&mut self, &session_orchestrator::SnapshotDescriptor, &session_orchestrator::WorkspaceTemplateId, &G) -> core::result::Result<session_orchestrator::SessionInfo, session_orchestrator::StartError> where C: session_orchestrator::CapabilityBackend<G>
+pub const fn session_orchestrator::session_owner::SessionOwner<R, L, W, B, V, C, Work>::state(&self) -> session_orchestrator::LifecycleState
+pub fn session_orchestrator::session_owner::SessionOwner<R, L, W, B, V, C, Work>::stop(&mut self) -> core::result::Result<session_orchestrator::session_owner::OwnerPollOutcome, session_orchestrator::session_owner::OwnerPollError>
+impl<R, L, W, B, V, C, Work> core::ops::drop::Drop for session_orchestrator::session_owner::SessionOwner<R, L, W, B, V, C, Work> where R: session_orchestrator::CryptographicRandom, L: session_orchestrator::IdentityLedger, W: session_orchestrator::WorkspaceBackend, B: session_orchestrator::session_owner::BrokerStatusBackend, V: session_orchestrator::VmBackend, C: session_orchestrator::CapabilityRevocationBackend, Work: session_orchestrator::WorkloadBackend
+pub fn session_orchestrator::session_owner::SessionOwner<R, L, W, B, V, C, Work>::drop(&mut self)
+pub trait session_orchestrator::session_owner::BrokerStatusBackend: session_orchestrator::BrokerBackend
+pub fn session_orchestrator::session_owner::BrokerStatusBackend::poll_broker_status(&mut self, &session_orchestrator::BrokerLease) -> core::result::Result<session_orchestrator::session_owner::BrokerRuntimeStatus, session_orchestrator::BackendError>
+impl<F, R> session_orchestrator::session_owner::BrokerStatusBackend for session_orchestrator::egress_backend::BrokerBackend<F, R> where F: session_orchestrator::egress_backend::VsockListenerFactory, R: session_orchestrator::egress_backend::BrokerRuntimeFactory<<<F as session_orchestrator::egress_backend::VsockListenerFactory>::Listener as session_orchestrator::egress_backend::BrokerServiceListener>::Stream>
+pub fn session_orchestrator::egress_backend::BrokerBackend<F, R>::poll_broker_status(&mut self, &session_orchestrator::BrokerLease) -> core::result::Result<session_orchestrator::session_owner::BrokerRuntimeStatus, session_orchestrator::BackendError>
+pub mod session_orchestrator::system_egress
+pub enum session_orchestrator::system_egress::GitHubEgressConfig
+pub session_orchestrator::system_egress::GitHubEgressConfig::Disabled
+pub session_orchestrator::system_egress::GitHubEgressConfig::Environment
+pub session_orchestrator::system_egress::GitHubEgressConfig::Environment::credential_handle: egress_broker::github::CredentialHandle
+pub session_orchestrator::system_egress::GitHubEgressConfig::Environment::installation: authority_core::github::InstallationId
+pub session_orchestrator::system_egress::GitHubEgressConfig::Environment::publish_plans: alloc::vec::Vec<session_orchestrator::system_egress::HostPublishPlanConfig>
+impl session_orchestrator::system_egress::GitHubEgressConfig
+pub const fn session_orchestrator::system_egress::GitHubEgressConfig::environment(authority_core::github::InstallationId, egress_broker::github::CredentialHandle) -> Self
+pub const fn session_orchestrator::system_egress::GitHubEgressConfig::environment_with_plans(authority_core::github::InstallationId, egress_broker::github::CredentialHandle, alloc::vec::Vec<session_orchestrator::system_egress::HostPublishPlanConfig>) -> Self
+pub struct session_orchestrator::system_egress::HostPublishPlanConfig
+impl session_orchestrator::system_egress::HostPublishPlanConfig
+pub fn session_orchestrator::system_egress::HostPublishPlanConfig::matches_authority(&self, &authority_core::github::GitHubAuthority) -> bool
+pub fn session_orchestrator::system_egress::HostPublishPlanConfig::new(egress_protocol::session::BrokerRequestId, authority_core::github::GitHubRequest, egress_broker::github::PublishBranchPlan) -> core::result::Result<Self, session_orchestrator::system_egress::PublishPlanConfigError>
+pub const fn session_orchestrator::system_egress::HostPublishPlanConfig::plan(&self) -> &egress_broker::github::PublishBranchPlan
+pub const fn session_orchestrator::system_egress::HostPublishPlanConfig::request(&self) -> &authority_core::github::GitHubRequest
+pub const fn session_orchestrator::system_egress::HostPublishPlanConfig::request_id(&self) -> egress_protocol::session::BrokerRequestId
+pub struct session_orchestrator::system_egress::PublishPlanConfigError
+impl core::error::Error for session_orchestrator::system_egress::PublishPlanConfigError
+impl core::fmt::Display for session_orchestrator::system_egress::PublishPlanConfigError
+pub fn session_orchestrator::system_egress::PublishPlanConfigError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::system_egress::SystemEgressFactory
+impl session_orchestrator::system_egress::SystemEgressFactory
+pub const fn session_orchestrator::system_egress::SystemEgressFactory::new(session_orchestrator::system_egress::GitHubEgressConfig) -> Self
+pub const fn session_orchestrator::system_egress::SystemEgressFactory::public_https_only() -> Self
+impl session_orchestrator::production_runtime::PerSessionEgressFactory for session_orchestrator::system_egress::SystemEgressFactory
+pub fn session_orchestrator::system_egress::SystemEgressFactory::prepare(&self, &session_orchestrator::production_runtime::SessionEgressRequest) -> core::result::Result<session_orchestrator::production_runtime::PreparedEgressSession, session_orchestrator::BackendError>
+pub fn session_orchestrator::system_egress::load_publish_plan_manifest(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<alloc::vec::Vec<session_orchestrator::system_egress::HostPublishPlanConfig>, alloc::string::String>
+pub fn session_orchestrator::system_egress::validate_publish_plans_for_authority(&authority_core::github::GitHubAuthority, alloc::vec::Vec<session_orchestrator::system_egress::HostPublishPlanConfig>) -> core::result::Result<alloc::vec::Vec<session_orchestrator::system_egress::HostPublishPlanConfig>, alloc::string::String>
+pub enum session_orchestrator::CleanupStage
+pub session_orchestrator::CleanupStage::BrokerClose
+pub session_orchestrator::CleanupStage::CapabilityRevoke
+pub session_orchestrator::CleanupStage::VmKill
+pub session_orchestrator::CleanupStage::WorkspaceIsolation
+pub enum session_orchestrator::IdentityKind
+pub session_orchestrator::IdentityKind::BrokerSession
+pub session_orchestrator::IdentityKind::Capability
+pub session_orchestrator::IdentityKind::Request
+pub session_orchestrator::IdentityKind::Session
+pub session_orchestrator::IdentityKind::Subject
+pub session_orchestrator::IdentityKind::Vm
+pub session_orchestrator::IdentityKind::Workspace
+impl core::fmt::Display for session_orchestrator::IdentityKind
+pub fn session_orchestrator::IdentityKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::LedgerError
+pub session_orchestrator::LedgerError::CapacityExceeded
+pub session_orchestrator::LedgerError::CapacityExceeded::max_records: u64
+pub session_orchestrator::LedgerError::CapacityExceeded::records: u64
+pub session_orchestrator::LedgerError::Corrupt
+pub session_orchestrator::LedgerError::Corrupt::offset: u64
+pub session_orchestrator::LedgerError::Corrupt::reason: alloc::string::String
+pub session_orchestrator::LedgerError::Duplicate
+pub session_orchestrator::LedgerError::Duplicate::identity: [u8; 16]
+pub session_orchestrator::LedgerError::Duplicate::kind: session_orchestrator::IdentityKind
+pub session_orchestrator::LedgerError::Io
+pub session_orchestrator::LedgerError::Io::message: alloc::string::String
+pub session_orchestrator::LedgerError::Io::operation: session_orchestrator::LedgerOperation
+pub session_orchestrator::LedgerError::Io::path: std::path::PathBuf
+pub session_orchestrator::LedgerError::LengthChanged
+pub session_orchestrator::LedgerError::LengthChanged::actual: u64
+pub session_orchestrator::LedgerError::LengthChanged::expected: u64
+pub session_orchestrator::LedgerError::LengthChanged::path: std::path::PathBuf
+pub session_orchestrator::LedgerError::Locked
+pub session_orchestrator::LedgerError::Locked::path: std::path::PathBuf
+pub session_orchestrator::LedgerError::NotRegularFile
+pub session_orchestrator::LedgerError::NotRegularFile::path: std::path::PathBuf
+pub session_orchestrator::LedgerError::PathIdentityChanged
+pub session_orchestrator::LedgerError::PathIdentityChanged::path: std::path::PathBuf
+pub session_orchestrator::LedgerError::Symlink
+pub session_orchestrator::LedgerError::Symlink::path: std::path::PathBuf
+pub session_orchestrator::LedgerError::SyncFailed
+pub session_orchestrator::LedgerError::SyncFailed::message: alloc::string::String
+pub session_orchestrator::LedgerError::SyncFailed::path: std::path::PathBuf
+pub session_orchestrator::LedgerError::Truncated
+pub session_orchestrator::LedgerError::Truncated::actual: usize
+pub session_orchestrator::LedgerError::Truncated::expected: usize
+pub session_orchestrator::LedgerError::Truncated::offset: u64
+pub session_orchestrator::LedgerError::Unavailable
+pub session_orchestrator::LedgerError::Unavailable::reason: alloc::string::String
+pub session_orchestrator::LedgerError::UnsafeParentDirectory
+pub session_orchestrator::LedgerError::UnsafeParentDirectory::path: std::path::PathBuf
+pub session_orchestrator::LedgerError::UnsafePermissions
+pub session_orchestrator::LedgerError::UnsafePermissions::mode: u32
+pub session_orchestrator::LedgerError::UnsafePermissions::path: std::path::PathBuf
+pub session_orchestrator::LedgerError::UnsupportedVersion
+pub session_orchestrator::LedgerError::UnsupportedVersion::version: u8
+pub session_orchestrator::LedgerError::WriteFailed
+pub session_orchestrator::LedgerError::WriteFailed::message: alloc::string::String
+pub session_orchestrator::LedgerError::WriteFailed::path: std::path::PathBuf
+pub session_orchestrator::LedgerError::WrongOwner
+pub session_orchestrator::LedgerError::WrongOwner::actual: u32
+pub session_orchestrator::LedgerError::WrongOwner::expected: u32
+pub session_orchestrator::LedgerError::WrongOwner::path: std::path::PathBuf
+impl core::error::Error for session_orchestrator::LedgerError
+impl core::fmt::Display for session_orchestrator::LedgerError
+pub fn session_orchestrator::LedgerError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::LedgerOperation
+pub session_orchestrator::LedgerOperation::Append
+pub session_orchestrator::LedgerOperation::DirectoryOpen
+pub session_orchestrator::LedgerOperation::DirectorySync
+pub session_orchestrator::LedgerOperation::HeaderWrite
+pub session_orchestrator::LedgerOperation::Lock
+pub session_orchestrator::LedgerOperation::Metadata
+pub session_orchestrator::LedgerOperation::Open
+pub session_orchestrator::LedgerOperation::Read
+pub session_orchestrator::LedgerOperation::Sync
+impl core::fmt::Display for session_orchestrator::LedgerOperation
+pub fn session_orchestrator::LedgerOperation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::LifecycleState
+pub session_orchestrator::LifecycleState::BrokerEstablished
+pub session_orchestrator::LifecycleState::Closed
+pub session_orchestrator::LifecycleState::Ready
+pub session_orchestrator::LifecycleState::RootCapabilityInjected
+pub session_orchestrator::LifecycleState::Running
+pub session_orchestrator::LifecycleState::Stopping
+pub session_orchestrator::LifecycleState::VmStarted
+pub session_orchestrator::LifecycleState::WorkloadReleased
+pub session_orchestrator::LifecycleState::WorkspaceCloned
+impl core::fmt::Display for session_orchestrator::LifecycleState
+pub fn session_orchestrator::LifecycleState::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::ResourceKind
+pub session_orchestrator::ResourceKind::Broker
+pub session_orchestrator::ResourceKind::Capability
+pub session_orchestrator::ResourceKind::Vm
+pub session_orchestrator::ResourceKind::Workload
+pub session_orchestrator::ResourceKind::Workspace
+pub enum session_orchestrator::StartFailure
+pub session_orchestrator::StartFailure::Backend(session_orchestrator::BackendError)
+pub session_orchestrator::StartFailure::CrossSessionLease
+pub session_orchestrator::StartFailure::CrossSessionLease::expected: session_orchestrator::SessionId
+pub session_orchestrator::StartFailure::CrossSessionLease::received: session_orchestrator::SessionId
+pub session_orchestrator::StartFailure::CrossSessionLease::resource: session_orchestrator::ResourceKind
+pub session_orchestrator::StartFailure::Entropy(session_orchestrator::EntropyError)
+pub session_orchestrator::StartFailure::IdentityReused(session_orchestrator::IdentityKind)
+pub session_orchestrator::StartFailure::InvalidState(session_orchestrator::LifecycleState)
+pub session_orchestrator::StartFailure::LeaseIdentityMismatch(session_orchestrator::ResourceKind)
+pub session_orchestrator::StartFailure::Ledger(session_orchestrator::LedgerError)
+pub session_orchestrator::StartFailure::SnapshotContainsSessionIdentity
+pub session_orchestrator::StartFailure::SnapshotContainsSessionIdentity::kind: session_orchestrator::IdentityKind
+pub session_orchestrator::StartFailure::SnapshotContainsSessionIdentity::snapshot: session_orchestrator::SnapshotId
+impl core::fmt::Display for session_orchestrator::StartFailure
+pub fn session_orchestrator::StartFailure::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::StartStage
+pub session_orchestrator::StartStage::BrokerEstablishment
+pub session_orchestrator::StartStage::IdentityAllocation
+pub session_orchestrator::StartStage::RootCapabilityInjection
+pub session_orchestrator::StartStage::SnapshotRestore
+pub session_orchestrator::StartStage::VmStart
+pub session_orchestrator::StartStage::WorkloadRelease
+pub session_orchestrator::StartStage::WorkspaceClone
+pub enum session_orchestrator::StopError
+pub session_orchestrator::StopError::Cleanup(alloc::vec::Vec<session_orchestrator::CleanupFailure>)
+pub session_orchestrator::StopError::InvalidState(session_orchestrator::LifecycleState)
+impl core::error::Error for session_orchestrator::StopError
+impl core::fmt::Display for session_orchestrator::StopError
+pub fn session_orchestrator::StopError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::BackendError
+impl session_orchestrator::BackendError
+pub fn session_orchestrator::BackendError::message(&self) -> &str
+pub fn session_orchestrator::BackendError::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::error::Error for session_orchestrator::BackendError
+impl core::fmt::Display for session_orchestrator::BackendError
+pub fn session_orchestrator::BackendError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::BrokerLease
+impl session_orchestrator::BrokerLease
+pub const fn session_orchestrator::BrokerLease::broker_session_id(&self) -> session_orchestrator::BrokerSessionId
+pub const fn session_orchestrator::BrokerLease::new(session_orchestrator::SessionId, session_orchestrator::BrokerSessionId) -> Self
+pub const fn session_orchestrator::BrokerLease::session_id(&self) -> session_orchestrator::SessionId
+pub struct session_orchestrator::BrokerSessionId(_)
+impl session_orchestrator::BrokerSessionId
+pub const fn session_orchestrator::BrokerSessionId::as_bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::BrokerSessionId::new([u8; 16]) -> Self
+impl core::fmt::Display for session_orchestrator::BrokerSessionId
+pub fn session_orchestrator::BrokerSessionId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::CapabilityId(_)
+impl session_orchestrator::CapabilityId
+pub const fn session_orchestrator::CapabilityId::as_bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::CapabilityId::new([u8; 16]) -> Self
+impl core::fmt::Display for session_orchestrator::CapabilityId
+pub fn session_orchestrator::CapabilityId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::CapabilityLease
+impl session_orchestrator::CapabilityLease
+pub const fn session_orchestrator::CapabilityLease::capability_id(&self) -> session_orchestrator::CapabilityId
+pub const fn session_orchestrator::CapabilityLease::new(session_orchestrator::SessionId, session_orchestrator::SubjectId, session_orchestrator::CapabilityId) -> Self
+pub const fn session_orchestrator::CapabilityLease::new_bound(session_orchestrator::SessionId, session_orchestrator::SubjectId, session_orchestrator::CapabilityId, authority_core::policy::AuthorityPolicyDigest) -> Self
+pub const fn session_orchestrator::CapabilityLease::policy_digest(&self) -> core::option::Option<authority_core::policy::AuthorityPolicyDigest>
+pub const fn session_orchestrator::CapabilityLease::session_id(&self) -> session_orchestrator::SessionId
+pub const fn session_orchestrator::CapabilityLease::subject_id(&self) -> session_orchestrator::SubjectId
+pub struct session_orchestrator::CleanupFailure
+impl session_orchestrator::CleanupFailure
+pub const fn session_orchestrator::CleanupFailure::error(&self) -> &session_orchestrator::BackendError
+pub const fn session_orchestrator::CleanupFailure::stage(&self) -> session_orchestrator::CleanupStage
+pub struct session_orchestrator::DurableIdentityLedger
+impl session_orchestrator::DurableIdentityLedger
+pub fn session_orchestrator::DurableIdentityLedger::committed_count(&self) -> usize
+pub fn session_orchestrator::DurableIdentityLedger::contains(&self, [u8; 16]) -> bool
+pub fn session_orchestrator::DurableIdentityLedger::open(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, session_orchestrator::LedgerError>
+pub fn session_orchestrator::DurableIdentityLedger::path(&self) -> &std::path::Path
+impl session_orchestrator::IdentityLedger for session_orchestrator::DurableIdentityLedger
+pub fn session_orchestrator::DurableIdentityLedger::reserve(&mut self, session_orchestrator::IdentityKind, [u8; 16]) -> core::result::Result<(), session_orchestrator::LedgerError>
+pub fn session_orchestrator::DurableIdentityLedger::reserve_batch(&mut self, &[(session_orchestrator::IdentityKind, [u8; 16])]) -> core::result::Result<(), session_orchestrator::LedgerError>
+pub struct session_orchestrator::EntropyError
+impl session_orchestrator::EntropyError
+pub fn session_orchestrator::EntropyError::message(&self) -> &str
+pub fn session_orchestrator::EntropyError::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::error::Error for session_orchestrator::EntropyError
+impl core::fmt::Display for session_orchestrator::EntropyError
+pub fn session_orchestrator::EntropyError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::InMemoryIdentityLedger
+impl session_orchestrator::InMemoryIdentityLedger
+pub const fn session_orchestrator::InMemoryIdentityLedger::new() -> Self
+impl session_orchestrator::IdentityLedger for session_orchestrator::InMemoryIdentityLedger
+pub fn session_orchestrator::InMemoryIdentityLedger::reserve(&mut self, session_orchestrator::IdentityKind, [u8; 16]) -> core::result::Result<(), session_orchestrator::LedgerError>
+pub fn session_orchestrator::InMemoryIdentityLedger::reserve_batch(&mut self, &[(session_orchestrator::IdentityKind, [u8; 16])]) -> core::result::Result<(), session_orchestrator::LedgerError>
+pub struct session_orchestrator::OsEntropy
+impl session_orchestrator::CryptographicRandom for session_orchestrator::OsEntropy
+pub fn session_orchestrator::OsEntropy::random_128(&mut self) -> core::result::Result<[u8; 16], session_orchestrator::EntropyError>
+pub struct session_orchestrator::RequestId(_)
+impl session_orchestrator::RequestId
+pub const fn session_orchestrator::RequestId::as_bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::RequestId::new([u8; 16]) -> Self
+impl core::fmt::Display for session_orchestrator::RequestId
+pub fn session_orchestrator::RequestId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::SessionId(_)
+impl session_orchestrator::SessionId
+pub const fn session_orchestrator::SessionId::as_bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::SessionId::new([u8; 16]) -> Self
+impl core::fmt::Display for session_orchestrator::SessionId
+pub fn session_orchestrator::SessionId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::SessionIdentity
+impl session_orchestrator::SessionIdentity
+pub const fn session_orchestrator::SessionIdentity::broker_session_id(self) -> session_orchestrator::BrokerSessionId
+pub const fn session_orchestrator::SessionIdentity::capability_id(self) -> session_orchestrator::CapabilityId
+pub const fn session_orchestrator::SessionIdentity::request_id(self) -> session_orchestrator::RequestId
+pub const fn session_orchestrator::SessionIdentity::session_id(self) -> session_orchestrator::SessionId
+pub const fn session_orchestrator::SessionIdentity::subject_id(self) -> session_orchestrator::SubjectId
+pub const fn session_orchestrator::SessionIdentity::vm_id(self) -> session_orchestrator::VmId
+pub const fn session_orchestrator::SessionIdentity::workspace_id(self) -> session_orchestrator::WorkspaceId
+pub struct session_orchestrator::SessionInfo
+impl session_orchestrator::SessionInfo
+pub const fn session_orchestrator::SessionInfo::identity(self) -> session_orchestrator::SessionIdentity
+pub struct session_orchestrator::SessionOrchestrator<R, L>
+impl<R, L> session_orchestrator::SessionOrchestrator<R, L> where R: session_orchestrator::CryptographicRandom, L: session_orchestrator::IdentityLedger
+pub fn session_orchestrator::SessionOrchestrator<R, L>::start_session<W, B, V, C, Work, G>(&mut self, &session_orchestrator::SnapshotDescriptor, &session_orchestrator::WorkspaceTemplateId, &G, &mut W, &mut B, &mut V, &mut C, &mut Work) -> core::result::Result<session_orchestrator::SessionInfo, session_orchestrator::StartError> where W: session_orchestrator::WorkspaceBackend, B: session_orchestrator::BrokerBackend, V: session_orchestrator::VmBackend, C: session_orchestrator::CapabilityBackend<G>, Work: session_orchestrator::WorkloadBackend
+pub fn session_orchestrator::SessionOrchestrator<R, L>::stop_session<W, B, V, C>(&mut self, &mut W, &mut B, &mut V, &mut C) -> core::result::Result<(), session_orchestrator::StopError> where W: session_orchestrator::WorkspaceBackend, B: session_orchestrator::BrokerBackend, V: session_orchestrator::VmBackend, C: session_orchestrator::CapabilityRevocationBackend
+impl<R, L> session_orchestrator::SessionOrchestrator<R, L>
+pub fn session_orchestrator::SessionOrchestrator<R, L>::active_broker_lease(&self) -> core::option::Option<&session_orchestrator::BrokerLease>
+pub fn session_orchestrator::SessionOrchestrator<R, L>::active_session(&self) -> core::option::Option<session_orchestrator::SessionInfo>
+pub const fn session_orchestrator::SessionOrchestrator<R, L>::state(&self) -> session_orchestrator::LifecycleState
+pub fn session_orchestrator::SessionOrchestrator<R, L>::with_ledger(R, L) -> Self
+impl<R> session_orchestrator::SessionOrchestrator<R, session_orchestrator::DurableIdentityLedger>
+pub fn session_orchestrator::SessionOrchestrator<R, session_orchestrator::DurableIdentityLedger>::new_durable(R, impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, session_orchestrator::LedgerError>
+impl<R> session_orchestrator::SessionOrchestrator<R, session_orchestrator::InMemoryIdentityLedger>
+pub const fn session_orchestrator::SessionOrchestrator<R, session_orchestrator::InMemoryIdentityLedger>::new(R) -> Self
+pub struct session_orchestrator::SnapshotDescriptor
+impl session_orchestrator::SnapshotDescriptor
+pub const fn session_orchestrator::SnapshotDescriptor::clean(session_orchestrator::SnapshotId) -> Self
+pub fn session_orchestrator::SnapshotDescriptor::inherited_ids(&self) -> &[session_orchestrator::SnapshotIdentity]
+pub const fn session_orchestrator::SnapshotDescriptor::snapshot_id(&self) -> session_orchestrator::SnapshotId
+pub fn session_orchestrator::SnapshotDescriptor::with_inherited_ids(session_orchestrator::SnapshotId, impl core::iter::traits::collect::IntoIterator<Item = session_orchestrator::SnapshotIdentity>) -> Self
+pub struct session_orchestrator::SnapshotId(_)
+impl session_orchestrator::SnapshotId
+pub const fn session_orchestrator::SnapshotId::as_bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::SnapshotId::new([u8; 16]) -> Self
+impl core::fmt::Display for session_orchestrator::SnapshotId
+pub fn session_orchestrator::SnapshotId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::SnapshotIdentity
+impl session_orchestrator::SnapshotIdentity
+pub const fn session_orchestrator::SnapshotIdentity::bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::SnapshotIdentity::kind(self) -> session_orchestrator::IdentityKind
+pub const fn session_orchestrator::SnapshotIdentity::new(session_orchestrator::IdentityKind, [u8; 16]) -> Self
+pub struct session_orchestrator::StartError
+impl session_orchestrator::StartError
+pub const fn session_orchestrator::StartError::failure(&self) -> &session_orchestrator::StartFailure
+pub fn session_orchestrator::StartError::rollback_failures(&self) -> &[session_orchestrator::CleanupFailure]
+pub const fn session_orchestrator::StartError::stage(&self) -> session_orchestrator::StartStage
+impl core::error::Error for session_orchestrator::StartError
+impl core::fmt::Display for session_orchestrator::StartError
+pub fn session_orchestrator::StartError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::SubjectId(_)
+impl session_orchestrator::SubjectId
+pub const fn session_orchestrator::SubjectId::as_bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::SubjectId::new([u8; 16]) -> Self
+impl core::fmt::Display for session_orchestrator::SubjectId
+pub fn session_orchestrator::SubjectId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::VmId(_)
+impl session_orchestrator::VmId
+pub const fn session_orchestrator::VmId::as_bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::VmId::new([u8; 16]) -> Self
+impl core::fmt::Display for session_orchestrator::VmId
+pub fn session_orchestrator::VmId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::VmLease
+impl session_orchestrator::VmLease
+pub const fn session_orchestrator::VmLease::broker_session_id(&self) -> session_orchestrator::BrokerSessionId
+pub const fn session_orchestrator::VmLease::new(session_orchestrator::SessionId, session_orchestrator::VmId, session_orchestrator::WorkspaceId, session_orchestrator::BrokerSessionId) -> Self
+pub const fn session_orchestrator::VmLease::session_id(&self) -> session_orchestrator::SessionId
+pub const fn session_orchestrator::VmLease::vm_id(&self) -> session_orchestrator::VmId
+pub const fn session_orchestrator::VmLease::workspace_id(&self) -> session_orchestrator::WorkspaceId
+pub struct session_orchestrator::WorkloadLease
+impl session_orchestrator::WorkloadLease
+pub const fn session_orchestrator::WorkloadLease::capability_id(&self) -> session_orchestrator::CapabilityId
+pub const fn session_orchestrator::WorkloadLease::new(session_orchestrator::SessionId, session_orchestrator::VmId, session_orchestrator::SubjectId, session_orchestrator::CapabilityId) -> Self
+pub const fn session_orchestrator::WorkloadLease::session_id(&self) -> session_orchestrator::SessionId
+pub const fn session_orchestrator::WorkloadLease::subject_id(&self) -> session_orchestrator::SubjectId
+pub const fn session_orchestrator::WorkloadLease::vm_id(&self) -> session_orchestrator::VmId
+pub struct session_orchestrator::WorkspaceId(_)
+impl session_orchestrator::WorkspaceId
+pub const fn session_orchestrator::WorkspaceId::as_bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::WorkspaceId::new([u8; 16]) -> Self
+impl core::fmt::Display for session_orchestrator::WorkspaceId
+pub fn session_orchestrator::WorkspaceId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::WorkspaceLease
+impl session_orchestrator::WorkspaceLease
+pub const fn session_orchestrator::WorkspaceLease::new(session_orchestrator::SessionId, session_orchestrator::WorkspaceId) -> Self
+pub const fn session_orchestrator::WorkspaceLease::session_id(&self) -> session_orchestrator::SessionId
+pub const fn session_orchestrator::WorkspaceLease::workspace_id(&self) -> session_orchestrator::WorkspaceId
+pub struct session_orchestrator::WorkspaceTemplateId(_)
+impl session_orchestrator::WorkspaceTemplateId
+pub fn session_orchestrator::WorkspaceTemplateId::as_str(&self) -> &str
+pub fn session_orchestrator::WorkspaceTemplateId::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub const session_orchestrator::ID_BYTES: usize
+pub const session_orchestrator::MAX_LEDGER_RECORDS: usize
+pub trait session_orchestrator::BrokerBackend
+pub fn session_orchestrator::BrokerBackend::close_broker_session(&mut self, &session_orchestrator::BrokerLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::BrokerBackend::ensure_broker_session_running(&mut self, &session_orchestrator::BrokerLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::BrokerBackend::establish_broker_session(&mut self, &session_orchestrator::SessionIdentity) -> core::result::Result<session_orchestrator::BrokerLease, session_orchestrator::BackendError>
+impl<F, R> session_orchestrator::BrokerBackend for session_orchestrator::egress_backend::BrokerBackend<F, R> where F: session_orchestrator::egress_backend::VsockListenerFactory, R: session_orchestrator::egress_backend::BrokerRuntimeFactory<<<F as session_orchestrator::egress_backend::VsockListenerFactory>::Listener as session_orchestrator::egress_backend::BrokerServiceListener>::Stream>
+pub fn session_orchestrator::egress_backend::BrokerBackend<F, R>::close_broker_session(&mut self, &session_orchestrator::BrokerLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::egress_backend::BrokerBackend<F, R>::ensure_broker_session_running(&mut self, &session_orchestrator::BrokerLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::egress_backend::BrokerBackend<F, R>::establish_broker_session(&mut self, &session_orchestrator::SessionIdentity) -> core::result::Result<session_orchestrator::BrokerLease, session_orchestrator::BackendError>
+pub trait session_orchestrator::CapabilityBackend<G>: session_orchestrator::CapabilityRevocationBackend
+pub fn session_orchestrator::CapabilityBackend::inject_root_capability(&mut self, &session_orchestrator::SessionIdentity, &G) -> core::result::Result<session_orchestrator::CapabilityLease, session_orchestrator::BackendError>
+impl session_orchestrator::CapabilityBackend<session_orchestrator::authority_backend::AuthorityRootGrant> for session_orchestrator::authority_backend::AuthorityCoreBackend
+pub fn session_orchestrator::authority_backend::AuthorityCoreBackend::inject_root_capability(&mut self, &session_orchestrator::SessionIdentity, &session_orchestrator::authority_backend::AuthorityRootGrant) -> core::result::Result<session_orchestrator::CapabilityLease, session_orchestrator::BackendError>
+pub trait session_orchestrator::CapabilityRevocationBackend
+pub fn session_orchestrator::CapabilityRevocationBackend::revoke_root_capability(&mut self, &session_orchestrator::CapabilityLease) -> core::result::Result<(), session_orchestrator::BackendError>
+impl session_orchestrator::CapabilityRevocationBackend for session_orchestrator::authority_backend::AuthorityCoreBackend
+pub fn session_orchestrator::authority_backend::AuthorityCoreBackend::revoke_root_capability(&mut self, &session_orchestrator::CapabilityLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub trait session_orchestrator::CryptographicRandom
+pub fn session_orchestrator::CryptographicRandom::random_128(&mut self) -> core::result::Result<[u8; 16], session_orchestrator::EntropyError>
+impl session_orchestrator::CryptographicRandom for session_orchestrator::OsEntropy
+pub fn session_orchestrator::OsEntropy::random_128(&mut self) -> core::result::Result<[u8; 16], session_orchestrator::EntropyError>
+pub trait session_orchestrator::IdentityLedger
+pub fn session_orchestrator::IdentityLedger::reserve(&mut self, session_orchestrator::IdentityKind, [u8; 16]) -> core::result::Result<(), session_orchestrator::LedgerError>
+pub fn session_orchestrator::IdentityLedger::reserve_batch(&mut self, &[(session_orchestrator::IdentityKind, [u8; 16])]) -> core::result::Result<(), session_orchestrator::LedgerError>
+impl session_orchestrator::IdentityLedger for session_orchestrator::DurableIdentityLedger
+pub fn session_orchestrator::DurableIdentityLedger::reserve(&mut self, session_orchestrator::IdentityKind, [u8; 16]) -> core::result::Result<(), session_orchestrator::LedgerError>
+pub fn session_orchestrator::DurableIdentityLedger::reserve_batch(&mut self, &[(session_orchestrator::IdentityKind, [u8; 16])]) -> core::result::Result<(), session_orchestrator::LedgerError>
+impl session_orchestrator::IdentityLedger for session_orchestrator::InMemoryIdentityLedger
+pub fn session_orchestrator::InMemoryIdentityLedger::reserve(&mut self, session_orchestrator::IdentityKind, [u8; 16]) -> core::result::Result<(), session_orchestrator::LedgerError>
+pub fn session_orchestrator::InMemoryIdentityLedger::reserve_batch(&mut self, &[(session_orchestrator::IdentityKind, [u8; 16])]) -> core::result::Result<(), session_orchestrator::LedgerError>
+pub trait session_orchestrator::VmBackend
+pub fn session_orchestrator::VmBackend::cleanup_failed_start(&mut self) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::VmBackend::kill_vm(&mut self, &session_orchestrator::VmLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::VmBackend::start_vm(&mut self, &session_orchestrator::SnapshotDescriptor, &session_orchestrator::SessionIdentity, &session_orchestrator::WorkspaceLease, &session_orchestrator::BrokerLease) -> core::result::Result<session_orchestrator::VmLease, session_orchestrator::BackendError>
+impl<C, F, A, G, I> session_orchestrator::VmBackend for session_orchestrator::firecracker_backend::FirecrackerVmBackend<C, F, A, G, I> where C: firecracker_runtime::CommandRunner, F: firecracker_runtime::FileSystem, A: firecracker_runtime::ApiClient, G: firecracker_runtime::ApiClient, I: firecracker_runtime::IdentitySource
+pub fn session_orchestrator::firecracker_backend::FirecrackerVmBackend<C, F, A, G, I>::cleanup_failed_start(&mut self) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::firecracker_backend::FirecrackerVmBackend<C, F, A, G, I>::kill_vm(&mut self, &session_orchestrator::VmLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub fn session_orchestrator::firecracker_backend::FirecrackerVmBackend<C, F, A, G, I>::start_vm(&mut self, &session_orchestrator::SnapshotDescriptor, &session_orchestrator::SessionIdentity, &session_orchestrator::WorkspaceLease, &session_orchestrator::BrokerLease) -> core::result::Result<session_orchestrator::VmLease, session_orchestrator::BackendError>
+pub trait session_orchestrator::WorkloadBackend
+pub fn session_orchestrator::WorkloadBackend::release_workload(&mut self, &session_orchestrator::SessionIdentity, &session_orchestrator::VmLease, &session_orchestrator::CapabilityLease) -> core::result::Result<session_orchestrator::WorkloadLease, session_orchestrator::BackendError>
+impl<C, F, A, G, I> session_orchestrator::WorkloadBackend for session_orchestrator::firecracker_backend::FirecrackerWorkloadBackend<C, F, A, G, I> where C: firecracker_runtime::CommandRunner, F: firecracker_runtime::FileSystem, A: firecracker_runtime::ApiClient, G: firecracker_runtime::ApiClient, I: firecracker_runtime::IdentitySource
+pub fn session_orchestrator::firecracker_backend::FirecrackerWorkloadBackend<C, F, A, G, I>::release_workload(&mut self, &session_orchestrator::SessionIdentity, &session_orchestrator::VmLease, &session_orchestrator::CapabilityLease) -> core::result::Result<session_orchestrator::WorkloadLease, session_orchestrator::BackendError>
+pub trait session_orchestrator::WorkspaceBackend
+pub fn session_orchestrator::WorkspaceBackend::clone_workspace(&mut self, &session_orchestrator::SessionIdentity, &session_orchestrator::WorkspaceTemplateId) -> core::result::Result<session_orchestrator::WorkspaceLease, session_orchestrator::BackendError>
+pub fn session_orchestrator::WorkspaceBackend::isolate_workspace(&mut self, &session_orchestrator::WorkspaceLease) -> core::result::Result<(), session_orchestrator::BackendError>
+impl<F> session_orchestrator::WorkspaceBackend for session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackend<F> where F: firecracker_runtime::FileSystem
+pub fn session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackend<F>::clone_workspace(&mut self, &session_orchestrator::SessionIdentity, &session_orchestrator::WorkspaceTemplateId) -> core::result::Result<session_orchestrator::WorkspaceLease, session_orchestrator::BackendError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerWorkspaceBackend<F>::isolate_workspace(&mut self, &session_orchestrator::WorkspaceLease) -> core::result::Result<(), session_orchestrator::BackendError>
+pub type session_orchestrator::FileIdentityLedger = session_orchestrator::DurableIdentityLedger

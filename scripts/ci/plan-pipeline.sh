@@ -121,8 +121,8 @@ resolve_tier() {
   esac
 
   case "${event}" in
-    schedule | workflow_dispatch) printf 'deep' ;;
-    pull_request | push | merge_group | tag | web | api) printf 'standard' ;;
+    schedule | workflow_dispatch | web | api) printf 'deep' ;;
+    pull_request | push | merge_group | tag) printf 'standard' ;;
     *) printf 'deep' ;;
   esac
 }
@@ -206,6 +206,18 @@ scope_matched() {
   return 1
 }
 
+event_allowed() {
+  local allowed_events="$1" allowed_event
+  [[ -z "${allowed_events}" ]] && return 0
+  IFS=',' read -r -a allowed_event_list <<< "${allowed_events}"
+  for allowed_event in "${allowed_event_list[@]}"; do
+    if [[ "${event}" == "${allowed_event}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 stage_selected() {
   local stage="$1"
   [[ -n "${stage_filter}" ]] || return 0
@@ -257,10 +269,16 @@ unavailable_gates=()
 planned_gates=()
 gate_entries=()
 
-while IFS='|' read -r gate_id gate_stage gate_tier gate_scopes github_job gitlab_job gate_status gate_workflow; do
+while IFS='|' read -r gate_id gate_stage gate_tier gate_scopes github_job gitlab_job gate_status gate_workflow gate_events; do
   [[ -n "${gate_id}" ]] || continue
   stage_selected "${gate_stage}" || continue
-  if [[ -n "${workflow_filter}" && "${gate_workflow}" != "${workflow_filter}" ]]; then
+  # Planned gates deliberately have no workflow/include: that is the topology
+  # assertion that no platform job exists yet. Keep them in a filtered plan so
+  # the plan and fan-in report the unbuilt boundary instead of dropping it from
+  # the evidence document entirely. Implemented gates remain restricted to the
+  # workflow that owns their job.
+  if [[ -n "${workflow_filter}" && "${gate_workflow}" != "${workflow_filter}" \
+    && "${gate_status}" != 'planned' ]]; then
     continue
   fi
 
@@ -287,6 +305,9 @@ while IFS='|' read -r gate_id gate_stage gate_tier gate_scopes github_job gitlab
   elif ! scope_matched "${gate_scopes}"; then
     status='skipped'
     skipped_gates+=("${gate_id}")
+  elif ! event_allowed "${gate_events}"; then
+    status='skipped'
+    skipped_gates+=("${gate_id}")
   else
     status='required'
     required_gates+=("${gate_id}")
@@ -294,7 +315,7 @@ while IFS='|' read -r gate_id gate_stage gate_tier gate_scopes github_job gitlab
 
   gate_entries+=("\"${gate_id}\":\"${status}\"")
 done < <(yq eval \
-  '.gates[] | [.id, .stage, .tier, (.scopes | join(",")), (.github // "null"), (.gitlab // "null"), (.status // "null"), (.workflow // "null")] | join("|")' \
+  '.gates[] | [.id, .stage, .tier, (.scopes | join(",")), (.github // "null"), (.gitlab // "null"), (.status // "null"), (.workflow // "null"), (.events // [] | join(","))] | join("|")' \
   "${manifest}")
 
 join_json_array() {

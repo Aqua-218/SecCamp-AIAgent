@@ -1,0 +1,3 @@
+# benchmark-name baseline-nanoseconds threshold-percent noise-floor-nanoseconds
+capability_check/commit 650 25 100
+capability_check/observe 160 25 50

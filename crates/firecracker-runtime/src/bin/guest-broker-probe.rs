@@ -9,9 +9,11 @@
 
 use std::{
     env,
-    fs::File,
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
+    os::unix::fs::{PermissionsExt, symlink},
+    path::Path,
 };
 
 use authority_core::http::{CanonicalHost, CanonicalUrlPath, HttpFetchMethod, HttpFetchRequest};
@@ -32,6 +34,8 @@ const EGRESS_BROKER_SESSION_ENV: &str = "EGRESS_BROKER_SESSION_ID";
 const SUPERVISOR_READINESS_ENV: &str = "GUEST_SUPERVISOR_READINESS";
 const SUPERVISOR_READINESS_REQUIRED: &str = "1";
 const SUPERVISOR_READY_MARKER: &[u8; 25] = b"guest-supervisor-ready/v1";
+const CAPFS_MOUNTPOINT_ENV: &str = "CAPFS_MOUNTPOINT";
+const CAPFS_MOUNTPOINT: &str = "/workspace";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Transport {
@@ -55,6 +59,7 @@ fn run() -> Result<(), String> {
         &mut io::stdout().lock(),
     )?;
     let transport = parse_transport(env::args().skip(1))?;
+    exercise_capfs_if_present()?;
     let session = match transport {
         Transport::Inherited => broker_session_from_environment()?,
         Transport::DirectVsock(_) => PROBE_SESSION,
@@ -80,6 +85,78 @@ fn run() -> Result<(), String> {
             "host did not return the expected detail-free authorization rejection".to_owned(),
         );
     }
+    Ok(())
+}
+
+fn exercise_capfs_if_present() -> Result<(), String> {
+    let Some(mountpoint) = env::var_os(CAPFS_MOUNTPOINT_ENV) else {
+        return Ok(());
+    };
+    if mountpoint != CAPFS_MOUNTPOINT {
+        return Err(format!(
+            "{CAPFS_MOUNTPOINT_ENV} must be the fixed isolated mountpoint {CAPFS_MOUNTPOINT}"
+        ));
+    }
+    exercise_all_capfs_effects(Path::new(CAPFS_MOUNTPOINT))
+}
+
+fn exercise_all_capfs_effects(root: &Path) -> Result<(), String> {
+    fs::read_dir(root)
+        .map_err(|error| format!("listing the fixed CapFS root: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("reading a fixed CapFS directory entry: {error}"))?;
+
+    let directory = root.join(".capfs-vm-effect-probe");
+    let created = directory.join("created.txt");
+    let hard_link = directory.join("hard-link.txt");
+    let renamed = directory.join("renamed-hard-link.txt");
+    let symbolic_link = directory.join("symbolic-link.txt");
+
+    fs::create_dir(&directory)
+        .map_err(|error| format!("creating a directory through CapFS: {error}"))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&created)
+        .map_err(|error| format!("creating a file through CapFS: {error}"))?;
+    file.write_all(b"capfs-vm-all-effects")
+        .map_err(|error| format!("writing file data through CapFS: {error}"))?;
+    drop(file);
+    fs::set_permissions(&created, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("setting metadata through CapFS: {error}"))?;
+    fs::hard_link(&created, &hard_link)
+        .map_err(|error| format!("creating a hard link through CapFS: {error}"))?;
+    symlink("created.txt", &symbolic_link)
+        .map_err(|error| format!("creating a symbolic link through CapFS: {error}"))?;
+    if fs::read_link(&symbolic_link)
+        .map_err(|error| format!("reading a symbolic link through CapFS: {error}"))?
+        != Path::new("created.txt")
+    {
+        return Err("CapFS symbolic-link target changed".to_owned());
+    }
+    fs::rename(&hard_link, &renamed).map_err(|error| format!("renaming through CapFS: {error}"))?;
+    OpenOptions::new()
+        .write(true)
+        .open(&created)
+        .and_then(|file| file.set_len(0))
+        .map_err(|error| format!("truncating through CapFS: {error}"))?;
+    OpenOptions::new()
+        .write(true)
+        .open(&created)
+        .and_then(|mut file| file.write_all(b"rewritten"))
+        .map_err(|error| format!("rewriting file data through CapFS: {error}"))?;
+    if fs::read(&created).map_err(|error| format!("reading data through CapFS: {error}"))?
+        != b"rewritten"
+    {
+        return Err("CapFS returned unexpected rewritten data".to_owned());
+    }
+    fs::remove_file(&symbolic_link)
+        .map_err(|error| format!("removing a symbolic link through CapFS: {error}"))?;
+    fs::remove_file(&renamed)
+        .map_err(|error| format!("removing a hard link through CapFS: {error}"))?;
+    fs::remove_file(&created).map_err(|error| format!("removing a file through CapFS: {error}"))?;
+    fs::remove_dir(&directory)
+        .map_err(|error| format!("removing a directory through CapFS: {error}"))?;
     Ok(())
 }
 
@@ -192,7 +269,10 @@ fn usage() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SUPERVISOR_READY_MARKER, Transport, parse_transport, signal_supervisor_readiness};
+    use super::{
+        SUPERVISOR_READY_MARKER, Transport, exercise_all_capfs_effects, parse_transport,
+        signal_supervisor_readiness,
+    };
 
     #[test]
     fn accepts_one_explicit_non_wildcard_port() {
@@ -245,5 +325,18 @@ mod tests {
             assert!(signal_supervisor_readiness(Some(requirement), &mut output).is_err());
             assert!(output.is_empty());
         }
+    }
+
+    #[test]
+    fn fixed_capfs_probe_exercises_and_cleans_its_complete_effect_sequence() {
+        let root = tempfile::tempdir().expect("test directory must be creatable");
+        exercise_all_capfs_effects(root.path()).expect("all host filesystem operations must work");
+        assert!(
+            root.path()
+                .read_dir()
+                .expect("test root must remain readable")
+                .next()
+                .is_none()
+        );
     }
 }

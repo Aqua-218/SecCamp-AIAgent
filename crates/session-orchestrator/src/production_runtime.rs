@@ -15,6 +15,9 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+
 use authority_core::{
     capability::IssuerId,
     durable_audit::{DurableAuditError, DurableAuditLog},
@@ -26,6 +29,7 @@ use egress_broker::{
     dispatch::{BrokerDispatcher, DispatchContext, PublicDispatchAdapter},
     durable::DurableSessionConfig,
     github::GitHubAdapter,
+    transport::DeadlineStream,
 };
 use egress_protocol::{
     budget::SessionBudgetLimits, session::BrokerSessionId as WireBrokerSessionId,
@@ -1752,7 +1756,7 @@ struct ProductionBrokerRuntimeFactory {
 
 impl<S> BrokerRuntimeFactory<S> for ProductionBrokerRuntimeFactory
 where
-    S: Read + Write + Send + 'static,
+    S: DeadlineStream + Send + 'static,
 {
     type Runtime = BuiltBrokerRuntime<Box<dyn FnMut() -> MonotonicTime + Send>>;
 
@@ -1799,19 +1803,27 @@ where
                 self.limits.budget_concurrent,
             ),
         );
-        let dispatcher = BrokerDispatcher::new_durable(
+        let dispatcher = match BrokerDispatcher::new_durable(
             self.authority.broker_executor(),
             prepared.public_adapter,
             prepared.github_adapter,
             durable_config,
             self.limits.github_response_cap,
             &wal_path,
-        )
-        .map_err(|error| {
-            BackendError::new(format!(
-                "host-owned durable Broker dispatcher creation failed: {error}"
-            ))
-        })?;
+        ) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => {
+                let cleanup = remove_unstarted_broker_wal(&wal_path);
+                return Err(BackendError::new(match cleanup {
+                    Ok(()) => {
+                        format!("host-owned durable Broker dispatcher creation failed: {error}")
+                    }
+                    Err(cleanup) => format!(
+                        "host-owned durable Broker dispatcher creation failed: {error}; removing its unleased WAL also failed: {cleanup}"
+                    ),
+                }));
+            }
+        };
         Ok(BuiltBrokerRuntime::new(
             Box::new(dispatcher),
             context,
@@ -1819,6 +1831,51 @@ where
             self.limits.max_connection_requests,
         ))
     }
+
+    fn discard_unstarted(&self, identity: &SessionIdentity) -> Result<(), BackendError> {
+        remove_unstarted_broker_wal(
+            &self
+                .wal_root
+                .join(format!("{}.wal", identity.broker_session_id())),
+        )
+    }
+}
+
+fn remove_unstarted_broker_wal(path: &Path) -> Result<(), BackendError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(BackendError::new(format!(
+                "cannot inspect unstarted Broker WAL {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    #[cfg(unix)]
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.nlink() != 1
+        || (metadata.uid() != 0 && metadata.uid() != rustix::process::geteuid().as_raw())
+    {
+        return Err(BackendError::new(format!(
+            "unstarted Broker WAL ownership is ambiguous and will not be removed: {}",
+            path.display()
+        )));
+    }
+    #[cfg(not(unix))]
+    if !metadata.is_file() {
+        return Err(BackendError::new(format!(
+            "unstarted Broker WAL is not a regular file: {}",
+            path.display()
+        )));
+    }
+    fs::remove_file(path).map_err(|error| {
+        BackendError::new(format!(
+            "cannot remove unstarted Broker WAL {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 /// Attaches capability state to the configured authority journal.

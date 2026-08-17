@@ -6,7 +6,7 @@
 
 設計上の判断と現在の実装は別々に書いてある。「なぜこの構造か」を知りたいときは[設計書](design/README.md)、「なぜ別の案を採らなかったか」は[決定記録](decisions/README.md)、「今どこまで実装され、どこから未検証か」は各 crate の文書を読む。
 
-**mock test の成功を、実機動作の根拠にしない。** コードと API が存在すること、mock / contract test が通ること、特権操作や外部サービスを含む実機検証を行ったことは、各 crate の検証対応表で区別して書く。VM 実起動と full isolation はまだ達成していない。
+**mock test の成功を、実機動作の根拠にしない。** コードと API が存在すること、mock / contract test が通ること、特権操作や外部サービスを含む実機検証を行ったことは、各 crate の検証対応表で区別して書く。v2 identity gate と guest composition の VM 実起動は検証済みだが、production `Runtime::launch` の jailer/snapshot lifecycle と full isolation は未検証である。
 
 ## 文書の地図
 

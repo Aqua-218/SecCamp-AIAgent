@@ -189,7 +189,7 @@ supervisor は、事前検証を始める前から `capfs` の稼働終了まで
 
 現在は、[`runtime.rs`](../../crates/capfs/src/runtime.rs)と[`read_only.rs`](../../crates/capfs/src/read_only.rs)がroot fdからのruntime metadata、open、read、positioned write、metadata mutation、exclusive create、remove、no-replace renameをFUSE opcodeとCapability guardへ接続している。createはlive parent directory fdから`openat2(O_EXCL)`または`mkdirat`を行い、`fchmod`と`statx`の再検証が終わるまでnamespaceを公開しない。removeはlive parent fdから検証済みchildへ`unlinkat`し、renameは両parentとsubtree全objectを検証してから`renameat2(RENAME_NOREPLACE)`を実行する。modeとatime/mtimeは検証済みmetadata fdへ`fchmod`または`futimens`する。read / write / mutationごとにadapterが現在pathを再認可し、runtimeはそのguardの内側でのみfd-relative I/Oを行う。実装内容は[Direct-I/O FUSE adapter](read-only-fuse.md)を参照する。
 
-まだ実装していないのは、実 FUSE mount 上のrename / write競合、mount越境、敵対的なbacking差し替えtestである。加えて、supervisorがbacking treeを非信頼processから隔離する実行基盤なしに、host上の任意のprocessをこのFUSE adapterだけで止めることはできない。
+実FUSE mount上のbounded mutation／revoke競合、nested mount越境、regular file／symlinkの敵対的backing差し替えは回帰testがある。未検証なのは無制限の連続race、全scheduler interleaving、全mount topologyである。また、このFUSE adapter単体でhost上の任意processを止めるものではなく、productionではguest／runtime isolationがbacking treeへの別経路を閉じる。
 
 したがってfile operationは起動時検査から実I/Oまで接続されたが、「全 workload syscall が認可を通る」隔離境界はruntime-isolationを含めて完成する。
 

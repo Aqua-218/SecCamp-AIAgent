@@ -128,6 +128,21 @@ case "${command_name}" in
   privileged-isolation)
     scripts/ci/verify-privileged-isolation.sh
     ;;
+  real-capfs)
+    scripts/ci/verify-real-capfs.sh
+    ;;
+  real-runtime-lifecycle)
+    scripts/ci/verify-real-runtime-lifecycle.sh
+    ;;
+  post-exec-isolation)
+    scripts/ci/verify-post-exec-isolation.sh
+    ;;
+  real-public-https)
+    scripts/ci/verify-real-public-https.sh
+    ;;
+  live-github)
+    scripts/ci/verify-live-github.sh
+    ;;
   repository-policy)
     scripts/ci/check-adr-index.sh
     scripts/ci/check-verification-traceability.sh

@@ -27,13 +27,14 @@ capfs はこの repository で最も実環境に近い test を持つ。実 dire
 | 同じ `ImportedRepository` を clone した複数 mount が同じ root fd を保持し、片方の open count をもう片方から観測・close できる |
 | preflight 失敗時に部分的な namespace 所有型を返さない |
 
-mount ID の相違と、Linux が返しうる全 unsupported object kind の分類は module 内 test が直接検査する。**実 nested mount の作成には mount namespace の権限が要るため、通常の unit test は metadata 判定までしか固定していない。**
+mount ID の相違と、Linux が返しうる全 unsupported object kind の分類は module 内 test が直接検査する。さらに required FUSE gate では backing 配下へ実 FUSE mount を重ね、二度目の preflight が nested mount を拒否することを確認する。通常の hosted unit test は metadata 判定までで、実 nested mount の証拠は gate 側だけに置く。
 
 ### runtime の I/O 境界（実 filesystem）
 
 | 境界 | test |
 |---|---|
 | preflight 後に差し替えられた symlink を open が拒否 | `runtime_open_rejects_a_symlink_substituted_after_preflight` |
+| preflight 後に同じ kind の別 inode へ regular file / directory を差し替えても runtime が拒否 | `runtime_open_rejects_a_same_kind_inode_replacement_after_preflight`, `runtime_directory_metadata_rejects_a_same_kind_replacement_after_preflight` |
 | create が既存 symlink を辿らない | `runtime_create_does_not_follow_an_existing_target_symlink` |
 | preflight 後に追加された hard link を metadata が拒否 | `runtime_metadata_rejects_a_hard_link_added_after_preflight` |
 | 同じく remove が拒否 | `runtime_remove_rejects_hard_link_introduced_after_preflight` |
@@ -52,12 +53,17 @@ mount ID の相違と、Linux が返しうる全 unsupported object kind の分�
 | positioned write が未書き込み部分を保つ | `runtime_positioned_write_preserves_unwritten_file_content` |
 | NOREPLACE rename の失敗が backing も namespace も変えない | `failed_no_replace_rename_leaves_backing_and_namespace_unchanged` |
 | create 後の検証失敗が、namespace rollback の前に backing entry を削除する | `post_create_failure_removes_backing_entry_before_namespace_rollback` |
+| remove 後に同じ path を fresh inode へ再作成でき、path identity registry が stale にならない | `runtime_remove_then_recreate_rebinds_the_path_identity` |
+| runtime / preflight が `MNT_ID` 不在の metadata mask を fail closed で拒否 | `runtime_metadata_mask_rejects_missing_mount_id`, `metadata_mask_rejects_missing_mount_id` |
+| backing object/path identity registry の lock poison を unavailable として拒否 | `identity_registry_poison_fails_closed` |
 
 ### FUSE adapter（実 mount）
 
 revoke 後の既存 file descriptor からの read / write / size 変更 / mode 変更、既存 directory stream からの次の listing、既存 parent directory fd に対する `mkdirat` が拒否されることを、実 mount 上で確認している。
 
 create / remove / rename が directory stream の途中で成功した場合、古い cookie を使わず `EAGAIN` で再開を要求することも確認している。
+
+`mounted_view_linearizes_backing_mutation_against_revoke` は、実 FUSE handle から backing file へ反復 write を行う thread と capability revoke を競合させる。revoke が返った後の同じ handle の write は拒否され、backing の最終長は revoke 前に commit した write 数と一致する。したがって、逐次的な revoke 後拒否だけでなく、実 mount を通る mutation/revoke の線形化点も検査する。
 
 link については、実 mount 上で次を確認している。
 
@@ -69,6 +75,9 @@ link については、実 mount 上で次を確認している。
 | hard link が同一 inode へ 2 つ目の名前を作り、許可範囲外へは作れない | `mounted_view_creates_hard_links_only_within_its_authorized_range` |
 | 許可範囲外に別名を持つ inode は、範囲内の名前からも read 不能で listing にも現れない | `mounted_view_denies_an_inode_whose_other_name_is_out_of_range` |
 | `mknod(2)` が `ENOSYS` ではなく `EPERM` になる | `mounted_view_refuses_device_and_fifo_creation_with_eperm` |
+| backing の同種 inode 差し替えと symlink 置換を実 mount 上で `EIO` にし、replacement / outside content を返さない | `mounted_view_rejects_backing_replacement_and_symlink_substitution` |
+| contained な深い symlink chain は解決し、cycle は kernel の `ELOOP` を返す | `mounted_view_handles_deep_symlink_chains_and_cycles` |
+| backing 配下の実 nested FUSE mount を fresh preflight が `NestedMount` として拒否 | `mounted_view_rejects_a_real_nested_mount_during_preflight` |
 
 ## 実行コマンド
 
@@ -76,22 +85,24 @@ link については、実 mount 上で次を確認している。
 cargo fmt --manifest-path crates/capfs/Cargo.toml -- --check
 cargo test --manifest-path crates/capfs/Cargo.toml
 cargo clippy --manifest-path crates/capfs/Cargo.toml --all-targets -- -D warnings
+# Linux / root / /dev/fuse が必要な no-skip gate
+scripts/ci/verify-real-capfs.sh
 ```
 
-実 mount を伴う test は、FUSE が使える環境でのみ実行される。
+通常の `cargo test` では、`/dev/fuse` が無い hosted 環境に限って実 mount test を skip する。実 kernel の証拠を作るときは `scripts/ci/verify-real-capfs.sh` を使う。この script は Linux、root、読み書き可能な `/dev/fuse` を先に確認し、`CAPFS_REQUIRE_FUSE=1` を設定して全 21 件の実 FUSE test を一件も skip せずに実行する。device が無い、mount が拒否される、または test 側が skip を検出した場合は exit 2 または test failure になり、green にはならない。
 
 ## 未検証の境界
 
 | 未検証の対象 | なぜ |
 |---|---|
-| 変更系 operation と revoke の並行競合 | 実 mount 上で同時に走らせる統合 test が無い。revoke 後の逐次拒否は確認済みだが、競合中の挙動は未検証 |
-| 実 nested mount の越境 | mount namespace の権限が要るため、通常の unit test では metadata 判定まで |
-| 敵対的な backing 差し替え | symlink と hard link の個別 case は実 file で確認しているが、体系的な差し替え攻撃の test は無い |
-| symlink chain | 単一 link の解決と containment は実 mount で確認しているが、深い chain と cycle は kernel の `ELOOP` に委ねており、test を置いていない |
+| 全ての変更系 operation と revoke の並行競合 | 実 FUSE write と revoke の線形化競合は `mounted_view_linearizes_backing_mutation_against_revoke` で確認済み。rename / unlink / create / metadata の全 interleaving と、全 kernel scheduling は未検証 |
+| cross-filesystem / bind mount を含む全 nested mount の越境 | backing 配下の実 FUSE nested mount は gate で確認済みだが、全種類の mount topology と全 kernel mount namespace 組合せは未検証 |
+| 敵対的な backing 差し替えの全 race | 実 FUSE 上で同種 regular file と symlink の置換を bounded deterministic case として確認済み。連続 rename/create race、全 scheduler interleaving、別 process の無制限 mutation は未検証 |
+| symlink chain の全長・全 topology | 8 段の contained chain と 2-node cycle の `ELOOP` は gate で確認済み。kernel の上限近傍、複雑な相互参照、全 chain 長は未検証 |
 | VM 内での動作 | guest の中で capfs を mount して agent が触る経路は一度も実行していない |
 | 全 interleaving の loom model | [Authorization guard](../authority-core/authorization-guard.md) の loom は Authority Core 側の同期境界だけを扱う。capfs の namespace lock は対象外 |
-| `MNT_ID` を返さない kernel での挙動 | fail closed であることはコードから読めるが、そういう環境で実行していない |
-| lock poisoning からの復旧 | create 失敗時の panic が `RwLock` を poison することは設計だが、その後の運用経路は無い |
+| `MNT_ID` を返さない kernel での実挙動 | required mask の fail-closed test はあるが、実際に MNT_ID を欠落させる kernel / filesystem はこの host で再現していない |
+| lock poisoning 後の復旧 | namespace / node と backing identity registry が poison 後に拒否することは test 済み。復旧は意図せず、全 interleaving や process restart 後の運用は対象外 |
 
 capfs が守れるのは、supervisor が backing tree を非信頼 process から隔離した実行基盤の上でだけ。**host 上の任意の process を、この FUSE adapter だけで止めることはできない。** 隔離境界は [runtime-isolation](../runtime-isolation/README.md) を含めて完成する。
 

@@ -58,6 +58,10 @@ jobs:
         run: scripts/ci/install-pipeline-tools.sh
       - name: Exercise the planner against known inputs
         run: scripts/ci/test-pipeline-planner.sh
+      - name: Exercise commit policy positive and negative controls
+        run: scripts/ci/run.sh commit-policy-self-test
+      - name: Exercise mutation gate positive and negative controls
+        run: scripts/ci/tests/test-mutation-gate.sh
 
   adr_index:
     name: Decision record index
@@ -84,6 +88,19 @@ jobs:
           fetch-depth: 1
       - name: Check every crate declares its unverified boundaries
         run: scripts/ci/check-verification-traceability.sh
+
+  commit_policy:
+    name: Commit policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate authored commit subjects for this event
+        run: scripts/ci/run.sh commit-policy
 
   codeowners_coverage:
     name: CODEOWNERS coverage
@@ -172,6 +189,10 @@ jobs:
           fetch-depth: 1
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
+      - name: Install pinned pipeline tools
+        run: scripts/ci/install-pipeline-tools.sh
+      - name: Install cross-target C toolchains
+        run: scripts/ci/install-cross-tools.sh
       - name: Type-check every declared target
         run: scripts/ci/run.sh cross-targets
 
@@ -219,8 +240,14 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 1
-      - name: Check documentation policy
-        run: scripts/ci/run.sh docs-policy
+      - name: Install pinned pipeline tools
+        run: scripts/ci/install-pipeline-tools.sh
+      - name: Check documentation tree policy
+        run: scripts/ci/check-docs.sh
+      - name: Check machine-readable verification status consistency
+        run: scripts/ci/check-doc-consistency.sh
+      - name: Exercise documentation consistency negative controls
+        run: scripts/ci/tests/test-doc-consistency.sh
 
   toolchain_consistency:
     name: Toolchain consistency
@@ -281,6 +308,23 @@ jobs:
         run: scripts/ci/run.sh clippy
       - name: Build documentation
         run: scripts/ci/run.sh docs
+
+  api_surface:
+    name: Public API surface
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust and cargo-public-api
+        uses: ./.github/actions/setup-rust
+        with:
+          tool-groups: public-api
+      - name: Verify every library against its committed API baseline
+        run: scripts/ci/run.sh api-surface
 
   rust_tests:
     name: Rust tests / shard ${{ matrix.shard }}
@@ -410,6 +454,7 @@ jobs:
       - docs_policy
       - adr_index
       - verification_traceability
+      - commit_policy
       - codeowners_coverage
       - repository_hygiene
       - lean_hygiene
@@ -419,6 +464,7 @@ jobs:
       - dependency_usage
       - lockfile_integrity
       - rust_quality
+      - api_surface
       - rust_tests
       - rust_doctests
       - loom

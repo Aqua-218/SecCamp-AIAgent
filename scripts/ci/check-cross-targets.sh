@@ -28,14 +28,31 @@ fail() {
   failures=$((failures + 1))
 }
 
-mapfile -t cross_targets < <(yq eval '.matrices.cross_targets.values[].triple' ci/gates.yml)
+mapfile -t cross_targets < <(
+  yq eval '.matrices.cross_targets.values[] | [.triple, .cc, .linker] | @tsv' ci/gates.yml
+)
 
 if [[ "${#cross_targets[@]}" -eq 0 ]]; then
   printf 'ci/gates.yml declares no cross targets\n' >&2
   exit 1
 fi
 
-for triple in "${cross_targets[@]}"; do
+for target in "${cross_targets[@]}"; do
+  IFS=$'\t' read -r triple cc linker <<< "${target}"
+  if [[ -z "${triple}" || -z "${cc}" || -z "${linker}" ]]; then
+    fail "cross-target manifest entries require triple, cc, and linker"
+    continue
+  fi
+  if ! command -v "${cc}" > /dev/null 2>&1; then
+    fail "${triple}: target C compiler ${cc} is not installed; run scripts/ci/install-cross-tools.sh"
+    continue
+  fi
+
+  environment_suffix="${triple^^}"
+  environment_suffix="${environment_suffix//-/_}"
+  export "CC_${environment_suffix}=${cc}"
+  export "CARGO_TARGET_${environment_suffix}_LINKER=${linker}"
+
   # Installing here rather than in a setup step keeps the target list in one
   # place: the manifest.
   if ! rustup target add "${triple}" > /dev/null 2>&1; then

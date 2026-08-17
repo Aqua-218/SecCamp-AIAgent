@@ -30,6 +30,16 @@ readonly nightly_toolchain="$(scripts/ci/install-nightly-toolchain.sh)"
 printf 'Sanitizer: mode=%s package=%s toolchain=%s\n' \
   "${mode}" "${package}" "${nightly_toolchain}"
 
+listed_tests="$(
+  RUSTUP_TOOLCHAIN="${nightly_toolchain}" RUSTFLAGS="-Zsanitizer=${mode}" \
+    cargo test --locked --package "${package}" --lib --no-default-features -- --list
+)"
+readonly listed_tests
+if ! grep -qE ': test$' <<< "${listed_tests}"; then
+  printf 'sanitizer configuration selected no tests: %s %s\n' "${mode}" "${package}" >&2
+  exit 1
+fi
+
 # The protocol crate's no-default-features library tests exercise the bounded
 # decoder and frame/session state without requiring a privileged runtime.
 # Keep the sanitizer flag on the test binary, rather than compiling only a

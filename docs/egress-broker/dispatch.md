@@ -6,7 +6,7 @@
 
 > **対象読者:** Broker の認可境界を触る実装者、外部副作用の重複をレビューする人
 
-[`dispatch.rs`](../../crates/egress-broker/src/dispatch.rs) は、guest の control frame から外部副作用の adapter までの唯一の経路である。frame を 1 つ decode し、canonical CBOR に復元し、replay guard に通し、budget を予約し、`CapabilityKernel::authorize_and_commit` の内側で adapter を呼ぶ。
+[`dispatch.rs`](../../crates/egress-broker/src/dispatch.rs) は、guest の control frame から外部副作用の adapter までの唯一の経路である。frame を 1 つ decode し、canonical CBOR に復元し、replay guard に通し、budget を予約し、`CapabilityKernel::authorize_and_execute_classified` の内側で adapter を呼ぶ。
 
 ## 何を防ぎたいのか
 
@@ -18,7 +18,7 @@ flowchart TB
     c --> r["SessionReplayGuard::accept<br/>session / sequence / request ID"]
     r -->|Duplicate| cache["cache 済み outcome を返す"]
     r -->|New| b["SessionBudget::start<br/>request 数・並行数・byte を予約"]
-    b --> k["CapabilityKernel::authorize_and_commit"]
+    b --> k["CapabilityKernel::authorize_and_execute_classified"]
     k --> a["adapter<br/>authority family が一致する側だけ"]
     a --> done["budget.complete で実測 byte を計上"]
 ```
@@ -59,7 +59,7 @@ guest が宣言した値を public fetch で使えるのは、`http_fetch_matche
 
 ## 認可と副作用を 1 つの guard の内側に置く
 
-`CapabilityKernel::authorize_and_commit` は、`state.authorizes(...)` から `commit_to_linearization(capability)` までの間、`state` の read guard を保持する。adapter の呼び出しはその内側にある。
+`CapabilityKernel::authorize_and_execute_classified` は、`state.authorizes(...)` から `commit_to_linearization(capability)` までの間、`state` の read guard を保持する。adapter の呼び出しはその内側にある。
 
 外すと、認可の判定と HTTPS / GitHub 呼び出しの間に `revoke` が入りうる。失効した capability で pull request が作られる。audit の attempt も副作用を挟まなくなる。
 

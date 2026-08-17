@@ -1,6 +1,9 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
-set -eu
+set -euo pipefail
+
+readonly repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd -- "${repository_root}"
 
 : "${CI_API_V4_URL:?CI_API_V4_URL is required}"
 : "${CI_PROJECT_ID:?CI_PROJECT_ID is required}"
@@ -8,15 +11,9 @@ set -eu
 : "${CI_COMMIT_SHA:?CI_COMMIT_SHA is required}"
 : "${CI_COMMIT_TAG:?CI_COMMIT_TAG is required}"
 
-if [ ! -f dist/release.env ]; then
-  printf 'dist/release.env is missing\n' >&2
-  exit 1
-fi
-
-set -a
-# shellcheck disable=SC1091
-. dist/release.env
-set +a
+# shellcheck source=scripts/ci/release-metadata-lib.sh
+source "${repository_root}/scripts/ci/release-metadata-lib.sh"
+release_metadata_load dist/release.env
 
 if [ "${CI_COMMIT_TAG}" != "${RELEASE_TAG}" ]; then
   printf 'release metadata tag does not match CI_COMMIT_TAG\n' >&2

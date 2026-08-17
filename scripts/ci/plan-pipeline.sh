@@ -244,9 +244,10 @@ project_matrix() {
 required_gates=()
 skipped_gates=()
 unavailable_gates=()
+planned_gates=()
 gate_entries=()
 
-while IFS='|' read -r gate_id gate_stage gate_tier gate_scopes github_job gitlab_job; do
+while IFS='|' read -r gate_id gate_stage gate_tier gate_scopes github_job gitlab_job gate_status; do
   [[ -n "${gate_id}" ]] || continue
   stage_selected "${gate_stage}" || continue
 
@@ -257,7 +258,14 @@ while IFS='|' read -r gate_id gate_stage gate_tier gate_scopes github_job gitlab
     local_job="${gitlab_job}"
   fi
 
-  if [[ "${local_job}" == 'null' ]]; then
+  # `planned` and `unavailable` both mean "expect no result", but they are not
+  # the same claim: one says nobody has built the gate, the other says this
+  # platform cannot host a gate that does exist. Reporting a planned gate as
+  # unavailable would quietly blame the platform for missing work.
+  if [[ "${gate_status}" == 'planned' ]]; then
+    status='planned'
+    planned_gates+=("${gate_id}")
+  elif [[ "${local_job}" == 'null' ]]; then
     status='unavailable'
     unavailable_gates+=("${gate_id}")
   elif ! tier_enabled "${gate_tier}"; then
@@ -273,7 +281,7 @@ while IFS='|' read -r gate_id gate_stage gate_tier gate_scopes github_job gitlab
 
   gate_entries+=("\"${gate_id}\":\"${status}\"")
 done < <(yq eval \
-  '.gates[] | [.id, .stage, .tier, (.scopes | join(",")), (.github // "null"), (.gitlab // "null")] | join("|")' \
+  '.gates[] | [.id, .stage, .tier, (.scopes | join(",")), (.github // "null"), (.gitlab // "null"), (.status // "null")] | join("|")' \
   "${manifest}")
 
 join_json_array() {
@@ -315,6 +323,7 @@ plan="$(
   printf '"required":%s,' "$(join_json_array "${required_gates[@]+"${required_gates[@]}"}")"
   printf '"skipped":%s,' "$(join_json_array "${skipped_gates[@]+"${skipped_gates[@]}"}")"
   printf '"unavailable":%s,' "$(join_json_array "${unavailable_gates[@]+"${unavailable_gates[@]}"}")"
+  printf '"planned":%s,' "$(join_json_array "${planned_gates[@]+"${planned_gates[@]}"}")"
   printf '"matrix":{'
   printf '"test_shards":%s,' "$(test_shards_json)"
   printf '"isolation_packages":%s,' "$(isolation_packages_json)"

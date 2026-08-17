@@ -159,6 +159,15 @@ impl ProductionBrokerEndpoint {
     }
 }
 
+/// Hard upper bound for the replay identities retained by one production Broker session.
+pub const MAX_PRODUCTION_BROKER_REPLAY_CAPACITY: usize = 4096;
+
+/// Hard upper bound for the requests served on one production Broker connection.
+pub const MAX_PRODUCTION_BROKER_CONNECTION_REQUESTS: usize = 4096;
+
+/// Hard upper bound for concurrent requests admitted by one production Broker session.
+pub const MAX_PRODUCTION_BROKER_CONCURRENT_REQUESTS: usize = 256;
+
 /// Durable replay, budget, and connection ceilings for one Broker session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProductionBrokerLimits {
@@ -1884,27 +1893,57 @@ fn validate_production_config(
             "guest-control vsock port must be explicit, non-zero, and non-wildcard".to_owned(),
         ));
     }
-    if config.broker_limits.budget_response_bytes == 0
-        || config.broker_limits.github_response_cap == 0
-    {
+    validate_production_broker_limits(config.broker_limits)
+}
+
+fn validate_production_broker_limits(
+    limits: ProductionBrokerLimits,
+) -> Result<(), ProductionBuildError> {
+    if limits.budget_response_bytes == 0 || limits.github_response_cap == 0 {
         return Err(ProductionBuildError::InvalidConfig(
             "Broker response budgets and provider cap must be non-zero".to_owned(),
         ));
     }
-    if config.broker_limits.replay_capacity.get()
-        < config.broker_limits.max_connection_requests.get()
-    {
+    if limits.replay_capacity.get() > MAX_PRODUCTION_BROKER_REPLAY_CAPACITY {
+        return Err(ProductionBuildError::InvalidConfig(format!(
+            "Broker replay capacity {} exceeds the production maximum {}",
+            limits.replay_capacity, MAX_PRODUCTION_BROKER_REPLAY_CAPACITY
+        )));
+    }
+    if limits.max_connection_requests.get() > MAX_PRODUCTION_BROKER_CONNECTION_REQUESTS {
+        return Err(ProductionBuildError::InvalidConfig(format!(
+            "Broker connection request ceiling {} exceeds the production maximum {}",
+            limits.max_connection_requests, MAX_PRODUCTION_BROKER_CONNECTION_REQUESTS
+        )));
+    }
+    if limits.budget_concurrent.get() > MAX_PRODUCTION_BROKER_CONCURRENT_REQUESTS {
+        return Err(ProductionBuildError::InvalidConfig(format!(
+            "Broker concurrent request limit {} exceeds the production maximum {}",
+            limits.budget_concurrent, MAX_PRODUCTION_BROKER_CONCURRENT_REQUESTS
+        )));
+    }
+    let replay_requests = u64::try_from(limits.replay_capacity.get()).map_err(|_| {
+        ProductionBuildError::InvalidConfig(
+            "Broker replay capacity does not fit the durable request budget".to_owned(),
+        )
+    })?;
+    if replay_requests > limits.budget_requests.get() {
+        return Err(ProductionBuildError::InvalidConfig(
+            "Broker replay capacity exceeds the durable request budget".to_owned(),
+        ));
+    }
+    if limits.replay_capacity.get() < limits.max_connection_requests.get() {
         return Err(ProductionBuildError::InvalidConfig(
             "Broker replay capacity must cover the connection request ceiling".to_owned(),
         ));
     }
-    let connection_requests = u64::try_from(config.broker_limits.max_connection_requests.get())
-        .map_err(|_| {
+    let connection_requests =
+        u64::try_from(limits.max_connection_requests.get()).map_err(|_| {
             ProductionBuildError::InvalidConfig(
                 "Broker connection request ceiling does not fit the durable budget".to_owned(),
             )
         })?;
-    if connection_requests > config.broker_limits.budget_requests.get() {
+    if connection_requests > limits.budget_requests.get() {
         return Err(ProductionBuildError::InvalidConfig(
             "Broker connection request ceiling exceeds the durable request budget".to_owned(),
         ));
@@ -3730,6 +3769,143 @@ mod tests {
                 if message.contains("identity ledger")
                     && message.contains("workspace template source")
         ));
+    }
+
+    fn assert_broker_limit_rejected_before_backend_side_effects(
+        mut config: ProductionSessionConfig,
+        mutate: impl FnOnce(&mut ProductionBrokerLimits),
+        expected_message: &str,
+    ) {
+        let identity_ledger_path = config.durability.identity_ledger_path.clone();
+        let recovery_journal_path = config.durability.recovery_journal_path.clone();
+        let authority_audit_path = config.durability.authority_audit.path().to_owned();
+        mutate(&mut config.broker_limits);
+
+        let error = ProductionSessionRuntimeBuilder::new(
+            config,
+            TestFirecrackerFactory {
+                snapshot_id: SnapshotId::new([0x91; crate::ID_BYTES]),
+            },
+            TestEgressFactory,
+        )
+        .build()
+        .err()
+        .expect("invalid Broker limits must fail closed before backend construction");
+
+        assert!(matches!(
+            error,
+            ProductionBuildError::InvalidConfig(message)
+                if message.contains(expected_message)
+        ));
+        assert!(!identity_ledger_path.exists());
+        assert!(!recovery_journal_path.exists());
+        assert!(!authority_audit_path.exists());
+    }
+
+    #[test]
+    fn broker_limits_accept_small_and_hard_cap_boundaries() {
+        assert!(validate_production_broker_limits(broker_limits()).is_ok());
+
+        let maximum = ProductionBrokerLimits::new(
+            NonZeroUsize::new(MAX_PRODUCTION_BROKER_REPLAY_CAPACITY).expect("nonzero"),
+            NonZeroU64::new(
+                u64::try_from(MAX_PRODUCTION_BROKER_REPLAY_CAPACITY).expect("u64 capacity"),
+            )
+            .expect("nonzero"),
+            1024,
+            NonZeroUsize::new(MAX_PRODUCTION_BROKER_CONCURRENT_REQUESTS).expect("nonzero"),
+            1024,
+            NonZeroUsize::new(MAX_PRODUCTION_BROKER_CONNECTION_REQUESTS).expect("nonzero"),
+        );
+        assert!(validate_production_broker_limits(maximum).is_ok());
+    }
+
+    #[test]
+    fn broker_limits_reject_replay_capacity_above_production_cap_before_side_effects() {
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("Broker WAL root must be creatable");
+        let config = production_config(
+            &root.0,
+            AuthorityAuditMode::CreateNew(root.0.join("authority.wal")),
+        );
+        assert_broker_limit_rejected_before_backend_side_effects(
+            config,
+            |limits| {
+                limits.replay_capacity =
+                    NonZeroUsize::new(MAX_PRODUCTION_BROKER_REPLAY_CAPACITY + 1).expect("nonzero");
+                limits.budget_requests = NonZeroU64::new(
+                    u64::try_from(MAX_PRODUCTION_BROKER_REPLAY_CAPACITY + 1).expect("u64 capacity"),
+                )
+                .expect("nonzero");
+                limits.max_connection_requests =
+                    NonZeroUsize::new(MAX_PRODUCTION_BROKER_CONNECTION_REQUESTS).expect("nonzero");
+            },
+            "replay capacity",
+        );
+    }
+
+    #[test]
+    fn broker_limits_reject_connection_requests_above_production_cap_before_side_effects() {
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("Broker WAL root must be creatable");
+        let config = production_config(
+            &root.0,
+            AuthorityAuditMode::CreateNew(root.0.join("authority.wal")),
+        );
+        assert_broker_limit_rejected_before_backend_side_effects(
+            config,
+            |limits| {
+                limits.replay_capacity =
+                    NonZeroUsize::new(MAX_PRODUCTION_BROKER_REPLAY_CAPACITY).expect("nonzero");
+                limits.max_connection_requests =
+                    NonZeroUsize::new(MAX_PRODUCTION_BROKER_CONNECTION_REQUESTS + 1)
+                        .expect("nonzero");
+                limits.budget_requests = NonZeroU64::new(
+                    u64::try_from(MAX_PRODUCTION_BROKER_CONNECTION_REQUESTS + 1)
+                        .expect("u64 capacity"),
+                )
+                .expect("nonzero");
+            },
+            "connection request ceiling",
+        );
+    }
+
+    #[test]
+    fn broker_limits_reject_concurrency_above_production_cap_before_side_effects() {
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("Broker WAL root must be creatable");
+        let config = production_config(
+            &root.0,
+            AuthorityAuditMode::CreateNew(root.0.join("authority.wal")),
+        );
+        assert_broker_limit_rejected_before_backend_side_effects(
+            config,
+            |limits| {
+                limits.budget_concurrent =
+                    NonZeroUsize::new(MAX_PRODUCTION_BROKER_CONCURRENT_REQUESTS + 1)
+                        .expect("nonzero");
+            },
+            "concurrent request limit",
+        );
+    }
+
+    #[test]
+    fn broker_limits_reject_replay_capacity_above_durable_request_budget() {
+        let root = TestDirectory::new();
+        fs::create_dir(root.0.join("broker-wal")).expect("Broker WAL root must be creatable");
+        let config = production_config(
+            &root.0,
+            AuthorityAuditMode::CreateNew(root.0.join("authority.wal")),
+        );
+        assert_broker_limit_rejected_before_backend_side_effects(
+            config,
+            |limits| {
+                limits.replay_capacity = NonZeroUsize::new(9).expect("nonzero");
+                limits.budget_requests = NonZeroU64::new(8).expect("nonzero");
+                limits.max_connection_requests = NonZeroUsize::new(8).expect("nonzero");
+            },
+            "replay capacity exceeds the durable request budget",
+        );
     }
 
     #[test]

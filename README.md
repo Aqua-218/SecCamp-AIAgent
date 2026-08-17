@@ -120,15 +120,29 @@ startup は `workspace → Broker → VM → Capability → workload` の順に 
 |---|---|---|
 | Rust workspace | 検証済み | 全 target / feature の test、Clippy、rustdoc、API baseline |
 | Authority model | 検証済み | property test、Loom、Lean 4、Rust / Lean 共通 corpus 150件 |
-| CapFS | hosted + 実 mount test | `/dev/fuse` がある Linux で17件の FUSE integration test |
+| CapFS | hosted + 実 mount + KVM guest で検証済み | `/dev/fuse` 上の22件と、guest内の全13 file effect |
 | Runtime isolation | 特権 host で検証済み | namespace、cgroup v2、seccomp、Landlock、read-only rootfs、device、fd、capability |
-| Firecracker guest path | 実 KVM で検証済み | dm-verity boot、v2 identity gate、cgroup controller、guest→host Broker、isolation 後の Broker channel |
-| CI / supply chain | 実装済み | GitHub / GitLab 39 gate parity、audit、deny、SBOM、SAST、secret scan、再現可能 release |
-| 外部 provider | 未検証 | repository test は実 DNS / HTTPS / GitHub credential mutation を実行しない |
-| production `Runtime::launch` | 実機未検証 | direct-API KVM test は実施済みだが、実 jailer + snapshot create / restore lifecycle は別境界 |
+| Firecracker guest path | 実 KVM で検証済み | dm-verity boot、v2 identity gate、guest Supervisor、全13 CapFS effect、isolation後のBroker channel |
+| production `Runtime::launch` / `SessionOwner` | 実 KVM で検証済み | 実jailer、clean snapshot create/restore、durable Broker/ledger、stopと全resource cleanup |
+| CI / supply chain | 実装済み | GitHub / GitLab 44 gate parity、audit、deny、SBOM、SAST、secret scan、再現可能 release |
+| 外部 provider | 一部blocked | controlled DNS/HTTPS/TLSは実kernelで検証済み。実GitHub credential mutationは資格情報未提供のためblocked |
 | multi-session control plane | 未実装 | API、認証、scheduler、HA は scope 外 |
 
 > **注意:** 「実 KVM test が通る」ことを VM 隔離全体の証明とは扱いません。crate ごとの仮定と残存境界は `docs/<crate>/verification.md` に明記しています。
+
+### shell command の境界
+
+このrepositoryはshell文字列を解析して「安全なコマンドか」を判定しない。production launcherは
+暗黙のshellを起動せず、image/configに固定されたprogramへ引数をliteralなargvとして`execve`
+するため、`;`、`$()`、空白はshell構文として展開されない。workload自身がshellや`rm`を実行する
+場合の安全性は、read-only guest root、mount/PID/user namespace、cgroup、seccomp、Landlock、
+CapFSのpath/effect authorityで閉じる。
+
+従って、隔離済みguest内の`rm -rf /`がhostの`/`を削除することはなく、guest rootやmaskされた
+領域への変更も拒否される。一方で、sessionに`RemoveFile` / `RemoveDirectory`を付与したworkspace
+内の対象は、要求どおり削除できる。これは危険コマンドの意味解析による無害化ではなく、付与済み
+authorityの範囲だけ副作用を許す設計である。host kernel/KVM/Firecracker/jailer、runner管理権限、
+物理・microarchitectural side channelはTCBまたは非目標であり、絶対安全を主張しない。
 
 ## Quick start
 
@@ -265,7 +279,7 @@ daemon は `SIGTERM`、`SIGINT`、または stop file で dependency-order shutd
 
 ## CI and release
 
-[`ci/gates.yml`](ci/gates.yml) が pipeline topology の single source of truth です。現在は 39 gate が `implemented`、`planned` は 0 で、GitHub Actions と GitLab CI の parity check が欠落・余分な job・空実装を拒否します。
+[`ci/gates.yml`](ci/gates.yml) が pipeline topology の single source of truth です。現在は 44 gate が `implemented`、`planned` は 0 で、GitHub Actions と GitLab CI の parity check が欠落・余分な job・空実装を拒否します。
 
 release 対象は、現在 repository が再現可能性を証明できる `authority-corpus` Linux binary に限定しています。release pipeline は clean tree から archive、AGPL license、build metadata、SPDX SBOM、checksum を生成し、独立した二つの target directory で byte-identical rebuild を要求します。GitHub は OIDC attestation、GitLab は keyless Sigstore bundle を使用し、既存 asset と異なる bytes を上書きしません。
 

@@ -95,12 +95,13 @@ rootfs と workspace の権限差が定数 2 つに集約されているので�
 
 ## 正確な保証範囲
 
-ここで説明したのは access mask の定義とその意図だけ。実際に Landlock が効いていることは確認していない。
+ここで説明した access mask の定義と意図は、実 kernel probe でも確認する。`privileged_isolation` の direct `enforce` scenario は mount 上書き込める `/tmp` への作成が `EACCES` になること、production launcher の post-exec scenario は同じ拒否が `execve` 後にも残ることを観測する。
 
-- `LinuxBackend` の Landlock 適用は特権と ABI 3 以上の kernel を要する。この repository の test では実行していない。
+- `LinuxBackend` の Landlock 適用は特権と ABI 3 以上の kernel を要する。実 kernel での証拠は scheduled privileged wrapper の host に限定される。
 - ruleset を張る path が `config.landlock.read_only_paths` / `writable_paths` と一致していること、rule の追加が全 path について成功していることは、mock backend では見ていない。
-- Landlock は `pivot_root` の後に張る。宣言した path が pivot 後の名前空間で正しく解決されるかは実機でしか確認できない。
-- Landlock はすでに開いている fd には遡って効かない。step 9 で継承 fd を閉じているのはこのため。閉じ漏れがあった場合の挙動は未検証。
+- Landlock は `pivot_root` の後に張る。宣言した path が pivot 後の名前空間で正しく解決されることは direct probe と launcher の post-exec probe で確認する。
+- Landlock はすでに開いている fd には遡って効かない。step 9 で継承 fd を閉じているのはこのため。launcher probe は exec 後に marker / exec-status が消え、control/Broker だけが残ることも確認する。
+- mount rollback は Landlock の証拠とは別の境界である。`limited-tmpfs-failure` は実 `LinuxBackend` の mount failure、完了済み workspace の逆順 unmount、child namespace の消滅、host mount table の残差なしを確認するが、Landlock ruleset の rollback（不可逆）や mount syscall の部分成功後の failure を意味しない。
 - capfs 層の再認可（[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)）とは独立した層。Landlock が許しても Capability が無ければ capfs が拒否する。逆も同じ。
 
 ## 変更時の確認点

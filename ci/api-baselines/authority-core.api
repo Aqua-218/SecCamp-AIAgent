@@ -1,0 +1,716 @@
+pub mod authority_core
+pub mod authority_core::audit
+pub enum authority_core::audit::AttemptOutcome
+pub authority_core::audit::AttemptOutcome::CommitUnknown
+pub authority_core::audit::AttemptOutcome::Committed
+pub authority_core::audit::AttemptOutcome::Denied
+pub authority_core::audit::AttemptOutcome::FailedBeforeCommit
+pub authority_core::audit::AttemptOutcome::Started
+pub enum authority_core::audit::AuditError
+pub authority_core::audit::AuditError::AttemptIdExhausted
+pub authority_core::audit::AuditError::Durable(authority_core::durable_audit::DurableAuditError)
+pub authority_core::audit::AuditError::LockPoisoned
+pub authority_core::audit::AuditError::StateRecoveryRequired
+pub authority_core::audit::AuditError::StateRecoveryRequired::attempts: alloc::vec::Vec<authority_core::audit::AttemptId>
+impl core::convert::From<authority_core::durable_audit::DurableAuditError> for authority_core::audit::AuditError
+pub fn authority_core::audit::AuditError::from(authority_core::durable_audit::DurableAuditError) -> Self
+impl core::error::Error for authority_core::audit::AuditError
+pub fn authority_core::audit::AuditError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for authority_core::audit::AuditError
+pub fn authority_core::audit::AuditError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum authority_core::audit::ReconciliationError
+pub authority_core::audit::ReconciliationError::Durable(authority_core::durable_audit::DurableAuditError)
+pub authority_core::audit::ReconciliationError::Provider
+pub authority_core::audit::ReconciliationError::Provider::attempt: authority_core::audit::AttemptId
+pub authority_core::audit::ReconciliationError::Provider::source: alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>
+impl core::error::Error for authority_core::audit::ReconciliationError
+pub fn authority_core::audit::ReconciliationError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for authority_core::audit::ReconciliationError
+pub fn authority_core::audit::ReconciliationError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::audit::AttemptId(_)
+impl authority_core::audit::AttemptId
+pub const fn authority_core::audit::AttemptId::as_u64(self) -> u64
+pub const fn authority_core::audit::AttemptId::from_u64(u64) -> Self
+pub struct authority_core::audit::AttemptRecord
+impl authority_core::audit::AttemptRecord
+pub const fn authority_core::audit::AttemptRecord::authorization_epoch(&self) -> authority_core::state::AuthorizationEpoch
+pub const fn authority_core::audit::AttemptRecord::caller(&self) -> &authority_core::capability::SubjectId
+pub const fn authority_core::audit::AttemptRecord::capability_id(&self) -> &authority_core::capability::CapId
+pub const fn authority_core::audit::AttemptRecord::id(&self) -> authority_core::audit::AttemptId
+pub const fn authority_core::audit::AttemptRecord::outcome(&self) -> authority_core::audit::AttemptOutcome
+pub const fn authority_core::audit::AttemptRecord::request(&self) -> &authority_core::capability::CapabilityRequest
+pub fn authority_core::audit::AttemptRecord::requests(&self) -> impl core::iter::traits::double_ended::DoubleEndedIterator<Item = &authority_core::capability::CapabilityRequest>
+pub struct authority_core::audit::AuditRecovery
+impl authority_core::audit::AuditRecovery
+pub const fn authority_core::audit::AuditRecovery::inherited_attempts(&self) -> usize
+pub fn authority_core::audit::AuditRecovery::reconciled(&self) -> &[authority_core::audit::AttemptId]
+pub const fn authority_core::audit::AuditRecovery::state_instance(&self) -> u64
+pub struct authority_core::audit::EffectRecord
+impl authority_core::audit::EffectRecord
+pub const fn authority_core::audit::EffectRecord::attempt_id(&self) -> authority_core::audit::AttemptId
+pub const fn authority_core::audit::EffectRecord::authorization_epoch(&self) -> authority_core::state::AuthorizationEpoch
+pub const fn authority_core::audit::EffectRecord::caller(&self) -> &authority_core::capability::SubjectId
+pub const fn authority_core::audit::EffectRecord::capability_id(&self) -> &authority_core::capability::CapId
+pub const fn authority_core::audit::EffectRecord::request(&self) -> &authority_core::capability::CapabilityRequest
+pub fn authority_core::audit::EffectRecord::requests(&self) -> impl core::iter::traits::double_ended::DoubleEndedIterator<Item = &authority_core::capability::CapabilityRequest>
+pub struct authority_core::audit::ReconciliationSummary
+impl authority_core::audit::ReconciliationSummary
+pub fn authority_core::audit::ReconciliationSummary::committed(&self) -> &[authority_core::audit::AttemptId]
+pub fn authority_core::audit::ReconciliationSummary::not_committed(&self) -> &[authority_core::audit::AttemptId]
+pub fn authority_core::audit::ReconciliationSummary::still_unknown(&self) -> &[authority_core::audit::AttemptId]
+pub trait authority_core::audit::CommitReconciler
+pub type authority_core::audit::CommitReconciler::Error: core::error::Error + core::marker::Send + core::marker::Sync + 'static
+pub fn authority_core::audit::CommitReconciler::resolve(&mut self, &authority_core::durable_audit::DurableAttempt, &authority_core::durable_audit::DurableAttemptMetadata) -> core::result::Result<core::option::Option<authority_core::durable_audit::ReconciledCommit>, Self::Error>
+pub fn authority_core::audit::reconcile_unknown_commits<R>(&authority_core::durable_audit::DurableAuditLog, &mut R) -> core::result::Result<authority_core::audit::ReconciliationSummary, authority_core::audit::ReconciliationError> where R: authority_core::audit::CommitReconciler
+pub mod authority_core::capability
+pub enum authority_core::capability::AuthorityBody
+pub authority_core::capability::AuthorityBody::File(authority_core::file::FileAuthority)
+pub authority_core::capability::AuthorityBody::GitHub(authority_core::github::GitHubAuthority)
+pub authority_core::capability::AuthorityBody::HttpFetch(authority_core::http::HttpFetchAuthority)
+pub enum authority_core::capability::AuthorityRequest
+pub authority_core::capability::AuthorityRequest::File(authority_core::file::FileRequest)
+pub authority_core::capability::AuthorityRequest::GitHub(authority_core::github::GitHubRequest)
+pub authority_core::capability::AuthorityRequest::HttpFetch(authority_core::http::HttpFetchRequest)
+pub struct authority_core::capability::CapId(_)
+impl authority_core::capability::CapId
+pub fn authority_core::capability::CapId::as_str(&self) -> &str
+pub fn authority_core::capability::CapId::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::fmt::Display for authority_core::capability::CapId
+pub fn authority_core::capability::CapId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::capability::Capability
+impl authority_core::capability::Capability
+pub const fn authority_core::capability::Capability::authority(&self) -> &authority_core::capability::AuthorityBody
+pub const fn authority_core::capability::Capability::metadata(&self) -> &authority_core::capability::CapabilityMetadata
+pub const fn authority_core::capability::Capability::new(authority_core::capability::CapabilityMetadata, authority_core::time::TimeWindow, authority_core::capability::AuthorityBody) -> Self
+pub const fn authority_core::capability::Capability::validity(&self) -> authority_core::time::TimeWindow
+pub struct authority_core::capability::CapabilityMetadata
+impl authority_core::capability::CapabilityMetadata
+pub const fn authority_core::capability::CapabilityMetadata::id(&self) -> &authority_core::capability::CapId
+pub const fn authority_core::capability::CapabilityMetadata::is_delegable(&self) -> bool
+pub const fn authority_core::capability::CapabilityMetadata::issuer(&self) -> &authority_core::capability::IssuerId
+pub const fn authority_core::capability::CapabilityMetadata::new(authority_core::capability::CapId, authority_core::capability::SubjectId, authority_core::capability::IssuerId) -> Self
+pub const fn authority_core::capability::CapabilityMetadata::parent(&self) -> core::option::Option<&authority_core::capability::CapId>
+pub const fn authority_core::capability::CapabilityMetadata::subject(&self) -> &authority_core::capability::SubjectId
+pub const fn authority_core::capability::CapabilityMetadata::with_delegable(self, bool) -> Self
+pub fn authority_core::capability::CapabilityMetadata::with_parent(self, authority_core::capability::CapId) -> Self
+pub struct authority_core::capability::CapabilityRequest
+impl authority_core::capability::CapabilityRequest
+pub const fn authority_core::capability::CapabilityRequest::authority(&self) -> &authority_core::capability::AuthorityRequest
+pub const fn authority_core::capability::CapabilityRequest::new(authority_core::time::MonotonicTime, authority_core::capability::AuthorityRequest) -> Self
+pub const fn authority_core::capability::CapabilityRequest::time(&self) -> authority_core::time::MonotonicTime
+pub struct authority_core::capability::CapabilityRequestSet
+impl authority_core::capability::CapabilityRequestSet
+pub fn authority_core::capability::CapabilityRequestSet::additional(&self) -> &[authority_core::capability::CapabilityRequest]
+pub const fn authority_core::capability::CapabilityRequestSet::first(&self) -> &authority_core::capability::CapabilityRequest
+pub fn authority_core::capability::CapabilityRequestSet::iter(&self) -> impl core::iter::traits::double_ended::DoubleEndedIterator<Item = &authority_core::capability::CapabilityRequest>
+pub fn authority_core::capability::CapabilityRequestSet::new(authority_core::capability::CapabilityRequest, impl core::iter::traits::collect::IntoIterator<Item = authority_core::capability::CapabilityRequest>) -> Self
+pub const fn authority_core::capability::CapabilityRequestSet::one(authority_core::capability::CapabilityRequest) -> Self
+pub struct authority_core::capability::IssuerId(_)
+impl authority_core::capability::IssuerId
+pub fn authority_core::capability::IssuerId::as_str(&self) -> &str
+pub fn authority_core::capability::IssuerId::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::fmt::Display for authority_core::capability::IssuerId
+pub fn authority_core::capability::IssuerId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::capability::SubjectId(_)
+impl authority_core::capability::SubjectId
+pub fn authority_core::capability::SubjectId::as_str(&self) -> &str
+pub fn authority_core::capability::SubjectId::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::fmt::Display for authority_core::capability::SubjectId
+pub fn authority_core::capability::SubjectId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn authority_core::capability::authority_body_below(&authority_core::capability::AuthorityBody, &authority_core::capability::AuthorityBody) -> bool
+pub fn authority_core::capability::authority_matches(&authority_core::capability::AuthorityBody, &authority_core::capability::AuthorityRequest) -> bool
+pub fn authority_core::capability::capability_matches(&authority_core::capability::Capability, &authority_core::capability::CapabilityRequest) -> bool
+pub fn authority_core::capability::weaker_than(&authority_core::capability::Capability, &authority_core::capability::Capability) -> bool
+pub mod authority_core::durable_audit
+pub enum authority_core::durable_audit::DurableAuditError
+pub authority_core::durable_audit::DurableAuditError::CapacityExceeded
+pub authority_core::durable_audit::DurableAuditError::CapacityExceeded::capacity: u64
+pub authority_core::durable_audit::DurableAuditError::CapacityExceeded::current: u64
+pub authority_core::durable_audit::DurableAuditError::CapacityExceeded::projected: u64
+pub authority_core::durable_audit::DurableAuditError::ChecksumMismatch
+pub authority_core::durable_audit::DurableAuditError::ChecksumMismatch::sequence: u64
+pub authority_core::durable_audit::DurableAuditError::InvalidCapacity
+pub authority_core::durable_audit::DurableAuditError::InvalidCapacity::maximum: u64
+pub authority_core::durable_audit::DurableAuditError::InvalidCapacity::requested: u64
+pub authority_core::durable_audit::DurableAuditError::InvalidMagic
+pub authority_core::durable_audit::DurableAuditError::InvalidRecord(alloc::string::String)
+pub authority_core::durable_audit::DurableAuditError::Io
+pub authority_core::durable_audit::DurableAuditError::Io::kind: std::io::error::ErrorKind
+pub authority_core::durable_audit::DurableAuditError::Io::message: alloc::string::String
+pub authority_core::durable_audit::DurableAuditError::JournalFull
+pub authority_core::durable_audit::DurableAuditError::JournalFull::length: u64
+pub authority_core::durable_audit::DurableAuditError::JournalFull::max_length: u64
+pub authority_core::durable_audit::DurableAuditError::JournalUnavailable
+pub authority_core::durable_audit::DurableAuditError::LockPoisoned
+pub authority_core::durable_audit::DurableAuditError::Locked
+pub authority_core::durable_audit::DurableAuditError::NotRegularFile
+pub authority_core::durable_audit::DurableAuditError::PathIdentityChanged
+pub authority_core::durable_audit::DurableAuditError::RecordTooLarge(usize)
+pub authority_core::durable_audit::DurableAuditError::ReplayDetected
+pub authority_core::durable_audit::DurableAuditError::ReplayDetected::attempt_id: authority_core::audit::AttemptId
+pub authority_core::durable_audit::DurableAuditError::SequenceExhausted
+pub authority_core::durable_audit::DurableAuditError::SequenceMismatch
+pub authority_core::durable_audit::DurableAuditError::SequenceMismatch::actual: u64
+pub authority_core::durable_audit::DurableAuditError::SequenceMismatch::expected: u64
+pub authority_core::durable_audit::DurableAuditError::Symlink
+pub authority_core::durable_audit::DurableAuditError::TruncatedRecord
+pub authority_core::durable_audit::DurableAuditError::UnsafeParentDirectory
+pub authority_core::durable_audit::DurableAuditError::UnsafePermissions
+pub authority_core::durable_audit::DurableAuditError::UnsafePermissions::mode: u32
+pub authority_core::durable_audit::DurableAuditError::UnsupportedVersion(u16)
+pub authority_core::durable_audit::DurableAuditError::WrongOwner
+pub authority_core::durable_audit::DurableAuditError::WrongOwner::actual: u32
+pub authority_core::durable_audit::DurableAuditError::WrongOwner::expected: u32
+impl core::convert::From<authority_core::durable_audit::DurableAuditError> for authority_core::audit::AuditError
+pub fn authority_core::audit::AuditError::from(authority_core::durable_audit::DurableAuditError) -> Self
+impl core::convert::From<std::io::error::Error> for authority_core::durable_audit::DurableAuditError
+pub fn authority_core::durable_audit::DurableAuditError::from(std::io::error::Error) -> Self
+impl core::error::Error for authority_core::durable_audit::DurableAuditError
+impl core::fmt::Display for authority_core::durable_audit::DurableAuditError
+pub fn authority_core::durable_audit::DurableAuditError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum authority_core::durable_audit::ReconciledCommit
+pub authority_core::durable_audit::ReconciledCommit::Committed(authority_core::durable_audit::CommitReceipt)
+pub authority_core::durable_audit::ReconciledCommit::NotCommitted
+pub struct authority_core::durable_audit::CommitReceipt
+impl authority_core::durable_audit::CommitReceipt
+pub const fn authority_core::durable_audit::CommitReceipt::attempt_id(&self) -> authority_core::audit::AttemptId
+pub fn authority_core::durable_audit::CommitReceipt::token(&self) -> &[u8]
+pub struct authority_core::durable_audit::CommitUnknownEvidence
+impl authority_core::durable_audit::CommitUnknownEvidence
+pub const fn authority_core::durable_audit::CommitUnknownEvidence::attempt_id(&self) -> authority_core::audit::AttemptId
+pub fn authority_core::durable_audit::CommitUnknownEvidence::token(&self) -> &[u8]
+pub struct authority_core::durable_audit::DurableAttempt
+impl authority_core::durable_audit::DurableAttempt
+pub const fn authority_core::durable_audit::DurableAttempt::attempt_id(&self) -> authority_core::audit::AttemptId
+pub fn authority_core::durable_audit::DurableAttempt::commit_unknown_evidence(&self) -> core::option::Option<&authority_core::durable_audit::CommitUnknownEvidence>
+pub const fn authority_core::durable_audit::DurableAttempt::finish_sequence(&self) -> core::option::Option<u64>
+pub fn authority_core::durable_audit::DurableAttempt::metadata(&self) -> core::result::Result<authority_core::durable_audit::DurableAttemptMetadata, authority_core::durable_audit::DurableAuditError>
+pub const fn authority_core::durable_audit::DurableAttempt::outcome(&self) -> authority_core::audit::AttemptOutcome
+pub fn authority_core::durable_audit::DurableAttempt::payload(&self) -> &[u8]
+pub fn authority_core::durable_audit::DurableAttempt::receipt(&self) -> core::option::Option<&authority_core::durable_audit::CommitReceipt>
+pub const fn authority_core::durable_audit::DurableAttempt::reconciliation(&self) -> core::option::Option<&authority_core::durable_audit::ReconciledCommit>
+pub const fn authority_core::durable_audit::DurableAttempt::start_sequence(&self) -> u64
+pub struct authority_core::durable_audit::DurableAttemptMetadata
+impl authority_core::durable_audit::DurableAttemptMetadata
+pub const fn authority_core::durable_audit::DurableAttemptMetadata::authorization_epoch(&self) -> authority_core::state::AuthorizationEpoch
+pub const fn authority_core::durable_audit::DurableAttemptMetadata::caller(&self) -> &authority_core::capability::SubjectId
+pub const fn authority_core::durable_audit::DurableAttemptMetadata::capability_id(&self) -> &authority_core::capability::CapId
+pub const fn authority_core::durable_audit::DurableAttemptMetadata::requests(&self) -> &authority_core::capability::CapabilityRequestSet
+pub const fn authority_core::durable_audit::DurableAttemptMetadata::state_instance(&self) -> u64
+pub struct authority_core::durable_audit::DurableAuditLog
+impl authority_core::durable_audit::DurableAuditLog
+pub fn authority_core::durable_audit::DurableAuditLog::attempts(&self) -> core::result::Result<alloc::vec::Vec<authority_core::durable_audit::DurableAttempt>, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditLog::create(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditLog::create_with_capacity(impl core::convert::AsRef<std::path::Path>, u64) -> core::result::Result<Self, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditLog::create_with_max_bytes(impl core::convert::AsRef<std::path::Path>, u64) -> core::result::Result<Self, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditLog::next_attempt_sequence(&self) -> core::result::Result<core::option::Option<u64>, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditLog::open(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditLog::open_with_capacity(impl core::convert::AsRef<std::path::Path>, u64) -> core::result::Result<Self, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditLog::open_with_max_bytes(impl core::convert::AsRef<std::path::Path>, u64) -> core::result::Result<Self, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditLog::path(&self) -> std::path::PathBuf
+pub fn authority_core::durable_audit::DurableAuditLog::read_only_view(&self) -> core::result::Result<authority_core::durable_audit::DurableAuditView, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditLog::reconcile_attempt(&self, authority_core::audit::AttemptId, &authority_core::durable_audit::ReconciledCommit) -> core::result::Result<(), authority_core::durable_audit::DurableAuditError>
+pub struct authority_core::durable_audit::DurableAuditView
+impl authority_core::durable_audit::DurableAuditView
+pub fn authority_core::durable_audit::DurableAuditView::attempts(&self) -> &[authority_core::durable_audit::DurableAttempt]
+pub const fn authority_core::durable_audit::DurableAuditView::next_attempt_sequence(&self) -> core::option::Option<u64>
+pub fn authority_core::durable_audit::DurableAuditView::open(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditView::open_with_capacity(impl core::convert::AsRef<std::path::Path>, u64) -> core::result::Result<Self, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditView::open_with_max_bytes(impl core::convert::AsRef<std::path::Path>, u64) -> core::result::Result<Self, authority_core::durable_audit::DurableAuditError>
+pub fn authority_core::durable_audit::DurableAuditView::path(&self) -> &std::path::Path
+pub const authority_core::durable_audit::DEFAULT_MAX_JOURNAL_BYTES: u64
+pub const authority_core::durable_audit::MAX_COMMIT_RECEIPT_BYTES: usize
+pub const authority_core::durable_audit::MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES: usize
+pub const authority_core::durable_audit::MAX_JOURNAL_BYTES: u64
+pub mod authority_core::file
+#[repr(u8)] pub enum authority_core::file::FileEffect
+pub authority_core::file::FileEffect::CreateDirectory
+pub authority_core::file::FileEffect::CreateFile
+pub authority_core::file::FileEffect::CreateHardLink
+pub authority_core::file::FileEffect::CreateSymlink
+pub authority_core::file::FileEffect::ListDirectory
+pub authority_core::file::FileEffect::ReadData
+pub authority_core::file::FileEffect::ReadLink
+pub authority_core::file::FileEffect::RemoveDirectory
+pub authority_core::file::FileEffect::RemoveFile
+pub authority_core::file::FileEffect::Rename
+pub authority_core::file::FileEffect::SetMetadata
+pub authority_core::file::FileEffect::Truncate
+pub authority_core::file::FileEffect::WriteData
+pub struct authority_core::file::FileAuthority
+impl authority_core::file::FileAuthority
+pub const fn authority_core::file::FileAuthority::effects(&self) -> authority_core::file::FileEffects
+pub const fn authority_core::file::FileAuthority::new(authority_core::repository::RepoId, authority_core::file::FileEffects, authority_core::path::PathPattern) -> Self
+pub const fn authority_core::file::FileAuthority::path(&self) -> &authority_core::path::PathPattern
+pub const fn authority_core::file::FileAuthority::repository(&self) -> &authority_core::repository::RepoId
+pub struct authority_core::file::FileEffects(_)
+impl authority_core::file::FileEffects
+pub const fn authority_core::file::FileEffects::contains(self, authority_core::file::FileEffect) -> bool
+pub const fn authority_core::file::FileEffects::empty() -> Self
+pub fn authority_core::file::FileEffects::from_effects(impl core::iter::traits::collect::IntoIterator<Item = authority_core::file::FileEffect>) -> Self
+pub const fn authority_core::file::FileEffects::is_empty(self) -> bool
+pub const fn authority_core::file::FileEffects::is_subset_of(self, Self) -> bool
+pub const fn authority_core::file::FileEffects::only(authority_core::file::FileEffect) -> Self
+pub struct authority_core::file::FileRequest
+impl authority_core::file::FileRequest
+pub const fn authority_core::file::FileRequest::effect(&self) -> authority_core::file::FileEffect
+pub const fn authority_core::file::FileRequest::new(authority_core::repository::RepoId, authority_core::file::FileEffect, authority_core::path::CanonicalPath) -> Self
+pub const fn authority_core::file::FileRequest::path(&self) -> &authority_core::path::CanonicalPath
+pub const fn authority_core::file::FileRequest::repository(&self) -> &authority_core::repository::RepoId
+pub fn authority_core::file::file_body_below(&authority_core::file::FileAuthority, &authority_core::file::FileAuthority) -> bool
+pub fn authority_core::file::file_matches(&authority_core::file::FileAuthority, &authority_core::file::FileRequest) -> bool
+pub mod authority_core::github
+pub enum authority_core::github::BranchPattern
+pub authority_core::github::BranchPattern::Exact(authority_core::github::BranchName)
+pub authority_core::github::BranchPattern::Prefix(authority_core::github::BranchName)
+impl authority_core::github::BranchPattern
+pub const fn authority_core::github::BranchPattern::branch(&self) -> &authority_core::github::BranchName
+#[repr(u8)] pub enum authority_core::github::GitHubOperation
+pub authority_core::github::GitHubOperation::CreatePullRequest
+pub authority_core::github::GitHubOperation::PublishBranch
+pub enum authority_core::github::InvalidBranchName
+pub authority_core::github::InvalidBranchName::DoubleDot
+pub authority_core::github::InvalidBranchName::Empty
+pub authority_core::github::InvalidBranchName::EmptySegment
+pub authority_core::github::InvalidBranchName::EmptySegment::index: usize
+pub authority_core::github::InvalidBranchName::ForbiddenCharacter
+pub authority_core::github::InvalidBranchName::ForbiddenCharacter::index: usize
+pub authority_core::github::InvalidBranchName::FullyQualifiedReference
+pub authority_core::github::InvalidBranchName::LeadingDash
+pub authority_core::github::InvalidBranchName::LeadingOrTrailingSeparator
+pub authority_core::github::InvalidBranchName::ReflogSyntax
+pub authority_core::github::InvalidBranchName::ReservedAt
+pub authority_core::github::InvalidBranchName::SegmentLeadingDot
+pub authority_core::github::InvalidBranchName::SegmentLeadingDot::index: usize
+pub authority_core::github::InvalidBranchName::SegmentLockSuffix
+pub authority_core::github::InvalidBranchName::SegmentLockSuffix::index: usize
+pub authority_core::github::InvalidBranchName::SegmentTrailingDot
+pub authority_core::github::InvalidBranchName::SegmentTrailingDot::index: usize
+pub authority_core::github::InvalidBranchName::TrailingDot
+impl core::error::Error for authority_core::github::InvalidBranchName
+impl core::fmt::Display for authority_core::github::InvalidBranchName
+pub fn authority_core::github::InvalidBranchName::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::github::BranchName
+impl authority_core::github::BranchName
+pub const fn authority_core::github::BranchName::as_segments(&self) -> &[alloc::string::String]
+pub fn authority_core::github::BranchName::is_at_or_below(&self, &Self) -> bool
+pub fn authority_core::github::BranchName::new(impl core::convert::AsRef<str>) -> core::result::Result<Self, authority_core::github::InvalidBranchName>
+impl core::fmt::Display for authority_core::github::BranchName
+pub fn authority_core::github::BranchName::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::github::GitHubAuthority
+impl authority_core::github::GitHubAuthority
+pub const fn authority_core::github::GitHubAuthority::base(&self) -> &authority_core::github::BranchPattern
+pub const fn authority_core::github::GitHubAuthority::head(&self) -> &authority_core::github::BranchPattern
+pub const fn authority_core::github::GitHubAuthority::installation(&self) -> &authority_core::github::InstallationId
+pub const fn authority_core::github::GitHubAuthority::new(authority_core::github::InstallationId, authority_core::repository::RepoId, authority_core::github::GitHubOperations, authority_core::github::BranchPattern, authority_core::github::BranchPattern) -> Self
+pub const fn authority_core::github::GitHubAuthority::operations(&self) -> authority_core::github::GitHubOperations
+pub const fn authority_core::github::GitHubAuthority::repository(&self) -> &authority_core::repository::RepoId
+pub struct authority_core::github::GitHubOperations(_)
+impl authority_core::github::GitHubOperations
+pub const fn authority_core::github::GitHubOperations::contains(self, authority_core::github::GitHubOperation) -> bool
+pub const fn authority_core::github::GitHubOperations::empty() -> Self
+pub fn authority_core::github::GitHubOperations::from_operations(impl core::iter::traits::collect::IntoIterator<Item = authority_core::github::GitHubOperation>) -> Self
+pub const fn authority_core::github::GitHubOperations::is_empty(self) -> bool
+pub const fn authority_core::github::GitHubOperations::is_subset_of(self, Self) -> bool
+pub const fn authority_core::github::GitHubOperations::only(authority_core::github::GitHubOperation) -> Self
+pub struct authority_core::github::GitHubRequest
+impl authority_core::github::GitHubRequest
+pub const fn authority_core::github::GitHubRequest::base(&self) -> &authority_core::github::BranchName
+pub const fn authority_core::github::GitHubRequest::head(&self) -> &authority_core::github::BranchName
+pub const fn authority_core::github::GitHubRequest::installation(&self) -> &authority_core::github::InstallationId
+pub const fn authority_core::github::GitHubRequest::new(authority_core::github::InstallationId, authority_core::repository::RepoId, authority_core::github::GitHubOperation, authority_core::github::BranchName, authority_core::github::BranchName) -> Self
+pub const fn authority_core::github::GitHubRequest::operation(&self) -> authority_core::github::GitHubOperation
+pub const fn authority_core::github::GitHubRequest::repository(&self) -> &authority_core::repository::RepoId
+pub struct authority_core::github::InstallationId(_)
+impl authority_core::github::InstallationId
+pub fn authority_core::github::InstallationId::as_str(&self) -> &str
+pub fn authority_core::github::InstallationId::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::fmt::Display for authority_core::github::InstallationId
+pub fn authority_core::github::InstallationId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub fn authority_core::github::branch_below(&authority_core::github::BranchPattern, &authority_core::github::BranchPattern) -> bool
+pub fn authority_core::github::branch_matches(&authority_core::github::BranchPattern, &authority_core::github::BranchName) -> bool
+pub fn authority_core::github::github_body_below(&authority_core::github::GitHubAuthority, &authority_core::github::GitHubAuthority) -> bool
+pub fn authority_core::github::github_matches(&authority_core::github::GitHubAuthority, &authority_core::github::GitHubRequest) -> bool
+pub mod authority_core::handle
+pub struct authority_core::handle::HandleId(_)
+impl authority_core::handle::HandleId
+pub fn authority_core::handle::HandleId::as_str(&self) -> &str
+pub fn authority_core::handle::HandleId::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::fmt::Display for authority_core::handle::HandleId
+pub fn authority_core::handle::HandleId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::handle::ObjectId(_)
+impl authority_core::handle::ObjectId
+pub fn authority_core::handle::ObjectId::as_str(&self) -> &str
+pub fn authority_core::handle::ObjectId::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::fmt::Display for authority_core::handle::ObjectId
+pub fn authority_core::handle::ObjectId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::handle::OpenHandle
+impl authority_core::handle::OpenHandle
+pub const fn authority_core::handle::OpenHandle::id(&self) -> &authority_core::handle::HandleId
+pub const fn authority_core::handle::OpenHandle::new(authority_core::handle::HandleId, authority_core::capability::SubjectId, authority_core::handle::ObjectId) -> Self
+pub const fn authority_core::handle::OpenHandle::object(&self) -> &authority_core::handle::ObjectId
+pub const fn authority_core::handle::OpenHandle::subject(&self) -> &authority_core::capability::SubjectId
+pub mod authority_core::http
+#[repr(u8)] pub enum authority_core::http::HttpFetchMethod
+pub authority_core::http::HttpFetchMethod::Get
+pub authority_core::http::HttpFetchMethod::Head
+pub enum authority_core::http::InvalidCanonicalHostReason
+pub authority_core::http::InvalidCanonicalHostReason::Empty
+pub authority_core::http::InvalidCanonicalHostReason::EmptyLabel
+pub authority_core::http::InvalidCanonicalHostReason::InvalidLabelCharacter
+pub authority_core::http::InvalidCanonicalHostReason::IpAddressLiteral
+pub authority_core::http::InvalidCanonicalHostReason::LabelEdgeHyphen
+pub authority_core::http::InvalidCanonicalHostReason::LabelTooLong
+pub authority_core::http::InvalidCanonicalHostReason::NonAscii
+pub authority_core::http::InvalidCanonicalHostReason::TooLong
+impl core::fmt::Display for authority_core::http::InvalidCanonicalHostReason
+pub fn authority_core::http::InvalidCanonicalHostReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum authority_core::http::InvalidCanonicalUrlPathReason
+pub authority_core::http::InvalidCanonicalUrlPathReason::ContainsBackslash
+pub authority_core::http::InvalidCanonicalUrlPathReason::ContainsControlCharacter
+pub authority_core::http::InvalidCanonicalUrlPathReason::ContainsFragmentDelimiter
+pub authority_core::http::InvalidCanonicalUrlPathReason::ContainsInvalidCharacter
+pub authority_core::http::InvalidCanonicalUrlPathReason::ContainsPercentEncoding
+pub authority_core::http::InvalidCanonicalUrlPathReason::ContainsQueryDelimiter
+pub authority_core::http::InvalidCanonicalUrlPathReason::CurrentDirectory
+pub authority_core::http::InvalidCanonicalUrlPathReason::EmptySegment
+pub authority_core::http::InvalidCanonicalUrlPathReason::EncodedPathTooLong
+pub authority_core::http::InvalidCanonicalUrlPathReason::MissingLeadingSlash
+pub authority_core::http::InvalidCanonicalUrlPathReason::NonAscii
+pub authority_core::http::InvalidCanonicalUrlPathReason::ParentDirectory
+pub authority_core::http::InvalidCanonicalUrlPathReason::TooManySegments
+pub authority_core::http::InvalidCanonicalUrlPathReason::TrailingSlash
+impl core::fmt::Display for authority_core::http::InvalidCanonicalUrlPathReason
+pub fn authority_core::http::InvalidCanonicalUrlPathReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum authority_core::http::UrlPathPattern
+pub authority_core::http::UrlPathPattern::Exact(authority_core::http::CanonicalUrlPath)
+pub authority_core::http::UrlPathPattern::Prefix(authority_core::http::CanonicalUrlPath)
+impl authority_core::http::UrlPathPattern
+pub const fn authority_core::http::UrlPathPattern::path(&self) -> &authority_core::http::CanonicalUrlPath
+pub struct authority_core::http::CanonicalHost(_)
+impl authority_core::http::CanonicalHost
+pub fn authority_core::http::CanonicalHost::as_str(&self) -> &str
+pub fn authority_core::http::CanonicalHost::new(impl core::convert::AsRef<str>) -> core::result::Result<Self, authority_core::http::InvalidCanonicalHost>
+impl core::fmt::Display for authority_core::http::CanonicalHost
+pub fn authority_core::http::CanonicalHost::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::http::CanonicalUrlPath
+impl authority_core::http::CanonicalUrlPath
+pub const fn authority_core::http::CanonicalUrlPath::as_segments(&self) -> &[alloc::string::String]
+pub fn authority_core::http::CanonicalUrlPath::is_at_or_below(&self, &Self) -> bool
+pub const fn authority_core::http::CanonicalUrlPath::is_root(&self) -> bool
+pub fn authority_core::http::CanonicalUrlPath::new(impl core::convert::AsRef<str>) -> core::result::Result<Self, authority_core::http::InvalidCanonicalUrlPath>
+pub const fn authority_core::http::CanonicalUrlPath::root() -> Self
+impl core::fmt::Display for authority_core::http::CanonicalUrlPath
+pub fn authority_core::http::CanonicalUrlPath::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::http::HttpFetchAuthority
+impl authority_core::http::HttpFetchAuthority
+pub const fn authority_core::http::HttpFetchAuthority::host(&self) -> &authority_core::http::CanonicalHost
+pub const fn authority_core::http::HttpFetchAuthority::max_response_bytes(&self) -> u64
+pub const fn authority_core::http::HttpFetchAuthority::methods(&self) -> authority_core::http::HttpFetchMethods
+pub const fn authority_core::http::HttpFetchAuthority::new(authority_core::http::HttpFetchMethods, authority_core::http::CanonicalHost, authority_core::http::UrlPathPattern, u64) -> Self
+pub const fn authority_core::http::HttpFetchAuthority::path(&self) -> &authority_core::http::UrlPathPattern
+pub struct authority_core::http::HttpFetchMethods(_)
+impl authority_core::http::HttpFetchMethods
+pub const fn authority_core::http::HttpFetchMethods::contains(self, authority_core::http::HttpFetchMethod) -> bool
+pub const fn authority_core::http::HttpFetchMethods::empty() -> Self
+pub fn authority_core::http::HttpFetchMethods::from_methods(impl core::iter::traits::collect::IntoIterator<Item = authority_core::http::HttpFetchMethod>) -> Self
+pub const fn authority_core::http::HttpFetchMethods::is_empty(self) -> bool
+pub const fn authority_core::http::HttpFetchMethods::is_subset_of(self, Self) -> bool
+pub const fn authority_core::http::HttpFetchMethods::only(authority_core::http::HttpFetchMethod) -> Self
+pub struct authority_core::http::HttpFetchRequest
+impl authority_core::http::HttpFetchRequest
+pub const fn authority_core::http::HttpFetchRequest::host(&self) -> &authority_core::http::CanonicalHost
+pub const fn authority_core::http::HttpFetchRequest::max_response_bytes(&self) -> u64
+pub const fn authority_core::http::HttpFetchRequest::method(&self) -> authority_core::http::HttpFetchMethod
+pub const fn authority_core::http::HttpFetchRequest::new(authority_core::http::HttpFetchMethod, authority_core::http::CanonicalHost, authority_core::http::CanonicalUrlPath, u64) -> Self
+pub const fn authority_core::http::HttpFetchRequest::path(&self) -> &authority_core::http::CanonicalUrlPath
+pub struct authority_core::http::InvalidCanonicalHost
+impl authority_core::http::InvalidCanonicalHost
+pub const fn authority_core::http::InvalidCanonicalHost::label_index(self) -> core::option::Option<usize>
+pub const fn authority_core::http::InvalidCanonicalHost::reason(self) -> authority_core::http::InvalidCanonicalHostReason
+impl core::error::Error for authority_core::http::InvalidCanonicalHost
+impl core::fmt::Display for authority_core::http::InvalidCanonicalHost
+pub fn authority_core::http::InvalidCanonicalHost::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::http::InvalidCanonicalUrlPath
+impl authority_core::http::InvalidCanonicalUrlPath
+pub const fn authority_core::http::InvalidCanonicalUrlPath::reason(self) -> authority_core::http::InvalidCanonicalUrlPathReason
+pub const fn authority_core::http::InvalidCanonicalUrlPath::segment_index(self) -> core::option::Option<usize>
+impl core::error::Error for authority_core::http::InvalidCanonicalUrlPath
+impl core::fmt::Display for authority_core::http::InvalidCanonicalUrlPath
+pub fn authority_core::http::InvalidCanonicalUrlPath::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub const authority_core::http::MAX_CANONICAL_URL_PATH_BYTES: usize
+pub const authority_core::http::MAX_CANONICAL_URL_PATH_SEGMENTS: usize
+pub fn authority_core::http::http_fetch_body_below(&authority_core::http::HttpFetchAuthority, &authority_core::http::HttpFetchAuthority) -> bool
+pub fn authority_core::http::http_fetch_matches(&authority_core::http::HttpFetchAuthority, &authority_core::http::HttpFetchRequest) -> bool
+pub fn authority_core::http::url_path_below(&authority_core::http::UrlPathPattern, &authority_core::http::UrlPathPattern) -> bool
+pub fn authority_core::http::url_path_matches(&authority_core::http::UrlPathPattern, &authority_core::http::CanonicalUrlPath) -> bool
+pub mod authority_core::kernel
+pub enum authority_core::kernel::CapabilityInspectionError<E>
+pub authority_core::kernel::CapabilityInspectionError::Inspection(E)
+pub authority_core::kernel::CapabilityInspectionError::LockPoisoned
+pub authority_core::kernel::CapabilityInspectionError::NotActive
+impl<E: core::error::Error + 'static> core::error::Error for authority_core::kernel::CapabilityInspectionError<E>
+pub fn authority_core::kernel::CapabilityInspectionError<E>::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl<E: core::fmt::Display> core::fmt::Display for authority_core::kernel::CapabilityInspectionError<E>
+pub fn authority_core::kernel::CapabilityInspectionError<E>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum authority_core::kernel::CapabilityKernelError
+pub authority_core::kernel::CapabilityKernelError::LockPoisoned
+pub authority_core::kernel::CapabilityKernelError::RevocationNotPropagated(authority_core::kernel::RevocationObserverError)
+pub authority_core::kernel::CapabilityKernelError::StateTransition(authority_core::state::CapabilityStateError)
+impl core::convert::From<authority_core::state::CapabilityStateError> for authority_core::kernel::CapabilityKernelError
+pub fn authority_core::kernel::CapabilityKernelError::from(authority_core::state::CapabilityStateError) -> Self
+impl core::error::Error for authority_core::kernel::CapabilityKernelError
+pub fn authority_core::kernel::CapabilityKernelError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for authority_core::kernel::CapabilityKernelError
+pub fn authority_core::kernel::CapabilityKernelError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum authority_core::kernel::EffectCommitError<E>
+pub authority_core::kernel::EffectCommitError::Audit(authority_core::audit::AuditError)
+pub authority_core::kernel::EffectCommitError::CommitUnknown
+pub authority_core::kernel::EffectCommitError::CommitUnknown::attempt_id: authority_core::audit::AttemptId
+pub authority_core::kernel::EffectCommitError::CommitUnknown::evidence: alloc::vec::Vec<u8>
+pub authority_core::kernel::EffectCommitError::CommitUnknownAndAudit
+pub authority_core::kernel::EffectCommitError::CommitUnknownAndAudit::attempt_id: authority_core::audit::AttemptId
+pub authority_core::kernel::EffectCommitError::CommitUnknownAndAudit::evidence: alloc::vec::Vec<u8>
+pub authority_core::kernel::EffectCommitError::CommitUnknownAndAudit::source: authority_core::audit::AuditError
+pub authority_core::kernel::EffectCommitError::CommittedButAudit
+pub authority_core::kernel::EffectCommitError::CommittedButAudit::attempt_id: authority_core::audit::AttemptId
+pub authority_core::kernel::EffectCommitError::CommittedButAudit::receipt: authority_core::durable_audit::CommitReceipt
+pub authority_core::kernel::EffectCommitError::CommittedButAudit::source: authority_core::audit::AuditError
+pub authority_core::kernel::EffectCommitError::Effect(E)
+pub authority_core::kernel::EffectCommitError::LockPoisoned
+pub authority_core::kernel::EffectCommitError::NotAuthorized
+impl<E: core::error::Error + 'static> core::error::Error for authority_core::kernel::EffectCommitError<E>
+pub fn authority_core::kernel::EffectCommitError<E>::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl<E: core::fmt::Display> core::fmt::Display for authority_core::kernel::EffectCommitError<E>
+pub fn authority_core::kernel::EffectCommitError<E>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum authority_core::kernel::EffectExecution<T, E>
+pub authority_core::kernel::EffectExecution::CommitUnknown
+pub authority_core::kernel::EffectExecution::CommitUnknown::evidence: alloc::vec::Vec<u8>
+pub authority_core::kernel::EffectExecution::Committed
+pub authority_core::kernel::EffectExecution::Committed::receipt: core::option::Option<alloc::vec::Vec<u8>>
+pub authority_core::kernel::EffectExecution::Committed::value: T
+pub authority_core::kernel::EffectExecution::FailedBeforeCommit(E)
+pub struct authority_core::kernel::CapabilityKernel
+impl authority_core::kernel::CapabilityKernel
+pub fn authority_core::kernel::CapabilityKernel::attempt_records(&self) -> core::result::Result<alloc::vec::Vec<authority_core::audit::AttemptRecord>, authority_core::audit::AuditError>
+pub fn authority_core::kernel::CapabilityKernel::authorization_epoch(&self) -> core::result::Result<authority_core::state::AuthorizationEpoch, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::authorize_all_and_execute_classified<T, E>(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId, &authority_core::capability::CapabilityRequestSet, impl core::ops::function::FnOnce(&authority_core::capability::Capability) -> authority_core::kernel::EffectExecution<T, E>) -> core::result::Result<T, authority_core::kernel::EffectCommitError<E>>
+pub fn authority_core::kernel::CapabilityKernel::authorize_and_execute_classified<T, E>(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId, &authority_core::capability::CapabilityRequest, impl core::ops::function::FnOnce(&authority_core::capability::Capability) -> authority_core::kernel::EffectExecution<T, E>) -> core::result::Result<T, authority_core::kernel::EffectCommitError<E>>
+pub fn authority_core::kernel::CapabilityKernel::begin_subject_close(&self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectCloseStatus, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::close_handle(&self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> core::result::Result<authority_core::state::HandleCloseStatus, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::derive(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId, authority_core::state::CapabilityGrant, authority_core::time::MonotonicTime) -> core::result::Result<authority_core::capability::CapId, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::effect_records(&self) -> core::result::Result<alloc::vec::Vec<authority_core::audit::EffectRecord>, authority_core::audit::AuditError>
+pub fn authority_core::kernel::CapabilityKernel::finish_subject_close(&self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectFinishStatus, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::is_pristine(&self) -> core::result::Result<bool, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::issue_root(&self, authority_core::state::CapabilityGrant) -> core::result::Result<authority_core::capability::CapId, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::issue_root_with_id(&self, authority_core::capability::CapId, authority_core::state::CapabilityGrant) -> core::result::Result<authority_core::capability::CapId, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::new(authority_core::state::CapabilityState) -> Self
+pub fn authority_core::kernel::CapabilityKernel::object_open_handle_count(&self, &authority_core::handle::ObjectId) -> core::result::Result<usize, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::open_handle(&self, &authority_core::handle::HandleId) -> core::result::Result<core::option::Option<authority_core::handle::OpenHandle>, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::register_open_handle(&self, authority_core::handle::OpenHandle) -> core::result::Result<(), authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::register_revocation_observer(&self, alloc::sync::Arc<dyn authority_core::kernel::RevocationObserver>) -> core::result::Result<(), authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::register_subject(&self, authority_core::state::Subject) -> core::result::Result<(), authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::revoke_held_by(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId) -> core::result::Result<authority_core::state::RevocationStatus, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::subject_status(&self, &authority_core::capability::SubjectId) -> core::result::Result<core::option::Option<authority_core::state::SubjectStatus>, authority_core::kernel::CapabilityKernelError>
+pub fn authority_core::kernel::CapabilityKernel::try_new_with_durable_audit(authority_core::state::CapabilityState, authority_core::durable_audit::DurableAuditLog) -> core::result::Result<Self, authority_core::audit::AuditError>
+pub fn authority_core::kernel::CapabilityKernel::try_recover_with_durable_audit(authority_core::state::CapabilityState, authority_core::durable_audit::DurableAuditLog) -> core::result::Result<(Self, authority_core::audit::AuditRecovery), authority_core::audit::AuditError>
+pub fn authority_core::kernel::CapabilityKernel::with_active_capability<T, E>(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId, authority_core::time::MonotonicTime, impl core::ops::function::FnOnce(&authority_core::capability::Capability) -> core::result::Result<T, E>) -> core::result::Result<T, authority_core::kernel::CapabilityInspectionError<E>>
+impl core::fmt::Debug for authority_core::kernel::CapabilityKernel
+pub fn authority_core::kernel::CapabilityKernel::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::kernel::RevocationObserverError
+impl authority_core::kernel::RevocationObserverError
+pub fn authority_core::kernel::RevocationObserverError::new(&'static str, impl core::convert::Into<alloc::string::String>) -> Self
+pub const fn authority_core::kernel::RevocationObserverError::observer(&self) -> &'static str
+pub fn authority_core::kernel::RevocationObserverError::reason(&self) -> &str
+impl core::error::Error for authority_core::kernel::RevocationObserverError
+impl core::fmt::Display for authority_core::kernel::RevocationObserverError
+pub fn authority_core::kernel::RevocationObserverError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub trait authority_core::kernel::RevocationObserver: core::marker::Send + core::marker::Sync
+pub fn authority_core::kernel::RevocationObserver::discard_cached_decisions(&self) -> core::result::Result<(), authority_core::kernel::RevocationObserverError>
+pub mod authority_core::path
+pub enum authority_core::path::InvalidPathSegmentReason
+pub authority_core::path::InvalidPathSegmentReason::ContainsNul
+pub authority_core::path::InvalidPathSegmentReason::ContainsSeparator
+pub authority_core::path::InvalidPathSegmentReason::ContainsWildcard
+pub authority_core::path::InvalidPathSegmentReason::CurrentDirectory
+pub authority_core::path::InvalidPathSegmentReason::Empty
+pub authority_core::path::InvalidPathSegmentReason::EncodedPathTooLong
+pub authority_core::path::InvalidPathSegmentReason::ParentDirectory
+pub authority_core::path::InvalidPathSegmentReason::TooManySegments
+impl core::fmt::Display for authority_core::path::InvalidPathSegmentReason
+pub fn authority_core::path::InvalidPathSegmentReason::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum authority_core::path::PathPattern
+pub authority_core::path::PathPattern::Exact(authority_core::path::CanonicalPath)
+pub authority_core::path::PathPattern::Prefix(authority_core::path::CanonicalPath)
+impl authority_core::path::PathPattern
+pub const fn authority_core::path::PathPattern::path(&self) -> &authority_core::path::CanonicalPath
+pub struct authority_core::path::CanonicalPath
+impl authority_core::path::CanonicalPath
+pub const fn authority_core::path::CanonicalPath::as_segments(&self) -> &[alloc::string::String]
+pub fn authority_core::path::CanonicalPath::child(&self, &str) -> core::result::Result<Self, authority_core::path::InvalidPathSegment>
+pub fn authority_core::path::CanonicalPath::is_at_or_below(&self, &Self) -> bool
+pub const fn authority_core::path::CanonicalPath::is_root(&self) -> bool
+pub fn authority_core::path::CanonicalPath::new<I, S>(I) -> core::result::Result<Self, authority_core::path::InvalidPathSegment> where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::AsRef<str>
+pub fn authority_core::path::CanonicalPath::parent(&self) -> core::option::Option<Self>
+pub fn authority_core::path::CanonicalPath::rebase(&self, &Self, &Self) -> core::option::Option<Self>
+pub const fn authority_core::path::CanonicalPath::root() -> Self
+pub struct authority_core::path::InvalidPathSegment
+impl authority_core::path::InvalidPathSegment
+pub const fn authority_core::path::InvalidPathSegment::index(self) -> usize
+pub const fn authority_core::path::InvalidPathSegment::reason(self) -> authority_core::path::InvalidPathSegmentReason
+impl core::error::Error for authority_core::path::InvalidPathSegment
+impl core::fmt::Display for authority_core::path::InvalidPathSegment
+pub fn authority_core::path::InvalidPathSegment::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub const authority_core::path::MAX_CANONICAL_PATH_BYTES: usize
+pub const authority_core::path::MAX_CANONICAL_PATH_SEGMENTS: usize
+pub fn authority_core::path::path_below(&authority_core::path::PathPattern, &authority_core::path::PathPattern) -> bool
+pub fn authority_core::path::path_matches(&authority_core::path::PathPattern, &authority_core::path::CanonicalPath) -> bool
+pub mod authority_core::policy
+pub struct authority_core::policy::AuthorityPolicyDigest(_)
+impl authority_core::policy::AuthorityPolicyDigest
+pub const fn authority_core::policy::AuthorityPolicyDigest::as_bytes(self) -> [u8; 32]
+pub fn authority_core::policy::AuthorityPolicyDigest::for_root(authority_core::time::TimeWindow, &authority_core::capability::AuthorityBody, bool) -> Self
+pub fn authority_core::policy::AuthorityPolicyDigest::from_hex(&str) -> core::result::Result<Self, authority_core::policy::InvalidAuthorityPolicyDigest>
+pub fn authority_core::policy::AuthorityPolicyDigest::to_hex(self) -> alloc::string::String
+impl core::fmt::Display for authority_core::policy::AuthorityPolicyDigest
+pub fn authority_core::policy::AuthorityPolicyDigest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::policy::InvalidAuthorityPolicyDigest
+impl core::error::Error for authority_core::policy::InvalidAuthorityPolicyDigest
+impl core::fmt::Display for authority_core::policy::InvalidAuthorityPolicyDigest
+pub fn authority_core::policy::InvalidAuthorityPolicyDigest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub const authority_core::policy::ROOT_POLICY_ENCODING_VERSION: u16
+pub mod authority_core::repository
+pub struct authority_core::repository::RepoId(_)
+impl authority_core::repository::RepoId
+pub fn authority_core::repository::RepoId::as_str(&self) -> &str
+pub fn authority_core::repository::RepoId::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::fmt::Display for authority_core::repository::RepoId
+pub fn authority_core::repository::RepoId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub mod authority_core::state
+pub enum authority_core::state::CapabilityStateError
+pub authority_core::state::CapabilityStateError::AuthorizationEpochExhausted
+pub authority_core::state::CapabilityStateError::CapabilityCountExceeded
+pub authority_core::state::CapabilityStateError::CapabilityIdAlreadyIssued(authority_core::capability::CapId)
+pub authority_core::state::CapabilityStateError::CapabilityIdExhausted
+pub authority_core::state::CapabilityStateError::CapabilityNotHeld
+pub authority_core::state::CapabilityStateError::CapabilityNotHeld::caller: authority_core::capability::SubjectId
+pub authority_core::state::CapabilityStateError::CapabilityNotHeld::capability: authority_core::capability::CapId
+pub authority_core::state::CapabilityStateError::DelegationDepthExceeded(authority_core::capability::CapId)
+pub authority_core::state::CapabilityStateError::DuplicateSubject(authority_core::capability::SubjectId)
+pub authority_core::state::CapabilityStateError::GrantExceedsEnvelope(authority_core::capability::SubjectId)
+pub authority_core::state::CapabilityStateError::GrantExceedsParent(authority_core::capability::CapId)
+pub authority_core::state::CapabilityStateError::HandleCountExceeded
+pub authority_core::state::CapabilityStateError::HandleIdAlreadyIssued(authority_core::handle::HandleId)
+pub authority_core::state::CapabilityStateError::HandleNotOwned
+pub authority_core::state::CapabilityStateError::HandleNotOwned::caller: authority_core::capability::SubjectId
+pub authority_core::state::CapabilityStateError::HandleNotOwned::handle: authority_core::handle::HandleId
+pub authority_core::state::CapabilityStateError::InvalidCapabilityId(authority_core::capability::CapId)
+pub authority_core::state::CapabilityStateError::ParentChainInactive(authority_core::capability::CapId)
+pub authority_core::state::CapabilityStateError::ParentNotDelegable(authority_core::capability::CapId)
+pub authority_core::state::CapabilityStateError::ParentNotHeld
+pub authority_core::state::CapabilityStateError::ParentNotHeld::caller: authority_core::capability::SubjectId
+pub authority_core::state::CapabilityStateError::ParentNotHeld::parent: authority_core::capability::CapId
+pub authority_core::state::CapabilityStateError::SubjectCountExceeded
+pub authority_core::state::CapabilityStateError::SubjectHasOpenHandles(authority_core::capability::SubjectId)
+pub authority_core::state::CapabilityStateError::SubjectNotClosing(authority_core::capability::SubjectId)
+pub authority_core::state::CapabilityStateError::SubjectNotRunning(authority_core::capability::SubjectId)
+pub authority_core::state::CapabilityStateError::UnknownCapability(authority_core::capability::CapId)
+pub authority_core::state::CapabilityStateError::UnknownHandle(authority_core::handle::HandleId)
+pub authority_core::state::CapabilityStateError::UnknownParentSubject(authority_core::capability::SubjectId)
+pub authority_core::state::CapabilityStateError::UnknownSubject(authority_core::capability::SubjectId)
+impl core::convert::From<authority_core::state::CapabilityStateError> for authority_core::kernel::CapabilityKernelError
+pub fn authority_core::kernel::CapabilityKernelError::from(authority_core::state::CapabilityStateError) -> Self
+impl core::error::Error for authority_core::state::CapabilityStateError
+impl core::fmt::Display for authority_core::state::CapabilityStateError
+pub fn authority_core::state::CapabilityStateError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum authority_core::state::HandleCloseStatus
+pub authority_core::state::HandleCloseStatus::AlreadyClosed
+pub authority_core::state::HandleCloseStatus::Closed
+pub enum authority_core::state::RevocationStatus
+pub authority_core::state::RevocationStatus::AlreadyRevoked
+pub authority_core::state::RevocationStatus::NewlyRevoked
+pub enum authority_core::state::SubjectCloseStatus
+pub authority_core::state::SubjectCloseStatus::AlreadyClosed
+pub authority_core::state::SubjectCloseStatus::AlreadyClosing
+pub authority_core::state::SubjectCloseStatus::Started
+pub enum authority_core::state::SubjectFinishStatus
+pub authority_core::state::SubjectFinishStatus::AlreadyClosed
+pub authority_core::state::SubjectFinishStatus::Closed
+pub enum authority_core::state::SubjectStatus
+pub authority_core::state::SubjectStatus::Closed
+pub authority_core::state::SubjectStatus::Closing
+pub authority_core::state::SubjectStatus::Running
+pub struct authority_core::state::AuthorizationEpoch(_)
+impl authority_core::state::AuthorizationEpoch
+pub const fn authority_core::state::AuthorizationEpoch::as_u64(self) -> u64
+pub struct authority_core::state::CapabilityGrant
+impl authority_core::state::CapabilityGrant
+pub const fn authority_core::state::CapabilityGrant::authority(&self) -> &authority_core::capability::AuthorityBody
+pub const fn authority_core::state::CapabilityGrant::is_delegable(&self) -> bool
+pub const fn authority_core::state::CapabilityGrant::new(authority_core::capability::SubjectId, authority_core::time::TimeWindow, authority_core::capability::AuthorityBody) -> Self
+pub const fn authority_core::state::CapabilityGrant::subject(&self) -> &authority_core::capability::SubjectId
+pub const fn authority_core::state::CapabilityGrant::validity(&self) -> authority_core::time::TimeWindow
+pub const fn authority_core::state::CapabilityGrant::with_delegable(self, bool) -> Self
+pub struct authority_core::state::CapabilityState
+impl authority_core::state::CapabilityState
+pub fn authority_core::state::CapabilityState::active_capability(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId, authority_core::time::MonotonicTime) -> core::option::Option<&authority_core::capability::Capability>
+pub const fn authority_core::state::CapabilityState::authorization_epoch(&self) -> authority_core::state::AuthorizationEpoch
+pub fn authority_core::state::CapabilityState::authorizes(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId, &authority_core::capability::CapabilityRequest) -> bool
+pub fn authority_core::state::CapabilityState::begin_subject_close(&mut self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectCloseStatus, authority_core::state::CapabilityStateError>
+pub fn authority_core::state::CapabilityState::capability(&self, &authority_core::capability::CapId) -> core::option::Option<&authority_core::capability::Capability>
+pub fn authority_core::state::CapabilityState::close_handle(&mut self, &authority_core::capability::SubjectId, &authority_core::handle::HandleId) -> core::result::Result<authority_core::state::HandleCloseStatus, authority_core::state::CapabilityStateError>
+pub fn authority_core::state::CapabilityState::derive(&mut self, &authority_core::capability::SubjectId, &authority_core::capability::CapId, authority_core::state::CapabilityGrant, authority_core::time::MonotonicTime) -> core::result::Result<authority_core::capability::CapId, authority_core::state::CapabilityStateError>
+pub fn authority_core::state::CapabilityState::finish_subject_close(&mut self, &authority_core::capability::SubjectId) -> core::result::Result<authority_core::state::SubjectFinishStatus, authority_core::state::CapabilityStateError>
+pub fn authority_core::state::CapabilityState::is_effectively_active(&self, &authority_core::capability::CapId, authority_core::time::MonotonicTime) -> bool
+pub fn authority_core::state::CapabilityState::is_held_by(&self, &authority_core::capability::SubjectId, &authority_core::capability::CapId) -> bool
+pub fn authority_core::state::CapabilityState::is_pristine(&self) -> bool
+pub fn authority_core::state::CapabilityState::is_revoked(&self, &authority_core::capability::CapId) -> bool
+pub fn authority_core::state::CapabilityState::issue_root(&mut self, authority_core::state::CapabilityGrant) -> core::result::Result<authority_core::capability::CapId, authority_core::state::CapabilityStateError>
+pub fn authority_core::state::CapabilityState::issue_root_with_id(&mut self, authority_core::capability::CapId, authority_core::state::CapabilityGrant) -> core::result::Result<authority_core::capability::CapId, authority_core::state::CapabilityStateError>
+pub const fn authority_core::state::CapabilityState::issuer(&self) -> &authority_core::capability::IssuerId
+pub const fn authority_core::state::CapabilityState::new(authority_core::capability::IssuerId) -> Self
+pub fn authority_core::state::CapabilityState::object_open_handle_count(&self, &authority_core::handle::ObjectId) -> usize
+pub fn authority_core::state::CapabilityState::open_handle(&self, &authority_core::handle::HandleId) -> core::option::Option<&authority_core::handle::OpenHandle>
+pub fn authority_core::state::CapabilityState::register_open_handle(&mut self, authority_core::handle::OpenHandle) -> core::result::Result<(), authority_core::state::CapabilityStateError>
+pub fn authority_core::state::CapabilityState::register_subject(&mut self, authority_core::state::Subject) -> core::result::Result<(), authority_core::state::CapabilityStateError>
+pub fn authority_core::state::CapabilityState::revoke(&mut self, &authority_core::capability::CapId) -> core::result::Result<authority_core::state::RevocationStatus, authority_core::state::CapabilityStateError>
+pub fn authority_core::state::CapabilityState::revoke_held_by(&mut self, &authority_core::capability::SubjectId, &authority_core::capability::CapId) -> core::result::Result<authority_core::state::RevocationStatus, authority_core::state::CapabilityStateError>
+pub fn authority_core::state::CapabilityState::subject(&self, &authority_core::capability::SubjectId) -> core::option::Option<&authority_core::state::Subject>
+pub fn authority_core::state::CapabilityState::subject_open_handle_count(&self, &authority_core::capability::SubjectId) -> usize
+pub fn authority_core::state::CapabilityState::subject_status(&self, &authority_core::capability::SubjectId) -> core::option::Option<authority_core::state::SubjectStatus>
+pub struct authority_core::state::StaticAuthorityEnvelope
+impl authority_core::state::StaticAuthorityEnvelope
+pub const fn authority_core::state::StaticAuthorityEnvelope::authority(&self) -> &authority_core::capability::AuthorityBody
+pub fn authority_core::state::StaticAuthorityEnvelope::contains(&self, authority_core::time::TimeWindow, &authority_core::capability::AuthorityBody) -> bool
+pub const fn authority_core::state::StaticAuthorityEnvelope::new(authority_core::time::TimeWindow, authority_core::capability::AuthorityBody) -> Self
+pub const fn authority_core::state::StaticAuthorityEnvelope::validity(&self) -> authority_core::time::TimeWindow
+pub struct authority_core::state::Subject
+impl authority_core::state::Subject
+pub const fn authority_core::state::Subject::envelope(&self) -> &authority_core::state::StaticAuthorityEnvelope
+pub const fn authority_core::state::Subject::id(&self) -> &authority_core::capability::SubjectId
+pub const fn authority_core::state::Subject::new(authority_core::capability::SubjectId, authority_core::state::StaticAuthorityEnvelope) -> Self
+pub const fn authority_core::state::Subject::parent(&self) -> core::option::Option<&authority_core::capability::SubjectId>
+pub fn authority_core::state::Subject::with_parent(self, authority_core::capability::SubjectId) -> Self
+pub const authority_core::state::MAX_CAPABILITIES_PER_SESSION: usize
+pub const authority_core::state::MAX_DELEGATION_DEPTH: usize
+pub const authority_core::state::MAX_HANDLES_PER_SESSION: usize
+pub const authority_core::state::MAX_SUBJECTS_PER_SESSION: usize
+pub mod authority_core::time
+pub struct authority_core::time::InvalidTimeWindow
+impl authority_core::time::InvalidTimeWindow
+pub const fn authority_core::time::InvalidTimeWindow::expires_at(self) -> authority_core::time::MonotonicTime
+pub const fn authority_core::time::InvalidTimeWindow::not_before(self) -> authority_core::time::MonotonicTime
+impl core::error::Error for authority_core::time::InvalidTimeWindow
+impl core::fmt::Display for authority_core::time::InvalidTimeWindow
+pub fn authority_core::time::InvalidTimeWindow::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct authority_core::time::MonotonicTime(_)
+impl authority_core::time::MonotonicTime
+pub const fn authority_core::time::MonotonicTime::from_ticks(u64) -> Self
+pub const fn authority_core::time::MonotonicTime::ticks(self) -> u64
+pub struct authority_core::time::TimeWindow
+impl authority_core::time::TimeWindow
+pub const fn authority_core::time::TimeWindow::contains(self, authority_core::time::MonotonicTime) -> bool
+pub const fn authority_core::time::TimeWindow::expires_at(self) -> authority_core::time::MonotonicTime
+pub const fn authority_core::time::TimeWindow::is_subset_of(self, Self) -> bool
+pub const fn authority_core::time::TimeWindow::new(authority_core::time::MonotonicTime, authority_core::time::MonotonicTime) -> core::result::Result<Self, authority_core::time::InvalidTimeWindow>
+pub const fn authority_core::time::TimeWindow::not_before(self) -> authority_core::time::MonotonicTime

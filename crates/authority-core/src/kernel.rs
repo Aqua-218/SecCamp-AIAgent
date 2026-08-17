@@ -810,6 +810,9 @@ impl CapabilityKernel {
         requests: &CapabilityRequestSet,
         commit_to_linearization: impl FnOnce(&Capability) -> EffectExecution<T, E>,
     ) -> Result<T, EffectCommitError<E>> {
+        if !requests.is_complete() {
+            return Err(EffectCommitError::NotAuthorized);
+        }
         let state = self
             .state
             .read()
@@ -945,7 +948,10 @@ mod tests {
     use super::{CapabilityKernel, CapabilityKernelError, EffectCommitError, EffectExecution};
     use crate::{
         audit::{AttemptId, AttemptOutcome, AuditError},
-        capability::{AuthorityBody, AuthorityRequest, CapabilityRequest, IssuerId, SubjectId},
+        capability::{
+            AuthorityBody, AuthorityRequest, CapabilityRequest, CapabilityRequestSet, IssuerId,
+            MAX_REQUESTS_PER_EFFECT, SubjectId,
+        },
         durable_audit::{DurableAuditError, DurableAuditLog, MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES},
         file::{FileAuthority, FileEffect, FileEffects, FileRequest},
         path::{CanonicalPath, PathPattern},
@@ -1105,6 +1111,34 @@ mod tests {
         let error = result.expect_err("commit completion must remain unknown");
         assert!(error.source().is_none());
         assert!(error.to_string().contains("effect attempt 0 completion"));
+    }
+
+    #[test]
+    fn oversized_compound_request_is_denied_before_audit_or_execution() {
+        let (kernel, subject, capability, request) = authorized_kernel();
+        let requests = CapabilityRequestSet::new(
+            request.clone(),
+            std::iter::repeat_n(request, MAX_REQUESTS_PER_EFFECT),
+        );
+        let mut executed = false;
+
+        let result =
+            kernel.authorize_all_and_execute_classified(&subject, &capability, &requests, |_| {
+                executed = true;
+                EffectExecution::<(), Infallible>::Committed {
+                    value: (),
+                    receipt: None,
+                }
+            });
+
+        assert_eq!(result, Err(EffectCommitError::NotAuthorized));
+        assert!(!executed);
+        assert!(
+            kernel
+                .attempt_records()
+                .expect("audit must remain readable")
+                .is_empty()
+        );
     }
 
     #[test]

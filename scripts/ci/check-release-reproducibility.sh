@@ -35,47 +35,58 @@ cleanup() { rm -rf -- "${comparison_directory}"; }
 trap cleanup EXIT
 
 package_once() {
-  local destination="$1"
-  scripts/ci/package-release.sh "${release_tag}" > /dev/null
+  local destination="$1" target_directory="$2"
+  RELEASE_TARGET_DIR="${target_directory}" \
+    scripts/ci/package-release.sh "${release_tag}" > /dev/null
+  scripts/ci/finalize-release.sh
   mkdir -p -- "${destination}"
-  cp -- dist/*.tar.gz "${destination}/"
+  # Copy the exact declared asset set. Wildcards could let stale files make a
+  # supposedly reproducible build pass without producing the current release.
+  # shellcheck disable=SC1091
+  source dist/release.env
+  cp -- \
+    "dist/${ARCHIVE_NAME}" \
+    "dist/${SBOM_NAME}" \
+    "dist/${CHECKSUM_NAME}" \
+    dist/release.env \
+    "${destination}/"
 }
 
 printf 'building %s twice from the same tree\n' "${release_tag}"
 
-package_once "${comparison_directory}/first"
-
-# Removing the compiled binary forces the second archive to come from a real
-# rebuild rather than from whatever the first run left in the target directory.
-rm -rf -- target/release/authority-corpus
-package_once "${comparison_directory}/second"
+package_once \
+  "${comparison_directory}/first" \
+  "${comparison_directory}/target-first"
+package_once \
+  "${comparison_directory}/second" \
+  "${comparison_directory}/target-second"
 
 failures=0
 
-while IFS= read -r first_archive; do
-  archive_name="$(basename "${first_archive}")"
-  second_archive="${comparison_directory}/second/${archive_name}"
+while IFS= read -r first_asset; do
+  asset_name="$(basename "${first_asset}")"
+  second_asset="${comparison_directory}/second/${asset_name}"
 
-  if [[ ! -f "${second_archive}" ]]; then
-    printf 'FAIL %s: the second build did not produce this archive\n' "${archive_name}" >&2
+  if [[ ! -f "${second_asset}" ]]; then
+    printf 'FAIL %s: the second build did not produce this asset\n' "${asset_name}" >&2
     failures=$((failures + 1))
     continue
   fi
 
-  if ! cmp -s -- "${first_archive}" "${second_archive}"; then
-    printf 'FAIL %s: rebuild is not byte-identical\n' "${archive_name}" >&2
-    printf '  first:  %s\n' "$(sha256sum < "${first_archive}" | cut -d' ' -f1)" >&2
-    printf '  second: %s\n' "$(sha256sum < "${second_archive}" | cut -d' ' -f1)" >&2
+  if ! cmp -s -- "${first_asset}" "${second_asset}"; then
+    printf 'FAIL %s: rebuild is not byte-identical\n' "${asset_name}" >&2
+    printf '  first:  %s\n' "$(sha256sum < "${first_asset}" | cut -d' ' -f1)" >&2
+    printf '  second: %s\n' "$(sha256sum < "${second_asset}" | cut -d' ' -f1)" >&2
     failures=$((failures + 1))
     continue
   fi
 
-  printf 'reproducible %s %s\n' "$(sha256sum < "${first_archive}" | cut -d' ' -f1)" "${archive_name}"
-done < <(find "${comparison_directory}/first" -type f -name '*.tar.gz' | sort)
+  printf 'reproducible %s %s\n' "$(sha256sum < "${first_asset}" | cut -d' ' -f1)" "${asset_name}"
+done < <(find "${comparison_directory}/first" -maxdepth 1 -type f | sort)
 
 if [[ "${failures}" -gt 0 ]]; then
-  printf '\nrelease reproducibility: %d archive(s) differ between builds\n' "${failures}" >&2
+  printf '\nrelease reproducibility: %d asset(s) differ between builds\n' "${failures}" >&2
   exit 1
 fi
 
-printf 'release reproducibility: every archive rebuilt byte-identically\n'
+printf 'release reproducibility: every declared asset rebuilt byte-identically\n'

@@ -75,7 +75,7 @@ flowchart TB
 
 ポリシー型と 13 step の順序制御、seccomp allowlist の検査に加え、実 syscall を叩く [`LinuxBackend`](../../crates/runtime-isolation/src/linux.rs) と、guest の `workload-isolation-launcher` から呼ぶ実行経路が実装されている。`scripts/ci/verify-privileged-isolation.sh` は user namespace、cgroup v2、Landlock ABI 3、seccomp が揃った host で staged rootfs の 13 step を実測する。
 
-ただし privileged probe は launcher の inherited start gate と `execve` 後の workload を直接通さず、staged rootfs で観測する。したがって post-exec enforcement、`rootfs.source == "/"`、mount rollback、VM 境界は未検証である。詳細は[検証対応表](verification.md)。
+privileged probe は staged rootfs のdirect enforceに加え、production launcherのinherited start gateと`execve`後のhostile workloadを通し、実unmount rollbackも観測する。host rootを危険にremountしないため、`rootfs.source == "/"` はreadonly SquashFS rootを使うKVM SessionOwner gateで検証する。詳細は[検証対応表](verification.md)。
 
 ## 文書一覧
 

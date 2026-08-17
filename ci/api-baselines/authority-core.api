@@ -102,7 +102,10 @@ pub struct authority_core::capability::CapabilityRequestSet
 impl authority_core::capability::CapabilityRequestSet
 pub fn authority_core::capability::CapabilityRequestSet::additional(&self) -> &[authority_core::capability::CapabilityRequest]
 pub const fn authority_core::capability::CapabilityRequestSet::first(&self) -> &authority_core::capability::CapabilityRequest
+pub const fn authority_core::capability::CapabilityRequestSet::is_complete(&self) -> bool
+pub const fn authority_core::capability::CapabilityRequestSet::is_empty(&self) -> bool
 pub fn authority_core::capability::CapabilityRequestSet::iter(&self) -> impl core::iter::traits::double_ended::DoubleEndedIterator<Item = &authority_core::capability::CapabilityRequest>
+pub const fn authority_core::capability::CapabilityRequestSet::len(&self) -> usize
 pub fn authority_core::capability::CapabilityRequestSet::new(authority_core::capability::CapabilityRequest, impl core::iter::traits::collect::IntoIterator<Item = authority_core::capability::CapabilityRequest>) -> Self
 pub const fn authority_core::capability::CapabilityRequestSet::one(authority_core::capability::CapabilityRequest) -> Self
 pub struct authority_core::capability::IssuerId(_)
@@ -117,6 +120,7 @@ pub fn authority_core::capability::SubjectId::as_str(&self) -> &str
 pub fn authority_core::capability::SubjectId::new(impl core::convert::Into<alloc::string::String>) -> Self
 impl core::fmt::Display for authority_core::capability::SubjectId
 pub fn authority_core::capability::SubjectId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub const authority_core::capability::MAX_REQUESTS_PER_EFFECT: usize
 pub fn authority_core::capability::authority_body_below(&authority_core::capability::AuthorityBody, &authority_core::capability::AuthorityBody) -> bool
 pub fn authority_core::capability::authority_matches(&authority_core::capability::AuthorityBody, &authority_core::capability::AuthorityRequest) -> bool
 pub fn authority_core::capability::capability_matches(&authority_core::capability::Capability, &authority_core::capability::CapabilityRequest) -> bool

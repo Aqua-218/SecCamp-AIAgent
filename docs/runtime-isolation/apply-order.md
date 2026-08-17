@@ -97,6 +97,8 @@ supervisor は `Rollback` を受け取ったら child を再利用せず終了�
 
 実際の guest 起動では、親の `LinuxHostResources` が unnamed socketpair を launcher の stdin/stdout にだけ継承させる。launcher は `ready` → release byte → 13 step startup → close-on-exec の EOF という順序を守り、EOF を確認するまで親へ `isolated` attestation を返さない。partial/malformed marker、exec failure、timeout、isolation rollback failure は全て workload を再利用せず cleanup-required/fail-closed とする。
 
+privileged probe の `limited-tmpfs-failure` は、debug build 限定の fault seam で `LimitedTmpfs` の syscall 前に実 backend を失敗させる。rootfs pivot と workspace bind mount は既に完了しているため、child は `Workspace` → `ReadOnlyRootfs` の逆順 rollback を通り、前者の unmount が成功した後、不可逆な pivot の rollback failure を報告して abort する。親は child を reap した後、child mount namespace が消え、probe staging tree 以下の host mount table に残差がないこと、cgroup が削除されたことを確認する。fault は release build ではコンパイルされず、通常の production default を変更しない。
+
 ## `apply` を呼ぶ場所を間違えない
 
 `create_namespaces` は `CLONE_NEWPID` を unshare する。`unshare(CLONE_NEWPID)` は呼び出したプロセス自身を新しい PID namespace に入れず、次に `fork` した子から適用される。したがって、この取引は「workload を exec する側の child」で開始しなければならない。親 supervisor が自分のプロセスで `apply` を呼ぶと、PID namespace が意図した位置にできない。
@@ -107,7 +109,7 @@ supervisor は `Rollback` を受け取ったら child を再利用せず終了�
 
 順序が配列リテラル 1 箇所に固定されているので、「この操作はいつ実行されるのか」を追うのに実装を読む必要がない。step を増やすときも、依存関係を検討する場所が 1 つに絞られる。
 
-receipt に完了 step が順番どおり入るため、supervisor の audit event に添付すれば「exec 前の境界が完成した」ことの機械的な証拠になる。ログの文字列ではなく型で残るので、後から欠けた step を検出できる。
+receipt に完了 step が順番どおり入るため、supervisor の audit event に添付すれば「exec 前の境界が完成した」ことの機械的な証拠になる。launcher はさらに CLOEXEC exec-status の EOF を確認してから `isolated` を返すので、実 kernel probe では exec 後の workload から同じ境界を再観測できる。ログの文字列ではなく型で残るので、後から欠けた step を検出できる。
 
 ## step 4 が step 7 の mount を用意する理由
 
@@ -132,17 +134,17 @@ step 4 で staging しない場合:
 
 mock backend が保証するのは、13 step が定義順に呼ばれ、失敗時に完了済み step が逆順に rollback されることだけ。
 
-[`tests/privileged_isolation.rs`](../../crates/runtime-isolation/tests/privileged_isolation.rs) が実 kernel 上で 13 step を適用し、完成した境界の内側から観測することで、次を確認している。staged rootfs 経路、`execve` を挟まない場合に限る。
+[`tests/privileged_isolation.rs`](../../crates/runtime-isolation/tests/privileged_isolation.rs) が実 kernel 上で 13 step を適用し、完成した境界の内側から観測することで、次を確認している。`enforce` は staged rootfs を API 直呼びし、`launcher-post-exec` は production launcher の start gate、connected control/Broker descriptors、`execve`、hostile workload を同じ probe で通す。
 
 - 13 step が実 syscall で完走し、launcher が `Ready` を受け取ること。
 - seccomp filter、Landlock ruleset、read-only rootfs、device masking、fd の一掃、capability の剥奪が、それぞれ kernel によって強制されていること。
 - 途中で失敗した step が launcher に正しく報告され、host 側の cgroup が解放されること。
+- `LimitedTmpfs` 前の実 backend failure で、完了済み workspace mount の逆順 unmount、child mount namespace の消滅、host mount table の残差なしが観測できること。
 
 次は依然として保証していない。
 
-- unmount による rollback が実際に元の状態へ戻ること。失敗を注入できたのは `pivot_root` 後の `Landlock` で、そこは crate 自身が「戻せない」と申告する位置にある。確認できたのは cgroup の解放だけ。
-- `rootfs.source == "/"` の guest 経路。probe は staged rootfs 経路だけを通る。
-- exec 後の workload が境界を越えられないこと。probe は child 内で直接観測しており、exec を挟んでいない。
+- mount syscall が部分成功した後に返る failure に対する rollback。privileged probe の fault は `LimitedTmpfs` syscall 前なので、失敗した syscall 自身が mount を残すケースは別途必要である。
+- mutable な host で `rootfs.source == "/"` を使う経路。host root が起動前から readonly の runner では launcher probe がこの分岐を選ぶが、probe の都合で root を remount することはしない。現在の runner が mutable なら `rootfs_source_slash=unavailable` と記録される。
 - VM 境界。host から見た隔離は [firecracker-runtime](../firecracker-runtime/README.md) の担当。
 
 正確な線引きは [検証対応表](verification.md) にある。

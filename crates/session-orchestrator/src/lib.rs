@@ -13,12 +13,19 @@
 //! は `SessionOrchestrator::new_durable` を使い、専用 ledger file を渡すこと。
 //! `DurableIdentityLedger` は trusted parent directory と stable sidecar lock の
 //! descriptor を保持し、versioned header と checksummed fixed-size record を全て
-//! 検証してから開く。session の七つの identity は一つの batch として append
-//! され、`sync_all` が成功するまで backend の副作用は開始されない。破損、
-//! 切断、容量超過、write/sync failure は operator-readable な typed error になり、
-//! identity を再利用できるように ledger を修復・切り詰めることは許可しない。
+//! 検証してから開く。新規 ledger は v2 の二つの交互 commit header を使い、
+//! record batch を sync してから次の header を sync する。片方の header が
+//! torn でももう片方の世代を選び、header が公開していない末尾は、連続した
+//! record と構造的に妥当な最終 partial record と確認できた場合だけ切り詰める。
+//! committed record 内の破損、無関係な末尾 bytes、両 header の破損は fail closed
+//! する。v1 ledger は読み書き可能な互換モードで保持するが、自動形式変換は行わない。
+//! session の七つの identity は一つの batch として append され、`sync_all` が
+//! 成功するまで backend の副作用は開始されない。破損、切断、容量超過、
+//! write/sync failure は operator-readable な typed error になる。
 
 #![forbid(unsafe_code)]
+
+use authority_core::policy::AuthorityPolicyDigest;
 
 pub mod authority_backend;
 pub mod egress_backend;
@@ -185,11 +192,21 @@ impl IdentityKind {
 /// Maximum number of identity records accepted by a durable ledger.
 pub const MAX_LEDGER_RECORDS: usize = 1_048_576;
 
+/// The original single-header format remains readable and writable so a
+/// process can reopen a ledger created by an older release.
 const LEDGER_MAGIC: [u8; 8] = *b"SORLEDG1";
 const LEDGER_VERSION: u8 = 1;
 const LEDGER_HEADER_BYTES: usize = 32;
+/// New ledgers use two independently checksummed commit headers. Header
+/// version two deliberately has a different magic so a damaged v2 header
+/// cannot be mistaken for a legacy ledger.
+const LEDGER_V2_MAGIC: [u8; 8] = *b"SORLEDG2";
+const LEDGER_V2_VERSION: u8 = 2;
+const LEDGER_V2_HEADER_BYTES: usize = 64;
+const LEDGER_V2_HEADER_SLOTS: usize = 2;
+const LEDGER_V2_DATA_OFFSET: usize = LEDGER_V2_HEADER_BYTES * LEDGER_V2_HEADER_SLOTS;
 const LEDGER_RECORD_BYTES: usize = 32;
-const MAX_LEDGER_BYTES: usize = LEDGER_HEADER_BYTES + (MAX_LEDGER_RECORDS * LEDGER_RECORD_BYTES);
+const MAX_LEDGER_BYTES: usize = LEDGER_V2_DATA_OFFSET + (MAX_LEDGER_RECORDS * LEDGER_RECORD_BYTES);
 #[cfg(target_os = "linux")]
 const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(unix)]
@@ -593,6 +610,14 @@ struct DurableLedgerDirectory {
     effective_uid: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerFormat {
+    /// The pre-v2 format with one mutable header at byte zero.
+    LegacyV1,
+    /// The current format with alternating checksummed commit headers.
+    RedundantV2,
+}
+
 impl DurableLedgerDirectory {
     fn open(ledger_path: &Path) -> Result<Self, LedgerError> {
         let ledger_name = ledger_path
@@ -689,9 +714,12 @@ pub struct DurableIdentityLedger {
     directory: DurableLedgerDirectory,
     file: File,
     lock: ExclusiveLedgerLock,
+    format: LedgerFormat,
     issued: BTreeSet<[u8; ID_BYTES]>,
     next_sequence: u64,
     length: u64,
+    generation: u64,
+    active_slot: usize,
     poisoned: bool,
 }
 
@@ -710,6 +738,7 @@ impl DurableIdentityLedger {
     ///
     /// Returns [`LedgerError`] when ownership cannot be acquired or the file
     /// cannot be safely opened and recovered.
+    #[allow(clippy::too_many_lines)]
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let path = path.as_ref().to_path_buf();
         let directory = DurableLedgerDirectory::open(&path)?;
@@ -735,8 +764,15 @@ impl DurableIdentityLedger {
 
         if created {
             validate_open_ledger(&directory, &file, Some(0))?;
-            let header = ledger_header(0, LEDGER_HEADER_BYTES as u64);
-            file.write_all(&header)
+            // Both slots are initialized before the first sync. A fresh file
+            // with only one valid slot is rejected on reopen: it cannot be
+            // distinguished from an interrupted or tampered initialization.
+            let first_header = ledger_header_v2(0, 0, LEDGER_V2_DATA_OFFSET as u64);
+            let second_header = ledger_header_v2(1, 0, LEDGER_V2_DATA_OFFSET as u64);
+            let mut initial = [0_u8; LEDGER_V2_DATA_OFFSET];
+            initial[..LEDGER_V2_HEADER_BYTES].copy_from_slice(&first_header);
+            initial[LEDGER_V2_HEADER_BYTES..].copy_from_slice(&second_header);
+            file.write_all(&initial)
                 .map_err(|error| LedgerError::WriteFailed {
                     path: path.clone(),
                     message: error.to_string(),
@@ -745,18 +781,21 @@ impl DurableIdentityLedger {
                 path: path.clone(),
                 message: error.to_string(),
             })?;
-            validate_open_ledger(&directory, &file, Some(LEDGER_HEADER_BYTES as u64))?;
+            validate_open_ledger(&directory, &file, Some(LEDGER_V2_DATA_OFFSET as u64))?;
             validate_open_lock(&directory, &lock.file)?;
             directory.sync()?;
-            validate_open_ledger(&directory, &file, Some(LEDGER_HEADER_BYTES as u64))?;
+            validate_open_ledger(&directory, &file, Some(LEDGER_V2_DATA_OFFSET as u64))?;
             Ok(Self {
                 path,
                 directory,
                 file,
                 lock,
+                format: LedgerFormat::RedundantV2,
                 issued: BTreeSet::new(),
                 next_sequence: 0,
-                length: LEDGER_HEADER_BYTES as u64,
+                length: LEDGER_V2_DATA_OFFSET as u64,
+                generation: 0,
+                active_slot: 0,
                 poisoned: false,
             })
         } else {
@@ -782,17 +821,67 @@ impl DurableIdentityLedger {
                     actual: observed,
                 });
             }
-            let (issued, next_sequence) = parse_ledger(&bytes)?;
-            validate_open_ledger(&directory, &file, Some(length))?;
+            let is_v2 = bytes.len() >= LEDGER_V2_HEADER_BYTES
+                && (bytes[..LEDGER_V2_MAGIC.len()] == LEDGER_V2_MAGIC
+                    || (bytes.len() >= LEDGER_V2_HEADER_BYTES * 2
+                        && bytes[LEDGER_V2_HEADER_BYTES
+                            ..LEDGER_V2_HEADER_BYTES + LEDGER_V2_MAGIC.len()]
+                            == LEDGER_V2_MAGIC));
+            let (
+                format,
+                issued,
+                next_sequence,
+                generation,
+                active_slot,
+                committed_length,
+                recover_tail,
+            ) = if is_v2 {
+                let parsed = parse_ledger_v2(&bytes)?;
+                (
+                    LedgerFormat::RedundantV2,
+                    parsed.issued,
+                    parsed.next_sequence,
+                    parsed.generation,
+                    parsed.active_slot,
+                    parsed.committed_length,
+                    parsed.recover_tail,
+                )
+            } else {
+                let (issued, next_sequence) = parse_ledger(&bytes)?;
+                (
+                    LedgerFormat::LegacyV1,
+                    issued,
+                    next_sequence,
+                    0,
+                    0,
+                    length,
+                    false,
+                )
+            };
+            if recover_tail {
+                // A tail is recoverable only after parse_ledger_v2 has
+                // validated every complete staged record and the structural
+                // prefix of a final partial record. It is never part of the
+                // committed identity set, so truncating it cannot make an
+                // identity reusable.
+                file.set_len(committed_length)
+                    .map_err(|error| LedgerError::io(LedgerOperation::Append, &path, &error))?;
+                file.sync_all()
+                    .map_err(|error| LedgerError::io(LedgerOperation::Sync, &path, &error))?;
+            }
+            validate_open_ledger(&directory, &file, Some(committed_length))?;
             validate_open_lock(&directory, &lock.file)?;
             Ok(Self {
                 path,
                 directory,
                 file,
                 lock,
+                format,
                 issued,
                 next_sequence,
-                length,
+                length: committed_length,
+                generation,
+                active_slot,
                 poisoned: false,
             })
         }
@@ -854,6 +943,27 @@ impl IdentityLedger for DurableIdentityLedger {
         if encoded.is_empty() {
             return Ok(());
         }
+
+        match self.format {
+            LedgerFormat::LegacyV1 => {
+                self.reserve_legacy(identities, pending, current_records, new_records, &encoded)
+            }
+            LedgerFormat::RedundantV2 => {
+                self.reserve_redundant_v2(pending, current_records, new_records, &encoded)
+            }
+        }
+    }
+}
+
+impl DurableIdentityLedger {
+    fn reserve_legacy(
+        &mut self,
+        _identities: &[(IdentityKind, [u8; ID_BYTES])],
+        pending: BTreeSet<[u8; ID_BYTES]>,
+        _current_records: u64,
+        new_records: u64,
+        encoded: &[u8],
+    ) -> Result<(), LedgerError> {
         if let Err(error) = self.validate_append_target(self.length) {
             self.poisoned = true;
             return Err(error);
@@ -862,7 +972,7 @@ impl IdentityLedger for DurableIdentityLedger {
             self.poisoned = true;
             return Err(LedgerError::io(LedgerOperation::Append, &self.path, &error));
         }
-        if let Err(error) = self.file.write_all(&encoded) {
+        if let Err(error) = self.file.write_all(encoded) {
             self.poisoned = true;
             return Err(LedgerError::WriteFailed {
                 path: self.path.clone(),
@@ -870,9 +980,8 @@ impl IdentityLedger for DurableIdentityLedger {
             });
         }
         // Persist records while the old header still defines the committed
-        // prefix. Only after this barrier may the header publish the new
-        // record count. A crash can therefore leave an invalid trailing suffix,
-        // but can never publish records that were not durably written first.
+        // prefix. Legacy files retain their original single-header behavior;
+        // new files use reserve_redundant_v2 below.
         if let Err(error) = self.file.sync_all() {
             self.poisoned = true;
             return Err(LedgerError::SyncFailed {
@@ -909,12 +1018,6 @@ impl IdentityLedger for DurableIdentityLedger {
                 message: error.to_string(),
             });
         }
-        // The records and the header are both durable at this point, so the
-        // reservation has committed. Commit the in-memory view first: returning
-        // Err here would tell the caller the identities are free while they are
-        // permanently on disk, and retrying them after a reopen yields
-        // Duplicate. A failed reposition still poisons the ledger so no later
-        // append writes at an unknown offset.
         self.issued.extend(pending);
         self.next_sequence = new_records;
         self.length = committed_length;
@@ -924,9 +1027,98 @@ impl IdentityLedger for DurableIdentityLedger {
         }
         Ok(())
     }
-}
 
-impl DurableIdentityLedger {
+    fn reserve_redundant_v2(
+        &mut self,
+        pending: BTreeSet<[u8; ID_BYTES]>,
+        current_records: u64,
+        new_records: u64,
+        encoded: &[u8],
+    ) -> Result<(), LedgerError> {
+        if let Err(error) = self.validate_append_target(self.length) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        if let Err(error) = self.file.seek(SeekFrom::Start(self.length)) {
+            self.poisoned = true;
+            return Err(LedgerError::io(LedgerOperation::Append, &self.path, &error));
+        }
+        if let Err(error) = self.file.write_all(encoded) {
+            self.poisoned = true;
+            return Err(LedgerError::WriteFailed {
+                path: self.path.clone(),
+                message: error.to_string(),
+            });
+        }
+        // The record batch is durable before either header advertises it.
+        // A crash in the remainder of this method leaves an uncommitted tail
+        // that open() can prove is staged and discard.
+        if let Err(error) = self.file.sync_all() {
+            self.poisoned = true;
+            return Err(LedgerError::SyncFailed {
+                path: self.path.clone(),
+                message: error.to_string(),
+            });
+        }
+        let committed_length =
+            LEDGER_V2_DATA_OFFSET as u64 + new_records * LEDGER_RECORD_BYTES as u64;
+        if let Err(error) = self.validate_append_target(committed_length) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        let Some(next_generation) = self.generation.checked_add(1) else {
+            self.poisoned = true;
+            return Err(LedgerError::Unavailable {
+                reason: "identity ledger header generation exhausted".into(),
+            });
+        };
+        let next_slot = (self.active_slot + 1) % LEDGER_V2_HEADER_SLOTS;
+        if let Err(error) = self
+            .file
+            .seek(SeekFrom::Start((next_slot * LEDGER_V2_HEADER_BYTES) as u64))
+        {
+            self.poisoned = true;
+            return Err(LedgerError::io(
+                LedgerOperation::HeaderWrite,
+                &self.path,
+                &error,
+            ));
+        }
+        let header = ledger_header_v2(next_slot, next_generation, committed_length);
+        if let Err(error) = self.file.write_all(&header) {
+            self.poisoned = true;
+            return Err(LedgerError::WriteFailed {
+                path: self.path.clone(),
+                message: error.to_string(),
+            });
+        }
+        if let Err(error) = self.file.sync_all() {
+            self.poisoned = true;
+            return Err(LedgerError::SyncFailed {
+                path: self.path.clone(),
+                message: error.to_string(),
+            });
+        }
+        // The record batch and its commit header are durable. Update memory
+        // only after that barrier; a later validation failure poisons this
+        // handle and forces a reopen instead of risking an offset mismatch.
+        self.issued.extend(pending);
+        self.next_sequence = new_records;
+        self.length = committed_length;
+        self.generation = next_generation;
+        self.active_slot = next_slot;
+        if let Err(error) = self.validate_append_target(committed_length) {
+            self.poisoned = true;
+            return Err(error);
+        }
+        debug_assert_eq!(
+            current_records
+                + u64::try_from(encoded.len()).unwrap_or(0) / LEDGER_RECORD_BYTES as u64,
+            new_records
+        );
+        Ok(())
+    }
+
     fn validate_append_target(&self, expected_length: u64) -> Result<(), LedgerError> {
         self.directory.validate()?;
         validate_open_lock(&self.directory, &self.lock.file)?;
@@ -1299,6 +1491,26 @@ fn ledger_header(record_count: u64, data_length: u64) -> [u8; LEDGER_HEADER_BYTE
     header
 }
 
+fn ledger_header_v2(
+    slot: usize,
+    generation: u64,
+    data_length: u64,
+) -> [u8; LEDGER_V2_HEADER_BYTES] {
+    let mut header = [0_u8; LEDGER_V2_HEADER_BYTES];
+    header[..LEDGER_V2_MAGIC.len()].copy_from_slice(&LEDGER_V2_MAGIC);
+    header[8] = LEDGER_V2_VERSION;
+    header[9] = u8::try_from(LEDGER_V2_HEADER_BYTES).expect("header length fits in u8");
+    header[12..20].copy_from_slice(&generation.to_le_bytes());
+    let record_count =
+        data_length.saturating_sub(LEDGER_V2_DATA_OFFSET as u64) / LEDGER_RECORD_BYTES as u64;
+    header[20..28].copy_from_slice(&record_count.to_le_bytes());
+    header[28..36].copy_from_slice(&data_length.to_le_bytes());
+    header[36] = u8::try_from(slot).expect("header slot fits in u8");
+    let header_checksum = checksum(&header[..60]);
+    header[60..].copy_from_slice(&header_checksum.to_le_bytes());
+    header
+}
+
 fn ledger_record(
     kind: IdentityKind,
     identity: [u8; ID_BYTES],
@@ -1312,6 +1524,295 @@ fn ledger_record(
     let record_checksum = checksum(&record[..28]);
     record[28..].copy_from_slice(&record_checksum.to_le_bytes());
     record
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedV2Header {
+    slot: usize,
+    generation: u64,
+    record_count: u64,
+    data_length: u64,
+}
+
+#[derive(Debug)]
+struct ParsedV2Ledger {
+    issued: BTreeSet<[u8; ID_BYTES]>,
+    next_sequence: u64,
+    generation: u64,
+    active_slot: usize,
+    committed_length: u64,
+    recover_tail: bool,
+}
+
+fn parse_v2_header(bytes: &[u8], slot: usize) -> Result<ParsedV2Header, LedgerError> {
+    let offset = slot * LEDGER_V2_HEADER_BYTES;
+    let end = offset + LEDGER_V2_HEADER_BYTES;
+    if bytes.len() < end {
+        return Err(LedgerError::truncated(
+            offset,
+            LEDGER_V2_HEADER_BYTES,
+            bytes.len().saturating_sub(offset),
+        ));
+    }
+    let header = &bytes[offset..end];
+    if header[..LEDGER_V2_MAGIC.len()] != LEDGER_V2_MAGIC {
+        return Err(LedgerError::corrupt(
+            offset,
+            "v2 header magic does not match",
+        ));
+    }
+    if header[8] != LEDGER_V2_VERSION {
+        return Err(LedgerError::UnsupportedVersion { version: header[8] });
+    }
+    if header[9] as usize != LEDGER_V2_HEADER_BYTES || header[10..12] != [0, 0] {
+        return Err(LedgerError::corrupt(
+            offset + 9,
+            "invalid v2 header length or reserved bytes",
+        ));
+    }
+    if header[37..60].iter().any(|byte| *byte != 0) {
+        return Err(LedgerError::corrupt(
+            offset + 37,
+            "v2 header reserved bytes are non-zero",
+        ));
+    }
+    let observed_slot = usize::from(header[36]);
+    if observed_slot != slot {
+        return Err(LedgerError::corrupt(
+            offset + 36,
+            "v2 header slot does not match its physical slot",
+        ));
+    }
+    let expected_checksum = u32::from_le_bytes(header[60..64].try_into().expect("fixed header"));
+    if checksum(&header[..60]) != expected_checksum {
+        return Err(LedgerError::corrupt(
+            offset + 60,
+            "v2 header checksum mismatch",
+        ));
+    }
+    let generation = u64::from_le_bytes(header[12..20].try_into().expect("fixed header"));
+    let record_count = u64::from_le_bytes(header[20..28].try_into().expect("fixed header"));
+    let data_length = u64::from_le_bytes(header[28..36].try_into().expect("fixed header"));
+    if record_count > MAX_LEDGER_RECORDS as u64 {
+        return Err(LedgerError::CapacityExceeded {
+            records: record_count,
+            max_records: MAX_LEDGER_RECORDS as u64,
+        });
+    }
+    let expected_length = (LEDGER_V2_DATA_OFFSET as u64)
+        .checked_add(record_count.saturating_mul(LEDGER_RECORD_BYTES as u64))
+        .ok_or(LedgerError::CapacityExceeded {
+            records: record_count,
+            max_records: MAX_LEDGER_RECORDS as u64,
+        })?;
+    if data_length != expected_length {
+        return Err(LedgerError::corrupt(
+            offset + 28,
+            "v2 header data length does not match record count",
+        ));
+    }
+    Ok(ParsedV2Header {
+        slot,
+        generation,
+        record_count,
+        data_length,
+    })
+}
+
+fn parse_ledger_v2(bytes: &[u8]) -> Result<ParsedV2Ledger, LedgerError> {
+    if bytes.len() < LEDGER_V2_DATA_OFFSET {
+        return Err(LedgerError::truncated(
+            bytes.len(),
+            LEDGER_V2_DATA_OFFSET,
+            bytes.len(),
+        ));
+    }
+    let first = parse_v2_header(bytes, 0);
+    let second = parse_v2_header(bytes, 1);
+    let first_error = first.as_ref().err().cloned();
+    let second_error = second.as_ref().err().cloned();
+    let valid = [first.ok(), second.ok()];
+    let Some(selected) = valid
+        .iter()
+        .flatten()
+        .max_by_key(|header| header.generation)
+        .copied()
+    else {
+        // Prefer the first slot's detailed error. Returning a structural
+        // error instead of accepting either slot is fail-closed when both
+        // redundant commits are unavailable.
+        return Err(first_error
+            .or(second_error)
+            .unwrap_or_else(|| LedgerError::corrupt(0, "v2 ledger has no valid commit header")));
+    };
+    if let (Some(left), Some(right)) = (valid[0], valid[1])
+        && left.generation == right.generation
+        && (left.record_count != right.record_count || left.data_length != right.data_length)
+    {
+        return Err(LedgerError::corrupt(
+            0,
+            "v2 commit headers disagree at the same generation",
+        ));
+    }
+    // Generation zero is the initial two-slot commit. Requiring both copies
+    // at that generation prevents a partially-created file or a one-byte
+    // header mutation from being mistaken for a healthy ledger. Once a later
+    // generation exists, one damaged inactive slot is exactly the crash case
+    // the redundant format is designed to survive.
+    if selected.generation == 0 && (valid[0].is_none() || valid[1].is_none()) {
+        return Err(LedgerError::corrupt(
+            0,
+            "initial v2 commit is missing one redundant header",
+        ));
+    }
+    let data_length =
+        usize::try_from(selected.data_length).map_err(|_| LedgerError::CapacityExceeded {
+            records: selected.record_count,
+            max_records: MAX_LEDGER_RECORDS as u64,
+        })?;
+    if bytes.len() < data_length {
+        return Err(LedgerError::truncated(
+            bytes.len(),
+            data_length,
+            bytes.len(),
+        ));
+    }
+    let record_count =
+        usize::try_from(selected.record_count).map_err(|_| LedgerError::CapacityExceeded {
+            records: selected.record_count,
+            max_records: MAX_LEDGER_RECORDS as u64,
+        })?;
+    let record_bytes = &bytes[LEDGER_V2_DATA_OFFSET..data_length];
+    if record_bytes.len() != record_count * LEDGER_RECORD_BYTES {
+        return Err(LedgerError::corrupt(
+            LEDGER_V2_DATA_OFFSET,
+            "v2 record byte length does not match selected header",
+        ));
+    }
+    let mut issued = BTreeSet::new();
+    for (index, record) in record_bytes.chunks_exact(LEDGER_RECORD_BYTES).enumerate() {
+        let offset = LEDGER_V2_DATA_OFFSET + index * LEDGER_RECORD_BYTES;
+        let (kind, identity) = parse_record(record, index as u64, offset)?;
+        if !issued.insert(identity) {
+            return Err(LedgerError::Duplicate { kind, identity });
+        }
+    }
+    let tail = &bytes[data_length..];
+    let recover_tail = if tail.is_empty() {
+        false
+    } else {
+        validate_staged_tail(tail, selected.record_count, data_length)?;
+        true
+    };
+    Ok(ParsedV2Ledger {
+        issued,
+        next_sequence: selected.record_count,
+        generation: selected.generation,
+        active_slot: selected.slot,
+        committed_length: selected.data_length,
+        recover_tail,
+    })
+}
+
+fn validate_staged_tail(
+    tail: &[u8],
+    first_sequence: u64,
+    offset: usize,
+) -> Result<(), LedgerError> {
+    let complete_bytes = tail.len() / LEDGER_RECORD_BYTES * LEDGER_RECORD_BYTES;
+    for (index, record) in tail[..complete_bytes]
+        .chunks_exact(LEDGER_RECORD_BYTES)
+        .enumerate()
+    {
+        let record_offset = offset + index * LEDGER_RECORD_BYTES;
+        let _ = parse_record(record, first_sequence + index as u64, record_offset)?;
+    }
+    let partial = &tail[complete_bytes..];
+    if !partial.is_empty() {
+        validate_partial_record_prefix(
+            partial,
+            first_sequence + (complete_bytes / LEDGER_RECORD_BYTES) as u64,
+            offset + complete_bytes,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_partial_record_prefix(
+    partial: &[u8],
+    expected_sequence: u64,
+    offset: usize,
+) -> Result<(), LedgerError> {
+    if partial[0] != LEDGER_VERSION {
+        return Err(LedgerError::corrupt(
+            offset,
+            "staged tail has an invalid record version",
+        ));
+    }
+    if partial.len() >= 2 && IdentityKind::from_tag(partial[1]).is_none() {
+        return Err(LedgerError::corrupt(
+            offset + 1,
+            "staged tail has an unknown identity kind",
+        ));
+    }
+    if partial.len() >= 4 && partial[2..4] != [0, 0] {
+        return Err(LedgerError::corrupt(
+            offset + 2,
+            "staged tail reserved bytes are non-zero",
+        ));
+    }
+    if partial.len() >= 12 {
+        let sequence = u64::from_le_bytes(partial[4..12].try_into().expect("fixed prefix"));
+        if sequence != expected_sequence {
+            return Err(LedgerError::corrupt(
+                offset + 4,
+                "staged tail record sequence is not contiguous",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_record(
+    record: &[u8],
+    expected_sequence: u64,
+    offset: usize,
+) -> Result<(IdentityKind, [u8; ID_BYTES]), LedgerError> {
+    if record.len() != LEDGER_RECORD_BYTES {
+        return Err(LedgerError::truncated(
+            offset,
+            LEDGER_RECORD_BYTES,
+            record.len(),
+        ));
+    }
+    if record[0] != LEDGER_VERSION {
+        return Err(LedgerError::UnsupportedVersion { version: record[0] });
+    }
+    if record[2..4] != [0, 0] {
+        return Err(LedgerError::corrupt(
+            offset + 2,
+            "record reserved bytes are non-zero",
+        ));
+    }
+    let sequence = u64::from_le_bytes(record[4..12].try_into().expect("fixed record"));
+    if sequence != expected_sequence {
+        return Err(LedgerError::corrupt(
+            offset + 4,
+            "record sequence is not contiguous",
+        ));
+    }
+    let Some(kind) = IdentityKind::from_tag(record[1]) else {
+        return Err(LedgerError::corrupt(offset + 1, "unknown identity kind"));
+    };
+    let expected_checksum = u32::from_le_bytes(record[28..32].try_into().expect("fixed record"));
+    if checksum(&record[..28]) != expected_checksum {
+        return Err(LedgerError::corrupt(
+            offset + 28,
+            "record checksum mismatch",
+        ));
+    }
+    let identity: [u8; ID_BYTES] = record[12..28].try_into().expect("fixed identity");
+    Ok((kind, identity))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1765,6 +2266,7 @@ pub struct CapabilityLease {
     session_id: SessionId,
     subject_id: SubjectId,
     capability_id: CapabilityId,
+    policy_digest: Option<AuthorityPolicyDigest>,
 }
 
 impl CapabilityLease {
@@ -1779,6 +2281,23 @@ impl CapabilityLease {
             session_id,
             subject_id,
             capability_id,
+            policy_digest: None,
+        }
+    }
+
+    /// Creates a production lease bound to the exact guest authority policy digest.
+    #[must_use]
+    pub const fn new_bound(
+        session_id: SessionId,
+        subject_id: SubjectId,
+        capability_id: CapabilityId,
+        policy_digest: AuthorityPolicyDigest,
+    ) -> Self {
+        Self {
+            session_id,
+            subject_id,
+            capability_id,
+            policy_digest: Some(policy_digest),
         }
     }
 
@@ -1798,6 +2317,12 @@ impl CapabilityLease {
     #[must_use]
     pub const fn capability_id(&self) -> CapabilityId {
         self.capability_id
+    }
+
+    /// Returns the guest authority policy digest carried by a production lease.
+    #[must_use]
+    pub const fn policy_digest(&self) -> Option<AuthorityPolicyDigest> {
+        self.policy_digest
     }
 }
 
@@ -3227,8 +3752,96 @@ mod tests {
             fs::metadata(&fixture.path)
                 .expect("rejected ledger must remain for operator recovery")
                 .len(),
-            LEDGER_HEADER_BYTES as u64 + 1
+            LEDGER_V2_DATA_OFFSET as u64 + 1
         );
+    }
+
+    #[test]
+    fn durable_ledger_recovers_when_the_inactive_commit_header_is_torn() {
+        let fixture = DurableLedgerFixture::new("header-redundancy");
+        let identity = [0x81; ID_BYTES];
+        {
+            let mut ledger = DurableIdentityLedger::open(&fixture.path).expect("ledger must open");
+            ledger
+                .reserve(IdentityKind::Session, identity)
+                .expect("reservation must commit");
+        }
+        // After the first reservation slot one is active and slot zero is the
+        // inactive copy. A damaged inactive copy must not hide the durable
+        // commit in the other slot.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .expect("ledger must be writable");
+        file.seek(SeekFrom::Start(60))
+            .expect("inactive checksum offset must be reachable");
+        file.write_all(&[0xff])
+            .expect("test must tear inactive checksum");
+        file.sync_all().expect("test corruption must sync");
+
+        let reopened = DurableIdentityLedger::open(&fixture.path)
+            .expect("healthy redundant commit must remain recoverable");
+        assert!(reopened.contains(identity));
+        assert_eq!(reopened.committed_count(), 1);
+    }
+
+    #[test]
+    fn durable_ledger_truncates_only_a_structurally_valid_staged_tail() {
+        let fixture = DurableLedgerFixture::new("staged-tail");
+        let committed = [0x82; ID_BYTES];
+        let staged = [0x83; ID_BYTES];
+        {
+            let mut ledger = DurableIdentityLedger::open(&fixture.path).expect("ledger must open");
+            ledger
+                .reserve(IdentityKind::Session, committed)
+                .expect("reservation must commit");
+        }
+        let staged_record = ledger_record(IdentityKind::Vm, staged, 1);
+        let partial_record = ledger_record(IdentityKind::Request, [0x84; ID_BYTES], 2);
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&fixture.path)
+            .expect("ledger must be writable");
+        file.write_all(&staged_record)
+            .and_then(|()| file.write_all(&partial_record[..12]))
+            .and_then(|()| file.sync_all())
+            .expect("test must append a staged complete and partial record");
+
+        let reopened = DurableIdentityLedger::open(&fixture.path)
+            .expect("staged tail must be discarded during recovery");
+        assert!(reopened.contains(committed));
+        assert!(!reopened.contains(staged));
+        assert_eq!(reopened.committed_count(), 1);
+        assert_eq!(
+            fs::metadata(&fixture.path)
+                .expect("ledger metadata must be readable")
+                .len(),
+            LEDGER_V2_DATA_OFFSET as u64 + LEDGER_RECORD_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn durable_ledger_rejects_corruption_inside_the_committed_record_region() {
+        let fixture = DurableLedgerFixture::new("committed-record-corruption");
+        {
+            let mut ledger = DurableIdentityLedger::open(&fixture.path).expect("ledger must open");
+            ledger
+                .reserve(IdentityKind::Session, [0x85; ID_BYTES])
+                .expect("reservation must commit");
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .expect("ledger must be writable");
+        file.seek(SeekFrom::Start((LEDGER_V2_DATA_OFFSET + 12) as u64))
+            .expect("record identity offset must be reachable");
+        file.write_all(&[0xff])
+            .and_then(|()| file.sync_all())
+            .expect("test corruption must sync");
+        assert!(matches!(
+            DurableIdentityLedger::open(&fixture.path),
+            Err(LedgerError::Corrupt { .. })
+        ));
     }
 
     #[derive(Debug, Default)]

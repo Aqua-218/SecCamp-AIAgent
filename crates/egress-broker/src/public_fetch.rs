@@ -11,10 +11,11 @@ use std::{
     fmt,
     io::Read,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
+    panic::{self, AssertUnwindSafe},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, RecvTimeoutError},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread,
     time::{Duration, Instant},
@@ -38,7 +39,19 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 pub const HTTPS_PORT: u16 = 443;
 const MAX_REDIRECT_LOCATION_BYTES: usize = 8 * 1024;
 const MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
-static SYSTEM_RESOLUTION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Maximum number of addresses retained from one DNS answer.
+pub const MAX_DNS_ANSWER_IPS: usize = 32;
+/// Number of process-wide resolver workers. A worker blocked in the OS
+/// resolver cannot be forcibly cancelled, so this remains finite and small.
+pub const DNS_RESOLVER_WORKER_COUNT: usize = 1;
+/// Maximum queued resolver requests after the active worker.
+pub const DNS_RESOLVER_QUEUE_CAPACITY: usize = 8;
+// Unit tests intentionally run in parallel. Keep their process-wide fixture
+// queue large enough that an unrelated blocking-resolver test cannot turn
+// every short deterministic lookup into a saturation assertion; production
+// continues to use the documented eight-entry queue.
+#[cfg(test)]
+const TEST_DNS_RESOLVER_QUEUE_CAPACITY: usize = 64;
 
 /// A validated host/path pair supplied to a connector.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,11 +108,11 @@ pub trait Resolver: Send + Sync + 'static {
     /// Returns [`ResolveError`] when the host cannot be resolved.
     fn resolve(&self, host: &CanonicalHost) -> Result<Vec<IpAddr>, ResolveError>;
 
-    /// Returns whether blocking lookups must share the production process-wide worker limit.
+    /// Returns whether this resolver uses a blocking platform API.
     ///
-    /// The default keeps deterministic extension resolvers independent. A resolver backed by a
-    /// platform API without cancellation must opt in so a stuck lookup cannot be multiplied by
-    /// constructing new [`PublicFetcher`] values or starting new sessions.
+    /// The bounded process-wide resolver pool applies to every resolver. This marker is retained
+    /// for source compatibility with the previous admission contract and lets integrations
+    /// document that their implementation cannot forcibly cancel a blocked lookup.
     #[doc(hidden)]
     fn requires_process_wide_worker_limit(&self) -> bool {
         false
@@ -128,10 +141,17 @@ pub struct SystemResolver;
 
 impl Resolver for SystemResolver {
     fn resolve(&self, host: &CanonicalHost) -> Result<Vec<IpAddr>, ResolveError> {
-        (host.as_str(), HTTPS_PORT)
+        let addresses = (host.as_str(), HTTPS_PORT)
             .to_socket_addrs()
-            .map(|addresses| addresses.map(|address| address.ip()).collect())
-            .map_err(|_| ResolveError::LookupFailed)
+            .map_err(|_| ResolveError::LookupFailed)?;
+        let mut resolved = Vec::new();
+        for address in addresses {
+            if resolved.len() >= MAX_DNS_ANSWER_IPS {
+                return Err(ResolveError::AnswerLimitExceeded);
+            }
+            resolved.push(address.ip());
+        }
+        Ok(resolved)
     }
 
     fn requires_process_wide_worker_limit(&self) -> bool {
@@ -298,8 +318,10 @@ impl PublicResponse {
 pub enum ResolveError {
     /// The resolver could not provide an answer.
     LookupFailed,
-    /// A previous timed-out lookup is still occupying the bounded resolver worker.
+    /// Bounded resolver admission is unavailable (for example, the queue is full).
     Unavailable,
+    /// The complete answer exceeded the host's bounded address-set capacity.
+    AnswerLimitExceeded,
 }
 
 impl fmt::Display for ResolveError {
@@ -309,6 +331,10 @@ impl fmt::Display for ResolveError {
                 formatter.write_str("DNS resolution failed for the requested host")
             }
             Self::Unavailable => formatter.write_str("DNS resolution is temporarily unavailable"),
+            Self::AnswerLimitExceeded => write!(
+                formatter,
+                "DNS answer exceeded the {MAX_DNS_ANSWER_IPS}-address broker limit"
+            ),
         }
     }
 }
@@ -510,32 +536,21 @@ where
         host: &CanonicalHost,
         timeout: Duration,
     ) -> Result<Vec<IpAddr>, FetchError> {
-        let gate = if self.resolver.requires_process_wide_worker_limit() {
-            ResolutionGate::ProcessWide(&SYSTEM_RESOLUTION_IN_FLIGHT)
-        } else {
-            ResolutionGate::Fetcher(Arc::clone(&self.resolution_in_flight))
-        };
+        let gate = ResolutionGate::Fetcher(Arc::clone(&self.resolution_in_flight));
         let permit = ResolutionPermit::acquire(gate)
             .ok_or(FetchError::Resolve(ResolveError::Unavailable))?;
-        let resolver = Arc::clone(&self.resolver);
+        let resolver: Arc<dyn Resolver> = self.resolver.clone();
         let host = host.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
-        let worker = thread::Builder::new()
-            .name("egress-dns-resolver".to_owned())
-            .spawn(move || {
-                let result = resolver.resolve(&host);
-                // Release the single-worker gate before publishing the answer,
-                // so a completed lookup cannot transiently reject the next hop.
-                drop(permit);
-                let _ = sender.send(result);
-            })
-            .map_err(|_| FetchError::Resolve(ResolveError::LookupFailed))?;
-
-        // The platform resolver API has no portable cancellation primitive.
-        // Detaching keeps the capability guard and Broker worker bounded by the
-        // request deadline. The permit prevents a timed-out lookup from being
-        // multiplied into an unbounded set of abandoned resolver threads.
-        drop(worker);
+        let task = ResolutionTask {
+            resolver,
+            host,
+            sender,
+            permit,
+        };
+        ResolutionPool::global()
+            .and_then(|pool| pool.submit(task))
+            .map_err(FetchError::Resolve)?;
         match receiver.recv_timeout(timeout) {
             Ok(result) => result.map_err(FetchError::Resolve),
             Err(RecvTimeoutError::Timeout) => Err(FetchError::OverallTimeout),
@@ -546,16 +561,92 @@ where
     }
 }
 
+struct ResolutionTask {
+    resolver: Arc<dyn Resolver>,
+    host: CanonicalHost,
+    sender: SyncSender<Result<Vec<IpAddr>, ResolveError>>,
+    permit: ResolutionPermit,
+}
+
+/// One process-wide bounded pool for resolver calls.
+///
+/// `ToSocketAddrs`/`getaddrinfo` has no portable cancellation primitive. A
+/// timed-out task therefore remains owned by this fixed worker until the OS
+/// call returns, while callers only abandon their bounded result channel. No
+/// request creates a new thread, and the queue rejects work once its finite
+/// capacity is reached.
+struct ResolutionPool {
+    sender: SyncSender<ResolutionTask>,
+}
+
+impl ResolutionPool {
+    fn global() -> Result<&'static Self, ResolveError> {
+        static POOL: OnceLock<Result<ResolutionPool, ()>> = OnceLock::new();
+        match POOL.get_or_init(Self::new) {
+            Ok(pool) => Ok(pool),
+            Err(()) => Err(ResolveError::Unavailable),
+        }
+    }
+
+    fn new() -> Result<Self, ()> {
+        debug_assert_eq!(DNS_RESOLVER_WORKER_COUNT, 1);
+        #[cfg(test)]
+        let queue_capacity = TEST_DNS_RESOLVER_QUEUE_CAPACITY;
+        #[cfg(not(test))]
+        let queue_capacity = DNS_RESOLVER_QUEUE_CAPACITY;
+        Self::new_with_capacity(queue_capacity)
+    }
+
+    fn new_with_capacity(queue_capacity: usize) -> Result<Self, ()> {
+        let (sender, receiver) = mpsc::sync_channel(queue_capacity);
+        thread::Builder::new()
+            .name("egress-dns-resolver-0".to_owned())
+            .spawn(move || run_resolution_worker(receiver))
+            .map_err(|_| ())?;
+        Ok(Self { sender })
+    }
+
+    fn submit(&self, task: ResolutionTask) -> Result<(), ResolveError> {
+        self.sender.try_send(task).map_err(|error| match error {
+            TrySendError::Full(_) | TrySendError::Disconnected(_) => ResolveError::Unavailable,
+        })
+    }
+}
+
+fn run_resolution_worker(receiver: Receiver<ResolutionTask>) {
+    for task in receiver {
+        let ResolutionTask {
+            resolver,
+            host,
+            sender,
+            permit,
+        } = task;
+        let result = panic::catch_unwind(AssertUnwindSafe(|| resolver.resolve(&host)))
+            .unwrap_or(Err(ResolveError::LookupFailed))
+            .and_then(bound_dns_answer);
+        // Release the per-fetcher admission before publishing the result. A
+        // completed lookup must not transiently reject the next hop.
+        drop(permit);
+        let _ = sender.send(result);
+    }
+}
+
+fn bound_dns_answer(addresses: Vec<IpAddr>) -> Result<Vec<IpAddr>, ResolveError> {
+    if addresses.len() > MAX_DNS_ANSWER_IPS {
+        Err(ResolveError::AnswerLimitExceeded)
+    } else {
+        Ok(addresses)
+    }
+}
+
 enum ResolutionGate {
     Fetcher(Arc<AtomicBool>),
-    ProcessWide(&'static AtomicBool),
 }
 
 impl ResolutionGate {
     fn in_flight(&self) -> &AtomicBool {
         match self {
             Self::Fetcher(in_flight) => in_flight,
-            Self::ProcessWide(in_flight) => in_flight,
         }
     }
 }
@@ -666,7 +757,7 @@ mod tests {
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::{
             Arc, Condvar, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
         time::{Duration, Instant},
@@ -742,6 +833,90 @@ mod tests {
         calls: Arc<AtomicUsize>,
         release: Arc<(Mutex<bool>, Condvar)>,
         finished: mpsc::SyncSender<()>,
+    }
+
+    struct PoolBlockingResolver {
+        started: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    struct ReusableBlockingResolver {
+        started: mpsc::SyncSender<()>,
+        completed: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<usize>, Condvar)>,
+    }
+
+    struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let (release_lock, release_signal) = &*self.0;
+            if let Ok(mut released) = release_lock.lock() {
+                *released = true;
+                release_signal.notify_all();
+            }
+        }
+    }
+
+    impl Resolver for PoolBlockingResolver {
+        fn resolve(&self, _host: &CanonicalHost) -> Result<Vec<IpAddr>, ResolveError> {
+            self.started
+                .send(())
+                .expect("pool test must retain the started signal");
+            let (release_lock, release_signal) = &*self.release;
+            let mut released = release_lock
+                .lock()
+                .expect("pool release lock must not be poisoned");
+            while !*released {
+                released = release_signal
+                    .wait(released)
+                    .expect("pool release wait must not be poisoned");
+            }
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))])
+        }
+    }
+
+    impl Resolver for ReusableBlockingResolver {
+        fn resolve(&self, _host: &CanonicalHost) -> Result<Vec<IpAddr>, ResolveError> {
+            self.started
+                .send(())
+                .expect("repeated pool test must retain the started signal");
+            let (release_lock, release_signal) = &*self.release;
+            let mut permits = release_lock
+                .lock()
+                .expect("repeated pool release lock must not be poisoned");
+            while *permits == 0 {
+                permits = release_signal
+                    .wait(permits)
+                    .expect("repeated pool release wait must not be poisoned");
+            }
+            *permits -= 1;
+            self.completed
+                .send(())
+                .expect("repeated pool test must retain the completed signal");
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))])
+        }
+    }
+
+    fn pool_task(
+        resolver: Arc<dyn Resolver>,
+    ) -> (
+        super::ResolutionTask,
+        mpsc::Receiver<Result<Vec<IpAddr>, ResolveError>>,
+    ) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let gate = Arc::new(AtomicBool::new(false));
+        let permit = super::ResolutionPermit::acquire(super::ResolutionGate::Fetcher(gate))
+            .expect("fresh pool task gate must be available");
+        (
+            super::ResolutionTask {
+                resolver,
+                host: CanonicalHost::new("public.example").expect("fixture host"),
+                sender,
+                permit,
+            },
+            receiver,
+        )
     }
 
     impl Resolver for BlockingResolver {
@@ -854,12 +1029,14 @@ mod tests {
         );
     }
 
-    // Requirement: DNS consumes the same total deadline as redirects, connection, and body I/O.
+    // Requirement: DNS consumes the same total deadline as redirects, connection, and body I/O;
+    // a second caller queues within the fixed pool rather than spawning a worker.
     // Category: timeout/concurrency/resource. Risk: critical.
     #[test]
     fn dns_timeout_bounds_abandoned_resolution_work_across_fetchers() {
         let calls = Arc::new(AtomicUsize::new(0));
         let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let _release_on_panic = ReleaseOnDrop(Arc::clone(&release));
         let (finished_sender, finished_receiver) = mpsc::sync_channel(2);
         let targets = Arc::new(Mutex::new(Vec::new()));
         let fetcher = PublicFetcher::new(
@@ -904,7 +1081,7 @@ mod tests {
         );
         assert_eq!(
             second_fetcher.fetch(&request("/guide", 32), &authority("/guide", 32)),
-            Err(FetchError::Resolve(ResolveError::Unavailable))
+            Err(FetchError::OverallTimeout)
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(
@@ -921,7 +1098,156 @@ mod tests {
         release_signal.notify_all();
         finished_receiver
             .recv_timeout(Duration::from_secs(1))
-            .expect("bounded test resolver must finish after release");
+            .expect("first bounded test resolver must finish after release");
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued bounded test resolver must finish after release");
+    }
+
+    // Requirement: an oversized DNS answer is rejected before IP-policy
+    // dispatch or connector invocation.
+    // Category: boundary/resource exhaustion. Risk: critical.
+    #[test]
+    fn dns_answer_cap_fails_closed_before_dispatch() {
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let addresses =
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)); super::MAX_DNS_ANSWER_IPS + 1];
+        let resolver = QueueResolver(Arc::new(Mutex::new(VecDeque::from([addresses]))));
+        let fetcher = PublicFetcher::new(
+            resolver,
+            MockConnector {
+                responses: Mutex::new(VecDeque::new()),
+                targets: Arc::clone(&targets),
+            },
+            IpPolicy::default(),
+            FetchPolicy::default(),
+        );
+        assert_eq!(
+            fetcher.fetch(&request("/guide", 32), &authority("/guide", 32)),
+            Err(FetchError::Resolve(ResolveError::AnswerLimitExceeded))
+        );
+        assert!(targets.lock().expect("target log lock").is_empty());
+    }
+
+    // Requirement: the fixed resolver pool rejects excess queued work without
+    // creating another worker, then recovers after the stuck OS lookup returns.
+    // Category: concurrency/resource exhaustion. Risk: critical.
+    #[test]
+    fn resolver_pool_queue_saturates_and_recovers_after_timeout() {
+        let pool = super::ResolutionPool::new_with_capacity(1)
+            .expect("test resolver pool must spawn its one worker");
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let blocking: Arc<dyn Resolver> = Arc::new(PoolBlockingResolver {
+            started: started_sender,
+            release: Arc::clone(&release),
+        });
+
+        let (first_task, first_result) = pool_task(Arc::clone(&blocking));
+        pool.submit(first_task).expect("first task must start");
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker must enter the blocking resolver");
+        // Simulate a caller timing out and dropping its result receiver. The
+        // worker remains the sole owner of the un-cancellable OS lookup.
+        drop(first_result);
+
+        let (queued_task, queued_result) = pool_task(Arc::clone(&blocking));
+        pool.submit(queued_task)
+            .expect("one bounded queue slot must remain available");
+        let (rejected_task, _rejected_result) = pool_task(Arc::clone(&blocking));
+        assert_eq!(
+            pool.submit(rejected_task),
+            Err(ResolveError::Unavailable),
+            "queue saturation must fail fast"
+        );
+
+        let (release_lock, release_signal) = &*release;
+        *release_lock.lock().expect("pool release lock") = true;
+        release_signal.notify_all();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued resolver must enter after release");
+        assert_eq!(
+            queued_result
+                .recv_timeout(Duration::from_secs(1))
+                .expect("queued task must recover after release")
+                .expect("queued resolver must succeed")
+                .len(),
+            1
+        );
+
+        // A recovery submission proves the worker was reused rather than a
+        // fresh detached thread being created for every timed-out lookup.
+        let (recovery_task, recovery_result) = pool_task(Arc::clone(&blocking));
+        pool.submit(recovery_task)
+            .expect("pool must accept recovery work");
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recovery resolver must enter the reused worker");
+        assert!(
+            recovery_result
+                .recv_timeout(Duration::from_secs(1))
+                .expect("recovery task must complete")
+                .is_ok()
+        );
+    }
+
+    // Requirement: repeated caller timeouts do not create additional workers;
+    // each abandoned lookup eventually releases its bounded worker and the
+    // same pool remains usable.
+    // Category: concurrency/resource exhaustion. Risk: critical.
+    #[test]
+    fn resolver_pool_repeated_timeouts_reuse_one_worker() {
+        let pool = super::ResolutionPool::new_with_capacity(1)
+            .expect("test resolver pool must spawn its one worker");
+        let release = Arc::new((Mutex::new(0_usize), Condvar::new()));
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (completed_sender, completed_receiver) = mpsc::sync_channel(1);
+        let resolver: Arc<dyn Resolver> = Arc::new(ReusableBlockingResolver {
+            started: started_sender,
+            completed: completed_sender,
+            release: Arc::clone(&release),
+        });
+
+        for _ in 0..3 {
+            let (task, result) = pool_task(Arc::clone(&resolver));
+            pool.submit(task).expect("pool must admit one task");
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker must enter each blocking resolver");
+            assert!(matches!(
+                result.recv_timeout(Duration::from_millis(1)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(result);
+
+            let (release_lock, release_signal) = &*release;
+            *release_lock.lock().expect("repeated pool release lock") += 1;
+            release_signal.notify_one();
+            completed_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("abandoned resolver must eventually finish");
+        }
+
+        let (recovery_task, recovery_result) = pool_task(Arc::clone(&resolver));
+        pool.submit(recovery_task)
+            .expect("pool must remain usable after repeated timeouts");
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recovery resolver must enter the reused worker");
+        let (release_lock, release_signal) = &*release;
+        *release_lock.lock().expect("repeated pool release lock") += 1;
+        release_signal.notify_one();
+        completed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recovery resolver must complete");
+        assert!(
+            recovery_result
+                .recv_timeout(Duration::from_secs(1))
+                .expect("recovery result must be published")
+                .is_ok()
+        );
     }
 
     // Requirement: resolver errors fail closed before IP selection or connector invocation.

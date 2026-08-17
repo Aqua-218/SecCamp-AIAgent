@@ -8,7 +8,7 @@
 
 このページは [`crates/egress-protocol/src/session.rs`](../../crates/egress-protocol/src/session.rs) が担当する、Host Egress Broker の replay 防止と request identity の境界を説明する。
 
-この crate はまだ vsock、CBOR、HTTP、GitHub client を実装しない。外部副作用を dispatch する前に transport が必ず通す、小さく独立した state machine と closed operation boundary だけを置いている。これにより、network client を足す前に retry と snapshot restore の安全条件を固定する。
+この crate は vsock、HTTP、GitHub client を実装しない。CBOR request / response schema と、外部副作用を dispatch する前に transport が必ず通す、小さく独立した replay state machine を置いている。これにより、network client の前に retry と snapshot restore の安全条件を固定する。
 
 ```mermaid
 sequenceDiagram
@@ -41,6 +41,8 @@ sequenceDiagram
 | `PayloadHash` | canonical payload の SHA-256 | 同じ request ID への別内容のすり替え |
 
 `SessionReplayGuard` は、最初に新しい request を一度だけ `New` として受け入れる。同じ session、sequence、request ID、payload hash の完全一致だけが `Duplicate` になる。`Duplicate` のとき dispatcher は外部操作を再実行せず、保存してある元の outcome を返す。
+
+未検証 bytes を扱う ingress は `BrokerEnvelope::from_canonical_payload` で hash を導出し、`SessionReplayGuard::accept_payload` で同じ payload を検査してから受理する。payload hash を直接受け取る constructor と payload 無しの `accept` は crate-private で、外部 transport からは呼べない。production Broker も canonical decoder が返した exact payload を `accept_payload` へ渡す。
 
 同じ request ID に違う sequence または payload hash を付けた場合、別 session、順序違反、request table の容量超過、`u64` sequence の尽きた後もすべて fail closed である。失敗時は guard の状態を変更しない。
 

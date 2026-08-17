@@ -17,17 +17,14 @@ use std::{
     fmt, fs,
     io::{self, Read, Write},
     os::{
-        fd::RawFd,
-        unix::{fs::PermissionsExt, net::UnixListener},
+        fd::{OwnedFd, RawFd},
+        unix::{fs::PermissionsExt, net::UnixStream},
     },
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     thread::sleep,
     time::{Duration, Instant},
 };
-
-use authority_core::{capability::SubjectId, handle::HandleId};
-use rustix::net::sockopt::socket_peercred;
 
 use crate::{
     capfs_resources::CapfsHostResources,
@@ -37,6 +34,7 @@ use crate::{
         WorkloadHandle,
     },
 };
+use authority_core::{capability::SubjectId, handle::HandleId};
 
 /// How long a stopped workload is given to leave its cgroup before stop reports failure.
 const WORKLOAD_STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -167,7 +165,6 @@ impl WorkloadIsolationConfig {
             "--host-gid",
             self.limits.group_id.to_string(),
         );
-        append_argument(&mut arguments, "--start-gate", launch.start_gate);
         append_argument(&mut arguments, "--control-socket", launch.control_path);
         append_argument(
             &mut arguments,
@@ -208,7 +205,6 @@ impl WorkloadIsolationConfig {
 struct IsolatedWorkloadLaunch<'a> {
     workspace_source: &'a Path,
     cgroup_root: &'a Path,
-    start_gate: &'a Path,
     subject: &'a SubjectId,
     control_path: &'a Path,
     workload_program: &'a Path,
@@ -470,86 +466,50 @@ struct SubjectWorkload {
     start_gate: Option<WorkloadStartGate>,
 }
 
-/// Parent-owned gate that prevents an expendable launcher from entering isolation too early.
+/// Parent-owned inherited channel that gates one exact launcher process.
 struct WorkloadStartGate {
-    listener: UnixListener,
-    path: PathBuf,
+    supervisor: UnixStream,
 }
 
 impl WorkloadStartGate {
-    fn bind(directory: &Path, subject: &SubjectId) -> Result<Self, LinuxHostError> {
-        let name = resource_name(subject)?;
-        let path = directory.join(format!("{name}.start-gate.sock"));
-        let listener = UnixListener::bind(&path)
-            .map_err(|source| io_error("binding workload start gate", source))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .map_err(|source| io_error("restricting workload start gate", source))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|source| io_error("making workload start gate nonblocking", source))?;
-        Ok(Self { listener, path })
+    fn pair() -> Result<(Self, UnixStream, UnixStream), LinuxHostError> {
+        let (supervisor, launcher) = UnixStream::pair()
+            .map_err(|source| io_error("creating inherited workload start gate", source))?;
+        supervisor
+            .set_read_timeout(Some(WORKLOAD_START_TIMEOUT))
+            .map_err(|source| io_error("setting workload start-gate read timeout", source))?;
+        supervisor
+            .set_write_timeout(Some(WORKLOAD_START_TIMEOUT))
+            .map_err(|source| io_error("setting workload start-gate write timeout", source))?;
+        let launcher_output = launcher
+            .try_clone()
+            .map_err(|source| io_error("duplicating inherited workload start gate", source))?;
+        Ok((Self { supervisor }, launcher, launcher_output))
     }
 
-    fn release(&self) -> Result<(), LinuxHostError> {
-        let deadline = Instant::now() + WORKLOAD_START_TIMEOUT;
-        loop {
-            match self.listener.accept() {
-                Ok((mut stream, _)) => {
-                    let peer = socket_peercred(&stream)
-                        .map_err(|error| LinuxHostError::StartGate(error.to_string()))?;
-                    if peer.uid.as_raw() != 0 || peer.gid.as_raw() != 0 {
-                        return Err(LinuxHostError::StartGate(
-                            "start-gate peer is not the root-owned launcher".to_owned(),
-                        ));
-                    }
-                    stream
-                        .set_read_timeout(Some(WORKLOAD_START_TIMEOUT))
-                        .map_err(|source| {
-                            io_error("setting workload start-gate read timeout", source)
-                        })?;
-                    let mut ready = [0_u8; START_GATE_READY.len()];
-                    stream.read_exact(&mut ready).map_err(|source| {
-                        io_error("reading workload start-gate readiness", source)
-                    })?;
-                    if ready != *START_GATE_READY {
-                        return Err(LinuxHostError::StartGate(
-                            "start-gate peer sent an invalid readiness marker".to_owned(),
-                        ));
-                    }
-                    stream
-                        .write_all(&START_GATE_RELEASE)
-                        .map_err(|source| io_error("releasing workload start gate", source))?;
-                    let mut isolated = [0_u8; START_GATE_ISOLATED.len()];
-                    stream.read_exact(&mut isolated).map_err(|source| {
-                        io_error("reading isolated workload startup attestation", source)
-                    })?;
-                    if isolated != *START_GATE_ISOLATED {
-                        return Err(LinuxHostError::StartGate(
-                            "launcher sent an invalid isolation attestation".to_owned(),
-                        ));
-                    }
-                    return Ok(());
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return Err(LinuxHostError::StartGate(format!(
-                            "root-owned launcher did not connect within {} seconds",
-                            WORKLOAD_START_TIMEOUT.as_secs()
-                        )));
-                    }
-                    sleep(WORKLOAD_POLL_INTERVAL);
-                }
-                Err(source) => return Err(io_error("accepting workload start gate", source)),
-            }
+    fn release(&mut self) -> Result<(), LinuxHostError> {
+        let mut ready = [0_u8; START_GATE_READY.len()];
+        self.supervisor.read_exact(&mut ready).map_err(|source| {
+            io_error("reading inherited workload start-gate readiness", source)
+        })?;
+        if ready != *START_GATE_READY {
+            return Err(LinuxHostError::StartGate(
+                "inherited launcher sent an invalid readiness marker".to_owned(),
+            ));
         }
-    }
-
-    fn remove(&self) -> Result<(), LinuxHostError> {
-        match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(io_error("removing workload start gate", source)),
+        self.supervisor
+            .write_all(&START_GATE_RELEASE)
+            .map_err(|source| io_error("releasing inherited workload start gate", source))?;
+        let mut isolated = [0_u8; START_GATE_ISOLATED.len()];
+        self.supervisor
+            .read_exact(&mut isolated)
+            .map_err(|source| io_error("reading executed workload startup attestation", source))?;
+        if isolated != *START_GATE_ISOLATED {
+            return Err(LinuxHostError::StartGate(
+                "launcher sent an invalid executed-workload attestation".to_owned(),
+            ));
         }
+        Ok(())
     }
 }
 
@@ -719,6 +679,36 @@ impl LinuxHostResources {
             sleep(WORKLOAD_POLL_INTERVAL);
         }
     }
+
+    fn stop_and_reap_launcher(
+        child: &mut Child,
+        subject: &SubjectId,
+    ) -> Result<(), LinuxHostError> {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {
+                if let Err(error) = child.kill()
+                    && error.kind() != io::ErrorKind::InvalidInput
+                {
+                    return Err(io_error("killing the workload launcher", error));
+                }
+            }
+            Err(error) => return Err(io_error("checking the workload launcher", error)),
+        }
+        let deadline = Instant::now() + WORKLOAD_STOP_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) if Instant::now() < deadline => sleep(WORKLOAD_POLL_INTERVAL),
+                Ok(None) => {
+                    return Err(LinuxHostError::WorkloadStopTimeout {
+                        subject: subject.clone(),
+                    });
+                }
+                Err(error) => return Err(io_error("reaping the workload launcher", error)),
+            }
+        }
+    }
 }
 
 fn cgroup_populated(path: &Path) -> Result<bool, LinuxHostError> {
@@ -867,16 +857,14 @@ impl CapfsHostResources for LinuxHostResources {
             return ResourceAcquisition::NoEffect(LinuxHostError::AlreadyOwned("workload"));
         }
 
-        let start_gate =
-            match WorkloadStartGate::bind(&self.config.control_socket_directory, subject) {
-                Ok(start_gate) => start_gate,
-                Err(error) => return ResourceAcquisition::NoEffect(error),
-            };
+        let (start_gate, launcher_stdin, launcher_stdout) = match WorkloadStartGate::pair() {
+            Ok(start_gate) => start_gate,
+            Err(error) => return ResourceAcquisition::NoEffect(error),
+        };
 
         let launch = IsolatedWorkloadLaunch {
             workspace_source: mountpoint,
             cgroup_root: &cgroup_path,
-            start_gate: &start_gate.path,
             subject,
             control_path: &control_path,
             workload_program: &self.config.workload_program,
@@ -889,8 +877,11 @@ impl CapfsHostResources for LinuxHostResources {
             .args(launcher_arguments)
             .env_clear()
             .current_dir("/")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            // The launcher gets both endpoints only as standard input/output. This socketpair is
+            // inherited by the exact spawned process and has no filesystem name another process
+            // can connect to or replace.
+            .stdin(Stdio::from(OwnedFd::from(launcher_stdin)))
+            .stdout(Stdio::from(OwnedFd::from(launcher_stdout)))
             // The fixed guest workload has neither host credentials nor a host-controlled command
             // line. Retaining only stderr makes isolated startup failures observable on the guest
             // serial console without turning normal workload output into a host data channel.
@@ -898,10 +889,6 @@ impl CapfsHostResources for LinuxHostResources {
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                let gate_cleanup = start_gate.remove();
-                if let Err(gate_error) = gate_cleanup {
-                    return ResourceAcquisition::EffectUnknown(gate_error);
-                }
                 return ResourceAcquisition::NoEffect(io_error("spawning the workload", error));
             }
         };
@@ -921,8 +908,8 @@ impl CapfsHostResources for LinuxHostResources {
         );
         let release = self
             .workloads
-            .get(&handle)
-            .and_then(|owned| owned.start_gate.as_ref())
+            .get_mut(&handle)
+            .and_then(|owned| owned.start_gate.as_mut())
             .ok_or_else(|| LinuxHostError::StartGate("start gate disappeared".to_owned()))
             .and_then(WorkloadStartGate::release);
         if let Err(error) = release {
@@ -943,19 +930,8 @@ impl CapfsHostResources for LinuxHostResources {
                         error: LinuxHostError::StartGate("start gate disappeared".to_owned()),
                     };
                 };
-                match start_gate.remove() {
-                    Ok(()) => ResourceAcquisition::Acquired(handle),
-                    Err(error) => {
-                        self.workloads
-                            .get_mut(&handle)
-                            .expect("issued workload token must remain live")
-                            .start_gate = Some(start_gate);
-                        ResourceAcquisition::CleanupRequired {
-                            resource: handle,
-                            error,
-                        }
-                    }
-                }
+                drop(start_gate);
+                ResourceAcquisition::Acquired(handle)
             }
             Ok(false) => ResourceAcquisition::CleanupRequired {
                 resource: handle,
@@ -999,19 +975,13 @@ impl CapfsHostResources for LinuxHostResources {
             self.workloads.insert(workload, owned);
             return ResourceMutation::CleanupRequired(error);
         }
-        if let Some(start_gate) = owned.start_gate.take()
-            && let Err(error) = start_gate.remove()
-        {
-            self.workloads.insert(workload, owned);
-            return ResourceMutation::CleanupRequired(error);
-        }
-        // Reaping is what releases the zombie the supervisor created; the cgroup being empty is
-        // not enough on its own.
-        match owned.child.wait() {
-            Ok(_) => ResourceMutation::Applied,
-            Err(error) => {
-                ResourceMutation::CleanupRequired(io_error("reaping the workload", error))
-            }
+        drop(owned.start_gate.take());
+        // The launcher itself deliberately remains outside the delegated workload cgroup. Stop
+        // and reap it under the same deadline so a launcher stalled before clone3 cannot hang
+        // supervisor shutdown after the cgroup has already become empty.
+        match Self::stop_and_reap_launcher(&mut owned.child, &owned.subject) {
+            Ok(()) => ResourceMutation::Applied,
+            Err(error) => ResourceMutation::CleanupRequired(error),
         }
     }
 
@@ -1125,14 +1095,23 @@ mod tests {
 
     #[test]
     fn isolation_launcher_arguments_bind_each_dynamic_resource() {
-        let config = Fixture::new("arguments")
-            .expect("test fixture must be creatable")
-            .config("/usr/local/libexec/guest-workload", &["--fixed"]);
+        // Argument construction is pure and must not depend on a writable cgroup hierarchy.
+        // Hosted CI intentionally does not delegate `/sys/fs/cgroup` to ordinary test jobs.
+        let config = LinuxHostConfig::new(
+            "/sys/fs/cgroup",
+            std::env::temp_dir(),
+            "/usr/local/libexec/guest-workload",
+            [OsString::from("--fixed")],
+            test_isolation_config(),
+            SubjectCredential::new(
+                rustix::process::geteuid().as_raw(),
+                rustix::process::getegid().as_raw(),
+            ),
+        );
         let subject = SubjectId::new("subject-a");
         let launch = IsolatedWorkloadLaunch {
             workspace_source: Path::new("/run/capfs/subject-a"),
             cgroup_root: Path::new("/sys/fs/cgroup/subject-a"),
-            start_gate: Path::new("/run/supervisor/subject-a.start-gate.sock"),
             subject: &subject,
             control_path: Path::new("/run/supervisor/subject-a.sock"),
             workload_program: &config.workload_program,
@@ -1157,12 +1136,7 @@ mod tests {
                 OsString::from("/sys/fs/cgroup/subject-a"),
             ]
         }));
-        assert!(arguments.windows(2).any(|pair| {
-            pair == [
-                OsString::from("--start-gate"),
-                OsString::from("/run/supervisor/subject-a.start-gate.sock"),
-            ]
-        }));
+        assert!(!arguments.iter().any(|argument| argument == "--start-gate"));
         assert!(arguments.windows(2).any(|pair| {
             pair == [
                 OsString::from("--control-socket"),
@@ -1175,6 +1149,29 @@ mod tests {
             })
         );
         assert_eq!(arguments.last(), Some(&OsString::from("--fixed")));
+    }
+
+    #[test]
+    fn inherited_start_gate_accepts_only_its_socketpair_endpoint() {
+        let (mut gate, mut launcher_input, mut launcher_output) =
+            WorkloadStartGate::pair().expect("an unnamed start gate must be creatable");
+        let launcher = std::thread::spawn(move || {
+            launcher_output
+                .write_all(START_GATE_READY)
+                .expect("launcher must announce readiness");
+            let mut release = [0_u8; START_GATE_RELEASE.len()];
+            launcher_input
+                .read_exact(&mut release)
+                .expect("launcher must receive release");
+            assert_eq!(release, START_GATE_RELEASE);
+            launcher_output
+                .write_all(START_GATE_ISOLATED)
+                .expect("launcher must attest executed isolation");
+        });
+
+        gate.release()
+            .expect("the exact inherited endpoint must open the gate");
+        launcher.join().expect("launcher fixture must exit");
     }
 
     #[test]
@@ -1304,31 +1301,15 @@ mod tests {
     }
 
     #[test]
-    fn host_config_requires_existing_owned_directories() {
+    fn owned_directories_must_exist_and_use_lexical_absolute_paths() {
         let missing = std::env::temp_dir().join(unique("missing"));
-        let config = LinuxHostConfig::new(
-            &missing,
-            std::env::temp_dir(),
-            "/bin/true",
-            [],
-            test_isolation_config(),
-            SubjectCredential::new(0, 0),
-        );
         assert!(matches!(
-            LinuxHostResources::new(config),
+            validate_owned_directory(&missing),
             Err(LinuxHostError::MissingDirectory(_))
         ));
 
-        let relative = LinuxHostConfig::new(
-            "relative/cgroup",
-            std::env::temp_dir(),
-            "/bin/true",
-            [],
-            test_isolation_config(),
-            SubjectCredential::new(0, 0),
-        );
         assert!(matches!(
-            LinuxHostResources::new(relative),
+            validate_owned_directory(Path::new("relative/cgroup")),
             Err(LinuxHostError::InvalidPath(_))
         ));
     }

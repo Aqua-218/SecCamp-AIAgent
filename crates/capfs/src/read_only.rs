@@ -379,6 +379,21 @@ enum AdapterError {
     Internal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalTargetKind {
+    NonDirectory,
+    Directory,
+}
+
+impl RemovalTargetKind {
+    fn accepts(self, actual: NamespaceObjectKind) -> bool {
+        match self {
+            Self::NonDirectory => actual != NamespaceObjectKind::Directory,
+            Self::Directory => actual == NamespaceObjectKind::Directory,
+        }
+    }
+}
+
 impl AdapterError {
     const fn errno(self) -> Errno {
         match self {
@@ -1233,7 +1248,7 @@ impl CapabilityFilesystem {
         self.remove_child(
             parent,
             name,
-            NamespaceObjectKind::RegularFile,
+            RemovalTargetKind::NonDirectory,
             AdapterError::IsDirectory,
             FileEffect::RemoveFile,
         )
@@ -1243,7 +1258,7 @@ impl CapabilityFilesystem {
         self.remove_child(
             parent,
             name,
-            NamespaceObjectKind::Directory,
+            RemovalTargetKind::Directory,
             AdapterError::NotDirectory,
             FileEffect::RemoveDirectory,
         )
@@ -1253,7 +1268,7 @@ impl CapabilityFilesystem {
         &self,
         parent: NodeId,
         name: &str,
-        expected_kind: NamespaceObjectKind,
+        expected_kind: RemovalTargetKind,
         kind_error: AdapterError,
         effect: FileEffect,
     ) -> Result<(), AdapterError> {
@@ -1267,7 +1282,7 @@ impl CapabilityFilesystem {
                 if let Err(error) = self.ensure_healthy() {
                     return NamespaceExecutorOutcome::FailedBeforeCommit(error);
                 }
-                if child.kind() != expected_kind {
+                if !expected_kind.accepts(child.kind()) {
                     return NamespaceExecutorOutcome::FailedBeforeCommit(kind_error);
                 }
                 self.with_authorized_namespace_effect(child, effect, || {
@@ -3193,6 +3208,43 @@ mod tests {
             .remove_file(scoped.node, "allowed.txt")
             .expect("RemoveFile must delete a closed regular file");
         assert!(!directory.path().join("scoped/allowed.txt").exists());
+    }
+
+    // Requirement: POSIX unlink removes both regular files and symbolic links, while directories
+    // remain exclusive to RMDIR. Category: FUSE/remove. Risk: critical.
+    #[test]
+    fn remove_file_accepts_a_symbolic_link_but_not_a_directory() {
+        let (directory, filesystem, _kernel, _capability) = test_filesystem_with_effects(
+            PathPattern::Prefix(path(&["scoped"])),
+            FileEffects::from_effects([
+                FileEffect::CreateDirectory,
+                FileEffect::CreateSymlink,
+                FileEffect::RemoveFile,
+            ]),
+        );
+        let scoped = filesystem
+            .lookup_entry(NodeId::ROOT, "scoped")
+            .expect("remove authority must expose the parent directory");
+        filesystem
+            .create_symlink(scoped.node, "link.txt", "allowed.txt")
+            .expect("CreateSymlink must create the test link");
+
+        filesystem
+            .remove_file(scoped.node, "link.txt")
+            .expect("RemoveFile must unlink a symbolic link without following it");
+        assert!(
+            fs::symlink_metadata(directory.path().join("scoped/link.txt")).is_err(),
+            "the symbolic link name must be removed"
+        );
+        assert!(directory.path().join("scoped/allowed.txt").is_file());
+        filesystem
+            .create_directory(scoped.node, "empty", 0o700, 0)
+            .expect("CreateDirectory must create an empty comparison directory");
+        assert_eq!(
+            filesystem.remove_file(scoped.node, "empty"),
+            Err(AdapterError::IsDirectory),
+            "UNLINK must not remove a directory"
+        );
     }
 
     // Requirement: RMDIR has its own effect and only commits for an empty

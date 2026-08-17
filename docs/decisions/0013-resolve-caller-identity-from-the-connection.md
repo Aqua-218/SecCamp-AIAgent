@@ -61,7 +61,7 @@ production の caller resolver は、**request bytes を decode する前に** s
 - `claimed_subject` は request に残っている。認可に使わないので、値が間違っていても要求は通る。診断で読むときは「guest が名乗った値」であって事実ではないことを踏まえる。
 - 同じ方針が Broker 側にもある。[transport 契約](../egress-broker/transport.md)の listener が peer identity を運び、認可に使う subject は connection から解決する。
 - [ADR 0011](0011-require-an-expected-old-object-plan-for-publish-branch.md) が expected-old object を guest に決めさせなかったのと同じ形の判断。信用しない側が渡した値を安全条件に使わない。
-- production の caller resolver は [`control_socket.rs`](../../crates/supervisor/src/control_socket.rs) にある。`SubjectControlListener` が subject ごとの `SOCK_SEQPACKET` socket を持ち、`SO_PEERCRED` から `ConnectionIdentity` を作り、`SubjectCredentialResolver` へ binding を登録してから connection を返す。request bytes へ到達する唯一の経路が accept 後の `receive_request` なので、「decode より前に subject を決める」がコードの規律ではなく型の性質になっている。実 socket に対する module test で検証済み。guest VM 内の agent process からの end-to-end は [Supervisor adapter](../supervisor/README.md) の未検証範囲に残る。
+- production の caller resolver は [`control_socket.rs`](../../crates/supervisor/src/control_socket.rs) にある。`SubjectControlListener` が subject ごとの `SOCK_SEQPACKET` socket を持ち、`SO_PEERCRED` から `ConnectionIdentity` を作り、`SubjectCredentialResolver` へ binding を登録してから connection を返す。request bytes へ到達する唯一の経路が accept 後の `receive_request` なので、「decode より前に subject を決める」がコードの規律ではなく型の性質になっている。実socket module testに加え、KVM gateがguest supervisorからlistener／Supervisor／isolation launcherまでのcompositionを確認する。
 
 ## 関連
 

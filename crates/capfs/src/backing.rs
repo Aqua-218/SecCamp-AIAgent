@@ -17,6 +17,7 @@ use std::{
 };
 
 use authority_core::{
+    handle::ObjectId,
     path::{CanonicalPath, InvalidPathSegment},
     repository::RepoId,
 };
@@ -38,6 +39,10 @@ const PREFLIGHT_RESOLVE: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_MAGICLINKS)
     .union(ResolveFlags::NO_SYMLINKS)
     .union(ResolveFlags::NO_XDEV);
+const REQUIRED_METADATA: StatxFlags = StatxFlags::TYPE
+    .union(StatxFlags::NLINK)
+    .union(StatxFlags::INO)
+    .union(StatxFlags::MNT_ID);
 
 use crate::namespace::{
     AliasGroup, InvalidSymlinkTarget, ManifestEntry, NamespaceError, NamespaceObjectKind,
@@ -463,6 +468,8 @@ pub enum RepositoryStartupError {
     },
     /// The process-wide repository lease registry cannot be trusted.
     LeaseRegistryUnavailable,
+    /// The object-to-inode identity registry cannot be initialized safely.
+    IdentityRegistryUnavailable,
 }
 
 impl fmt::Display for RepositoryStartupError {
@@ -480,6 +487,9 @@ impl fmt::Display for RepositoryStartupError {
             Self::LeaseRegistryUnavailable => {
                 formatter.write_str("process-wide repository lease registry is unavailable")
             }
+            Self::IdentityRegistryUnavailable => {
+                formatter.write_str("repository object identity registry is unavailable")
+            }
         }
     }
 }
@@ -489,7 +499,9 @@ impl Error for RepositoryStartupError {
         match self {
             Self::Preflight(error) => Some(error),
             Self::Namespace(error) => Some(error),
-            Self::AlreadyOpen { .. } | Self::LeaseRegistryUnavailable => None,
+            Self::AlreadyOpen { .. }
+            | Self::LeaseRegistryUnavailable
+            | Self::IdentityRegistryUnavailable => None,
         }
     }
 }
@@ -518,6 +530,8 @@ pub struct ValidatedRepository {
     root_mount_id: u64,
     entries: Vec<RepositoryEntry>,
     materialized_aliases: Vec<MaterializedAlias>,
+    expected_inodes: Mutex<HashMap<ObjectId, u64>>,
+    expected_paths: Mutex<HashMap<CanonicalPath, u64>>,
     // Kept on the backing owner so `ImportedRepository::into_parts` cannot
     // accidentally release exclusivity while an adapter still holds the fd.
     repository_lease: Option<Arc<RepositoryLease>>,
@@ -646,6 +660,7 @@ impl ImportedRepository {
                 AliasGroup::new(entry.inode()),
             )
         }))?;
+        backing.initialize_object_inodes(&namespace)?;
         backing.repository_lease = Some(lease);
         Ok(Self {
             repository,
@@ -741,6 +756,8 @@ impl ValidatedRepository {
             root_mount_id: opened_root.mount_id,
             entries,
             materialized_aliases,
+            expected_inodes: Mutex::new(HashMap::new()),
+            expected_paths: Mutex::new(HashMap::new()),
             repository_lease: None,
         })
     }
@@ -779,6 +796,231 @@ impl ValidatedRepository {
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.root_fd.as_fd()
     }
+
+    fn initialize_object_inodes(
+        &self,
+        namespace: &NamespaceRegistry,
+    ) -> Result<(), RepositoryStartupError> {
+        let mut expected = self
+            .expected_inodes
+            .lock()
+            .map_err(|_| RepositoryStartupError::IdentityRegistryUnavailable)?;
+        let mut paths = self
+            .expected_paths
+            .lock()
+            .map_err(|_| RepositoryStartupError::IdentityRegistryUnavailable)?;
+        for entry in &self.entries {
+            let object = namespace
+                .object_at_path_snapshot(entry.path())
+                .map_err(RepositoryStartupError::Namespace)?
+                .ok_or(RepositoryStartupError::Namespace(
+                    NamespaceError::InvariantViolation,
+                ))?;
+            expected.insert(object.id().clone(), entry.inode());
+            paths.insert(entry.path().clone(), entry.inode());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn expected_inode(
+        &self,
+        object: &ObjectId,
+    ) -> Result<Option<u64>, BackingIdentityError> {
+        self.expected_inodes
+            .lock()
+            .map(|expected| expected.get(object).copied())
+            .map_err(|_| BackingIdentityError::RegistryPoisoned)
+    }
+
+    pub(crate) fn remember_inode(
+        &self,
+        object: &ObjectId,
+        path: &CanonicalPath,
+        actual: u64,
+    ) -> Result<(), BackingIdentityError> {
+        let mut expected = self
+            .expected_inodes
+            .lock()
+            .map_err(|_| BackingIdentityError::RegistryPoisoned)?;
+        let mut paths = self
+            .expected_paths
+            .lock()
+            .map_err(|_| BackingIdentityError::RegistryPoisoned)?;
+        if let Some(value) = expected.get(object).copied()
+            && value != actual
+        {
+            return Err(BackingIdentityError::Mismatch {
+                path: path.clone(),
+                expected: value,
+                actual,
+            });
+        }
+        if let Some(value) = paths.get(path).copied()
+            && value != actual
+        {
+            return Err(BackingIdentityError::Mismatch {
+                path: path.clone(),
+                expected: value,
+                actual,
+            });
+        }
+        expected.entry(object.clone()).or_insert(actual);
+        paths.entry(path.clone()).or_insert(actual);
+        Ok(())
+    }
+
+    pub(crate) fn expected_path_inode(
+        &self,
+        path: &CanonicalPath,
+    ) -> Result<Option<u64>, BackingIdentityError> {
+        self.expected_paths
+            .lock()
+            .map(|expected| expected.get(path).copied())
+            .map_err(|_| BackingIdentityError::RegistryPoisoned)
+    }
+
+    pub(crate) fn remember_path_inode(
+        &self,
+        path: &CanonicalPath,
+        actual: u64,
+    ) -> Result<(), BackingIdentityError> {
+        let mut expected = self
+            .expected_paths
+            .lock()
+            .map_err(|_| BackingIdentityError::RegistryPoisoned)?;
+        if let Some(value) = expected.get(path).copied() {
+            if value != actual {
+                return Err(BackingIdentityError::Mismatch {
+                    path: path.clone(),
+                    expected: value,
+                    actual,
+                });
+            }
+        } else {
+            expected.insert(path.clone(), actual);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stage_path_removal(
+        &self,
+        path: &CanonicalPath,
+        expected: u64,
+    ) -> Result<(), BackingIdentityError> {
+        let mut paths = self
+            .expected_paths
+            .lock()
+            .map_err(|_| BackingIdentityError::RegistryPoisoned)?;
+        match paths.get(path).copied() {
+            Some(actual) if actual != expected => Err(BackingIdentityError::Mismatch {
+                path: path.clone(),
+                expected: actual,
+                actual: expected,
+            }),
+            Some(_) => {
+                paths.remove(path);
+                Ok(())
+            }
+            None => Err(BackingIdentityError::Missing(path.clone())),
+        }
+    }
+
+    /// Restores a path after a backing syscall failed. The operation already
+    /// validated the registry before reaching the syscall; a poisoned lock at
+    /// this point is therefore an unrecoverable repository inconsistency.
+    pub(crate) fn restore_path_removal(&self, path: &CanonicalPath, inode: u64) {
+        let mut paths = self
+            .expected_paths
+            .lock()
+            .unwrap_or_else(|_| panic!("backing identity registry poisoned during rollback"));
+        if let Some(existing) = paths.insert(path.clone(), inode) {
+            assert_eq!(
+                existing, inode,
+                "backing identity registry changed during removal rollback"
+            );
+        }
+    }
+
+    pub(crate) fn stage_path_moves(
+        &self,
+        moves: &[(CanonicalPath, CanonicalPath, u64)],
+    ) -> Result<(), BackingIdentityError> {
+        let mut paths = self
+            .expected_paths
+            .lock()
+            .map_err(|_| BackingIdentityError::RegistryPoisoned)?;
+        for (source, destination, inode) in moves {
+            match paths.get(source).copied() {
+                Some(actual) if actual != *inode => {
+                    return Err(BackingIdentityError::Mismatch {
+                        path: source.clone(),
+                        expected: actual,
+                        actual: *inode,
+                    });
+                }
+                Some(_) => {}
+                None => return Err(BackingIdentityError::Missing(source.clone())),
+            }
+            if let Some(actual) = paths.get(destination).copied()
+                && actual != *inode
+            {
+                return Err(BackingIdentityError::Mismatch {
+                    path: destination.clone(),
+                    expected: actual,
+                    actual: *inode,
+                });
+            }
+        }
+        for (source, destination, inode) in moves {
+            paths.remove(source);
+            paths.insert(destination.clone(), *inode);
+        }
+        Ok(())
+    }
+
+    /// Restores path names after a no-replace rename failed before commit.
+    pub(crate) fn restore_path_moves(&self, moves: &[(CanonicalPath, CanonicalPath, u64)]) {
+        let mut paths = self
+            .expected_paths
+            .lock()
+            .unwrap_or_else(|_| panic!("backing identity registry poisoned during rollback"));
+        for (_, destination, inode) in moves {
+            match paths.remove(destination) {
+                Some(existing) => assert_eq!(
+                    existing, *inode,
+                    "backing identity registry changed during rename rollback"
+                ),
+                None => panic!("backing identity registry lost rename destination"),
+            }
+        }
+        for (source, _, inode) in moves {
+            if let Some(existing) = paths.insert(source.clone(), *inode) {
+                assert_eq!(
+                    existing, *inode,
+                    "backing identity registry changed during rename rollback"
+                );
+            }
+        }
+    }
+}
+
+/// Failure of the repository's object-to-inode identity registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BackingIdentityError {
+    /// The registry lock was poisoned and cannot be trusted.
+    RegistryPoisoned,
+    /// A path now names a different inode than the imported object.
+    Mismatch {
+        /// The path whose identity changed.
+        path: CanonicalPath,
+        /// The inode recorded at import or creation.
+        expected: u64,
+        /// The inode observed by the current descriptor.
+        actual: u64,
+    },
+    /// The path has no identity entry because the registry transition was not
+    /// published for it.
+    Missing(CanonicalPath),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1312,8 +1554,7 @@ fn read_metadata_at(
     )
     .map_err(|error| io_error("inspect repository metadata", diagnostic_path, error))?;
     let available = StatxFlags::from_bits_retain(metadata.stx_mask);
-    let required = StatxFlags::TYPE | StatxFlags::NLINK | StatxFlags::INO | StatxFlags::MNT_ID;
-    if !available.contains(required) {
+    if !has_required_metadata(available) {
         return Err(RepositoryPreflightError::RequiredMetadataUnavailable {
             path: diagnostic_path.to_path_buf(),
             field: "type, link count, inode, and mount ID",
@@ -1326,6 +1567,10 @@ fn read_metadata_at(
         mount_id: metadata.stx_mnt_id,
         link_count: metadata.stx_nlink,
     })
+}
+
+fn has_required_metadata(available: StatxFlags) -> bool {
+    available.contains(REQUIRED_METADATA)
 }
 
 fn validate_entry_metadata(
@@ -1411,15 +1656,20 @@ impl fmt::Display for DisplayCanonicalPath<'_> {
 #[cfg(test)]
 mod tests {
     use authority_core::{path::CanonicalPath, repository::RepoId};
-    use rustix::fs::FileType;
+    use rustix::fs::{FileType, StatxFlags};
     use tempfile::tempdir;
 
-    use std::{collections::HashMap, num::NonZeroUsize};
+    use std::{
+        collections::HashMap,
+        num::NonZeroUsize,
+        panic::{AssertUnwindSafe, catch_unwind},
+    };
 
     use super::{
-        EntryMetadata, ImportedRepository, NamespaceObjectSpec, PreflightLimits,
-        RejectedObjectKind, RepositoryEntry, RepositoryPreflightError, RepositoryStartupError,
-        external_alias_inodes, validate_entry_metadata,
+        BackingIdentityError, EntryMetadata, ImportedRepository, NamespaceObjectSpec,
+        PreflightLimits, RejectedObjectKind, RepositoryEntry, RepositoryPreflightError,
+        RepositoryStartupError, external_alias_inodes, has_required_metadata,
+        validate_entry_metadata,
     };
 
     fn path(segments: &[&str]) -> CanonicalPath {
@@ -1465,6 +1715,47 @@ mod tests {
         drop(reopened);
     }
 
+    // Requirement: identity registry poisoning must be observable as an
+    // unavailable registry, never as an unchecked backing operation.
+    #[test]
+    fn identity_registry_poison_fails_closed() {
+        let directory = tempdir().expect("temporary repository must be creatable");
+        let imported =
+            ImportedRepository::open(RepoId::new("poisoned-identity"), directory.path(), limits())
+                .expect("empty repository must validate");
+        let (_repository, backing, namespace) = imported.into_parts();
+        let root = namespace
+            .object_at_path_snapshot(&CanonicalPath::root())
+            .expect("namespace must remain readable")
+            .expect("root must be imported");
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = backing
+                .expected_inodes
+                .lock()
+                .expect("identity registry must initially be healthy");
+            panic!("poison the object identity registry for this test");
+        }));
+        assert!(result.is_err());
+        assert!(matches!(
+            backing.expected_inode(root.id()),
+            Err(BackingIdentityError::RegistryPoisoned)
+        ));
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = backing
+                .expected_paths
+                .lock()
+                .expect("path identity registry must initially be healthy");
+            panic!("poison the path identity registry for this test");
+        }));
+        assert!(result.is_err());
+        assert!(matches!(
+            backing.expected_path_inode(&CanonicalPath::root()),
+            Err(BackingIdentityError::RegistryPoisoned)
+        ));
+    }
+
     #[test]
     fn metadata_validation_rejects_mount_crossing() {
         assert!(matches!(
@@ -1479,6 +1770,16 @@ mod tests {
                 1,
             ),
             Err(RepositoryPreflightError::NestedMount(_))
+        ));
+    }
+
+    // Requirement: preflight must fail closed when the kernel does not return
+    // the mount identity needed to reject nested mounts.
+    #[test]
+    fn metadata_mask_rejects_missing_mount_id() {
+        assert!(!has_required_metadata(StatxFlags::BASIC_STATS));
+        assert!(has_required_metadata(
+            StatxFlags::BASIC_STATS | StatxFlags::MNT_ID
         ));
     }
 

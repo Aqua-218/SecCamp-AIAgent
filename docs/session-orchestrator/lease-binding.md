@@ -90,7 +90,8 @@ backend の bug が、その stage で止まる。誤った lease を持った�
 - 照合は lease が持つ identity 値の比較だけ。lease が指す実 resource が存在すること、その resource がその identity を持つことは確認していない。
 - `WorkspaceLease` の `CrossSessionLease` 経路と、その clone 解放は test 済み。`LeaseIdentityMismatch` 側は未検証。
 - backend が commit point 到達後にだけ lease を返すという約束は、型でも test でも確認していない。
-- production adapter の composition test は外部 command/filesystem/API を fake に置き換えている。identity が adapter を貫通することは示すが、Firecracker が起動することは示さない。Broker の Firecracker per-port Unix listener は別の module / opt-in KVM test で確認する。
+- production adapter の composition test は外部 command/filesystem/API を fake に置き換えている。identity が adapter を貫通することは示すが、実機の起動は示さない。`scripts/ci/verify-real-session-owner.sh` の opt-in KVM gate は、実 `ProductionSessionRuntimeBuilder` / `SessionOwner`、guest readiness、`Continue` poll、stop/`Closed`、および subject/Broker/VM/cgroup/mapper/jail/socket/workspace の cleanup を確認する。ただし egress は closed のため、外部 provider、全ての CapFS effect、FUSE/OS semantics はこの gate の保証範囲に含まれない。
+- production adapter の composition test は外部 command/filesystem/API を fake に置き換えている。identity が adapter を貫通することは示すが、実機の起動は示さない。`scripts/ci/verify-real-session-owner.sh` の opt-in KVM gate は、実 `ProductionSessionRuntimeBuilder` / `SessionOwner`、guest readiness、`Continue` poll、stop/`Closed`、および subject/Broker/VM/cgroup/mapper/jail/socket/workspace の cleanup を確認する。wrapper は jailer 実行に必要な実行可能 mount を事前検査する。ただし egress は closed のため、外部 provider、全ての CapFS effect、FUSE/OS semantics はこの gate の保証範囲に含まれない。
 
 ## 変更時の確認点
 

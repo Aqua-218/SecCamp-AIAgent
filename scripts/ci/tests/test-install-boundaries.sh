@@ -183,8 +183,7 @@ run_cargo_tests() (
     '  case "${key:-}" in --root) root="$value";; --version) version="$value";; esac' \
     '  key=' \
     'done' \
-    'if [[ -e "${FAKE_CARGO_MARKER}" ]]; then exit 77; fi' \
-    'printf marker > "${FAKE_CARGO_MARKER}"' \
+    'printf "called\\n" >> "${FAKE_CARGO_MARKER}"' \
     'mkdir -p "${root}/bin"' \
     'printf "#!/usr/bin/env bash\\nprintf \"%s %s (fixture)\\\\n\"\\n" "${crate}" "${version}" > "${root}/bin/${crate}"' \
     '# Real cargo install honors the caller umask and emits an owner-only staging binary.' \
@@ -198,7 +197,9 @@ run_cargo_tests() (
   PATH="${fake_bin}:${PATH}" CI_TOOLS_DIR="${cargo_tools_root}" \
     FAKE_CARGO_MARKER="${cargo_marker}" \
     "${test_repository_root}/scripts/ci/install-cargo-tools.sh" nextest > /dev/null \
-    || fail 'valid Cargo cache was not reused'
+    || fail 'cached Cargo tool was not rebuilt through isolated staging'
+  [[ "$(wc -l < "${cargo_marker}")" -eq 2 ]] \
+    || fail 'a restored Cargo executable bypassed the rebuild boundary'
   local installed_tool="${cargo_tools_root}/cargo/bin/cargo-nextest"
   [[ "$(stat -c '%a' -- "${installed_tool}")" == 755 ]] \
     || fail 'published Cargo tool mode was not normalized to 0755'

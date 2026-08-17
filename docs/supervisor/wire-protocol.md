@@ -19,6 +19,7 @@
 | `PROTOCOL_VERSION` | `1` 固定。他の値は `UnsupportedVersion(byte)` |
 | `HEADER_BYTES` | `4`。これ未満は `Truncated` |
 | `MAX_WIRE_REQUEST_BYTES` | `4 * 1024`。超過は `TooLarge { actual }` |
+| `MAX_WIRE_RESPONSE_BYTES` | `64`。response も同じ header と bounded datagram を使う |
 | body 長 field | `u16` big-endian。宣言と実体が一致しなければ `LengthMismatch { declared, actual }` |
 | trailing bytes | 許さない。`TrailingBytes` |
 
@@ -52,6 +53,12 @@ wire tag が無い操作: `issue_root`、`derive`、`revoke`、`open_handle`。�
 `SubjectId::new` と `HandleId::new` は検証しない `Self(value.into())` である。**この decoder が、空文字列や無制限長の identity を kernel の `BTreeMap` key に入れない唯一の場所。**
 
 field が最大 2 つなので body の最大は `2 * (2 + 256) = 516` bytes。encode 側で 4 KiB の上限に当たることはない。
+
+request の field 上限、4 KiB ちょうどの datagram size gate、truncated frame、length mismatch、型付き request 後の `TrailingBytes` は module test で確認している。
+
+## `WireResponse`
+
+`DispatchResponse` は `WireResponse` に変換され、response も同じ 4-byte header と closed tag set で encode/decode される。`SubjectClosed` と `HandleClosed` は空 body、`Refused` は 1-byte の `RefusalCode` を持つ。response は最大 64 bytes で、subject ID、handle ID、自由形式の error text を運ばない。
 
 ## `WireEncodeError`
 
@@ -97,11 +104,9 @@ stateDiagram-v2
 
 ## 保証範囲外
 
-- 応答形式。`DispatchResponse` は定義されているが、この crate に encoder が無い。返信の wire 表現はまだ決まっていない。
 - 認可。decoder は形だけを見る。誰の要求かは connection から決める。
-- transport。実 socket、`SOCK_SEQPACKET` の使用、peer credential の取得はいずれもこの crate の外。
+- guest VM 内の agent process と supervisor の接続を含む end-to-end transport。実 `SOCK_SEQPACKET`、`SO_PEERCRED`、bounded datagram 送受信そのものは control socket module test で確認している。
 - version 交渉。`PROTOCOL_VERSION` は 1 固定で、negotiation の経路が無い。
-- 境界値の test。ちょうど 4096 bytes、ちょうど 256 bytes の field を受理する test が無い。`TrailingBytes` と `Truncated` を実際に起こす test も無い。fuzz も property test も無い。
 
 ## 関連
 

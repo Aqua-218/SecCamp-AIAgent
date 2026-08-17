@@ -11,7 +11,7 @@ use std::{
     net::Shutdown,
     num::NonZeroUsize,
     os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     panic::{self, AssertUnwindSafe},
@@ -28,9 +28,12 @@ use std::{
 use authority_core::time::MonotonicTime;
 use egress_broker::{
     dispatch::DispatchContext,
-    server::{ConnectionCloseReason, RequestDispatcher, ServerError, serve_connection},
+    server::{
+        ConnectionCloseReason, RequestDispatcher, ServerError, serve_connection_with_policy,
+    },
     transport::{
-        AfVsockListener, DeadlineStream, TransportError, VsockShutdownHandle, VsockStream,
+        AfVsockListener, DeadlineStream, TransportError, TransportPolicy, VsockShutdownHandle,
+        VsockStream,
     },
 };
 use firecracker_runtime::firecracker_guest_port_path;
@@ -233,12 +236,25 @@ impl FirecrackerUnixListener {
                 format!("invalid Firecracker guest Broker socket: {error}"),
             )
         })?;
-        validate_private_socket_parent(&path)?;
+        ensure_private_socket_parent(&path)?;
         reject_existing_socket_path(&path)?;
         let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        validate_bound_socket(&path)?;
-        listener.set_nonblocking(true)?;
+        let setup = (|| {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            validate_bound_socket(&path)?;
+            listener.set_nonblocking(true)
+        })();
+        if let Err(error) = setup {
+            drop(listener);
+            let cleanup = std::fs::remove_file(&path);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(io::Error::new(
+                    error.kind(),
+                    format!("{error}; removing failed Broker socket also failed: {cleanup}"),
+                )),
+            };
+        }
         Ok(Self {
             listener,
             expected_guest_cid,
@@ -293,6 +309,29 @@ impl FirecrackerUnixListener {
     }
 }
 
+fn ensure_private_socket_parent(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Firecracker guest Broker socket has no parent directory",
+        )
+    })?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let ancestor = parent.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Broker socket parent has no ancestor")
+            })?;
+            validate_private_directory_chain(ancestor)?;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(parent)?;
+        }
+        Err(error) => return Err(error),
+    }
+    validate_private_socket_parent(path)
+}
+
 fn validate_private_socket_parent(path: &Path) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -300,8 +339,12 @@ fn validate_private_socket_parent(path: &Path) -> io::Result<()> {
             "Firecracker guest Broker socket has no parent directory",
         )
     })?;
+    validate_private_directory_chain(parent)
+}
+
+fn validate_private_directory_chain(directory: &Path) -> io::Result<()> {
     let effective_uid = effective_uid()?;
-    let mut current = Some(parent);
+    let mut current = Some(directory);
     while let Some(directory) = current {
         let metadata = std::fs::symlink_metadata(directory)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -708,12 +751,13 @@ impl<C> BuiltBrokerRuntime<C> {
 
 impl<S, C> BrokerRuntime<S> for BuiltBrokerRuntime<C>
 where
-    S: Read + Write + Send + 'static,
+    S: DeadlineStream + Send + 'static,
     C: FnMut() -> MonotonicTime + Send + 'static,
 {
     fn serve(mut self, stream: S, cancellation: &BrokerCancellation) -> BrokerConnectionExit {
-        match serve_connection(
+        match serve_connection_with_policy(
             stream,
+            TransportPolicy::default(),
             self.dispatcher.as_mut(),
             &self.identity,
             &mut self.clock,
@@ -768,6 +812,16 @@ pub trait BrokerRuntimeFactory<S>: Send + Sync + 'static {
     ///
     /// Returns [`BackendError`] when the runtime cannot be built completely.
     fn build(&self, identity: &SessionIdentity) -> Result<Self::Runtime, BackendError>;
+
+    /// Discards durable state from a fully built runtime that could not be transferred to a
+    /// worker. The default is suitable only for factories whose `build` is side-effect free.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackendError`] while factory-owned pre-lease state remains.
+    fn discard_unstarted(&self, _identity: &SessionIdentity) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 
 /// Typed terminal reason for the backend-owned Broker worker.
@@ -1146,7 +1200,15 @@ where
                 .unwrap_or(BrokerWorkerExit::Panicked);
                 let _ = exit_sender.send(exit);
             })
-            .map_err(|error| BackendError::new(format!("Broker worker spawn failed: {error}")))?;
+            .map_err(|error| {
+                let cleanup = self.runtime_factory.discard_unstarted(identity);
+                BackendError::new(match cleanup {
+                    Ok(()) => format!("Broker worker spawn failed: {error}"),
+                    Err(cleanup) => format!(
+                        "Broker worker spawn failed: {error}; discarding unstarted runtime also failed: {cleanup}"
+                    ),
+                })
+            })?;
 
         self.active = Some(ActiveBroker {
             lease: lease.clone(),

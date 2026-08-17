@@ -405,9 +405,14 @@ fn open_status_file(path: &Path) -> Result<fs::File, String> {
         .ok_or_else(|| "status file has no parent directory".to_owned())?;
     let parent_metadata = fs::symlink_metadata(parent)
         .map_err(|error| format!("inspect status directory {}: {error}", parent.display()))?;
-    if !parent_metadata.is_dir() {
+    let effective_uid = rustix::process::geteuid().as_raw();
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != effective_uid
+        || parent_metadata.mode() & 0o022 != 0
+    {
         return Err(format!(
-            "status parent is not a directory: {}",
+            "status parent must be a secure, service-owned directory: {}",
             parent.display()
         ));
     }
@@ -423,9 +428,13 @@ fn open_status_file(path: &Path) -> Result<fs::File, String> {
     let metadata = file
         .metadata()
         .map_err(|error| format!("inspect opened status file {}: {error}", path.display()))?;
-    if !metadata.is_file() || metadata.nlink() != 1 {
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != effective_uid
+        || metadata.mode() & 0o022 != 0
+    {
         return Err(format!(
-            "status file must be a singly-linked regular file: {}",
+            "status file must be a singly-linked, service-owned regular file: {}",
             path.display()
         ));
     }
@@ -585,12 +594,12 @@ impl DaemonConfig {
         }
         let audit_path = arguments.absolute_path("authority-audit")?;
         let audit_mode = match arguments.required("authority-audit-mode")?.as_str() {
-            "create" => AuthorityAuditMode::CreateNew(audit_path),
-            "open" => AuthorityAuditMode::OpenExisting(audit_path),
+            "create" => AuthorityAuditMode::CreateNew(audit_path.clone()),
+            "open" => AuthorityAuditMode::OpenExisting(audit_path.clone()),
             "auto" => match fs::symlink_metadata(&audit_path) {
-                Ok(_) => AuthorityAuditMode::OpenExisting(audit_path),
+                Ok(_) => AuthorityAuditMode::OpenExisting(audit_path.clone()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    AuthorityAuditMode::CreateNew(audit_path)
+                    AuthorityAuditMode::CreateNew(audit_path.clone())
                 }
                 Err(error) => {
                     return Err(format!(
@@ -613,12 +622,15 @@ impl DaemonConfig {
             arguments.number("github-response-cap-bytes")?,
             arguments.nonzero_usize("broker-max-connection-requests")?,
         );
+        let identity_ledger_path = arguments.absolute_path("identity-ledger")?;
+        let recovery_journal_path = arguments.absolute_path("recovery-journal")?;
+        let broker_wal_root = arguments.absolute_path("broker-wal-root")?;
         let production = ProductionSessionConfig::new(
             ProductionDurabilityConfig::new(
-                arguments.absolute_path("identity-ledger")?,
-                arguments.absolute_path("recovery-journal")?,
+                identity_ledger_path.clone(),
+                recovery_journal_path.clone(),
                 audit_mode,
-                arguments.absolute_path("broker-wal-root")?,
+                broker_wal_root.clone(),
             ),
             IssuerId::new(arguments.required("issuer")?),
             ProductionFirecrackerConfig::new(
@@ -662,6 +674,35 @@ impl DaemonConfig {
                 Ok::<PathBuf, String>(path)
             })
             .transpose()?;
+        if let Some(status_file) = status_file.as_deref() {
+            validate_status_file_separation(
+                status_file,
+                &[
+                    &identity_ledger_path,
+                    &recovery_journal_path,
+                    &audit_path,
+                    &stop_file,
+                    &runtime.firecracker.path,
+                    &runtime.kernel.path,
+                    &runtime.rootfs.path,
+                    &runtime.verity_hash.path,
+                    &runtime.veritysetup.path,
+                    &runtime.workspace.image.formatter.path,
+                    &runtime.jailer.path,
+                    &runtime.isolation.seccomp.filter.path,
+                    &kernel_source.path,
+                    &seccomp_source.path,
+                    &snapshot_state.path,
+                    &snapshot_memory.path,
+                ],
+                &[
+                    &broker_wal_root,
+                    &runtime.jailer_config.chroot_base_dir,
+                    &runtime.workspace.source,
+                    &runtime.workspace.clone_root,
+                ],
+            )?;
+        }
         arguments.finish()?;
         Ok(Self {
             production,
@@ -679,6 +720,26 @@ impl DaemonConfig {
             status_file,
         })
     }
+}
+
+fn validate_status_file_separation(
+    status_file: &Path,
+    protected_files: &[&PathBuf],
+    protected_roots: &[&PathBuf],
+) -> Result<(), String> {
+    if protected_files
+        .iter()
+        .any(|path| status_file == path.as_path())
+        || protected_roots
+            .iter()
+            .any(|root| status_file == root.as_path() || status_file.starts_with(root))
+    {
+        return Err(format!(
+            "--status-file must be disjoint from every durable, runtime, workspace, and artifact path: {}",
+            status_file.display()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_shutdown_timeout(milliseconds: u64) -> Result<Duration, String> {

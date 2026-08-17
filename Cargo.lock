@@ -318,6 +318,7 @@ dependencies = [
  "serde_json",
  "socket2",
  "url",
+ "zeroize",
 ]
 
 [[package]]

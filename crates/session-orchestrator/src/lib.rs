@@ -3854,6 +3854,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn new_durable_constructs_an_orchestrator_while_holding_the_exact_ledger() {
+        let fixture = DurableLedgerFixture::new("orchestrator-constructor");
+        let orchestrator = SessionOrchestrator::<TestRandom, DurableIdentityLedger>::new_durable(
+            TestRandom::default(),
+            &fixture.path,
+        )
+        .expect("durable orchestrator must acquire and initialize its ledger");
+        assert_eq!(orchestrator.state(), LifecycleState::Ready);
+        assert!(matches!(
+            DurableIdentityLedger::open(&fixture.path),
+            Err(LedgerError::Locked { .. })
+        ));
+        drop(orchestrator);
+        let reopened = DurableIdentityLedger::open(&fixture.path)
+            .expect("dropping the orchestrator must release the exact ledger lock");
+        assert_eq!(reopened.committed_count(), 0);
+    }
+
     #[derive(Default)]
     struct TestWorkspace {
         mismatch: bool,

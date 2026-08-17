@@ -1,0 +1,125 @@
+pipeline_plan:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/install-pipeline-tools.sh
+    - |
+      case "${CI_PIPELINE_SOURCE}" in
+        merge_request_event) plan_event=pull_request ;;
+        schedule) plan_event=schedule ;;
+        web) plan_event=workflow_dispatch ;;
+        api) plan_event=api ;;
+        push) if [[ -n "${CI_COMMIT_TAG:-}" ]]; then plan_event=tag; else plan_event=push; fi ;;
+        *) plan_event="${CI_PIPELINE_SOURCE}" ;;
+      esac
+      PLAN_EVENT="${plan_event}" PLAN_PLATFORM=gitlab \
+        scripts/ci/plan-pipeline.sh --output reports/pipeline-plan.json > /dev/null
+  artifacts:
+    expire_in: 14 days
+    access: developer
+    paths:
+      - reports/pipeline-plan.json
+
+# This job consumes the actual current-pipeline job set from GitLab. Matrix instances collapse to
+# their manifest gate; a missing, failed, canceled, or unexpectedly executed gate then disagrees
+# with the exact plan and fails before packaging or publication stages can begin.
+pipeline_complete:
+  stage: complete
+  timeout: 10m
+  when: always
+  needs:
+    - job: pipeline_plan
+      artifacts: true
+    - job: pipeline_policy
+      artifacts: false
+    - job: pipeline_self_test
+      artifacts: false
+    - job: docs_policy
+      artifacts: false
+    - job: adr_index
+      artifacts: false
+    - job: verification_traceability
+      artifacts: false
+    - job: commit_policy
+      artifacts: false
+    - job: repository_hygiene
+      artifacts: false
+    - job: codeowners_coverage
+      artifacts: false
+    - job: toolchain_consistency
+      artifacts: false
+    - job: dependency_usage
+      artifacts: false
+    - job: lockfile_integrity
+      artifacts: false
+    - job: lean_hygiene
+      artifacts: false
+    - job: rust_quality
+      artifacts: false
+    - job: api_surface
+      artifacts: false
+    - job: crate_isolation
+      artifacts: false
+    - job: cross_targets
+      artifacts: false
+    - job: rust_tests
+      artifacts: false
+    - job: rust_doctests
+      artifacts: false
+    - job: loom
+      artifacts: false
+    - job: lean_proofs
+      artifacts: false
+    - job: differential_corpus
+      artifacts: false
+    - job: coverage
+      artifacts: false
+    - job: release_dry_run
+      artifacts: false
+    - job: reproducibility
+      artifacts: false
+    - job: dependency_audit
+      artifacts: false
+    - job: dependency_policy
+      artifacts: false
+    - job: sast
+      artifacts: false
+    - job: secret_detection
+      artifacts: false
+    - job: supply_chain_inventory
+      artifacts: false
+    - job: pin_inventory
+      artifacts: false
+    - job: miri
+      artifacts: false
+      optional: true
+    - job: sanitizers
+      artifacts: false
+      optional: true
+    - job: mutation
+      artifacts: false
+      optional: true
+    - job: fuzz
+      artifacts: false
+      optional: true
+    - job: benchmarks
+      artifacts: false
+      optional: true
+    - job: real_vm
+      artifacts: false
+      optional: true
+    - job: privileged_isolation
+      artifacts: false
+      optional: true
+  script:
+    - scripts/ci/install-pipeline-tools.sh
+    - scripts/ci/collect-gate-results.sh --from-gitlab-api --output reports/gate-results.tsv > /dev/null
+    - scripts/ci/check-gate-results.sh --plan reports/pipeline-plan.json --results reports/gate-results.tsv --report reports/gate-summary.md
+  artifacts:
+    when: always
+    expire_in: 14 days
+    access: developer
+    paths:
+      - reports/pipeline-plan.json
+      - reports/gate-results.tsv
+      - reports/gate-summary.md

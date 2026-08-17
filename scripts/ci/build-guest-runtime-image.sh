@@ -292,6 +292,8 @@ for executable in "${guest_control_init}" "${guest_supervisor_init}" "${isolatio
 done
 install -d -m 0755 "${staging}/root/run/guest-supervisor"
 install -d -m 0755 "${staging}/root/workspace"
+install -d -m 0755 "${staging}/root/proc"
+install -d -m 0755 "${staging}/root/dev"
 install -d -m 0755 "${staging}/root/sys/fs/cgroup"
 install -d -m 1777 "${staging}/root/tmp"
 
@@ -314,4 +316,4 @@ sha256sum "${output_rootfs}" | awk '{print $1}'
 printf 'hash SHA-256: '
 sha256sum "${output_hash}" | awk '{print $1}'
 grep -E '^Root hash:' "${output_verity}"
-printf 'boot args: console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init -- --port %s --workload /usr/local/libexec/guest-supervisor-init -- --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port %s --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository %s --file-effects %s --path-prefix %s\n' "${port}" "${broker_port}" "${repository}" "${file_effects}" "${path_prefix}"
+printf 'boot args: console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init -- --port %s --workload /usr/local/libexec/guest-supervisor-init --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port %s --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository %s --file-effects %s --path-prefix %s\n' "${port}" "${broker_port}" "${repository}" "${file_effects}" "${path_prefix}"

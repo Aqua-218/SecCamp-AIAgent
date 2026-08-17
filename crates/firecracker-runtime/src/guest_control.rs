@@ -72,8 +72,9 @@ impl GuestControlAction {
         matches!(self, Self::InjectIdentityBound | Self::StartWorkloadBound)
     }
 
-    const fn accepts_bound_request(self) -> bool {
-        matches!(self, Self::StartWorkload | Self::StartWorkloadBound)
+    const fn accepts_bound_request(self, request_is_bound: bool) -> bool {
+        self.is_bound() == request_is_bound
+            || matches!(self, Self::StartWorkload) && request_is_bound
     }
 }
 
@@ -659,7 +660,7 @@ impl GuestControlState {
         action: GuestControlAction,
         request: GuestControlRequest,
     ) -> Result<String, GuestControlError> {
-        if action.is_bound() != request.is_bound() && !action.accepts_bound_request() {
+        if !action.accepts_bound_request(request.is_bound()) {
             return Err(GuestControlError::VersionMismatch);
         }
         if let Self::IdentityInjected(existing) | Self::WorkloadStarted(existing) = self
@@ -1147,6 +1148,20 @@ mod tests {
         assert_eq!(
             state.apply(GuestControlAction::StartWorkloadBound, first.clone(),),
             Ok(first.canonical_bound_acknowledgement(GuestControlAction::StartWorkloadBound))
+        );
+    }
+
+    #[test]
+    fn bound_start_action_rejects_a_legacy_request_without_panicking() {
+        let legacy = request(42);
+        let mut state = GuestControlState::default();
+        state
+            .apply(GuestControlAction::InjectIdentity, legacy.clone())
+            .expect("legacy identity injection");
+
+        assert_eq!(
+            state.apply(GuestControlAction::StartWorkloadBound, legacy),
+            Err(GuestControlError::VersionMismatch)
         );
     }
 

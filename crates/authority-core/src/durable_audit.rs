@@ -50,7 +50,13 @@ const RECONCILED_NOT_COMMITTED: u8 = 2;
 const HEADER_LEN: usize = 8 + 2 + 1 + 1 + 8 + 8 + 4;
 const CHECKSUM_LEN: usize = 8;
 const MAX_RECORD_PAYLOAD: usize = 8 * 1024 * 1024;
-const MAX_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
+/// Hard upper bound for one durable audit WAL in production.
+///
+/// A smaller cap can be supplied to the explicit test/integration constructors, but no caller
+/// can raise the limit above this bound. The journal never evicts or compacts committed frames.
+pub const MAX_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
+/// The default cap used by [`DurableAuditLog::create`] and [`DurableAuditLog::open`].
+pub const DEFAULT_MAX_JOURNAL_BYTES: u64 = MAX_JOURNAL_BYTES;
 /// Version 2 prefixes the attempt metadata with the capability-state instance that authorized it.
 ///
 /// A journal outlives the process that created it, so one file can hold attempts from several
@@ -326,6 +332,22 @@ pub enum DurableAuditError {
         /// Maximum byte length this crate will reopen.
         max_length: u64,
     },
+    /// Appending or reopening a journal would exceed its configured byte capacity.
+    CapacityExceeded {
+        /// Bytes currently present in the journal.
+        current: u64,
+        /// Bytes the serialized frame or existing file would occupy.
+        projected: u64,
+        /// Configured hard byte capacity.
+        capacity: u64,
+    },
+    /// A caller supplied a test/integration capacity above the production hard bound.
+    InvalidCapacity {
+        /// Requested capacity.
+        requested: u64,
+        /// Maximum accepted capacity.
+        maximum: u64,
+    },
     /// The file header does not identify this journal format.
     InvalidMagic,
     /// The file uses a format version this crate cannot validate.
@@ -382,6 +404,18 @@ impl fmt::Display for DurableAuditError {
             Self::JournalFull { length, max_length } => write!(
                 formatter,
                 "durable audit journal would reach {length} bytes, above the {max_length} byte ceiling"
+            ),
+            Self::CapacityExceeded {
+                current,
+                projected,
+                capacity,
+            } => write!(
+                formatter,
+                "durable audit journal capacity exceeded: {current} -> {projected} bytes (capacity {capacity})"
+            ),
+            Self::InvalidCapacity { requested, maximum } => write!(
+                formatter,
+                "durable audit capacity {requested} exceeds the production maximum {maximum}"
             ),
             Self::JournalUnavailable => formatter.write_str("durable audit journal is unavailable"),
             Self::InvalidMagic => {
@@ -555,6 +589,8 @@ struct DurableState {
     /// journal past the ceiling that `open` enforces; without it a running
     /// process writes a file it can never reopen.
     length: u64,
+    /// Configured byte capacity for this writer.
+    capacity: u64,
 }
 
 /// An exclusively owned WAL for authorization audit records.
@@ -591,15 +627,45 @@ impl DurableAuditView {
     /// Returns [`DurableAuditError`] when the file cannot be read or contains
     /// an invalid, truncated, replayed, or checksum-invalid frame.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DurableAuditError> {
+        Self::open_with_max_bytes(path, DEFAULT_MAX_JOURNAL_BYTES)
+    }
+
+    /// Opens and validates an existing journal with an explicit byte capacity.
+    ///
+    /// This constructor is intended for bounded integration tests and controlled deployments.
+    /// The capacity may be lower than the production default, but never higher than
+    /// [`MAX_JOURNAL_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableAuditError::CapacityExceeded`] when the existing file is above the
+    /// requested capacity, or another [`DurableAuditError`] when the file is malformed.
+    pub fn open_with_max_bytes(
+        path: impl AsRef<Path>,
+        max_bytes: u64,
+    ) -> Result<Self, DurableAuditError> {
+        validate_capacity(max_bytes)?;
         let path = path.as_ref().to_owned();
         let directory = DurableDirectory::open(&path)?;
-        validate_existing_path(&directory)?;
+        validate_existing_path(&directory, max_bytes)?;
         let mut file = open_existing_file(&directory.journal_path(), false)?;
-        validate_open_journal(&directory, &file)?;
-        let bytes = read_bounded_journal(&mut file)?;
-        validate_open_journal_length(&directory, &file, bytes.len())?;
-        let (_, attempts) = parse_journal(&bytes)?;
+        validate_open_journal(&directory, &file, max_bytes)?;
+        let bytes = read_bounded_journal(&mut file, max_bytes)?;
+        validate_open_journal_length(&directory, &file, bytes.len(), max_bytes)?;
+        let (_, attempts) = parse_journal(&bytes, max_bytes)?;
         Ok(Self::from_attempts(path, &attempts))
+    }
+
+    /// Alias for [`Self::open_with_max_bytes`] using capacity terminology.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open_with_max_bytes`].
+    pub fn open_with_capacity(
+        path: impl AsRef<Path>,
+        capacity: u64,
+    ) -> Result<Self, DurableAuditError> {
+        Self::open_with_max_bytes(path, capacity)
     }
 
     /// Returns the path from which this snapshot was recovered.
@@ -644,16 +710,33 @@ impl DurableAuditLog {
     ///
     /// Returns an IO error when the path already exists or cannot be synced.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, DurableAuditError> {
+        Self::create_with_max_bytes(path, DEFAULT_MAX_JOURNAL_BYTES)
+    }
+
+    /// Creates a new empty journal with an explicit byte capacity.
+    ///
+    /// The capacity is useful for bounded integration tests and controlled deployments. It may
+    /// be lower than the production default, but never higher than [`MAX_JOURNAL_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableAuditError::InvalidCapacity`] when the requested capacity exceeds the
+    /// production hard bound, or an IO error when the path already exists or cannot be synced.
+    pub fn create_with_max_bytes(
+        path: impl AsRef<Path>,
+        max_bytes: u64,
+    ) -> Result<Self, DurableAuditError> {
+        validate_capacity(max_bytes)?;
         let path = path.as_ref().to_owned();
         let directory = DurableDirectory::open(&path)?;
         let lock_file = open_writer_lock(&directory)?;
         validate_new_path(&directory)?;
         let file = create_private_file(&directory.journal_path())?;
         acquire_exclusive_lock(&file)?;
-        validate_open_journal(&directory, &file)?;
+        validate_open_journal(&directory, &file, max_bytes)?;
         file.sync_all().map_err(DurableAuditError::from)?;
         directory.sync()?;
-        validate_open_journal_length(&directory, &file, 0)?;
+        validate_open_journal_length(&directory, &file, 0, max_bytes)?;
         validate_open_lock(&directory, &lock_file)?;
         Ok(Self {
             state: Arc::new(Mutex::new(DurableState {
@@ -664,9 +747,22 @@ impl DurableAuditLog {
                 attempts: BTreeMap::new(),
                 unusable: false,
                 length: 0,
+                capacity: max_bytes,
             })),
             path,
         })
+    }
+
+    /// Alias for [`Self::create_with_max_bytes`] using capacity terminology.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::create_with_max_bytes`].
+    pub fn create_with_capacity(
+        path: impl AsRef<Path>,
+        capacity: u64,
+    ) -> Result<Self, DurableAuditError> {
+        Self::create_with_max_bytes(path, capacity)
     }
 
     /// Reopens and validates an existing journal.
@@ -681,16 +777,33 @@ impl DurableAuditLog {
     /// Returns [`DurableAuditError`] when the file cannot be read or contains
     /// an invalid, truncated, replayed, or checksum-invalid frame.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DurableAuditError> {
+        Self::open_with_max_bytes(path, DEFAULT_MAX_JOURNAL_BYTES)
+    }
+
+    /// Reopens and validates an existing journal with an explicit byte capacity.
+    ///
+    /// This is the bounded integration-test/deployment counterpart of [`Self::open`]. Existing
+    /// bytes are never truncated or compacted; a file above the requested capacity is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurableAuditError::CapacityExceeded`] when existing bytes exceed the capacity,
+    /// or another [`DurableAuditError`] when the file cannot be trusted.
+    pub fn open_with_max_bytes(
+        path: impl AsRef<Path>,
+        max_bytes: u64,
+    ) -> Result<Self, DurableAuditError> {
+        validate_capacity(max_bytes)?;
         let path = path.as_ref().to_owned();
         let directory = DurableDirectory::open(&path)?;
         let lock_file = open_writer_lock(&directory)?;
-        validate_existing_path(&directory)?;
+        validate_existing_path(&directory, max_bytes)?;
         let mut file = open_existing_file(&directory.journal_path(), true)?;
         acquire_exclusive_lock(&file)?;
-        validate_open_journal(&directory, &file)?;
-        let bytes = read_bounded_journal(&mut file)?;
-        validate_open_journal_length(&directory, &file, bytes.len())?;
-        let (next_sequence, attempts) = parse_journal(&bytes)?;
+        validate_open_journal(&directory, &file, max_bytes)?;
+        let bytes = read_bounded_journal(&mut file, max_bytes)?;
+        validate_open_journal_length(&directory, &file, bytes.len(), max_bytes)?;
+        let (next_sequence, attempts) = parse_journal(&bytes, max_bytes)?;
         let file_length = u64::try_from(bytes.len())
             .map_err(|_| DurableAuditError::RecordTooLarge(bytes.len()))?;
         validate_open_lock(&directory, &lock_file)?;
@@ -703,9 +816,22 @@ impl DurableAuditLog {
                 attempts,
                 unusable: false,
                 length: file_length,
+                capacity: max_bytes,
             })),
             path,
         })
+    }
+
+    /// Alias for [`Self::open_with_max_bytes`] using capacity terminology.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open_with_max_bytes`].
+    pub fn open_with_capacity(
+        path: impl AsRef<Path>,
+        capacity: u64,
+    ) -> Result<Self, DurableAuditError> {
+        Self::open_with_max_bytes(path, capacity)
     }
 
     /// Returns the path of the underlying journal file.
@@ -929,6 +1055,24 @@ fn next_sequence(state: &DurableState) -> Result<u64, DurableAuditError> {
         .ok_or(DurableAuditError::SequenceExhausted)
 }
 
+fn validate_capacity(capacity: u64) -> Result<(), DurableAuditError> {
+    if capacity > MAX_JOURNAL_BYTES {
+        return Err(DurableAuditError::InvalidCapacity {
+            requested: capacity,
+            maximum: MAX_JOURNAL_BYTES,
+        });
+    }
+    Ok(())
+}
+
+const fn capacity_exceeded(current: u64, capacity: u64) -> DurableAuditError {
+    DurableAuditError::CapacityExceeded {
+        current,
+        projected: current,
+        capacity,
+    }
+}
+
 fn append_frame(
     state: &mut DurableState,
     sequence: u64,
@@ -943,30 +1087,13 @@ fn append_frame(
     if payload.len() > MAX_RECORD_PAYLOAD {
         return Err(DurableAuditError::RecordTooLarge(payload.len()));
     }
-    let frame_length = u64::try_from(HEADER_LEN + payload.len() + CHECKSUM_LEN)
-        .map_err(|_| DurableAuditError::RecordTooLarge(payload.len()))?;
-    let new_length =
-        state
-            .length
-            .checked_add(frame_length)
-            .ok_or(DurableAuditError::JournalFull {
-                length: u64::MAX,
-                max_length: MAX_JOURNAL_BYTES,
-            })?;
-    if new_length > MAX_JOURNAL_BYTES {
-        return Err(DurableAuditError::JournalFull {
-            length: new_length,
-            max_length: MAX_JOURNAL_BYTES,
-        });
-    }
     let payload_length = u32::try_from(payload.len())
         .map_err(|_| DurableAuditError::RecordTooLarge(payload.len()))?;
-    let mut frame = Vec::with_capacity(
-        HEADER_LEN
-            .checked_add(payload.len())
-            .and_then(|length| length.checked_add(CHECKSUM_LEN))
-            .ok_or(DurableAuditError::RecordTooLarge(payload.len()))?,
-    );
+    let frame_capacity = HEADER_LEN
+        .checked_add(payload.len())
+        .and_then(|length| length.checked_add(CHECKSUM_LEN))
+        .ok_or(DurableAuditError::RecordTooLarge(payload.len()))?;
+    let mut frame = Vec::with_capacity(frame_capacity);
     frame.extend_from_slice(MAGIC);
     frame.extend_from_slice(&VERSION.to_le_bytes());
     frame.push(kind);
@@ -977,6 +1104,25 @@ fn append_frame(
     frame.extend_from_slice(payload);
     let checksum = checksum(&frame);
     frame.extend_from_slice(&checksum.to_le_bytes());
+
+    let frame_length =
+        u64::try_from(frame.len()).map_err(|_| DurableAuditError::RecordTooLarge(frame.len()))?;
+    let new_length =
+        state
+            .length
+            .checked_add(frame_length)
+            .ok_or(DurableAuditError::CapacityExceeded {
+                current: state.length,
+                projected: u64::MAX,
+                capacity: state.capacity,
+            })?;
+    if new_length > state.capacity {
+        return Err(DurableAuditError::CapacityExceeded {
+            current: state.length,
+            projected: new_length,
+            capacity: state.capacity,
+        });
+    }
 
     if let Err(error) = state
         .file
@@ -1000,7 +1146,7 @@ fn validate_append_target(
 ) -> Result<(), DurableAuditError> {
     state.directory.validate()?;
     validate_open_lock(&state.directory, &state.lock_file)?;
-    let actual_length = validate_open_journal(&state.directory, &state.file)?;
+    let actual_length = validate_open_journal(&state.directory, &state.file, state.capacity)?;
     if actual_length != expected_length {
         return Err(DurableAuditError::InvalidRecord(format!(
             "journal length changed outside the exclusive writer: expected {expected_length}, got {actual_length}"
@@ -1022,8 +1168,11 @@ fn validate_new_path(directory: &DurableDirectory) -> Result<(), DurableAuditErr
     }
 }
 
-fn validate_existing_path(directory: &DurableDirectory) -> Result<(), DurableAuditError> {
-    validate_existing_named_path(directory, &directory.journal_name, Some(MAX_JOURNAL_BYTES))
+fn validate_existing_path(
+    directory: &DurableDirectory,
+    maximum_length: u64,
+) -> Result<(), DurableAuditError> {
+    validate_existing_named_path(directory, &directory.journal_name, Some(maximum_length))
 }
 
 fn validate_existing_named_path(
@@ -1044,9 +1193,7 @@ fn validate_existing_named_path(
     if let Some(maximum_length) = maximum_length
         && metadata.len() > maximum_length
     {
-        return Err(DurableAuditError::RecordTooLarge(
-            usize::try_from(metadata.len()).unwrap_or(usize::MAX),
-        ));
+        return Err(capacity_exceeded(metadata.len(), maximum_length));
     }
     Ok(())
 }
@@ -1054,12 +1201,13 @@ fn validate_existing_named_path(
 fn validate_open_journal(
     directory: &DurableDirectory,
     file: &File,
+    maximum_length: u64,
 ) -> Result<u64, DurableAuditError> {
     validate_open_named_file(
         directory,
         &directory.journal_name,
         file,
-        Some(MAX_JOURNAL_BYTES),
+        Some(maximum_length),
     )
 }
 
@@ -1095,9 +1243,7 @@ fn validate_open_named_file(
     if let Some(maximum_length) = maximum_length
         && metadata.len() > maximum_length
     {
-        return Err(DurableAuditError::RecordTooLarge(
-            usize::try_from(metadata.len()).unwrap_or(usize::MAX),
-        ));
+        return Err(capacity_exceeded(metadata.len(), maximum_length));
     }
     Ok(metadata.len())
 }
@@ -1106,10 +1252,11 @@ fn validate_open_journal_length(
     directory: &DurableDirectory,
     file: &File,
     expected_length: usize,
+    maximum_length: u64,
 ) -> Result<(), DurableAuditError> {
     let expected_length = u64::try_from(expected_length)
         .map_err(|_| DurableAuditError::RecordTooLarge(expected_length))?;
-    let actual_length = validate_open_journal(directory, file)?;
+    let actual_length = validate_open_journal(directory, file, maximum_length)?;
     if actual_length != expected_length {
         return Err(DurableAuditError::InvalidRecord(format!(
             "journal length changed while it was read: expected {expected_length}, got {actual_length}"
@@ -1324,19 +1471,25 @@ fn acquire_exclusive_lock(file: &File) -> Result<(), DurableAuditError> {
     }
 }
 
-fn read_bounded_journal(file: &mut File) -> Result<Vec<u8>, DurableAuditError> {
+fn read_bounded_journal(
+    file: &mut File,
+    maximum_length: u64,
+) -> Result<Vec<u8>, DurableAuditError> {
     let mut bytes = Vec::new();
-    file.take(MAX_JOURNAL_BYTES + 1)
+    file.take(maximum_length.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(DurableAuditError::from)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_JOURNAL_BYTES {
-        return Err(DurableAuditError::RecordTooLarge(bytes.len()));
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if length > maximum_length {
+        return Err(capacity_exceeded(length, maximum_length));
     }
     Ok(bytes)
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_journal(
     bytes: &[u8],
+    maximum_length: u64,
 ) -> Result<
     (
         Option<u64>,
@@ -1344,6 +1497,10 @@ fn parse_journal(
     ),
     DurableAuditError,
 > {
+    let byte_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if byte_length > maximum_length {
+        return Err(capacity_exceeded(byte_length, maximum_length));
+    }
     let mut offset = 0_usize;
     let mut expected_sequence = 0_u64;
     let mut attempts = BTreeMap::new();
@@ -2168,6 +2325,10 @@ mod tests {
     }
 
     fn begin(log: &DurableAuditLog, attempt: u64) {
+        begin_result(log, attempt).expect("test attempt must be durable");
+    }
+
+    fn begin_result(log: &DurableAuditLog, attempt: u64) -> Result<(), DurableAuditError> {
         log.begin_attempt(
             0,
             AttemptId::from_u64(attempt),
@@ -2176,7 +2337,6 @@ mod tests {
             &request_set(),
             AuthorizationEpoch::default(),
         )
-        .expect("test attempt must be durable");
     }
 
     #[test]
@@ -2506,12 +2666,158 @@ mod tests {
 
         assert!(matches!(
             DurableAuditView::open(&journal.path),
-            Err(DurableAuditError::RecordTooLarge(_))
+            Err(DurableAuditError::CapacityExceeded { .. })
         ));
         assert!(matches!(
             DurableAuditLog::open(&journal.path),
-            Err(DurableAuditError::RecordTooLarge(_))
+            Err(DurableAuditError::CapacityExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn capacity_zero_rejects_before_any_file_or_memory_state_mutation() {
+        let journal = TestJournal::new();
+        let log = DurableAuditLog::create_with_max_bytes(&journal.path, 0)
+            .expect("zero-capacity empty journal must be creatable");
+        let before = fs::read(&journal.path).expect("empty journal must be readable");
+
+        let error = begin_result(&log, 0).expect_err("first frame must exceed zero capacity");
+        assert!(matches!(
+            error,
+            DurableAuditError::CapacityExceeded {
+                current: 0,
+                projected,
+                capacity: 0
+            } if projected > 0
+        ));
+        assert_eq!(
+            fs::read(&journal.path).expect("rejected append must not write bytes"),
+            before
+        );
+        assert!(
+            log.attempts()
+                .expect("rejected append keeps state readable")
+                .is_empty()
+        );
+        assert_eq!(
+            log.next_attempt_sequence()
+                .expect("rejected append keeps sequence allocation unchanged"),
+            Some(0)
+        );
+        drop(log);
+
+        let view = DurableAuditView::open_with_max_bytes(&journal.path, 0)
+            .expect("zero-capacity empty journal must reopen");
+        drop(view);
+        let reopened = DurableAuditLog::open_with_max_bytes(&journal.path, 0)
+            .expect("zero-capacity empty journal must reopen writable");
+        drop(reopened);
+    }
+
+    #[test]
+    fn exact_capacity_preserves_existing_terminal_frames_when_next_append_is_rejected() {
+        let journal = TestJournal::new();
+        let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
+        begin(&log, 0);
+        log.finish_attempt(AttemptId::from_u64(0), AttemptOutcome::Denied, None, None)
+            .expect("terminal frame must be durable");
+        let capacity = fs::metadata(&journal.path)
+            .expect("journal metadata must be readable")
+            .len();
+        let before = fs::read(&journal.path).expect("committed journal bytes must be readable");
+        drop(log);
+
+        let log = DurableAuditLog::open_with_max_bytes(&journal.path, capacity)
+            .expect("journal at exact capacity must reopen");
+        let error = begin_result(&log, 1).expect_err("next frame must exceed exact capacity");
+        assert!(matches!(
+            error,
+            DurableAuditError::CapacityExceeded {
+                current,
+                projected,
+                capacity: actual_capacity
+            } if current == capacity && projected > capacity && actual_capacity == capacity
+        ));
+        assert_eq!(
+            fs::read(&journal.path).expect("rejected append must preserve terminal bytes"),
+            before
+        );
+        let attempts = log
+            .attempts()
+            .expect("existing terminal frame must remain readable");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome(), AttemptOutcome::Denied);
+        drop(log);
+
+        let reopened = DurableAuditView::open_with_max_bytes(&journal.path, capacity)
+            .expect("unchanged exact-capacity journal must reopen read-only");
+        assert_eq!(reopened.attempts().len(), 1);
+        assert_eq!(reopened.attempts()[0].outcome(), AttemptOutcome::Denied);
+    }
+
+    #[test]
+    fn reopen_rejects_capacity_before_parsing_torn_or_overlong_suffixes() {
+        let journal = TestJournal::new();
+        let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
+        begin(&log, 0);
+        drop(log);
+        let complete_length = fs::metadata(&journal.path)
+            .expect("journal metadata must be readable")
+            .len();
+
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&journal.path)
+            .expect("journal must be writable for suffix fixture");
+        file.set_len(complete_length + 1)
+            .expect("suffix fixture must be representable");
+        file.sync_all().expect("suffix fixture must be synced");
+        drop(file);
+
+        assert!(matches!(
+            DurableAuditView::open_with_max_bytes(&journal.path, complete_length),
+            Err(DurableAuditError::CapacityExceeded {
+                current,
+                projected,
+                capacity
+            }) if current == complete_length + 1
+                && projected == complete_length + 1
+                && capacity == complete_length
+        ));
+        assert!(matches!(
+            DurableAuditLog::open_with_max_bytes(&journal.path, complete_length),
+            Err(DurableAuditError::CapacityExceeded { .. })
+        ));
+
+        file_cleanup(&journal.path, complete_length - 1);
+        assert!(matches!(
+            DurableAuditView::open_with_max_bytes(&journal.path, complete_length),
+            Err(DurableAuditError::TruncatedRecord)
+        ));
+    }
+
+    #[test]
+    fn custom_capacity_above_production_hard_bound_is_rejected_without_creating_paths() {
+        let journal = TestJournal::new();
+        let requested = MAX_JOURNAL_BYTES + 1;
+        assert!(matches!(
+            DurableAuditLog::create_with_max_bytes(&journal.path, requested),
+            Err(DurableAuditError::InvalidCapacity {
+                requested: actual,
+                maximum: MAX_JOURNAL_BYTES,
+            }) if actual == requested
+        ));
+        assert!(!journal.path.exists());
+        assert!(!journal.lock_path().exists());
+    }
+
+    fn file_cleanup(path: &PathBuf, length: u64) {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("journal must be writable for suffix cleanup");
+        file.set_len(length)
+            .expect("suffix cleanup must restore complete prefix");
     }
 
     #[test]

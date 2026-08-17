@@ -6,7 +6,7 @@
 
 > **対象読者:** runtime-isolation の実装者、レビュー担当者、特権環境で統合 test を回す人
 
-この crate の検証は 2 層ある。mock backend による順序制御・設定検査・BPF プログラムの形の確認と、実 kernel 上で 13 step を適用して境界を kernel に問い直す確認。guest 側には別に `guest-supervisor-init` → `LinuxHostResources` → `workload-isolation-launcher` の実装と opt-in Firecracker runtime-image test があるが、ここでの privileged probe とは別の証拠である。前者だけでは「隔離が効いている」ことは言えないので、どの層で何が言えるのかを分けて書く。
+この crate の検証は 2 層ある。mock backend による順序制御・設定検査・BPF プログラムの形の確認と、実 kernel 上で 13 step を適用して境界を kernel に問い直す確認。privileged probe は API 直呼びの staged rootfs と、実際の `workload-isolation-launcher` を起動して固定 workload を `execve` する経路の両方を持つ。guest 側には別に `guest-supervisor-init` → `LinuxHostResources` → `workload-isolation-launcher` の実装と opt-in Firecracker runtime-image test がある。前者だけでは「隔離が効いている」ことは言えないので、どの層で何が言えるのかを分けて書く。
 
 ## local test で確認したこと
 
@@ -48,11 +48,25 @@ guest 起動側の protocol は別 crate の unit test で固定している。`
 | 継承 fd が閉じられている | close-on-exec を外した fd 100 が `EBADF` | `enforce` |
 | capability が全て落ちている | `/proc/self/status` の `CapEff` が `0000000000000000` | `enforce` |
 | `no_new_privs` と seccomp mode が立っている | `NoNewPrivs=1`、`Seccomp=2` | `enforce` |
+| production launcher の start gate が完了する | `ready` → release byte → `isolated` の順で ACK | `launcher-post-exec` |
+| `execve` 後も PID namespace が続く | 再 exec された workload の `getpid()` が `1` | `launcher-post-exec` |
+| `execve` 後も path / syscall 境界が続く | `socket` / `unshare` が `EPERM`、workspace は成功、tmpfs は `EACCES`、rootfs は `EROFS` | `launcher-post-exec` |
+| `execve` 後の masks が効く | `/dev/null`、`/run/lock`、`/sys/kernel` が `ENOENT` | `launcher-post-exec` |
+| capability / mode が exec で緩まない | `CapEff` / `CapPrm` / `CapBnd` / `CapAmb` は全て 0、`NoNewPrivs=1`、`Seccomp=2` | `launcher-post-exec` |
+| exec 後の fd policy が exact である | 標準 fd は `/dev/null`、control/Broker の 2 本だけが nonstandard に残り、marker / exec-status は消える | `launcher-post-exec` |
+| launcher が shell を暗黙に起動しない | `;`、`$(touch /outside)`、空白を含む argv がそのまま再 exec される | `launcher-post-exec` |
 | 失敗した step が launcher に正しく報告される | `Landlock` で失敗し `termination_required=true` | `landlock-failure` |
-| launcher が host の cgroup を解放する | `/sys/fs/cgroup/<name>` が消える | 両 scenario |
-| 境界未完成の workload は実行されない | child の report file が作られない | `landlock-failure` |
+| 実 backend の mount failure が完了済み mount を rollback する | `LimitedTmpfs` の直前で失敗し、完了済み `Workspace` の逆順 unmount、child mount namespace の消滅、host mount table の残差なしを外部観測する | `limited-tmpfs-failure` |
+| launcher が host の cgroup を解放する | `/sys/fs/cgroup/<name>` が消える | failure scenarios |
+| 境界未完成の workload は実行されない | child の report file が作られない | `landlock-failure`, `limited-tmpfs-failure` |
 
 Landlock の証拠に tmpfs を使うのは意図的である。rootfs は read-only mount のため LSM hook より手前で `EROFS` になり、Landlock が効いているかどうかを区別できない。tmpfs は mount 上書き込めるので、拒否できるのは ruleset だけになる。
+
+`launcher-post-exec` は libtest process から直接 kernel API を叩くのではなく、同じ package の production binary を起動する。workload binary 自身は probe の再 exec であり、report は隔離後も保持された supervisor control channel から親へ返す。Broker descriptor には host 上の `AF_VSOCK` local-CID pair を使うため、実際の descriptor validation（`SOCK_STREAM`、connected `AF_VSOCK`）も通る。
+
+`rootfs.source == "/"` は host root が起動前から readonly の場合だけ同じ launcher scenario で選択する。mutable な host root を test の都合で remount してから namespace clone することはしない（kernel が user namespace clone を `EPERM` にするうえ、host root の安全境界を壊すため）。その前提がない host では staged rootfs の post-exec 証拠を実行し、`/` branch は unavailable として別に記録する。
+
+`limited-tmpfs-failure` は debug build にだけコンパイルされる test-only seam を環境変数で有効にし、実際の `LinuxBackend` が `LimitedTmpfs` syscall を呼ぶ直前に `BackendError` を返す。rootfs pivot と workspace bind mount は完了済みなので、production coordinator の逆順 rollback が workspace を unmount し、cgroup は launcher が child を reap した後に削除する。親 probe は child の mount namespace が消えたこと、probe staging tree 以下の host mount table に新しい mount が残っていないこと、workload report が存在しないことを確認する。root pivot 自体は不可逆であるため、これは「完了済み reversible mount の rollback と host cleanup」の証拠であり、pivot を元へ戻せる証拠ではない。
 
 この層が見つけた実装の誤りは 2 件ある。どちらも mock では原理的に検出できない。
 
@@ -70,18 +84,21 @@ cargo clippy --manifest-path crates/runtime-isolation/Cargo.toml --all-targets -
 scripts/ci/verify-privileged-isolation.sh
 ```
 
+wrapper は先に production の `workload-isolation-launcher` binary を build し、その binary を
+`launcher-post-exec` scenario へ渡す。kernel feature / privilege が不足して probe が実行できない
+場合は `unavailable` を stderr に出して exit 2 とし、skip を green として扱わない。
+
 `capability_detection.rs` と `privileged_isolation.rs` はどちらも `#[ignore]` を使っていない。権限や kernel feature が足りない環境では、`CapabilityReport` の不足理由を stderr に出したうえで detection 分岐そのものを検証する。CI で「skip されたので緑」という状態を作らないための書き方。
 
-`privileged_isolation.rs` が要求するのは、user namespace が許可された Linux host、`memory` と `pids` を子へ委譲している cgroup v2 hierarchy、Landlock ABI 3 以上、seccomp、`clone3` / `close_range` / `pidfd_open`。root で走らせる必要がある。probe は自分専用の mount namespace の中で read-only rootfs を組み立てるので、host の mount table は変えない。
+`privileged_isolation.rs` が要求するのは、user namespace が許可された Linux host、`memory` と `pids` を子へ委譲している cgroup v2 hierarchy、Landlock ABI 3 以上、seccomp、`clone3` / `close_range` / `pidfd_open`、host local `AF_VSOCK`。root で走らせる必要がある。probe は自分専用の mount namespace と tmpfs の中に staged rootfs を組み立てるので、host の mount table や root filesystem は変えない。
 
 ## 未検証の境界
 
 | 未検証の対象 | なぜ未検証か | 何があれば検証できるか |
 |---|---|---|
-| unmount による rollback が実際に戻ること | 失敗を注入できたのは `Landlock` で、そこは `pivot_root` 後のため crate 自身が「戻せない」と申告する。確認できたのは cgroup の解放だけ | `Workspace` や `LimitedTmpfs` で失敗を注入し、child の mount namespace を外から観測する test |
-| 既に immutable な root を持つ guest 経路 (`rootfs.source == "/"`) | probe は staged rootfs 経路だけを通る。`/` 経路は `/run` と `/sys` の masking を含む別分岐 | 実 guest image を持つ VM 内での同等 probe |
-| workload を `execve` した後も境界が続くこと | probe は child 内で直接観測しており、exec を挟んでいない | 固定 workload binary を exec してから同じ観測を行う test |
-| privileged probe による実 supervisor 経由の起動 | host probe 自体は `workload-isolation-launcher` ではなく API を直接使う。別の opt-in KVM test は v2 guest gate、supervisor/launcher/Broker channel を通す | CapFS の全 effect と `Runtime::launch` lifecycle を同時に通す実KVM試験 |
+| mount syscall の部分成功後に失敗した場合の rollback | privileged probe は `LimitedTmpfs` syscall の前に失敗させるため、失敗した呼び出し自身が mount を残すケースは実測していない | `mount(2)` の戻り値を含む test-only fault seam と、対象 mount namespace を保持した観測 helper |
+| mutable host での `rootfs.source == "/"` | source `/` は起動前から readonly である必要がある。mutable host root を test が remount することはせず、`rootfs_source_slash=unavailable:...` と記録する。readonly guest root では同じ launcher scenario が `/` branch を選ぶ | readonly guest image、または rootfs `/` が最初から readonly の privileged runner |
+| privileged probe による実 supervisor 経由の起動 | host probe は production launcher の gate / exec / Broker descriptor validation を通すが、`guest-supervisor-init` と CapFS の全 effect は同時に通さない | CapFS の全 effect と `Runtime::launch` lifecycle を同時に通す実 KVM 試験 |
 | x86_64 以外の syscall 番号 | `number()` が `None` を返すため `validate` が通らない | 対象 arch の番号表と、その arch での CI runner |
 
 mock test が全部通っても、VM 実起動や full isolation の完成とは判断しない。この方針は [docs/README.md](../README.md) の宣言に従う。特権 test が通ったことも、上の表の範囲を超えては主張しない。

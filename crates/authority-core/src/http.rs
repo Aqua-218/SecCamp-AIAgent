@@ -9,6 +9,11 @@
 
 use std::{error::Error, fmt, net::IpAddr};
 
+/// Maximum encoded ASCII bytes in one canonical origin-form URL path.
+pub const MAX_CANONICAL_URL_PATH_BYTES: usize = 4096;
+/// Maximum number of segments in one canonical origin-form URL path.
+pub const MAX_CANONICAL_URL_PATH_SEGMENTS: usize = 64;
+
 /// A DNS hostname normalized for exact HTTP authority comparisons.
 ///
 /// Construction accepts ASCII DNS names only. ASCII letters are lowercased and
@@ -211,7 +216,9 @@ impl CanonicalUrlPath {
     /// # Errors
     ///
     /// Returns [`InvalidCanonicalUrlPath`] when `path` is not the one allowed
-    /// spelling for an authority path.
+    /// spelling for an authority path, exceeds
+    /// `MAX_CANONICAL_URL_PATH_BYTES` encoded bytes, or exceeds
+    /// `MAX_CANONICAL_URL_PATH_SEGMENTS` segments.
     pub fn new(path: impl AsRef<str>) -> Result<Self, InvalidCanonicalUrlPath> {
         let path = path.as_ref();
         if path == "/" {
@@ -230,6 +237,18 @@ impl CanonicalUrlPath {
         if !path.is_ascii() {
             return Err(InvalidCanonicalUrlPath::new(
                 InvalidCanonicalUrlPathReason::NonAscii,
+            ));
+        }
+        if path.len() > MAX_CANONICAL_URL_PATH_BYTES {
+            return Err(InvalidCanonicalUrlPath::new(
+                InvalidCanonicalUrlPathReason::EncodedPathTooLong,
+            ));
+        }
+        let segment_count = path[1..].split('/').count();
+        if segment_count > MAX_CANONICAL_URL_PATH_SEGMENTS {
+            return Err(InvalidCanonicalUrlPath::at_segment(
+                MAX_CANONICAL_URL_PATH_SEGMENTS,
+                InvalidCanonicalUrlPathReason::TooManySegments,
             ));
         }
 
@@ -346,6 +365,11 @@ pub enum InvalidCanonicalUrlPathReason {
     /// A segment contains a character outside the accepted RFC 3986 `pchar`
     /// set (with `%` handled separately).
     ContainsInvalidCharacter,
+    /// The path would contain more than `MAX_CANONICAL_URL_PATH_SEGMENTS`
+    /// segments.
+    TooManySegments,
+    /// The encoded path would exceed `MAX_CANONICAL_URL_PATH_BYTES` bytes.
+    EncodedPathTooLong,
 }
 
 impl fmt::Display for InvalidCanonicalUrlPathReason {
@@ -365,6 +389,8 @@ impl fmt::Display for InvalidCanonicalUrlPathReason {
             Self::ContainsInvalidCharacter => {
                 "must contain only RFC 3986 path characters without percent encoding"
             }
+            Self::TooManySegments => "the canonical URL path must not exceed 64 segments",
+            Self::EncodedPathTooLong => "the canonical URL path must not exceed 4096 encoded bytes",
         };
         formatter.write_str(expectation)
     }
@@ -657,8 +683,8 @@ mod tests {
     use super::{
         CanonicalHost, CanonicalUrlPath, HttpFetchAuthority, HttpFetchMethod, HttpFetchMethods,
         HttpFetchRequest, InvalidCanonicalHostReason, InvalidCanonicalUrlPathReason,
-        UrlPathPattern, http_fetch_body_below, http_fetch_matches, url_path_below,
-        url_path_matches,
+        MAX_CANONICAL_URL_PATH_BYTES, MAX_CANONICAL_URL_PATH_SEGMENTS, UrlPathPattern,
+        http_fetch_body_below, http_fetch_matches, url_path_below, url_path_matches,
     };
 
     fn host(value: &str) -> CanonicalHost {
@@ -824,6 +850,46 @@ mod tests {
             assert_eq!(error.segment_index(), segment_index, "input: {input:?}");
             assert_eq!(error.reason(), reason, "input: {input:?}");
         }
+    }
+
+    #[test]
+    fn canonical_url_path_accepts_exact_byte_and_segment_boundaries() {
+        let at_byte_limit = format!("/{}", "a".repeat(MAX_CANONICAL_URL_PATH_BYTES - 1));
+        let canonical = CanonicalUrlPath::new(&at_byte_limit)
+            .expect("a URL path at the encoded byte limit must be accepted");
+        assert_eq!(canonical.to_string().len(), MAX_CANONICAL_URL_PATH_BYTES);
+
+        let at_segment_limit = format!("/{}", ["x"; MAX_CANONICAL_URL_PATH_SEGMENTS].join("/"));
+        let canonical = CanonicalUrlPath::new(&at_segment_limit)
+            .expect("a URL path at the segment limit must be accepted");
+        assert_eq!(
+            canonical.as_segments().len(),
+            MAX_CANONICAL_URL_PATH_SEGMENTS
+        );
+    }
+
+    #[test]
+    fn canonical_url_path_rejects_overlong_and_overdeep_inputs() {
+        let overlong = format!("/{}", "a".repeat(MAX_CANONICAL_URL_PATH_BYTES));
+        let byte_error = CanonicalUrlPath::new(&overlong)
+            .expect_err("a URL path over the encoded byte limit must be rejected");
+        assert_eq!(byte_error.segment_index(), None);
+        assert_eq!(
+            byte_error.reason(),
+            InvalidCanonicalUrlPathReason::EncodedPathTooLong
+        );
+
+        let too_deep = format!("/{}", ["x"; MAX_CANONICAL_URL_PATH_SEGMENTS + 1].join("/"));
+        let segment_error = CanonicalUrlPath::new(&too_deep)
+            .expect_err("a URL path over the segment limit must be rejected");
+        assert_eq!(
+            segment_error.segment_index(),
+            Some(MAX_CANONICAL_URL_PATH_SEGMENTS)
+        );
+        assert_eq!(
+            segment_error.reason(),
+            InvalidCanonicalUrlPathReason::TooManySegments
+        );
     }
 
     #[test]

@@ -3500,44 +3500,66 @@ where
 {
     let mut failures = Vec::new();
 
-    if !active.cleanup.capability_revoked
-        && let Some(capability) = active.capability.as_ref()
-    {
-        match capability_backend.revoke_root_capability(capability) {
-            Ok(()) => active.cleanup.capability_revoked = true,
-            Err(error) => failures.push(CleanupFailure {
+    if !active.cleanup.capability_revoked {
+        if let Some(capability) = active.capability.as_ref() {
+            match capability_backend.revoke_root_capability(capability) {
+                Ok(()) => active.cleanup.capability_revoked = true,
+                Err(error) => failures.push(CleanupFailure {
+                    stage: CleanupStage::CapabilityRevoke,
+                    error,
+                }),
+            }
+        } else {
+            failures.push(CleanupFailure {
                 stage: CleanupStage::CapabilityRevoke,
-                error,
-            }),
+                error: BackendError::new(
+                    "cleanup invariant failed: capability revocation is pending without a lease",
+                ),
+            });
         }
     }
 
     if !active.cleanup.vm_killed {
         let result = if let Some(vm) = active.vm.as_ref() {
-            vm_backend.kill_vm(vm)
+            Some(vm_backend.kill_vm(vm))
         } else if active.vm_start_attempted {
-            vm_backend.cleanup_failed_start()
+            Some(vm_backend.cleanup_failed_start())
         } else {
-            Ok(())
-        };
-        match result {
-            Ok(()) => active.cleanup.vm_killed = true,
-            Err(error) => failures.push(CleanupFailure {
+            failures.push(CleanupFailure {
                 stage: CleanupStage::VmKill,
-                error,
-            }),
+                error: BackendError::new(
+                    "cleanup invariant failed: VM cleanup is pending without a lease or start attempt",
+                ),
+            });
+            None
+        };
+        if let Some(result) = result {
+            match result {
+                Ok(()) => active.cleanup.vm_killed = true,
+                Err(error) => failures.push(CleanupFailure {
+                    stage: CleanupStage::VmKill,
+                    error,
+                }),
+            }
         }
     }
 
-    if !active.cleanup.broker_closed
-        && let Some(broker) = active.broker.as_ref()
-    {
-        match broker_backend.close_broker_session(broker) {
-            Ok(()) => active.cleanup.broker_closed = true,
-            Err(error) => failures.push(CleanupFailure {
+    if !active.cleanup.broker_closed {
+        if let Some(broker) = active.broker.as_ref() {
+            match broker_backend.close_broker_session(broker) {
+                Ok(()) => active.cleanup.broker_closed = true,
+                Err(error) => failures.push(CleanupFailure {
+                    stage: CleanupStage::BrokerClose,
+                    error,
+                }),
+            }
+        } else {
+            failures.push(CleanupFailure {
                 stage: CleanupStage::BrokerClose,
-                error,
-            }),
+                error: BackendError::new(
+                    "cleanup invariant failed: Broker close is pending without a lease",
+                ),
+            });
         }
     }
 
@@ -4266,6 +4288,61 @@ mod tests {
                 identity.capability_id(),
             ))
         }
+    }
+
+    #[test]
+    fn impossible_missing_cleanup_leases_report_typed_failures_instead_of_an_empty_error() {
+        let identity = SessionIdentity {
+            session_id: SessionId::new([1; ID_BYTES]),
+            request_id: RequestId::new([2; ID_BYTES]),
+            vm_id: VmId::new([3; ID_BYTES]),
+            subject_id: SubjectId::new([4; ID_BYTES]),
+            workspace_id: WorkspaceId::new([5; ID_BYTES]),
+            broker_session_id: BrokerSessionId::new([6; ID_BYTES]),
+            capability_id: CapabilityId::new([7; ID_BYTES]),
+        };
+        let mut active = ActiveSession::pending(
+            SessionInfo { identity },
+            WorkspaceLease::new(identity.session_id(), identity.workspace_id()),
+            None,
+            None,
+            None,
+        );
+        active.cleanup.capability_revoked = false;
+        active.cleanup.vm_killed = false;
+        active.cleanup.broker_closed = false;
+
+        let mut workspace = TestWorkspace::default();
+        let mut broker = TestBroker::default();
+        let mut vm = TestVm::default();
+        let mut capability = TestCapability::default();
+        let failures = cleanup_active(
+            &mut active,
+            &mut workspace,
+            &mut broker,
+            &mut vm,
+            &mut capability,
+        );
+
+        assert_eq!(
+            failures
+                .iter()
+                .map(CleanupFailure::stage)
+                .collect::<Vec<_>>(),
+            vec![
+                CleanupStage::CapabilityRevoke,
+                CleanupStage::VmKill,
+                CleanupStage::BrokerClose
+            ]
+        );
+        assert!(failures.iter().all(|failure| {
+            failure
+                .error()
+                .message()
+                .starts_with("cleanup invariant failed:")
+        }));
+        assert!(!active.cleanup_complete());
+        assert!(workspace.isolated.is_empty());
     }
 
     #[derive(Debug, Clone, Copy)]

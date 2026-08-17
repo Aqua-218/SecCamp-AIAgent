@@ -57,12 +57,37 @@ pull_request_plan="$(plan_for PLAN_EVENT=pull_request PLAN_PLATFORM=github)"
 expect_status 'pull request' rust_tests required "${pull_request_plan}"
 expect_status 'pull request' coverage required "${pull_request_plan}"
 expect_status 'pull request' real_vm skipped "${pull_request_plan}"
+expect_status 'pull request' real_runtime_lifecycle skipped "${pull_request_plan}"
+expect_status 'pull request' real_capfs skipped "${pull_request_plan}"
+expect_status 'pull request' egress_real_https skipped "${pull_request_plan}"
+expect_status 'pull request' external_provider_smoke skipped "${pull_request_plan}"
 expect_status 'pull request' privileged_isolation skipped "${pull_request_plan}"
 
 # A scheduled run is the only thing that reaches the deep tier.
 schedule_plan="$(plan_for PLAN_EVENT=schedule PLAN_PLATFORM=github)"
 expect_status 'schedule' real_vm required "${schedule_plan}"
+expect_status 'schedule' real_runtime_lifecycle required "${schedule_plan}"
+expect_status 'schedule' real_capfs required "${schedule_plan}"
+expect_status 'schedule' egress_real_https required "${schedule_plan}"
+expect_status 'schedule' external_provider_smoke skipped "${schedule_plan}"
 expect_status 'schedule' privileged_isolation required "${schedule_plan}"
+
+# The external-provider gate mutates a disposable repository, so it is never
+# eligible for the unattended schedule. GitHub dispatch and protected GitLab
+# web/API runs are the only allowed on-demand events.
+github_dispatch_plan="$(plan_for PLAN_EVENT=workflow_dispatch PLAN_PLATFORM=github)"
+expect_status 'GitHub workflow dispatch' external_provider_smoke required "${github_dispatch_plan}"
+gitlab_web_plan="$(plan_for PLAN_EVENT=web PLAN_PLATFORM=gitlab)"
+expect_status 'GitLab web pipeline' external_provider_smoke required "${gitlab_web_plan}"
+gitlab_api_plan="$(plan_for PLAN_EVENT=api PLAN_PLATFORM=gitlab)"
+expect_status 'GitLab API pipeline' external_provider_smoke required "${gitlab_api_plan}"
+
+# A workflow-filtered deep plan still carries planned entries. They have no job
+# by design, but hiding them from the plan would hide the unbuilt boundary from
+# the evidence report.
+deep_workflow_plan="$(PLAN_EVENT=schedule PLAN_PLATFORM=github \
+  "${repository_root}/scripts/ci/plan-pipeline.sh" --workflow deep.yml)"
+expect_status 'deep workflow' session_owner_kvm planned "${deep_workflow_plan}"
 
 # ------------------------------------------------------ platform availability --
 
@@ -110,6 +135,60 @@ planned_gate_count="$(printf '%s' "${pull_request_plan}" | yq eval -p json '.gat
 if [[ "${manifest_gate_count}" != "${planned_gate_count}" ]]; then
   fail "plan covers ${planned_gate_count} gates, manifest declares ${manifest_gate_count}"
 fi
+
+# ------------------------------------------------------------- fan-in semantics --
+
+# The fan-in is the last security boundary: a required protected gate must fail
+# when it is absent or skipped, while an unavailable platform gate may be absent
+# or explicitly skipped. Planned gates must have no result at all.
+fanin_plan="${work_directory}/fanin-plan.json"
+printf '%s\n' '{"gates":{"required_gate":"required","skipped_gate":"skipped","unavailable_gate":"unavailable","planned_gate":"planned"}}' > "${fanin_plan}"
+
+expect_fanin() {
+  local description="$1" expected="$2" result_path="$3"
+  checks=$((checks + 1))
+  local actual='failure'
+  if "${repository_root}/scripts/ci/check-gate-results.sh" \
+    --plan "${fanin_plan}" --results "${result_path}" >/dev/null 2>&1; then
+    actual='success'
+  fi
+  if [[ "${actual}" != "${expected}" ]]; then
+    fail "${description}: fan-in returned ${actual}, expected ${expected}"
+  fi
+}
+
+# A scheduled plan must reject an external-provider result even if a runner
+# accidentally creates the job. This protects against a destructive mutation
+# being smuggled into the unattended fan-in by topology drift.
+scheduled_external_plan="${work_directory}/scheduled-external-plan.json"
+printf '%s\n' '{"gates":{"external_provider_smoke":"skipped"}}' > "${scheduled_external_plan}"
+scheduled_external_result="${work_directory}/scheduled-external-result.tsv"
+printf 'external_provider_smoke\tsuccess\n' > "${scheduled_external_result}"
+checks=$((checks + 1))
+if "${repository_root}/scripts/ci/check-gate-results.sh" \
+  --plan "${scheduled_external_plan}" --results "${scheduled_external_result}" >/dev/null 2>&1; then
+  fail 'scheduled external mutation result: fan-in accepted a result for a skipped gate'
+fi
+
+fanin_pass="${work_directory}/fanin-pass.tsv"
+printf 'required_gate\tsuccess\nskipped_gate\tskipped\nunavailable_gate\tskipped\n' > "${fanin_pass}"
+expect_fanin 'successful required and explicitly skipped optional gates' success "${fanin_pass}"
+
+fanin_required_missing="${work_directory}/fanin-required-missing.tsv"
+: > "${fanin_required_missing}"
+expect_fanin 'missing required gate' failure "${fanin_required_missing}"
+
+fanin_required_skipped="${work_directory}/fanin-required-skipped.tsv"
+printf 'required_gate\tskipped\n' > "${fanin_required_skipped}"
+expect_fanin 'skipped required gate' failure "${fanin_required_skipped}"
+
+fanin_unavailable_success="${work_directory}/fanin-unavailable-success.tsv"
+printf 'required_gate\tsuccess\nunavailable_gate\tsuccess\n' > "${fanin_unavailable_success}"
+expect_fanin 'successful unavailable gate result' failure "${fanin_unavailable_success}"
+
+fanin_planned_result="${work_directory}/fanin-planned-result.tsv"
+printf 'required_gate\tsuccess\nplanned_gate\tsuccess\n' > "${fanin_planned_result}"
+expect_fanin 'result reported for planned gate' failure "${fanin_planned_result}"
 
 if [[ "${failures}" -gt 0 ]]; then
   printf '\npipeline planner self-test: %d of %d check(s) failed\n' "${failures}" "${checks}" >&2

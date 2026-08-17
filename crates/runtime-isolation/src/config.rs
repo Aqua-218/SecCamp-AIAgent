@@ -306,39 +306,6 @@ impl IsolationConfig {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{ControlChannelConfig, EgressChannelConfig};
-
-    #[test]
-    fn refuses_control_channel_descriptors_that_overlap_standard_io() {
-        assert!(ControlChannelConfig::new(2).is_err());
-        assert_eq!(
-            ControlChannelConfig::new(3)
-                .expect("the first nonstandard descriptor must be accepted")
-                .fd(),
-            3
-        );
-        assert_eq!(
-            ControlChannelConfig::new(4)
-                .expect("another nonstandard descriptor must be accepted")
-                .fd(),
-            4
-        );
-    }
-
-    #[test]
-    fn refuses_egress_channel_descriptors_that_overlap_standard_io() {
-        assert!(EgressChannelConfig::new(2).is_err());
-        assert_eq!(
-            EgressChannelConfig::new(3)
-                .expect("the first nonstandard descriptor must be accepted")
-                .fd(),
-            3
-        );
-    }
-}
-
 fn validate_rootfs(config: &RootfsConfig) -> Result<(), IsolationError> {
     validate_absolute_clean_path(&config.source, "rootfs source")?;
     validate_absolute_clean_path(&config.mount_target, "rootfs mount target")?;
@@ -433,5 +400,38 @@ struct InvalidConfig;
 impl InvalidConfig {
     fn message(message: impl Into<String>) -> IsolationError {
         IsolationError::InvalidConfig(message.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ControlChannelConfig, EgressChannelConfig};
+
+    #[test]
+    fn refuses_control_channel_descriptors_that_overlap_standard_io() {
+        assert!(ControlChannelConfig::new(2).is_err());
+        assert_eq!(
+            ControlChannelConfig::new(3)
+                .expect("the first nonstandard descriptor must be accepted")
+                .fd(),
+            3
+        );
+        assert_eq!(
+            ControlChannelConfig::new(4)
+                .expect("another nonstandard descriptor must be accepted")
+                .fd(),
+            4
+        );
+    }
+
+    #[test]
+    fn refuses_egress_channel_descriptors_that_overlap_standard_io() {
+        assert!(EgressChannelConfig::new(2).is_err());
+        assert_eq!(
+            EgressChannelConfig::new(3)
+                .expect("the first nonstandard descriptor must be accepted")
+                .fd(),
+            3
+        );
     }
 }

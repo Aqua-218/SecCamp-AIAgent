@@ -63,12 +63,8 @@ impl CanonicalBrokerRequest {
         operation: BrokerOperation,
     ) -> Self {
         let canonical_payload = encode_operation(&operation);
-        let envelope = BrokerEnvelope::new(
-            session,
-            sequence,
-            request,
-            PayloadHash::of_canonical_payload(&canonical_payload),
-        );
+        let envelope =
+            BrokerEnvelope::from_canonical_payload(session, sequence, request, &canonical_payload);
         Self {
             envelope,
             operation,
@@ -108,7 +104,12 @@ impl CanonicalBrokerRequest {
             return Err(CborError::PayloadHashMismatch);
         }
         Ok(Self {
-            envelope: BrokerEnvelope::new(session, sequence, request, payload_hash),
+            envelope: BrokerEnvelope::from_canonical_payload(
+                session,
+                sequence,
+                request,
+                &canonical_payload,
+            ),
             operation,
             canonical_payload,
         })

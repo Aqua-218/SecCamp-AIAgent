@@ -99,7 +99,7 @@ connection 単位の責務が 1 関数に収まっている。何回読むか、
 - direct kernel `AF_VSOCK` の bind / accept は未検証。module test は in-memory の stream を使うが、repository の opt-in KVM test は Firecracker が転送する Unix stream を使い、実 `BrokerDispatcher` の 1 request / 1 canonical rejection を確認する。
 - peer CID の照合は `accept_peer` が返す値に依存する。kernel から正しく取れることは、この crate では確認していない。
 - `ConnectionReport` は `requests_served` と `accounting_invariant_closed` を返すが、これを使った運用側の処理は無い。
-- `serve_connection_with_policy` / `serve_expected_peer_with_policy` は per-read/per-write と absolute connection deadline を `DeadlineStream` に適用し、期限到達時は typed error で fail closed する。generic `serve_connection` は互換の plain path であり timeout を主張しない。現行 `session-orchestrator::BuiltBrokerRuntime` は plain path を使うため、production Firecracker UDS の absolute connection deadline wiring は未完了である。
+- `serve_connection_with_policy` / `serve_expected_peer_with_policy` は per-read/per-write と absolute connection deadline を `DeadlineStream` に適用し、期限到達時は typed error で fail closed する。generic `serve_connection` は互換の plain path であり timeout を主張しない。production `session-orchestrator::BuiltBrokerRuntime` は policy-aware path を使う。
 - `serve_connection` は caller / capability の identity と clock を別々に受け取り、request ごとに `DispatchContext` を作り直す。clock の実装が実時刻を返すことは、この crate では検証していない。
 
 ## 変更時の確認点

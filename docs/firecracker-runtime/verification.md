@@ -20,6 +20,8 @@
 | API 失敗でプロセス・dm-verity・workspace を逆順に rollback する | `api_error_rolls_back_process_verity_and_workspace_in_reverse_order` |
 | workspace clone 失敗で VM を起動せず部分 tree を削除する | `workspace_clone_error_removes_partial_destination_without_starting_vm` |
 | shutdown が成功済み step を繰り返さず未完了だけ retry する | `shutdown_retries_each_pending_cleanup_without_repeating_successes` |
+| snapshot 前に pause acknowledgement を受け、失敗時も paused state を再利用しない | `snapshot_pauses_vm_before_writing_snapshot_files`, `snapshot_create_failure_keeps_instance_explicitly_paused` |
+| pause 応答の失敗を unknown state として扱い snapshot を作らない | `snapshot_pause_failure_enters_unknown_state_and_does_not_create_snapshot` |
 | restore が全 identity を再生成し、注入まで workload を止める | `restore_regenerates_all_identities_and_gates_workload_until_injection` |
 | host が割り当てた identity をそのまま受け入れる | `restore_accepts_exact_host_allocated_identities` |
 | host identity の再利用を side effect の前に拒否する | `restore_rejects_host_identity_reuse_before_side_effects` |
@@ -87,12 +89,14 @@ symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` �
 | boot / artifact | KVM 上の Firecracker が read-only dm-verity mapper を root として起動する |
 | guest control listener | guest PID 1 が `AF_VSOCK` port 18080 で host CID からの HTTP request を受ける |
 | identity gate | identity 注入前の workload start は `409 Conflict` になる |
-| identity injection | 5 個の session-bound identity を canonical JSON で注入し、guest の canonical ACK を返す |
-| workload release | identity 注入後の start だけが canonical ACK を返し、image に固定した workload を起動する |
+| identity injection | 5 個の session-bound identity と authority policy digest を canonical v2 JSON で注入し、guest の digest-bound ACK を返す |
+| workload release | 同じ v2 policy digest に束縛した start だけが canonical ACK を返し、image に固定した workload を起動する |
+| guest runtime composition | 別の runtime image test が `guest-supervisor-init`、readiness、`workload-isolation-launcher`、inherited gate、Broker probe を通して workload を起動する |
+| workspace drive | runtime image test が writable ext4 workspace drive を guest supervisor に渡す |
 | guest-to-host Broker | Firecracker が guest の CID 2 / port 18081 接続を session UDS の `_18081` socket へ転送し、host Broker が canonical request に `NotAuthorized` を返す |
 | effect exclusion | 未発行 capability では public / GitHub adapter が一度も呼ばれない |
 
-この test は `Runtime::launch` を経由せず、Firecracker REST API を直接構成する。従って guest control と guest-to-host Broker transport の実境界は確認するが、runtime の jailer / workspace / snapshot lifecycle を実証する test ではない。
+これらの test は `Runtime::launch` を経由せず、Firecracker REST API を直接構成する。PID 1 の gate は production と同じ v2 digest-bound identity/start path と exact ACK を使い、別の固定 runtime image は guest-supervisor-init → workload-isolation-launcher → Broker probe を実 KVM で通す。従って authority binding、guest composition、guest-to-host Broker transport の実境界は確認するが、runtime の jailer / snapshot lifecycleや CapFS の全 effect を実証する test ではない。
 
 ## 実行コマンド
 
@@ -112,9 +116,9 @@ scripts/ci/verify-real-guest-control.sh
 | 実 jailer の隔離効果 | 特権と cgroup v2 書き込みが必要 | 同上。加えて namespace / cgroup を外から観測する手段 |
 | snapshot / restore の実動作 | VM が無い | 実 VM |
 | `Runtime::launch` の実 lifecycle | opt-in test は REST API を直接使い、jailer / workspace / rollback を通さない | jailer と workspace drive を含む実 launch test |
-| guest `CapabilityKernel` / capfs / supervisor | PID 1 は identity gate と固定 workload 起動だけを担う | guest supervisor を image に組み込み、workload と end-to-end で結ぶ test |
+| guest CapFS の全 effect | runtime image test は guest supervisor / isolation launcher / Broker channel を通し、別の実KVM試験は v2 identity/start ACK を検証するが、CapFS 全操作は試さない | 各 CapFS operation と revoke を含む実 KVM test |
 | seccomp filter の中身 | 宣言の文字列比較のみ、filter を解析していない | filter を parse するか、実プロセスで syscall を試す test |
-| digest 照合と exec の間の差し替え | fd を保持した exec になっていない | jailer 経由の起動で fd を引き回す仕組み |
+| 実 `veritysetup` / `dmsetup` mapping と jailer 隔離効果 | pinned helper は no-follow・sealed memfd・環境消去で実行するが、local test は実 mapper/jailer を通さない | 実 `Runtime::launch` による mapper、jailer、workspace、rollback の検証 |
 
 test double は 4 種。`CommandRunner`、`FileSystem`、`ApiClient`（Firecracker 用と guest control 用）、`IdentitySource`。実 guest-control test は Firecracker API と guest control API の両方を production transport で置き換えるが、`Runtime::launch` が使う他の境界を置き換えるものではない。
 

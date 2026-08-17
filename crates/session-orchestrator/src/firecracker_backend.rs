@@ -289,10 +289,16 @@ where
                 "VM lease does not match the active Firecracker VM",
             ));
         }
-        let expected_capability = CapabilityLease::new(
+        let policy_digest = capability.policy_digest().ok_or_else(|| {
+            BackendError::new(
+                "production Firecracker workload release requires a policy-bound capability lease",
+            )
+        })?;
+        let expected_capability = CapabilityLease::new_bound(
             identity.session_id(),
             identity.subject_id(),
             identity.capability_id(),
+            policy_digest,
         );
         if *capability != expected_capability {
             return Err(BackendError::new(
@@ -311,7 +317,7 @@ where
         } = &mut *state;
         let active = active.as_mut().expect("active VM was checked above");
         runtime
-            .inject_identity(&mut active.instance)
+            .inject_identity_bound(&mut active.instance, policy_digest)
             .map_err(|error| runtime_failure("identity injection", &error))?;
         runtime
             .start_workload(&mut active.instance)
@@ -477,6 +483,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
 
+    use authority_core::policy::AuthorityPolicyDigest;
     use firecracker_runtime::{
         ApiRequest, ApiResponse, CgroupVersion, CommandOutput, CommandSpec, DmVerityConfig,
         HostIsolationConfig, IdentityId, JailerConfig, NamespaceConfig, PinnedArtifact,
@@ -508,6 +515,14 @@ mod tests {
         fn start(&mut self, _command: &CommandSpec) -> Result<ProcessHandle, RuntimeError> {
             self.next_pid += 1;
             Ok(ProcessHandle { pid: self.next_pid })
+        }
+
+        fn verify_verity(
+            &mut self,
+            _veritysetup: &PinnedArtifact,
+            _expected: &DmVerityConfig,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
         }
 
         fn start_owned(
@@ -612,13 +627,73 @@ mod tests {
                 return Err(RuntimeError::Api("test API failure".to_owned()));
             }
             let body = match request.path.as_str() {
-                "/actions/inject-identity" => Some("identity-injected"),
-                "/actions/start-workload" => Some("workload-started"),
-                _ => None,
-            }
-            .map_or_else(String::new, |acknowledgement| {
-                format!("{{\"ack\":\"{acknowledgement}\",{}", &request.body[1..])
-            });
+                "/actions/inject-identity" => {
+                    firecracker_runtime::guest_control::GuestControlRequest::parse_canonical(
+                        &request.body,
+                    )
+                    .map(|request| {
+                        request.canonical_acknowledgement(
+                            firecracker_runtime::guest_control::GuestControlAction::InjectIdentity,
+                        )
+                    })
+                    .map_err(|error| {
+                        RuntimeError::Api(format!("test v1 injection request was invalid: {error}"))
+                    })?
+                }
+                "/actions/start-workload" if request.body.starts_with("{\"version\":") => {
+                    firecracker_runtime::guest_control::GuestControlRequest::parse_bound_canonical(
+                        &request.body,
+                    )
+                    .map(|request| {
+                        request.canonical_bound_acknowledgement(
+                            firecracker_runtime::guest_control::GuestControlAction::StartWorkload,
+                        )
+                    })
+                    .map_err(|error| {
+                        RuntimeError::Api(format!("test v2 workload request was invalid: {error}"))
+                    })?
+                }
+                "/actions/start-workload" => {
+                    firecracker_runtime::guest_control::GuestControlRequest::parse_canonical(
+                        &request.body,
+                    )
+                    .map(|request| {
+                        request.canonical_acknowledgement(
+                            firecracker_runtime::guest_control::GuestControlAction::StartWorkload,
+                        )
+                    })
+                    .map_err(|error| {
+                        RuntimeError::Api(format!("test v1 workload request was invalid: {error}"))
+                    })?
+                }
+                "/actions/inject-identity-v2" => {
+                    firecracker_runtime::guest_control::GuestControlRequest::parse_bound_canonical(
+                        &request.body,
+                    )
+                    .map(|request| {
+                        request.canonical_bound_acknowledgement(
+                            firecracker_runtime::guest_control::GuestControlAction::InjectIdentityBound,
+                        )
+                    })
+                    .map_err(|error| {
+                        RuntimeError::Api(format!("test v2 injection request was invalid: {error}"))
+                    })?
+                }
+                "/actions/start-workload-v2" => {
+                    firecracker_runtime::guest_control::GuestControlRequest::parse_bound_canonical(
+                        &request.body,
+                    )
+                    .map(|request| {
+                        request.canonical_bound_acknowledgement(
+                            firecracker_runtime::guest_control::GuestControlAction::StartWorkloadBound,
+                        )
+                    })
+                    .map_err(|error| {
+                        RuntimeError::Api(format!("test v2 workload request was invalid: {error}"))
+                    })?
+                }
+                _ => String::new(),
+            };
             Ok(ApiResponse { status: 200, body })
         }
 
@@ -688,6 +763,7 @@ mod tests {
             ),
             rootfs: rootfs.clone(),
             verity_hash: artifact("/test/verity"),
+            veritysetup: artifact("/usr/sbin/veritysetup"),
             dm_verity: DmVerityConfig {
                 data_device: rootfs.path.clone(),
                 hash_device: PathBuf::from("/test/verity"),
@@ -756,7 +832,9 @@ mod tests {
             network_devices: Vec::new(),
             vcpu_count: 1,
             memory_mib: 1,
-            boot_args: "console=ttyS0".to_owned(),
+            boot_args:
+                "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init"
+                    .to_owned(),
         }
     }
 
@@ -827,6 +905,11 @@ mod tests {
         SnapshotDescriptor::clean(SnapshotId::new([9; crate::ID_BYTES]))
     }
 
+    fn test_policy_digest() -> AuthorityPolicyDigest {
+        AuthorityPolicyDigest::from_hex(&"11".repeat(32))
+            .expect("test policy digest must be canonical")
+    }
+
     #[test]
     fn rebinds_every_session_scoped_runtime_resource_to_the_workspace_identity() {
         let base = test_config();
@@ -873,10 +956,11 @@ mod tests {
         let vm_lease = vm
             .start_vm(&snapshot_descriptor(), &identity, &workspace, &broker)
             .expect("VM restore should succeed");
-        let capability = CapabilityLease::new(
+        let capability = CapabilityLease::new_bound(
             identity.session_id(),
             identity.subject_id(),
             identity.capability_id(),
+            test_policy_digest(),
         );
 
         let workload_lease = workload
@@ -907,37 +991,62 @@ mod tests {
             .expect("test API mutex must not be poisoned");
         let injection = requests
             .iter()
-            .find(|request| request.path == "/actions/inject-identity")
+            .find(|request| request.path == "/actions/inject-identity-v2")
             .expect("identity injection request should follow explicit resume");
-        assert_eq!(
-            injection.body,
-            format!(
-                "{{\"challenge\":\"{}\",\"vm_id\":\"{}\",\"session_id\":\"{}\",\"request_id\":\"{}\",\"subject_id\":\"{}\",\"capability_id\":\"{}\"}}",
-                injection
-                    .body
-                    .split('"')
-                    .nth(3)
-                    .expect("canonical request includes a challenge"),
-                bundle.vm_id.to_hex(),
-                bundle.session_id.to_hex(),
-                bundle.request_id.to_hex(),
-                bundle.subject_id.to_hex(),
-                bundle.capability_id.to_hex(),
+        let injection_request =
+            firecracker_runtime::guest_control::GuestControlRequest::parse_bound_canonical(
+                &injection.body,
             )
+            .expect("bound injection request should be canonical");
+        assert_eq!(injection_request.identities(), &bundle);
+        assert_eq!(
+            injection_request.policy_digest(),
+            Some(test_policy_digest())
         );
         assert!(
             requests.iter().position(|request| request.path == "/vm")
                 < requests
                     .iter()
-                    .position(|request| request.path == "/actions/inject-identity")
+                    .position(|request| request.path == "/actions/inject-identity-v2")
         );
         assert!(
             requests
                 .iter()
-                .position(|request| request.path == "/actions/inject-identity")
+                .position(|request| request.path == "/actions/inject-identity-v2")
                 < requests
                     .iter()
-                    .position(|request| request.path == "/actions/start-workload")
+                    .position(|request| request.path == "/actions/start-workload-v2")
+        );
+    }
+
+    #[test]
+    fn production_workload_release_rejects_a_legacy_unbound_capability_lease() {
+        let (mut vm, mut workload, identity, requests, _clones) = test_backends([]);
+        let workspace = WorkspaceLease::new(identity.session_id(), identity.workspace_id());
+        let broker = BrokerLease::new(identity.session_id(), identity.broker_session_id());
+        let vm_lease = vm
+            .start_vm(&snapshot_descriptor(), &identity, &workspace, &broker)
+            .expect("VM restore should succeed");
+        let legacy = CapabilityLease::new(
+            identity.session_id(),
+            identity.subject_id(),
+            identity.capability_id(),
+        );
+
+        let error = workload
+            .release_workload(&identity, &vm_lease, &legacy)
+            .expect_err("production release must require a policy-bound lease");
+        assert!(
+            error
+                .to_string()
+                .contains("requires a policy-bound capability lease")
+        );
+        assert!(
+            requests
+                .lock()
+                .expect("test API mutex must not be poisoned")
+                .iter()
+                .all(|request| !request.path.contains("identity"))
         );
     }
 

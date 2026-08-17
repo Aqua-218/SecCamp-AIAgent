@@ -11,6 +11,8 @@
 #   required    must be present and `success`
 #   skipped     must be absent, or present and `skipped`
 #   unavailable must be absent, or present and `skipped`
+#   planned     must be absent; a result means a job exists for a gate the
+#               manifest still calls unbuilt
 #   anything reported that the manifest does not declare is drift
 #
 # Deliberately pure bash. It runs on the Debian-based GitLab image as well as on
@@ -138,6 +140,14 @@ for gate_id in "${!planned[@]}"; do
     skipped | unavailable)
       if [[ "${result}" != '<absent>' && "${result}" != 'skipped' ]]; then
         fail "${gate_id}: plan marked it ${status}, observed ${result}"
+      fi
+      ;;
+    planned)
+      # A planned gate has no job anywhere. Seeing any result for one means a
+      # job was built without promoting the gate, which is exactly the drift the
+      # `status` field exists to prevent.
+      if [[ "${result}" != '<absent>' ]]; then
+        fail "${gate_id}: planned gates must run nowhere, observed ${result}"
       fi
       ;;
     *)

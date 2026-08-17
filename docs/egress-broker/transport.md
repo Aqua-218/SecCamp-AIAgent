@@ -101,7 +101,7 @@ stateDiagram-v2
 - peer credential の認証。listener は identity を運ぶが、その正しさは OS に依存する。
 - 1 MiB を下回る frame の flooding。frame 単位の上限はあるが、接続あたりの frame 数や帯域の制限はこの層に無い。
 - generic `FramedTransport` を使う caller の timeout。deadline-aware API を選ばない caller は自分で生存時間を制限する。
-- production Firecracker per-port UDS owner (`BuiltBrokerRuntime`) の absolute connection deadline wiring。UDS stream 自体は `DeadlineStream` を実装するが、現行 owner は互換の plain `serve_connection` を使う。
+- production Firecracker per-port UDS owner は `DeadlineStream` と policy-aware server path を使う。保証範囲外なのは、この既定値を変えた deployment 固有 policy と、長時間・高並行の実負荷検証である。
 
 ## 関連
 

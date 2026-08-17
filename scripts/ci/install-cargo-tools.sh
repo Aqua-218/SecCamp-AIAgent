@@ -147,10 +147,11 @@ install_tool() {
   if is_present "${target}"; then
     regular_file_is_safe "${target}" 755 \
       || die "existing Cargo tool is not a safe regular file: ${target}"
-    if tool_matches_version "${binary}" "${version}"; then
-      return
-    fi
   fi
+
+  # A same-UID Actions/GitLab cache is not a provenance boundary. Never execute or trust a
+  # restored tool merely because it reports the expected version: rebuild from the locked crate
+  # into a fresh private root, validate that result, and only then replace the cached bytes.
 
   no_stale_entries "${tool_root}" ".staging-${binary}." \
     || die "partial Cargo staging exists for ${binary}"

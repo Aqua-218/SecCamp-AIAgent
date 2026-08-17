@@ -22,7 +22,10 @@ use crate::{
         CapabilityExecutor, DispatchContext, DispatchError, PublicDispatchAdapter,
     },
     github::GitHubAdapter,
-    transport::{FramedTransport, PeerBoundListener, TransportError},
+    transport::{
+        DeadlineFramedTransport, DeadlineStream, FramedIo, FramedTransport, PeerBoundListener,
+        TransportError, TransportPolicy,
+    },
 };
 
 /// The result of serving one accepted connection.
@@ -172,6 +175,43 @@ where
     serve_connection(stream, dispatcher, identity, clock, max_requests)
 }
 
+/// Accepts and serves one peer with a real socket deadline policy.
+///
+/// This is the production entry point for streams that implement
+/// [`DeadlineStream`]. Generic `Cursor`-style streams cannot call it and thus
+/// cannot accidentally claim to enforce timeouts. A failed deadline is a
+/// typed [`TransportError::Deadline`] and the stream is dropped immediately;
+/// an owner-side shutdown handle can interrupt an already blocked syscall.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] for accept, peer identity, policy, framing,
+/// dispatch, or canonical response failures.
+pub fn serve_expected_peer_with_policy<L, D, C>(
+    listener: &L,
+    expected_peer_cid: u32,
+    policy: TransportPolicy,
+    dispatcher: &mut D,
+    identity: &DispatchContext,
+    clock: &mut C,
+    max_requests: NonZeroUsize,
+) -> Result<ConnectionReport, ServerError>
+where
+    L: PeerBoundListener,
+    L::Stream: DeadlineStream,
+    D: RequestDispatcher + ?Sized,
+    C: FnMut() -> MonotonicTime,
+{
+    let (peer_cid, stream) = listener.accept_peer().map_err(ServerError::Accept)?;
+    if peer_cid != expected_peer_cid {
+        return Err(ServerError::UnexpectedPeer {
+            expected: expected_peer_cid,
+            received: peer_cid,
+        });
+    }
+    serve_connection_with_policy(stream, policy, dispatcher, identity, clock, max_requests)
+}
+
 /// Serves at most `max_requests` on one already-authenticated connection.
 ///
 /// Any framing, dispatch, encoding, or write error closes the connection by
@@ -195,7 +235,53 @@ where
     D: RequestDispatcher + ?Sized,
     C: FnMut() -> MonotonicTime,
 {
-    let mut transport = FramedTransport::new(stream);
+    let transport = FramedTransport::new(stream);
+    serve_framed_connection(transport, dispatcher, identity, clock, max_requests)
+}
+
+/// Serves one already-authenticated stream with bounded read, write, and
+/// absolute connection deadlines.
+///
+/// The stream must implement [`DeadlineStream`], which is intentionally
+/// stricter than [`Read`] + [`Write`]. On a deadline, the function returns a
+/// typed [`ServerError::Transport`] and drops the stream, so callers must not
+/// retry an ambiguous frame on the same connection. A separate owner-only
+/// shutdown handle can interrupt a blocked read or write immediately during
+/// cancellation.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] on policy application, deadline, framing, dispatch,
+/// encoding, or write failure.
+pub fn serve_connection_with_policy<S, D, C>(
+    stream: S,
+    policy: TransportPolicy,
+    dispatcher: &mut D,
+    identity: &DispatchContext,
+    clock: &mut C,
+    max_requests: NonZeroUsize,
+) -> Result<ConnectionReport, ServerError>
+where
+    S: DeadlineStream,
+    D: RequestDispatcher + ?Sized,
+    C: FnMut() -> MonotonicTime,
+{
+    let transport = DeadlineFramedTransport::new(stream, policy).map_err(ServerError::Transport)?;
+    serve_framed_connection(transport, dispatcher, identity, clock, max_requests)
+}
+
+fn serve_framed_connection<T, D, C>(
+    mut transport: T,
+    dispatcher: &mut D,
+    identity: &DispatchContext,
+    clock: &mut C,
+    max_requests: NonZeroUsize,
+) -> Result<ConnectionReport, ServerError>
+where
+    T: FramedIo,
+    D: RequestDispatcher + ?Sized,
+    C: FnMut() -> MonotonicTime,
+{
     for request_index in 0..max_requests.get() {
         let frame = transport.read_frame().map_err(ServerError::Transport)?;
         // Re-read the clock per request. Reusing one instant for the whole
@@ -243,12 +329,12 @@ where
     })
 }
 
-fn write_wire_response<S>(
-    transport: &mut FramedTransport<S>,
+fn write_wire_response<T>(
+    transport: &mut T,
     wire: &CanonicalBrokerResponse,
 ) -> Result<(), ServerError>
 where
-    S: Read + Write,
+    T: FramedIo,
 {
     match wire.encode() {
         Ok(payload) => write_payload_frame(transport, payload),
@@ -266,12 +352,9 @@ where
     }
 }
 
-fn write_payload_frame<S>(
-    transport: &mut FramedTransport<S>,
-    payload: Vec<u8>,
-) -> Result<(), ServerError>
+fn write_payload_frame<T>(transport: &mut T, payload: Vec<u8>) -> Result<(), ServerError>
 where
-    S: Read + Write,
+    T: FramedIo,
 {
     let response_frame = ControlFrame::new(payload)
         .map_err(|error| ServerError::Transport(TransportError::Frame(error)))?;
@@ -330,7 +413,7 @@ mod tests {
             DispatchError,
         },
         public_fetch::PublicResponse,
-        transport::PeerBoundListener,
+        transport::{DeadlineKind, DeadlineStream, PeerBoundListener},
     };
 
     use super::{
@@ -342,6 +425,34 @@ mod tests {
     struct DuplexBuffer {
         input: Cursor<Vec<u8>>,
         output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct TimeoutStream;
+
+    impl Read for TimeoutStream {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        }
+    }
+
+    impl Write for TimeoutStream {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DeadlineStream for TimeoutStream {
+        fn set_read_timeout(&self, _timeout: std::time::Duration) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_write_timeout(&self, _timeout: std::time::Duration) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     impl Read for DuplexBuffer {
@@ -642,6 +753,39 @@ mod tests {
             report.close_reason(),
             ConnectionCloseReason::RequestLimitReached
         );
+    }
+
+    // Requirement: a transport deadline fails closed before dispatch and does
+    // not attempt to recover or write a response on an ambiguous stream.
+    // Category: timeout/fail-closed. Risk: critical.
+    #[test]
+    fn deadline_error_closes_connection_before_dispatch() {
+        let mut dispatcher = FakeDispatcher {
+            outcomes: VecDeque::from([rejection(1, BrokerRejection::Budget)]),
+            calls: 0,
+        };
+        let policy = super::TransportPolicy::new(
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_secs(1),
+        )
+        .expect("test policy must be valid");
+
+        let error = super::serve_connection_with_policy(
+            TimeoutStream,
+            policy,
+            &mut dispatcher,
+            &context(),
+            &mut || MonotonicTime::from_ticks(7),
+            NonZeroUsize::new(1).expect("request bound must be non-zero"),
+        )
+        .expect_err("deadline must close the connection");
+
+        assert!(matches!(
+            error,
+            ServerError::Transport(super::TransportError::Deadline(DeadlineKind::Read))
+        ));
+        assert_eq!(dispatcher.calls, 0);
     }
 
     #[test]

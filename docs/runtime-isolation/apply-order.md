@@ -40,7 +40,8 @@ flowchart TB
     ll --> caps["11 DropCapabilities"]
     caps --> nnp["12 NoNewPrivs"]
     nnp --> sec["13 Seccomp"]
-    sec --> exec["execve"]
+    sec --> ack["CLOEXEC exec-status EOF"]
+    ack --> exec["execve"]
 ```
 
 ## なぜ user namespace が最初なのか
@@ -92,7 +93,9 @@ IsolationError::Rollback {
 
 呼び出し側がここでやってはいけないのは、「namespace は作れたし mount も済んでいるから、seccomp だけ諦めて続行する」という判断。境界が 1 つ欠けた状態は、境界が無い状態と同じくらい危険なことがある。seccomp が無ければ workload は `socket` を呼べるし、capability を消していなければ mount を張り直せる。
 
-supervisor は `Rollback` を受け取ったら child を再利用せず終了させる。この判断は [ADR 0016](../decisions/README.md) に記録する予定。
+supervisor は `Rollback` を受け取ったら child を再利用せず終了させる。この判断は [ADR 0016](../decisions/0016-terminate-the-child-after-an-unrollbackable-isolation-failure.md) に記録済みである。
+
+実際の guest 起動では、親の `LinuxHostResources` が unnamed socketpair を launcher の stdin/stdout にだけ継承させる。launcher は `ready` → release byte → 13 step startup → close-on-exec の EOF という順序を守り、EOF を確認するまで親へ `isolated` attestation を返さない。partial/malformed marker、exec failure、timeout、isolation rollback failure は全て workload を再利用せず cleanup-required/fail-closed とする。
 
 ## `apply` を呼ぶ場所を間違えない
 

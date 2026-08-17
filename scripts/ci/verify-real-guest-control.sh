@@ -135,7 +135,7 @@ run_runtime_test() {
     --isolation-launcher "${repository_root}/target/release/workload-isolation-launcher" \
     --agent-workload "${repository_root}/target/release/guest-broker-probe" \
     --repository workspace \
-    --file-effects read-data,list-directory,write-data \
+    --file-effects read-data,list-directory,write-data,truncate,create-file,create-directory,remove-file,remove-directory,rename,set-metadata,read-link,create-symlink,create-hard-link \
     --path-prefix / \
     --port 18080 \
     --broker-port 18081 \

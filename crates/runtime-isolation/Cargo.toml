@@ -15,3 +15,15 @@ libc = "=0.2.189"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.4", features = ["fs", "net"] }
+
+# The isolation transaction refuses a multi-threaded launcher and turns its child into PID 1 of
+# a fresh namespace set, so it cannot run inside the libtest harness. This target drives the
+# transaction from its own `main` and re-executes itself as the single-threaded probe.
+#
+# `test = false` keeps it out of the default test run: it needs root and a privileged host, and
+# a libtest-shaped runner cannot enumerate a harness-free target. `scripts/ci/run.sh
+# privileged-isolation` is the entry point, matching how the real-VM verification is invoked.
+[[test]]
+name = "privileged_isolation"
+harness = false
+test = false

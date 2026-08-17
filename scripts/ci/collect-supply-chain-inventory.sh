@@ -22,6 +22,7 @@ cd -- "${repository_root}"
 
 readonly inventory_directory="reports"
 readonly sbom_file="${inventory_directory}/workspace-sbom.spdx.json"
+readonly fuzz_sbom_file="${inventory_directory}/fuzz-sbom.spdx.json"
 
 # The resolved graph is large and stable; a collapse to a handful of packages
 # means the scanner stopped understanding the lockfile rather than that the
@@ -38,6 +39,7 @@ mkdir -p -- "${inventory_directory}"
 # The lockfile is the authority on what a build resolves to, which is exactly
 # the set an advisory will later be asked about.
 syft scan "file:Cargo.lock" -o spdx-json > "${sbom_file}"
+syft scan "file:fuzz/Cargo.lock" -o spdx-json > "${fuzz_sbom_file}"
 
 package_count="$(yq eval -o json '.packages | length' "${sbom_file}")"
 sbom_names="$(yq eval -o tsv '.packages[].name' "${sbom_file}")"
@@ -79,9 +81,26 @@ if [[ "${unversioned}" -ne 0 ]]; then
   fail "${unversioned} package(s) in the SBOM carry no version"
 fi
 
+fuzz_package_count="$(yq eval -o json '.packages | length' "${fuzz_sbom_file}")"
+if [[ "${fuzz_package_count}" -lt 20 ]]; then
+  fail "the fuzz SBOM lists ${fuzz_package_count} packages, below the 20 expected from fuzz/Cargo.lock"
+fi
+if ! yq eval -o tsv '.packages[].name' "${fuzz_sbom_file}" \
+  | grep -qxF -- ai-agent-fuzz; then
+  fail 'ai-agent-fuzz: fuzz workspace root is absent from the fuzz SBOM'
+fi
+fuzz_unversioned="$(
+  yq eval -o json '[.packages[] | select(has("versionInfo") | not)] | length' \
+    "${fuzz_sbom_file}"
+)"
+if [[ "${fuzz_unversioned}" -ne 0 ]]; then
+  fail "${fuzz_unversioned} fuzz package(s) in the SBOM carry no version"
+fi
+
 if [[ "${failures}" -gt 0 ]]; then
   printf '\nsupply-chain inventory: %d problem(s)\n' "${failures}" >&2
   exit 1
 fi
 
-printf 'supply-chain inventory: %s packages recorded in %s\n' "${package_count}" "${sbom_file}"
+printf 'supply-chain inventory: %s workspace and %s fuzz packages recorded\n' \
+  "${package_count}" "${fuzz_package_count}"

@@ -1058,12 +1058,13 @@ fn session_jail_root() -> PathBuf {
 
 fn snapshot(config: &RuntimeConfig) -> Snapshot {
     let jail_root = session_jail_root();
-    Snapshot::new(
+    Snapshot::new_bound(
         jail_root.join("snapshots/state"),
         jail_root.join("snapshots/memory"),
         config.snapshot_fingerprint(),
         sha256(&[]),
         sha256(&[]),
+        authority_grant().policy_digest(),
         Vec::new(),
     )
 }

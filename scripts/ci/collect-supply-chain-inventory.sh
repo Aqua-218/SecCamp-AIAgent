@@ -36,10 +36,14 @@ command -v syft > /dev/null || {
 
 mkdir -p -- "${inventory_directory}"
 
-# The lockfile is the authority on what a build resolves to, which is exactly
-# the set an advisory will later be asked about.
+# The lockfile is the authority on what the primary workspace resolves to. The
+# separate fuzz workspace is scanned as a directory so its non-published root
+# package is retained alongside the dependencies resolved by its lockfile.
 syft scan "file:Cargo.lock" -o spdx-json > "${sbom_file}"
-syft scan "file:fuzz/Cargo.lock" -o spdx-json > "${fuzz_sbom_file}"
+syft scan "dir:fuzz" \
+  --source-name ai-agent-fuzz-workspace \
+  --source-version 0.0.0 \
+  -o spdx-json > "${fuzz_sbom_file}"
 
 package_count="$(yq eval -o json '.packages | length' "${sbom_file}")"
 sbom_names="$(yq eval -o tsv '.packages[].name' "${sbom_file}")"
@@ -82,15 +86,17 @@ if [[ "${unversioned}" -ne 0 ]]; then
 fi
 
 fuzz_package_count="$(yq eval -o json '.packages | length' "${fuzz_sbom_file}")"
+fuzz_sbom_names="$(yq eval -o tsv '.packages[].name' "${fuzz_sbom_file}")"
+readonly fuzz_sbom_names
 if [[ "${fuzz_package_count}" -lt 20 ]]; then
   fail "the fuzz SBOM lists ${fuzz_package_count} packages, below the 20 expected from fuzz/Cargo.lock"
 fi
-if ! yq eval -o tsv '.packages[].name' "${fuzz_sbom_file}" \
-  | grep -qxF -- ai-agent-fuzz; then
+if ! grep -qxF -- ai-agent-fuzz <<< "${fuzz_sbom_names}"; then
   fail 'ai-agent-fuzz: fuzz workspace root is absent from the fuzz SBOM'
 fi
 fuzz_unversioned="$(
-  yq eval -o json '[.packages[] | select(has("versionInfo") | not)] | length' \
+  yq eval -o json \
+    '[.packages[] | select(has("versionInfo") | not) | select(.primaryPackagePurpose != "FILE")] | length' \
     "${fuzz_sbom_file}"
 )"
 if [[ "${fuzz_unversioned}" -ne 0 ]]; then

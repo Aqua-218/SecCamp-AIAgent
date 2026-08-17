@@ -142,7 +142,7 @@ executor の失敗は 5 種類に分かれ、そのうち 2 つは「外部副�
 ## 正確な保証範囲
 
 - adapter はすべて trait 越し。fake resolver / connector / provider を注入した module test で検証している。
-- Firecracker guest-to-host の closed authorization rejection は opt-in KVM test で確認済み。direct kernel `AF_VSOCK`、外部 DNS / HTTPS、実 GitHub API は未検証。
+- Firecracker guest-to-hostのclosed authorization rejectionはKVM gateで、system DNS／TLS/SNI／address pin／rebindingはprivileged HTTPS gateで確認済み。direct kernel `AF_VSOCK`の長時間・高並行負荷と実GitHub APIは未実行である。
 - `CommittedButUnrecorded` を返した後の reconciliation 経路は、この crate に無い。rejection として区別するところまでで、provider との突き合わせは運用側の責務。
 - GitHub の byte 自己申告を悪用する第三者 adapter 実装は、この crate では防げない。
 

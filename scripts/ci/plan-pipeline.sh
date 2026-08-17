@@ -24,6 +24,7 @@
 #
 # Options
 #   --stages a,b,c      Restrict the plan to these manifest stages.
+#   --workflow FILE     Restrict the plan to gates owned by one GitHub workflow.
 #   --output PATH       Write the plan to PATH as well as to stdout.
 
 set -euo pipefail
@@ -36,6 +37,7 @@ cd -- "${repository_root}"
 readonly manifest="ci/gates.yml"
 
 stage_filter=""
+workflow_filter=""
 output_path=""
 
 while [[ "$#" -gt 0 ]]; do
@@ -54,6 +56,14 @@ while [[ "$#" -gt 0 ]]; do
         exit 2
       }
       output_path="$2"
+      shift 2
+      ;;
+    --workflow)
+      [[ "$#" -ge 2 ]] || {
+        printf -- '--workflow requires a value\n' >&2
+        exit 2
+      }
+      workflow_filter="$2"
       shift 2
       ;;
     *)
@@ -247,9 +257,12 @@ unavailable_gates=()
 planned_gates=()
 gate_entries=()
 
-while IFS='|' read -r gate_id gate_stage gate_tier gate_scopes github_job gitlab_job gate_status; do
+while IFS='|' read -r gate_id gate_stage gate_tier gate_scopes github_job gitlab_job gate_status gate_workflow; do
   [[ -n "${gate_id}" ]] || continue
   stage_selected "${gate_stage}" || continue
+  if [[ -n "${workflow_filter}" && "${gate_workflow}" != "${workflow_filter}" ]]; then
+    continue
+  fi
 
   local_job='null'
   if [[ "${platform}" == 'github' ]]; then
@@ -281,7 +294,7 @@ while IFS='|' read -r gate_id gate_stage gate_tier gate_scopes github_job gitlab
 
   gate_entries+=("\"${gate_id}\":\"${status}\"")
 done < <(yq eval \
-  '.gates[] | [.id, .stage, .tier, (.scopes | join(",")), (.github // "null"), (.gitlab // "null"), (.status // "null")] | join("|")' \
+  '.gates[] | [.id, .stage, .tier, (.scopes | join(",")), (.github // "null"), (.gitlab // "null"), (.status // "null"), (.workflow // "null")] | join("|")' \
   "${manifest}")
 
 join_json_array() {

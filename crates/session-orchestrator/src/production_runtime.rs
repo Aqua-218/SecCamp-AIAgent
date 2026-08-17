@@ -12,6 +12,7 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -1761,6 +1762,10 @@ fn guest_control_for(
         config.vsock.guest_cid,
         endpoint.port,
     )
+    // The guest enforces its own forty-five-second supervisor-readiness deadline. Keep the host
+    // transport bound strictly larger so it receives the guest's typed failure response instead
+    // of racing that deadline and collapsing it into EAGAIN.
+    .and_then(|client| client.with_timeout(Duration::from_secs(50)))
     .map_err(|error| {
         BackendError::new(format!(
             "verified guest-control vsock endpoint is not usable: {error}"
@@ -3763,9 +3768,7 @@ mod tests {
         let expected_mapper = format!("session-root-{workspace_id}");
         let expected_cgroup = cgroup_parent().join(&workspace_id);
         let expected_workspace = jail_root.join("workspace").join(&workspace_id);
-        let expected_workspace_image = jail_root
-            .join("workspace")
-            .join(format!("{workspace_id}.ext4"));
+        let expected_workspace_image = jail_root.join("workspace").join("workspace.ext4");
 
         assert_eq!(prepared.dm_verity.mapper_name, expected_mapper);
         assert_eq!(prepared.isolation.cgroup.path, expected_cgroup);
@@ -3847,7 +3850,7 @@ mod tests {
         assert_eq!(
             capture.restored_resources,
             Some((
-                Path::new("/workspace").join(format!("{workspace_id}.ext4")),
+                PathBuf::from("/workspace/workspace.ext4"),
                 PathBuf::from("/run/vsock.sock"),
                 prepared.vsock.guest_cid,
             ))

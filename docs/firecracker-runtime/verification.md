@@ -93,10 +93,11 @@ symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` �
 | workload release | 同じ v2 policy digest に束縛した start だけが canonical ACK を返し、image に固定した workload を起動する |
 | guest runtime composition | 別の runtime image test が `guest-supervisor-init`、readiness、`workload-isolation-launcher`、inherited gate、Broker probe を通して workload を起動する |
 | workspace drive | runtime image test が writable ext4 workspace drive を guest supervisor に渡す |
+| guest CapFS effects | 隔離後の固定workloadがCapFS mount上で全13 file effectを実行し、作成物を全て回収する |
 | guest-to-host Broker | Firecracker が guest の CID 2 / port 18081 接続を session UDS の `_18081` socket へ転送し、host Broker が canonical request に `NotAuthorized` を返す |
 | effect exclusion | 未発行 capability では public / GitHub adapter が一度も呼ばれない |
 
-これらの test は `Runtime::launch` を経由せず、Firecracker REST API を直接構成する。PID 1 の gate は production と同じ v2 digest-bound identity/start path と exact ACK を使い、別の固定 runtime image は guest-supervisor-init → workload-isolation-launcher → Broker probe を実 KVM で通す。従って authority binding、guest composition、guest-to-host Broker transport の実境界は確認するが、runtime の jailer / snapshot lifecycleや CapFS の全 effect を実証する test ではない。
+これらの test は `Runtime::launch` を経由せず、Firecracker REST API を直接構成する。PID 1 の gate は production と同じ v2 digest-bound identity/start path と exact ACK を使い、別の固定 runtime image は guest-supervisor-init → workload-isolation-launcher → 全13 CapFS effect → Broker probe を実 KVM で通す。従って authority binding、guest composition、CapFS、guest-to-host Broker transport の実境界を確認するが、runtime の jailer / snapshot lifecycleは下の別gateが担う。
 
 ### production `Runtime::launch` lifecycle（opt-in）
 
@@ -112,7 +113,7 @@ symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` �
 | API sequence | `/machine-config`、`/boot-source`、rootfs/workspace drive、vsock、`InstanceStart` が `Runtime::launch` の順序で成立し、返却 state は `WorkloadStopped` である |
 | shutdown residue | process、cgroup leaf/parent、mapper、bind target、workspace image/clone、jailer root/instance directory が shutdown 後に残らない |
 
-この gate が示すのは、指定 host 上で resource ownership と jailer lifecycle が実際に成立し、shutdown が exact scope を回収することまでである。VM escape proof、seccomp の各 syscall deny の意味論、snapshot restore、guest CapFS の全 effect は含まない。
+このgateが示すのは、指定host上でresource ownershipとjailer lifecycleが実際に成立し、shutdownがexact scopeを回収することまでである。さらに`scripts/ci/verify-real-session-owner.sh`はclean snapshotを実作成してproduction `SessionOwner`からrestoreし、guestの全13 CapFS effect、durable Broker/identity evidence、stopと全resource cleanupを一続きで検証する。VM escape proofや任意guest codeに対する完全な意味論証明は含まない。
 
 ## 実行コマンド
 
@@ -124,6 +125,7 @@ cargo clippy --manifest-path crates/firecracker-runtime/Cargo.toml --all-targets
 # root、KVM、vhost-vsock、device-mapper がある Linux host でだけ実行する
 scripts/ci/verify-real-guest-control.sh
 scripts/ci/verify-real-runtime-lifecycle.sh
+scripts/ci/verify-real-session-owner.sh
 ```
 
 ## 未検証の境界
@@ -131,9 +133,7 @@ scripts/ci/verify-real-runtime-lifecycle.sh
 | 未検証の対象 | なぜ未検証か | 何があれば検証できる |
 |---|---|---|
 | VM escape を含む実 jailer の完全な隔離効果 | lifecycle gate は PID/mount namespace、UID、cgroup、seccomp installation を観測するが、攻撃者が escape できないことまでは証明しない | syscall deny と host boundary を含む hostile guest test |
-| snapshot / restore の実動作 | VM が無い | 実 VM |
-| guest CapFS の全 effect | runtime image test は guest supervisor / isolation launcher / Broker channel を通し、別の実KVM試験は v2 identity/start ACK を検証するが、CapFS 全操作は試さない | 各 CapFS operation と revoke を含む実 KVM test |
-| seccomp filter の deny 意味論 | lifecycle gate は pinned filter がロードされ `Seccomp: 2` になったことを確認するが、各 syscall の deny を試していない | filter を parse するか、実プロセスで各 syscall を試す test |
+| seccomp filterの全syscall・全引数に対する意味論 | privileged post-exec gateは代表的deny、KVM guestは標準filesystem APIに必要なallowを実測するが、Linux全syscall/引数空間を列挙しない | syscall/argument corpusを持つhostile guest test |
 
 test double は 4 種。`CommandRunner`、`FileSystem`、`ApiClient`（Firecracker 用と guest control 用）、`IdentitySource`。実 guest-control test は Firecracker API と guest control API の両方を production transport で置き換えるが、`Runtime::launch` が使う他の境界を置き換えるものではない。
 

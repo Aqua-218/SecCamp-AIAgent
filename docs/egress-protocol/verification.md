@@ -14,10 +14,11 @@
 |---|---|
 | `frame` | 4 bytes prefix の read / write round trip、1 MiB 超の宣言を payload 確保前に拒否、truncated prefix、truncated payload、trailing bytes |
 | `cbor` | v1 schema の round trip、非正規表現の拒否、payload hash と埋め込み payload の一致検査、item 数の不一致、未知の operation discriminant |
-| `session` | sequence 0 からの受理、直前の次だけの受理、完全一致 retry の `Duplicate`、別 payload での request ID 再利用の拒否、別 session の拒否、capacity 超過の拒否 |
+| `session` | `from_canonical_payload` による hash 導出、`accept_payload` の mismatch 前状態保持、sequence 0 からの受理、直前の次だけの受理、完全一致 retry の `Duplicate`、別 payload での request ID 再利用の拒否、restore 後の fresh session による旧 envelope 拒否、capacity / `u64::MAX` sequence の枯渇 |
 | `budget` | 3 種の上限それぞれの枯渇、active な request ID の重複拒否、`complete` の超過時に予約が残ること |
 | `operation` | 閉じた union の discriminant、`public_response_byte_limit` が `PublicFetch` のみ `Some` を返すこと |
-| `response` | 型付き response の encode / decode、1 MiB の再検査 |
+| `response` | 型付き response の encode / decode、1 MiB の再検査、canonical chunk の wire round trip、chunk 境界、request / order / duplicate / missing / digest binding |
+| `fuzz` | bounded response / response chunk decoder と payload-bound session ingress の committed-seed smoke target |
 
 budget の枯渇 assertion は fixture の値（`requests = 3`、`response_bytes = 100`、`concurrent = 2`）に合わせて書かれている。`60 + 40 = 100` のように、数値が計算に埋まっている。
 
@@ -27,7 +28,14 @@ budget の枯渇 assertion は fixture の値（`requests = 3`、`response_bytes
 cargo fmt --manifest-path crates/egress-protocol/Cargo.toml -- --check
 cargo test --manifest-path crates/egress-protocol/Cargo.toml
 cargo clippy --manifest-path crates/egress-protocol/Cargo.toml --all-targets -- -D warnings
+cargo check --manifest-path fuzz/Cargo.toml --bins --locked
+scripts/ci/run-fuzz.sh egress-protocol response_decode
+scripts/ci/run-fuzz.sh egress-protocol session_accept
 ```
+
+`cargo-fuzz` が無い環境では、最後の 2 コマンドは実行せずに明示的な
+tooling failure となる。target の compile と committed seed の存在確認は
+独立して実行できる。
 
 ## 未検証の境界
 
@@ -40,18 +48,16 @@ cargo clippy --manifest-path crates/egress-protocol/Cargo.toml --all-targets -- 
 | 認可と外部副作用の線形化 | [Authorization guard](../authority-core/authorization-guard.md) |
 | clock。この crate は時刻を持たない | Capability の[有効期間](../authority-core/validity-windows.md) |
 
-この crate 自身の未検証。
+この crate 自身の残る前提。
 
 | 対象 | 何が未検証か |
 |---|---|
-| `SessionReplayGuard` の capacity 枯渇 | 上限に達した後、session が永久に固着することを確認する test が無い。`RequestCapacityExhausted` を返すことは確認しているが、そこから回復できないことは test で固定していない |
-| restore 後の session ID | 新しい `BrokerSessionId` を取ることをこの crate は強制していない。古い ID を再利用したときに全 sequence が replay に開くことは、test ではなく doc comment にしか書かれていない |
-| payload hash の binding | `SessionReplayGuard` は hash が payload を hash したものか検証しない。binding は `cbor.rs` の 1 箇所だけ。**その検査を外しても、この crate の test は落ちない可能性がある** |
-| `SequenceExhausted` | `u64::MAX` まで sequence を進める test は無い |
-| fuzz / property test | どの module にも無い。境界値は選んだ具体例だけ |
+| payload/hash binding | raw payload hash constructor と payload 無しの `accept` は crate-private。外部 consumer は `from_canonical_payload` と `accept_payload` だけを使い、production Broker も decoder が返した exact payload を admission 時に再検査する |
+| restore 後の global no-reuse | fresh `BrokerSessionId` で pre-restore envelope を拒否することは local test で確認するが、過去の全 session ID を知る no-reuse ledger はこの crate の責務ではない |
 | 並行性 | 状態機械はいずれも `&mut self` で単一 thread。複数 thread から使う場合の保証は無い |
+| fuzz / property の完全性 | committed seed による bounded smoke と deterministic property はあるが、fuzz の探索完了自体は証明しない |
 
-`BrokerEnvelope::new` が `pub const` で任意の 32 bytes を受けることに注意する。`CanonicalBrokerRequest::decode` の外で envelope を組み立てる新しい経路を書くときは、payload hash の検査を複製する必要がある。**2 つの file を必ず一緒に直す。**
+`CanonicalBrokerRequest::decode` は hash と embedded canonical payload を比較し、production decoder から返る envelope はこの検査を通過している。独自の ingress を追加するときは、payload と digest を別々に組み立てず、`BrokerEnvelope::from_canonical_payload` と `SessionReplayGuard::accept_payload` を使う。
 
 ## 関連
 

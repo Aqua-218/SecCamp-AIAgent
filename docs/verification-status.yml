@@ -1,13 +1,29 @@
 schema: verification-status/v1
+
+# This is an inventory of claims, not a green-list of tests. A claim is
+# "verified" only after its gate command has run in the declared scope and the
+# gate reports a required result. "unverified" means that the boundary is
+# known but the repository has not established it yet. "blocked" means that
+# the boundary cannot currently be exercised because a named prerequisite or
+# external owner is unavailable. Both states are intentionally machine-visible.
 claims:
-  # "verified" means the named evidence was run in the named scope. It does
-  # not mean that a neighboring privileged, KVM, or external boundary is
-  # covered; those boundaries have separate claims below.
   - id: authority-core-hosted
     component: authority-core
     scope: hosted
     status: verified
-    summary: Closed capability, identity, and authorization state transitions are covered by hosted Rust and corpus tests.
+    summary: Capability identity, authorization transitions, and bounded state-machine behavior are covered by locked hosted tests and the Rust/Lean corpus gate.
+    verification_page: docs/authority-core/verification.md
+    prerequisites:
+      - id: locked-rust-toolchain
+        description: Repository-pinned Rust toolchain and locked dependency graph are available.
+        check: rust-toolchain.toml and Cargo.lock
+    gate:
+      id: authority-core-hosted
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p authority-core --all-targets
+        - scripts/check-authority-corpus.sh
     evidence:
       commands:
         - cargo test --locked -p authority-core --all-targets
@@ -18,40 +34,158 @@ claims:
         - crates/authority-core/tests
     residual_reasons: []
 
+  - id: authority-core-concurrent-effects
+    component: authority-core
+    scope: privileged
+    status: unverified
+    summary: Filesystem effect and revoke races have no end-to-end hostile test through the real adapter boundary.
+    verification_page: docs/authority-core/verification.md
+    prerequisites:
+      - id: real-adapter-boundary
+        description: A Linux test host with the real filesystem adapter and controlled concurrent actors is required.
+        check: privileged filesystem integration environment
+    gate:
+      id: authority-core-concurrent-effects
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p authority-core --all-targets
+    evidence:
+      commands:
+        - cargo test --locked -p authority-core --all-targets
+      sources:
+        - crates/authority-core/src/kernel.rs
+      tests:
+        - crates/authority-core/tests/authorization_kernel.rs
+    residual_reasons:
+      - The current tests cover bounded synchronization models and selected adapter operations, not hostile concurrent effect/revoke races.
+
   - id: capfs-hosted
     component: capfs
     scope: hosted
     status: verified
-    summary: Namespace, node-table, repository-preflight, and read-only FUSE contracts are covered by hosted tests.
+    summary: Namespace, node-table, repository-preflight, and fd-relative runtime contracts are covered by non-privileged hosted tests.
+    verification_page: docs/capfs/verification.md
+    prerequisites:
+      - id: hosted-filesystem
+        description: The test runner can create a private temporary directory and regular files.
+        check: writable temporary directory
+    gate:
+      id: capfs-hosted
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p capfs --all-targets
     evidence:
       commands:
         - cargo test --locked -p capfs --all-targets
       sources:
         - crates/capfs/src
       tests:
-        - crates/capfs/tests
+        - crates/capfs/tests/repository_preflight.rs
+        - crates/capfs/tests/namespace_registry.rs
+        - crates/capfs/tests/node_table.rs
+        - crates/capfs/tests/concurrency.rs
     residual_reasons: []
 
   - id: capfs-privileged
     component: capfs
     scope: privileged
-    status: unverified
-    summary: The hosted tests do not establish behavior against a privileged production FUSE mount and kernel boundary.
+    status: verified
+    summary: The required Linux CapFS gate mounts the real FUSE adapter and exercises kernel-backed operations, revoke, and cleanup without treating missing /dev/fuse as a pass.
+    verification_page: docs/capfs/verification.md
+    prerequisites:
+      - id: fuse-device
+        description: The runner exposes a working FUSE device and permits the required mount operations.
+        check: /dev/fuse and mount capability
+    gate:
+      id: capfs-privileged
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-capfs.sh
     evidence:
       commands:
-        - cargo test --locked -p capfs --test read_only_fuse
+        - scripts/ci/verify-real-capfs.sh
       sources:
         - crates/capfs/src/read_only.rs
       tests:
         - crates/capfs/tests/read_only_fuse.rs
+    residual_reasons: []
+
+  - id: capfs-concurrency
+    component: capfs
+    scope: privileged
+    status: unverified
+    summary: Hostile concurrent mutation, revoke, nested mounts, and backing-tree replacement are not covered as one real mount attack scenario.
+    verification_page: docs/capfs/verification.md
+    prerequisites:
+      - id: mount-namespace
+        description: The runner can create an isolated mount namespace and controlled adversarial backing actors.
+        check: Linux mount namespace and concurrent test actors
+    gate:
+      id: capfs-concurrency
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p capfs --test read_only_fuse
+    evidence:
+      commands:
+        - cargo test --locked -p capfs --test read_only_fuse
+      sources:
+        - crates/capfs/src/runtime.rs
+        - crates/capfs/src/backing.rs
+      tests:
+        - crates/capfs/tests/read_only_fuse.rs
+        - crates/capfs/tests/concurrency.rs
     residual_reasons:
-      - No dedicated privileged mount verification command is part of the hosted gate.
+      - The real mount test covers write/revoke linearization, but rename, unlink, create, and metadata races are not yet covered by dedicated hostile scenarios.
+      - Nested mount crossing, deep symlink cycles, adversarial replacement, missing MNT_ID behavior, and lock-poison recovery remain unverified.
+
+  - id: capfs-vm
+    component: capfs
+    scope: kvm
+    status: unverified
+    summary: CapFS has not been mounted and exercised by an agent inside the real guest runtime image.
+    verification_page: docs/capfs/verification.md
+    prerequisites:
+      - id: guest-fuse-kernel
+        description: The guest kernel and runtime image must provide FUSE and the CapFS mount path.
+        check: guest CONFIG_FUSE_FS and runtime image CapFS wiring
+    gate:
+      id: capfs-vm
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+      sources:
+        - crates/capfs/src/read_only.rs
+        - crates/session-orchestrator/src/production_runtime.rs
+      tests:
+        - crates/firecracker-runtime/tests/real_guest_control.rs
+    residual_reasons:
+      - The current real KVM runtime image checks guest supervisor/isolation/Broker composition but does not perform all CapFS effects.
 
   - id: egress-protocol-hosted
     component: egress-protocol
     scope: hosted
     status: verified
-    summary: Wire-v1 framing, canonical request/response schemas, replay metadata, budgets, and the reusable guest client are covered by hosted tests.
+    summary: Wire-v1 framing, canonical schemas, replay metadata, budget admission, and the reusable guest client are covered by locked hosted tests and Clippy.
+    verification_page: docs/egress-protocol/verification.md
+    prerequisites:
+      - id: locked-rust-toolchain
+        description: Repository-pinned Rust toolchain and locked dependency graph are available.
+        check: rust-toolchain.toml and Cargo.lock
+    gate:
+      id: egress-protocol-hosted
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p egress-protocol --all-targets
+        - cargo clippy --locked -p egress-protocol --all-targets -- -D warnings
     evidence:
       commands:
         - cargo test --locked -p egress-protocol --all-targets
@@ -62,11 +196,81 @@ claims:
         - crates/egress-protocol/src/client.rs
     residual_reasons: []
 
+  - id: egress-protocol-boundary-coverage
+    component: egress-protocol
+    scope: hosted
+    status: verified
+    summary: Bounded session capacity, restore-session identity, payload-hash binding, sequence exhaustion, canonical response chunk boundaries, and committed fuzz-target compilation are regression-locked in the supported hosted scope.
+    verification_page: docs/egress-protocol/verification.md
+    prerequisites:
+      - id: protocol-adversarial-harness
+        description: The protocol harness must generate malformed, exhausted, restored, and concurrent session inputs.
+        check: deterministic adversarial protocol test harness
+    gate:
+      id: egress-protocol-boundary-coverage
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p egress-protocol --all-targets
+        - cargo check --manifest-path fuzz/Cargo.toml --bins --locked
+    evidence:
+      commands:
+        - cargo test --locked -p egress-protocol --all-targets
+        - cargo check --manifest-path fuzz/Cargo.toml --bins --locked
+      sources:
+        - crates/egress-protocol/src/session.rs
+        - crates/egress-protocol/src/cbor.rs
+      tests:
+        - crates/egress-protocol/src/session.rs
+        - crates/egress-protocol/src/cbor.rs
+    residual_reasons: []
+
+  - id: egress-protocol-raw-envelope-ingress
+    component: egress-protocol
+    scope: hosted
+    status: verified
+    summary: The raw payload-hash constructor is crate-private, so external transports can construct envelopes only from canonical payload bytes; the production decoder independently rechecks the digest.
+    verification_page: docs/egress-protocol/verification.md
+    prerequisites:
+      - id: ingress-callsite-audit
+        description: Every workspace consumer must compile without access to the crate-private raw constructor.
+        check: locked workspace all-target check
+    gate:
+      id: egress-protocol-raw-envelope-ingress
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p egress-protocol --all-targets
+        - cargo check --locked --workspace --all-targets
+    evidence:
+      commands:
+        - cargo test --locked -p egress-protocol --all-targets
+        - cargo check --locked --workspace --all-targets
+      sources:
+        - crates/egress-protocol/src/session.rs
+        - crates/egress-protocol/src/cbor.rs
+      tests:
+        - crates/egress-protocol/src/session.rs
+        - crates/egress-protocol/src/cbor.rs
+    residual_reasons: []
+
   - id: egress-broker-hosted
     component: egress-broker
     scope: hosted
     status: verified
-    summary: Bounded transport, typed dispatch, replay and budget admission, policy checks, and fake provider paths are covered by hosted tests.
+    summary: Bounded transport, typed dispatch, replay and budget admission, policy checks, and fake provider paths are covered by locked hosted tests and Clippy.
+    verification_page: docs/egress-broker/verification.md
+    prerequisites:
+      - id: locked-rust-toolchain
+        description: Repository-pinned Rust toolchain and locked dependency graph are available.
+        check: rust-toolchain.toml and Cargo.lock
+    gate:
+      id: egress-broker-hosted
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p egress-broker --all-targets
+        - cargo clippy --locked -p egress-broker --all-targets -- -D warnings
     evidence:
       commands:
         - cargo test --locked -p egress-broker --all-targets
@@ -81,7 +285,18 @@ claims:
     component: egress-broker
     scope: kvm
     status: verified
-    summary: A real Firecracker guest reaches the host Broker through the Firecracker vsock boundary and receives the canonical closed authorization rejection without invoking a provider adapter.
+    summary: The required Firecracker guest-to-host Broker gate reaches the host dispatcher over the real vsock forwarding boundary and checks the canonical closed rejection.
+    verification_page: docs/egress-broker/verification.md
+    prerequisites:
+      - id: real-kvm-vsock
+        description: Root, /dev/kvm, Firecracker, guest artifacts, dm-verity, and AF_VSOCK forwarding are available.
+        check: scripts/ci/verify-real-guest-control.sh prerequisites
+    gate:
+      id: egress-broker-kvm
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
     evidence:
       commands:
         - scripts/ci/verify-real-guest-control.sh
@@ -94,25 +309,99 @@ claims:
   - id: egress-external-providers
     component: egress-broker
     scope: external
-    status: unverified
-    summary: Real DNS, HTTPS, GitHub API, and host credential use are outside the deterministic hosted provider doubles.
+    status: blocked
+    summary: Live GitHub installation credential use, provider mutation, and ref races remain outside deterministic provider doubles.
+    verification_page: docs/egress-broker/verification.md
+    prerequisites:
+      - id: disposable-provider-credentials
+        description: A disposable repository and least-privilege GitHub installation credential are required for the destructive smoke.
+        check: scripts/ci/verify-live-github.sh environment
+    gate:
+      id: egress-external-providers
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-live-github.sh
     evidence:
       commands:
-        - cargo test --locked -p egress-broker --all-targets
+        - scripts/ci/verify-live-github.sh
       sources:
         - crates/egress-broker/src/public_fetch.rs
         - crates/egress-broker/src/github.rs
       tests:
         - crates/egress-broker/src/public_fetch.rs
     residual_reasons:
-      - No external DNS or HTTPS endpoint is contacted by the repository test suite.
-      - No live GitHub installation credential or provider mutation is exercised.
+      - No live GitHub installation credential, provider mutation, or ref race is exercised in the available environment.
+
+  - id: egress-privileged-public-https
+    component: egress-broker
+    scope: privileged
+    status: verified
+    summary: The required isolated transport gate exercises the real system DNS and HTTPS/TLS/SNI path, address pinning, and rebinding rejection against a controlled disposable endpoint; it is not Internet-provider evidence.
+    verification_page: docs/egress-broker/verification.md
+    prerequisites:
+      - id: isolated-network-namespace
+        description: Root, a private network namespace, loopback addresses, and OpenSSL are available for the controlled endpoint.
+        check: scripts/ci/verify-real-public-https.sh prerequisites
+    gate:
+      id: egress-privileged-public-https
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-public-https.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-real-public-https.sh
+      sources:
+        - crates/egress-broker/src/public_fetch.rs
+      tests:
+        - crates/egress-broker/tests/real_public_https.rs
+    residual_reasons: []
+
+  - id: egress-broker-supervisor-dispatch
+    component: egress-broker
+    scope: kvm
+    status: unverified
+    summary: The capability issued by guest supervisor has not been driven through CapFS, isolation, and Broker dispatch in one real guest lifecycle.
+    verification_page: docs/egress-broker/verification.md
+    prerequisites:
+      - id: guest-capability-wiring
+        description: Guest supervisor, CapFS, isolation launcher, and Broker must share one controlled runtime image.
+        check: end-to-end guest capability dispatch scenario
+    gate:
+      id: egress-broker-supervisor-dispatch
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+      sources:
+        - crates/egress-broker/src/dispatch.rs
+        - crates/supervisor/src/supervisor.rs
+      tests:
+        - crates/firecracker-runtime/tests/real_guest_control.rs
+    residual_reasons:
+      - Existing KVM evidence proves a canonical Broker rejection and runtime composition, not capability-authorized guest dispatch.
 
   - id: runtime-isolation-hosted
     component: runtime-isolation
     scope: hosted
     status: verified
-    summary: Policy validation, ordered apply and rollback state machines, and capability detection branches are covered by hosted tests and doubles.
+    summary: Policy validation, ordered apply and rollback state machines, and capability detection branches are covered by locked hosted tests and Clippy.
+    verification_page: docs/runtime-isolation/verification.md
+    prerequisites:
+      - id: locked-rust-toolchain
+        description: Repository-pinned Rust toolchain and locked dependency graph are available.
+        check: rust-toolchain.toml and Cargo.lock
+    gate:
+      id: runtime-isolation-hosted
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p runtime-isolation --all-targets
+        - cargo clippy --locked -p runtime-isolation --all-targets -- -D warnings
     evidence:
       commands:
         - cargo test --locked -p runtime-isolation --all-targets
@@ -127,7 +416,18 @@ claims:
     component: runtime-isolation
     scope: privileged
     status: verified
-    summary: The privileged Linux probe applies the isolation envelope to staged root filesystems and verifies namespace, seccomp, Landlock, read-only rootfs, device masking, descriptor, and capability boundaries.
+    summary: The fail-closed privileged probe applies the isolation envelope to a staged root filesystem and asks the Linux kernel about namespace, seccomp, Landlock, rootfs, device, descriptor, and capability boundaries.
+    verification_page: docs/runtime-isolation/verification.md
+    prerequisites:
+      - id: delegated-cgroup-v2
+        description: Root and a writable cgroup v2 parent with memory and pids delegated are available.
+        check: scripts/ci/verify-privileged-isolation.sh prerequisites
+    gate:
+      id: runtime-isolation-privileged
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-privileged-isolation.sh
     evidence:
       commands:
         - scripts/ci/verify-privileged-isolation.sh
@@ -137,11 +437,128 @@ claims:
         - crates/runtime-isolation/tests/privileged_isolation.rs
     residual_reasons: []
 
+  - id: runtime-isolation-post-exec
+    component: runtime-isolation
+    scope: privileged
+    status: verified
+    summary: The required privileged gate executes a fixed workload after exec and observes the post-exec seccomp, Landlock, namespace, rootfs, device, descriptor, and capability envelope.
+    verification_page: docs/runtime-isolation/verification.md
+    prerequisites:
+      - id: fixed-workload-binary
+        description: A repository-built workload must be execed after isolation and report kernel observations through a controlled channel.
+        check: post-exec adversarial workload harness
+    gate:
+      id: runtime-isolation-post-exec
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-privileged-isolation.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-privileged-isolation.sh
+      sources:
+        - crates/runtime-isolation/src/linux.rs
+        - crates/runtime-isolation/src/bin/workload-isolation-launcher.rs
+      tests:
+        - crates/runtime-isolation/tests/privileged_isolation.rs
+    residual_reasons: []
+
+  - id: runtime-isolation-rootfs-host
+    component: runtime-isolation
+    scope: privileged
+    status: blocked
+    summary: The immutable host-root path (rootfs.source == /) and its /run, /sys, /proc, and /dev masking branch are not covered by the staged-rootfs probe.
+    verification_page: docs/runtime-isolation/verification.md
+    prerequisites:
+      - id: immutable-root-path
+        description: A controlled guest or host probe must enter the already-mounted root path without mutating the test host.
+        check: rootfs.source slash integration scenario
+    gate:
+      id: runtime-isolation-rootfs-host
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-privileged-isolation.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-privileged-isolation.sh
+      sources:
+        - crates/runtime-isolation/src/linux.rs
+      tests:
+        - crates/runtime-isolation/tests/privileged_isolation.rs
+    residual_reasons:
+      - The current host reports host-root-mount-is-writable, so the readonly-root prerequisite for the literal source==/ branch is unavailable; the existing probe uses a staged rootfs instead.
+
+  - id: runtime-isolation-rollback
+    component: runtime-isolation
+    scope: privileged
+    status: unverified
+    summary: Actual unmount and mount-namespace rollback after injected Workspace or LimitedTmpfs failure are not observed from outside the child.
+    verification_page: docs/runtime-isolation/verification.md
+    prerequisites:
+      - id: rollback-fault-seam
+        description: A test-only failure seam must inject a mount failure and expose child namespace cleanup without changing production defaults.
+        check: isolated mount rollback fault-injection harness
+    gate:
+      id: runtime-isolation-rollback
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-privileged-isolation.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-privileged-isolation.sh
+      sources:
+        - crates/runtime-isolation/src/backend.rs
+        - crates/runtime-isolation/src/linux.rs
+      tests:
+        - crates/runtime-isolation/tests/privileged_isolation.rs
+    residual_reasons:
+      - Current fault injection covers Landlock failure and cgroup release, not an externally observed unmount rollback.
+
+  - id: runtime-isolation-architecture
+    component: runtime-isolation
+    scope: privileged
+    status: blocked
+    summary: The syscall-number policy is intentionally x86_64-only and no alternate-architecture runner currently establishes a complete boundary.
+    verification_page: docs/runtime-isolation/verification.md
+    prerequisites:
+      - id: alternate-architecture-runner
+        description: An architecture-specific Linux runner and syscall table are required before this boundary can be exercised.
+        check: aarch64 privileged CI runner
+    gate:
+      id: runtime-isolation-architecture
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p runtime-isolation --all-targets
+    evidence:
+      commands:
+        - cargo test --locked -p runtime-isolation --all-targets
+      sources:
+        - crates/runtime-isolation/src/syscall.rs
+      tests:
+        - crates/runtime-isolation/tests/capability_detection.rs
+    residual_reasons:
+      - x86_64 is the only architecture with a privileged syscall-number evidence path in this repository.
+
   - id: firecracker-runtime-hosted
     component: firecracker-runtime
     scope: hosted
     status: verified
-    summary: Artifact validation, API sequencing, workspace handling, rollback paths, and Unix-socket adapters are covered by hosted doubles and local socket tests.
+    summary: Artifact validation, API sequencing, workspace handling, identity gates, and rollback state contracts are covered by locked hosted doubles and Clippy.
+    verification_page: docs/firecracker-runtime/verification.md
+    prerequisites:
+      - id: locked-rust-toolchain
+        description: Repository-pinned Rust toolchain and locked dependency graph are available.
+        check: rust-toolchain.toml and Cargo.lock
+    gate:
+      id: firecracker-runtime-hosted
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p firecracker-runtime --all-targets
+        - cargo clippy --locked -p firecracker-runtime --all-targets -- -D warnings
     evidence:
       commands:
         - cargo test --locked -p firecracker-runtime --all-targets
@@ -156,7 +573,18 @@ claims:
     component: firecracker-runtime
     scope: kvm
     status: verified
-    summary: Real Firecracker boots from a dm-verity rootfs and verifies the v2 digest-bound identity/start gate, guest readiness, guest-to-host Broker vsock, and the guest supervisor/isolation-launcher composition.
+    summary: The required real KVM gate boots the pinned dm-verity guest, checks the identity/start gate, guest readiness, guest-to-host Broker vsock, and guest supervisor/isolation composition.
+    verification_page: docs/firecracker-runtime/verification.md
+    prerequisites:
+      - id: real-kvm-artifacts
+        description: Root, /dev/kvm, pinned Firecracker, guest kernel/rootfs, dm-verity, and guest image tools are available.
+        check: scripts/ci/verify-real-guest-control.sh prerequisites
+    gate:
+      id: firecracker-runtime-kvm
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
     evidence:
       commands:
         - scripts/ci/verify-real-guest-control.sh
@@ -170,23 +598,76 @@ claims:
     component: firecracker-runtime
     scope: kvm
     status: unverified
-    summary: The production Runtime::launch path through jailer plus snapshot create and restore remains separate from the direct-API KVM evidence.
+    summary: Production Runtime::launch through jailer, workspace, mapper, snapshot create/restore, and rollback remains separate from the direct-API KVM evidence.
+    verification_page: docs/firecracker-runtime/verification.md
+    prerequisites:
+      - id: production-jailer-snapshot-host
+        description: A root KVM host with jailer, cgroup v2, dm-verity, workspace image, and snapshot storage is required.
+        check: Runtime::launch lifecycle integration environment
+    gate:
+      id: firecracker-runtime-production-lifecycle
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
     evidence:
       commands:
         - scripts/ci/verify-real-guest-control.sh
       sources:
         - crates/firecracker-runtime/src/lib.rs
+        - crates/firecracker-runtime/src/recovery.rs
       tests:
         - crates/firecracker-runtime/tests/runtime.rs
+        - crates/firecracker-runtime/tests/real_guest_control.rs
     residual_reasons:
-      - The real KVM command configures Firecracker directly and does not invoke Runtime::launch through jailer.
-      - Real snapshot create, restore, and rollback cleanup are not exercised.
+      - The current real KVM command configures Firecracker directly and does not invoke Runtime::launch through jailer.
+      - Snapshot create, restore, identity rotation, and rollback cleanup are not exercised end to end.
+
+  - id: firecracker-runtime-guest-capfs
+    component: firecracker-runtime
+    scope: kvm
+    status: unverified
+    summary: Guest CapFS all-effect behavior and the actual seccomp filter effect are not established by the current runtime image checks.
+    verification_page: docs/firecracker-runtime/verification.md
+    prerequisites:
+      - id: guest-capfs-workload
+        description: A guest workload must exercise every selected CapFS effect and adversarial syscall after isolation.
+        check: guest CapFS effect and seccomp workload
+    gate:
+      id: firecracker-runtime-guest-capfs
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+      sources:
+        - crates/firecracker-runtime/src/lib.rs
+        - crates/runtime-isolation/src/linux.rs
+      tests:
+        - crates/firecracker-runtime/tests/real_guest_control.rs
+    residual_reasons:
+      - The current runtime image checks supervisor/isolation/Broker composition but does not cover every CapFS operation.
+      - Seccomp is not independently parsed or exercised for the complete declared filter in the real workload.
 
   - id: session-orchestrator-hosted
     component: session-orchestrator
     scope: hosted
     status: verified
-    summary: Lifecycle state transitions, durable identity records, and production adapter composition with controlled doubles are covered by hosted tests.
+    summary: Lifecycle transitions, durable identity records, and production adapter composition with controlled doubles are covered by locked hosted tests and Clippy.
+    verification_page: docs/session-orchestrator/verification.md
+    prerequisites:
+      - id: locked-rust-toolchain
+        description: Repository-pinned Rust toolchain and locked dependency graph are available.
+        check: rust-toolchain.toml and Cargo.lock
+    gate:
+      id: session-orchestrator-hosted
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p session-orchestrator --all-targets
+        - cargo clippy --locked -p session-orchestrator --all-targets -- -D warnings
     evidence:
       commands:
         - cargo test --locked -p session-orchestrator --all-targets
@@ -201,23 +682,105 @@ claims:
     component: session-orchestrator
     scope: kvm
     status: unverified
-    summary: Full SessionOwner lifecycle through a real VM and guest capability path is not established by adapter composition tests.
+    summary: Full SessionOwner lifecycle through a real VM, guest CapFS, isolation, Broker, and production cleanup is not established by adapter composition tests.
+    verification_page: docs/session-orchestrator/verification.md
+    prerequisites:
+      - id: full-session-kvm-host
+        description: A root KVM host with production artifacts and a disposable workspace/snapshot is required.
+        check: full SessionOwner real VM integration environment
+    gate:
+      id: session-orchestrator-kvm
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+      sources:
+        - crates/session-orchestrator/src/production_runtime.rs
+        - crates/session-orchestrator/src/session_owner.rs
+      tests:
+        - crates/session-orchestrator/tests/production_adapters.rs
+        - crates/firecracker-runtime/tests/real_guest_control.rs
+    residual_reasons:
+      - Production adapter tests replace Firecracker, filesystem, listener, and API boundaries with doubles.
+      - No single real SessionOwner lifecycle proves CapFS, isolation, Firecracker, Broker, and cleanup together.
+
+  - id: session-orchestrator-durable-ledger
+    component: session-orchestrator
+    scope: hosted
+    status: unverified
+    summary: Durable ledger crash consistency, stale-lock recovery, cross-process contention, entropy, and all error variants are not regression-locked.
+    verification_page: docs/session-orchestrator/verification.md
+    prerequisites:
+      - id: ledger-fault-harness
+        description: The ledger test harness must inject sync/write/crash faults and coordinate multiple processes.
+        check: durable ledger fault-injection and contention harness
+    gate:
+      id: session-orchestrator-durable-ledger
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p session-orchestrator --all-targets
     evidence:
       commands:
         - cargo test --locked -p session-orchestrator --all-targets
       sources:
-        - crates/session-orchestrator/src/production_runtime.rs
+        - crates/session-orchestrator/src/recovery.rs
+        - crates/session-orchestrator/src/session_owner.rs
+      tests:
+        - crates/session-orchestrator/tests/ledger.rs
+    residual_reasons:
+      - new_durable is not exercised through the orchestrator, and crash consistency, stale lock recovery, and cross-process contention are missing.
+      - Capacity bounds, OsEntropy, poisoned paths, and the full ledger error matrix remain unverified.
+
+  - id: session-orchestrator-snapshot-integrity
+    component: session-orchestrator
+    scope: kvm
+    status: unverified
+    summary: Snapshot contents, identity binding, restore session uniqueness, and cleanup behavior are not independently inspected by SessionOwner.
+    verification_page: docs/session-orchestrator/verification.md
+    prerequisites:
+      - id: snapshot-inspection-harness
+        description: A disposable snapshot restore environment must inspect image contents and enforce new session identity.
+        check: snapshot restore identity and content inspection scenario
+    gate:
+      id: session-orchestrator-snapshot-integrity
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+      sources:
+        - crates/session-orchestrator/src/firecracker_identity.rs
+        - crates/session-orchestrator/src/recovery.rs
       tests:
         - crates/session-orchestrator/tests/production_adapters.rs
+        - crates/firecracker-runtime/tests/runtime.rs
     residual_reasons:
-      - Production adapter tests replace external command, filesystem, and API boundaries with test doubles.
-      - No end-to-end real SessionOwner lifecycle currently proves capfs, isolation, and Firecracker together.
+      - SnapshotDescriptor is caller-supplied metadata and the snapshot image is not inspected for embedded identity.
+      - Real snapshot restore and fresh Broker/session identity are not established.
 
   - id: supervisor-hosted
     component: supervisor
     scope: hosted
     status: verified
-    summary: Supervisor protocol, caller identity, control socket, and lifecycle behavior are covered by hosted tests.
+    summary: Supervisor protocol, caller identity, control socket, and ordinary lifecycle behavior are covered by locked hosted tests and Clippy.
+    verification_page: docs/supervisor/verification.md
+    prerequisites:
+      - id: locked-rust-toolchain
+        description: Repository-pinned Rust toolchain and locked dependency graph are available.
+        check: rust-toolchain.toml and Cargo.lock
+    gate:
+      id: supervisor-hosted
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p supervisor --all-targets
+        - cargo clippy --locked -p supervisor --all-targets -- -D warnings
     evidence:
       commands:
         - cargo test --locked -p supervisor --all-targets
@@ -232,7 +795,98 @@ claims:
     component: supervisor
     scope: kvm
     status: verified
-    summary: A real Firecracker guest runs guest-control PID 1, waits for guest-supervisor readiness, mounts its workspace, starts the isolation launcher, and preserves the inherited Broker channel to the workload.
+    summary: The required real guest gate runs guest supervisor PID 1, readiness, workspace setup, isolation launcher, and inherited Broker channel checks.
+    verification_page: docs/supervisor/verification.md
+    prerequisites:
+      - id: guest-supervisor-kernel
+        description: A guest kernel with FUSE, Landlock, and the required Firecracker device enumeration support is available.
+        check: pinned guest kernel and runtime image prerequisites
+    gate:
+      id: supervisor-kvm
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+      sources:
+        - crates/supervisor/src/bin/guest-supervisor-init.rs
+      tests:
+        - crates/firecracker-runtime/tests/real_guest_control.rs
+    residual_reasons: []
+
+  - id: supervisor-real-resources
+    component: supervisor
+    scope: privileged
+    status: verified
+    summary: The required privileged adapter gate exercises real FUSE mount/unmount, cgroup create/retry/recreate, seqpacket peer credentials, descriptor cleanup, and handle bookkeeping in a private mount namespace.
+    verification_page: docs/supervisor/verification.md
+    prerequisites:
+      - id: supervisor-resource-host
+        description: A disposable privileged host must allow isolated mount/cgroup operations and external observation of cleanup.
+        check: scripts/ci/verify-real-supervisor-resources.sh prerequisites
+    gate:
+      id: supervisor-real-resources
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-supervisor-resources.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-real-supervisor-resources.sh
+      sources:
+        - crates/supervisor/src/linux_host.rs
+        - crates/supervisor/src/supervisor.rs
+      tests:
+        - crates/supervisor/tests/real_resources.rs
+    residual_reasons: []
+
+  - id: supervisor-negative-lifecycle
+    component: supervisor
+    scope: hosted
+    status: unverified
+    summary: Remaining supervisor lifecycle risk is concentrated in multi-phase cleanup combinations, concurrent authority changes during setup, permanent-record bounds, and deliberately unreachable token combinations.
+    verification_page: docs/supervisor/verification.md
+    prerequisites:
+      - id: supervisor-failure-matrix
+        description: A negative lifecycle matrix must exercise every cleanup and protocol error with caller identity preserved.
+        check: supervisor failure and protocol boundary test matrix
+    gate:
+      id: supervisor-negative-lifecycle
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p supervisor --all-targets
+    evidence:
+      commands:
+        - cargo test --locked -p supervisor --all-targets
+      sources:
+        - crates/supervisor/src/supervisor.rs
+        - crates/supervisor/src/protocol.rs
+      tests:
+        - crates/supervisor/tests/supervisor.rs
+    residual_reasons:
+      - Stop-workload, remove-cgroup, close-handle, and simultaneous multi-phase cleanup failures are not all regression-locked through Supervisor.
+      - Concurrent state changes between registration and workload start plus permanent subject/handle registry bounds remain unverified.
+      - The unreachable workload/cgroup token branch has no public construction path or direct test.
+
+  - id: supervisor-guest-kernel
+    component: supervisor
+    scope: kvm
+    status: verified
+    summary: The required real guest gate boots the repository-pinned kernel and establishes the FUSE, Landlock ABI, and Firecracker device-enumeration prerequisites used by guest-supervisor-init.
+    verification_page: docs/supervisor/verification.md
+    prerequisites:
+      - id: pinned-guest-kernel
+        description: The repository-pinned guest kernel satisfying FUSE, Landlock ABI 3, and Firecracker device-enumeration assumptions is built and available.
+        check: scripts/ci/build-guest-kernel.sh output
+    gate:
+      id: supervisor-guest-kernel
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
     evidence:
       commands:
         - scripts/ci/verify-real-guest-control.sh

@@ -121,6 +121,14 @@ impl CommandRunner for MockRunner {
         Ok(process)
     }
 
+    fn verify_verity(
+        &mut self,
+        _veritysetup: &PinnedArtifact,
+        _expected: &DmVerityConfig,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
     fn start_owned(
         &mut self,
         command: &CommandSpec,
@@ -361,6 +369,7 @@ fn config() -> RuntimeConfig {
         ),
         rootfs: rootfs.clone(),
         verity_hash: artifact("/artifacts/rootfs.verity", "verity-hash"),
+        veritysetup: artifact("/usr/sbin/veritysetup", "veritysetup"),
         dm_verity: DmVerityConfig {
             data_device: rootfs.path.clone(),
             hash_device: PathBuf::from("/artifacts/rootfs.verity"),
@@ -430,7 +439,10 @@ fn config() -> RuntimeConfig {
         network_devices: Vec::new(),
         vcpu_count: 2,
         memory_mib: 256,
-        boot_args: "console=ttyS0 reboot=k panic=1 pci=off".to_owned(),
+        boot_args: format!(
+            "console=ttyS0 reboot=k panic=1 pci=off init={}",
+            firecracker_runtime::REQUIRED_GUEST_INIT
+        ),
     }
 }
 
@@ -441,6 +453,7 @@ fn filesystem_for(config: &RuntimeConfig, events: Events) -> MockFileSystem {
         (&config.kernel.path, b"kernel".as_slice()),
         (&config.rootfs.path, b"rootfs".as_slice()),
         (&config.verity_hash.path, b"verity-hash".as_slice()),
+        (&config.veritysetup.path, b"veritysetup".as_slice()),
         (&config.workspace.image.formatter.path, b"mke2fs".as_slice()),
         (&config.jailer.path, b"jailer".as_slice()),
         (&config.isolation.seccomp.filter.path, b"seccomp".as_slice()),
@@ -530,7 +543,7 @@ fn launch_valid_profile_configures_verity_vsock_and_jailer_without_network() {
     assert!(events[0].starts_with("filesystem:clone:"));
     assert!(events[1].starts_with("filesystem:image:"));
     assert!(events[2].starts_with("command:run:/artifacts/mke2fs -F -q -t ext4 -d"));
-    assert!(events[3].starts_with("command:run:veritysetup open --readonly"));
+    assert!(events[3].starts_with("command:run:/usr/sbin/veritysetup open --readonly"));
     assert!(events[4].starts_with("filesystem:bind-device:"));
     assert!(events[5].starts_with("filesystem:verify-device:"));
     assert!(events[6].contains("--new-pid-ns"));
@@ -591,7 +604,7 @@ fn api_error_rolls_back_process_verity_and_workspace_in_reverse_order() {
     assert!(events[0].starts_with("filesystem:clone:"));
     assert!(events[1].starts_with("filesystem:image:"));
     assert!(events[2].starts_with("command:run:/artifacts/mke2fs"));
-    assert!(events[3].starts_with("command:run:veritysetup open"));
+    assert!(events[3].starts_with("command:run:/usr/sbin/veritysetup open"));
     assert!(events[4].starts_with("filesystem:bind-device:"));
     assert!(events[5].starts_with("filesystem:verify-device:"));
     assert!(events[6].starts_with("command:start:"));
@@ -599,7 +612,7 @@ fn api_error_rolls_back_process_verity_and_workspace_in_reverse_order() {
     assert!(events[8].starts_with("api:/boot-source:"));
     assert!(events[9].starts_with("command:stop:"));
     assert!(events[10].starts_with("filesystem:unbind-device:"));
-    assert!(events[11].starts_with("command:run:veritysetup close"));
+    assert!(events[11].starts_with("command:run:/usr/sbin/veritysetup close"));
     assert!(events[12].starts_with("filesystem:remove:"));
 }
 
@@ -625,6 +638,103 @@ fn workspace_clone_error_removes_partial_destination_without_starting_vm() {
     assert_eq!(events.len(), 2);
     assert!(events[0].starts_with("filesystem:clone:"));
     assert!(events[1].starts_with("filesystem:remove:"));
+}
+
+#[test]
+fn snapshot_pauses_vm_before_writing_snapshot_files() {
+    let config = config();
+    let (mut runtime, events) = runtime(&config, std::iter::empty());
+    let mut instance = runtime.launch(&config).expect("baseline VM must launch");
+
+    runtime
+        .create_snapshot(&mut instance, SNAPSHOT_STATE_PATH, SNAPSHOT_MEMORY_PATH)
+        .expect("pre-session snapshot must succeed");
+    assert_eq!(instance.state(), RuntimeState::Snapshotted);
+
+    let events = events.borrow();
+    let pause_index = events
+        .iter()
+        .position(|event| event == r#"api:/vm:{"state":"Paused"}"#)
+        .expect("snapshot must pause the VM first");
+    let create_index = events
+        .iter()
+        .position(|event| event.starts_with("api:/snapshot/create:"))
+        .expect("snapshot must be written through Firecracker API");
+    assert!(pause_index < create_index);
+    assert_eq!(
+        events[pause_index], r#"api:/vm:{"state":"Paused"}"#,
+        "the pause body must request Firecracker's paused state"
+    );
+}
+
+#[test]
+fn snapshot_create_failure_keeps_instance_explicitly_paused() {
+    let config = config();
+    // launch: machine-config, boot-source, rootfs, workspace, vsock, InstanceStart;
+    // create_snapshot: pause succeeds, snapshot/create fails.
+    let (mut runtime, events) = runtime(&config, [200, 200, 200, 200, 200, 200, 200, 503]);
+    let mut instance = runtime.launch(&config).expect("baseline VM must launch");
+
+    let error = runtime
+        .create_snapshot(&mut instance, SNAPSHOT_STATE_PATH, SNAPSHOT_MEMORY_PATH)
+        .expect_err("Firecracker snapshot failure must be returned");
+    assert!(matches!(
+        error,
+        RuntimeError::ApiStatus {
+            path,
+            status: 503,
+            ..
+        } if path == "/snapshot/create"
+    ));
+    assert_eq!(instance.state(), RuntimeState::SnapshotPaused);
+    assert!(
+        events
+            .borrow()
+            .iter()
+            .any(|event| event == r#"api:/vm:{"state":"Paused"}"#)
+    );
+
+    runtime
+        .shutdown(&mut instance, &config)
+        .expect("paused failed snapshot must still be cleanly shut down");
+}
+
+#[test]
+fn snapshot_pause_failure_enters_unknown_state_and_does_not_create_snapshot() {
+    let config = config();
+    // launch: machine-config, boot-source, rootfs, workspace, vsock, InstanceStart;
+    // create_snapshot: pause is rejected, so snapshot/create must not be attempted.
+    let (mut runtime, events) = runtime(&config, [200, 200, 200, 200, 200, 200, 503]);
+    let mut instance = runtime.launch(&config).expect("baseline VM must launch");
+
+    let error = runtime
+        .create_snapshot(&mut instance, SNAPSHOT_STATE_PATH, SNAPSHOT_MEMORY_PATH)
+        .expect_err("Firecracker pause failure must be returned");
+    assert!(matches!(
+        error,
+        RuntimeError::ApiStatus {
+            path,
+            status: 503,
+            ..
+        } if path == "/vm"
+    ));
+    assert_eq!(instance.state(), RuntimeState::SnapshotPauseUnknown);
+    assert!(
+        events
+            .borrow()
+            .iter()
+            .any(|event| event == r#"api:/vm:{"state":"Paused"}"#)
+    );
+    assert!(
+        !events
+            .borrow()
+            .iter()
+            .any(|event| event.starts_with("api:/snapshot/create:"))
+    );
+
+    runtime
+        .shutdown(&mut instance, &config)
+        .expect("unknown pause state must still be cleanly shut down");
 }
 
 fn assert_shutdown_retry(stop_failures: &[bool], run_failures: &[bool], remove_failures: &[bool]) {
@@ -821,7 +931,7 @@ fn stale_identity_is_rejected_and_restored_process_is_rolled_back() {
     assert!(
         events
             .iter()
-            .any(|event| event.starts_with("command:run:veritysetup close"))
+            .any(|event| event.starts_with("command:run:/usr/sbin/veritysetup close"))
     );
     assert!(
         events
@@ -870,6 +980,24 @@ fn latest_artifact_channel_is_rejected_by_validation() {
     assert!(
         matches!(config.validate(), Err(RuntimeError::LatestArtifactPath { label }) if label == "firecracker")
     );
+}
+
+#[test]
+fn boot_args_cannot_bypass_or_duplicate_the_guest_identity_gate() {
+    let mut config = config();
+    for invalid in [
+        "console=ttyS0 reboot=k panic=1 pci=off",
+        "console=ttyS0 reboot=k panic=1 pci=off init=/bin/sh",
+        "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init init=/bin/sh",
+        "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init rdinit=/bin/sh",
+        "console=ttyS0 panic=1 pci=off init=/usr/local/libexec/guest-control-init",
+    ] {
+        config.boot_args = invalid.to_owned();
+        assert!(
+            matches!(config.validate(), Err(RuntimeError::InvalidConfig(_))),
+            "unsafe boot args must fail: {invalid}"
+        );
+    }
 }
 
 #[test]
@@ -1170,6 +1298,7 @@ fn shell_command(script: &str) -> CommandSpec {
     CommandSpec {
         program: PathBuf::from("/bin/sh"),
         args: vec!["-c".to_owned(), script.to_owned()],
+        expected_digest: None,
     }
 }
 
@@ -1192,12 +1321,31 @@ fn real_command_runner_captures_normal_output() {
 }
 
 #[test]
+fn real_command_runner_does_not_inherit_the_host_environment() {
+    let mut runner = RealCommandRunner::new();
+    let output = runner
+        .run(&CommandSpec {
+            program: PathBuf::from("/usr/bin/env"),
+            args: Vec::new(),
+            expected_digest: None,
+        })
+        .expect("environment probe must run");
+    assert_eq!(output.status, 0);
+    assert!(
+        output.stdout.is_empty(),
+        "host credentials and proxy settings must not reach helper processes"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn real_command_runner_terminates_on_oversized_stdout() {
     let mut runner = RealCommandRunner::new();
     let error = runner
         .run(&CommandSpec {
             program: PathBuf::from("yes"),
             args: Vec::new(),
+            expected_digest: None,
         })
         .expect_err("unbounded command output must be rejected");
     assert!(

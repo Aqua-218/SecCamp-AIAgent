@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 use authority_core::{
     capability::{AuthorityBody, IssuerId, SubjectId},
@@ -15,7 +15,8 @@ use authority_core::{
 use supervisor::{
     CgroupHandle, CleanupStep, ConnectionIdentity, ControlFdHandle, MountHandle,
     ResourceAcquisition, ResourceMutation, RuntimeResources, SetupStep, StaticCallerResolver,
-    SubjectLifecycle, Supervisor, SupervisorError, WorkloadHandle,
+    SubjectLifecycle, Supervisor, SupervisorCapacity, SupervisorError, SupervisorLimits,
+    SupervisorLimitsError, WorkloadHandle,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +35,7 @@ struct FakeResources {
     events: Vec<&'static str>,
     failures: Vec<&'static str>,
     next_token: u64,
+    mutate_authority_during_start: Option<Arc<CapabilityKernel>>,
 }
 
 impl FakeResources {
@@ -117,13 +119,19 @@ impl RuntimeResources for FakeResources {
 
     fn start_workload(
         &mut self,
-        _subject: &SubjectId,
+        subject: &SubjectId,
         _cgroup: CgroupHandle,
         _mount: MountHandle,
         _control: ControlFdHandle,
     ) -> ResourceAcquisition<WorkloadHandle, Self::Error> {
         match self.record("start_workload") {
-            Ok(()) => ResourceAcquisition::Acquired(WorkloadHandle::new(self.token())),
+            Ok(()) => {
+                if let Some(kernel) = self.mutate_authority_during_start.take() {
+                    CapabilityKernel::begin_subject_close(&kernel, subject)
+                        .expect("concurrent test mutation must be accepted");
+                }
+                ResourceAcquisition::Acquired(WorkloadHandle::new(self.token()))
+            }
             Err(error) => ResourceAcquisition::NoEffect(error),
         }
     }
@@ -215,6 +223,19 @@ fn new_supervisor() -> (
         .create_subject(Subject::new(root_subject(), root_envelope()), identity)
         .expect("subject setup must succeed");
     (supervisor, identity)
+}
+
+fn assert_cleanup_steps<KE, RE, CE>(error: &SupervisorError<KE, RE, CE>, expected: &[CleanupStep]) {
+    let SupervisorError::CleanupFailed { failures, .. } = error else {
+        panic!("expected CleanupFailed");
+    };
+    assert_eq!(
+        failures
+            .iter()
+            .map(|failure| failure.step)
+            .collect::<Vec<_>>(),
+        expected,
+    );
 }
 
 #[test]
@@ -375,10 +396,74 @@ fn authenticated_foreign_subject_cannot_close_another_subjects_handle() {
     supervisor
         .open_handle(&root_identity, handle.clone(), ObjectId::new("object-1"))
         .expect("root handle setup must succeed");
+
+    let before_events = supervisor.resources().events.clone();
+    let request = supervisor::WireRequest::CloseHandle {
+        claimed_subject: root_subject(),
+        handle,
+    }
+    .encode()
+    .expect("request must encode");
     assert!(matches!(
-        supervisor.close_handle(&child_identity, &handle),
+        supervisor.dispatch_wire(&child_identity, &request),
         Err(SupervisorError::HandleNotOwned { .. })
     ));
+    assert_eq!(
+        supervisor.resources().events,
+        before_events,
+        "ownership rejection must happen before the runtime adapter is called"
+    );
+}
+
+#[test]
+fn close_subject_claim_cannot_close_a_foreign_subject() {
+    let root_identity = ConnectionIdentity::new(6, 106, 1000, 1000);
+    let child_identity = ConnectionIdentity::new(7, 107, 1000, 1000);
+    let mut callers = StaticCallerResolver::new();
+    callers
+        .bind(root_identity, root_subject())
+        .expect("root caller binding must be unique");
+    callers
+        .bind(child_identity, child_subject())
+        .expect("child caller binding must be unique");
+    let kernel = CapabilityKernel::new(CapabilityState::new(IssuerId::new("session")));
+    let resources = FakeResources::default();
+    let mut supervisor = Supervisor::new(kernel, resources, callers)
+        .expect("pristine kernel must initialize supervisor");
+    supervisor
+        .create_subject(Subject::new(root_subject(), root_envelope()), root_identity)
+        .expect("root setup must succeed");
+    supervisor
+        .create_subject(
+            Subject::new(child_subject(), child_envelope()).with_parent(root_subject()),
+            child_identity,
+        )
+        .expect("child setup must succeed");
+
+    let request = supervisor::WireRequest::CloseSubject {
+        claimed_subject: root_subject(),
+    }
+    .encode()
+    .expect("request must encode");
+    assert_eq!(
+        supervisor
+            .dispatch_wire(&child_identity, &request)
+            .expect("the caller's own subject must close"),
+        supervisor::DispatchResponse::SubjectClosed
+    );
+    assert_eq!(
+        supervisor
+            .lifecycle(&child_subject())
+            .expect("closed child record must remain queryable"),
+        SubjectLifecycle::Closed
+    );
+    assert_eq!(
+        supervisor
+            .lifecycle(&root_subject())
+            .expect("foreign subject must remain queryable"),
+        SubjectLifecycle::Running,
+        "claimed subject data must never select the shutdown target"
+    );
 }
 
 #[test]
@@ -414,6 +499,96 @@ fn partial_setup_rolls_back_already_acquired_resources() {
         supervisor.lifecycle(&subject),
         Err(SupervisorError::UnknownSubject(_))
     ));
+}
+
+#[test]
+fn clean_setup_rollback_permanently_reserves_subject_id() {
+    let identity = ConnectionIdentity::new(20, 120, 1000, 1000);
+    let subject = SubjectId::new("rollback-reserved-subject");
+    let mut callers = StaticCallerResolver::new();
+    callers
+        .bind(identity, subject.clone())
+        .expect("caller binding must be unique");
+    let mut resources = FakeResources::default();
+    resources.fail_once("mount");
+    let mut supervisor = Supervisor::new(
+        CapabilityKernel::new(CapabilityState::new(IssuerId::new("session"))),
+        resources,
+        callers,
+    )
+    .expect("pristine kernel must initialize supervisor");
+
+    supervisor
+        .create_subject(Subject::new(subject.clone(), root_envelope()), identity)
+        .expect_err("the first setup must fail before authority registration");
+    let events_after_rollback = supervisor.resources().events.clone();
+
+    assert!(matches!(
+        supervisor.create_subject(Subject::new(subject.clone(), root_envelope()), identity),
+        Err(SupervisorError::DuplicateSubject(duplicate)) if duplicate == subject
+    ));
+    assert_eq!(
+        supervisor.resources().events,
+        events_after_rollback,
+        "a permanently reserved subject ID must not reach the adapter again"
+    );
+}
+
+#[test]
+fn register_to_start_authority_mutation_fails_closed_and_rolls_back_resources() {
+    let identity = ConnectionIdentity::new(21, 121, 1000, 1000);
+    let subject = SubjectId::new("authority-start-race");
+    let mut callers = StaticCallerResolver::new();
+    callers
+        .bind(identity, subject.clone())
+        .expect("caller binding must be unique");
+    let kernel = Arc::new(CapabilityKernel::new(CapabilityState::new(IssuerId::new(
+        "session",
+    ))));
+    let resources = FakeResources {
+        mutate_authority_during_start: Some(Arc::clone(&kernel)),
+        ..FakeResources::default()
+    };
+    let mut supervisor = Supervisor::new(kernel.clone(), resources, callers)
+        .expect("pristine shared kernel must initialize supervisor");
+
+    let error = supervisor
+        .create_subject(Subject::new(subject.clone(), root_envelope()), identity)
+        .expect_err("authority mutation during workload start must fail closed");
+    assert!(matches!(
+        error,
+        SupervisorError::SetupFailed {
+            step: SetupStep::StartWorkload,
+            primary: supervisor::OperationFailure::Invariant(
+                "authority subject changed during workload start"
+            ),
+            rollback,
+            ..
+        } if rollback.is_empty()
+    ));
+    assert!(matches!(
+        supervisor.lifecycle(&subject),
+        Err(SupervisorError::UnknownSubject(_))
+    ));
+    assert_eq!(
+        supervisor.resources().events,
+        vec![
+            "create_cgroup",
+            "mount",
+            "open_control",
+            "start_workload",
+            "stop_workload",
+            "close_control",
+            "unmount",
+            "remove_cgroup",
+        ],
+        "a concurrent authority mutation must not publish a running resource record"
+    );
+    assert_eq!(
+        CapabilityKernel::subject_status(&kernel, &subject)
+            .expect("shared kernel status must remain readable"),
+        Some(authority_core::state::SubjectStatus::Closed)
+    );
 }
 
 #[test]
@@ -514,6 +689,185 @@ fn cleanup_failure_keeps_subject_closing_and_blocks_new_requests() {
         supervisor
             .lifecycle(&root_subject())
             .expect("closed subject record must remain queryable"),
+        SubjectLifecycle::Closed
+    );
+}
+
+#[test]
+fn stop_workload_failure_is_retained_and_retried_before_mount_cleanup() {
+    let (mut supervisor, _) = new_supervisor();
+    supervisor.resources_mut().fail_once("stop_workload");
+
+    let error = supervisor
+        .shutdown_subject(&root_subject())
+        .expect_err("workload stop failure must remain fail-closed");
+    assert_cleanup_steps(&error, &[CleanupStep::StopWorkload]);
+    assert_eq!(
+        supervisor
+            .lifecycle(&root_subject())
+            .expect("closing subject must remain tracked"),
+        SubjectLifecycle::Closing
+    );
+    assert_eq!(
+        supervisor.resources().events,
+        vec![
+            "create_cgroup",
+            "mount",
+            "open_control",
+            "start_workload",
+            "stop_workload",
+            "close_control"
+        ],
+        "mount and cgroup cleanup must wait for workload stop"
+    );
+
+    supervisor
+        .shutdown_subject(&root_subject())
+        .expect("retry must stop workload before releasing prerequisites");
+    assert_eq!(
+        supervisor.resources().events,
+        vec![
+            "create_cgroup",
+            "mount",
+            "open_control",
+            "start_workload",
+            "stop_workload",
+            "close_control",
+            "stop_workload",
+            "unmount",
+            "remove_cgroup",
+        ]
+    );
+}
+
+#[test]
+fn remove_cgroup_failure_is_retained_after_mount_cleanup_and_retried() {
+    let (mut supervisor, _) = new_supervisor();
+    supervisor.resources_mut().fail_once("remove_cgroup");
+
+    let error = supervisor
+        .shutdown_subject(&root_subject())
+        .expect_err("cgroup removal failure must remain fail-closed");
+    assert_cleanup_steps(&error, &[CleanupStep::RemoveCgroup]);
+    assert_eq!(
+        supervisor.resources().events,
+        vec![
+            "create_cgroup",
+            "mount",
+            "open_control",
+            "start_workload",
+            "stop_workload",
+            "close_control",
+            "unmount",
+            "remove_cgroup",
+        ]
+    );
+
+    supervisor
+        .shutdown_subject(&root_subject())
+        .expect("retry must remove the retained cgroup");
+    assert_eq!(supervisor.resources().events.last(), Some(&"remove_cgroup"));
+    assert_eq!(
+        supervisor
+            .lifecycle(&root_subject())
+            .expect("closed subject must remain queryable"),
+        SubjectLifecycle::Closed
+    );
+}
+
+#[test]
+fn close_handle_failure_is_retained_and_retried_before_unmount() {
+    let (mut supervisor, identity) = new_supervisor();
+    let handle = HandleId::new("close-retry-handle");
+    supervisor
+        .open_handle(&identity, handle, ObjectId::new("object-1"))
+        .expect("handle setup must succeed");
+    supervisor.resources_mut().fail_once("close_handle");
+
+    let error = supervisor
+        .shutdown_subject(&root_subject())
+        .expect_err("runtime handle close failure must remain fail-closed");
+    assert_cleanup_steps(&error, &[CleanupStep::CloseHandle]);
+    assert_eq!(
+        supervisor.resources().events,
+        vec![
+            "create_cgroup",
+            "mount",
+            "open_control",
+            "start_workload",
+            "open_handle",
+            "stop_workload",
+            "close_control",
+            "close_handle",
+        ]
+    );
+
+    supervisor
+        .shutdown_subject(&root_subject())
+        .expect("retry must close the retained runtime handle");
+    assert_eq!(
+        supervisor
+            .lifecycle(&root_subject())
+            .expect("closed subject must remain queryable"),
+        SubjectLifecycle::Closed
+    );
+    assert_eq!(
+        supervisor.resources().events,
+        vec![
+            "create_cgroup",
+            "mount",
+            "open_control",
+            "start_workload",
+            "open_handle",
+            "stop_workload",
+            "close_control",
+            "close_handle",
+            "close_handle",
+            "unmount",
+            "remove_cgroup",
+        ]
+    );
+}
+
+#[test]
+fn simultaneous_cleanup_failures_are_all_retained_for_one_retry_matrix() {
+    let (mut supervisor, identity) = new_supervisor();
+    supervisor
+        .open_handle(
+            &identity,
+            HandleId::new("multi-failure-handle"),
+            ObjectId::new("object-1"),
+        )
+        .expect("handle setup must succeed");
+    supervisor.resources_mut().fail_once("stop_workload");
+    supervisor.resources_mut().fail_once("close_control");
+    supervisor.resources_mut().fail_once("close_handle");
+
+    let error = supervisor
+        .shutdown_subject(&root_subject())
+        .expect_err("simultaneous cleanup failures must be reported together");
+    assert_cleanup_steps(
+        &error,
+        &[
+            CleanupStep::StopWorkload,
+            CleanupStep::CloseControlFd,
+            CleanupStep::CloseHandle,
+        ],
+    );
+    assert_eq!(
+        supervisor
+            .lifecycle(&root_subject())
+            .expect("failed cleanup must remain tracked"),
+        SubjectLifecycle::Closing
+    );
+
+    supervisor
+        .shutdown_subject(&root_subject())
+        .expect("the retry matrix must converge after transient failures are consumed");
+    assert_eq!(
+        supervisor
+            .lifecycle(&root_subject())
+            .expect("closed subject must remain queryable"),
         SubjectLifecycle::Closed
     );
 }
@@ -832,4 +1186,135 @@ fn derive_requires_a_running_caller_and_a_capability_it_holds() {
         ),
         Err(SupervisorError::SubjectClosed(subject)) if subject == root_subject()
     ));
+}
+
+#[test]
+fn zero_registry_capacity_is_rejected_during_supervisor_construction() {
+    let callers = StaticCallerResolver::new();
+    let result = Supervisor::new_with_limits(
+        CapabilityKernel::new(CapabilityState::new(IssuerId::new("session"))),
+        FakeResources::default(),
+        callers,
+        SupervisorLimits::new(0, 1),
+    );
+    assert!(matches!(
+        result,
+        Err(SupervisorError::InvalidLimits(SupervisorLimitsError::Zero(
+            SupervisorCapacity::Subjects
+        )))
+    ));
+}
+
+#[test]
+fn subject_capacity_exhaustion_happens_before_the_resource_adapter() {
+    let root_identity = ConnectionIdentity::new(30, 130, 1000, 1000);
+    let extra_identity = ConnectionIdentity::new(31, 131, 1000, 1000);
+    let extra_subject = SubjectId::new("capacity-subject");
+    let mut callers = StaticCallerResolver::new();
+    callers
+        .bind(root_identity, root_subject())
+        .expect("root binding must be unique");
+    callers
+        .bind(extra_identity, extra_subject.clone())
+        .expect("extra binding must be unique");
+    let mut supervisor = Supervisor::new_with_limits(
+        CapabilityKernel::new(CapabilityState::new(IssuerId::new("session"))),
+        FakeResources::default(),
+        callers,
+        SupervisorLimits::new(1, 8),
+    )
+    .expect("positive limits must construct");
+    supervisor
+        .create_subject(Subject::new(root_subject(), root_envelope()), root_identity)
+        .expect("the single subject slot must be usable");
+    let before = supervisor.resources().events.clone();
+
+    assert!(matches!(
+        supervisor.create_subject(Subject::new(extra_subject, root_envelope()), extra_identity),
+        Err(SupervisorError::CapacityExceeded(
+            SupervisorCapacity::Subjects
+        ))
+    ));
+    assert_eq!(supervisor.issued_subject_count(), 1);
+    assert_eq!(supervisor.resources().events, before);
+}
+
+#[test]
+fn clean_rollback_consumes_subject_capacity_permanently() {
+    let first_identity = ConnectionIdentity::new(32, 132, 1000, 1000);
+    let second_identity = ConnectionIdentity::new(33, 133, 1000, 1000);
+    let first_subject = SubjectId::new("capacity-rollback-first");
+    let second_subject = SubjectId::new("capacity-rollback-second");
+    let mut callers = StaticCallerResolver::new();
+    callers
+        .bind(first_identity, first_subject.clone())
+        .expect("first binding must be unique");
+    callers
+        .bind(second_identity, second_subject.clone())
+        .expect("second binding must be unique");
+    let mut resources = FakeResources::default();
+    resources.fail_once("mount");
+    let mut supervisor = Supervisor::new_with_limits(
+        CapabilityKernel::new(CapabilityState::new(IssuerId::new("session"))),
+        resources,
+        callers,
+        SupervisorLimits::new(1, 8),
+    )
+    .expect("positive limits must construct");
+    supervisor
+        .create_subject(Subject::new(first_subject, root_envelope()), first_identity)
+        .expect_err("first setup must fail cleanly");
+    let before = supervisor.resources().events.clone();
+
+    assert!(matches!(
+        supervisor.create_subject(
+            Subject::new(second_subject, root_envelope()),
+            second_identity
+        ),
+        Err(SupervisorError::CapacityExceeded(
+            SupervisorCapacity::Subjects
+        ))
+    ));
+    assert_eq!(supervisor.issued_subject_count(), 1);
+    assert_eq!(supervisor.resources().events, before);
+}
+
+#[test]
+fn issued_handle_capacity_remains_exhausted_after_close_before_adapter_call() {
+    let identity = ConnectionIdentity::new(34, 134, 1000, 1000);
+    let mut callers = StaticCallerResolver::new();
+    callers
+        .bind(identity, root_subject())
+        .expect("caller binding must be unique");
+    let mut supervisor = Supervisor::new_with_limits(
+        CapabilityKernel::new(CapabilityState::new(IssuerId::new("session"))),
+        FakeResources::default(),
+        callers,
+        SupervisorLimits::new(1, 1),
+    )
+    .expect("positive limits must construct");
+    supervisor
+        .create_subject(Subject::new(root_subject(), root_envelope()), identity)
+        .expect("subject setup must succeed");
+    let first = HandleId::new("capacity-handle-first");
+    supervisor
+        .open_handle(&identity, first.clone(), ObjectId::new("object-1"))
+        .expect("the single handle slot must be usable");
+    supervisor
+        .close_handle(&identity, &first)
+        .expect("closing a handle must not release its identity reservation");
+    let before = supervisor.resources().events.clone();
+
+    assert!(matches!(
+        supervisor.open_handle(
+            &identity,
+            HandleId::new("capacity-handle-second"),
+            ObjectId::new("object-2"),
+        ),
+        Err(SupervisorError::CapacityExceeded(
+            SupervisorCapacity::IssuedHandles
+        ))
+    ));
+    assert_eq!(supervisor.issued_handle_count(), 1);
+    assert_eq!(supervisor.resources().events, before);
 }

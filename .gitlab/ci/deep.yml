@@ -1,0 +1,39 @@
+# The system-stage gates. Both need a host this project cannot rent from a
+# shared runner pool: one boots a real Firecracker microVM over /dev/kvm, the
+# other applies the isolation transaction as root and asks the kernel what it
+# enforces. Neither is allowed to report a skip as a pass, so both run on a
+# schedule or on demand rather than on every merge request, where a missing
+# device would either block every merge or teach everyone to ignore a failure.
+#
+# The runner tags are repository configuration; docs/ci-cd.md records what each
+# host must provide.
+
+.deep_rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "api"
+
+real_vm:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 45m
+  interruptible: false
+  tags:
+    - kvm
+  script:
+    - scripts/ci/verify-real-guest-control.sh
+
+privileged_isolation:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 20m
+  interruptible: false
+  tags:
+    - privileged
+  script:
+    - scripts/ci/run.sh privileged-isolation

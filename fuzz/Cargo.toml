@@ -1,0 +1,36 @@
+[package]
+name = "ai-agent-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+authority-core = { path = "../crates/authority-core" }
+egress-protocol = { path = "../crates/egress-protocol" }
+libfuzzer-sys = "=0.4.13"
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cbor_request_decode"
+path = "fuzz_targets/cbor_request_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canonical_path"
+path = "fuzz_targets/canonical_path.rs"
+test = false
+doc = false
+bench = false

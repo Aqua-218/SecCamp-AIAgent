@@ -1,0 +1,43 @@
+Subject: ACPI: do not install the PCI config default region handler without PCI
+
+`acpi_gbl_default_address_spaces` names PCI config space unconditionally, but
+`acpi_ev_install_space_handler` only compiles a case for it when
+`ACPI_PCI_CONFIGURED` is defined, which follows `CONFIG_PCI`. On a kernel built
+without PCI the loop therefore reaches the `default:` label, returns
+`AE_BAD_PARAMETER`, and the whole namespace load fails:
+
+    ACPI Error: AE_BAD_PARAMETER, During Region initialization
+    ACPI: Unable to load the System Description Tables
+
+Firecracker enumerates its virtio-mmio devices through ACPI and its published
+guest configuration disables PCI, so a stock upstream kernel built with that
+configuration cannot find its root device and panics. The condition is still
+present in 6.12 LTS.
+
+Keep the default space list and the handler switch in agreement.
+--- a/include/acpi/acconfig.h
++++ b/include/acpi/acconfig.h
+@@ -161,7 +161,11 @@
+ /* Maximum space_ids for Operation Regions */
+ 
+ #define ACPI_MAX_ADDRESS_SPACE          255
++#ifdef ACPI_PCI_CONFIGURED
+ #define ACPI_NUM_DEFAULT_SPACES         4
++#else
++#define ACPI_NUM_DEFAULT_SPACES         3
++#endif
+ 
+ /* Array sizes.  Used for range checking also */
+ 
+--- a/drivers/acpi/acpica/evhandler.c
++++ b/drivers/acpi/acpica/evhandler.c
+@@ -26,7 +26,9 @@
+ u8 acpi_gbl_default_address_spaces[ACPI_NUM_DEFAULT_SPACES] = {
+ 	ACPI_ADR_SPACE_SYSTEM_MEMORY,
+ 	ACPI_ADR_SPACE_SYSTEM_IO,
++#ifdef ACPI_PCI_CONFIGURED
+ 	ACPI_ADR_SPACE_PCI_CONFIG,
++#endif
+ 	ACPI_ADR_SPACE_DATA_TABLE
+ };
+ 

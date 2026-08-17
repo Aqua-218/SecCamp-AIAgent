@@ -3,5 +3,12 @@
 /.gitlab/ @Aqua-218
 /.gitlab-ci.yml @Aqua-218
 /scripts/ci/ @Aqua-218
+# The gate manifest decides which checks must pass. Without an owner on it, a
+# change could move a gate from `implemented` to `planned` and remove it from
+# both pipelines without anyone reviewing the removal.
+/ci/ @Aqua-218
+# The guest kernel configuration and patch decide what the VM boundary is made
+# of. A change here can remove Landlock or FUSE from every session.
+/guest/ @Aqua-218
 /deny.toml @Aqua-218
 /.semgrep.yml @Aqua-218

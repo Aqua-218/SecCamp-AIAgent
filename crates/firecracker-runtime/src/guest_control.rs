@@ -9,6 +9,8 @@ use std::{
     io::{self, Read, Write},
 };
 
+use authority_core::policy::{AuthorityPolicyDigest, ROOT_POLICY_ENCODING_VERSION};
+
 use crate::{IdentityBundle, IdentityId};
 
 /// Guest operation selected by the HTTP path exposed over Firecracker vsock.
@@ -16,17 +18,30 @@ use crate::{IdentityBundle, IdentityId};
 pub enum GuestControlAction {
     /// Store the identities while retaining the workload gate.
     InjectIdentity,
+    /// Store identities and bind the guest start to the authority policy digest.
+    InjectIdentityBound,
     /// Release the workload gate after an identity injection.
     StartWorkload,
+    /// Release the workload gate for a digest-bound identity injection.
+    StartWorkloadBound,
 }
 
 impl GuestControlAction {
+    /// Compatibility alias for callers that name the bound action by protocol version.
+    #[allow(non_upper_case_globals)]
+    pub const InjectIdentityV2: Self = Self::InjectIdentityBound;
+    /// Compatibility alias for callers that name the bound start by protocol version.
+    #[allow(non_upper_case_globals)]
+    pub const StartWorkloadV2: Self = Self::StartWorkloadBound;
+
     /// HTTP path used by the host runtime.
     #[must_use]
     pub const fn path(self) -> &'static str {
         match self {
             Self::InjectIdentity => "/actions/inject-identity",
+            Self::InjectIdentityBound => "/actions/inject-identity-v2",
             Self::StartWorkload => "/actions/start-workload",
+            Self::StartWorkloadBound => "/actions/start-workload-v2",
         }
     }
 
@@ -35,7 +50,9 @@ impl GuestControlAction {
     pub fn from_path(path: &str) -> Option<Self> {
         match path {
             "/actions/inject-identity" => Some(Self::InjectIdentity),
+            "/actions/inject-identity-v2" => Some(Self::InjectIdentityBound),
             "/actions/start-workload" => Some(Self::StartWorkload),
+            "/actions/start-workload-v2" => Some(Self::StartWorkloadBound),
             _ => None,
         }
     }
@@ -43,8 +60,20 @@ impl GuestControlAction {
     const fn acknowledgement(self) -> &'static str {
         match self {
             Self::InjectIdentity => "identity-injected",
+            Self::InjectIdentityBound => "identity-injected-v2",
             Self::StartWorkload => "workload-started",
+            Self::StartWorkloadBound => "workload-started-v2",
         }
+    }
+
+    /// Returns whether this action selects the explicit digest-bound v2 path.
+    #[must_use]
+    pub const fn is_bound(self) -> bool {
+        matches!(self, Self::InjectIdentityBound | Self::StartWorkloadBound)
+    }
+
+    const fn accepts_bound_request(self) -> bool {
+        matches!(self, Self::StartWorkload | Self::StartWorkloadBound)
     }
 }
 
@@ -53,6 +82,8 @@ impl GuestControlAction {
 pub struct GuestControlRequest {
     challenge: IdentityId,
     identities: IdentityBundle,
+    policy_digest: Option<AuthorityPolicyDigest>,
+    policy_encoding_version: Option<u16>,
 }
 
 impl GuestControlRequest {
@@ -74,7 +105,43 @@ impl GuestControlRequest {
         Ok(Self {
             challenge,
             identities,
+            policy_digest: None,
+            policy_encoding_version: None,
         })
+    }
+
+    /// Validates a request bound to the canonical authority policy encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GuestControlError::ChallengeReused`] when the challenge is part of the bundle.
+    pub fn new_bound(
+        challenge: IdentityId,
+        identities: IdentityBundle,
+        policy_digest: AuthorityPolicyDigest,
+    ) -> Result<Self, GuestControlError> {
+        if identities_match(challenge, &identities) {
+            return Err(GuestControlError::ChallengeReused);
+        }
+        Ok(Self {
+            challenge,
+            identities,
+            policy_digest: Some(policy_digest),
+            policy_encoding_version: Some(ROOT_POLICY_ENCODING_VERSION),
+        })
+    }
+
+    /// Alias for callers that name the wire generation rather than the security property.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GuestControlError::ChallengeReused`] when the challenge is part of the bundle.
+    pub fn new_v2(
+        challenge: IdentityId,
+        identities: IdentityBundle,
+        policy_digest: AuthorityPolicyDigest,
+    ) -> Result<Self, GuestControlError> {
+        Self::new_bound(challenge, identities, policy_digest)
     }
 
     /// Parses only the single canonical request spelling emitted by [`Self::canonical_body`].
@@ -86,6 +153,39 @@ impl GuestControlRequest {
         let fields = parse_fields(body)?;
         let request = Self::new(fields.challenge, fields.into_bundle()?)?;
         if body != request.canonical_body() {
+            return Err(GuestControlError::NonCanonicalBody);
+        }
+        Ok(request)
+    }
+
+    /// Parses only the canonical digest-bound v2 request spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns a parse, identity-validation, policy-version, or canonical-encoding error for
+    /// any other body.
+    pub fn parse_bound_canonical(body: &str) -> Result<Self, GuestControlError> {
+        let fields = parse_bound_fields(body)?;
+        if fields.policy_encoding_version != ROOT_POLICY_ENCODING_VERSION {
+            return Err(GuestControlError::UnsupportedPolicyEncodingVersion(
+                fields.policy_encoding_version,
+            ));
+        }
+        let BoundFields {
+            policy_encoding_version: _,
+            policy_digest,
+            challenge,
+            vm_id,
+            session_id,
+            request_id,
+            subject_id,
+            capability_id,
+        } = fields;
+        let identities =
+            IdentityBundle::new(vm_id, session_id, request_id, subject_id, capability_id)
+                .map_err(|error| GuestControlError::InvalidIdentity(error.to_string()))?;
+        let request = Self::new_bound(challenge, identities, policy_digest)?;
+        if body != request.canonical_bound_body() {
             return Err(GuestControlError::NonCanonicalBody);
         }
         Ok(request)
@@ -103,16 +203,91 @@ impl GuestControlRequest {
         &self.identities
     }
 
+    /// Returns the authority policy digest, when this is a bound v2 request.
+    #[must_use]
+    pub const fn policy_digest(&self) -> Option<AuthorityPolicyDigest> {
+        self.policy_digest
+    }
+
+    /// Returns the canonical policy encoding version, when this is a bound v2 request.
+    #[must_use]
+    pub const fn policy_encoding_version(&self) -> Option<u16> {
+        self.policy_encoding_version
+    }
+
+    /// Returns whether this request uses the digest-bound v2 wire shape.
+    #[must_use]
+    pub const fn is_bound(&self) -> bool {
+        self.policy_digest.is_some() && self.policy_encoding_version.is_some()
+    }
+
+    fn same_identity_binding(&self, other: &Self) -> bool {
+        self.challenge == other.challenge && self.identities == other.identities
+    }
+
     /// Stable JSON encoding sent over the vsock endpoint.
     #[must_use]
     pub fn canonical_body(&self) -> String {
         encode_request(self.challenge, &self.identities)
     }
 
+    /// Stable JSON encoding for a digest-bound v2 request.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called for a legacy v1 request without a policy digest.
+    #[must_use]
+    pub fn canonical_bound_body(&self) -> String {
+        let digest = self
+            .policy_digest
+            .expect("canonical_bound_body requires a bound request");
+        let version = self
+            .policy_encoding_version
+            .expect("canonical_bound_body requires a policy encoding version");
+        encode_bound_request(version, digest, self.challenge, &self.identities)
+    }
+
+    /// Alias for the v2 spelling used by callers that expose protocol versions.
+    #[must_use]
+    pub fn canonical_v2_body(&self) -> String {
+        self.canonical_bound_body()
+    }
+
     /// Stable acknowledgement encoding expected from the guest.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a bound action is requested for a legacy v1 request, or when a bound request
+    /// has no policy encoding metadata.
     #[must_use]
     pub fn canonical_acknowledgement(&self, action: GuestControlAction) -> String {
-        encode_acknowledgement(action.acknowledgement(), self.challenge, &self.identities)
+        if action.is_bound() || self.is_bound() {
+            let digest = self
+                .policy_digest
+                .expect("bound acknowledgement requires a bound request");
+            let version = self
+                .policy_encoding_version
+                .expect("bound acknowledgement requires a policy encoding version");
+            encode_bound_acknowledgement(
+                action.acknowledgement(),
+                version,
+                digest,
+                self.challenge,
+                &self.identities,
+            )
+        } else {
+            encode_acknowledgement(action.acknowledgement(), self.challenge, &self.identities)
+        }
+    }
+
+    /// Returns the canonical v2 acknowledgement for a digest-bound action.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called for a legacy v1 request.
+    #[must_use]
+    pub fn canonical_bound_acknowledgement(&self, action: GuestControlAction) -> String {
+        self.canonical_acknowledgement(action)
     }
 }
 
@@ -145,8 +320,12 @@ pub enum GuestControlOutcome {
 impl From<GuestControlAction> for GuestControlOutcome {
     fn from(action: GuestControlAction) -> Self {
         match action {
-            GuestControlAction::InjectIdentity => Self::IdentityInjected,
-            GuestControlAction::StartWorkload => Self::WorkloadStarted,
+            GuestControlAction::InjectIdentity | GuestControlAction::InjectIdentityBound => {
+                Self::IdentityInjected
+            }
+            GuestControlAction::StartWorkload | GuestControlAction::StartWorkloadBound => {
+                Self::WorkloadStarted
+            }
         }
     }
 }
@@ -216,7 +395,18 @@ impl GuestControlServer {
         let Ok(body) = std::str::from_utf8(body) else {
             return response(400, String::new(), None);
         };
-        let Ok(request) = GuestControlRequest::parse_canonical(body) else {
+        let parsed = match action {
+            GuestControlAction::InjectIdentityBound | GuestControlAction::StartWorkloadBound => {
+                GuestControlRequest::parse_bound_canonical(body)
+            }
+            GuestControlAction::StartWorkload if body.starts_with("{\"version\":") => {
+                GuestControlRequest::parse_bound_canonical(body)
+            }
+            GuestControlAction::InjectIdentity | GuestControlAction::StartWorkload => {
+                GuestControlRequest::parse_canonical(body)
+            }
+        };
+        let Ok(request) = parsed else {
             return response(400, String::new(), None);
         };
         match self.state.apply(action, request) {
@@ -228,8 +418,12 @@ impl GuestControlServer {
                 GuestControlError::MalformedBody
                 | GuestControlError::NonCanonicalBody
                 | GuestControlError::InvalidIdentity(_)
-                | GuestControlError::ChallengeReused,
+                | GuestControlError::InvalidPolicyDigest(_)
+                | GuestControlError::UnsupportedPolicyEncodingVersion(_)
+                | GuestControlError::ChallengeReused
+                | GuestControlError::VersionMismatch,
             ) => response(400, String::new(), None),
+            Err(GuestControlError::PolicyDigestMismatch) => response(409, String::new(), None),
         }
     }
 
@@ -465,36 +659,64 @@ impl GuestControlState {
         action: GuestControlAction,
         request: GuestControlRequest,
     ) -> Result<String, GuestControlError> {
+        if action.is_bound() != request.is_bound() && !action.accepts_bound_request() {
+            return Err(GuestControlError::VersionMismatch);
+        }
+        if let Self::IdentityInjected(existing) | Self::WorkloadStarted(existing) = self
+            && existing.is_bound() != request.is_bound()
+        {
+            return Err(GuestControlError::VersionMismatch);
+        }
         match action {
-            GuestControlAction::InjectIdentity => match self {
-                Self::AwaitingIdentity => {
-                    let acknowledgement = request.canonical_acknowledgement(action);
-                    *self = Self::IdentityInjected(request);
-                    Ok(acknowledgement)
+            GuestControlAction::InjectIdentity | GuestControlAction::InjectIdentityBound => {
+                match self {
+                    Self::AwaitingIdentity => {
+                        let acknowledgement = request.canonical_acknowledgement(action);
+                        *self = Self::IdentityInjected(request);
+                        Ok(acknowledgement)
+                    }
+                    Self::IdentityInjected(existing) | Self::WorkloadStarted(existing)
+                        if existing == &request =>
+                    {
+                        Ok(request.canonical_acknowledgement(action))
+                    }
+                    Self::IdentityInjected(existing) | Self::WorkloadStarted(existing) => {
+                        if existing.same_identity_binding(&request)
+                            && existing.is_bound()
+                            && request.is_bound()
+                            && existing.policy_digest != request.policy_digest
+                        {
+                            Err(GuestControlError::PolicyDigestMismatch)
+                        } else {
+                            Err(GuestControlError::IdentityMismatch)
+                        }
+                    }
                 }
-                Self::IdentityInjected(existing) | Self::WorkloadStarted(existing)
-                    if existing == &request =>
-                {
-                    Ok(request.canonical_acknowledgement(action))
+            }
+            GuestControlAction::StartWorkload | GuestControlAction::StartWorkloadBound => {
+                match self {
+                    Self::AwaitingIdentity => Err(GuestControlError::IdentityNotInjected),
+                    Self::IdentityInjected(existing) if existing == &request => {
+                        let acknowledgement = request.canonical_acknowledgement(action);
+                        *self = Self::WorkloadStarted(request);
+                        Ok(acknowledgement)
+                    }
+                    Self::WorkloadStarted(existing) if existing == &request => {
+                        Ok(request.canonical_acknowledgement(action))
+                    }
+                    Self::IdentityInjected(existing) | Self::WorkloadStarted(existing) => {
+                        if existing.same_identity_binding(&request)
+                            && existing.is_bound()
+                            && request.is_bound()
+                            && existing.policy_digest != request.policy_digest
+                        {
+                            Err(GuestControlError::PolicyDigestMismatch)
+                        } else {
+                            Err(GuestControlError::IdentityMismatch)
+                        }
+                    }
                 }
-                Self::IdentityInjected(_) | Self::WorkloadStarted(_) => {
-                    Err(GuestControlError::IdentityMismatch)
-                }
-            },
-            GuestControlAction::StartWorkload => match self {
-                Self::AwaitingIdentity => Err(GuestControlError::IdentityNotInjected),
-                Self::IdentityInjected(existing) if existing == &request => {
-                    let acknowledgement = request.canonical_acknowledgement(action);
-                    *self = Self::WorkloadStarted(request);
-                    Ok(acknowledgement)
-                }
-                Self::WorkloadStarted(existing) if existing == &request => {
-                    Ok(request.canonical_acknowledgement(action))
-                }
-                Self::IdentityInjected(_) | Self::WorkloadStarted(_) => {
-                    Err(GuestControlError::IdentityMismatch)
-                }
-            },
+            }
         }
     }
 }
@@ -514,6 +736,14 @@ pub enum GuestControlError {
     IdentityNotInjected,
     /// A request tried to replace the injected identity bundle.
     IdentityMismatch,
+    /// A v1 request was sent to a v2 endpoint, or vice versa.
+    VersionMismatch,
+    /// A policy digest was malformed in a v2 request.
+    InvalidPolicyDigest(String),
+    /// The v2 request used an unknown policy encoding version.
+    UnsupportedPolicyEncodingVersion(u16),
+    /// A bound request used a different policy than the accepted bundle.
+    PolicyDigestMismatch,
 }
 
 impl Display for GuestControlError {
@@ -536,6 +766,25 @@ impl Display for GuestControlError {
                     "guest-control identities do not match the accepted bundle"
                 )
             }
+            Self::VersionMismatch => {
+                write!(
+                    formatter,
+                    "guest-control v1 and v2 requests cannot be mixed"
+                )
+            }
+            Self::InvalidPolicyDigest(message) => {
+                write!(formatter, "invalid guest-control policy digest: {message}")
+            }
+            Self::UnsupportedPolicyEncodingVersion(version) => write!(
+                formatter,
+                "unsupported guest-control policy encoding version: {version}"
+            ),
+            Self::PolicyDigestMismatch => {
+                write!(
+                    formatter,
+                    "guest-control policy digest does not match the accepted bundle"
+                )
+            }
         }
     }
 }
@@ -543,6 +792,17 @@ impl Display for GuestControlError {
 impl std::error::Error for GuestControlError {}
 
 struct Fields {
+    challenge: IdentityId,
+    vm_id: IdentityId,
+    session_id: IdentityId,
+    request_id: IdentityId,
+    subject_id: IdentityId,
+    capability_id: IdentityId,
+}
+
+struct BoundFields {
+    policy_encoding_version: u16,
+    policy_digest: AuthorityPolicyDigest,
     challenge: IdentityId,
     vm_id: IdentityId,
     session_id: IdentityId,
@@ -587,6 +847,57 @@ fn parse_fields(body: &str) -> Result<Fields, GuestControlError> {
     })
 }
 
+fn parse_bound_fields(body: &str) -> Result<BoundFields, GuestControlError> {
+    let rest = body
+        .strip_prefix("{\"version\":")
+        .ok_or(GuestControlError::MalformedBody)?;
+    let Some((version, rest)) = rest.split_once(",\"policy_digest\":\"") else {
+        return Err(GuestControlError::MalformedBody);
+    };
+    if version.is_empty() || !version.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(GuestControlError::MalformedBody);
+    }
+    let policy_encoding_version = version
+        .parse::<u16>()
+        .map_err(|_| GuestControlError::MalformedBody)?;
+    let (policy_digest, rest) = take_policy_digest(rest, "\",\"challenge\":\"")?;
+    let (challenge, rest) = take_identity(rest, "\",\"vm_id\":\"")?;
+    let (vm_id, rest) = take_identity(rest, "\",\"session_id\":\"")?;
+    let (session_id, rest) = take_identity(rest, "\",\"request_id\":\"")?;
+    let (request_id, rest) = take_identity(rest, "\",\"subject_id\":\"")?;
+    let (subject_id, rest) = take_identity(rest, "\",\"capability_id\":\"")?;
+    let (capability_id, rest) = take_identity(rest, "\"}")?;
+    if !rest.is_empty() {
+        return Err(GuestControlError::MalformedBody);
+    }
+    Ok(BoundFields {
+        policy_encoding_version,
+        policy_digest,
+        challenge,
+        vm_id,
+        session_id,
+        request_id,
+        subject_id,
+        capability_id,
+    })
+}
+
+fn take_policy_digest<'a>(
+    value: &'a str,
+    suffix: &str,
+) -> Result<(AuthorityPolicyDigest, &'a str), GuestControlError> {
+    let Some(hex) = value.get(..64) else {
+        return Err(GuestControlError::MalformedBody);
+    };
+    let rest = value.get(64..).ok_or(GuestControlError::MalformedBody)?;
+    let rest = rest
+        .strip_prefix(suffix)
+        .ok_or(GuestControlError::MalformedBody)?;
+    let digest = AuthorityPolicyDigest::from_hex(hex)
+        .map_err(|error| GuestControlError::InvalidPolicyDigest(error.to_string()))?;
+    Ok((digest, rest))
+}
+
 fn take_identity<'a>(
     value: &'a str,
     suffix: &str,
@@ -626,6 +937,24 @@ fn encode_request(challenge: IdentityId, identities: &IdentityBundle) -> String 
     )
 }
 
+fn encode_bound_request(
+    policy_encoding_version: u16,
+    policy_digest: AuthorityPolicyDigest,
+    challenge: IdentityId,
+    identities: &IdentityBundle,
+) -> String {
+    format!(
+        "{{\"version\":{policy_encoding_version},\"policy_digest\":\"{}\",\"challenge\":\"{}\",\"vm_id\":\"{}\",\"session_id\":\"{}\",\"request_id\":\"{}\",\"subject_id\":\"{}\",\"capability_id\":\"{}\"}}",
+        policy_digest,
+        challenge.to_hex(),
+        identities.vm_id.to_hex(),
+        identities.session_id.to_hex(),
+        identities.request_id.to_hex(),
+        identities.subject_id.to_hex(),
+        identities.capability_id.to_hex(),
+    )
+}
+
 fn encode_acknowledgement(
     acknowledgement: &str,
     challenge: IdentityId,
@@ -634,6 +963,25 @@ fn encode_acknowledgement(
     format!(
         "{{\"ack\":\"{}\",\"challenge\":\"{}\",\"vm_id\":\"{}\",\"session_id\":\"{}\",\"request_id\":\"{}\",\"subject_id\":\"{}\",\"capability_id\":\"{}\"}}",
         acknowledgement,
+        challenge.to_hex(),
+        identities.vm_id.to_hex(),
+        identities.session_id.to_hex(),
+        identities.request_id.to_hex(),
+        identities.subject_id.to_hex(),
+        identities.capability_id.to_hex(),
+    )
+}
+
+fn encode_bound_acknowledgement(
+    acknowledgement: &str,
+    policy_encoding_version: u16,
+    policy_digest: AuthorityPolicyDigest,
+    challenge: IdentityId,
+    identities: &IdentityBundle,
+) -> String {
+    format!(
+        "{{\"ack\":\"{acknowledgement}\",\"version\":{policy_encoding_version},\"policy_digest\":\"{}\",\"challenge\":\"{}\",\"vm_id\":\"{}\",\"session_id\":\"{}\",\"request_id\":\"{}\",\"subject_id\":\"{}\",\"capability_id\":\"{}\"}}",
+        policy_digest,
         challenge.to_hex(),
         identities.vm_id.to_hex(),
         identities.session_id.to_hex(),
@@ -669,6 +1017,32 @@ mod tests {
         .expect("independent test challenge")
     }
 
+    fn policy_digest(seed: u8) -> AuthorityPolicyDigest {
+        AuthorityPolicyDigest::from_hex(&format!("{seed:02x}").repeat(32))
+            .expect("test digest must be canonical")
+    }
+
+    fn bound_request(seed: u8, digest_seed: u8) -> GuestControlRequest {
+        let identity = |offset| {
+            let mut value = [0_u8; 16];
+            value[15] = seed.wrapping_add(offset);
+            IdentityId(value)
+        };
+        GuestControlRequest::new_bound(
+            identity(1),
+            IdentityBundle::new(
+                identity(2),
+                identity(3),
+                identity(4),
+                identity(5),
+                identity(6),
+            )
+            .expect("distinct test identities"),
+            policy_digest(digest_seed),
+        )
+        .expect("independent test challenge")
+    }
+
     #[test]
     fn canonical_body_round_trips_and_rejects_noncanonical_spelling() {
         let request = request(170);
@@ -687,6 +1061,30 @@ mod tests {
             GuestControlRequest::parse_canonical("{}"),
             Err(GuestControlError::MalformedBody)
         );
+    }
+
+    #[test]
+    fn bound_v2_body_round_trips_and_never_parses_as_v1() {
+        let bound = bound_request(171, 7);
+        let body = bound.canonical_bound_body();
+        assert_eq!(
+            GuestControlRequest::parse_bound_canonical(&body),
+            Ok(bound.clone())
+        );
+        assert!(matches!(
+            GuestControlRequest::parse_canonical(&body),
+            Err(GuestControlError::MalformedBody)
+        ));
+        assert!(matches!(
+            GuestControlRequest::parse_bound_canonical(&request(172).canonical_body()),
+            Err(GuestControlError::MalformedBody)
+        ));
+
+        let noncanonical = body.replacen("\"version\":1", "\"version\":01", 1);
+        assert!(matches!(
+            GuestControlRequest::parse_bound_canonical(&noncanonical),
+            Err(GuestControlError::NonCanonicalBody)
+        ));
     }
 
     #[test]
@@ -717,6 +1115,38 @@ mod tests {
         assert_eq!(
             state.apply(GuestControlAction::StartWorkload, request.clone()),
             Ok(request.canonical_acknowledgement(GuestControlAction::StartWorkload))
+        );
+    }
+
+    #[test]
+    fn bound_gate_rejects_v1_mixing_digest_changes_and_accepts_exact_retries() {
+        let first = bound_request(41, 9);
+        let changed_digest = bound_request(41, 10);
+        let legacy = request(41);
+        let mut state = GuestControlState::default();
+        assert_eq!(
+            state.apply(GuestControlAction::InjectIdentity, first.clone()),
+            Err(GuestControlError::VersionMismatch)
+        );
+        assert_eq!(
+            state.apply(GuestControlAction::InjectIdentityBound, first.clone()),
+            Ok(first.canonical_bound_acknowledgement(GuestControlAction::InjectIdentityBound))
+        );
+        assert_eq!(
+            state.apply(GuestControlAction::InjectIdentityBound, first.clone()),
+            Ok(first.canonical_bound_acknowledgement(GuestControlAction::InjectIdentityBound))
+        );
+        assert_eq!(
+            state.apply(GuestControlAction::StartWorkload, legacy),
+            Err(GuestControlError::VersionMismatch)
+        );
+        assert_eq!(
+            state.apply(GuestControlAction::StartWorkloadBound, changed_digest),
+            Err(GuestControlError::PolicyDigestMismatch)
+        );
+        assert_eq!(
+            state.apply(GuestControlAction::StartWorkloadBound, first.clone(),),
+            Ok(first.canonical_bound_acknowledgement(GuestControlAction::StartWorkloadBound))
         );
     }
 
@@ -782,6 +1212,43 @@ mod tests {
         assert_eq!(
             started.outcome(),
             Some(GuestControlOutcome::WorkloadStarted)
+        );
+    }
+
+    #[test]
+    fn server_requires_the_matching_v2_path_and_acknowledges_the_exact_digest() {
+        let request = bound_request(71, 12);
+        let body = request.canonical_bound_body();
+        let mut server = GuestControlServer::new();
+        assert_eq!(
+            server
+                .handle(
+                    "PUT",
+                    GuestControlAction::InjectIdentity.path(),
+                    body.as_bytes(),
+                )
+                .status(),
+            400
+        );
+        let injected = server.handle(
+            "PUT",
+            GuestControlAction::InjectIdentityBound.path(),
+            body.as_bytes(),
+        );
+        assert_eq!(injected.status(), 200);
+        assert_eq!(
+            injected.body(),
+            request.canonical_bound_acknowledgement(GuestControlAction::InjectIdentityBound)
+        );
+        let started = server.handle(
+            "PUT",
+            GuestControlAction::StartWorkload.path(),
+            body.as_bytes(),
+        );
+        assert_eq!(started.status(), 200);
+        assert_eq!(
+            started.body(),
+            request.canonical_bound_acknowledgement(GuestControlAction::StartWorkload)
         );
     }
 

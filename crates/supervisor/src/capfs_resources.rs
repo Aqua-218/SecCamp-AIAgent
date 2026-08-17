@@ -37,9 +37,9 @@ use rustix::{
 };
 
 use crate::{
-    AuthorityKernel, CallerResolver, CgroupHandle, ControlFdHandle, MountHandle,
-    ResourceAcquisition, ResourceMutation, RuntimeResources, Supervisor, SupervisorError,
-    WorkloadHandle,
+    AuthorityKernel, AuthorityStartupSnapshot, CallerResolver, CgroupHandle, ControlFdHandle,
+    MountHandle, ResourceAcquisition, ResourceMutation, RuntimeResources, Supervisor,
+    SupervisorError, WorkloadHandle,
 };
 
 /// Host operations that surround, but do not implement, a `CapFS` mount.
@@ -1274,6 +1274,23 @@ impl<B> CapfsRuntimeManager<B> {
     {
         Supervisor::new(self.kernel, self.resources, callers)
     }
+
+    /// Consumes the builder with explicit permanent supervisor registry bounds.
+    ///
+    /// The ordinary [`Self::into_supervisor`] path keeps the safe default bounds for wire and
+    /// guest-runtime compatibility. Deployments that size one session differently must still
+    /// choose positive bounds explicitly; identities are never evicted after cleanup.
+    pub fn into_supervisor_with_limits<C>(
+        self,
+        callers: C,
+        limits: crate::SupervisorLimits,
+    ) -> Result<CapfsSupervisor<B, C>, CapfsSupervisorError<B, C>>
+    where
+        B: CapfsHostResources,
+        C: CallerResolver,
+    {
+        Supervisor::new_with_limits(self.kernel, self.resources, callers, limits)
+    }
 }
 
 fn validate_plans(
@@ -1438,6 +1455,20 @@ impl AuthorityKernel for Arc<CapabilityKernel> {
 
     fn open_handle(&self, handle: &HandleId) -> Result<Option<OpenHandle>, Self::Error> {
         CapabilityKernel::open_handle(self.as_ref(), handle)
+    }
+
+    fn startup_snapshot(
+        &self,
+        subject: &SubjectId,
+    ) -> Result<Option<AuthorityStartupSnapshot>, Self::Error> {
+        Ok(Some(AuthorityStartupSnapshot {
+            status: CapabilityKernel::subject_status(self.as_ref(), subject)?.ok_or_else(|| {
+                authority_core::kernel::CapabilityKernelError::StateTransition(
+                    authority_core::state::CapabilityStateError::UnknownSubject(subject.clone()),
+                )
+            })?,
+            authorization_epoch: CapabilityKernel::authorization_epoch(self.as_ref())?,
+        }))
     }
 }
 

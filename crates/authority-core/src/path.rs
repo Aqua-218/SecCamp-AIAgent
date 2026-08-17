@@ -2,6 +2,14 @@
 
 use std::{error::Error, fmt};
 
+/// Maximum encoded UTF-8 bytes in one canonical repository-relative path.
+///
+/// Separators between segments count toward this limit. The repository root
+/// therefore has an encoded length of zero.
+pub const MAX_CANONICAL_PATH_BYTES: usize = 4096;
+/// Maximum number of segments in one canonical repository-relative path.
+pub const MAX_CANONICAL_PATH_SEGMENTS: usize = 64;
+
 /// A repository-relative path represented as validated segments.
 ///
 /// The empty path denotes the repository root. Non-empty paths can only be
@@ -25,23 +33,45 @@ impl CanonicalPath {
     /// # Errors
     ///
     /// Returns [`InvalidPathSegment`] for the first segment that is empty,
-    /// equals `.` or `..`, or contains `/`, NUL, or `*`.
+    /// equals `.` or `..`, or contains `/`, NUL, or `*`. It also rejects paths
+    /// over `MAX_CANONICAL_PATH_BYTES` encoded bytes or
+    /// `MAX_CANONICAL_PATH_SEGMENTS` segments.
     pub fn new<I, S>(segments: I) -> Result<Self, InvalidPathSegment>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let segments = segments
-            .into_iter()
-            .enumerate()
-            .map(|(index, segment)| {
-                let segment = segment.as_ref();
-                validate_segment(index, segment)?;
-                Ok(segment.to_owned())
-            })
-            .collect::<Result<Vec<_>, InvalidPathSegment>>()?;
+        let mut canonical = Vec::new();
+        let mut encoded_bytes = 0_usize;
+        for (index, segment) in segments.into_iter().enumerate() {
+            let segment = segment.as_ref();
+            validate_segment(index, segment)?;
+            if index >= MAX_CANONICAL_PATH_SEGMENTS {
+                return Err(InvalidPathSegment {
+                    index,
+                    reason: InvalidPathSegmentReason::TooManySegments,
+                });
+            }
+            let separator_bytes = usize::from(index != 0);
+            encoded_bytes = encoded_bytes
+                .checked_add(separator_bytes)
+                .and_then(|length| length.checked_add(segment.len()))
+                .ok_or(InvalidPathSegment {
+                    index,
+                    reason: InvalidPathSegmentReason::EncodedPathTooLong,
+                })?;
+            if encoded_bytes > MAX_CANONICAL_PATH_BYTES {
+                return Err(InvalidPathSegment {
+                    index,
+                    reason: InvalidPathSegmentReason::EncodedPathTooLong,
+                });
+            }
+            canonical.push(segment.to_owned());
+        }
 
-        Ok(Self { segments })
+        Ok(Self {
+            segments: canonical,
+        })
     }
 
     /// Returns the validated path segments in order.
@@ -70,9 +100,32 @@ impl CanonicalPath {
     /// # Errors
     ///
     /// Returns [`InvalidPathSegment`] when `child` is empty, equals `.` or
-    /// `..`, or contains `/`, NUL, or `*`.
+    /// `..`, or contains `/`, NUL, or `*`, or when appending it would exceed
+    /// either canonical path limit.
     pub fn child(&self, child: &str) -> Result<Self, InvalidPathSegment> {
-        validate_segment(self.segments.len(), child)?;
+        let index = self.segments.len();
+        validate_segment(index, child)?;
+        if index >= MAX_CANONICAL_PATH_SEGMENTS {
+            return Err(InvalidPathSegment {
+                index,
+                reason: InvalidPathSegmentReason::TooManySegments,
+            });
+        }
+        let separator_bytes = usize::from(index != 0);
+        let encoded_bytes = self
+            .encoded_len()
+            .checked_add(separator_bytes)
+            .and_then(|length| length.checked_add(child.len()))
+            .ok_or(InvalidPathSegment {
+                index,
+                reason: InvalidPathSegmentReason::EncodedPathTooLong,
+            })?;
+        if encoded_bytes > MAX_CANONICAL_PATH_BYTES {
+            return Err(InvalidPathSegment {
+                index,
+                reason: InvalidPathSegmentReason::EncodedPathTooLong,
+            });
+        }
         let mut segments = Vec::with_capacity(self.segments.len() + 1);
         segments.extend(self.segments.iter().cloned());
         segments.push(child.to_owned());
@@ -91,10 +144,27 @@ impl CanonicalPath {
     #[must_use]
     pub fn rebase(&self, source: &Self, destination: &Self) -> Option<Self> {
         let suffix = self.segments.strip_prefix(source.segments.as_slice())?;
+        if destination.segments.len() + suffix.len() > MAX_CANONICAL_PATH_SEGMENTS {
+            return None;
+        }
+        let suffix_bytes =
+            suffix.iter().map(String::len).sum::<usize>() + suffix.len().saturating_sub(1);
+        let separator_bytes = usize::from(!suffix.is_empty() && !destination.segments.is_empty());
+        let encoded_bytes = destination
+            .encoded_len()
+            .checked_add(separator_bytes)?
+            .checked_add(suffix_bytes)?;
+        if encoded_bytes > MAX_CANONICAL_PATH_BYTES {
+            return None;
+        }
         let mut segments = Vec::with_capacity(destination.segments.len() + suffix.len());
         segments.extend(destination.segments.iter().cloned());
         segments.extend(suffix.iter().cloned());
         Some(Self { segments })
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.segments.iter().map(String::len).sum::<usize>() + self.segments.len().saturating_sub(1)
     }
 }
 
@@ -157,6 +227,10 @@ pub enum InvalidPathSegmentReason {
     ContainsNul,
     /// The segment contains `*`.
     ContainsWildcard,
+    /// The path would contain more than `MAX_CANONICAL_PATH_SEGMENTS` segments.
+    TooManySegments,
+    /// The encoded path would exceed `MAX_CANONICAL_PATH_BYTES` bytes.
+    EncodedPathTooLong,
 }
 
 impl fmt::Display for InvalidPathSegmentReason {
@@ -168,6 +242,8 @@ impl fmt::Display for InvalidPathSegmentReason {
             Self::ContainsSeparator => "must not contain `/`",
             Self::ContainsNul => "must not contain NUL",
             Self::ContainsWildcard => "must not contain `*`",
+            Self::TooManySegments => "the canonical path must not exceed 64 segments",
+            Self::EncodedPathTooLong => "the canonical path must not exceed 4096 encoded bytes",
         };
         formatter.write_str(expectation)
     }
@@ -228,7 +304,10 @@ fn validate_segment(index: usize, segment: &str) -> Result<(), InvalidPathSegmen
 
 #[cfg(test)]
 mod tests {
-    use super::{CanonicalPath, InvalidPathSegmentReason, PathPattern, path_below, path_matches};
+    use super::{
+        CanonicalPath, InvalidPathSegmentReason, MAX_CANONICAL_PATH_BYTES,
+        MAX_CANONICAL_PATH_SEGMENTS, PathPattern, path_below, path_matches,
+    };
 
     fn path(segments: &[&str]) -> CanonicalPath {
         CanonicalPath::new(segments).expect("test paths must contain valid segments")
@@ -250,6 +329,75 @@ mod tests {
 
         assert_eq!(from_empty_segments, CanonicalPath::root());
         assert!(from_empty_segments.is_root());
+    }
+
+    #[test]
+    fn canonical_path_accepts_exact_byte_and_segment_boundaries() {
+        let max_segment = "a".repeat(MAX_CANONICAL_PATH_BYTES);
+        let at_byte_limit = CanonicalPath::new([max_segment.as_str()])
+            .expect("a path at the encoded byte limit must be accepted");
+        assert_eq!(
+            at_byte_limit.as_segments()[0].len(),
+            MAX_CANONICAL_PATH_BYTES
+        );
+
+        let at_segment_limit = CanonicalPath::new(vec!["x"; MAX_CANONICAL_PATH_SEGMENTS])
+            .expect("a path at the segment limit must be accepted");
+        assert_eq!(
+            at_segment_limit.as_segments().len(),
+            MAX_CANONICAL_PATH_SEGMENTS
+        );
+    }
+
+    #[test]
+    fn canonical_path_rejects_overlong_and_overdeep_inputs() {
+        let overlong = format!("{}a", "a".repeat(MAX_CANONICAL_PATH_BYTES));
+        let byte_error = CanonicalPath::new([overlong.as_str()])
+            .expect_err("a path over the encoded byte limit must be rejected");
+        assert_eq!(byte_error.index(), 0);
+        assert_eq!(
+            byte_error.reason(),
+            InvalidPathSegmentReason::EncodedPathTooLong
+        );
+
+        let too_deep = CanonicalPath::new(vec!["x"; MAX_CANONICAL_PATH_SEGMENTS + 1])
+            .expect_err("a path over the segment limit must be rejected");
+        assert_eq!(too_deep.index(), MAX_CANONICAL_PATH_SEGMENTS);
+        assert_eq!(too_deep.reason(), InvalidPathSegmentReason::TooManySegments);
+    }
+
+    #[test]
+    fn canonical_path_child_and_rebase_preserve_resource_limits() {
+        let max_segment = "a".repeat(MAX_CANONICAL_PATH_BYTES);
+        let root_child = CanonicalPath::root()
+            .child(&max_segment)
+            .expect("a child at the encoded byte limit must be accepted");
+        assert_eq!(
+            root_child
+                .child("x")
+                .expect_err("the child would exceed the byte limit")
+                .reason(),
+            InvalidPathSegmentReason::EncodedPathTooLong
+        );
+
+        let at_segment_limit = CanonicalPath::new(vec!["x"; MAX_CANONICAL_PATH_SEGMENTS])
+            .expect("the test path must be valid");
+        assert_eq!(
+            at_segment_limit
+                .child("x")
+                .expect_err("the child would exceed the segment limit")
+                .reason(),
+            InvalidPathSegmentReason::TooManySegments
+        );
+
+        let source = path(&["source"]);
+        let descendant = source.child("leaf").expect("the descendant must be valid");
+        let destination =
+            CanonicalPath::new([max_segment.as_str()]).expect("the destination must be valid");
+        assert!(
+            descendant.rebase(&source, &destination).is_none(),
+            "rebasing must not construct an overlong path"
+        );
     }
 
     #[test]

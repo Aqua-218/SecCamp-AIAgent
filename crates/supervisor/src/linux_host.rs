@@ -39,11 +39,13 @@ use authority_core::{capability::SubjectId, handle::HandleId};
 /// How long a stopped workload is given to leave its cgroup before stop reports failure.
 const WORKLOAD_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKLOAD_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const WORKLOAD_START_TIMEOUT: Duration = Duration::from_secs(10);
+const WORKLOAD_START_TIMEOUT: Duration = Duration::from_secs(30);
 const ISOLATED_WORKLOAD_CGROUP: &str = "workload";
 const START_GATE_READY: &[u8; 5] = b"ready";
 const START_GATE_RELEASE: [u8; 1] = [1];
 const START_GATE_ISOLATED: &[u8; 8] = b"isolated";
+const START_GATE_ERROR_PREFIX: &[u8; 28] = b"workload-isolation-error/v1:";
+const MAX_START_GATE_ERROR_BYTES: usize = 768;
 
 /// Environment variable carrying the subject's `CapFS` mount point to its workload.
 pub const WORKLOAD_MOUNTPOINT_ENV: &str = "CAPFS_MOUNTPOINT";
@@ -504,12 +506,51 @@ impl WorkloadStartGate {
         self.supervisor
             .read_exact(&mut isolated)
             .map_err(|source| io_error("reading executed workload startup attestation", source))?;
-        if isolated != *START_GATE_ISOLATED {
-            return Err(LinuxHostError::StartGate(
-                "launcher sent an invalid executed-workload attestation".to_owned(),
-            ));
+        if isolated == *START_GATE_ISOLATED {
+            return Ok(());
         }
-        Ok(())
+        if isolated == START_GATE_ERROR_PREFIX[..isolated.len()] {
+            let maximum =
+                START_GATE_ERROR_PREFIX.len() - isolated.len() + MAX_START_GATE_ERROR_BYTES + 1;
+            let mut payload = Vec::with_capacity(maximum);
+            loop {
+                if payload.len() == maximum {
+                    return Err(LinuxHostError::StartGate(
+                        "launcher isolation-failure record exceeds its fixed bound".to_owned(),
+                    ));
+                }
+                let mut byte = [0_u8; 1];
+                self.supervisor
+                    .read_exact(&mut byte)
+                    .map_err(|source| io_error("reading workload isolation failure", source))?;
+                if byte[0] == b'\n' {
+                    break;
+                }
+                payload.push(byte[0]);
+            }
+            let remaining_prefix = &START_GATE_ERROR_PREFIX[isolated.len()..];
+            if !payload.starts_with(remaining_prefix) {
+                return Err(LinuxHostError::StartGate(
+                    "launcher sent a malformed isolation-failure record".to_owned(),
+                ));
+            }
+            let diagnostic = payload[remaining_prefix.len()..]
+                .iter()
+                .map(|byte| {
+                    if byte.is_ascii_graphic() || *byte == b' ' {
+                        char::from(*byte)
+                    } else {
+                        '?'
+                    }
+                })
+                .collect::<String>();
+            return Err(LinuxHostError::StartGate(format!(
+                "workload isolation failed before execution: {diagnostic}"
+            )));
+        }
+        Err(LinuxHostError::StartGate(
+            "launcher sent an invalid executed-workload attestation".to_owned(),
+        ))
     }
 }
 
@@ -1168,6 +1209,36 @@ mod tests {
 
         gate.release()
             .expect("the exact inherited endpoint must open the gate");
+        launcher.join().expect("launcher fixture must exit");
+    }
+
+    #[test]
+    fn inherited_start_gate_preserves_a_bounded_launcher_failure() {
+        let (mut gate, mut launcher_input, mut launcher_output) =
+            WorkloadStartGate::pair().expect("an unnamed start gate must be creatable");
+        let launcher = std::thread::spawn(move || {
+            launcher_output
+                .write_all(START_GATE_READY)
+                .expect("launcher must announce readiness");
+            let mut release = [0_u8; START_GATE_RELEASE.len()];
+            launcher_input
+                .read_exact(&mut release)
+                .expect("launcher must receive release");
+            launcher_output
+                .write_all(START_GATE_ERROR_PREFIX)
+                .expect("launcher must report its typed failure");
+            launcher_output
+                .write_all(b"child startup timed out while applying Landlock setup")
+                .expect("launcher must report bounded detail");
+            launcher_output
+                .write_all(b"\n")
+                .expect("launcher must terminate its bounded failure record");
+        });
+
+        let error = gate
+            .release()
+            .expect_err("a launcher failure must never open the gate");
+        assert!(error.to_string().contains("Landlock setup"));
         launcher.join().expect("launcher fixture must exit");
     }
 

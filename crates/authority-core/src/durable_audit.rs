@@ -24,7 +24,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use crate::{
     audit::AttemptOutcome,
-    capability::{AuthorityRequest, CapId, CapabilityRequest, CapabilityRequestSet, SubjectId},
+    capability::{
+        AuthorityRequest, CapId, CapabilityRequest, CapabilityRequestSet, MAX_REQUESTS_PER_EFFECT,
+        SubjectId,
+    },
     file::{FileEffect, FileRequest},
     github::{BranchName, GitHubOperation, GitHubRequest, InstallationId},
     http::{CanonicalHost, CanonicalUrlPath, HttpFetchMethod, HttpFetchRequest},
@@ -1751,9 +1754,12 @@ fn decode_finish_payload(
             _ => unreachable!("terminal evidence outcomes were matched above"),
         };
         if token_length == 0 {
-            return Err(DurableAuditError::InvalidRecord(
-                "terminal evidence cannot be empty".to_owned(),
-            ));
+            let message = match outcome {
+                AttemptOutcome::Committed => "commit receipt token cannot be empty",
+                AttemptOutcome::CommitUnknown => "CommitUnknown evidence cannot be empty",
+                _ => unreachable!("terminal evidence outcomes were matched above"),
+            };
+            return Err(DurableAuditError::InvalidRecord(message.to_owned()));
         }
         if token_length > token_limit {
             return Err(DurableAuditError::RecordTooLarge(token_length));
@@ -1867,6 +1873,11 @@ fn encode_attempt_payload(
     requests: &CapabilityRequestSet,
     authorization_epoch: AuthorizationEpoch,
 ) -> Result<Vec<u8>, DurableAuditError> {
+    if !requests.is_complete() {
+        return Err(DurableAuditError::InvalidRecord(format!(
+            "effect request set exceeds the {MAX_REQUESTS_PER_EFFECT}-request limit"
+        )));
+    }
     let mut writer = PayloadWriter::new();
     writer.byte(ATTEMPT_PAYLOAD_VERSION);
     writer.u64(state_instance);
@@ -2085,6 +2096,11 @@ fn decode_attempt_payload(payload: &[u8]) -> Result<DurableAttemptMetadata, Dura
     if count == 0 {
         return Err(invalid_payload("attempt payload authorized no request"));
     }
+    if usize::try_from(count).unwrap_or(usize::MAX) > MAX_REQUESTS_PER_EFFECT {
+        return Err(DurableAuditError::InvalidRecord(format!(
+            "attempt payload exceeds the {MAX_REQUESTS_PER_EFFECT}-request limit"
+        )));
+    }
     let mut requests = Vec::new();
     for _ in 0..count {
         let time = MonotonicTime::from_ticks(reader.u64()?);
@@ -2285,8 +2301,7 @@ mod tests {
     use super::{
         CommitReceipt, CommitUnknownEvidence, DurableAuditError, DurableAuditLog, DurableAuditView,
         MAX_COMMIT_RECEIPT_BYTES, MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES, MAX_JOURNAL_BYTES,
-        PRIVATE_FILE_MODE,
-        decode_attempt_payload, durable_lock_name, encode_attempt_payload,
+        PRIVATE_FILE_MODE, decode_attempt_payload, durable_lock_name, encode_attempt_payload,
         validate_owner_and_permissions,
     };
     use crate::{

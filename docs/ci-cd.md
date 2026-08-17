@@ -8,7 +8,7 @@
 
 This repository ships equivalent, fail-closed delivery pipelines for GitHub Actions and GitLab CI. Both platforms execute the same repository-owned scripts so that a platform migration does not change the quality, security, or release contract.
 
-The release boundary is deliberately limited to the artifact this repository can prove today: the `authority-corpus` Linux binary. No production deployment job is present because the repository does not define a deployable service image, environment manifest, infrastructure target, or rollback contract.
+The release boundary is deliberately limited to the artifact this repository can prove today: the `authority-corpus` Linux binary. The repository contains a systemd unit, environment template, and recovery runbook for `host-sessiond`, but no automated production deployment job, immutable service image, or repository-owned infrastructure target is present.
 
 ## Pipeline topology
 
@@ -16,7 +16,7 @@ The release boundary is deliberately limited to the artifact this repository can
 |---|---|---|---|
 | Pipeline policy | `Continuous Integration / Pipeline policy` | `pipeline_policy` | Parse all YAML, lint Actions and shell, require full Action SHAs and container digests, reject broad permissions and suppressed failures |
 | Rust quality | `Rust quality gate` | `rust_quality` | Format, all-target/all-feature check, Clippy with warnings denied, rustdoc with warnings denied |
-| Rust tests | Four `Rust tests` jobs | Four `rust_tests` matrix jobs | Workspace split into four deterministic nextest shards with JUnit reports |
+| Rust tests | Eight `Rust tests` jobs | Eight `rust_tests` matrix jobs | One deterministic nextest shard per workspace crate, with JUnit reports |
 | Repository invariants | `Toolchain consistency`, `Declared dependency usage`, `Lockfile integrity`, `Documentation policy`, `Repository hygiene`, `Pin inventory` | `toolchain_consistency`, `dependency_usage`, `lockfile_integrity`, `docs_policy`, `repository_hygiene`, `pin_inventory` | Pinned toolchains agree, every declared dependency is used, the lockfile matches the manifests, the documentation tree obeys its conventions, no tracked file is an unreviewable blob or a stray build output, and every pinned version and digest is collected into one reviewable list |
 | Claim traceability | `Decision record index`, `Verification page traceability`, `CODEOWNERS coverage`, `Lean proof hygiene` | `adr_index`, `verification_traceability`, `codeowners_coverage`, `lean_hygiene` | The decision log matches its index and numbers without a gap, every crate has a reachable verification page carrying its `未検証の境界` section, the paths that define the gates still require owner review, and no Lean proof contains a hole or an axiom |
 | Pipeline self-test | `Pipeline script self-test` | `pipeline_self_test` | Drives `plan-pipeline.sh` against inputs with known answers, so a planner bug cannot silently demote a gate to `skipped` and still pass the fan-in |

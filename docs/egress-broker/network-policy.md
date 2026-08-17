@@ -51,6 +51,14 @@ if addresses.iter().copied().any(|address| self.is_denied(address)) {
 
 空応答も `EmptyAnswer` で拒否する。resolver が空を返したときに「制限なし」と解釈する経路を作らない。
 
+## DNS answer と resolver worker の上限
+
+DNS answer は `MAX_DNS_ANSWER_IPS = 32` address までしか保持しない。`SystemResolver` は収集中に 33 件目を見つけた時点で `ResolveError::AnswerLimitExceeded` を返し、注入された resolver についても worker 境界で同じ上限を再確認する。上限超過は `IpPolicy` や connector へ渡さず fail-closed にする。
+
+resolver の OS API (`getaddrinfo` / `ToSocketAddrs`) には、呼び出し側から強制キャンセルする portable な操作がない。そのため `public_fetch` は process-wide に固定 1 worker、追加キュー 8 件の同期 pool を使う。timeout した呼び出しは結果 channel を捨てるだけで、OS lookup は同じ worker が戻るまで保持する。新しい thread は request ごとに作られず、worker が塞がりキューも満杯なら `ResolveError::Unavailable` で即時拒否する。
+
+この設計が保証するのは、Broker process 内の resolver worker と待ち行列の数が有限であることまでである。OS resolver の内部 thread、DNS server 側の処理、名前解決の強制中断は制御できない。したがって timeout は lookup をキャンセルしたことを意味せず、有限 pool の admission を解放しないことで abandoned lookup の増殖だけを防ぐ。
+
 ## IPv4-mapped IPv6 は埋め込み address が public でも拒否する
 
 ```rust

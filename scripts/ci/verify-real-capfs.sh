@@ -33,6 +33,58 @@ command -v cargo >/dev/null || {
   printf '%s\n' 'real CapFS FUSE verification requires cargo' >&2
   exit 2
 }
+command -v findmnt >/dev/null || {
+  printf '%s\n' 'real CapFS FUSE verification requires findmnt' >&2
+  exit 2
+}
+command -v umount >/dev/null || {
+  printf '%s\n' 'real CapFS FUSE verification requires umount' >&2
+  exit 2
+}
+
+baseline_capfs_mounts=()
+while IFS= read -r mountpoint; do
+  baseline_capfs_mounts+=("${mountpoint}")
+done < <(findmnt -rn -t fuse -o TARGET,SOURCE | awk '$2 == "capfs" { print $1 }')
+
+is_baseline_capfs_mount() {
+  local candidate="$1" known
+  for known in "${baseline_capfs_mounts[@]}"; do
+    [[ "${candidate}" == "${known}" ]] && return 0
+  done
+  return 1
+}
+
+cleanup_new_capfs_mounts() {
+  local mountpoint cleanup_failed=0
+  while IFS= read -r mountpoint; do
+    is_baseline_capfs_mount "${mountpoint}" && continue
+    if [[ ! "${mountpoint}" =~ ^/tmp/\.tmp[[:alnum:]]{6}(/nested)?$ ]]; then
+      printf 'refusing to clean unexpected residual CapFS mount: %s\n' "${mountpoint}" >&2
+      cleanup_failed=1
+      continue
+    fi
+    printf 'cleaning residual CapFS test mount: %s\n' "${mountpoint}" >&2
+    if ! umount --lazy -- "${mountpoint}"; then
+      printf 'failed to clean residual CapFS test mount: %s\n' "${mountpoint}" >&2
+      cleanup_failed=1
+    elif ! rmdir -- "${mountpoint}" 2>/dev/null; then
+      printf 'residual CapFS mountpoint is not an empty test directory: %s\n' "${mountpoint}" >&2
+      cleanup_failed=1
+    fi
+  done < <(findmnt -rn -t fuse -o TARGET,SOURCE | awk '$2 == "capfs" { print $1 }')
+  return "${cleanup_failed}"
+}
+
+cleanup_capfs_mounts_on_exit() {
+  local status=$?
+  trap - EXIT
+  if ! cleanup_new_capfs_mounts; then
+    status=1
+  fi
+  exit "${status}"
+}
+trap cleanup_capfs_mounts_on_exit EXIT
 
 cd -- "${repository_root}"
 
@@ -48,5 +100,11 @@ CAPFS_REQUIRE_FUSE=1 \
     -- \
     --test-threads=1 \
     --nocapture
+
+if ! cleanup_new_capfs_mounts; then
+  printf '%s\n' 'real CapFS FUSE verification left a mount that could not be cleaned' >&2
+  exit 1
+fi
+trap - EXIT
 
 printf '%s\n' 'real CapFS FUSE verification: kernel mount and revoke regressions passed'

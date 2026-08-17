@@ -1,0 +1,15 @@
+schema: verification-status/v1
+claims:
+  - id: fixture-invalid-status
+    component: fixture
+    scope: hosted
+    status: maybe
+    summary: This fixture intentionally uses a status outside the schema.
+    evidence:
+      commands:
+        - cargo test --locked -p authority-core --all-targets
+      sources:
+        - crates/authority-core/src
+      tests:
+        - crates/authority-core/tests
+    residual_reasons: []

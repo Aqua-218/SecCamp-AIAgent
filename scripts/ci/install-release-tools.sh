@@ -21,7 +21,7 @@ readonly cosign_url="https://github.com/sigstore/cosign/releases/download/v${cos
 
 # shellcheck source=scripts/ci/install-binary-tool-lib.sh
 source "${repository_root}/scripts/ci/install-binary-tool-lib.sh"
-binary_install_init
+binary_install_init "${tools_root}" "${tool_bin}" "${downloads}"
 
 binary_fetch_pinned syft "${syft_url}" "${syft_archive}" "${syft_sha256}"
 binary_publish_archive_member syft "${syft_archive}" "${syft_sha256}" syft \

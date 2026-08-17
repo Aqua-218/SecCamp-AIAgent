@@ -15,6 +15,8 @@ use firecracker_runtime::{FileSystem, RuntimeError, Sha256Digest};
 
 use crate::{BackendError, SessionIdentity, WorkspaceBackend, WorkspaceLease, WorkspaceTemplateId};
 
+const WORKSPACE_IMAGE_FILE_NAME: &str = "workspace.ext4";
+
 /// The orchestrator-side adapter and runtime-side filesystem view for one workspace root.
 pub type FirecrackerWorkspaceAdapters<F> =
     (FirecrackerWorkspaceBackend<F>, FirecrackerFileSystem<F>);
@@ -38,6 +40,14 @@ enum WorkspaceBlockDeviceState {
     Released,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceJailerState {
+    Unregistered,
+    Registered,
+    ResourcesPrepared,
+    Removed,
+}
+
 /// The exact binding retained after the orchestrator prepares a workspace.
 struct PreparedWorkspace {
     session_id: crate::SessionId,
@@ -48,6 +58,7 @@ struct PreparedWorkspace {
     runtime_claimed: bool,
     runtime_image: WorkspaceImageState,
     runtime_block_device: WorkspaceBlockDeviceState,
+    runtime_jailer: WorkspaceJailerState,
     runtime_released: bool,
     orchestrator_released: bool,
 }
@@ -238,6 +249,7 @@ where
                 runtime_claimed: false,
                 runtime_image: WorkspaceImageState::NotCreated,
                 runtime_block_device: WorkspaceBlockDeviceState::NeverBound,
+                runtime_jailer: WorkspaceJailerState::Unregistered,
                 runtime_released: false,
                 orchestrator_released: false,
             },
@@ -315,6 +327,109 @@ where
     fn digest(&mut self, path: &Path) -> Result<Sha256Digest, RuntimeError> {
         let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
         state.filesystem.digest(path)
+    }
+
+    fn register_jailer_root(&mut self, jail_root: &Path) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
+        let workspace_id = state
+            .prepared
+            .values()
+            .find(|record| record.session_jail_root == jail_root)
+            .map(|record| record.workspace_id)
+            .ok_or_else(|| {
+                runtime_workspace_error("jailer root is not bound to a prepared session")
+            })?;
+        let record = state.prepared.get(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared while registering its jail")
+        })?;
+        if !record.runtime_claimed || record.runtime_released || record.orchestrator_released {
+            return Err(runtime_workspace_error(
+                "jailer registration requires a live Runtime workspace claim",
+            ));
+        }
+        if record.runtime_jailer != WorkspaceJailerState::Unregistered {
+            return Err(runtime_workspace_error(
+                "jailer root was already registered for this Runtime claim",
+            ));
+        }
+        state.filesystem.register_jailer_root(jail_root)?;
+        let record = state.prepared.get_mut(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared after registering its jail")
+        })?;
+        record.runtime_jailer = WorkspaceJailerState::Registered;
+        Ok(())
+    }
+
+    fn prepare_jailer_resources(
+        &mut self,
+        workspace: &Path,
+        jailed_device: &Path,
+        jail_root: &Path,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
+        let workspace_id = state
+            .prepared
+            .values()
+            .find(|record| record.destination == workspace && record.session_jail_root == jail_root)
+            .map(|record| record.workspace_id)
+            .ok_or_else(|| {
+                runtime_workspace_error(
+                    "jailer resources are not bound to one prepared session workspace",
+                )
+            })?;
+        let record = state.prepared.get(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared during jailer preparation")
+        })?;
+        if !record.runtime_claimed
+            || record.runtime_released
+            || record.orchestrator_released
+            || record.runtime_jailer != WorkspaceJailerState::Registered
+            || record.runtime_image != WorkspaceImageState::Created
+            || record.runtime_block_device != WorkspaceBlockDeviceState::Bound
+        {
+            return Err(runtime_workspace_error(
+                "jailer resource preparation requires the exact live workspace, image, device, and registered jail",
+            ));
+        }
+        state
+            .filesystem
+            .prepare_jailer_resources(workspace, jailed_device, jail_root, uid, gid)?;
+        let record = state.prepared.get_mut(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared after jailer preparation")
+        })?;
+        record.runtime_jailer = WorkspaceJailerState::ResourcesPrepared;
+        Ok(())
+    }
+
+    fn remove_jail(&mut self, jail_root: &Path) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
+        let workspace_id = state
+            .prepared
+            .values()
+            .find(|record| record.session_jail_root == jail_root)
+            .map(|record| record.workspace_id)
+            .ok_or_else(|| {
+                runtime_workspace_error("jailer removal is not bound to a prepared session")
+            })?;
+        let record = state.prepared.get(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared during jailer removal")
+        })?;
+        if record.runtime_jailer == WorkspaceJailerState::Removed {
+            return Ok(());
+        }
+        if record.runtime_jailer == WorkspaceJailerState::Unregistered || !record.runtime_released {
+            return Err(runtime_workspace_error(
+                "jailer removal requires a registered jail after Runtime workspace release",
+            ));
+        }
+        state.filesystem.remove_jail(jail_root)?;
+        let record = state.prepared.get_mut(&workspace_id).ok_or_else(|| {
+            runtime_workspace_error("workspace record disappeared after jailer removal")
+        })?;
+        record.runtime_jailer = WorkspaceJailerState::Removed;
+        Ok(())
     }
 
     fn bind_block_device(
@@ -443,7 +558,11 @@ where
         let record = state.prepared.get(&workspace_id).ok_or_else(|| {
             runtime_workspace_error("workspace record disappeared while preparing its block image")
         })?;
-        let expected_image = record.destination.with_extension("ext4");
+        let expected_image = record
+            .destination
+            .parent()
+            .ok_or_else(|| runtime_workspace_error("prepared workspace has no image directory"))?
+            .join(WORKSPACE_IMAGE_FILE_NAME);
         if !record.runtime_claimed || record.runtime_released || record.orchestrator_released {
             return Err(runtime_workspace_error(
                 "workspace image requires a live Runtime claim",
@@ -562,6 +681,9 @@ mod tests {
         block_device_binds: Vec<(PathBuf, PathBuf)>,
         block_bindings: Vec<(PathBuf, PathBuf)>,
         block_device_unbinds: Vec<(PathBuf, PathBuf)>,
+        jail_registrations: Vec<PathBuf>,
+        jail_preparations: Vec<(PathBuf, PathBuf, PathBuf, u32, u32)>,
+        jail_removals: Vec<PathBuf>,
         removals: Vec<PathBuf>,
         remove_failures: VecDeque<bool>,
     }
@@ -622,6 +744,46 @@ mod tests {
                 .expect("fake state must not be poisoned")
                 .images
                 .push((workspace.to_owned(), image.to_owned(), size_bytes));
+            Ok(())
+        }
+
+        fn register_jailer_root(&mut self, jail_root: &Path) -> Result<(), RuntimeError> {
+            self.state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .jail_registrations
+                .push(jail_root.to_owned());
+            Ok(())
+        }
+
+        fn prepare_jailer_resources(
+            &mut self,
+            workspace: &Path,
+            jailed_device: &Path,
+            jail_root: &Path,
+            uid: u32,
+            gid: u32,
+        ) -> Result<(), RuntimeError> {
+            self.state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .jail_preparations
+                .push((
+                    workspace.to_owned(),
+                    jailed_device.to_owned(),
+                    jail_root.to_owned(),
+                    uid,
+                    gid,
+                ));
+            Ok(())
+        }
+
+        fn remove_jail(&mut self, jail_root: &Path) -> Result<(), RuntimeError> {
+            self.state
+                .lock()
+                .expect("fake state must not be poisoned")
+                .jail_removals
+                .push(jail_root.to_owned());
             Ok(())
         }
 
@@ -779,7 +941,10 @@ mod tests {
         let workspace = PathBuf::from(format!(
             "/srv/jailer/firecracker/{workspace_id}/root/workspace/{workspace_id}"
         ));
-        let image = workspace.with_extension("ext4");
+        let image = workspace
+            .parent()
+            .expect("workspace must have an image directory")
+            .join(WORKSPACE_IMAGE_FILE_NAME);
         backend
             .clone_workspace(&session, &WorkspaceTemplateId::new("template-a"))
             .expect("orchestrator clone must succeed");
@@ -811,6 +976,81 @@ mod tests {
                 .images,
             [(workspace, image, 64 * 1024 * 1024)]
         );
+    }
+
+    #[test]
+    fn jailer_ownership_lifecycle_is_session_bound_and_forwarded_exactly() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let (mut backend, mut runtime_filesystem) = adapters(Arc::clone(&state));
+        let session = identity(0x11, 0xab);
+        let workspace_id = session.workspace_id().to_string();
+        let jail_root = PathBuf::from(format!("/srv/jailer/firecracker/{workspace_id}/root"));
+        let workspace = jail_root.join("workspace").join(&workspace_id);
+        let image = jail_root.join("workspace").join(WORKSPACE_IMAGE_FILE_NAME);
+        let jailed_device = jail_root.join("dev/rootfs");
+        let mapper = PathBuf::from(format!("/dev/mapper/session-root-{workspace_id}"));
+
+        let lease = backend
+            .clone_workspace(&session, &WorkspaceTemplateId::new("template-a"))
+            .expect("orchestrator clone must succeed");
+        runtime_filesystem
+            .clone_workspace(Path::new("/workspace/source"), &workspace)
+            .expect("runtime must claim the prepared workspace");
+        runtime_filesystem
+            .create_workspace_image(&workspace, &image, 64 * 1024 * 1024)
+            .expect("runtime must create the exact stable snapshot backing path");
+
+        assert!(
+            runtime_filesystem
+                .register_jailer_root(Path::new("/srv/jailer/firecracker/foreign/root"))
+                .is_err(),
+            "a foreign jail must not reach the production filesystem"
+        );
+        runtime_filesystem
+            .register_jailer_root(&jail_root)
+            .expect("the exact session jail must be registered");
+        runtime_filesystem
+            .bind_block_device(&mapper, &jailed_device)
+            .expect("the exact session device must be bound");
+        runtime_filesystem
+            .prepare_jailer_resources(&workspace, &jailed_device, &jail_root, 65_534, 65_534)
+            .expect("ownership preparation must reach the production filesystem");
+        assert!(
+            runtime_filesystem
+                .prepare_jailer_resources(&workspace, &jailed_device, &jail_root, 65_534, 65_534,)
+                .is_err(),
+            "one Runtime claim cannot transfer jailer ownership twice"
+        );
+        runtime_filesystem
+            .unbind_block_device(&mapper, &jailed_device)
+            .expect("the exact device binding must be released");
+        runtime_filesystem
+            .remove_workspace(&workspace)
+            .expect("Runtime must release its workspace claim first");
+        runtime_filesystem
+            .remove_jail(&jail_root)
+            .expect("the registered jail must be physically removed exactly once");
+        runtime_filesystem
+            .remove_jail(&jail_root)
+            .expect("jail removal retry must be idempotent");
+        backend
+            .isolate_workspace(&lease)
+            .expect("orchestrator must finish the released workspace record");
+
+        let state = state.lock().expect("fake state must not be poisoned");
+        assert_eq!(state.jail_registrations, std::slice::from_ref(&jail_root));
+        assert_eq!(
+            state.jail_preparations,
+            [(
+                workspace.clone(),
+                jailed_device,
+                jail_root.clone(),
+                65_534,
+                65_534,
+            )]
+        );
+        assert_eq!(state.jail_removals, [jail_root]);
+        assert_eq!(state.removals, [workspace]);
     }
 
     #[test]
@@ -939,7 +1179,10 @@ mod tests {
         runtime_filesystem
             .create_workspace_image(
                 &destination,
-                &destination.with_extension("ext4"),
+                &destination
+                    .parent()
+                    .expect("workspace must have an image directory")
+                    .join(WORKSPACE_IMAGE_FILE_NAME),
                 64 * 1024 * 1024,
             )
             .expect("exact workspace image must precede the block binding");

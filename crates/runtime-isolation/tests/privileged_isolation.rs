@@ -15,13 +15,17 @@
 #![allow(missing_docs)]
 
 use std::{
+    collections::BTreeSet,
     env,
-    ffi::CString,
+    ffi::{CString, OsStr, OsString},
     fs,
-    io::Error,
-    os::unix::ffi::OsStrExt,
+    io::{Error, Read, Write},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use runtime_isolation::{
@@ -41,6 +45,28 @@ const CGROUP_ENV: &str = "RUNTIME_ISOLATION_PROBE_CGROUP";
 const ROLE_ENFORCE: &str = "enforce";
 /// The scenario that must fail inside the child at `Landlock`.
 const ROLE_LANDLOCK_FAILURE: &str = "landlock-failure";
+/// The scenario that must fail before `LimitedTmpfs` and roll back the completed workspace mount.
+const ROLE_LIMITED_TMPFS_FAILURE: &str = "limited-tmpfs-failure";
+/// The scenario that starts the production isolation launcher and execs this binary again.
+const ROLE_LAUNCHER_POST_EXEC: &str = "launcher-post-exec";
+
+/// Selects the debug-only production-backend fault used by the rollback scenario.
+const TEST_FAILURE_STEP_ENV: &str = "RUNTIME_ISOLATION_TEST_FAIL_STEP";
+/// Requests the fault immediately before the real `LimitedTmpfs` mount operation.
+const TEST_FAILURE_LIMITED_TMPFS: &str = "limited-tmpfs";
+
+/// Set only by the launcher to select the hostile workload after `execve`.
+const POST_EXEC_ROLE_ENV: &str = "RUNTIME_ISOLATION_POST_EXEC_ROLE";
+/// The fixed value accepted by the post-exec workload.
+const POST_EXEC_ROLE_VALUE: &str = "hostile-v1";
+/// The inherited supervisor control descriptor name used by the launcher contract.
+const CONTROL_FD_ENV: &str = "SUPERVISOR_CONTROL_FD";
+/// The inherited Broker descriptor name used by the launcher contract.
+const BROKER_FD_ENV: &str = "EGRESS_BROKER_FD";
+/// The fixed workspace target passed to the hostile workload for this probe.
+const WORKSPACE_TARGET_ENV: &str = "RUNTIME_ISOLATION_WORKSPACE_TARGET";
+/// A local-only vsock CID supported by the kernel for an in-host connected pair.
+const VMADDR_CID_LOCAL: u32 = 1;
 
 /// A nonstandard descriptor deliberately left inheritable to prove the sweep closes it.
 const MARKER_FD: i32 = 100;
@@ -50,8 +76,15 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const ABSENT_LANDLOCK_PATH: &str = "/runtime-isolation-probe-absent";
 
 fn main() {
+    if env::var(POST_EXEC_ROLE_ENV).ok().as_deref() == Some(POST_EXEC_ROLE_VALUE) {
+        run_post_exec_probe();
+        return;
+    }
     match env::var(ROLE_ENV) {
-        Ok(role) => run_probe(&role),
+        Ok(role) => match role.as_str() {
+            ROLE_LAUNCHER_POST_EXEC => run_launcher_probe(),
+            _ => run_probe(&role),
+        },
         Err(_) => run_verification(),
     }
 }
@@ -72,13 +105,15 @@ fn run_verification() {
             "privileged runtime isolation verification unavailable: {}",
             report.reasons.join("; ")
         );
-        return;
+        std::process::exit(2);
     }
     assert_capability_report(&report);
 
     verify_enforced_boundary();
     verify_failed_step_reports_and_releases_the_host_cgroup();
-    println!("privileged runtime isolation verification: 2 scenarios passed");
+    verify_failed_mount_rolls_back_and_leaves_no_residue();
+    verify_launcher_post_exec_boundary();
+    println!("privileged runtime isolation verification: 4 scenarios passed");
 }
 
 fn assert_capability_report(report: &CapabilityReport) {
@@ -192,6 +227,116 @@ fn verify_failed_step_reports_and_releases_the_host_cgroup() {
     scenario.assert_cgroup_released();
 }
 
+/// Fails the real backend at `LimitedTmpfs` and observes cleanup outside the child namespace.
+fn verify_failed_mount_rolls_back_and_leaves_no_residue() {
+    let scenario = Scenario::start(ROLE_LIMITED_TMPFS_FAILURE);
+
+    let parent = scenario.parent_report();
+    assert_eq!(
+        field(&parent, "startup"),
+        "failed",
+        "a deterministic LimitedTmpfs fault must not report a started workload: {parent:?}"
+    );
+    assert_eq!(
+        field(&parent, "failed_step"),
+        format!("{:?}", IsolationStep::LimitedTmpfs),
+        "the launcher must report the production backend's failed mount step"
+    );
+    assert_eq!(
+        field(&parent, "termination_required"),
+        "true",
+        "the completed root pivot must force child termination after rollback"
+    );
+    assert_eq!(
+        field(&parent, "rollback_failures"),
+        "3",
+        "only irreversible namespace, identity-map, and rootfs rollback operations may fail; the completed workspace unmount must succeed"
+    );
+    assert_eq!(
+        field(&parent, "child_mount_namespace"),
+        "gone",
+        "the failed child namespace must be destroyed after its cleanup path"
+    );
+    assert_eq!(
+        field(&parent, "host_mount_residue"),
+        "none",
+        "completed child mounts must not propagate into the launcher's mount namespace"
+    );
+    assert!(
+        !scenario
+            .base
+            .join("workspace")
+            .join("child-report")
+            .exists(),
+        "a workload that never completed isolation must not have executed"
+    );
+
+    scenario.assert_cgroup_released();
+}
+
+/// Drives the deployable launcher through its inherited start gate and a real `execve`.
+fn verify_launcher_post_exec_boundary() {
+    let scenario = LauncherScenario::start();
+    let report = scenario.report();
+    if field(&report, "startup") == "unavailable" {
+        eprintln!(
+            "privileged post-exec launcher verification unavailable: {}",
+            field(&report, "reason")
+        );
+        std::process::exit(2);
+    }
+    assert_eq!(
+        field(&report, "startup"),
+        "ready",
+        "the production launcher must complete the isolation transaction: {report:?}"
+    );
+    assert_eq!(
+        field(&report, "launcher_exit"),
+        "exited:0",
+        "the production launcher must reap a successful post-exec workload: {report:?}"
+    );
+    let rootfs_slash = field(&report, "rootfs_source_slash");
+    assert!(
+        rootfs_slash == "tested" || rootfs_slash.starts_with("unavailable:"),
+        "rootfs source `/` must be tested or explicitly unavailable: {report:?}"
+    );
+    println!("privileged runtime isolation rootfs source slash: {rootfs_slash}");
+    let child = report
+        .iter()
+        .find_map(|line| line.strip_prefix("child-report="))
+        .expect("launcher report must carry the workload report")
+        .split('|')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(field(&child, "pid"), "1");
+    assert_eq!(
+        field(&child, "argv"),
+        "literal-shell-metacharacters-preserved"
+    );
+    assert_eq!(field(&child, "socket"), errno_name(libc::EPERM));
+    assert_eq!(field(&child, "unshare"), errno_name(libc::EPERM));
+    assert_eq!(field(&child, "workspace_write"), "0");
+    assert_eq!(field(&child, "tmpfs_write"), errno_name(libc::EACCES));
+    assert_eq!(field(&child, "rootfs_write"), errno_name(libc::EROFS));
+    assert_eq!(field(&child, "dev_null"), errno_name(libc::ENOENT));
+    assert_eq!(field(&child, "runtime_path"), errno_name(libc::ENOENT));
+    assert_eq!(field(&child, "sys_path"), errno_name(libc::ENOENT));
+    assert_eq!(field(&child, "capeff"), "0000000000000000");
+    assert_eq!(field(&child, "capprm"), "0000000000000000");
+    assert_eq!(field(&child, "capbnd"), "0000000000000000");
+    assert_eq!(field(&child, "capamb"), "0000000000000000");
+    assert_eq!(field(&child, "nonewprivs"), "1");
+    assert_eq!(field(&child, "seccomp"), "2");
+    assert_eq!(field(&child, "standard_fds"), "null");
+    assert_eq!(
+        field(&child, "fd_policy"),
+        "exact",
+        "post-exec descriptor policy report: {child:?}"
+    );
+
+    scenario.assert_cgroup_released();
+}
+
 struct Scenario {
     role: &'static str,
     base: PathBuf,
@@ -239,10 +384,16 @@ impl Scenario {
 
     fn execute(&self) {
         let probe = env::current_exe().expect("locating this verification target");
-        let output = Command::new(probe)
+        let mut command = Command::new(probe);
+        command
             .env(ROLE_ENV, self.role)
             .env(BASE_ENV, &self.base)
             .env(CGROUP_ENV, &self.cgroup_name)
+            .env_remove(TEST_FAILURE_STEP_ENV);
+        if self.role == ROLE_LIMITED_TMPFS_FAILURE {
+            command.env(TEST_FAILURE_STEP_ENV, TEST_FAILURE_LIMITED_TMPFS);
+        }
+        let output = command
             .output()
             .expect("re-executing this target as a single-threaded isolation probe");
         assert!(
@@ -279,6 +430,72 @@ impl Drop for Scenario {
     }
 }
 
+/// Host-side record for the launcher-backed post-exec scenario.
+struct LauncherScenario {
+    base: PathBuf,
+    cgroup_name: String,
+    output: Vec<String>,
+}
+
+impl LauncherScenario {
+    fn start() -> Self {
+        let base = env::temp_dir().join(format!(
+            "runtime-isolation-launcher-probe-{}",
+            std::process::id()
+        ));
+        let cgroup_name = format!("runtime-isolation-launcher-probe-{}", std::process::id());
+        let mut scenario = Self {
+            base,
+            cgroup_name,
+            output: Vec::new(),
+        };
+        scenario.execute();
+        scenario
+    }
+
+    fn execute(&mut self) {
+        let probe = env::current_exe().expect("locating this verification target");
+        let output = Command::new(probe)
+            .env(ROLE_ENV, ROLE_LAUNCHER_POST_EXEC)
+            .env(BASE_ENV, &self.base)
+            .env(CGROUP_ENV, &self.cgroup_name)
+            .env_remove(TEST_FAILURE_STEP_ENV)
+            .output()
+            .expect("re-executing the launcher-backed probe");
+        assert!(
+            output.status.success(),
+            "launcher-backed probe failed: status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.output = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+    }
+
+    fn report(&self) -> Vec<String> {
+        self.output.clone()
+    }
+
+    fn assert_cgroup_released(&self) {
+        let cgroup = Path::new(CGROUP_ROOT).join(&self.cgroup_name);
+        assert!(
+            !cgroup.exists(),
+            "the launcher must remove its constrained cgroup: {}",
+            cgroup.display()
+        );
+    }
+}
+
+impl Drop for LauncherScenario {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.base);
+        let _ = fs::remove_dir(Path::new(CGROUP_ROOT).join(&self.cgroup_name));
+    }
+}
+
 fn read_report(path: &Path) -> Vec<String> {
     let report = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("reading probe report {}: {error}", path.display()));
@@ -309,6 +526,7 @@ fn run_probe(role: &str) {
     match RuntimeIsolation::spawn_isolated(&mut backend, &config, |_receipt| report_from_child()) {
         Ok(SpawnOutcome::Child(())) => {}
         Ok(SpawnOutcome::Parent(mut child)) => {
+            let child_pid = child.pid().get();
             let mut lines = Vec::new();
             let mut failed = false;
             match child.wait_for_startup() {
@@ -347,6 +565,20 @@ fn run_probe(role: &str) {
                 Ok(ChildExit::Signaled(signal)) => format!("exit=signaled:{signal}"),
                 Err(error) => format!("exit=error:{error}"),
             });
+            if role == ROLE_LIMITED_TMPFS_FAILURE {
+                let child_mount_namespace = Path::new("/proc")
+                    .join(child_pid.to_string())
+                    .join("ns/mnt");
+                lines.push(format!(
+                    "child_mount_namespace={}",
+                    if child_mount_namespace.exists() {
+                        "present"
+                    } else {
+                        "gone"
+                    }
+                ));
+                lines.push(format!("host_mount_residue={}", host_mount_residue(&base)));
+            }
             fs::write(base.join("parent-report"), lines.join("\n"))
                 .expect("writing the launcher report");
         }
@@ -362,6 +594,783 @@ fn run_probe(role: &str) {
             std::process::exit(1);
         }
     }
+}
+
+/// Runs the production launcher as a child of a private mount namespace.
+///
+/// The staged rootfs and workspace live on private tmpfs mounts, so this test never writes a host
+/// root path. When the host root is already immutable, the same scenario selects the production
+/// `rootfs.source == "/"` branch and uses a private workspace under `/var/tmp`.
+fn run_launcher_probe() {
+    let base = PathBuf::from(env::var(BASE_ENV).expect("launcher probe staging directory"));
+    let cgroup_name = env::var(CGROUP_ENV).expect("launcher probe cgroup name");
+    match launch_post_exec_workload(&cgroup_name) {
+        Ok(report) => {
+            let encoded = report.lines().collect::<Vec<_>>().join("|");
+            println!("startup=ready");
+            println!(
+                "rootfs_source_slash={}",
+                if root_mount_is_read_only() {
+                    "tested"
+                } else {
+                    "unavailable:host-root-mount-is-writable"
+                }
+            );
+            println!("child-report={encoded}");
+            println!("launcher_exit=exited:0");
+        }
+        Err(LauncherProbeFailure {
+            unavailable: true,
+            detail,
+        }) => {
+            println!("startup=unavailable");
+            println!("reason={detail}");
+        }
+        Err(LauncherProbeFailure {
+            unavailable: false,
+            detail,
+        }) => panic!("launcher post-exec probe failed: {detail}"),
+    }
+
+    // `base` is intentionally not used as a writable report directory. It is kept in the API so
+    // the launcher scenario has the same stable re-exec shape as the direct kernel scenarios.
+    let _ = base;
+}
+
+#[derive(Debug)]
+struct LauncherProbeFailure {
+    unavailable: bool,
+    detail: String,
+}
+
+#[allow(clippy::too_many_lines)]
+fn launch_post_exec_workload(cgroup_name: &str) -> Result<String, LauncherProbeFailure> {
+    let workload = env::current_exe()
+        .map_err(|error| regular_failure(format!("locating post-exec workload binary: {error}")))?;
+    let root = prepare_launcher_root(&workload).map_err(unavailable_failure)?;
+    let rootfs_source = &root.source;
+    let prefix = &root.prefix;
+    let workspace_source = &root.workspace_source;
+    let workspace_target = &root.workspace_target;
+    let control_path = prefix.join("control.sock");
+    let control_listener = unix_seqpacket_listener(&control_path).map_err(unavailable_failure)?;
+    let (broker_client, broker_peer) = local_vsock_pair().map_err(unavailable_failure)?;
+    let launcher = launcher_binary().ok_or_else(|| {
+        unavailable_failure("workload-isolation-launcher binary was not built".to_owned())
+    })?;
+
+    let mut command = Command::new(launcher);
+    command
+        .arg("--rootfs-source")
+        .arg(rootfs_source)
+        .arg("--rootfs-mount-target")
+        .arg(prefix.join("rootfs"))
+        .arg("--old-root")
+        .arg(prefix.join("rootfs").join(".old-root"))
+        .arg("--workspace-source")
+        .arg(workspace_source)
+        .arg("--workspace-target")
+        .arg(workspace_target)
+        .arg("--tmpfs-target")
+        .arg("/tmp")
+        .arg("--tmpfs-size-bytes")
+        .arg("8388608")
+        .arg("--cgroup-root")
+        .arg(CGROUP_ROOT)
+        .arg("--cgroup-name")
+        .arg(cgroup_name)
+        .arg("--memory-max-bytes")
+        .arg("67108864")
+        .arg("--pids-max")
+        .arg("64")
+        .arg("--host-uid")
+        .arg("0")
+        .arg("--host-gid")
+        .arg("0")
+        .arg("--control-socket")
+        .arg(&control_path)
+        .arg("--egress-broker-fd")
+        .arg(broker_client.as_raw_fd().to_string())
+        .arg("--egress-broker-session")
+        .arg("00112233445566778899aabbccddeeff")
+        .arg("--landlock-read-only")
+        .arg("/")
+        .arg("--landlock-writable")
+        .arg(workspace_target)
+        .arg("--env")
+        .arg(format!("{POST_EXEC_ROLE_ENV}={POST_EXEC_ROLE_VALUE}"))
+        .arg("--env")
+        .arg(format!(
+            "{WORKSPACE_TARGET_ENV}={}",
+            workspace_target.display()
+        ))
+        .arg("--program")
+        .arg(workload)
+        .arg("--")
+        .arg("--literal")
+        .arg(";")
+        .arg("$(touch /outside)")
+        .arg("quoted value");
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            regular_failure(format!("spawning workload-isolation-launcher: {error}"))
+        })?;
+    // Keep the endpoint and its peer alive until the launcher has reaped the workload. The
+    // descriptor number itself is deliberately passed as an inherited, non-CLOEXEC fd.
+    let _broker_peer = broker_peer;
+    let mut start_input = child
+        .stdout
+        .take()
+        .ok_or_else(|| regular_failure("launcher stdout pipe was unavailable".to_owned()))?;
+    let mut start_output = child
+        .stdin
+        .take()
+        .ok_or_else(|| regular_failure("launcher stdin pipe was unavailable".to_owned()))?;
+    let mut ready = [0_u8; 5];
+    start_input.read_exact(&mut ready).map_err(|error| {
+        regular_failure(format!("reading launcher start-gate readiness: {error}"))
+    })?;
+    if ready != *b"ready" {
+        return Err(regular_failure(format!(
+            "launcher sent malformed start-gate readiness: {ready:?}"
+        )));
+    }
+    start_output
+        .write_all(&[1])
+        .map_err(|error| regular_failure(format!("releasing launcher start gate: {error}")))?;
+    start_output
+        .flush()
+        .map_err(|error| regular_failure(format!("flushing launcher start gate: {error}")))?;
+    let control = accept_seqpacket(control_listener.as_raw_fd())
+        .map_err(|error| regular_failure(format!("accepting launcher control channel: {error}")))?;
+    let mut isolated = [0_u8; 8];
+    start_input.read_exact(&mut isolated).map_err(|error| {
+        launcher_child_failure(
+            &mut child,
+            format!("reading launcher isolated acknowledgement: {error}"),
+        )
+    })?;
+    if isolated != *b"isolated" {
+        return Err(regular_failure(format!(
+            "launcher sent malformed isolated acknowledgement: {isolated:?}"
+        )));
+    }
+    let report = receive_control_report(control.as_raw_fd()).map_err(|error| {
+        regular_failure(format!("receiving post-exec workload report: {error}"))
+    })?;
+    let status = child.wait().map_err(|error| {
+        regular_failure(format!("waiting for workload-isolation-launcher: {error}"))
+    })?;
+    if !status.success() {
+        let stderr = child
+            .stderr
+            .take()
+            .and_then(|mut stream| {
+                let mut buffer = String::new();
+                stream.read_to_string(&mut buffer).ok().map(|_| buffer)
+            })
+            .unwrap_or_default();
+        return Err(regular_failure(format!(
+            "launcher exited with {status}: {stderr}; report={report:?}"
+        )));
+    }
+    Ok(report)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn launcher_child_failure(child: &mut std::process::Child, detail: String) -> LauncherProbeFailure {
+    let status = child.wait().ok();
+    let stderr = child
+        .stderr
+        .take()
+        .and_then(|mut stream| {
+            let mut buffer = String::new();
+            stream.read_to_string(&mut buffer).ok().map(|_| buffer)
+        })
+        .unwrap_or_default();
+    regular_failure(format!(
+        "{detail}; launcher_status={status:?}; stderr={stderr}"
+    ))
+}
+
+fn launcher_binary() -> Option<PathBuf> {
+    if let Ok(path) = env::var("RUNTIME_ISOLATION_LAUNCHER") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let current = env::current_exe().ok()?;
+    let path = current
+        .parent()?
+        .parent()?
+        .join("workload-isolation-launcher");
+    path.is_file().then_some(path)
+}
+
+fn regular_failure(detail: String) -> LauncherProbeFailure {
+    LauncherProbeFailure {
+        unavailable: false,
+        detail,
+    }
+}
+
+fn unavailable_failure(detail: String) -> LauncherProbeFailure {
+    LauncherProbeFailure {
+        unavailable: true,
+        detail,
+    }
+}
+
+/// Performs the hostile checks after the launcher has replaced the isolation child with `execve`.
+fn run_post_exec_probe() {
+    let control_fd = env::var(CONTROL_FD_ENV)
+        .expect("post-exec workload must receive supervisor control fd")
+        .parse::<i32>()
+        .expect("supervisor control fd must be decimal");
+    let broker_fd = env::var(BROKER_FD_ENV)
+        .expect("post-exec workload must receive Broker fd")
+        .parse::<i32>()
+        .expect("Broker fd must be decimal");
+    let workspace_target = env::var(WORKSPACE_TARGET_ENV)
+        .expect("post-exec workload must receive its workspace target");
+    let mut lines = vec![
+        format!("pid={}", std::process::id()),
+        format!("argv={}", post_exec_arguments_are_literal()),
+        format!("control_fd={control_fd}"),
+        format!("broker_fd={broker_fd}"),
+        format!("inherited_fd={}", errno_name(errno_of_fstat(MARKER_FD))),
+        format!("socket={}", errno_name(errno_of_denied_socket())),
+        format!("unshare={}", errno_name(errno_of_denied_unshare())),
+        format!(
+            "dev_null={}",
+            errno_name(errno_of_open("/dev/null", libc::O_RDONLY))
+        ),
+        format!(
+            "runtime_path={}",
+            errno_name(errno_of_open("/run/lock", libc::O_RDONLY))
+        ),
+        format!(
+            "sys_path={}",
+            errno_name(errno_of_open("/sys/kernel", libc::O_RDONLY))
+        ),
+        format!(
+            "tmpfs_write={}",
+            errno_name(errno_of_open(
+                "/tmp/post-exec-escape",
+                libc::O_CREAT | libc::O_WRONLY
+            ))
+        ),
+        format!(
+            "rootfs_write={}",
+            errno_name(errno_of_open(
+                "/etc/post-exec-escape",
+                libc::O_CREAT | libc::O_WRONLY
+            ))
+        ),
+        format!(
+            "workspace_write={}",
+            errno_name(errno_of_open(
+                &format!("{workspace_target}/post-exec-write"),
+                libc::O_CREAT | libc::O_WRONLY
+            ))
+        ),
+    ];
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for (field, label) in [
+        ("CapEff:", "capeff"),
+        ("CapPrm:", "capprm"),
+        ("CapBnd:", "capbnd"),
+        ("CapAmb:", "capamb"),
+        ("NoNewPrivs:", "nonewprivs"),
+        ("Seccomp:", "seccomp"),
+    ] {
+        lines.push(format!("{label}={}", status_field(&status, field)));
+    }
+    lines.push(format!("standard_fds={}", standard_descriptors_are_null()));
+    lines.push(format!(
+        "fd_policy={}",
+        exact_inherited_fd_policy(control_fd, broker_fd)
+    ));
+    let report = lines.join("\n");
+    let mut control = unsafe { std::fs::File::from_raw_fd(control_fd) };
+    control
+        .write_all(report.as_bytes())
+        .expect("the post-exec workload must report through the inherited control channel");
+    control
+        .flush()
+        .expect("the post-exec workload must flush its control report");
+}
+
+fn post_exec_arguments_are_literal() -> &'static str {
+    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    let expected = ["--literal", ";", "$(touch /outside)", "quoted value"];
+    if arguments
+        .iter()
+        .map(OsString::as_os_str)
+        .eq(expected.iter().map(OsStr::new))
+    {
+        "literal-shell-metacharacters-preserved"
+    } else {
+        "argv-mismatch"
+    }
+}
+
+fn standard_descriptors_are_null() -> &'static str {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    for descriptor in 0..=2 {
+        // SAFETY: `metadata` is writable and the descriptor is one of the three standard slots.
+        if unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) } != 0 {
+            return "missing";
+        }
+        // SAFETY: `fstat` initialized the complete structure on success.
+        let metadata = unsafe { metadata.assume_init() };
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFCHR
+            || libc::major(metadata.st_rdev) != 1
+            || libc::minor(metadata.st_rdev) != 3
+        {
+            return "unexpected";
+        }
+    }
+    "null"
+}
+
+fn exact_inherited_fd_policy(control_fd: i32, broker_fd: i32) -> String {
+    if control_fd < 3 || broker_fd < 3 || control_fd == broker_fd {
+        return "unexpected-channel-identity".to_owned();
+    }
+
+    // Collect names while the directory enumeration handle is open, then drop that iterator
+    // before checking liveness. This removes the transient enumeration fd without assuming a
+    // descriptor-number ceiling or relying on readlinkat (which is deliberately constrained by
+    // the workload policy).
+    let descriptors = {
+        let entries = match fs::read_dir("/proc/self/fd") {
+            Ok(entries) => entries,
+            Err(error) => return format!("fd-enumeration-error-{error}"),
+        };
+        match entries
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(entries) => entries
+                .into_iter()
+                .filter_map(|name| name.to_string_lossy().parse::<i32>().ok())
+                .filter(|descriptor| *descriptor >= 3)
+                .collect::<Vec<_>>(),
+            Err(error) => return format!("fd-enumeration-error-{error}"),
+        }
+    };
+    let observed = descriptors
+        .into_iter()
+        .filter(|descriptor| errno_of_fstat(*descriptor) == 0)
+        .collect::<BTreeSet<_>>();
+    let expected = BTreeSet::from([control_fd, broker_fd]);
+    if observed == expected {
+        "exact".to_owned()
+    } else {
+        format!("unexpected-fds-{observed:?}-expected-{expected:?}")
+    }
+}
+
+struct LauncherRoot {
+    source: PathBuf,
+    prefix: PathBuf,
+    workspace_source: PathBuf,
+    workspace_target: PathBuf,
+}
+
+fn prepare_launcher_root(workload: &Path) -> Result<LauncherRoot, String> {
+    // SAFETY: the flag is scalar and the namespace exists only in this re-execed probe process.
+    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+        return Err(format!(
+            "unsharing the probe mount namespace: {}",
+            Error::last_os_error()
+        ));
+    }
+    mount_private_for_probe(Path::new("/"))?;
+    if root_mount_is_read_only() {
+        let prefix = PathBuf::from(format!(
+            "/dev/shm/runtime-isolation-launcher-{}",
+            std::process::id()
+        ));
+        let workspace_source = prefix.join("source");
+        fs::create_dir_all(&workspace_source)
+            .map_err(|error| format!("creating slash-branch workspace source: {error}"))?;
+        return Ok(LauncherRoot {
+            source: PathBuf::from("/"),
+            prefix,
+            workspace_source,
+            workspace_target: PathBuf::from("/var/tmp"),
+        });
+    }
+    // `/opt` is an existing directory, so mounting a private tmpfs there avoids creating any
+    // files on the host root while staging the launcher rootfs.
+    mount_tmpfs_for_probe(Path::new("/opt"))?;
+    let prefix = PathBuf::from(format!(
+        "/opt/runtime-isolation-launcher-{}",
+        std::process::id()
+    ));
+    let rootfs = prefix.join("rootfs");
+    let rootfs_mount = prefix.join("mount");
+    fs::create_dir_all(&rootfs)
+        .map_err(|error| format!("creating private launcher rootfs target: {error}"))?;
+    fs::create_dir_all(&rootfs_mount)
+        .map_err(|error| format!("creating private launcher mount target: {error}"))?;
+    mount_tmpfs_for_probe(&rootfs)?;
+    stage_dynamic_workload(&rootfs, workload)?;
+    for directory in [
+        rootfs.join("workspace"),
+        rootfs.join("tmp"),
+        rootfs.join("proc"),
+        rootfs.join("dev"),
+        rootfs.join("etc"),
+        rootfs.join(".old-root"),
+    ] {
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("creating private launcher rootfs directory: {error}"))?;
+    }
+    fs::create_dir_all(rootfs.join("opt/probe"))
+        .map_err(|error| format!("creating private launcher target parent: {error}"))?;
+    fs::create_dir_all(rootfs.join("opt/probe/target"))
+        .map_err(|error| format!("creating private launcher target: {error}"))?;
+    let workspace_source = prefix.join("workspace-source");
+    fs::create_dir_all(&workspace_source)
+        .map_err(|error| format!("creating private launcher workspace source: {error}"))?;
+    mount_tmpfs_for_probe(&workspace_source)?;
+    remount_bind_readonly_for_probe(&rootfs)?;
+    Ok(LauncherRoot {
+        source: rootfs,
+        prefix,
+        workspace_source,
+        workspace_target: PathBuf::from("/opt/probe/target"),
+    })
+}
+
+fn root_mount_is_read_only() -> bool {
+    let path = c_path(Path::new("/"));
+    let mut details = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `details` is writable for the syscall output.
+    if unsafe { libc::statvfs(path.as_ptr(), details.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `statvfs` initialized the complete structure on success.
+    unsafe { details.assume_init() }.f_flag & libc::ST_RDONLY != 0
+}
+
+fn stage_dynamic_workload(rootfs: &Path, workload: &Path) -> Result<(), String> {
+    let output = Command::new("ldd")
+        .arg(workload)
+        .output()
+        .map_err(|error| format!("inspecting post-exec workload dependencies with ldd: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ldd could not inspect post-exec workload: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let mut dependencies = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let candidate = line
+            .split_once("=>")
+            .map(|(_, value)| value.split_whitespace().next().unwrap_or_default())
+            .filter(|value| value.starts_with('/'))
+            .or_else(|| {
+                line.split_whitespace()
+                    .next()
+                    .filter(|value| value.starts_with('/'))
+            });
+        if let Some(path) = candidate {
+            dependencies.push(PathBuf::from(path));
+        }
+    }
+    dependencies.push(workload.to_owned());
+    for source in dependencies {
+        let relative = source
+            .strip_prefix("/")
+            .map_err(|_| format!("dependency path was not absolute: {}", source.display()))?;
+        let target = rootfs.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "creating staged dependency directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        fs::copy(&source, &target).map_err(|error| {
+            format!(
+                "copying post-exec dependency {} into {}: {error}",
+                source.display(),
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn mount_private_for_probe(target: &Path) -> Result<(), String> {
+    let target = c_path(target);
+    // SAFETY: the target pointer is valid for the call and no source/data are used.
+    let result = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "making probe mounts private: {}",
+            Error::last_os_error()
+        ))
+    }
+}
+
+fn mount_tmpfs_for_probe(target: &Path) -> Result<(), String> {
+    let target = c_path(target);
+    let filesystem = c"tmpfs";
+    let data = c"size=16m";
+    // SAFETY: all pointers remain valid for the duration of the mount syscall.
+    let result = unsafe {
+        libc::mount(
+            filesystem.as_ptr(),
+            target.as_ptr(),
+            filesystem.as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            data.as_ptr().cast(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "mounting private tmpfs at {}: {}",
+            target.to_string_lossy(),
+            Error::last_os_error()
+        ))
+    }
+}
+
+fn remount_bind_readonly_for_probe(target: &Path) -> Result<(), String> {
+    let target = c_path(target);
+    // SAFETY: the bind mount is now private and the same target remains valid.
+    let remount = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    };
+    if remount == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "remounting probe root read-only: {}",
+            Error::last_os_error()
+        ))
+    }
+}
+
+fn unix_seqpacket_listener(path: &Path) -> Result<OwnedFd, String> {
+    let descriptor = socket_owned(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC)?;
+    let address = unix_address(path)?;
+    // SAFETY: the address points to a complete sockaddr_un for the duration of the call.
+    let result = unsafe {
+        libc::bind(
+            descriptor.as_raw_fd(),
+            (&raw const address).cast::<libc::sockaddr>(),
+            unix_address_length(&address),
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "binding launcher control socket {}: {}",
+            path.display(),
+            Error::last_os_error()
+        ));
+    }
+    // SAFETY: the descriptor is a valid listening socket.
+    if unsafe { libc::listen(descriptor.as_raw_fd(), 1) } != 0 {
+        return Err(format!(
+            "listening on launcher control socket: {}",
+            Error::last_os_error()
+        ));
+    }
+    Ok(descriptor)
+}
+
+fn accept_seqpacket(listener: i32) -> Result<OwnedFd, String> {
+    // SAFETY: null address storage is accepted when the peer address is not needed.
+    let descriptor = unsafe {
+        libc::accept4(
+            listener,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        Err(format!(
+            "accepting launcher control socket: {}",
+            Error::last_os_error()
+        ))
+    } else {
+        // SAFETY: `accept4` returned a unique owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+    }
+}
+
+fn receive_control_report(descriptor: i32) -> Result<String, String> {
+    let mut buffer = [0_u8; 16 * 1024];
+    // SAFETY: the buffer is writable for its complete length and the descriptor is connected.
+    let received = unsafe { libc::recv(descriptor, buffer.as_mut_ptr().cast(), buffer.len(), 0) };
+    if received < 0 {
+        return Err(Error::last_os_error().to_string());
+    }
+    let received = usize::try_from(received).map_err(|_| "negative report length".to_owned())?;
+    String::from_utf8(buffer[..received].to_vec())
+        .map_err(|error| format!("post-exec report was not UTF-8: {error}"))
+}
+
+fn local_vsock_pair() -> Result<(OwnedFd, OwnedFd), String> {
+    let listener = socket_owned(libc::AF_VSOCK, libc::SOCK_STREAM)?;
+    let mut address = libc::sockaddr_vm {
+        svm_family: libc::sa_family_t::try_from(libc::AF_VSOCK).expect("AF_VSOCK fits sa_family_t"),
+        svm_reserved1: 0,
+        svm_port: 0,
+        svm_cid: VMADDR_CID_LOCAL,
+        svm_zero: [0; 4],
+    };
+    // SAFETY: `address` is a complete sockaddr_vm and the listener is valid.
+    if unsafe {
+        libc::bind(
+            listener.as_raw_fd(),
+            (&raw mut address).cast::<libc::sockaddr>(),
+            sockaddr_vm_length(),
+        )
+    } != 0
+    {
+        return Err(format!(
+            "binding local AF_VSOCK listener: {}",
+            Error::last_os_error()
+        ));
+    }
+    let mut length = sockaddr_vm_length();
+    // SAFETY: the output address and length are writable and correctly sized.
+    if unsafe {
+        libc::getsockname(
+            listener.as_raw_fd(),
+            (&raw mut address).cast::<libc::sockaddr>(),
+            &raw mut length,
+        )
+    } != 0
+    {
+        return Err(format!(
+            "reading local AF_VSOCK port: {}",
+            Error::last_os_error()
+        ));
+    }
+    // SAFETY: the descriptor is a valid listening socket.
+    if unsafe { libc::listen(listener.as_raw_fd(), 1) } != 0 {
+        return Err(format!(
+            "listening on local AF_VSOCK: {}",
+            Error::last_os_error()
+        ));
+    }
+    let client = socket_owned(libc::AF_VSOCK, libc::SOCK_STREAM)?;
+    // SAFETY: `address` contains the listener's assigned local CID and port.
+    if unsafe {
+        libc::connect(
+            client.as_raw_fd(),
+            (&raw const address).cast::<libc::sockaddr>(),
+            sockaddr_vm_length(),
+        )
+    } != 0
+    {
+        return Err(format!(
+            "connecting local AF_VSOCK pair: {}",
+            Error::last_os_error()
+        ));
+    }
+    // SAFETY: null peer address storage is accepted when no peer metadata is needed.
+    let peer = unsafe {
+        libc::accept4(
+            listener.as_raw_fd(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC,
+        )
+    };
+    if peer < 0 {
+        return Err(format!(
+            "accepting local AF_VSOCK pair: {}",
+            Error::last_os_error()
+        ));
+    }
+    // SAFETY: `accept4` returned a unique owned descriptor.
+    Ok((client, unsafe { OwnedFd::from_raw_fd(peer) }))
+}
+
+fn socket_owned(domain: libc::c_int, socket_type: libc::c_int) -> Result<OwnedFd, String> {
+    // SAFETY: domain and type are scalar constants and no pointer is passed.
+    let descriptor = unsafe { libc::socket(domain, socket_type, 0) };
+    if descriptor < 0 {
+        Err(format!(
+            "creating socket family {domain}: {}",
+            Error::last_os_error()
+        ))
+    } else {
+        // SAFETY: `socket` returned a unique owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+    }
+}
+
+fn sockaddr_vm_length() -> libc::socklen_t {
+    libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_vm>())
+        .expect("sockaddr_vm size fits socklen_t")
+}
+
+fn unix_address(path: &Path) -> Result<libc::sockaddr_un, String> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.is_empty() || bytes.len() >= 108 || bytes.contains(&0) {
+        return Err(format!(
+            "control socket path is too long: {}",
+            path.display()
+        ));
+    }
+    // SAFETY: zero is a valid initial value for sockaddr_un's padding and path bytes.
+    let mut address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    address.sun_family =
+        libc::sa_family_t::try_from(libc::AF_UNIX).expect("AF_UNIX fits sa_family_t");
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes.iter().copied()) {
+        *slot = byte.cast_signed();
+    }
+    Ok(address)
+}
+
+fn unix_address_length(address: &libc::sockaddr_un) -> libc::socklen_t {
+    let offset = std::mem::size_of_val(&address.sun_family);
+    libc::socklen_t::try_from(
+        offset
+            + address
+                .sun_path
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(address.sun_path.len())
+            + 1,
+    )
+    .expect("Unix socket address length fits socklen_t")
 }
 
 fn probe_config(base: &Path, cgroup_name: &str, role: &str) -> IsolationConfig {
@@ -386,6 +1395,29 @@ fn probe_config(base: &Path, cgroup_name: &str, role: &str) -> IsolationConfig {
         .validate()
         .expect("the probe policy must satisfy the crate's own validation");
     config
+}
+
+/// Reports mounts under the probe's host-side staging tree, excluding its expected rootfs bind.
+///
+/// The isolation child makes its mount namespace private before any staged mount is created. A
+/// mount appearing here would therefore prove that a rollback or propagation boundary leaked
+/// into the launcher's namespace rather than merely showing that the child had a mount briefly.
+fn host_mount_residue(base: &Path) -> String {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .expect("reading the launcher's mount table after rollback");
+    let expected_rootfs = base.join("rootfs").to_string_lossy().into_owned();
+    let base = format!("{}/", base.to_string_lossy());
+    let residue = mountinfo
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(4))
+        .filter(|mountpoint| mountpoint.starts_with(base.as_str()))
+        .filter(|mountpoint| *mountpoint != expected_rootfs)
+        .collect::<Vec<_>>();
+    if residue.is_empty() {
+        "none".to_owned()
+    } else {
+        residue.join(",")
+    }
 }
 
 /// Asks the kernel what it refuses, from inside the completed boundary.

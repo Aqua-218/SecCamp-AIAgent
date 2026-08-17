@@ -2177,7 +2177,7 @@ fn digest_bounded_regular_file(
     }
 
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     let mut total = 0_u64;
     loop {
         let count = file.read(&mut buffer).map_err(RuntimeError::from)?;
@@ -4160,6 +4160,9 @@ pub struct Snapshot {
     pub snapshot_digest: Sha256Digest,
     /// Expected digest of the guest memory file.
     pub memory_digest: Sha256Digest,
+    /// Guest root-policy digest sealed into the snapshot image, when the
+    /// manifest was created by a policy-aware provisioning boundary.
+    policy_digest: Option<AuthorityPolicyDigest>,
     forbidden_identities: Vec<IdentityId>,
 }
 
@@ -4180,8 +4183,37 @@ impl Snapshot {
             artifact_fingerprint,
             snapshot_digest,
             memory_digest,
+            policy_digest: None,
             forbidden_identities,
         }
+    }
+
+    /// Creates snapshot metadata bound to the guest root policy baked into the image.
+    #[must_use]
+    pub fn new_bound(
+        snapshot_path: impl Into<PathBuf>,
+        memory_path: impl Into<PathBuf>,
+        artifact_fingerprint: Sha256Digest,
+        snapshot_digest: Sha256Digest,
+        memory_digest: Sha256Digest,
+        policy_digest: AuthorityPolicyDigest,
+        forbidden_identities: Vec<IdentityId>,
+    ) -> Self {
+        Self {
+            snapshot_path: snapshot_path.into(),
+            memory_path: memory_path.into(),
+            artifact_fingerprint,
+            snapshot_digest,
+            memory_digest,
+            policy_digest: Some(policy_digest),
+            forbidden_identities,
+        }
+    }
+
+    /// Returns the root-policy digest sealed into the snapshot image.
+    #[must_use]
+    pub const fn policy_digest(&self) -> Option<AuthorityPolicyDigest> {
+        self.policy_digest
     }
 }
 
@@ -4209,6 +4241,12 @@ impl VerifiedSnapshot {
     #[must_use]
     pub const fn artifact_fingerprint(&self) -> Sha256Digest {
         self.manifest.artifact_fingerprint
+    }
+
+    /// Returns the verified manifest's guest root-policy digest, if present.
+    #[must_use]
+    pub const fn policy_digest(&self) -> Option<AuthorityPolicyDigest> {
+        self.manifest.policy_digest
     }
 }
 
@@ -4642,6 +4680,7 @@ where
         self.restore_generated(config, snapshot)
     }
 
+    #[allow(clippy::too_many_lines)] // Restore sequencing and rollback ownership form one gate.
     fn restore_generated(
         &mut self,
         config: &RuntimeConfig,

@@ -14,6 +14,8 @@ pub runtime_isolation::ChildProcessError::OwnershipUnavailable
 pub runtime_isolation::ChildProcessError::ReapTimedOut
 pub runtime_isolation::ChildProcessError::StartupAlreadyObserved
 pub runtime_isolation::ChildProcessError::StartupChannelClosed
+pub runtime_isolation::ChildProcessError::StartupTimedOut
+pub runtime_isolation::ChildProcessError::StartupTimedOut::last_step: core::option::Option<runtime_isolation::IsolationStep>
 impl core::error::Error for runtime_isolation::ChildProcessError
 pub fn runtime_isolation::ChildProcessError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for runtime_isolation::ChildProcessError
@@ -66,6 +68,7 @@ pub runtime_isolation::Syscall::Bpf
 pub runtime_isolation::Syscall::Brk
 pub runtime_isolation::Syscall::Capset
 pub runtime_isolation::Syscall::Chdir
+pub runtime_isolation::Syscall::Chmod
 pub runtime_isolation::Syscall::Chroot
 pub runtime_isolation::Syscall::ClockGettime
 pub runtime_isolation::Syscall::Clone
@@ -103,8 +106,10 @@ pub runtime_isolation::Syscall::Kcmp
 pub runtime_isolation::Syscall::KexecFileLoad
 pub runtime_isolation::Syscall::KexecLoad
 pub runtime_isolation::Syscall::Keyctl
+pub runtime_isolation::Syscall::Linkat
 pub runtime_isolation::Syscall::Listen
 pub runtime_isolation::Syscall::Madvise
+pub runtime_isolation::Syscall::Mkdir
 pub runtime_isolation::Syscall::Mkdirat
 pub runtime_isolation::Syscall::Mknod
 pub runtime_isolation::Syscall::Mknodat
@@ -136,12 +141,15 @@ pub runtime_isolation::Syscall::ProcessVmWritev
 pub runtime_isolation::Syscall::Ptrace
 pub runtime_isolation::Syscall::Pwrite64
 pub runtime_isolation::Syscall::Read
+pub runtime_isolation::Syscall::Readlink
 pub runtime_isolation::Syscall::Readlinkat
 pub runtime_isolation::Syscall::Reboot
 pub runtime_isolation::Syscall::Recvfrom
 pub runtime_isolation::Syscall::Recvmsg
+pub runtime_isolation::Syscall::Rename
 pub runtime_isolation::Syscall::Renameat
 pub runtime_isolation::Syscall::RequestKey
+pub runtime_isolation::Syscall::Rmdir
 pub runtime_isolation::Syscall::Rseq
 pub runtime_isolation::Syscall::RtSigaction
 pub runtime_isolation::Syscall::RtSigprocmask
@@ -175,8 +183,10 @@ pub runtime_isolation::Syscall::Socketpair
 pub runtime_isolation::Syscall::Statx
 pub runtime_isolation::Syscall::Swapoff
 pub runtime_isolation::Syscall::Swapon
+pub runtime_isolation::Syscall::Symlink
 pub runtime_isolation::Syscall::Syslog
 pub runtime_isolation::Syscall::Umount2
+pub runtime_isolation::Syscall::Unlink
 pub runtime_isolation::Syscall::Unlinkat
 pub runtime_isolation::Syscall::Unshare
 pub runtime_isolation::Syscall::Userfaultfd

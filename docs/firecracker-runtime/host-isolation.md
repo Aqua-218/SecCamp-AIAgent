@@ -10,39 +10,34 @@ VM の中で workload を閉じ込めるのは [runtime-isolation](../runtime-is
 
 ## 何を防ぎたいのか
 
-前提として、Firecracker から VM 脱出が起きる可能性はゼロではない。脱出した攻撃者が最初に触れるのは Firecracker プロセスの権限であって、host の root ではない。ここを絞っておくと、脱出が起きても被害が VM 1 台分に留まる。
+前提として、Firecracker から VM 脱出が起きる可能性はゼロではない。脱出した攻撃者が最初に触れるのは Firecracker プロセスの権限であって、host の root ではない。ここを絞っておくと、脱出時の被害範囲を縮められる。ただし、下記の profile が escape proof になるわけではない。
 
 [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) の `RuntimeConfig::validate` は、この profile が緩んでいたら起動そのものを拒否する。
 
 ```mermaid
 flowchart TB
-    cfg["HostIsolationConfig"] --> ns{"user pid mount network<br/>ipc uts が全て true?"}
+    cfg["HostIsolationConfig"] --> ns{"private pid + mount<br/>namespace が true?"}
     ns -->|no| deny["InvalidConfig<br/>起動しない"]
     ns -->|yes| cg{"cgroup path が / でなく<br/>memory と CPU 上限が非ゼロ?"}
     cg -->|no| deny
-    cg -->|yes| sec{"seccomp が 8 個の<br/>必須 syscall を全て deny?"}
+    cg -->|yes| sec{"seccomp に 8 個の<br/>必須 syscall が宣言済み?"}
     sec -->|no| deny
     sec -->|yes| net{"network_devices が空?"}
     net -->|no| forbidden["NetworkDeviceForbidden"]
     net -->|yes| ok["起動へ"]
 ```
 
-## namespace は 6 つ全部が必須
+## jailer が作る namespace
 
 ```rust
-if !(self.isolation.namespaces.user
-    && self.isolation.namespaces.pid
-    && self.isolation.namespaces.mount
-    && self.isolation.namespaces.network
-    && self.isolation.namespaces.ipc
-    && self.isolation.namespaces.uts)
+if !self.isolation.namespaces.pid || !self.isolation.namespaces.mount
 ```
 
-`NamespaceConfig` は 6 つの bool を持つが、`false` にできる組み合わせは無い。全部 `true` でなければ `validate` が落ちる。
+`NamespaceConfig` は 6 つの bool を持つが、jailer が直接扱うのは private PID namespace と mount namespace である。この profile はその 2 つを必須にし、user/network/IPC/UTS の switch は jailer の未対応機能として明示的に拒否する。
 
-一見すると bool ではなく単一の flag にすべきに見える。個別に持っている理由は、jailer に渡す引数がそれぞれ対応していて、どの namespace を要求したかが config から読めるほうが監査しやすいから。将来 1 つを外す判断をするなら、その決定は ADR に残す。
+個別の bool を残しているのは、profile がどの隔離を要求したかを config から監査できるためである。実 launch gate は Firecracker task の PID/mount namespace が test process と異なることも観測する。これは namespace 作成の実証であって、VM escape が不可能であることの証明ではない。
 
-network namespace が最も効く。Firecracker プロセスが host の network stack を見ないので、VM 脱出後に host の他サービスへ横移動できない。外部通信は vsock 越しの [Host Egress Broker](../egress-broker/README.md) だけを通る。
+network device は `RuntimeConfig::validate` が常に拒否する。従ってこの runtime profile は Firecracker に host network device を渡さず、外部通信の設計は vsock 越しの [Host Egress Broker](../egress-broker/README.md) に限定する。network namespace を作ることを、この crate の検査結果として主張しない。
 
 ## cgroup で 2 つの上限を要求する
 
@@ -51,14 +46,15 @@ network namespace が最も効く。Firecracker プロセスが host の network
 ```rust
 if self.isolation.cgroup.path == Path::new("/") { /* 拒否 */ }
 if self.isolation.cgroup.memory_max_bytes == 0
-    || self.isolation.cgroup.cpu_quota_micros == 0 { /* 拒否 */ }
+    || self.isolation.cgroup.cpu_quota_micros == 0
+    || self.isolation.cgroup.cpu_period_micros == 0 { /* 拒否 */ }
 ```
 
 `path` が host の root であることを拒否するのは、cgroup 操作が host 全体に及ぶのを防ぐため。
 
 上限がゼロの場合を拒否するのは、`0` が「制限なし」を意味しかねないから。cgroup v2 の `memory.max` は `max` という文字列で無制限を表すが、数値の `0` を書くとすべての割り当てが失敗する。どちらの解釈でも意図した動作にならないので、設定の時点で落とす。`Default` で初期化したまま渡す事故もここで止まる。
 
-## seccomp は 8 個の deny を必須にする
+## seccomp は 8 個の deny 宣言を必須にする
 
 ```rust
 const REQUIRED_BLOCKED_SYSCALLS: [&str; 8] = [
@@ -71,7 +67,7 @@ const REQUIRED_BLOCKED_SYSCALLS: [&str; 8] = [
 
 ここは検査の性質を誤解しやすい。**この crate は filter を解析していない。** 宣言された一覧を文字列比較しているだけで、実際の BPF が本当にこれらを拒否するかは見ていない。宣言と実体がずれても検出できない。
 
-それでも入れている理由は、profile を差し替えるときに「この 8 個は落とすな」という要求が config に残るから。宣言を消せば起動しなくなるので、意図せず緩めることはできない。
+それでも入れている理由は、profile を差し替えるときに「この 8 個は落とすな」という要求が config に残るから。宣言を消せば起動しなくなるので、意図せず緩めることはできない。実 launch gate は pinned filter が Firecracker にロードされ、task の `Seccomp: 2` になることを確認するが、各 syscall の deny 動作までは確認しない。
 
 8 個の選び方は、VM 脱出後に最初に試されるものを並べている。`socket` と `connect` で外部通信、`mount` と `unshare` と `setns` で隔離の張り直し、`ptrace` で他プロセスへの干渉、`bpf` と `perf_event_open` で kernel への到達。
 
@@ -93,12 +89,11 @@ profile を緩める変更が起動失敗として現れる。静かに緩んだ
 
 ## 正確な保証範囲
 
-この crate が保証するのは、config が上記の条件を満たさなければ起動しないことだけ。**隔離が実際に効いていることは一切保証していない。**
+この crate が保証するのは、config が上記の条件を満たさなければ起動しないことと、opt-in の実 launch gate が指定 host 上の一部の設置状態を観測することまでである。**これを VM escape proof と解釈してはいけない。**
 
-- jailer が実際に 6 つの namespace を作るかは未検証。`start_jailer` は fake command runner 越しにしか実行していない。
-- cgroup が実際に作られ、上限が適用されるかは未検証。
-- seccomp filter の中身は解析していない。`blocked_syscalls` は宣言であって検証結果ではない。宣言と filter が食い違っていても検出しない。
-- jailer に渡すコマンドラインが Firecracker の期待する形式かは未検証。
+- `scripts/ci/verify-real-runtime-lifecycle.sh` は実 jailer/Firecracker を通り、PID/mount namespace、cgroup leaf と memory/cpu 上限、dedicated UID、pinned executable digest、`Seccomp: 2` を観測する。
+- seccomp filter の中身は解析していない。`blocked_syscalls` は宣言であって deny の検証結果ではない。宣言と filter が食い違っていても、各 syscall を実行しない限り検出しない。
+- wrapper の gate は jailer の期待する CLI、workspace/mapper/bind、shutdown cleanup も確認するが、VM escape、snapshot restore、guest CapFS、host の AppArmor/SELinux/seccomp は対象外である。
 - VM 脱出が起きたときに実際に被害が VM 1 台に留まるかは、上記が全部効いていることが前提。現時点でその前提は確認できていない。
 - host 側の他の防御（AppArmor、SELinux、host の seccomp）はこの crate の対象外。
 

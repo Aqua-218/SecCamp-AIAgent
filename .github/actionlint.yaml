@@ -1,0 +1,19 @@
+# Self-hosted runner labels this repository expects, declared so actionlint can
+# tell a real typo from a label it simply has not heard of.
+#
+# Both labels exist because the system-stage gates need a host that a hosted
+# runner pool cannot provide. What each host must offer is a deployment
+# contract, recorded here next to the name and in docs/ci-cd.md:
+#
+#   kvm         /dev/kvm, /dev/vhost-vsock, veritysetup, busybox, mkfs.ext4.
+#               Runs the real Firecracker microVM verification.
+#   privileged  root, and a cgroup v2 root delegating memory and pids to its
+#               children. Runs the isolation transaction against the kernel.
+#               Does not need KVM.
+#
+# A host carrying either label runs code from this repository with elevated
+# rights, so neither is attached to pull-request events.
+self-hosted-runner:
+  labels:
+    - kvm
+    - privileged

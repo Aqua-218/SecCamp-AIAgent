@@ -74,6 +74,8 @@ const PERMISSION_MODE_BITS: u32 = 0o7777;
 const STICKY_DIRECTORY: u32 = 0o1000;
 /// Maximum opaque evidence retained for one `CommitUnknown` terminal outcome.
 pub const MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES: usize = 64 * 1024;
+/// Maximum opaque provider acceptance token retained in one durable commit receipt.
+pub const MAX_COMMIT_RECEIPT_BYTES: usize = 64 * 1024;
 
 /// A bounded receipt that identifies the external acceptance observed by the
 /// executor.
@@ -1635,6 +1637,16 @@ fn validate_finish(
             "commit receipt belongs to another attempt".to_owned(),
         ));
     }
+    if let Some(receipt) = receipt {
+        if receipt.token().is_empty() {
+            return Err(DurableAuditError::InvalidRecord(
+                "commit receipt token cannot be empty".to_owned(),
+            ));
+        }
+        if receipt.token().len() > MAX_COMMIT_RECEIPT_BYTES {
+            return Err(DurableAuditError::RecordTooLarge(receipt.token().len()));
+        }
+    }
     if let Some(evidence) = commit_unknown_evidence {
         if evidence.attempt_id() != attempt_id {
             return Err(DurableAuditError::InvalidRecord(
@@ -1733,6 +1745,19 @@ fn decode_finish_payload(
         let token_length =
             usize::try_from(u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]))
                 .map_err(|_| DurableAuditError::RecordTooLarge(usize::MAX))?;
+        let token_limit = match outcome {
+            AttemptOutcome::Committed => MAX_COMMIT_RECEIPT_BYTES,
+            AttemptOutcome::CommitUnknown => MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES,
+            _ => unreachable!("terminal evidence outcomes were matched above"),
+        };
+        if token_length == 0 {
+            return Err(DurableAuditError::InvalidRecord(
+                "terminal evidence cannot be empty".to_owned(),
+            ));
+        }
+        if token_length > token_limit {
+            return Err(DurableAuditError::RecordTooLarge(token_length));
+        }
         let expected_length = 4_usize
             .checked_add(token_length)
             .ok_or(DurableAuditError::RecordTooLarge(token_length))?;
@@ -2259,7 +2284,8 @@ mod tests {
 
     use super::{
         CommitReceipt, CommitUnknownEvidence, DurableAuditError, DurableAuditLog, DurableAuditView,
-        MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES, MAX_JOURNAL_BYTES, PRIVATE_FILE_MODE,
+        MAX_COMMIT_RECEIPT_BYTES, MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES, MAX_JOURNAL_BYTES,
+        PRIVATE_FILE_MODE,
         decode_attempt_payload, durable_lock_name, encode_attempt_payload,
         validate_owner_and_permissions,
     };
@@ -2932,6 +2958,42 @@ mod tests {
             ),
             Err(DurableAuditError::RecordTooLarge(
                 MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn commit_receipt_is_non_empty_and_bounded_before_payload_allocation() {
+        let journal = TestJournal::new();
+        let log = DurableAuditLog::create(&journal.path).expect("journal creation must sync");
+
+        let empty_attempt = AttemptId::from_u64(0);
+        begin(&log, empty_attempt.as_u64());
+        assert!(matches!(
+            log.finish_attempt(
+                empty_attempt,
+                AttemptOutcome::Committed,
+                Some(&CommitReceipt::new(empty_attempt, Vec::new())),
+                None,
+            ),
+            Err(DurableAuditError::InvalidRecord(message))
+                if message == "commit receipt token cannot be empty"
+        ));
+
+        let oversized_attempt = AttemptId::from_u64(1);
+        begin(&log, oversized_attempt.as_u64());
+        assert_eq!(
+            log.finish_attempt(
+                oversized_attempt,
+                AttemptOutcome::Committed,
+                Some(&CommitReceipt::new(
+                    oversized_attempt,
+                    vec![0x5a; MAX_COMMIT_RECEIPT_BYTES + 1],
+                )),
+                None,
+            ),
+            Err(DurableAuditError::RecordTooLarge(
+                MAX_COMMIT_RECEIPT_BYTES + 1
             ))
         );
     }

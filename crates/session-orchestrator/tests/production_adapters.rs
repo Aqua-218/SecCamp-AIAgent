@@ -200,9 +200,7 @@ impl FileSystem for TestFileSystem {
         let expected_workspace = session_jail_root()
             .join("workspace")
             .join(expected_workspace_id().to_string());
-        let expected_image = session_jail_root()
-            .join("workspace")
-            .join(format!("{}.ext4", expected_workspace_id()));
+        let expected_image = session_jail_root().join("workspace").join("workspace.ext4");
         if workspace != expected_workspace
             || image != expected_image
             || size_bytes != 64 * 1024 * 1024
@@ -405,8 +403,7 @@ impl ApiClient for TestApi {
         vsock_uds_path: &Path,
         guest_cid: u32,
     ) -> Result<(), RuntimeError> {
-        let expected_workspace =
-            PathBuf::from(format!("/workspace/{}.ext4", expected_workspace_id()));
+        let expected_workspace = PathBuf::from("/workspace/workspace.ext4");
         if workspace_path != expected_workspace
             || vsock_uds_path != Path::new("/run/vsock.sock")
             || guest_cid != 3
@@ -808,9 +805,7 @@ fn assert_successful_restore_observations(
             session_jail_root()
                 .join("workspace")
                 .join(workspace_id.to_string()),
-            session_jail_root()
-                .join("workspace")
-                .join(format!("{workspace_id}.ext4")),
+            session_jail_root().join("workspace").join("workspace.ext4"),
             64 * 1024 * 1024,
         )]
     );
@@ -841,7 +836,7 @@ fn assert_successful_restore_observations(
             .expect("restore-verification log must not be poisoned")
             .as_slice(),
         [(
-            PathBuf::from(format!("/workspace/{workspace_id}.ext4")),
+            PathBuf::from("/workspace/workspace.ext4"),
             PathBuf::from("/run/vsock.sock"),
             3,
         )]

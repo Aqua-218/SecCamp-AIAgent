@@ -6,7 +6,7 @@
 
 > **対象読者:** crate をまたぐ変更を設計する人、統合順序と未接続の境界をレビューする人、この repository に初めて入る実装者
 
-crate ごとの文書は、その境界の内側を詳しく書いている。足りないのは、8 つの crate が実行時にどう並び、どの線が本物のコードで、どの線がまだ図の中にしか無いかを一度に見られる場所である。
+crate ごとの文書は、その境界の内側を詳しく書いている。足りないのは、8 つの crate、deployable な one-session host daemon、immutable guest image の composition が実行時にどう並ぶかを一度に見られる場所である。
 
 個別ページと食い違ったら、個別ページのほうを正とする。ここは配置図であって仕様ではない。
 
@@ -42,10 +42,10 @@ flowchart TB
     fcrt ==>|"identity 注入 / workload gate"| sup
     fcproc ==>|"boot"| sup
     fcrt --> ws
-    orch -.->|"root capability の受け渡し"| sup
+    orch -->|"production lease / digest-bound v2 identity"| sup
     sup --> akg
     capfs --> akg
-    sup -.->|"RuntimeResources"| iso
+    sup -->|"RuntimeResources"| iso
     iso ==>|"execve"| wl
     wl ==>|"file syscall / FUSE"| capfs
     wl ==>|"制御 RPC"| sup
@@ -72,7 +72,7 @@ flowchart TB
 |---|---|
 | 細い実線 | 同一プロセス内の関数呼び出し。型で繋がっている |
 | 太い実線 | プロセスや VM をまたぐ。syscall、socket、HTTP のいずれか |
-| 点線 | 設計上は必要だが、まだ繋ぐコードが無い。詳細は[まだコードになっていない線](#まだコードになっていない線) |
+| 点線 | 図に残る場合は実装不足ではなく、実装済み境界の実機検証が別途必要であることを示す。未検証項目は[実装と証拠の境界](#実装と証拠の境界)に集約する |
 
 ## 境界を越える手段は 5 種類しかない
 
@@ -94,43 +94,45 @@ guest に `virtio-net` は付かない。外へ出る経路が vsock 1 本しか
 
 ```mermaid
 flowchart BT
-    ac["authority-core<br/>10,558 行"]
-    ep["egress-protocol<br/>2,957 行"]
-    eb["egress-broker<br/>3,852 行"]
-    cf["capfs<br/>10,810 行"]
-    sv["supervisor<br/>2,268 行"]
-    fr["firecracker-runtime<br/>4,028 行"]
-    ri["runtime-isolation<br/>2,753 行"]
-    so["session-orchestrator<br/>6,379 行"]
+    ac["authority-core"]
+    ep["egress-protocol"]
+    eb["egress-broker"]
+    cf["capfs"]
+    sv["supervisor"]
+    fr["firecracker-runtime"]
+    ri["runtime-isolation"]
+    so["session-orchestrator"]
 
     ep --> ac
     cf --> ac
     sv --> ac
     eb --> ac
     eb --> ep
+    fr --> ac
+    fr --> ep
     so --> ac
     so --> eb
     so --> fr
 
     classDef leaf fill:#455a64,color:#fff,stroke:#263238;
-    class cf,sv,ri leaf;
+    class ac,ri leaf;
 ```
 
-灰色の 3 つは、どの crate からも依存されていない。`firecracker-runtime` と `runtime-isolation` は `authority-core` すら参照せず、前者は `rustix` と `sha2`、後者は `libc` だけで立っている。
+依存グラフの矢印は「依存する側 → 依存先」である。`authority-core` と `runtime-isolation` が依存木の葉で、`supervisor` は `capfs` を、`firecracker-runtime` は `authority-core` / `egress-protocol` を、`session-orchestrator` は Firecracker と Broker を参照する。実行時の supervisor → launcher → runtime-isolation の接続は Cargo の直接依存ではなく、immutable guest image に固定した executable path と inherited gate で構成される。
 
-deployable host daemon は無く、guest の CapabilityKernel / capfs / supervisor / runtime-isolation を一つの session として組み立てる init も無い。host 側には `ProductionSessionRuntimeBuilder` があるが、これは library composition root である。[`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は実 VM 内の identity/workload gate 専用 PID 1 であり、任意 command、credential、authority body を host から受け取らないため、配置図の guest supervisor の代替ではない。
+`host-sessiond` は `ProductionSessionRuntimeBuilder`、実 workspace/Broker/Firecracker/authority backend を組み立てる deployable one-session daemon で、systemd unit と environment manifest も `deploy/` / `service/` にある。guest 側には [`guest-supervisor-init`](../../crates/supervisor/src/bin/guest-supervisor-init.rs) があり、固定 image の repository/effect/path policy から guest `CapabilityKernel`、CapFS runtime、`LinuxHostResources` を組み立て、`workload-isolation-launcher` へ接続する。[`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) はその前段の PID 1 gate として、host-originated identity injection と image-configured supervisor release だけを受け付ける。どちらも host から任意 command、credential、authority body を受け取らない。
 
-これは書き忘れではなく順序の結果で、[実装順序](implementation-plan.md)が「Authority core と capfs をホスト上で確定してから統合する」という並びを選んでいる。ただし、そのぶん「crate 単体の test が通ること」と「システムが動くこと」の距離は、依存グラフを見ただけでは分からない。
+この構成は実装済みで、production と同じ v2 policy-digest-bound guest gate と guest supervisor composition は実 KVM でも確認している。ただし `Runtime::launch` の実 jailer/workspace/snapshot lifecycle、`rootfs.source == "/"` の privileged probe、mount rollback は別の未検証境界として残る。crate 単体の test が通ることとシステム全体の実機証拠を混同しない。
 
 ## 副作用は 1 つの API に集まる
 
-file を書く経路と外部へ出る経路は、途中はまったく別物だが、最後は同じ [`CapabilityKernel::authorize_and_commit`](../../crates/authority-core/src/kernel.rs) に入る。この関数を呼ぶのは 3 箇所しかない。
+file を書く経路と外部へ出る経路は、別 process の local kernel を通るが、いずれも [`CapabilityKernel::authorize_all_and_execute_classified`](../../crates/authority-core/src/kernel.rs) の read-guard/commit 規則を使う。host 側の Broker root と guest root は policy digest-bound v2 の lease/control gate で結ばれ、guest に host credential や authority body を渡さない。
 
 | 呼ぶ側 | 何を commit するか |
 |---|---|
-| [`capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs) | FUSE operation。backing への実 I/O が commit point |
-| [`egress-broker/src/dispatch.rs`](../../crates/egress-broker/src/dispatch.rs) | 型付き adapter の呼び出し。HTTPS request か GitHub 操作 |
-| [`session-orchestrator/src/authority_backend.rs`](../../crates/session-orchestrator/src/authority_backend.rs) | root capability の発行と revoke |
+| [`capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs) | guest FUSE operation。backing への実 I/O が commit point |
+| [`egress-broker/src/dispatch.rs`](../../crates/egress-broker/src/dispatch.rs) | host の型付き adapter 呼び出し。HTTPS request か GitHub 操作 |
+| [`session-orchestrator/src/authority_backend.rs`](../../crates/session-orchestrator/src/authority_backend.rs) | host root binding の発行、policy digest、revoke/subject close |
 
 ```mermaid
 sequenceDiagram
@@ -144,7 +146,7 @@ sequenceDiagram
     Note over W,X: file 経路
     W->>F: FUSE_WRITE(nodeid, fh, data)
     F->>F: ObjectId から現在 path を引く
-    F->>K: authorize_and_commit(WriteData, path)
+    F->>K: authorize_all_and_execute_classified(WriteData, path)
     K->>X: read guard を保持したまま write
     X-->>K: 書けた byte 数
     K-->>F: commit receipt
@@ -153,7 +155,7 @@ sequenceDiagram
     Note over W,X: egress 経路
     W->>S: 閉じた集合の操作を要求
     S->>B: frame → canonical CBOR → replay → budget
-    B->>K: authorize_and_commit(HttpFetch / GitHub)
+    B->>K: authorize_and_execute_classified(HttpFetch / GitHub)
     K->>X: read guard を保持したまま TLS request
     X-->>K: 型付き response
     K-->>B: commit receipt
@@ -161,15 +163,13 @@ sequenceDiagram
     S-->>W: 型付き response
 ```
 
-要点は guard の保持区間が揃っていること。認可してから効果が確定するまで Capability の read guard を離さないので、その間に走った revoke は待たされる。[revoke の約束](README.md#revoke-の約束)が経路によらず成立するのは、この 1 箇所に集めているからで、4 番目の呼び出し側を足すときは同じ規則を守らせる必要がある。詳細は [Authorization guard](../authority-core/authorization-guard.md)。
+要点は guard と revoke completion の保持区間が揃っていること。`authorize_all_and_execute_classified` は認可から effect の linearization point まで read guard を保持し、`revoke_held_by` は exclusive transition と observer propagation を完了してから返る。subject close は authorization epoch を進め、open handle が無くなるまで `finish_subject_close` を成功にしない。session owner は capability revoke → VM kill → Broker close の順に cleanup stage を進め、VM kill と Broker close が済むまで workspace isolation/reuse を許さず、失敗時は `Stopping` に残して未完了 stage だけを retry する。詳細は [Authorization guard](../authority-core/authorization-guard.md) と [状態機械と revoke](state-and-revocation.md)。
 
 ## Capability Kernel は今いくつあるのか
 
 配置図に `CapabilityKernel` を 2 つ描いたのは、現在のコードがそう読めるからである。`capfs` は `Arc<CapabilityKernel>` を受け取り、Broker の `CapabilityExecutor` も `CapabilityKernel` の impl で、どちらも同一プロセス内の instance を前提にしている。capfs は guest で、Broker は host で動く。同じ instance にはなりようがない。
 
-一方 `authority_core::state` の revoke と `auth_epoch` は、1 つの `CapabilityState` を直列化することで成り立っている。instance が 2 つあるなら、guest 側 revoke が host 側 Broker の判定へどう伝わるかを決めなければならない。今のところ、その経路はコードにも文書にも無い。
-
-取りうる形は 2 つある。root を guest 側 kernel だけに置いて Broker には guest が毎回 capability を提示する形と、host 側を正として guest 側を cache 扱いにし `auth_epoch` で無効化する形。後者は cache を持つ実装が epoch を key に含めるという[用語集](../glossary.md)の規約と噛み合う。どちらを採るかは ADR で決める話で、ここで決めない。
+`authority_core::state` の revoke と `auth_epoch` は各 `CapabilityState` を直列化する。host 側では `AuthorityCoreBackend` が guest/Broker binding を同じ host kernel に登録し、両方を revoke/close する。guest 側の固定 image は独自の guest kernel/CapFS を持つため、host lease の `AuthorityPolicyDigest` と guest-control v2 の canonical request/ack が境界を束縛し、production workload release は unbound lease/v1 API を拒否する。guest が応答しない場合の session-level completion は guest ACK ではなく VM/cgroup termination と owner の cleanup barrier によって閉じる。guest policy body 自体を host transport で受け渡す設計ではない。
 
 ## session の時間軸
 
@@ -181,26 +181,26 @@ startup は 4 つの state machine が噛み合って進む。orchestrator が c
 | `WorkspaceCloned` | — | capfs の backing になる tree を clone。symlink と hard link は許さない |
 | `BrokerEstablished` | — | 新しい `BrokerSessionId`、sequence は 0 から、replay guard も作り直す |
 | `VmStarted` | `RestoredStopped` → `IdentityRegenerated` | pre-session snapshot を restore し、128-bit の identity を 5 つ作り直す |
-| `RootCapabilityInjected` | `IdentityInjected` | `/actions/inject-identity` が 5 つの ID の hex を渡す。host 側では subject 登録と root 発行 |
-| `WorkloadReleased` | `Running` | 13 step の isolation receipt が揃ってから `execve` |
+| `RootCapabilityInjected` | `IdentityInjected` | production は `/actions/inject-identity-v2` へ policy encoding version + digest + 5 IDs を canonical に渡し、`identity-injected-v2` ACK を受ける。v1 は compatibility-only |
+| `WorkloadReleased` | `Running` | production は同じ bound digest を `/actions/start-workload-v2` へ渡し、`workload-started-v2` ACK を受けてから 13 step isolation の `execve` を許す。v1 は compatibility-only |
 | `Running` | `Running` | 定常 |
 
 **session は VM の起動ではなく restore から始まる。** `launch` が返すのは `WorkloadStopped` で、そこから `Running` へ抜ける遷移は `RuntimeState` に無い。`launch` の 5 本の PUT と `InstanceStart` は、snapshot 元になる VM を 1 つ作るための経路であって、session ごとに通る道ではない。session を増やすときに毎回払うのは restore と identity 再生成のコストになる。
 
-`RuntimeState::Running` も「VM が動いている」ではなく「workload の実行が明示的に許可された」を指す。VM 自体は restore の時点で立っている。state 名を条件に何かを判断するコードを書く前に、[snapshot と identity gate](../firecracker-runtime/snapshot-and-identity.md)を読む。
+`RuntimeState::Running` も「VM が動いている」ではなく「workload の実行が明示的に許可された」を指す。VM 自体は restore の時点で立っている。snapshot 作成時は `WorkloadStopped` から Firecracker の pause acknowledgement を受けて `SnapshotPaused` へ遷移し、write failure でも paused/unknown を再利用しない。state 名を条件に何かを判断するコードを書く前に、[snapshot と identity gate](../firecracker-runtime/snapshot-and-identity.md)を読む。
 
 restore 元に session-scoped identity が残っていれば、backend を呼ぶ前に startup 自体を拒否する。snapshot を取れるのも `WorkloadStopped` の VM だけなので、snapshot に「workload が走った後の memory」が入ることはない。
 
 停止は逆順で、どこが失敗しても後段を諦めない。ただし 1 箇所だけ例外がある。
 
 ```text
-root capability revoke
-  -> Firecracker VM kill
+root capability revoke + host authority completion
+  -> Firecracker VM kill / cgroup termination
   -> Broker close
   -> workspace isolation
   -> Closed
 
-VM kill が失敗したときだけ workspace isolation を実行しない。
+revoke が in-flight effect の linearization を待って返り、VM kill と Broker close が成功したときだけ workspace isolation を実行する。
 生きた VM が掴んだままの tree を、別 session へ配り直さないため。
 ```
 
@@ -222,20 +222,19 @@ orchestrator が割り当てる 7 種の 128-bit identity は、境界を越え�
 
 orchestrator の `SubjectId` と `authority_core` の `SubjectId` は名前が同じで別の型である。adapter がこの写像を持ち、別 session の capability が lease を満たせないようにする。ただし[契約](../session-orchestrator/contracts.md)が明記しているとおり、これは検出であって防止ではない。lease を正しい identity で作る責任は backend 側に残る。
 
-## まだコードになっていない線
+## 実装と証拠の境界
 
-配置図の点線と、太線のうち実機で動かしていないものを一覧にする。「実装済み」と「実機で確認済み」を混同しないための表なので、繋いだら行を消す。
+配置図の実装済みの線と、実機で動かしていない境界を分けて一覧にする。「実装済み」と「実機で確認済み」を混同しないための表である。
 
 | 線 | 現状 | 繋ぐのに要るもの |
 |---|---|---|
-| supervisor → runtime-isolation | `RuntimeResources` の実装が無い。`supervisor` の依存に `runtime-isolation` が入っていない | 13 step を呼ぶ backend 実装と、child process 側で `apply` を開始する起動経路 |
-| orchestrator → capfs | [契約](../session-orchestrator/contracts.md)が `ImportedRepository::open` → `CapabilityFilesystem::new` → `spawn_mount` の順序を書いているが、`session-orchestrator` の依存に `capfs` が無い | workspace adapter の実装。ただし mount するのは guest 側なので、host adapter が直接呼ぶ形でよいかは未決 |
-| root capability の受け渡し | `/actions/inject-identity` が送るのは 5 つの ID の hex だけで、authority body は含まれない | guest supervisor の trusted control channel と、その上の型 |
-| guest 側 kernel の生成 | identity/workload gate 用の `guest-control-init` はあるが、`Arc<CapabilityKernel>` を作って capfs と supervisor へ配る主体は無い | authority policy を受け取る trusted guest init と、その上の型 |
-| host の vsock listener | [`server.rs`](../../crates/egress-broker/src/server.rs) に `serve_expected_peer` があり、accept から dispatch までは実装済み。ただし test は `Cursor` 上で、実 `AF_VSOCK` の bind / accept は一度も通っていない | 実 VM と実 vsock を伴う統合 test |
-| Firecracker の実起動 | [`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) が実 Firecracker、dm-verity rootfs、guest `AF_VSOCK` control を通す | `Runtime::launch` 経由の実 jailer、workspace drive、snapshot restore |
+| supervisor → runtime-isolation | `guest-supervisor-init` → `LinuxHostResources` → image-configured `workload-isolation-launcher` の inherited start gate と close-on-exec acknowledgement が実装済み | privileged probe は launcher/exec を直接通さない。`rootfs.source == "/"` と post-exec の別実機証拠 |
+| guest composition | `guest-supervisor-init` が固定 policy から guest kernel/CapFS/control/workload を組み立て、readiness marker を返す | real KVM runtime image はこの composition を起動するが、全 CapFS effect を証明するものではない |
+| authority binding | `AuthorityPolicyDigest`、v2 canonical request/ack、bound lease、v1 compatibility parser は実装済み。production workload release は policy-bound lease を要求する | direct real KVM test で v2 digest-bound injection/start と exact ACK を確認済み。`Runtime::launch` lifecycle との一体試験は別境界 |
+| host の vsock/UDS listener | `FirecrackerUnixListener` は private path、CID、Linux `SO_PEERCRED` の UID/GID/PID を検査して fail closed。deadline-aware transport API も実装済み | direct `AF_VSOCK` bind/accept、production owner の absolute connection-deadline wiring、長時間/並行 stream |
+| Firecracker の実起動 | [`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) が実 Firecracker、dm-verity rootfs、guest runtime image、guest Broker channel を通す | `Runtime::launch` 経由の実 jailer、workspace drive、snapshot restore、resource rollback |
 
-`authority-core` と `capfs` の内側は、この表とは検証の水準が違う。前者は Rust と Lean の 150 件共通 corpus と loom、後者は `/dev/fuse` がある環境での実 mount test まで通っている。crate ごとの正確な線引きは各 [検証対応表](verification.md)を見る。
+`authority-core` と `capfs` の内側は、この表とは検証の水準が違う。前者は Rust と Lean の共通 corpus と loom、後者は `/dev/fuse` がある環境での実 mount test まで通っている。crate ごとの正確な線引きは各 [検証対応表](verification.md)を見る。
 
 ## どの箱がどの文書か
 

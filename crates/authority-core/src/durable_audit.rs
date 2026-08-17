@@ -2127,25 +2127,8 @@ fn decode_attempt_payload(payload: &[u8]) -> Result<DurableAttemptMetadata, Dura
 }
 
 fn decode_file_effect(tag: u8) -> Result<FileEffect, DurableAuditError> {
-    // Written as `effect as u8`, so this match is the only thing keeping the two in step.
-    match tag {
-        0 => Ok(FileEffect::ReadData),
-        1 => Ok(FileEffect::ListDirectory),
-        2 => Ok(FileEffect::WriteData),
-        3 => Ok(FileEffect::Truncate),
-        4 => Ok(FileEffect::CreateFile),
-        5 => Ok(FileEffect::CreateDirectory),
-        6 => Ok(FileEffect::RemoveFile),
-        7 => Ok(FileEffect::RemoveDirectory),
-        8 => Ok(FileEffect::Rename),
-        9 => Ok(FileEffect::SetMetadata),
-        10 => Ok(FileEffect::ReadLink),
-        11 => Ok(FileEffect::CreateSymlink),
-        12 => Ok(FileEffect::CreateHardLink),
-        _ => Err(invalid_payload(&format!(
-            "attempt payload holds unknown file effect {tag}"
-        ))),
-    }
+    FileEffect::from_tag(tag)
+        .ok_or_else(|| invalid_payload(&format!("attempt payload holds unknown file effect {tag}")))
 }
 
 fn decode_http_method(tag: u8) -> Result<HttpFetchMethod, DurableAuditError> {
@@ -2235,7 +2218,7 @@ fn encode_authority_request(
         AuthorityRequest::File(request) => {
             writer.byte(1);
             writer.string(request.repository().as_str())?;
-            writer.byte(request.effect() as u8);
+            writer.byte(request.effect().tag());
             writer.u32(
                 u32::try_from(request.path().as_segments().len()).map_err(|_| {
                     DurableAuditError::RecordTooLarge(request.path().as_segments().len())
@@ -3222,6 +3205,41 @@ mod tests {
         assert_eq!(decoded.capability_id(), &capability);
         assert_eq!(decoded.authorization_epoch(), epoch);
         assert_eq!(decoded.requests(), &requests);
+    }
+
+    #[test]
+    fn attempt_payload_round_trips_each_file_effect_tag() {
+        let caller = SubjectId::new("subject-a");
+        let capability = CapId::new("capability-a");
+        let epoch = AuthorizationEpoch::from_u64(42);
+
+        for effect in FileEffect::ALL {
+            let request = CapabilityRequest::new(
+                MonotonicTime::from_ticks(7),
+                AuthorityRequest::File(FileRequest::new(
+                    RepoId::new("workspace"),
+                    effect,
+                    CanonicalPath::new(["src", "main.rs"]).expect("canonical test path"),
+                )),
+            );
+            let requests = CapabilityRequestSet::one(request);
+            let payload = encode_attempt_payload(11, &caller, &capability, &requests, epoch)
+                .expect("every closed file effect must encode");
+            let decoded =
+                decode_attempt_payload(&payload).expect("every closed file effect tag must decode");
+
+            assert_eq!(decoded.requests(), &requests);
+            match decoded
+                .requests()
+                .iter()
+                .next()
+                .expect("one request must be present")
+                .authority()
+            {
+                AuthorityRequest::File(request) => assert_eq!(request.effect(), effect),
+                _ => panic!("the fixture is a file request"),
+            }
+        }
     }
 
     #[test]

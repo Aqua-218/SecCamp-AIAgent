@@ -31,7 +31,9 @@ use rustix::{
 
 const LANDLOCK_ABI: u32 = 3;
 const ISOLATION_READY: &[u8; 8] = b"isolated";
-const EXEC_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+const ISOLATION_ERROR_PREFIX: &[u8; 28] = b"workload-isolation-error/v1:";
+const MAX_ISOLATION_ERROR_BYTES: usize = 768;
+const EXEC_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 const EXEC_FAILED: [u8; 1] = [1];
 const EGRESS_BROKER_FD_ENV: &str = "EGRESS_BROKER_FD";
 const EGRESS_BROKER_SESSION_ENV: &str = "EGRESS_BROKER_SESSION_ID";
@@ -52,10 +54,26 @@ fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
+            // Stdout is the private inherited start gate.  A bounded failure record lets the
+            // supervisor distinguish a typed isolation failure from an unexplained EOF.
+            let _ = signal_startup_failure(&mut io::stdout(), &error);
             eprintln!("workload-isolation-launcher: {error}");
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+fn signal_startup_failure(writer: &mut impl Write, error: &str) -> io::Result<()> {
+    writer.write_all(ISOLATION_ERROR_PREFIX)?;
+    for byte in error.bytes().take(MAX_ISOLATION_ERROR_BYTES) {
+        writer.write_all(&[if byte.is_ascii_graphic() || byte == b' ' {
+            byte
+        } else {
+            b'?'
+        }])?;
+    }
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 fn run() -> Result<(), String> {
@@ -604,5 +622,21 @@ mod tests {
         assert!(wait_for_exec(&mut io::Cursor::new(Vec::<u8>::new())).is_ok());
         assert!(wait_for_exec(&mut io::Cursor::new(EXEC_FAILED)).is_err());
         assert!(wait_for_exec(&mut io::Cursor::new([7])).is_err());
+    }
+
+    #[test]
+    fn startup_failure_record_is_bounded_printable_and_not_a_success_attestation() {
+        let mut bytes = Vec::new();
+        signal_startup_failure(&mut bytes, &format!("bad\n{}", "x".repeat(2048)))
+            .expect("failure record must be writable");
+        assert!(bytes.starts_with(ISOLATION_ERROR_PREFIX));
+        assert_eq!(
+            bytes.len(),
+            ISOLATION_ERROR_PREFIX.len() + MAX_ISOLATION_ERROR_BYTES + 1
+        );
+        assert_eq!(bytes[ISOLATION_ERROR_PREFIX.len() + 3], b'?');
+        assert!(!bytes.starts_with(ISOLATION_READY));
+        assert!(bytes[..bytes.len() - 1].iter().all(u8::is_ascii_graphic));
+        assert_eq!(bytes.last(), Some(&b'\n'));
     }
 }

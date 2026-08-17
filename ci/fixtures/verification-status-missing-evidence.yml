@@ -1,0 +1,14 @@
+schema: verification-status/v1
+claims:
+  - id: fixture-missing-evidence
+    component: fixture
+    scope: hosted
+    status: unverified
+    summary: This fixture intentionally omits evidence entries.
+    evidence:
+      commands: []
+      sources:
+        - crates/authority-core/src
+      tests: []
+    residual_reasons:
+      - Fixture must be rejected because evidence is incomplete.

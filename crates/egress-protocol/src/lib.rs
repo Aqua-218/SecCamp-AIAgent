@@ -9,6 +9,7 @@
 
 pub mod budget;
 pub mod cbor;
+pub mod client;
 pub mod frame;
 pub mod operation;
 pub mod response;

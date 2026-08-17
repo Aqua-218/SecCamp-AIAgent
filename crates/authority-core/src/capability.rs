@@ -9,6 +9,14 @@ use crate::{
     time::{MonotonicTime, TimeWindow},
 };
 
+/// Maximum number of independently required authority checks in one effect.
+///
+/// Constructors stop consuming an iterator at this boundary and mark the set
+/// incomplete. The kernel rejects incomplete sets before audit or execution,
+/// preventing an unbounded caller-controlled iterator from becoming memory
+/// growth or from silently dropping required authorization checks.
+pub const MAX_REQUESTS_PER_EFFECT: usize = 16;
+
 /// An opaque, session-unique capability identity assigned by the host.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CapId(String);
@@ -255,6 +263,7 @@ impl CapabilityRequest {
 pub struct CapabilityRequestSet {
     first: CapabilityRequest,
     additional: Vec<CapabilityRequest>,
+    complete: bool,
 }
 
 impl CapabilityRequestSet {
@@ -264,6 +273,7 @@ impl CapabilityRequestSet {
         Self {
             first: request,
             additional: Vec::new(),
+            complete: true,
         }
     }
 
@@ -273,9 +283,16 @@ impl CapabilityRequestSet {
         first: CapabilityRequest,
         additional: impl IntoIterator<Item = CapabilityRequest>,
     ) -> Self {
+        let mut additional = additional.into_iter();
+        let bounded = additional
+            .by_ref()
+            .take(MAX_REQUESTS_PER_EFFECT - 1)
+            .collect();
+        let complete = additional.next().is_none();
         Self {
             first,
-            additional: additional.into_iter().collect(),
+            additional: bounded,
+            complete,
         }
     }
 
@@ -295,6 +312,27 @@ impl CapabilityRequestSet {
     #[must_use]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &CapabilityRequest> {
         std::iter::once(&self.first).chain(self.additional.iter())
+    }
+
+    /// Returns the bounded number of retained requests.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        1 + self.additional.len()
+    }
+
+    /// Returns `false`; a request set always contains its first request.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Returns whether the constructor observed the iterator's complete end.
+    ///
+    /// An incomplete set exceeded [`MAX_REQUESTS_PER_EFFECT`] and must never be
+    /// audited or authorized because doing so would omit caller-supplied checks.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.complete
     }
 }
 
@@ -352,7 +390,8 @@ pub fn weaker_than(child: &Capability, parent: &Capability) -> bool {
 mod tests {
     use super::{
         AuthorityBody, AuthorityRequest, CapId, Capability, CapabilityMetadata, CapabilityRequest,
-        IssuerId, SubjectId, capability_matches, weaker_than,
+        CapabilityRequestSet, IssuerId, MAX_REQUESTS_PER_EFFECT, SubjectId, capability_matches,
+        weaker_than,
     };
     use crate::{
         file::{FileAuthority, FileEffect, FileEffects, FileRequest},
@@ -482,6 +521,18 @@ mod tests {
         assert_eq!(metadata.issuer().as_str(), "issuer-child");
         assert_eq!(metadata.parent().map(CapId::as_str), Some("cap-parent"));
         assert!(metadata.is_delegable());
+    }
+
+    #[test]
+    fn compound_request_set_stops_consuming_and_marks_an_excess_as_incomplete() {
+        let request = file_request(7, FileEffect::ReadData, path(&["src", "lib.rs"]));
+        let requests = CapabilityRequestSet::new(
+            request.clone(),
+            std::iter::repeat_n(request, MAX_REQUESTS_PER_EFFECT + 100),
+        );
+
+        assert_eq!(requests.len(), MAX_REQUESTS_PER_EFFECT);
+        assert!(!requests.is_complete());
     }
 
     #[test]

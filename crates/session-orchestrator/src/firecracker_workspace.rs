@@ -844,6 +844,9 @@ mod tests {
         }
     }
 
+    // The scenario is one uninterrupted lifecycle: splitting it into helpers would hide the
+    // ordering this test exists to pin down.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn block_device_lifecycle_is_session_bound_and_forwarded_exactly() {
         let state = Arc::new(Mutex::new(FakeState::default()));

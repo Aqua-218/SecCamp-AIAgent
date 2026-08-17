@@ -8,12 +8,12 @@
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
 use session_orchestrator::{
-    BackendError, BrokerBackend, BrokerLease, CapabilityBackend, CapabilityLease,
-    CapabilityRevocationBackend, CleanupStage, CryptographicRandom, EntropyError, IdentityKind,
-    IdentityLedger, LedgerError, LifecycleState, SessionId, SessionInfo, SessionOrchestrator,
-    SnapshotDescriptor, SnapshotId, SnapshotIdentity, StartFailure, StartStage, StopError,
-    VmBackend, VmLease, WorkloadBackend, WorkloadLease, WorkspaceBackend, WorkspaceId,
-    WorkspaceLease, WorkspaceTemplateId,
+    BackendError, BrokerBackend, BrokerLease, BrokerSessionId, CapabilityBackend, CapabilityId,
+    CapabilityLease, CapabilityRevocationBackend, CleanupStage, CryptographicRandom, EntropyError,
+    IdentityKind, IdentityLedger, LedgerError, LifecycleState, SessionId, SessionInfo,
+    SessionOrchestrator, SnapshotDescriptor, SnapshotId, SnapshotIdentity, StartFailure,
+    StartStage, StopError, SubjectId, VmBackend, VmId, VmLease, WorkloadBackend, WorkloadLease,
+    WorkspaceBackend, WorkspaceId, WorkspaceLease, WorkspaceTemplateId,
 };
 
 #[derive(Clone, Default)]
@@ -88,6 +88,7 @@ struct MockWorkspace {
     fail_clone: bool,
     fail_isolate: bool,
     foreign_session: Option<SessionId>,
+    foreign_workspace: Option<WorkspaceId>,
 }
 
 impl WorkspaceBackend for MockWorkspace {
@@ -102,7 +103,7 @@ impl WorkspaceBackend for MockWorkspace {
         }
         Ok(WorkspaceLease::new(
             self.foreign_session.unwrap_or(identity.session_id()),
-            identity.workspace_id(),
+            self.foreign_workspace.unwrap_or(identity.workspace_id()),
         ))
     }
 
@@ -122,6 +123,7 @@ struct MockBroker {
     fail_running_check: bool,
     fail_close: bool,
     foreign_session: Option<SessionId>,
+    foreign_broker_session: Option<BrokerSessionId>,
 }
 
 impl BrokerBackend for MockBroker {
@@ -135,7 +137,8 @@ impl BrokerBackend for MockBroker {
         }
         Ok(BrokerLease::new(
             self.foreign_session.unwrap_or(identity.session_id()),
-            identity.broker_session_id(),
+            self.foreign_broker_session
+                .unwrap_or(identity.broker_session_id()),
         ))
     }
 
@@ -203,6 +206,8 @@ struct MockCapability {
     fail_inject: bool,
     fail_revoke: bool,
     foreign_session: Option<SessionId>,
+    foreign_subject: Option<SubjectId>,
+    foreign_capability: Option<CapabilityId>,
 }
 
 impl CapabilityRevocationBackend for MockCapability {
@@ -227,8 +232,8 @@ impl CapabilityBackend<u64> for MockCapability {
         }
         Ok(CapabilityLease::new(
             self.foreign_session.unwrap_or(identity.session_id()),
-            identity.subject_id(),
-            identity.capability_id(),
+            self.foreign_subject.unwrap_or(identity.subject_id()),
+            self.foreign_capability.unwrap_or(identity.capability_id()),
         ))
     }
 }
@@ -238,6 +243,9 @@ struct MockWorkload {
     log: CallLog,
     fail_release: bool,
     foreign_session: Option<SessionId>,
+    foreign_vm: Option<VmId>,
+    foreign_subject: Option<SubjectId>,
+    foreign_capability: Option<CapabilityId>,
 }
 
 impl WorkloadBackend for MockWorkload {
@@ -253,9 +261,9 @@ impl WorkloadBackend for MockWorkload {
         }
         Ok(WorkloadLease::new(
             self.foreign_session.unwrap_or(identity.session_id()),
-            identity.vm_id(),
-            identity.subject_id(),
-            identity.capability_id(),
+            self.foreign_vm.unwrap_or(identity.vm_id()),
+            self.foreign_subject.unwrap_or(identity.subject_id()),
+            self.foreign_capability.unwrap_or(identity.capability_id()),
         ))
     }
 }
@@ -707,6 +715,80 @@ fn rollback_failure_is_reported_without_claiming_success() {
 }
 
 #[test]
+fn startup_rollback_reports_every_attempted_failure_and_omits_dependency_blocked_stages() {
+    let log = CallLog::default();
+    let mut workspace = MockWorkspace {
+        log: log.clone(),
+        fail_isolate: true,
+        ..MockWorkspace::default()
+    };
+    let mut broker = MockBroker {
+        log: log.clone(),
+        fail_close: true,
+        ..MockBroker::default()
+    };
+    let mut vm = MockVm {
+        log: log.clone(),
+        fail_kill: true,
+        ..MockVm::default()
+    };
+    let mut capability = MockCapability {
+        log: log.clone(),
+        fail_revoke: true,
+        ..MockCapability::default()
+    };
+    let mut workload = MockWorkload {
+        log: log.clone(),
+        fail_release: true,
+        ..MockWorkload::default()
+    };
+    let mut orchestrator = SessionOrchestrator::new(SequenceRandom::new(identity_values(66, 7)));
+
+    let error = orchestrator
+        .start_session(
+            &snapshot(),
+            &template(),
+            &7_u64,
+            &mut workspace,
+            &mut broker,
+            &mut vm,
+            &mut capability,
+            &mut workload,
+        )
+        .expect_err("workload and every attempted cleanup must fail");
+
+    assert_eq!(error.stage(), StartStage::WorkloadRelease);
+    assert_eq!(
+        error
+            .rollback_failures()
+            .iter()
+            .map(session_orchestrator::CleanupFailure::stage)
+            .collect::<Vec<_>>(),
+        vec![
+            CleanupStage::CapabilityRevoke,
+            CleanupStage::VmKill,
+            CleanupStage::BrokerClose
+        ]
+    );
+    assert_eq!(
+        log.values(),
+        vec![
+            "workspace.clone",
+            "broker.establish",
+            "vm.start",
+            "capability.inject",
+            "broker.ensure-running",
+            "workload.release",
+            "capability.revoke",
+            "vm.kill",
+            "broker.close"
+        ],
+        "workspace isolation must remain dependency-blocked until VM and Broker cleanup succeed"
+    );
+    assert_eq!(orchestrator.state(), LifecycleState::Stopping);
+}
+
+#[test]
 fn startup_rollback_failure_is_retained_for_stop_retry() {
     let log = CallLog::default();
     let mut workspace = MockWorkspace {
@@ -841,6 +923,215 @@ fn foreign_workspace_lease_isolates_the_clone_before_returning() {
         "the clone must be released and no later backend touched"
     );
     assert_eq!(orchestrator.state(), LifecycleState::Ready);
+}
+
+// Requirement: every backend lease field is bound to the freshly allocated
+// session identity, not merely to its outer SessionId. Category: identity
+// confinement. Risk: critical.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn same_session_lease_identity_mismatches_roll_back_each_committed_stage() {
+    {
+        let log = CallLog::default();
+        let mut workspace = MockWorkspace {
+            log: log.clone(),
+            foreign_workspace: Some(WorkspaceId::new([0xD1; 16])),
+            ..MockWorkspace::default()
+        };
+        let mut broker = MockBroker::default();
+        let mut vm = MockVm::default();
+        let mut capability = MockCapability::default();
+        let mut workload = MockWorkload::default();
+        let mut orchestrator =
+            SessionOrchestrator::new(SequenceRandom::new(identity_values(120, 7)));
+
+        let error = orchestrator
+            .start_session(
+                &snapshot(),
+                &template(),
+                &7_u64,
+                &mut workspace,
+                &mut broker,
+                &mut vm,
+                &mut capability,
+                &mut workload,
+            )
+            .expect_err("a mismatched workspace identity must fail closed");
+        assert_eq!(error.stage(), StartStage::WorkspaceClone);
+        assert!(matches!(
+            error.failure(),
+            StartFailure::LeaseIdentityMismatch(session_orchestrator::ResourceKind::Workspace)
+        ));
+        assert!(error.rollback_failures().is_empty());
+        assert_eq!(log.values(), vec!["workspace.clone", "workspace.isolate"]);
+        assert_eq!(orchestrator.state(), LifecycleState::Ready);
+    }
+
+    {
+        let log = CallLog::default();
+        let mut workspace = MockWorkspace {
+            log: log.clone(),
+            ..MockWorkspace::default()
+        };
+        let mut broker = MockBroker {
+            log: log.clone(),
+            foreign_broker_session: Some(BrokerSessionId::new([0xD2; 16])),
+            ..MockBroker::default()
+        };
+        let mut vm = MockVm::default();
+        let mut capability = MockCapability::default();
+        let mut workload = MockWorkload::default();
+        let mut orchestrator =
+            SessionOrchestrator::new(SequenceRandom::new(identity_values(130, 7)));
+
+        let error = orchestrator
+            .start_session(
+                &snapshot(),
+                &template(),
+                &7_u64,
+                &mut workspace,
+                &mut broker,
+                &mut vm,
+                &mut capability,
+                &mut workload,
+            )
+            .expect_err("a mismatched Broker identity must fail closed");
+        assert_eq!(error.stage(), StartStage::BrokerEstablishment);
+        assert!(matches!(
+            error.failure(),
+            StartFailure::LeaseIdentityMismatch(session_orchestrator::ResourceKind::Broker)
+        ));
+        assert!(error.rollback_failures().is_empty());
+        assert_eq!(
+            log.values(),
+            vec![
+                "workspace.clone",
+                "broker.establish",
+                "broker.close",
+                "workspace.isolate"
+            ]
+        );
+        assert_eq!(orchestrator.state(), LifecycleState::Ready);
+    }
+
+    {
+        let log = CallLog::default();
+        let mut workspace = MockWorkspace {
+            log: log.clone(),
+            ..MockWorkspace::default()
+        };
+        let mut broker = MockBroker {
+            log: log.clone(),
+            ..MockBroker::default()
+        };
+        let mut vm = MockVm {
+            log: log.clone(),
+            ..MockVm::default()
+        };
+        let mut capability = MockCapability {
+            log: log.clone(),
+            foreign_subject: Some(SubjectId::new([0xD3; 16])),
+            ..MockCapability::default()
+        };
+        let mut workload = MockWorkload::default();
+        let mut orchestrator =
+            SessionOrchestrator::new(SequenceRandom::new(identity_values(140, 7)));
+
+        let error = orchestrator
+            .start_session(
+                &snapshot(),
+                &template(),
+                &7_u64,
+                &mut workspace,
+                &mut broker,
+                &mut vm,
+                &mut capability,
+                &mut workload,
+            )
+            .expect_err("a mismatched capability identity must fail closed");
+        assert_eq!(error.stage(), StartStage::RootCapabilityInjection);
+        assert!(matches!(
+            error.failure(),
+            StartFailure::LeaseIdentityMismatch(session_orchestrator::ResourceKind::Capability)
+        ));
+        assert!(error.rollback_failures().is_empty());
+        assert_eq!(
+            log.values(),
+            vec![
+                "workspace.clone",
+                "broker.establish",
+                "vm.start",
+                "capability.inject",
+                "capability.revoke",
+                "vm.kill",
+                "broker.close",
+                "workspace.isolate"
+            ]
+        );
+        assert_eq!(orchestrator.state(), LifecycleState::Ready);
+    }
+
+    {
+        let log = CallLog::default();
+        let mut workspace = MockWorkspace {
+            log: log.clone(),
+            ..MockWorkspace::default()
+        };
+        let mut broker = MockBroker {
+            log: log.clone(),
+            ..MockBroker::default()
+        };
+        let mut vm = MockVm {
+            log: log.clone(),
+            ..MockVm::default()
+        };
+        let mut capability = MockCapability {
+            log: log.clone(),
+            ..MockCapability::default()
+        };
+        let mut workload = MockWorkload {
+            log: log.clone(),
+            foreign_vm: Some(VmId::new([0xD4; 16])),
+            ..MockWorkload::default()
+        };
+        let mut orchestrator =
+            SessionOrchestrator::new(SequenceRandom::new(identity_values(150, 7)));
+
+        let error = orchestrator
+            .start_session(
+                &snapshot(),
+                &template(),
+                &7_u64,
+                &mut workspace,
+                &mut broker,
+                &mut vm,
+                &mut capability,
+                &mut workload,
+            )
+            .expect_err("a mismatched workload identity must fail closed");
+        assert_eq!(error.stage(), StartStage::WorkloadRelease);
+        assert!(matches!(
+            error.failure(),
+            StartFailure::LeaseIdentityMismatch(session_orchestrator::ResourceKind::Workload)
+        ));
+        assert!(error.rollback_failures().is_empty());
+        assert_eq!(
+            log.values(),
+            vec![
+                "workspace.clone",
+                "broker.establish",
+                "vm.start",
+                "capability.inject",
+                "broker.ensure-running",
+                "workload.release",
+                "capability.revoke",
+                "vm.kill",
+                "broker.close",
+                "workspace.isolate"
+            ]
+        );
+        assert_eq!(orchestrator.state(), LifecycleState::Ready);
+    }
 }
 
 // Requirement: workspace isolation never runs while a live VM kill has failed.

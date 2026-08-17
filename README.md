@@ -90,9 +90,9 @@ flowchart TB
 
 ### まだ無いもの
 
-- **deployable host daemon は無い。** host 側には `ProductionSessionRuntimeBuilder` があるが、guest の CapabilityKernel / capfs / supervisor / runtime-isolation を一つの session として起動する guest init と、運用用 daemon entrypoint は無い。
-- **実 VM の境界は限定的に検証済み。** [`verify-real-guest-control.sh`](scripts/ci/verify-real-guest-control.sh) は KVM 上の実 Firecracker、実 dm-verity mapper、guest の `AF_VSOCK` identity gate に加え、guest→host の Firecracker per-port Unix socket と Broker の canonical `NotAuthorized` 往復まで確認する。一方、実 jailer、snapshot restore、外部 DNS / HTTPS / GitHub API、full isolation は未検証である。
-- **特権 isolation の実 syscall は未実行。** 13 step の apply / rollback は mock backend と純粋関数までしか動かしていない。
+- **運用に必要なものが揃っていない。** guest session は実 microVM 上で通しで動く（下記）が、operator が使う形にはなっていない。`host-sessiond` は 1 session 分の固定 configuration を受け取る daemon で、複数 session の受け付け、API、認証、監視、再起動時の復旧手順は無い。deployable な service image と environment manifest も無い。
+- **実 jailer、snapshot restore、外部 DNS / HTTPS / GitHub API は未検証。** 実 VM 検証が通るのは KVM 上の実 Firecracker、実 dm-verity mapper、guest session の完走までで、jailer 経由の起動と snapshot からの復元、および Broker から外部への実通信は確認していない。
+- **exec 後の境界と guest 経路の isolation は未検証。** 13 step は特権 host 上で実際に適用し、seccomp / Landlock / read-only rootfs / device masking / fd 一掃 / capability 剥奪が kernel に強制されていることを確認済みだが、確認範囲は staged rootfs 経路で `execve` を挟まない場合に限る。`rootfs.source == "/"` の guest 経路と、unmount による rollback は未検証。
 
 これは書き忘れではなく順序の結果で、[実装順序](docs/design/implementation-plan.md)が「Authority core と capfs を確定してから統合する」という並びを選んでいる。
 
@@ -101,6 +101,8 @@ flowchart TB
 - `authority-core` の権限判定は Rust と Lean 4 の二重実装で、[150 件の共通 corpus](tests/fixtures/authority-core.tsv) に対して両者の正規化済み判定が byte 単位で一致することを CI が要求する。
 - `authority-core` の認可と revoke の線形化は loom で探索し、positive / negative control 付きで検査している。
 - `capfs` は `/dev/fuse` がある環境で実 mount test まで通る。
+- **guest session は実 Firecracker microVM 上で通しで動く。** [`verify-real-guest-control.sh`](scripts/ci/verify-real-guest-control.sh) が、identity gate の通過、workspace block device の mount、capfs の FUSE mount、13 step isolation の適用、workload の起動、isolation を跨いだ Broker channel の維持までを 1 本の VM で確認する。
+- 13 step isolation は特権 host 上で実 syscall として適用し、seccomp / Landlock / read-only rootfs / device masking / fd 一掃 / capability 剥奪が kernel に強制されることを [`verify-privileged-isolation.sh`](scripts/ci/verify-privileged-isolation.sh) が確認する。
 - workspace 全体で line coverage 75% を下限に強制している。
 
 crate ごとの正確な線引きは各 crate の検証対応表（`docs/<crate>/verification.md`）を読む。
@@ -113,7 +115,7 @@ crate ごとの正確な線引きは各 crate の検証対応表（`docs/<crate>
 | [lean/](lean/) | Lean 4 による判定の二重実装と定理。`leanprover/lean4:v4.16.0` に固定 |
 | [docs/](docs/README.md) | 設計、実装、決定記録、検証対応表。ページ型ごとの構造を CI が検査する |
 | [scripts/ci/](scripts/ci/) | CI と local が共有する gate 入口。pipeline から script を呼ぶだけにしてある |
-| [ci/gates.yml](ci/gates.yml) | gate 定義の single source of truth。GitHub と GitLab が同じ gate を実装していることを parity check が証明する |
+| [ci/gates.yml](ci/gates.yml) | gate 定義の single source of truth。各 gate は `implemented` か `planned` を宣言し、parity check が前者は両 platform に存在すること、後者はどこにも存在しないことを証明する |
 | [tests/fixtures/](tests/fixtures/) | Rust と Lean が共有する判定 corpus |
 | [.github/workflows/](.github/workflows/) | `ci` / `security` / `release` |
 | [.gitlab-ci.yml](.gitlab-ci.yml), [.gitlab/](.gitlab/) | 同等の GitLab pipeline |
@@ -128,11 +130,13 @@ crate ごとの正確な線引きは各 crate の検証対応表（`docs/<crate>
 | [egress-protocol](crates/egress-protocol/) | bounded frame、canonical CBOR、session と sequence、budget | module test |
 | [egress-broker](crates/egress-broker/) | frame、replay、budget、公開 HTTPS、型付き GitHub adapter | fake resolver / connector / provider。Firecracker guest-to-host canonical rejection は実機確認、外部 API は未検証 |
 | [firecracker-runtime](crates/firecracker-runtime/) | artifact 固定、dm-verity、jailer、API 順序、snapshot / restore、identity gate、guest-control PID 1 | fake boundary test に加え、実 Firecracker + dm-verity + guest `AF_VSOCK` identity gate と Broker round trip。jailer / snapshot restore は未検証 |
-| [runtime-isolation](crates/runtime-isolation/) | exec 直前の 13 step。namespace、mount、cgroup、Landlock、capability、seccomp | mock backend と純粋関数。実 syscall は未検証 |
+| [runtime-isolation](crates/runtime-isolation/) | exec 直前の 13 step。namespace、mount、cgroup、Landlock、capability、seccomp | mock backend と純粋関数に加え、特権 host での実 syscall 適用と kernel への境界問い合わせ。exec 後と guest 経路は未検証 |
 | [supervisor](crates/supervisor/) | 認証済み connection の subject binding、wire protocol、subject lifecycle | `CapabilityKernel` と `FakeResources`。実 socket は未検証 |
 | [session-orchestrator](crates/session-orchestrator/) | session identity、backend lease、startup / rollback / stop | production adapter composition test。実 VM は未検証 |
 
-`firecracker-runtime` と `runtime-isolation` はどの crate からも依存されておらず、`authority-core` すら参照しない。前者は `rustix` と `sha2`、後者は `libc` だけで立っている。
+依存木の底に立つのは `authority-core` と `runtime-isolation` の 2 つで、どちらも workspace の他 crate に一切依存しない。前者は全ての権限判定が集まる場所で、Lean の二重実装はこの crate だけを相手に書かれている。後者は syscall を実際に発行する場所で、隔離境界が「封じ込める対象である権限ロジック」に依存しないことと、単体で監査できることの両方をこの独立性が支えている。この 2 つの不変条件は [`check-crate-isolation.sh`](scripts/ci/check-crate-isolation.sh) が `cargo tree` の実グラフに対して検査する。
+
+逆に、両者を使う側は存在する。`supervisor` は `runtime-isolation` を、`session-orchestrator` は `firecracker-runtime` を呼ぶ。`firecracker-runtime` 自身は `authority-core` と `egress-protocol` に依存する（session identity と Broker frame の型を共有するため）。
 
 ## 開発環境の準備
 
@@ -178,18 +182,31 @@ scripts/ci/run.sh differential  # 150 件 corpus の byte 単位一致
 
 `capfs` の実 mount test は `/dev/fuse` を要求する。無い環境では該当 test が skip される。
 
-実 VM 検証だけは hosted pipeline ではなく `/dev/kvm` を持つ host で行う。
+特権を要する 2 つの検証は hosted pipeline では行わない。
 
 ```bash
-scripts/ci/install-firecracker.sh      # firecracker + jailer
-scripts/ci/install-guest-artifacts.sh  # guest kernel + read-only rootfs + verity hash device
+# 13 step を実 kernel に適用し、境界を kernel に問い直す。root と cgroup v2 の委譲が要る。
+scripts/ci/run.sh privileged-isolation
+
+# 実 VM 検証。/dev/kvm を持つ host で行う。初回は guest kernel を build する。
+scripts/ci/verify-real-guest-control.sh
 ```
 
-guest artifact の bucket は署名を公開していないため、script に書かれた digest は「この repository が観測して受け入れた bytes」であって、上流 build の信頼性を示すものではない。rootfs の hash device は download せず、その bytes からその場で `veritysetup format` する。
+guest kernel は Firecracker CI の prebuilt を使わず、[`build-guest-kernel.sh`](scripts/ci/build-guest-kernel.sh) が kernel.org の pin 済み source から build する。公開されている Firecracker CI kernel は 5.10 系・6.1 系のいずれも `CONFIG_FUSE_FS` を持たず capfs が mount できない。加えて `runtime-isolation` は Landlock ABI 3 を要求するが、これは 6.2 以降にしか存在しない。source tarball には公開 SHA-256 があるため、署名の無い prebuilt binary を信じるより provenance はむしろ良くなる。信頼の対象が version・digest・[commit 済み config](guest/kernel/)・[commit 済み patch](guest/kernel/) の 4 つに限定される。
+
+どちらも「権限が足りないので skip、よって緑」という状態を作らない。前提を満たさない host では不足理由を出したうえで専用の exit code で終わる。
+
+rootfs は引き続き Firecracker の bucket から取得する。この bucket は署名を公開していないため、script に書かれた digest は「この repository が観測して受け入れた bytes」であって、上流 build の信頼性を示すものではない。rootfs の hash device は download せず、その bytes からその場で `veritysetup format` する。
 
 ## CI/CD
 
 GitHub Actions と GitLab CI に等価な fail-closed pipeline を用意し、どちらも repository が所有する同じ script を実行する。platform を移しても品質・セキュリティ・release の契約が変わらないようにするためで、[`ci/gates.yml`](ci/gates.yml) に無い gate が workflow 側にあれば parity 検査で落ちる。
+
+manifest は「計画」と「記録」を兼ねるため、gate ごとに `status` を持つ。`implemented` は repository 所有の script が実際に走り両 platform が呼ぶ状態、`planned` は設計だけあって何も走らない状態で、parity は後者がどちらの platform にも存在しないことを要求する。この区別が無いと「毎回走る gate」と「意図だけの gate」が同じ見た目になり、parity 検査は通りようがない。現在 32 gate が implemented、7 gate が planned で、何が足りないかは各 gate の `why_planned` にある。
+
+「証拠を超えて主張しない」という方針は gate 自身にも適用してある。残る 7 個は nightly toolchain、未導入の tool、まだ書かれていない source（fuzz target と bench）を必要とするもので、**中身の無い job を置いて緑にすることはしていない**。空の gate は本物と同じ緑を出しながら何も証明せず、それを作る動機まで奪うため、gate が無い状態より危険になる。
+
+実 VM 検証と特権 isolation 検証は hosted runner では動かないため、`kvm` / `privileged` label を持つ self-hosted runner 上で schedule 実行する。各 host に何が必要かは [CI/CD operations](docs/ci-cd.md) に書いてある。
 
 release 境界は、この repository が今日証明できる artifact — `authority-corpus` の Linux binary — に意図的に限定してある。deployable な service image も environment manifest も無いので、production deployment job は置いていない。
 

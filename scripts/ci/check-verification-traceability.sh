@@ -17,6 +17,7 @@ set -euo pipefail
 
 readonly repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd -- "${repository_root}"
+readonly verification_manifest='docs/verification-status.yml'
 
 failures=0
 
@@ -24,6 +25,19 @@ fail() {
   printf 'FAIL %s\n' "$1" >&2
   failures=$((failures + 1))
 }
+
+if [[ ! -f "${verification_manifest}" ]]; then
+  printf 'verification manifest is missing: %s\n' "${verification_manifest}" >&2
+  exit 1
+fi
+
+# Keep this checker dependency-free: the docs job that checks the YAML shape
+# owns yq, while this job runs on a checkout-only runner. The manifest fields
+# used here are deliberately one-line scalars, so anchored text checks can
+# still prove that every verification page and workspace component has a
+# machine-visible claim. Do not require an unresolved claim: doing so would
+# make truthful completion structurally impossible. Existing unresolved
+# boundaries are protected by the manifest schema and documentation checks.
 
 mapfile -t workspace_members < <(
   awk '
@@ -63,6 +77,13 @@ for member in "${workspace_members[@]}"; do
   if ! grep -qE '^##[[:space:]]+未検証の境界[[:space:]]*$' "${verification_page}"; then
     fail "${member}: ${verification_page} has no 未検証の境界 section"
   fi
+
+  if ! grep -qE "^[[:space:]]+component:[[:space:]]+${member}$" "${verification_manifest}"; then
+    fail "${member}: no verification manifest claim names this workspace component"
+  fi
+  if ! grep -qE "^[[:space:]]+verification_page:[[:space:]]+docs/${member}/verification\.md$" "${verification_manifest}"; then
+    fail "${member}: verification manifest does not point at ${verification_page}"
+  fi
 done
 
 # A verification page for something that is not a crate is fine, but one for a
@@ -78,6 +99,8 @@ while IFS= read -r page; do
   done
   if [[ "${found}" != true ]]; then
     fail "${page}: verification page for '${subject}', which is not a workspace member"
+  elif ! grep -Fq "verification_page: ${page}" "${verification_manifest}"; then
+    fail "${page}: verification page is not represented by a manifest claim"
   fi
 done < <(find docs -mindepth 2 -maxdepth 2 -type f -name 'verification.md' | sort)
 

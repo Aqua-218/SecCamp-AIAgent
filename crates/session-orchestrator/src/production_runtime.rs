@@ -9,7 +9,6 @@
 use std::{
     error::Error,
     fmt, fs,
-    io::{Read, Write},
     num::{NonZeroU64, NonZeroUsize},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
@@ -175,8 +174,7 @@ pub const MAX_PRODUCTION_BROKER_CONCURRENT_REQUESTS: usize = 256;
 
 /// Maximum cumulative response budget that leaves at least half of the durable WAL for request,
 /// settlement, checksum, and crash-recovery framing overhead.
-pub const MAX_PRODUCTION_BROKER_RESPONSE_BUDGET_BYTES: u64 =
-    MAX_DURABLE_BROKER_WAL_BYTES / 2;
+pub const MAX_PRODUCTION_BROKER_RESPONSE_BUDGET_BYTES: u64 = MAX_DURABLE_BROKER_WAL_BYTES / 2;
 
 /// Durable replay, budget, and connection ceilings for one Broker session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

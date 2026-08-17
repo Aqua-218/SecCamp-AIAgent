@@ -108,8 +108,10 @@ for result_path in "${result_paths[@]}"; do
   while IFS=$'\t' read -r gate_id gate_result; do
     [[ -n "${gate_id}" ]] || continue
     # A fan-in job aggregating other fan-ins reports itself; it is not a gate.
-    if [[ -z "${planned[${gate_id}]:-}" ]] && [[ "${gate_id}" == *_complete || "${gate_id}" == plan ]]; then
-      continue
+    if [[ -z "${planned[${gate_id}]:-}" ]]; then
+      case "${gate_id}" in
+        *_complete | plan | standard_quality | standard_security | quality | security) continue ;;
+      esac
     fi
     if [[ -n "${observed[${gate_id}]:-}" && "${observed[${gate_id}]}" != "${gate_result}" ]]; then
       printf 'conflicting results reported for %s: %s and %s\n' \

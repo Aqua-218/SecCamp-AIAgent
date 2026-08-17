@@ -31,6 +31,17 @@ case "${command_name}" in
     ;;
   docs-policy)
     scripts/ci/check-docs.sh
+    scripts/ci/check-doc-consistency.sh
+    scripts/ci/tests/test-doc-consistency.sh
+    ;;
+  commit-policy)
+    scripts/ci/check-commit-policy.sh
+    ;;
+  commit-policy-self-test)
+    scripts/ci/test-commit-policy.sh
+    ;;
+  api-surface)
+    scripts/ci/check-api-surface.sh
     ;;
   test)
     if [[ "$#" -ne 1 ]]; then
@@ -81,8 +92,13 @@ case "${command_name}" in
     ;;
   coverage)
     mkdir -p -- coverage
+    # One audit test intentionally forks a competing writer. Running another
+    # reopen test during the fork-to-exec window can transiently inherit its
+    # flock even though every descriptor is close-on-exec. nextest isolates the
+    # normal test suite by process; make cargo-test coverage deterministic too.
     cargo llvm-cov --workspace --all-features --locked \
-      --lcov --output-path coverage/lcov.info --fail-under-lines 75
+      --lcov --output-path coverage/lcov.info --fail-under-lines 75 \
+      -- --test-threads=1
     cargo llvm-cov report --cobertura --output-path coverage/cobertura.xml
     cargo llvm-cov report --summary-only | tee coverage/summary.txt
     ;;
@@ -119,6 +135,37 @@ case "${command_name}" in
     ;;
   cross-targets)
     scripts/ci/check-cross-targets.sh
+    ;;
+  miri)
+    if [[ "$#" -ne 2 ]]; then
+      printf 'miri requires one package and one test filter\n' >&2
+      exit 2
+    fi
+    scripts/ci/run-miri.sh "$1" "$2"
+    ;;
+  sanitizers)
+    if [[ "$#" -ne 2 ]]; then
+      printf 'sanitizers requires one mode and one package\n' >&2
+      exit 2
+    fi
+    scripts/ci/run-sanitizer.sh "$1" "$2"
+    ;;
+  mutation)
+    if [[ "$#" -ne 2 ]]; then
+      printf 'mutation requires one shard and one package\n' >&2
+      exit 2
+    fi
+    scripts/ci/run-mutation.sh "$1" "$2"
+    ;;
+  fuzz)
+    if [[ "$#" -ne 2 ]]; then
+      printf 'fuzz requires one package and one target\n' >&2
+      exit 2
+    fi
+    scripts/ci/run-fuzz.sh "$1" "$2"
+    ;;
+  benchmarks)
+    scripts/ci/run-benchmark.sh "$@"
     ;;
   *)
     printf 'unknown command: %s\n' "${command_name}" >&2

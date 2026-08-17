@@ -21,6 +21,7 @@ use authority_core::{
     capability::IssuerId,
     durable_audit::{DurableAuditError, DurableAuditLog},
     kernel::CapabilityKernel,
+    policy::AuthorityPolicyDigest,
     state::CapabilityState,
     time::MonotonicTime,
 };
@@ -339,6 +340,7 @@ pub struct SessionFirecrackerRequest {
     snapshot_path: PathBuf,
     memory_path: PathBuf,
     guest_control_port: u32,
+    policy_digest: AuthorityPolicyDigest,
 }
 
 impl SessionFirecrackerRequest {
@@ -356,6 +358,7 @@ impl SessionFirecrackerRequest {
         snapshot_path: impl Into<PathBuf>,
         memory_path: impl Into<PathBuf>,
         guest_control_port: u32,
+        policy_digest: AuthorityPolicyDigest,
     ) -> Self {
         Self {
             identity,
@@ -364,6 +367,7 @@ impl SessionFirecrackerRequest {
             snapshot_path: snapshot_path.into(),
             memory_path: memory_path.into(),
             guest_control_port,
+            policy_digest,
         }
     }
 
@@ -401,6 +405,12 @@ impl SessionFirecrackerRequest {
     #[must_use]
     pub const fn guest_control_port(&self) -> u32 {
         self.guest_control_port
+    }
+
+    /// Returns the exact guest root policy required from the snapshot template.
+    #[must_use]
+    pub const fn policy_digest(&self) -> AuthorityPolicyDigest {
+        self.policy_digest
     }
 }
 
@@ -451,6 +461,9 @@ impl PreparedFirecrackerSession {
         }
         if snapshot.artifact_fingerprint != runtime_config.snapshot_fingerprint() {
             return Err(SessionPreparationError::SnapshotFingerprintMismatch);
+        }
+        if snapshot.policy_digest() != Some(request.policy_digest) {
+            return Err(SessionPreparationError::SnapshotPolicyMismatch);
         }
         Ok(Self {
             identity: request.identity,
@@ -628,6 +641,8 @@ pub enum SessionPreparationError {
     },
     /// Snapshot compatibility is not bound to the exact Runtime configuration.
     SnapshotFingerprintMismatch,
+    /// Snapshot image policy metadata differs from the exact session grant.
+    SnapshotPolicyMismatch,
 }
 
 impl fmt::Display for SessionPreparationError {
@@ -648,6 +663,9 @@ impl fmt::Display for SessionPreparationError {
             }
             Self::SnapshotFingerprintMismatch => formatter
                 .write_str("prepared snapshot fingerprint does not match the exact Runtime config"),
+            Self::SnapshotPolicyMismatch => formatter.write_str(
+                "prepared snapshot policy digest does not match the exact session request",
+            ),
         }
     }
 }
@@ -659,7 +677,8 @@ impl Error for SessionPreparationError {
             Self::RuntimeConfigMismatch
             | Self::SnapshotIdMismatch
             | Self::SnapshotPathMismatch { .. }
-            | Self::SnapshotFingerprintMismatch => None,
+            | Self::SnapshotFingerprintMismatch
+            | Self::SnapshotPolicyMismatch => None,
         }
     }
 }
@@ -1419,6 +1438,13 @@ impl OwnedSession for ConcreteOwnedSession {
                 .map_err(ProductionStartError::recovery)?;
             drain_deferred_recovery(&mut state, SessionRecoveryStage::Complete)
                 .map_err(ProductionStartError::recovery)?;
+            if state
+                .expected_policy_digest
+                .replace(grant.policy_digest())
+                .is_some()
+            {
+                return Err(ProductionStartError::AlreadyStarted);
+            }
         }
         self.start_attempted = true;
         let started = self
@@ -1472,6 +1498,7 @@ struct DeferredFirecrackerState {
     guest_control_endpoint: ProductionGuestControlEndpoint,
     recovery: SharedProductionRecovery,
     prepared_identity: Option<SessionIdentity>,
+    expected_policy_digest: Option<AuthorityPolicyDigest>,
     vm: Option<OwnedFirecrackerVm>,
     workload: Option<OwnedFirecrackerWorkload>,
 }
@@ -1498,6 +1525,7 @@ impl DeferredFirecrackerFactory {
                 guest_control_endpoint,
                 recovery,
                 prepared_identity: None,
+                expected_policy_digest: None,
                 vm: None,
                 workload: None,
             })),
@@ -1665,6 +1693,11 @@ fn prepare_firecracker(
     state: &mut DeferredFirecrackerState,
     identity: SessionIdentity,
 ) -> Result<(), BackendError> {
+    let policy_digest = state.expected_policy_digest.ok_or_else(|| {
+        BackendError::new(
+            "production Firecracker preparation requires the exact session policy digest",
+        )
+    })?;
     let runtime_config = rebind_runtime_config(&state.base_config, identity)?;
     let jail_root = session_jail_root(&runtime_config)?;
     let request = SessionFirecrackerRequest {
@@ -1674,6 +1707,7 @@ fn prepare_firecracker(
         snapshot_path: jail_root.join("snapshots/state"),
         memory_path: jail_root.join("snapshots/memory"),
         guest_control_port: state.guest_control_endpoint.port,
+        policy_digest,
     };
     let prepared = state.factory.prepare(&request)?;
     if prepared.identity != identity
@@ -1790,6 +1824,21 @@ where
             return Err(BackendError::new(
                 "egress factory returned a proof for another session request",
             ));
+        }
+        match fs::symlink_metadata(&wal_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(BackendError::new(format!(
+                    "host-owned durable Broker dispatcher creation failed: egress factory created the reserved WAL path: {}",
+                    wal_path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(BackendError::new(format!(
+                    "host-owned durable Broker dispatcher creation failed: reserved WAL path cannot be re-inspected: {}: {error}",
+                    wal_path.display()
+                )));
+            }
         }
         let authority = self.authority.broker_binding(identity);
         let context = DispatchContext {
@@ -3538,6 +3587,8 @@ mod tests {
         let session = identity(0x11);
         let exact = rebind_runtime_config(&base, session).expect("session config must rebind");
         let jail_root = session_jail_root(&exact).expect("jail root must resolve");
+        let policy_digest = AuthorityPolicyDigest::from_hex(&"11".repeat(32))
+            .expect("test policy digest must be valid");
         let request = SessionFirecrackerRequest {
             identity: session,
             runtime_config: exact.clone(),
@@ -3545,13 +3596,15 @@ mod tests {
             snapshot_path: jail_root.join("snapshots/state"),
             memory_path: jail_root.join("snapshots/memory"),
             guest_control_port: 19_002,
+            policy_digest,
         };
-        let snapshot = Snapshot::new(
+        let snapshot = Snapshot::new_bound(
             request.snapshot_path.clone(),
             root.0.join("foreign-memory"),
             exact.snapshot_fingerprint(),
             Sha256Digest::from_bytes([1; 32]),
             Sha256Digest::from_bytes([2; 32]),
+            policy_digest,
             Vec::new(),
         );
         let error = PreparedFirecrackerSession::verify(
@@ -3571,12 +3624,13 @@ mod tests {
 
         let mut changed = exact.clone();
         changed.memory_mib += 1;
-        let snapshot = Snapshot::new(
+        let snapshot = Snapshot::new_bound(
             request.snapshot_path.clone(),
             request.memory_path.clone(),
             changed.snapshot_fingerprint(),
             Sha256Digest::from_bytes([1; 32]),
             Sha256Digest::from_bytes([2; 32]),
+            policy_digest,
             Vec::new(),
         );
         assert!(matches!(
@@ -3614,6 +3668,8 @@ mod tests {
             session_jail_root(&session_config).expect("session jail root must be derivable");
         fs::create_dir_all(session_config.workspace.clone_path())
             .expect("workspace clone fixture must be creatable");
+        let policy_digest = AuthorityPolicyDigest::from_hex(&"12".repeat(32))
+            .expect("test policy digest must be valid");
         let request = SessionFirecrackerRequest::new(
             session,
             session_config.clone(),
@@ -3621,6 +3677,7 @@ mod tests {
             session_jail.join("snapshots/state"),
             session_jail.join("snapshots/memory"),
             19_002,
+            policy_digest,
         );
         let mut factory = FilesystemFirecrackerFactory::with_guest_artifacts(
             request.snapshot_id(),
@@ -3632,8 +3689,28 @@ mod tests {
             SnapshotTemplate::new(
                 PinnedArtifact::new(&state_source, sha256(b"snapshot-state-v1")),
                 PinnedArtifact::new(&memory_source, sha256(b"snapshot-memory-v1")),
+                policy_digest,
             ),
         );
+
+        let wrong_policy = AuthorityPolicyDigest::from_hex(&"13".repeat(32))
+            .expect("different test policy digest must be valid");
+        let mismatched = SessionFirecrackerRequest::new(
+            session,
+            session_config.clone(),
+            request.snapshot_id(),
+            request.snapshot_path(),
+            request.memory_path(),
+            request.guest_control_port(),
+            wrong_policy,
+        );
+        let error = factory
+            .prepare(&mismatched)
+            .err()
+            .expect("a policy-mismatched snapshot must fail before provisioning");
+        assert!(error.to_string().contains("policy digest"));
+        assert!(!request.snapshot_path().exists());
+        assert!(!request.memory_path().exists());
 
         factory
             .prepare(&request)

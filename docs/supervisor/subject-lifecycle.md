@@ -27,7 +27,7 @@
 
 **8 が 9 より前なのは意図的。** 逆にすると、live な workload が control fd と capfs mount を掴んでいる状態で、kernel には Running の subject が存在しないことになる。その workload が試みる認可はすべて拒否され、rollback は kernel が知らない process を止めることになる。
 
-その代わりに逆向きの window ができる。step 8 と 9 の間、subject は共有 kernel 上で Running だが workload はまだ起動していない。同じ `CapabilityKernel` を持つ他のコンポーネントは、この間に effect を認可できる。**これは意図した窓であり、test されていない。**
+その代わりに逆向きの window ができる。step 8 と 9 の間、subject は共有 kernel 上で Running だが workload はまだ起動していない。同じ `CapabilityKernel` を持つ他のコンポーネントは、この間に effect を認可できる。この窓では production `CapabilityKernel` の subject status と authorization epoch を前後で snapshot し、close / revoke が観測されたら workload を公開せず fail closed する。外部コンポーネントが任意の effect を同時に実行する全 interleaving を直列化するものではない。
 
 10 が最後なのは、`Running` の record を先に入れると、workload の起動に失敗して token を rollback 済みの subject に対して `ensure_running` が通ってしまうから。
 
@@ -52,11 +52,11 @@ stateDiagram-v2
 
 ## rollback が全部片付いたら record を残さない
 
-`rollback_setup` が全 resource を解放できた場合、supervisor は record を insert しない。その `SubjectId` は supervisor から見て未知になる。
+`rollback_setup` が全 resource を解放できた場合、supervisor は record を insert しない。ただし `SubjectId` は最初の effectful setup phase より前に永久予約されるため、同じ session で再利用できない。
 
 しかし `CapabilityState` は subject を永久に覚えている。`finish_subject_close` は status を変えるだけで entry を消さない。
 
-**結果として、同じ `SubjectId` で `create_subject` を再実行すると、重複検査（step 1）を通り、cgroup と mount と control fd を確保してから step 8 の `RegisterSubject` で失敗する。** supervisor が忘れて kernel が覚えている、という食い違いがここに出る。
+**結果として、同じ `SubjectId` で `create_subject` を再実行すると、adapter に触れる前の永久予約検査で `DuplicateSubject` になる。** supervisor の record は忘れても、遅れて返る setup completion を新しい subject に誤結合しないためである。kernel 側にも subject が登録済みなら、kernel の記憶を消して再利用する経路は持たない。
 
 逆に、1 つでも解放できなかった場合は record を残す。lifecycle は `authority_registered` で決まる。
 
@@ -117,12 +117,13 @@ gate が条件式として書かれているので、「なぜまだ unmount し
 ## 正確な保証範囲
 
 - syscall を 1 つも呼ばない。`FakeResources` は `Vec<&'static str>` の event log で、順序を確認するだけ。process が止まったこと、mount が消えたことは一切確認していない。
-- `CleanupStep::FinishClose` と `CleanupStep::BeginClose` を通る test が無い。kernel が `finish_subject_close` を拒否する経路、および step 3 の `?` で subject が止まる経路は完全に未検証。
-- cleanup 失敗の形は 2 つしか test されていない（unmount と close_control）。`stop_workload` 失敗、`remove_cgroup` 失敗、shutdown 中の `close_handle` 失敗、複数 phase の同時失敗は未検証。
+- `CleanupStep::FinishClose` と `CleanupStep::BeginClose` は fault-injection kernel で失敗を観測し、subject が `Closing` に留まって retry で `Closed` へ進むことを test している。
+- `stop_workload`、`remove_cgroup`、shutdown 中の `close_handle`、複数 phase の同時失敗を、失敗 token を record に保持して次回 shutdown で再試行する test で固定している。実 Linux adapter の全 failure injection は別境界である。
 - 親の gate は Running の成功経路しか通っていない。`Creating` / `Closing` / `Closed` / 未知の親は未検証。
-- 並行性の test が無い。`Supervisor` は `&mut self` で単一 thread だが、`AuthorityKernel` の method は `&self` を取り、`CapabilityKernel` は内部で lock を持つ。同じ kernel を共有する別コンポーネントが supervisor の step の間に状態を変えられる。step 8〜9 の窓は特にそう。
-- clean rollback 後に同じ `SubjectId` を作り直す経路（supervisor 忘却 / kernel 記憶の食い違い）は未検証。
-- adapter の error は失敗地点で `to_string()` され、型が落ちる。`CleanupFailure` と `SetupFailed` は `String` しか持たないので、呼び出し側は `EBUSY` と `EPERM` を区別して retry を判断できない。
+- `register_subject` と `start_workload` の間に共有 `CapabilityKernel` が close された場合は、snapshot 不一致を検出して setup を公開せず rollback する test で固定している。任意の外部 interleaving を lock で直列化するものではない。
+- clean rollback 後の同じ `SubjectId` の再作成は、永久予約検査で adapter に届かず拒否される test で固定している。
+- `subjects` と `issued_handles` は session 内で永久予約され、既定値または `SupervisorLimits` の正の上限に達すると adapter 呼び出し前に拒否される。close や clean rollback は容量を戻さない。
+- adapter の error は `ResourceFailure<RE>` として effect classification (`NoEffect` / `CleanupRequired` / `EffectUnknown`) を保持する。表示時にだけ `Display` へ整形され、retry 判断は型付き分類を使える。
 
 ## 変更時の確認点
 
@@ -130,8 +131,8 @@ gate が条件式として書かれているので、「なぜまだ unmount し
 - shutdown の step 3 を step 5 の後ろへ動かさない。停止と競合する request が live な capability で通る。
 - unmount の gate から `handles_closed` を外さない。`rollback_setup` 側の gate にはこの項が無いが、それは setup 中に handle が存在しないから。**setup が handle を開くようになったら、両方の gate を同時に直す。**
 - `record.subjects` から entry を消さない。`DuplicateSubject` が `SubjectId` の再利用を永久に禁止しているのは意図的で、消すと `Closed` 後に同じ ID を作れてしまう。
-- `resources_mut()` を production から呼ばない。無制限の `&mut R` を返し、この file の gate を全部迂回する。
-- adapter error の型を残したい場合、`CleanupFailure` と `SetupFailed` の `String` を typed error に変える必要がある。retry の判断材料が無いのは現在の制約。
+- `resources_mut()` は production の bootstrap listener 予約にも使われるが、setup 前の明示的な host 操作に限定する。通常の lifecycle mutation はこの file の gate を通し、privileged adapter test と fault injection 以外で直接呼ばない。
+- adapter error の具体型と effect classification を cleanup record から失わない。`NoEffect` と `EffectUnknown` を `CleanupRequired` に読み替えると、再試行ポリシーが壊れる。
 
 ## 関連
 

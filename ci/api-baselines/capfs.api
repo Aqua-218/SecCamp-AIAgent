@@ -64,6 +64,7 @@ pub enum capfs::backing::RepositoryStartupError
 pub capfs::backing::RepositoryStartupError::AlreadyOpen
 pub capfs::backing::RepositoryStartupError::AlreadyOpen::repository: authority_core::repository::RepoId
 pub capfs::backing::RepositoryStartupError::AlreadyOpen::root: std::path::PathBuf
+pub capfs::backing::RepositoryStartupError::IdentityRegistryUnavailable
 pub capfs::backing::RepositoryStartupError::LeaseRegistryUnavailable
 pub capfs::backing::RepositoryStartupError::Namespace(capfs::namespace::NamespaceError)
 pub capfs::backing::RepositoryStartupError::Preflight(capfs::backing::RepositoryPreflightError)

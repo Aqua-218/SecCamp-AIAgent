@@ -157,12 +157,12 @@ deny range が定数の配列なので、レビューで漏れを見つけやす
 
 ## 正確な保証範囲
 
-fake resolver と fake connector を使う module test で、GET / HEAD、private および混在 DNS 応答、redirect ごとの再解決、authority 外 redirect、unsafe redirect の形、応答上限、上限の clamp、全体 timeout を検証している。
+fake resolver と fake connector を使う module test で、GET / HEAD、private および混在 DNS 応答、redirect ごとの再解決、authority 外 redirect、unsafe redirect の形、応答上限、上限の clamp、全体 timeout を検証している。加えて、`scripts/ci/verify-real-public-https.sh` は isolated network namespace で dnsmasq の TTL 0/CNAME fixture、production `SystemResolver` / `RustlsHttpsConnector`、実 kernel socket、専用 CA/TLS server を使い、SNI/certificate、検査済み address pin、redirect 後の OS resolution 変更を確認する。
 
-- 実 DNS を引いていない。resolver は fake で、TTL、CNAME chain、DNSSEC、resolver 自身の挙動は扱っていない。
-- 実 HTTPS 接続をしていない。TLS の証明書検証、SNI の扱い、ALPN は rustls に委ねていて、この crate では確認していない。
-- 実ネットワーク上の DNS rebinding は未検証。fake resolver が 2 回目に別の答えを返す経路までしか見ていない。
-- 検証した address と実際に接続する address が同じであることは、connector の実装に依存する。型で `SocketAddr` を渡しているが、connector がそれを使うことを強制する仕組みは無い。
+- 制御 DNS protocol と単一 CNAME/TTL 0 は確認するが、DNSSEC、複数 CNAME chain、外部 recursive resolver は扱っていない。
+- 実 HTTPS/TLS handshake と certificate/SNI は確認するが、HTTP/2 ALPN と外部 CA store は扱っていない。
+- redirect の間に制御 DNS answer が public から private へ変わる経路を実 socket で確認する。攻撃者が制御する外部 authoritative DNS、recursive cache、DNSSEC の組合せは未検証。
+- 検証した address と実際の接続先が同じであることは、OS resolver を listener の無い address に向けたまま、policy supplied address だけに listener を置いて成功することで回帰固定する。
 - IPv6 の deny range が network の special-purpose registry を網羅しているかは確認していない。新しい範囲が割り当てられたら追随が要る。
 - host の network が別途分離されていることは前提。この policy は「解決結果が public であること」しか見ていないので、public address の先に内部 service がある構成は守れない。
 

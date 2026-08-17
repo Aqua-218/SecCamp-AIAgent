@@ -103,7 +103,7 @@ Landlock ABI 3 を最低値にしているのは、`LANDLOCK_ACCESS_FS_TRUNCATE`
 - path が実際に存在するか、permission があるか、symlink かどうかは見ていない。存在検査は mount 時点で kernel が行う。
 - 検査を通ったポリシーが「安全である」とは言えない。ここにない危険な組み合わせは通る。allowlist に危険な syscall が無いことは別途 `SeccompPolicy::new` が見るが、許した syscall の組み合わせが安全かは判断していない。
 - `detect_capabilities` の結果は host 環境に依存する。同じ config が、ある host では通り別の host では `CapabilityUnavailable` になる。
-- 実 mount / 実 Landlock での挙動は未検証。[検証対応表](verification.md)を参照。
+- 実mount／Landlock／seccomp／capability／descriptor境界はprivileged direct／post-exec gateとKVM guestで確認する。ただし`validate()`単体がkernel状態を観測するわけではない。[検証対応表](verification.md)を参照。
 
 ## 変更時の確認点
 

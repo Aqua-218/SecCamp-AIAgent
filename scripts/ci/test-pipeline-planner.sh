@@ -58,6 +58,7 @@ expect_status 'pull request' rust_tests required "${pull_request_plan}"
 expect_status 'pull request' coverage required "${pull_request_plan}"
 expect_status 'pull request' real_vm skipped "${pull_request_plan}"
 expect_status 'pull request' real_runtime_lifecycle skipped "${pull_request_plan}"
+expect_status 'pull request' session_owner_kvm skipped "${pull_request_plan}"
 expect_status 'pull request' real_capfs skipped "${pull_request_plan}"
 expect_status 'pull request' egress_real_https skipped "${pull_request_plan}"
 expect_status 'pull request' external_provider_smoke skipped "${pull_request_plan}"
@@ -67,6 +68,7 @@ expect_status 'pull request' privileged_isolation skipped "${pull_request_plan}"
 schedule_plan="$(plan_for PLAN_EVENT=schedule PLAN_PLATFORM=github)"
 expect_status 'schedule' real_vm required "${schedule_plan}"
 expect_status 'schedule' real_runtime_lifecycle required "${schedule_plan}"
+expect_status 'schedule' session_owner_kvm required "${schedule_plan}"
 expect_status 'schedule' real_capfs required "${schedule_plan}"
 expect_status 'schedule' egress_real_https required "${schedule_plan}"
 expect_status 'schedule' external_provider_smoke skipped "${schedule_plan}"
@@ -82,12 +84,10 @@ expect_status 'GitLab web pipeline' external_provider_smoke required "${gitlab_w
 gitlab_api_plan="$(plan_for PLAN_EVENT=api PLAN_PLATFORM=gitlab)"
 expect_status 'GitLab API pipeline' external_provider_smoke required "${gitlab_api_plan}"
 
-# A workflow-filtered deep plan still carries planned entries. They have no job
-# by design, but hiding them from the plan would hide the unbuilt boundary from
-# the evidence report.
+# A workflow-filtered deep plan must require the production composition gate.
 deep_workflow_plan="$(PLAN_EVENT=schedule PLAN_PLATFORM=github \
   "${repository_root}/scripts/ci/plan-pipeline.sh" --workflow deep.yml)"
-expect_status 'deep workflow' session_owner_kvm planned "${deep_workflow_plan}"
+expect_status 'deep workflow' session_owner_kvm required "${deep_workflow_plan}"
 
 # ------------------------------------------------------ platform availability --
 

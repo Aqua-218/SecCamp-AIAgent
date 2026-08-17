@@ -81,6 +81,8 @@ const CGROUP_READY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const SUPERVISOR_READINESS_ENV: &str = "GUEST_SUPERVISOR_READINESS";
 const SUPERVISOR_READINESS_REQUIRED: &str = "1";
 const SUPERVISOR_READY_MARKER: &[u8; 25] = b"guest-supervisor-ready/v1";
+const SUPERVISOR_ERROR_PREFIX: &[u8; 26] = b"guest-supervisor-error/v1:";
+const MAX_SUPERVISOR_ERROR_BYTES: usize = 768;
 const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
 // Linux statfs(2) mount flag values.  `MountFlags` controls the requested mount; statfs is the
 // independent kernel view used to verify that the requested policy actually took effect.
@@ -200,6 +202,14 @@ fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
+            if env::var_os(SUPERVISOR_READINESS_ENV).as_deref()
+                == Some(OsStr::new(SUPERVISOR_READINESS_REQUIRED))
+            {
+                // Before readiness, stdout is a private socket inherited from PID 1.  Report a
+                // bounded, printable diagnostic there so the host can distinguish an image
+                // setup failure from an unobservable EOF.  This is not an acknowledgement.
+                let _ = signal_startup_failure(&mut io::stdout(), &error);
+            }
             eprintln!(
                 "guest-supervisor-init: {error}; fixed image arguments: {:?}",
                 env::args_os().skip(1).collect::<Vec<_>>()
@@ -439,6 +449,18 @@ fn signal_readiness(writer: &mut impl Write) -> Result<(), String> {
     writer
         .flush()
         .map_err(|error| format!("flushing guest supervisor readiness: {error}"))
+}
+
+fn signal_startup_failure(writer: &mut impl Write, error: &str) -> io::Result<()> {
+    writer.write_all(SUPERVISOR_ERROR_PREFIX)?;
+    for byte in error.bytes().take(MAX_SUPERVISOR_ERROR_BYTES) {
+        writer.write_all(&[if byte.is_ascii_graphic() || byte == b' ' {
+            byte
+        } else {
+            b'?'
+        }])?;
+    }
+    writer.flush()
 }
 
 #[derive(Debug)]
@@ -1119,27 +1141,30 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Config,
     expect_flag(&mut arguments, "--repository")?;
     let repository = arguments
         .next()
-        .ok_or_else(usage)?
+        .ok_or_else(|| "--repository requires one value".to_owned())?
         .into_string()
-        .map_err(|_| usage())?;
+        .map_err(|_| "--repository value must be UTF-8".to_owned())?;
     expect_flag(&mut arguments, "--file-effects")?;
     let effects = parse_file_effects(
         &arguments
             .next()
-            .ok_or_else(usage)?
+            .ok_or_else(|| "--file-effects requires one value".to_owned())?
             .into_string()
-            .map_err(|_| usage())?,
+            .map_err(|_| "--file-effects value must be UTF-8".to_owned())?,
     )?;
     expect_flag(&mut arguments, "--path-prefix")?;
     let path = parse_path_prefix(
         &arguments
             .next()
-            .ok_or_else(usage)?
+            .ok_or_else(|| "--path-prefix requires one value".to_owned())?
             .into_string()
-            .map_err(|_| usage())?,
+            .map_err(|_| "--path-prefix value must be UTF-8".to_owned())?,
     )?;
-    if arguments.next().is_some() {
-        return Err(usage());
+    if let Some(unexpected) = arguments.next() {
+        return Err(format!(
+            "unexpected trailing fixed argument: {}",
+            unexpected.to_string_lossy()
+        ));
     }
     Ok(Config {
         workspace_device,
@@ -1161,11 +1186,11 @@ fn required_port(
     expect_flag(arguments, flag)?;
     let port = arguments
         .next()
-        .ok_or_else(usage)?
+        .ok_or_else(|| format!("{flag} requires one value"))?
         .into_string()
-        .map_err(|_| usage())?
+        .map_err(|_| format!("{flag} value must be UTF-8"))?
         .parse::<u32>()
-        .map_err(|_| usage())?;
+        .map_err(|_| format!("{flag} value must be canonical unsigned decimal"))?;
     if port == 0 || port == u32::MAX {
         return Err(format!(
             "{flag} must be explicit, non-zero, and non-wildcard"
@@ -1228,7 +1253,11 @@ fn required_path(
     flag: &str,
 ) -> Result<PathBuf, String> {
     expect_flag(arguments, flag)?;
-    let path = PathBuf::from(arguments.next().ok_or_else(usage)?);
+    let path = PathBuf::from(
+        arguments
+            .next()
+            .ok_or_else(|| format!("{flag} requires one value"))?,
+    );
     require_absolute_lexical_path(flag, &path)?;
     Ok(path)
 }
@@ -1237,10 +1266,13 @@ fn expect_flag(
     arguments: &mut impl Iterator<Item = OsString>,
     expected: &str,
 ) -> Result<(), String> {
-    if arguments.next().as_deref() == Some(OsStr::new(expected)) {
-        Ok(())
-    } else {
-        Err(usage())
+    match arguments.next() {
+        Some(actual) if actual == OsStr::new(expected) => Ok(()),
+        Some(actual) => Err(format!(
+            "expected fixed argument {expected}, received {}",
+            actual.to_string_lossy()
+        )),
+        None => Err(format!("required fixed argument {expected} is absent")),
     }
 }
 
@@ -1254,10 +1286,6 @@ fn require_absolute_lexical_path(label: &str, path: &Path) -> Result<(), String>
     } else {
         Err(format!("{label} must be an absolute lexical path"))
     }
-}
-
-fn usage() -> String {
-    "usage: guest-supervisor-init --workspace-device <absolute-path> --runtime-dir <absolute-path> --cgroup-parent <absolute-path> --broker-port <1..4294967294> --isolation-launcher <absolute-path> --workload <absolute-path> --repository <repository-id> --file-effects <canonical-comma-list> --path-prefix </|canonical/relative/path>".to_owned()
 }
 
 #[cfg(test)]
@@ -1287,6 +1315,21 @@ mod tests {
 
         let error = signal_readiness(&mut Closed).expect_err("closed readiness must fail");
         assert!(error.contains("signaling guest supervisor readiness"));
+    }
+
+    #[test]
+    fn startup_failure_signal_is_bounded_and_printable_without_acknowledging_readiness() {
+        let mut bytes = Vec::new();
+        signal_startup_failure(&mut bytes, &format!("bad\n{}", "x".repeat(2048)))
+            .expect("startup failure channel must be writable");
+        assert!(bytes.starts_with(SUPERVISOR_ERROR_PREFIX));
+        assert_eq!(
+            bytes.len(),
+            SUPERVISOR_ERROR_PREFIX.len() + MAX_SUPERVISOR_ERROR_BYTES
+        );
+        assert_eq!(bytes[SUPERVISOR_ERROR_PREFIX.len() + 3], b'?');
+        assert_ne!(bytes, SUPERVISOR_READY_MARKER);
+        assert!(bytes.iter().all(u8::is_ascii_graphic));
     }
 
     #[test]

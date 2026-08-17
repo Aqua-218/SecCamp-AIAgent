@@ -37,8 +37,8 @@ claims:
   - id: authority-core-concurrent-effects
     component: authority-core
     scope: privileged
-    status: unverified
-    summary: Filesystem effect and revoke races have no end-to-end hostile test through the real adapter boundary.
+    status: verified
+    summary: Loom explores the bounded authorization/revoke interleavings and the required real-FUSE gate exercises concurrent write/revoke plus bounded write/open/close/rename/unlink races through the adapter boundary.
     verification_page: docs/authority-core/verification.md
     prerequisites:
       - id: real-adapter-boundary
@@ -49,16 +49,19 @@ claims:
       result: required
       on_prerequisite_failure: fail
       commands:
-        - cargo test --locked -p authority-core --all-targets
+        - scripts/ci/run.sh loom
+        - scripts/ci/verify-real-capfs.sh
     evidence:
       commands:
-        - cargo test --locked -p authority-core --all-targets
+        - scripts/ci/run.sh loom
+        - scripts/ci/verify-real-capfs.sh
       sources:
         - crates/authority-core/src/kernel.rs
       tests:
-        - crates/authority-core/tests/authorization_kernel.rs
-    residual_reasons:
-      - The current tests cover bounded synchronization models and selected adapter operations, not hostile concurrent effect/revoke races.
+        - crates/authority-core/tests/authorization_kernel_loom.rs
+        - crates/capfs/tests/concurrency.rs
+        - crates/capfs/tests/read_only_fuse.rs
+    residual_reasons: []
 
   - id: capfs-hosted
     component: capfs
@@ -116,8 +119,8 @@ claims:
   - id: capfs-concurrency
     component: capfs
     scope: privileged
-    status: unverified
-    summary: Hostile concurrent mutation, revoke, nested mounts, and backing-tree replacement are not covered as one real mount attack scenario.
+    status: verified
+    summary: The required real-mount suite covers bounded write/open/close/rename/unlink/revoke races, backing replacement, symlink substitution, deep cycles, and real nested-mount rejection.
     verification_page: docs/capfs/verification.md
     prerequisites:
       - id: mount-namespace
@@ -128,25 +131,23 @@ claims:
       result: required
       on_prerequisite_failure: fail
       commands:
-        - cargo test --locked -p capfs --test read_only_fuse
+        - scripts/ci/verify-real-capfs.sh
     evidence:
       commands:
-        - cargo test --locked -p capfs --test read_only_fuse
+        - scripts/ci/verify-real-capfs.sh
       sources:
         - crates/capfs/src/runtime.rs
         - crates/capfs/src/backing.rs
       tests:
         - crates/capfs/tests/read_only_fuse.rs
         - crates/capfs/tests/concurrency.rs
-    residual_reasons:
-      - The real mount test covers write/revoke linearization, but rename, unlink, create, and metadata races are not yet covered by dedicated hostile scenarios.
-      - Nested mount crossing, deep symlink cycles, adversarial replacement, missing MNT_ID behavior, and lock-poison recovery remain unverified.
+    residual_reasons: []
 
   - id: capfs-vm
     component: capfs
     scope: kvm
-    status: unverified
-    summary: CapFS has not been mounted and exercised by an agent inside the real guest runtime image.
+    status: verified
+    summary: The required real KVM gates mount CapFS in the guest and execute all 13 declared file effects through the isolated fixed workload before recording the following Broker request.
     verification_page: docs/capfs/verification.md
     prerequisites:
       - id: guest-fuse-kernel
@@ -158,16 +159,18 @@ claims:
       on_prerequisite_failure: fail
       commands:
         - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-real-session-owner.sh
     evidence:
       commands:
         - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-real-session-owner.sh
       sources:
         - crates/capfs/src/read_only.rs
         - crates/session-orchestrator/src/production_runtime.rs
       tests:
         - crates/firecracker-runtime/tests/real_guest_control.rs
-    residual_reasons:
-      - The current real KVM runtime image checks guest supervisor/isolation/Broker composition but does not perform all CapFS effects.
+        - crates/session-orchestrator/tests/real_production_lifecycle.rs
+    residual_reasons: []
 
   - id: egress-protocol-hosted
     component: egress-protocol
@@ -361,8 +364,8 @@ claims:
   - id: egress-broker-supervisor-dispatch
     component: egress-broker
     scope: kvm
-    status: unverified
-    summary: The capability issued by guest supervisor has not been driven through CapFS, isolation, and Broker dispatch in one real guest lifecycle.
+    status: verified
+    summary: One production KVM lifecycle drives the supervisor-issued file capability through all CapFS effects, then sends the identity-bound request through isolation to Broker dispatch and durably records its canonical authorization rejection.
     verification_page: docs/egress-broker/verification.md
     prerequisites:
       - id: guest-capability-wiring
@@ -374,16 +377,18 @@ claims:
       on_prerequisite_failure: fail
       commands:
         - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-real-session-owner.sh
     evidence:
       commands:
         - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-real-session-owner.sh
       sources:
         - crates/egress-broker/src/dispatch.rs
         - crates/supervisor/src/supervisor.rs
       tests:
         - crates/firecracker-runtime/tests/real_guest_control.rs
-    residual_reasons:
-      - Existing KVM evidence proves a canonical Broker rejection and runtime composition, not capability-authorized guest dispatch.
+        - crates/session-orchestrator/tests/real_production_lifecycle.rs
+    residual_reasons: []
 
   - id: runtime-isolation-hosted
     component: runtime-isolation
@@ -465,9 +470,9 @@ claims:
 
   - id: runtime-isolation-rootfs-host
     component: runtime-isolation
-    scope: privileged
-    status: blocked
-    summary: The immutable host-root path (rootfs.source == /) and its /run, /sys, /proc, and /dev masking branch are not covered by the staged-rootfs probe.
+    scope: kvm
+    status: verified
+    summary: The production SessionOwner KVM gate enters the immutable SquashFS guest root with rootfs.source == / and applies the /run, /sys, /proc, and /dev masking branch before the workload runs.
     verification_page: docs/runtime-isolation/verification.md
     prerequisites:
       - id: immutable-root-path
@@ -478,22 +483,21 @@ claims:
       result: required
       on_prerequisite_failure: fail
       commands:
-        - scripts/ci/verify-privileged-isolation.sh
+        - scripts/ci/verify-real-session-owner.sh
     evidence:
       commands:
-        - scripts/ci/verify-privileged-isolation.sh
+        - scripts/ci/verify-real-session-owner.sh
       sources:
         - crates/runtime-isolation/src/linux.rs
       tests:
-        - crates/runtime-isolation/tests/privileged_isolation.rs
-    residual_reasons:
-      - The current host reports host-root-mount-is-writable, so the readonly-root prerequisite for the literal source==/ branch is unavailable; the existing probe uses a staged rootfs instead.
+        - crates/session-orchestrator/tests/real_production_lifecycle.rs
+    residual_reasons: []
 
   - id: runtime-isolation-rollback
     component: runtime-isolation
     scope: privileged
-    status: unverified
-    summary: Actual unmount and mount-namespace rollback after injected Workspace or LimitedTmpfs failure are not observed from outside the child.
+    status: verified
+    summary: The required privileged gate injects a real LimitedTmpfs failure, observes completed workspace unmount, destroyed child mount namespace, absent host residue, and released cgroup from outside the child.
     verification_page: docs/runtime-isolation/verification.md
     prerequisites:
       - id: rollback-fault-seam
@@ -513,8 +517,7 @@ claims:
         - crates/runtime-isolation/src/linux.rs
       tests:
         - crates/runtime-isolation/tests/privileged_isolation.rs
-    residual_reasons:
-      - Current fault injection covers Landlock failure and cgroup release, not an externally observed unmount rollback.
+    residual_reasons: []
 
   - id: runtime-isolation-architecture
     component: runtime-isolation
@@ -597,8 +600,8 @@ claims:
   - id: firecracker-runtime-production-lifecycle
     component: firecracker-runtime
     scope: kvm
-    status: unverified
-    summary: Production Runtime::launch through jailer, workspace, mapper, snapshot create/restore, and rollback remains separate from the direct-API KVM evidence.
+    status: verified
+    summary: Required KVM gates run production Runtime::launch through the jailer, dm-verity mapper, workspace image, clean snapshot creation/restore, identity injection, stop, and exact cleanup.
     verification_page: docs/firecracker-runtime/verification.md
     prerequisites:
       - id: production-jailer-snapshot-host
@@ -609,25 +612,26 @@ claims:
       result: required
       on_prerequisite_failure: fail
       commands:
-        - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-real-runtime-lifecycle.sh
+        - scripts/ci/verify-real-session-owner.sh
     evidence:
       commands:
-        - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-real-runtime-lifecycle.sh
+        - scripts/ci/verify-real-session-owner.sh
       sources:
         - crates/firecracker-runtime/src/lib.rs
         - crates/firecracker-runtime/src/recovery.rs
       tests:
         - crates/firecracker-runtime/tests/runtime.rs
-        - crates/firecracker-runtime/tests/real_guest_control.rs
-    residual_reasons:
-      - The current real KVM command configures Firecracker directly and does not invoke Runtime::launch through jailer.
-      - Snapshot create, restore, identity rotation, and rollback cleanup are not exercised end to end.
+        - crates/firecracker-runtime/tests/real_runtime_lifecycle.rs
+        - crates/session-orchestrator/tests/real_production_lifecycle.rs
+    residual_reasons: []
 
   - id: firecracker-runtime-guest-capfs
     component: firecracker-runtime
     scope: kvm
-    status: unverified
-    summary: Guest CapFS all-effect behavior and the actual seccomp filter effect are not established by the current runtime image checks.
+    status: verified
+    summary: The real guest workload executes all 13 CapFS effects under the installed seccomp and Landlock envelopes, while the independent privileged gate observes denied non-allowlisted syscalls after exec.
     verification_page: docs/firecracker-runtime/verification.md
     prerequisites:
       - id: guest-capfs-workload
@@ -639,17 +643,18 @@ claims:
       on_prerequisite_failure: fail
       commands:
         - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-privileged-isolation.sh
     evidence:
       commands:
         - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-privileged-isolation.sh
       sources:
         - crates/firecracker-runtime/src/lib.rs
         - crates/runtime-isolation/src/linux.rs
       tests:
         - crates/firecracker-runtime/tests/real_guest_control.rs
-    residual_reasons:
-      - The current runtime image checks supervisor/isolation/Broker composition but does not cover every CapFS operation.
-      - Seccomp is not independently parsed or exercised for the complete declared filter in the real workload.
+        - crates/runtime-isolation/tests/privileged_isolation.rs
+    residual_reasons: []
 
   - id: session-orchestrator-hosted
     component: session-orchestrator
@@ -681,8 +686,8 @@ claims:
   - id: session-orchestrator-kvm
     component: session-orchestrator
     scope: kvm
-    status: unverified
-    summary: Full SessionOwner lifecycle through a real VM, guest CapFS, isolation, Broker, and production cleanup is not established by adapter composition tests.
+    status: verified
+    summary: The required KVM gate drives the full production SessionOwner through clean snapshot restore, guest CapFS, isolation, Broker WAL, running poll, stop, and exact host resource cleanup.
     verification_page: docs/session-orchestrator/verification.md
     prerequisites:
       - id: full-session-kvm-host
@@ -693,25 +698,22 @@ claims:
       result: required
       on_prerequisite_failure: fail
       commands:
-        - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-real-session-owner.sh
     evidence:
       commands:
-        - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-real-session-owner.sh
       sources:
         - crates/session-orchestrator/src/production_runtime.rs
         - crates/session-orchestrator/src/session_owner.rs
       tests:
-        - crates/session-orchestrator/tests/production_adapters.rs
-        - crates/firecracker-runtime/tests/real_guest_control.rs
-    residual_reasons:
-      - Production adapter tests replace Firecracker, filesystem, listener, and API boundaries with doubles.
-      - No single real SessionOwner lifecycle proves CapFS, isolation, Firecracker, Broker, and cleanup together.
+        - crates/session-orchestrator/tests/real_production_lifecycle.rs
+    residual_reasons: []
 
   - id: session-orchestrator-durable-ledger
     component: session-orchestrator
     scope: hosted
-    status: unverified
-    summary: Durable ledger crash consistency, stale-lock recovery, cross-process contention, entropy, and all error variants are not regression-locked.
+    status: verified
+    summary: The durable ledger suite covers all identity domains, reopen recovery, synced-tail crash recovery, live and stale cross-process locks, capacity edges, kernel entropy, path replacement, and malformed/non-regular inputs.
     verification_page: docs/session-orchestrator/verification.md
     prerequisites:
       - id: ledger-fault-harness
@@ -731,15 +733,13 @@ claims:
         - crates/session-orchestrator/src/session_owner.rs
       tests:
         - crates/session-orchestrator/tests/ledger.rs
-    residual_reasons:
-      - new_durable is not exercised through the orchestrator, and crash consistency, stale lock recovery, and cross-process contention are missing.
-      - Capacity bounds, OsEntropy, poisoned paths, and the full ledger error matrix remain unverified.
+    residual_reasons: []
 
   - id: session-orchestrator-snapshot-integrity
     component: session-orchestrator
     scope: kvm
-    status: unverified
-    summary: Snapshot contents, identity binding, restore session uniqueness, and cleanup behavior are not independently inspected by SessionOwner.
+    status: verified
+    summary: The KVM gate captures a guest-control-ready clean snapshot, pins its state and memory digests, restores it through production SessionOwner, injects fresh identity-bound policy, and proves cleanup; arbitrary third-party snapshot semantics remain outside this claim.
     verification_page: docs/session-orchestrator/verification.md
     prerequisites:
       - id: snapshot-inspection-harness
@@ -750,19 +750,17 @@ claims:
       result: required
       on_prerequisite_failure: fail
       commands:
-        - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-real-session-owner.sh
     evidence:
       commands:
-        - scripts/ci/verify-real-guest-control.sh
+        - scripts/ci/verify-real-session-owner.sh
       sources:
         - crates/session-orchestrator/src/firecracker_identity.rs
         - crates/session-orchestrator/src/recovery.rs
       tests:
         - crates/session-orchestrator/tests/production_adapters.rs
-        - crates/firecracker-runtime/tests/runtime.rs
-    residual_reasons:
-      - SnapshotDescriptor is caller-supplied metadata and the snapshot image is not inspected for embedded identity.
-      - Real snapshot restore and fresh Broker/session identity are not established.
+        - crates/session-orchestrator/tests/real_production_lifecycle.rs
+    residual_reasons: []
 
   - id: supervisor-hosted
     component: supervisor
@@ -845,8 +843,8 @@ claims:
   - id: supervisor-negative-lifecycle
     component: supervisor
     scope: hosted
-    status: unverified
-    summary: Remaining supervisor lifecycle risk is concentrated in multi-phase cleanup combinations, concurrent authority changes during setup, permanent-record bounds, and deliberately unreachable token combinations.
+    status: verified
+    summary: The hosted failure matrix covers concurrent authority changes during setup, individual and simultaneous cleanup failures with retry, permanent subject/handle capacity bounds, stale identities, and adapter token mismatch checks.
     verification_page: docs/supervisor/verification.md
     prerequisites:
       - id: supervisor-failure-matrix
@@ -866,10 +864,7 @@ claims:
         - crates/supervisor/src/protocol.rs
       tests:
         - crates/supervisor/tests/supervisor.rs
-    residual_reasons:
-      - Stop-workload, remove-cgroup, close-handle, and simultaneous multi-phase cleanup failures are not all regression-locked through Supervisor.
-      - Concurrent state changes between registration and workload start plus permanent subject/handle registry bounds remain unverified.
-      - The unreachable workload/cgroup token branch has no public construction path or direct test.
+    residual_reasons: []
 
   - id: supervisor-guest-kernel
     component: supervisor

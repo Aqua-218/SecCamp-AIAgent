@@ -1,0 +1,243 @@
+schema: verification-status/v1
+claims:
+  # "verified" means the named evidence was run in the named scope. It does
+  # not mean that a neighboring privileged, KVM, or external boundary is
+  # covered; those boundaries have separate claims below.
+  - id: authority-core-hosted
+    component: authority-core
+    scope: hosted
+    status: verified
+    summary: Closed capability, identity, and authorization state transitions are covered by hosted Rust and corpus tests.
+    evidence:
+      commands:
+        - cargo test --locked -p authority-core --all-targets
+        - scripts/check-authority-corpus.sh
+      sources:
+        - crates/authority-core/src
+      tests:
+        - crates/authority-core/tests
+    residual_reasons: []
+
+  - id: capfs-hosted
+    component: capfs
+    scope: hosted
+    status: verified
+    summary: Namespace, node-table, repository-preflight, and read-only FUSE contracts are covered by hosted tests.
+    evidence:
+      commands:
+        - cargo test --locked -p capfs --all-targets
+      sources:
+        - crates/capfs/src
+      tests:
+        - crates/capfs/tests
+    residual_reasons: []
+
+  - id: capfs-privileged
+    component: capfs
+    scope: privileged
+    status: unverified
+    summary: The hosted tests do not establish behavior against a privileged production FUSE mount and kernel boundary.
+    evidence:
+      commands:
+        - cargo test --locked -p capfs --test read_only_fuse
+      sources:
+        - crates/capfs/src/read_only.rs
+      tests:
+        - crates/capfs/tests/read_only_fuse.rs
+    residual_reasons:
+      - No dedicated privileged mount verification command is part of the hosted gate.
+
+  - id: egress-protocol-hosted
+    component: egress-protocol
+    scope: hosted
+    status: verified
+    summary: Wire-v1 framing, canonical request/response schemas, replay metadata, budgets, and the reusable guest client are covered by hosted tests.
+    evidence:
+      commands:
+        - cargo test --locked -p egress-protocol --all-targets
+        - cargo clippy --locked -p egress-protocol --all-targets -- -D warnings
+      sources:
+        - crates/egress-protocol/src
+      tests:
+        - crates/egress-protocol/src/client.rs
+    residual_reasons: []
+
+  - id: egress-broker-hosted
+    component: egress-broker
+    scope: hosted
+    status: verified
+    summary: Bounded transport, typed dispatch, replay and budget admission, policy checks, and fake provider paths are covered by hosted tests.
+    evidence:
+      commands:
+        - cargo test --locked -p egress-broker --all-targets
+        - cargo clippy --locked -p egress-broker --all-targets -- -D warnings
+      sources:
+        - crates/egress-broker/src
+      tests:
+        - crates/egress-broker/src/server.rs
+    residual_reasons: []
+
+  - id: egress-broker-kvm
+    component: egress-broker
+    scope: kvm
+    status: verified
+    summary: A real Firecracker guest reaches the host Broker through the Firecracker vsock boundary and receives the canonical closed authorization rejection without invoking a provider adapter.
+    evidence:
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+      sources:
+        - crates/egress-broker/src/server.rs
+      tests:
+        - crates/firecracker-runtime/tests/real_guest_control.rs
+    residual_reasons: []
+
+  - id: egress-external-providers
+    component: egress-broker
+    scope: external
+    status: unverified
+    summary: Real DNS, HTTPS, GitHub API, and host credential use are outside the deterministic hosted provider doubles.
+    evidence:
+      commands:
+        - cargo test --locked -p egress-broker --all-targets
+      sources:
+        - crates/egress-broker/src/public_fetch.rs
+        - crates/egress-broker/src/github.rs
+      tests:
+        - crates/egress-broker/src/public_fetch.rs
+    residual_reasons:
+      - No external DNS or HTTPS endpoint is contacted by the repository test suite.
+      - No live GitHub installation credential or provider mutation is exercised.
+
+  - id: runtime-isolation-hosted
+    component: runtime-isolation
+    scope: hosted
+    status: verified
+    summary: Policy validation, ordered apply and rollback state machines, and capability detection branches are covered by hosted tests and doubles.
+    evidence:
+      commands:
+        - cargo test --locked -p runtime-isolation --all-targets
+        - cargo clippy --locked -p runtime-isolation --all-targets -- -D warnings
+      sources:
+        - crates/runtime-isolation/src
+      tests:
+        - crates/runtime-isolation/tests/capability_detection.rs
+    residual_reasons: []
+
+  - id: runtime-isolation-privileged
+    component: runtime-isolation
+    scope: privileged
+    status: verified
+    summary: The privileged Linux probe applies the isolation envelope to staged root filesystems and verifies namespace, seccomp, Landlock, read-only rootfs, device masking, descriptor, and capability boundaries.
+    evidence:
+      commands:
+        - scripts/ci/verify-privileged-isolation.sh
+      sources:
+        - crates/runtime-isolation/src/linux.rs
+      tests:
+        - crates/runtime-isolation/tests/privileged_isolation.rs
+    residual_reasons: []
+
+  - id: firecracker-runtime-hosted
+    component: firecracker-runtime
+    scope: hosted
+    status: verified
+    summary: Artifact validation, API sequencing, workspace handling, rollback paths, and Unix-socket adapters are covered by hosted doubles and local socket tests.
+    evidence:
+      commands:
+        - cargo test --locked -p firecracker-runtime --all-targets
+        - cargo clippy --locked -p firecracker-runtime --all-targets -- -D warnings
+      sources:
+        - crates/firecracker-runtime/src
+      tests:
+        - crates/firecracker-runtime/tests/runtime.rs
+    residual_reasons: []
+
+  - id: firecracker-runtime-kvm
+    component: firecracker-runtime
+    scope: kvm
+    status: verified
+    summary: Real Firecracker boots from a dm-verity rootfs and verifies the v2 digest-bound identity/start gate, guest readiness, guest-to-host Broker vsock, and the guest supervisor/isolation-launcher composition.
+    evidence:
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+      sources:
+        - crates/firecracker-runtime/src/lib.rs
+      tests:
+        - crates/firecracker-runtime/tests/real_guest_control.rs
+    residual_reasons: []
+
+  - id: firecracker-runtime-production-lifecycle
+    component: firecracker-runtime
+    scope: kvm
+    status: unverified
+    summary: The production Runtime::launch path through jailer plus snapshot create and restore remains separate from the direct-API KVM evidence.
+    evidence:
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+      sources:
+        - crates/firecracker-runtime/src/lib.rs
+      tests:
+        - crates/firecracker-runtime/tests/runtime.rs
+    residual_reasons:
+      - The real KVM command configures Firecracker directly and does not invoke Runtime::launch through jailer.
+      - Real snapshot create, restore, and rollback cleanup are not exercised.
+
+  - id: session-orchestrator-hosted
+    component: session-orchestrator
+    scope: hosted
+    status: verified
+    summary: Lifecycle state transitions, durable identity records, and production adapter composition with controlled doubles are covered by hosted tests.
+    evidence:
+      commands:
+        - cargo test --locked -p session-orchestrator --all-targets
+        - cargo clippy --locked -p session-orchestrator --all-targets -- -D warnings
+      sources:
+        - crates/session-orchestrator/src
+      tests:
+        - crates/session-orchestrator/tests
+    residual_reasons: []
+
+  - id: session-orchestrator-kvm
+    component: session-orchestrator
+    scope: kvm
+    status: unverified
+    summary: Full SessionOwner lifecycle through a real VM and guest capability path is not established by adapter composition tests.
+    evidence:
+      commands:
+        - cargo test --locked -p session-orchestrator --all-targets
+      sources:
+        - crates/session-orchestrator/src/production_runtime.rs
+      tests:
+        - crates/session-orchestrator/tests/production_adapters.rs
+    residual_reasons:
+      - Production adapter tests replace external command, filesystem, and API boundaries with test doubles.
+      - No end-to-end real SessionOwner lifecycle currently proves capfs, isolation, and Firecracker together.
+
+  - id: supervisor-hosted
+    component: supervisor
+    scope: hosted
+    status: verified
+    summary: Supervisor protocol, caller identity, control socket, and lifecycle behavior are covered by hosted tests.
+    evidence:
+      commands:
+        - cargo test --locked -p supervisor --all-targets
+        - cargo clippy --locked -p supervisor --all-targets -- -D warnings
+      sources:
+        - crates/supervisor/src
+      tests:
+        - crates/supervisor/tests/supervisor.rs
+    residual_reasons: []
+
+  - id: supervisor-kvm
+    component: supervisor
+    scope: kvm
+    status: verified
+    summary: A real Firecracker guest runs guest-control PID 1, waits for guest-supervisor readiness, mounts its workspace, starts the isolation launcher, and preserves the inherited Broker channel to the workload.
+    evidence:
+      commands:
+        - scripts/ci/verify-real-guest-control.sh
+      sources:
+        - crates/supervisor/src/bin/guest-supervisor-init.rs
+      tests:
+        - crates/firecracker-runtime/tests/real_guest_control.rs
+    residual_reasons: []

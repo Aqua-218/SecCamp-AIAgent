@@ -1,0 +1,369 @@
+pub mod egress_protocol
+pub mod egress_protocol::budget
+pub enum egress_protocol::budget::SessionBudgetError
+pub egress_protocol::budget::SessionBudgetError::AccountingInvariantBroken
+pub egress_protocol::budget::SessionBudgetError::ConcurrentRequestLimitReached
+pub egress_protocol::budget::SessionBudgetError::RequestCountExhausted
+pub egress_protocol::budget::SessionBudgetError::ReservationAlreadyActive
+pub egress_protocol::budget::SessionBudgetError::ReservationAlreadyActive::request: egress_protocol::session::BrokerRequestId
+pub egress_protocol::budget::SessionBudgetError::ResponseBytesExhausted
+pub egress_protocol::budget::SessionBudgetError::ResponseBytesExhausted::remaining: u64
+pub egress_protocol::budget::SessionBudgetError::ResponseBytesExhausted::requested: u64
+pub egress_protocol::budget::SessionBudgetError::ResponseExceedsReservation
+pub egress_protocol::budget::SessionBudgetError::ResponseExceedsReservation::received: u64
+pub egress_protocol::budget::SessionBudgetError::ResponseExceedsReservation::request: egress_protocol::session::BrokerRequestId
+pub egress_protocol::budget::SessionBudgetError::ResponseExceedsReservation::reserved: u64
+pub egress_protocol::budget::SessionBudgetError::UnknownReservation
+pub egress_protocol::budget::SessionBudgetError::UnknownReservation::request: egress_protocol::session::BrokerRequestId
+impl core::error::Error for egress_protocol::budget::SessionBudgetError
+impl core::fmt::Display for egress_protocol::budget::SessionBudgetError
+pub fn egress_protocol::budget::SessionBudgetError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_protocol::budget::ResponseReservation
+impl egress_protocol::budget::ResponseReservation
+pub const fn egress_protocol::budget::ResponseReservation::max_response_bytes(self) -> u64
+pub const fn egress_protocol::budget::ResponseReservation::request(self) -> egress_protocol::session::BrokerRequestId
+pub struct egress_protocol::budget::SessionBudget
+impl egress_protocol::budget::SessionBudget
+pub fn egress_protocol::budget::SessionBudget::abort(&mut self, egress_protocol::session::BrokerRequestId) -> core::result::Result<(), egress_protocol::budget::SessionBudgetError>
+pub fn egress_protocol::budget::SessionBudget::complete(&mut self, egress_protocol::session::BrokerRequestId, u64) -> core::result::Result<(), egress_protocol::budget::SessionBudgetError>
+pub const fn egress_protocol::budget::SessionBudget::limits(&self) -> egress_protocol::budget::SessionBudgetLimits
+pub const fn egress_protocol::budget::SessionBudget::new(egress_protocol::budget::SessionBudgetLimits) -> Self
+pub fn egress_protocol::budget::SessionBudget::start(&mut self, egress_protocol::session::BrokerRequestId, u64) -> core::result::Result<egress_protocol::budget::ResponseReservation, egress_protocol::budget::SessionBudgetError>
+pub fn egress_protocol::budget::SessionBudget::usage(&self) -> egress_protocol::budget::SessionBudgetUsage
+pub struct egress_protocol::budget::SessionBudgetLimits
+impl egress_protocol::budget::SessionBudgetLimits
+pub const fn egress_protocol::budget::SessionBudgetLimits::max_concurrent_requests(self) -> core::num::nonzero::NonZeroUsize
+pub const fn egress_protocol::budget::SessionBudgetLimits::max_requests(self) -> core::num::nonzero::NonZeroU64
+pub const fn egress_protocol::budget::SessionBudgetLimits::max_response_bytes(self) -> u64
+pub const fn egress_protocol::budget::SessionBudgetLimits::new(core::num::nonzero::NonZeroU64, u64, core::num::nonzero::NonZeroUsize) -> Self
+pub struct egress_protocol::budget::SessionBudgetUsage
+impl egress_protocol::budget::SessionBudgetUsage
+pub const fn egress_protocol::budget::SessionBudgetUsage::active_requests(self) -> usize
+pub const fn egress_protocol::budget::SessionBudgetUsage::committed_response_bytes(self) -> u64
+pub const fn egress_protocol::budget::SessionBudgetUsage::reserved_response_bytes(self) -> u64
+pub const fn egress_protocol::budget::SessionBudgetUsage::started_requests(self) -> u64
+pub mod egress_protocol::cbor
+pub enum egress_protocol::cbor::CborError
+pub egress_protocol::cbor::CborError::ControlPayloadTooLarge
+pub egress_protocol::cbor::CborError::ControlPayloadTooLarge::length: usize
+pub egress_protocol::cbor::CborError::IndefiniteLength
+pub egress_protocol::cbor::CborError::InvalidAuthorityValue
+pub egress_protocol::cbor::CborError::InvalidAuthorityValue::field: &'static str
+pub egress_protocol::cbor::CborError::InvalidUtf8
+pub egress_protocol::cbor::CborError::NonCanonicalInteger
+pub egress_protocol::cbor::CborError::PayloadHashMismatch
+pub egress_protocol::cbor::CborError::TrailingPayloadBytes
+pub egress_protocol::cbor::CborError::TrailingRequestBytes
+pub egress_protocol::cbor::CborError::Truncated
+pub egress_protocol::cbor::CborError::UnexpectedArrayLength
+pub egress_protocol::cbor::CborError::UnexpectedArrayLength::expected: u64
+pub egress_protocol::cbor::CborError::UnexpectedArrayLength::received: u64
+pub egress_protocol::cbor::CborError::UnexpectedByteStringLength
+pub egress_protocol::cbor::CborError::UnexpectedByteStringLength::expected: usize
+pub egress_protocol::cbor::CborError::UnexpectedByteStringLength::received: u64
+pub egress_protocol::cbor::CborError::UnexpectedMajorType
+pub egress_protocol::cbor::CborError::UnexpectedMajorType::expected: u8
+pub egress_protocol::cbor::CborError::UnexpectedMajorType::received: u8
+pub egress_protocol::cbor::CborError::UnknownGitHubOperation
+pub egress_protocol::cbor::CborError::UnknownGitHubOperation::received: u64
+pub egress_protocol::cbor::CborError::UnknownOperationFamily
+pub egress_protocol::cbor::CborError::UnknownOperationFamily::received: u64
+pub egress_protocol::cbor::CborError::UnknownPublicFetchMethod
+pub egress_protocol::cbor::CborError::UnknownPublicFetchMethod::received: u64
+pub egress_protocol::cbor::CborError::UnsupportedAdditionalInformation
+pub egress_protocol::cbor::CborError::UnsupportedAdditionalInformation::additional_information: u8
+pub egress_protocol::cbor::CborError::UnsupportedProtocolVersion
+pub egress_protocol::cbor::CborError::UnsupportedProtocolVersion::received: u64
+impl core::error::Error for egress_protocol::cbor::CborError
+impl core::fmt::Display for egress_protocol::cbor::CborError
+pub fn egress_protocol::cbor::CborError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_protocol::cbor::CanonicalBrokerRequest
+impl egress_protocol::cbor::CanonicalBrokerRequest
+pub fn egress_protocol::cbor::CanonicalBrokerRequest::canonical_payload(&self) -> &[u8]
+pub fn egress_protocol::cbor::CanonicalBrokerRequest::decode(&[u8]) -> core::result::Result<Self, egress_protocol::cbor::CborError>
+pub fn egress_protocol::cbor::CanonicalBrokerRequest::encode(&self) -> core::result::Result<alloc::vec::Vec<u8>, egress_protocol::cbor::CborError>
+pub const fn egress_protocol::cbor::CanonicalBrokerRequest::envelope(&self) -> egress_protocol::session::BrokerEnvelope
+pub fn egress_protocol::cbor::CanonicalBrokerRequest::new(egress_protocol::session::BrokerSessionId, u64, egress_protocol::session::BrokerRequestId, egress_protocol::operation::BrokerOperation) -> Self
+pub const fn egress_protocol::cbor::CanonicalBrokerRequest::operation(&self) -> &egress_protocol::operation::BrokerOperation
+pub const egress_protocol::cbor::BROKER_CBOR_PROTOCOL_VERSION: u64
+pub mod egress_protocol::client
+pub enum egress_protocol::client::ClientError
+pub egress_protocol::client::ClientError::Frame(egress_protocol::frame::FrameError)
+pub egress_protocol::client::ClientError::InvalidResponse
+pub egress_protocol::client::ClientError::InvalidResponse::chunk: egress_protocol::response::ResponseChunkError
+pub egress_protocol::client::ClientError::InvalidResponse::response: egress_protocol::response::ResponseCborError
+pub egress_protocol::client::ClientError::Io
+pub egress_protocol::client::ClientError::Io::operation: egress_protocol::client::ClientIoOperation
+pub egress_protocol::client::ClientError::Io::source: std::io::error::Error
+pub egress_protocol::client::ClientError::RequestEncoding(egress_protocol::cbor::CborError)
+pub egress_protocol::client::ClientError::RequestIdentityExhausted
+pub egress_protocol::client::ClientError::RequestIdentityReuse
+pub egress_protocol::client::ClientError::RequestIdentityReuse::request: egress_protocol::session::BrokerRequestId
+pub egress_protocol::client::ClientError::RequestLimitReached
+pub egress_protocol::client::ClientError::RequestLimitReached::maximum: usize
+pub egress_protocol::client::ClientError::Response(egress_protocol::response::ResponseCborError)
+pub egress_protocol::client::ClientError::ResponseChunk(egress_protocol::response::ResponseChunkError)
+pub egress_protocol::client::ClientError::ResponseChunkCountExceeded
+pub egress_protocol::client::ClientError::ResponseChunkCountExceeded::maximum: usize
+pub egress_protocol::client::ClientError::ResponseChunkCountExceeded::received: usize
+pub egress_protocol::client::ClientError::ResponseRequestMismatch
+pub egress_protocol::client::ClientError::ResponseRequestMismatch::expected: egress_protocol::session::BrokerRequestId
+pub egress_protocol::client::ClientError::ResponseRequestMismatch::received: egress_protocol::session::BrokerRequestId
+pub egress_protocol::client::ClientError::SequenceExhausted
+pub egress_protocol::client::ClientError::TruncatedFrame
+pub egress_protocol::client::ClientError::TruncatedFrame::expected: usize
+pub egress_protocol::client::ClientError::TruncatedFrame::operation: egress_protocol::client::ClientIoOperation
+pub egress_protocol::client::ClientError::TruncatedFrame::received: usize
+impl core::error::Error for egress_protocol::client::ClientError
+pub fn egress_protocol::client::ClientError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for egress_protocol::client::ClientError
+pub fn egress_protocol::client::ClientError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum egress_protocol::client::ClientIoOperation
+pub egress_protocol::client::ClientIoOperation::Flush
+pub egress_protocol::client::ClientIoOperation::ReadFramePayload
+pub egress_protocol::client::ClientIoOperation::ReadFramePrefix
+pub egress_protocol::client::ClientIoOperation::WriteFramePayload
+pub egress_protocol::client::ClientIoOperation::WriteFramePrefix
+impl core::fmt::Display for egress_protocol::client::ClientIoOperation
+pub fn egress_protocol::client::ClientIoOperation::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_protocol::client::ClientLimits
+impl egress_protocol::client::ClientLimits
+pub const fn egress_protocol::client::ClientLimits::max_requests(self) -> core::num::nonzero::NonZeroUsize
+pub const fn egress_protocol::client::ClientLimits::new(core::num::nonzero::NonZeroUsize) -> Self
+impl core::default::Default for egress_protocol::client::ClientLimits
+pub fn egress_protocol::client::ClientLimits::default() -> Self
+pub struct egress_protocol::client::GuestBrokerClient<S>
+impl<S> egress_protocol::client::GuestBrokerClient<S> where S: std::io::Read + std::io::Write
+pub fn egress_protocol::client::GuestBrokerClient<S>::execute(&mut self, egress_protocol::operation::BrokerOperation) -> core::result::Result<egress_protocol::response::CanonicalBrokerResponse, egress_protocol::client::ClientError>
+pub fn egress_protocol::client::GuestBrokerClient<S>::execute_with_id(&mut self, egress_protocol::session::BrokerRequestId, egress_protocol::operation::BrokerOperation) -> core::result::Result<egress_protocol::response::CanonicalBrokerResponse, egress_protocol::client::ClientError>
+pub fn egress_protocol::client::GuestBrokerClient<S>::request(&mut self, egress_protocol::operation::BrokerOperation) -> core::result::Result<egress_protocol::response::CanonicalBrokerResponse, egress_protocol::client::ClientError>
+pub fn egress_protocol::client::GuestBrokerClient<S>::request_with_id(&mut self, egress_protocol::session::BrokerRequestId, egress_protocol::operation::BrokerOperation) -> core::result::Result<egress_protocol::response::CanonicalBrokerResponse, egress_protocol::client::ClientError>
+impl<S> egress_protocol::client::GuestBrokerClient<S>
+pub fn egress_protocol::client::GuestBrokerClient<S>::into_inner(self) -> S
+pub fn egress_protocol::client::GuestBrokerClient<S>::issued_request_count(&self) -> usize
+pub const fn egress_protocol::client::GuestBrokerClient<S>::limits(&self) -> egress_protocol::client::ClientLimits
+pub const fn egress_protocol::client::GuestBrokerClient<S>::new(S, egress_protocol::session::BrokerSessionId) -> Self
+pub const fn egress_protocol::client::GuestBrokerClient<S>::next_sequence(&self) -> core::option::Option<u64>
+pub const fn egress_protocol::client::GuestBrokerClient<S>::session(&self) -> egress_protocol::session::BrokerSessionId
+pub const fn egress_protocol::client::GuestBrokerClient<S>::transport_mut(&mut self) -> &mut S
+pub const fn egress_protocol::client::GuestBrokerClient<S>::with_limits(S, egress_protocol::session::BrokerSessionId, egress_protocol::client::ClientLimits) -> Self
+pub const egress_protocol::client::DEFAULT_MAX_REQUESTS: core::num::nonzero::NonZeroUsize
+pub const egress_protocol::client::MAX_RESPONSE_CHUNKS: usize
+pub type egress_protocol::client::BrokerClient<S> = egress_protocol::client::GuestBrokerClient<S>
+pub type egress_protocol::client::BrokerClientError = egress_protocol::client::ClientError
+pub mod egress_protocol::frame
+pub enum egress_protocol::frame::FrameError
+pub egress_protocol::frame::FrameError::FrameTooLarge
+pub egress_protocol::frame::FrameError::FrameTooLarge::length: usize
+pub egress_protocol::frame::FrameError::TrailingBytes
+pub egress_protocol::frame::FrameError::TrailingBytes::declared: usize
+pub egress_protocol::frame::FrameError::TrailingBytes::trailing: usize
+pub egress_protocol::frame::FrameError::TruncatedPayload
+pub egress_protocol::frame::FrameError::TruncatedPayload::actual: usize
+pub egress_protocol::frame::FrameError::TruncatedPayload::expected: usize
+pub egress_protocol::frame::FrameError::TruncatedPrefix
+impl core::error::Error for egress_protocol::frame::FrameError
+impl core::fmt::Display for egress_protocol::frame::FrameError
+pub fn egress_protocol::frame::FrameError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_protocol::frame::ControlFrame
+impl egress_protocol::frame::ControlFrame
+pub fn egress_protocol::frame::ControlFrame::decode_complete(&[u8]) -> core::result::Result<Self, egress_protocol::frame::FrameError>
+pub fn egress_protocol::frame::ControlFrame::encode(&self) -> alloc::vec::Vec<u8>
+pub fn egress_protocol::frame::ControlFrame::encoded_len(&self) -> usize
+pub fn egress_protocol::frame::ControlFrame::new(alloc::vec::Vec<u8>) -> core::result::Result<Self, egress_protocol::frame::FrameError>
+pub fn egress_protocol::frame::ControlFrame::payload(&self) -> &[u8]
+pub struct egress_protocol::frame::ValidatedFrameLength(_)
+impl egress_protocol::frame::ValidatedFrameLength
+pub const fn egress_protocol::frame::ValidatedFrameLength::as_usize(self) -> usize
+pub fn egress_protocol::frame::ValidatedFrameLength::from_network_prefix([u8; 4]) -> core::result::Result<Self, egress_protocol::frame::FrameError>
+pub const egress_protocol::frame::CONTROL_FRAME_LENGTH_PREFIX_BYTES: usize
+pub mod egress_protocol::operation
+pub enum egress_protocol::operation::BrokerOperation
+pub egress_protocol::operation::BrokerOperation::GitHub(authority_core::github::GitHubRequest)
+pub egress_protocol::operation::BrokerOperation::PublicFetch(authority_core::http::HttpFetchRequest)
+impl egress_protocol::operation::BrokerOperation
+pub const fn egress_protocol::operation::BrokerOperation::as_github(&self) -> core::option::Option<&authority_core::github::GitHubRequest>
+pub const fn egress_protocol::operation::BrokerOperation::as_public_fetch(&self) -> core::option::Option<&authority_core::http::HttpFetchRequest>
+pub fn egress_protocol::operation::BrokerOperation::authority_request(&self) -> authority_core::capability::AuthorityRequest
+pub fn egress_protocol::operation::BrokerOperation::capability_request_at(&self, authority_core::time::MonotonicTime) -> authority_core::capability::CapabilityRequest
+pub const fn egress_protocol::operation::BrokerOperation::kind(&self) -> egress_protocol::operation::BrokerOperationKind
+pub const fn egress_protocol::operation::BrokerOperation::public_response_byte_limit(&self) -> core::option::Option<u64>
+pub enum egress_protocol::operation::BrokerOperationKind
+pub egress_protocol::operation::BrokerOperationKind::GitHub
+pub egress_protocol::operation::BrokerOperationKind::PublicFetch
+pub const fn egress_protocol::operation::is_safe_public_fetch_method(authority_core::http::HttpFetchMethod) -> bool
+pub mod egress_protocol::response
+pub enum egress_protocol::response::BrokerWireOutcome
+pub egress_protocol::response::BrokerWireOutcome::GitHub(egress_protocol::response::GitHubWireResponse)
+pub egress_protocol::response::BrokerWireOutcome::Public(egress_protocol::response::PublicWireResponse)
+pub egress_protocol::response::BrokerWireOutcome::Rejected(egress_protocol::response::BrokerWireRejection)
+pub enum egress_protocol::response::BrokerWireRejection
+pub egress_protocol::response::BrokerWireRejection::AccountingInvariant
+pub egress_protocol::response::BrokerWireRejection::AuditUnavailable
+pub egress_protocol::response::BrokerWireRejection::Budget
+pub egress_protocol::response::BrokerWireRejection::CommittedButUnrecorded
+pub egress_protocol::response::BrokerWireRejection::GitHub
+pub egress_protocol::response::BrokerWireRejection::NotAuthorized
+pub egress_protocol::response::BrokerWireRejection::OperationMismatch
+pub egress_protocol::response::BrokerWireRejection::PublicFetch
+pub enum egress_protocol::response::ResponseCborError
+pub egress_protocol::response::ResponseCborError::IndefiniteLength
+pub egress_protocol::response::ResponseCborError::InvalidValue
+pub egress_protocol::response::ResponseCborError::NonCanonicalInteger
+pub egress_protocol::response::ResponseCborError::PayloadTooLarge
+pub egress_protocol::response::ResponseCborError::PayloadTooLarge::length: usize
+pub egress_protocol::response::ResponseCborError::TrailingBytes
+pub egress_protocol::response::ResponseCborError::Truncated
+pub egress_protocol::response::ResponseCborError::UnexpectedArrayLength
+pub egress_protocol::response::ResponseCborError::UnexpectedArrayLength::expected: u64
+pub egress_protocol::response::ResponseCborError::UnexpectedArrayLength::received: u64
+pub egress_protocol::response::ResponseCborError::UnexpectedByteStringLength
+pub egress_protocol::response::ResponseCborError::UnexpectedByteStringLength::expected: usize
+pub egress_protocol::response::ResponseCborError::UnexpectedByteStringLength::received: usize
+pub egress_protocol::response::ResponseCborError::UnexpectedMajorType
+pub egress_protocol::response::ResponseCborError::UnexpectedMajorType::expected: u8
+pub egress_protocol::response::ResponseCborError::UnexpectedMajorType::received: u8
+pub egress_protocol::response::ResponseCborError::UnknownOutcome
+pub egress_protocol::response::ResponseCborError::UnknownOutcome::received: u64
+pub egress_protocol::response::ResponseCborError::UnknownRejection
+pub egress_protocol::response::ResponseCborError::UnknownRejection::received: u64
+pub egress_protocol::response::ResponseCborError::UnsupportedVersion
+pub egress_protocol::response::ResponseCborError::UnsupportedVersion::received: u64
+impl core::error::Error for egress_protocol::response::ResponseCborError
+impl core::fmt::Display for egress_protocol::response::ResponseCborError
+pub fn egress_protocol::response::ResponseCborError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum egress_protocol::response::ResponseChunkError
+pub egress_protocol::response::ResponseChunkError::DigestMismatch
+pub egress_protocol::response::ResponseChunkError::DuplicateChunk
+pub egress_protocol::response::ResponseChunkError::DuplicateChunk::index: u64
+pub egress_protocol::response::ResponseChunkError::EmptySequence
+pub egress_protocol::response::ResponseChunkError::EncodedChunkTooLarge
+pub egress_protocol::response::ResponseChunkError::EncodedChunkTooLarge::length: usize
+pub egress_protocol::response::ResponseChunkError::InconsistentMetadata
+pub egress_protocol::response::ResponseChunkError::InconsistentMetadata::index: u64
+pub egress_protocol::response::ResponseChunkError::InvalidChunkLength
+pub egress_protocol::response::ResponseChunkError::InvalidChunkLength::expected: usize
+pub egress_protocol::response::ResponseChunkError::InvalidChunkLength::index: u64
+pub egress_protocol::response::ResponseChunkError::InvalidChunkLength::received: usize
+pub egress_protocol::response::ResponseChunkError::InvalidMetadata
+pub egress_protocol::response::ResponseChunkError::MissingChunk
+pub egress_protocol::response::ResponseChunkError::MissingChunk::index: u64
+pub egress_protocol::response::ResponseChunkError::ReorderedChunk
+pub egress_protocol::response::ResponseChunkError::ReorderedChunk::expected: u64
+pub egress_protocol::response::ResponseChunkError::ReorderedChunk::received: u64
+pub egress_protocol::response::ResponseChunkError::RequestBindingMismatch
+pub egress_protocol::response::ResponseChunkError::RequestBindingMismatch::index: u64
+pub egress_protocol::response::ResponseChunkError::Response(egress_protocol::response::ResponseCborError)
+pub egress_protocol::response::ResponseChunkError::ResponseRequestMismatch
+pub egress_protocol::response::ResponseChunkError::TotalLengthMismatch
+pub egress_protocol::response::ResponseChunkError::TotalLengthMismatch::declared: usize
+pub egress_protocol::response::ResponseChunkError::TotalLengthMismatch::received: usize
+impl core::error::Error for egress_protocol::response::ResponseChunkError
+pub fn egress_protocol::response::ResponseChunkError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for egress_protocol::response::ResponseChunkError
+pub fn egress_protocol::response::ResponseChunkError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_protocol::response::CanonicalBrokerResponse
+impl egress_protocol::response::CanonicalBrokerResponse
+pub fn egress_protocol::response::CanonicalBrokerResponse::chunk_iter(&self) -> core::result::Result<egress_protocol::response::CanonicalResponseChunks<'_>, egress_protocol::response::ResponseChunkError>
+pub fn egress_protocol::response::CanonicalBrokerResponse::chunks(&self) -> core::result::Result<alloc::vec::Vec<egress_protocol::response::CanonicalResponseChunk>, egress_protocol::response::ResponseChunkError>
+pub fn egress_protocol::response::CanonicalBrokerResponse::decode(&[u8]) -> core::result::Result<Self, egress_protocol::response::ResponseCborError>
+pub fn egress_protocol::response::CanonicalBrokerResponse::encode(&self) -> core::result::Result<alloc::vec::Vec<u8>, egress_protocol::response::ResponseCborError>
+pub fn egress_protocol::response::CanonicalBrokerResponse::encoded_chunk_iter(&self) -> core::result::Result<egress_protocol::response::CanonicalResponseChunkPayloads<'_>, egress_protocol::response::ResponseChunkError>
+pub fn egress_protocol::response::CanonicalBrokerResponse::from_chunks(&[egress_protocol::response::CanonicalResponseChunk]) -> core::result::Result<Self, egress_protocol::response::ResponseChunkError>
+pub const fn egress_protocol::response::CanonicalBrokerResponse::new(egress_protocol::session::BrokerRequestId, egress_protocol::response::BrokerWireOutcome) -> Self
+pub const fn egress_protocol::response::CanonicalBrokerResponse::outcome(&self) -> &egress_protocol::response::BrokerWireOutcome
+pub const fn egress_protocol::response::CanonicalBrokerResponse::request(&self) -> egress_protocol::session::BrokerRequestId
+pub struct egress_protocol::response::CanonicalResponseChunk
+impl egress_protocol::response::CanonicalResponseChunk
+pub fn egress_protocol::response::CanonicalResponseChunk::bytes(&self) -> &[u8]
+pub const fn egress_protocol::response::CanonicalResponseChunk::count(&self) -> u64
+pub fn egress_protocol::response::CanonicalResponseChunk::decode(&[u8]) -> core::result::Result<Self, egress_protocol::response::ResponseChunkError>
+pub const fn egress_protocol::response::CanonicalResponseChunk::digest(&self) -> egress_protocol::response::ResponseDigest
+pub fn egress_protocol::response::CanonicalResponseChunk::encode(&self) -> core::result::Result<alloc::vec::Vec<u8>, egress_protocol::response::ResponseChunkError>
+pub const fn egress_protocol::response::CanonicalResponseChunk::index(&self) -> u64
+pub const fn egress_protocol::response::CanonicalResponseChunk::request(&self) -> egress_protocol::session::BrokerRequestId
+pub const fn egress_protocol::response::CanonicalResponseChunk::total_length(&self) -> usize
+pub struct egress_protocol::response::CanonicalResponseChunkPayloads<'response>
+impl core::iter::traits::exact_size::ExactSizeIterator for egress_protocol::response::CanonicalResponseChunkPayloads<'_>
+impl core::iter::traits::iterator::Iterator for egress_protocol::response::CanonicalResponseChunkPayloads<'_>
+pub type egress_protocol::response::CanonicalResponseChunkPayloads<'_>::Item = core::result::Result<alloc::vec::Vec<u8>, egress_protocol::response::ResponseChunkError>
+pub fn egress_protocol::response::CanonicalResponseChunkPayloads<'_>::next(&mut self) -> core::option::Option<Self::Item>
+pub fn egress_protocol::response::CanonicalResponseChunkPayloads<'_>::size_hint(&self) -> (usize, core::option::Option<usize>)
+impl core::iter::traits::marker::FusedIterator for egress_protocol::response::CanonicalResponseChunkPayloads<'_>
+pub struct egress_protocol::response::CanonicalResponseChunks<'response>
+impl core::iter::traits::exact_size::ExactSizeIterator for egress_protocol::response::CanonicalResponseChunks<'_>
+impl core::iter::traits::iterator::Iterator for egress_protocol::response::CanonicalResponseChunks<'_>
+pub type egress_protocol::response::CanonicalResponseChunks<'_>::Item = core::result::Result<egress_protocol::response::CanonicalResponseChunk, egress_protocol::response::ResponseChunkError>
+pub fn egress_protocol::response::CanonicalResponseChunks<'_>::next(&mut self) -> core::option::Option<Self::Item>
+pub fn egress_protocol::response::CanonicalResponseChunks<'_>::size_hint(&self) -> (usize, core::option::Option<usize>)
+impl core::iter::traits::marker::FusedIterator for egress_protocol::response::CanonicalResponseChunks<'_>
+pub struct egress_protocol::response::GitHubWireResponse
+impl egress_protocol::response::GitHubWireResponse
+pub fn egress_protocol::response::GitHubWireResponse::new(authority_core::github::GitHubOperation, u64, core::option::Option<u64>, core::option::Option<alloc::string::String>) -> core::result::Result<Self, egress_protocol::response::ResponseCborError>
+pub fn egress_protocol::response::GitHubWireResponse::object_id(&self) -> core::option::Option<&str>
+pub const fn egress_protocol::response::GitHubWireResponse::operation(&self) -> authority_core::github::GitHubOperation
+pub const fn egress_protocol::response::GitHubWireResponse::pull_request_number(&self) -> core::option::Option<u64>
+pub const fn egress_protocol::response::GitHubWireResponse::response_bytes(&self) -> u64
+pub struct egress_protocol::response::PublicWireResponse
+impl egress_protocol::response::PublicWireResponse
+pub fn egress_protocol::response::PublicWireResponse::body(&self) -> &[u8]
+pub const fn egress_protocol::response::PublicWireResponse::host(&self) -> &authority_core::http::CanonicalHost
+pub fn egress_protocol::response::PublicWireResponse::new(u16, authority_core::http::CanonicalHost, authority_core::http::CanonicalUrlPath, alloc::vec::Vec<u8>) -> core::result::Result<Self, egress_protocol::response::ResponseCborError>
+pub const fn egress_protocol::response::PublicWireResponse::path(&self) -> &authority_core::http::CanonicalUrlPath
+pub const fn egress_protocol::response::PublicWireResponse::status(&self) -> u16
+pub struct egress_protocol::response::ResponseDigest(_)
+impl egress_protocol::response::ResponseDigest
+pub const fn egress_protocol::response::ResponseDigest::as_bytes(&self) -> &[u8; 32]
+pub const egress_protocol::response::BROKER_RESPONSE_CHUNK_VERSION: u64
+pub const egress_protocol::response::BROKER_RESPONSE_VERSION: u64
+pub const egress_protocol::response::LEGACY_SINGLE_RESPONSE_BODY_BYTES: u64
+pub const egress_protocol::response::MAX_EXPANDED_CANONICAL_RESPONSE_BYTES: usize
+pub const egress_protocol::response::MAX_GITHUB_WIRE_RESPONSE_BYTES: u64
+pub const egress_protocol::response::MAX_PUBLIC_WIRE_BODY_BYTES: u64
+pub const egress_protocol::response::MAX_RESPONSE_CHUNK_BYTES: usize
+pub fn egress_protocol::response::reassemble_response_chunks(&[egress_protocol::response::CanonicalResponseChunk]) -> core::result::Result<egress_protocol::response::CanonicalBrokerResponse, egress_protocol::response::ResponseChunkError>
+pub mod egress_protocol::session
+pub enum egress_protocol::session::EnvelopeAcceptance
+pub egress_protocol::session::EnvelopeAcceptance::Duplicate
+pub egress_protocol::session::EnvelopeAcceptance::New
+pub enum egress_protocol::session::EnvelopeError
+pub egress_protocol::session::EnvelopeError::OutOfOrderSequence
+pub egress_protocol::session::EnvelopeError::OutOfOrderSequence::expected: u64
+pub egress_protocol::session::EnvelopeError::OutOfOrderSequence::received: u64
+pub egress_protocol::session::EnvelopeError::RequestCapacityExhausted
+pub egress_protocol::session::EnvelopeError::RequestIdentityMismatch
+pub egress_protocol::session::EnvelopeError::RequestIdentityMismatch::request: egress_protocol::session::BrokerRequestId
+pub egress_protocol::session::EnvelopeError::SequenceExhausted
+pub egress_protocol::session::EnvelopeError::WrongSession
+pub egress_protocol::session::EnvelopeError::WrongSession::expected: egress_protocol::session::BrokerSessionId
+pub egress_protocol::session::EnvelopeError::WrongSession::received: egress_protocol::session::BrokerSessionId
+impl core::error::Error for egress_protocol::session::EnvelopeError
+impl core::fmt::Display for egress_protocol::session::EnvelopeError
+pub fn egress_protocol::session::EnvelopeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct egress_protocol::session::BrokerEnvelope
+impl egress_protocol::session::BrokerEnvelope
+pub const fn egress_protocol::session::BrokerEnvelope::new(egress_protocol::session::BrokerSessionId, u64, egress_protocol::session::BrokerRequestId, egress_protocol::session::PayloadHash) -> Self
+pub const fn egress_protocol::session::BrokerEnvelope::payload_hash(&self) -> egress_protocol::session::PayloadHash
+pub const fn egress_protocol::session::BrokerEnvelope::request(&self) -> egress_protocol::session::BrokerRequestId
+pub const fn egress_protocol::session::BrokerEnvelope::sequence(&self) -> u64
+pub const fn egress_protocol::session::BrokerEnvelope::session(&self) -> egress_protocol::session::BrokerSessionId
+pub struct egress_protocol::session::BrokerRequestId(_)
+impl egress_protocol::session::BrokerRequestId
+pub const fn egress_protocol::session::BrokerRequestId::as_bytes(&self) -> &[u8; 16]
+pub const fn egress_protocol::session::BrokerRequestId::new([u8; 16]) -> Self
+pub struct egress_protocol::session::BrokerSessionId(_)
+impl egress_protocol::session::BrokerSessionId
+pub const fn egress_protocol::session::BrokerSessionId::as_bytes(&self) -> &[u8; 16]
+pub const fn egress_protocol::session::BrokerSessionId::new([u8; 16]) -> Self
+pub struct egress_protocol::session::PayloadHash(_)
+impl egress_protocol::session::PayloadHash
+pub const fn egress_protocol::session::PayloadHash::as_bytes(&self) -> &[u8; 32]
+pub fn egress_protocol::session::PayloadHash::of_canonical_payload(&[u8]) -> Self
+pub struct egress_protocol::session::SessionReplayGuard
+impl egress_protocol::session::SessionReplayGuard
+pub fn egress_protocol::session::SessionReplayGuard::accept(&mut self, egress_protocol::session::BrokerEnvelope) -> core::result::Result<egress_protocol::session::EnvelopeAcceptance, egress_protocol::session::EnvelopeError>
+pub fn egress_protocol::session::SessionReplayGuard::accepted_request_count(&self) -> usize
+pub const fn egress_protocol::session::SessionReplayGuard::new(egress_protocol::session::BrokerSessionId, core::num::nonzero::NonZeroUsize) -> Self
+pub const fn egress_protocol::session::SessionReplayGuard::next_sequence(&self) -> core::option::Option<u64>
+pub const fn egress_protocol::session::SessionReplayGuard::session(&self) -> egress_protocol::session::BrokerSessionId
+pub const egress_protocol::session::MAX_CONTROL_FRAME_BYTES: usize

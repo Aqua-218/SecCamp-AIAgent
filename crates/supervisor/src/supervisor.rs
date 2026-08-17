@@ -11,8 +11,8 @@ use authority_core::{
     handle::{HandleId, ObjectId, OpenHandle},
     kernel::CapabilityKernel,
     state::{
-        CapabilityGrant, HandleCloseStatus, RevocationStatus, Subject, SubjectCloseStatus,
-        SubjectFinishStatus,
+        AuthorizationEpoch, CapabilityGrant, HandleCloseStatus, RevocationStatus, Subject,
+        SubjectCloseStatus, SubjectFinishStatus, SubjectStatus,
     },
     time::MonotonicTime,
 };
@@ -359,6 +359,29 @@ pub trait AuthorityKernel {
 
     /// Returns the live handle record, if the kernel still owns it.
     fn open_handle(&self, handle: &HandleId) -> Result<Option<OpenHandle>, Self::Error>;
+
+    /// Captures the authority state that must remain valid while a newly registered subject's
+    /// external workload crosses its start boundary.
+    ///
+    /// Implementations that can be shared with another authority caller should override this
+    /// method. The default keeps compatibility with small adapters that have no lifecycle
+    /// inspection surface; production kernels return the subject status and authorization epoch
+    /// so a concurrent close or revocation fails closed before setup is published.
+    fn startup_snapshot(
+        &self,
+        _subject: &SubjectId,
+    ) -> Result<Option<AuthorityStartupSnapshot>, Self::Error> {
+        Ok(None)
+    }
+}
+
+/// Authority state observed around the register-to-workload-start boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityStartupSnapshot {
+    /// Lifecycle state of the subject at the observation point.
+    pub status: SubjectStatus,
+    /// Authorization epoch used to detect a revocation during startup.
+    pub authorization_epoch: AuthorizationEpoch,
 }
 
 impl AuthorityKernel for CapabilityKernel {
@@ -419,6 +442,111 @@ impl AuthorityKernel for CapabilityKernel {
 
     fn open_handle(&self, handle: &HandleId) -> Result<Option<OpenHandle>, Self::Error> {
         CapabilityKernel::open_handle(self, handle)
+    }
+
+    fn startup_snapshot(
+        &self,
+        subject: &SubjectId,
+    ) -> Result<Option<AuthorityStartupSnapshot>, Self::Error> {
+        Ok(Some(AuthorityStartupSnapshot {
+            status: CapabilityKernel::subject_status(self, subject)?.ok_or_else(|| {
+                authority_core::kernel::CapabilityKernelError::StateTransition(
+                    authority_core::state::CapabilityStateError::UnknownSubject(subject.clone()),
+                )
+            })?,
+            authorization_epoch: CapabilityKernel::authorization_epoch(self)?,
+        }))
+    }
+}
+
+/// Registry whose identities remain reserved for the lifetime of one supervisor session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SupervisorCapacity {
+    /// Subject identities, including identities from cleanly rolled-back setup attempts.
+    Subjects,
+    /// Runtime handle identities, including identities whose open operation had no effect.
+    IssuedHandles,
+}
+
+impl fmt::Display for SupervisorCapacity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Subjects => "subjects",
+            Self::IssuedHandles => "issued handles",
+        })
+    }
+}
+
+/// Validation failure for an explicit supervisor registry bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorLimitsError {
+    /// A registry bound of zero cannot admit even the first identity.
+    Zero(SupervisorCapacity),
+}
+
+impl fmt::Display for SupervisorLimitsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero(capacity) => write!(formatter, "{capacity} capacity must be non-zero"),
+        }
+    }
+}
+
+impl Error for SupervisorLimitsError {}
+
+/// Explicit bounds for the supervisor's permanent identity registries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SupervisorLimits {
+    max_subjects: usize,
+    max_issued_handles: usize,
+}
+
+/// Safe default bound for permanent subject identities in one session.
+pub const DEFAULT_MAX_SUBJECTS: usize = 1_024;
+/// Safe default bound for permanent runtime-handle identities in one session.
+pub const DEFAULT_MAX_ISSUED_HANDLES: usize = 65_536;
+
+impl Default for SupervisorLimits {
+    fn default() -> Self {
+        Self {
+            max_subjects: DEFAULT_MAX_SUBJECTS,
+            max_issued_handles: DEFAULT_MAX_ISSUED_HANDLES,
+        }
+    }
+}
+
+impl SupervisorLimits {
+    /// Creates explicit permanent registry bounds.
+    #[must_use]
+    pub const fn new(max_subjects: usize, max_issued_handles: usize) -> Self {
+        Self {
+            max_subjects,
+            max_issued_handles,
+        }
+    }
+
+    /// Returns the maximum number of permanently reserved subject identities.
+    #[must_use]
+    pub const fn max_subjects(self) -> usize {
+        self.max_subjects
+    }
+
+    /// Returns the maximum number of permanently reserved handle identities.
+    #[must_use]
+    pub const fn max_issued_handles(self) -> usize {
+        self.max_issued_handles
+    }
+
+    fn validate(self) -> Result<(), SupervisorLimitsError> {
+        if self.max_subjects == 0 {
+            return Err(SupervisorLimitsError::Zero(SupervisorCapacity::Subjects));
+        }
+        if self.max_issued_handles == 0 {
+            return Err(SupervisorLimitsError::Zero(
+                SupervisorCapacity::IssuedHandles,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -550,7 +678,9 @@ impl<KE, RE, CE> SupervisorError<KE, RE, CE> {
             Self::Resource(_)
             | Self::SetupFailed { .. }
             | Self::CleanupFailed { .. }
-            | Self::CleanupBlocked { .. } => RefusalCode::Unavailable,
+            | Self::CleanupBlocked { .. }
+            | Self::InvalidLimits(_)
+            | Self::CapacityExceeded(_) => RefusalCode::Unavailable,
             Self::Caller(_)
             | Self::Kernel(_)
             | Self::DuplicateSubject(_)
@@ -583,6 +713,10 @@ pub enum SupervisorError<KE, RE, CE> {
     DuplicateSubject(SubjectId),
     /// The supplied authority kernel already contains session state.
     KernelNotPristine,
+    /// The configured permanent registry bounds are invalid.
+    InvalidLimits(SupervisorLimitsError),
+    /// The configured permanent registry has no remaining identity capacity.
+    CapacityExceeded(SupervisorCapacity),
     /// A requested subject is not known to this supervisor.
     UnknownSubject(SubjectId),
     /// A subject is not in the Running state required by the operation.
@@ -666,6 +800,10 @@ impl<KE: fmt::Display + fmt::Debug, RE: fmt::Display + fmt::Debug, CE: fmt::Disp
             Self::KernelNotPristine => formatter.write_str(
                 "authority kernel is not pristine and cannot be paired with an empty ownership ledger",
             ),
+            Self::InvalidLimits(error) => write!(formatter, "invalid supervisor limits: {error}"),
+            Self::CapacityExceeded(capacity) => {
+                write!(formatter, "supervisor {capacity} capacity is exhausted")
+            }
             Self::UnknownSubject(subject) => {
                 write!(formatter, "subject `{subject}` is not supervised")
             }
@@ -793,6 +931,7 @@ pub struct Supervisor<K, R, C> {
     kernel: K,
     resources: R,
     callers: C,
+    limits: SupervisorLimits,
     subjects: BTreeMap<SubjectId, SubjectRecord>,
     /// Subject IDs remain reserved after every setup attempt that reached an
     /// effectful phase, even when rollback releases every resource.
@@ -820,6 +959,20 @@ where
         resources: R,
         callers: C,
     ) -> SupervisorResult<K::Error, R::Error, C::Error, Self> {
+        Self::new_with_limits(kernel, resources, callers, SupervisorLimits::default())
+    }
+
+    /// Creates an empty supervisor with explicit permanent identity bounds.
+    ///
+    /// A bound is validated before the kernel is inspected. The registry never evicts closed
+    /// subjects or issued handles, so exhaustion is permanent for the lifetime of this session.
+    pub fn new_with_limits(
+        kernel: K,
+        resources: R,
+        callers: C,
+        limits: SupervisorLimits,
+    ) -> SupervisorResult<K::Error, R::Error, C::Error, Self> {
+        limits.validate().map_err(SupervisorError::InvalidLimits)?;
         if !kernel.is_pristine().map_err(SupervisorError::Kernel)? {
             return Err(SupervisorError::KernelNotPristine);
         }
@@ -827,10 +980,29 @@ where
             kernel,
             resources,
             callers,
+            limits,
             subjects: BTreeMap::new(),
             issued_subjects: BTreeSet::new(),
             issued_handles: BTreeMap::new(),
         })
+    }
+
+    /// Returns the immutable registry bounds selected for this session.
+    #[must_use]
+    pub const fn limits(&self) -> SupervisorLimits {
+        self.limits
+    }
+
+    /// Returns the number of subject identities permanently reserved in this session.
+    #[must_use]
+    pub fn issued_subject_count(&self) -> usize {
+        self.issued_subjects.len()
+    }
+
+    /// Returns the number of runtime-handle identities permanently reserved in this session.
+    #[must_use]
+    pub fn issued_handle_count(&self) -> usize {
+        self.issued_handles.len()
     }
 
     /// Returns the locally tracked lifecycle state for a subject.
@@ -931,6 +1103,11 @@ where
                 Err(error) => return Err(error),
             }
         }
+        if self.issued_subjects.len() >= self.limits.max_subjects {
+            return Err(SupervisorError::CapacityExceeded(
+                SupervisorCapacity::Subjects,
+            ));
+        }
 
         // Reserve before the first adapter call. A delayed completion from any
         // later setup phase must never be rebound to a fresh local subject.
@@ -953,6 +1130,16 @@ where
                 .register_subject(subject.clone())
                 .map_err(|error| (SetupStep::RegisterSubject, OperationFailure::Kernel(error)))?;
             kernel_registered = true;
+            let startup_snapshot = self
+                .kernel
+                .startup_snapshot(&subject_id)
+                .map_err(|error| (SetupStep::StartWorkload, OperationFailure::Kernel(error)))?;
+            if startup_snapshot.is_some_and(|snapshot| snapshot.status != SubjectStatus::Running) {
+                return Err((
+                    SetupStep::StartWorkload,
+                    OperationFailure::Invariant("authority subject changed before workload start"),
+                ));
+            }
             let cgroup_token = cgroup.and_then(ResourceOwnership::token).ok_or((
                 SetupStep::StartWorkload,
                 OperationFailure::Invariant("cgroup setup ownership is unresolved"),
@@ -975,6 +1162,20 @@ where
                 &mut workload,
             )
             .map_err(|failure| (SetupStep::StartWorkload, failure))?;
+            if let Some(expected) = startup_snapshot {
+                let observed = self
+                    .kernel
+                    .startup_snapshot(&subject_id)
+                    .map_err(|error| (SetupStep::StartWorkload, OperationFailure::Kernel(error)))?;
+                if observed != Some(expected) {
+                    return Err((
+                        SetupStep::StartWorkload,
+                        OperationFailure::Invariant(
+                            "authority subject changed during workload start",
+                        ),
+                    ));
+                }
+            }
             Ok::<(), (SetupStep, OperationFailure<K::Error, R::Error>)>(())
         })();
 
@@ -1100,6 +1301,11 @@ where
         self.ensure_running(&caller)?;
         if self.issued_handles.contains_key(&handle) {
             return Err(SupervisorError::StaleHandle(handle));
+        }
+        if self.issued_handles.len() >= self.limits.max_issued_handles {
+            return Err(SupervisorError::CapacityExceeded(
+                SupervisorCapacity::IssuedHandles,
+            ));
         }
         // The adapter has observed this ID after this point, so even a
         // guaranteed no-effect failure consumes its session-local identity.
@@ -1765,20 +1971,29 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        error::Error,
+        fmt,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
     use super::{
-        CgroupHandle, CleanupStep, ConnectionIdentity, ControlFdHandle, MountHandle,
-        OperationFailure, ResourceAcquisition, ResourceError, ResourceFailure, ResourceMutation,
-        RuntimeResources, SetupStep, StaticCallerResolver, Supervisor, SupervisorError,
-        WorkloadHandle,
+        AuthorityKernel, CgroupHandle, CleanupStep, ConnectionIdentity, ControlFdHandle,
+        MountHandle, OperationFailure, ResourceAcquisition, ResourceError, ResourceFailure,
+        ResourceMutation, RuntimeResources, SetupStep, StaticCallerResolver, SubjectLifecycle,
+        Supervisor, SupervisorError, WorkloadHandle,
     };
     use authority_core::{
-        capability::{AuthorityBody, IssuerId, SubjectId},
+        capability::{AuthorityBody, CapId, IssuerId, SubjectId},
         file::{FileAuthority, FileEffect, FileEffects},
-        handle::{HandleId, ObjectId},
-        kernel::CapabilityKernel,
+        handle::{HandleId, ObjectId, OpenHandle},
+        kernel::{CapabilityKernel, CapabilityKernelError},
         path::{CanonicalPath, PathPattern},
         repository::RepoId,
-        state::{CapabilityState, StaticAuthorityEnvelope, Subject},
+        state::{
+            CapabilityGrant, CapabilityState, HandleCloseStatus, RevocationStatus,
+            StaticAuthorityEnvelope, Subject, SubjectCloseStatus, SubjectFinishStatus,
+        },
         time::{MonotonicTime, TimeWindow},
     };
 
@@ -1795,6 +2010,124 @@ mod tests {
         events: Vec<&'static str>,
         faults: Vec<TestFault>,
         next_token: u64,
+    }
+
+    #[derive(Debug)]
+    enum FaultKernelError {
+        Injected(&'static str),
+        Inner(CapabilityKernelError),
+    }
+
+    impl fmt::Display for FaultKernelError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Injected(operation) => write!(formatter, "injected {operation} failure"),
+                Self::Inner(error) => error.fmt(formatter),
+            }
+        }
+    }
+
+    impl Error for FaultKernelError {}
+
+    #[derive(Debug)]
+    struct FaultKernel {
+        inner: CapabilityKernel,
+        fail_begin: AtomicBool,
+        fail_finish: AtomicBool,
+    }
+
+    impl FaultKernel {
+        fn new(fail_begin: bool, fail_finish: bool) -> Self {
+            Self {
+                inner: kernel(),
+                fail_begin: AtomicBool::new(fail_begin),
+                fail_finish: AtomicBool::new(fail_finish),
+            }
+        }
+
+        fn inner<T>(result: Result<T, CapabilityKernelError>) -> Result<T, FaultKernelError> {
+            result.map_err(FaultKernelError::Inner)
+        }
+    }
+
+    impl AuthorityKernel for FaultKernel {
+        type Error = FaultKernelError;
+
+        fn is_pristine(&self) -> Result<bool, Self::Error> {
+            Self::inner(CapabilityKernel::is_pristine(&self.inner))
+        }
+
+        fn register_subject(&self, subject: Subject) -> Result<(), Self::Error> {
+            Self::inner(CapabilityKernel::register_subject(&self.inner, subject))
+        }
+
+        fn issue_root(&self, grant: CapabilityGrant) -> Result<CapId, Self::Error> {
+            Self::inner(CapabilityKernel::issue_root(&self.inner, grant))
+        }
+
+        fn derive(
+            &self,
+            caller: &SubjectId,
+            parent: &CapId,
+            grant: CapabilityGrant,
+            now: MonotonicTime,
+        ) -> Result<CapId, Self::Error> {
+            Self::inner(CapabilityKernel::derive(
+                &self.inner,
+                caller,
+                parent,
+                grant,
+                now,
+            ))
+        }
+
+        fn revoke(
+            &self,
+            caller: &SubjectId,
+            capability: &CapId,
+        ) -> Result<RevocationStatus, Self::Error> {
+            Self::inner(CapabilityKernel::revoke_held_by(
+                &self.inner,
+                caller,
+                capability,
+            ))
+        }
+
+        fn begin_subject_close(
+            &self,
+            subject: &SubjectId,
+        ) -> Result<SubjectCloseStatus, Self::Error> {
+            if self.fail_begin.swap(false, Ordering::SeqCst) {
+                return Err(FaultKernelError::Injected("begin_subject_close"));
+            }
+            Self::inner(CapabilityKernel::begin_subject_close(&self.inner, subject))
+        }
+
+        fn finish_subject_close(
+            &self,
+            subject: &SubjectId,
+        ) -> Result<SubjectFinishStatus, Self::Error> {
+            if self.fail_finish.swap(false, Ordering::SeqCst) {
+                return Err(FaultKernelError::Injected("finish_subject_close"));
+            }
+            Self::inner(CapabilityKernel::finish_subject_close(&self.inner, subject))
+        }
+
+        fn register_open_handle(&self, handle: OpenHandle) -> Result<(), Self::Error> {
+            Self::inner(CapabilityKernel::register_open_handle(&self.inner, handle))
+        }
+
+        fn close_handle(
+            &self,
+            caller: &SubjectId,
+            handle: &HandleId,
+        ) -> Result<HandleCloseStatus, Self::Error> {
+            Self::inner(CapabilityKernel::close_handle(&self.inner, caller, handle))
+        }
+
+        fn open_handle(&self, handle: &HandleId) -> Result<Option<OpenHandle>, Self::Error> {
+            Self::inner(CapabilityKernel::open_handle(&self.inner, handle))
+        }
     }
 
     impl TestResources {
@@ -1934,6 +2267,111 @@ mod tests {
 
     fn kernel() -> CapabilityKernel {
         CapabilityKernel::new(CapabilityState::new(IssuerId::new("test-session")))
+    }
+
+    fn prepared_fault_supervisor(
+        fail_begin: bool,
+        fail_finish: bool,
+    ) -> (
+        Supervisor<FaultKernel, TestResources, StaticCallerResolver>,
+        SubjectId,
+    ) {
+        let identity = ConnectionIdentity::new(90, 190, 1000, 1000);
+        let subject = SubjectId::new(if fail_begin {
+            "begin-close-retry"
+        } else {
+            "finish-close-retry"
+        });
+        let mut callers = StaticCallerResolver::new();
+        callers
+            .bind(identity, subject.clone())
+            .expect("caller binding must be unique");
+        let mut supervisor = Supervisor::new(
+            FaultKernel::new(fail_begin, fail_finish),
+            TestResources::default(),
+            callers,
+        )
+        .expect("fault kernel must start pristine");
+        supervisor
+            .create_subject(Subject::new(subject.clone(), envelope()), identity)
+            .expect("subject setup must succeed");
+        (supervisor, subject)
+    }
+
+    #[test]
+    fn begin_close_failure_is_retryable_after_local_closing_transition() {
+        let (mut supervisor, subject) = prepared_fault_supervisor(true, false);
+
+        let first = supervisor
+            .shutdown_subject(&subject)
+            .expect_err("injected begin failure must be observable");
+        assert!(matches!(
+            first,
+            SupervisorError::CleanupFailed { failures, .. }
+                if matches!(
+                    failures.as_slice(),
+                    [super::CleanupFailure {
+                        step: CleanupStep::BeginClose,
+                        cause: OperationFailure::Kernel(FaultKernelError::Injected(
+                            "begin_subject_close"
+                        )),
+                    }]
+                )
+        ));
+        assert_eq!(
+            supervisor
+                .lifecycle(&subject)
+                .expect("subject must remain tracked"),
+            SubjectLifecycle::Closing
+        );
+
+        supervisor
+            .shutdown_subject(&subject)
+            .expect("retry must complete begin-close cleanup");
+        assert_eq!(
+            supervisor
+                .lifecycle(&subject)
+                .expect("closed subject must remain inspectable"),
+            SubjectLifecycle::Closed
+        );
+    }
+
+    #[test]
+    fn finish_close_failure_is_retryable_after_external_cleanup() {
+        let (mut supervisor, subject) = prepared_fault_supervisor(false, true);
+
+        let first = supervisor
+            .shutdown_subject(&subject)
+            .expect_err("injected finish failure must be observable");
+        assert!(matches!(
+            first,
+            SupervisorError::CleanupFailed { failures, .. }
+                if matches!(
+                    failures.as_slice(),
+                    [super::CleanupFailure {
+                        step: CleanupStep::FinishClose,
+                        cause: OperationFailure::Kernel(FaultKernelError::Injected(
+                            "finish_subject_close"
+                        )),
+                    }]
+                )
+        ));
+        assert_eq!(
+            supervisor
+                .lifecycle(&subject)
+                .expect("subject must remain tracked"),
+            SubjectLifecycle::Closing
+        );
+
+        supervisor
+            .shutdown_subject(&subject)
+            .expect("retry must finish authority close after resources are gone");
+        assert_eq!(
+            supervisor
+                .lifecycle(&subject)
+                .expect("closed subject must remain inspectable"),
+            SubjectLifecycle::Closed
+        );
     }
 
     #[test]

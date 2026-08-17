@@ -11,6 +11,7 @@ pub mod handle;
 pub mod http;
 pub mod kernel;
 pub mod path;
+pub mod policy;
 pub mod repository;
 pub mod state;
 pub mod time;

@@ -31,9 +31,9 @@ use rustix::{
 };
 
 use super::{
-    CGROUP2_SUPER_MAGIC, COMMAND_TIMEOUT, CommandRunner, CommandSpec, MAX_COMMAND_OUTPUT_BYTES,
-    MAX_WORKSPACE_DEPTH, PROCESS_POLL_INTERVAL, RealCommandRunner, RuntimeConfig, RuntimeError,
-    Sha256Digest,
+    CGROUP2_SUPER_MAGIC, COMMAND_TIMEOUT, CommandRunner, CommandSpec, DmVerityConfig,
+    MAX_COMMAND_OUTPUT_BYTES, MAX_WORKSPACE_DEPTH, PROCESS_POLL_INTERVAL, RealCommandRunner,
+    RuntimeConfig, RuntimeError, Sha256Digest,
 };
 
 const RECOVERY_TIMEOUT: Duration = COMMAND_TIMEOUT;
@@ -617,13 +617,16 @@ impl SealedRecoveryTools {
     }
 }
 
-struct SealedExecutable {
+pub(crate) struct SealedExecutable {
     _file: File,
     program: PathBuf,
 }
 
 impl SealedExecutable {
-    fn load(label: &str, artifact: &super::PinnedArtifact) -> Result<Self, RuntimeError> {
+    pub(crate) fn load(
+        label: &str,
+        artifact: &super::PinnedArtifact,
+    ) -> Result<Self, RuntimeError> {
         let mut source = File::from(
             open(
                 &artifact.path,
@@ -691,6 +694,10 @@ impl SealedExecutable {
             _file: sealed,
             program,
         })
+    }
+
+    pub(crate) fn program(&self) -> &Path {
+        &self.program
     }
 }
 
@@ -1081,26 +1088,127 @@ fn validate_dmsetup_info(
 
 fn validate_verity_status(
     output: &[u8],
-    _ownership: &SessionResourceOwnership,
+    ownership: &SessionResourceOwnership,
+) -> Result<(), RuntimeError> {
+    validate_verity_status_fields(
+        output,
+        &ownership.mapper_name,
+        &ownership.data_device,
+        &ownership.hash_device,
+        ownership.root_hash,
+    )
+}
+
+pub(crate) fn validate_live_verity_status(
+    output: &[u8],
+    expected: &DmVerityConfig,
+) -> Result<(), RuntimeError> {
+    validate_verity_status_fields(
+        output,
+        &expected.mapper_name,
+        &expected.data_device,
+        &expected.hash_device,
+        expected.root_hash,
+    )
+}
+
+fn validate_verity_status_fields(
+    output: &[u8],
+    mapper_name: &str,
+    data_device: &Path,
+    hash_device: &Path,
+    root_hash: Sha256Digest,
 ) -> Result<(), RuntimeError> {
     let output = std::str::from_utf8(output)
         .map_err(|_| RuntimeError::Command("verity status is not valid UTF-8".to_owned()))?;
+    let mut lines = output.lines();
+    let header = lines.next().ok_or_else(|| {
+        RuntimeError::Command("verity status omitted the active mapper header".to_owned())
+    })?;
+    let expected_header = format!("/dev/mapper/{mapper_name} is active.");
+    let expected_in_use_header = format!("/dev/mapper/{mapper_name} is active and is in use.");
+    if !matches!(header, value if value == expected_header || value == expected_in_use_header) {
+        return Err(RuntimeError::Command(format!(
+            "verity status does not bind exact mapper {mapper_name}"
+        )));
+    }
+    let fields = lines.collect::<Vec<_>>();
     let expected = [
         ("type", "VERITY".to_owned()),
+        ("status", "verified".to_owned()),
+        ("hash type", "1".to_owned()),
+        ("data block", "4096".to_owned()),
+        ("hash block", "4096".to_owned()),
+        ("hash name", "sha256".to_owned()),
+        ("root hash", root_hash.to_hex()),
         ("mode", "readonly".to_owned()),
     ];
     for (key, value) in expected {
-        let observed = output.lines().find_map(|line| {
-            let (candidate, value) = line.trim().split_once(':')?;
-            (candidate == key).then(|| value.trim())
-        });
-        if observed != Some(value.as_str()) {
+        let observed = fields
+            .iter()
+            .filter_map(|line| {
+                let (candidate, value) = line.trim().split_once(':')?;
+                (candidate == key).then(|| value.trim())
+            })
+            .collect::<Vec<_>>();
+        if observed.len() != 1
+            || if key == "root hash" {
+                !observed[0].eq_ignore_ascii_case(&value)
+            } else {
+                observed[0] != value
+            }
+        {
             return Err(RuntimeError::Command(format!(
                 "verity status does not bind exact {key}: expected {value}, observed {observed:?}"
             )));
         }
     }
+    validate_status_device(&fields, "data", data_device)?;
+    validate_status_device(&fields, "hash", hash_device)?;
     Ok(())
+}
+
+fn validate_status_device(
+    fields: &[&str],
+    prefix: &str,
+    expected: &Path,
+) -> Result<(), RuntimeError> {
+    let device_key = format!("{prefix} device");
+    let device = unique_status_value(fields, &device_key)?;
+    if device == expected.to_string_lossy() {
+        return Ok(());
+    }
+
+    let loop_key = format!("{prefix} loop");
+    let loop_path = unique_status_value(fields, &loop_key)?;
+    let loop_device = device.strip_prefix("/dev/loop").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    if loop_device && loop_path == expected.to_string_lossy() {
+        Ok(())
+    } else {
+        Err(RuntimeError::Command(format!(
+            "verity status does not bind exact {prefix} input {}",
+            expected.display()
+        )))
+    }
+}
+
+fn unique_status_value<'a>(fields: &[&'a str], key: &str) -> Result<&'a str, RuntimeError> {
+    let observed = fields
+        .iter()
+        .filter_map(|line| {
+            let (candidate, value) = line.trim().split_once(':')?;
+            (candidate == key).then(|| value.trim())
+        })
+        .collect::<Vec<_>>();
+    if observed.len() == 1 {
+        Ok(observed[0])
+    } else {
+        Err(RuntimeError::Command(format!(
+            "verity status must contain exactly one {key} field, observed {observed:?}"
+        )))
+    }
 }
 
 fn validate_verity_table(
@@ -1560,8 +1668,19 @@ mod tests {
     #[test]
     fn verity_status_requires_exact_devices_type_and_mode() {
         let ownership = ownership();
-        let good = b"/dev/mapper/root-session-a is active.\n  type: VERITY\n  data device: /srv/images/root\n  hash device: /srv/images/root.verity\n  mode: readonly\n";
-        assert!(validate_verity_status(good, &ownership).is_ok());
+        let good = format!(
+            "/dev/mapper/root-session-a is active.\n  type: VERITY\n  status: verified\n  hash type: 1\n  data block: 4096\n  hash block: 4096\n  hash name: sha256\n  root hash: {}\n  data device: /srv/images/root\n  hash device: /srv/images/root.verity\n  mode: readonly\n",
+            ownership.root_hash.to_hex()
+        );
+        assert!(validate_verity_status(good.as_bytes(), &ownership).is_ok());
+        let loop_backed = format!(
+            "/dev/mapper/root-session-a is active.\n  type: VERITY\n  status: verified\n  hash type: 1\n  data block: 4096\n  hash block: 4096\n  hash name: sha256\n  root hash: {}\n  data device: /dev/loop21\n  data loop: /srv/images/root\n  hash device: /dev/loop20\n  hash loop: /srv/images/root.verity\n  mode: readonly\n",
+            ownership.root_hash.to_hex()
+        );
+        assert!(validate_verity_status(loop_backed.as_bytes(), &ownership).is_ok());
+        let foreign_loop =
+            loop_backed.replace("data loop: /srv/images/root", "data loop: /tmp/foreign");
+        assert!(validate_verity_status(foreign_loop.as_bytes(), &ownership).is_err());
         let foreign = b"type: VERITY\ndata device: /srv/images/root\nhash device: /srv/images/root.verity\nmode: readwrite\n";
         assert!(validate_verity_status(foreign, &ownership).is_err());
     }

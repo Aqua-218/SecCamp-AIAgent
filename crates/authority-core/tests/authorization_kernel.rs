@@ -10,7 +10,11 @@ use std::{
     convert::Infallible,
     error::Error,
     fmt,
-    sync::{Arc, Barrier, mpsc},
+    sync::{
+        Arc, Barrier, Weak,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -25,7 +29,7 @@ use authority_core::{
     handle::{HandleId, ObjectId, OpenHandle},
     kernel::{
         CapabilityInspectionError, CapabilityKernel, CapabilityKernelError, EffectCommitError,
-        EffectExecution,
+        EffectExecution, RevocationObserver, RevocationObserverError,
     },
     path::{CanonicalPath, PathPattern},
     repository::RepoId,
@@ -47,6 +51,30 @@ impl fmt::Display for ExecutorFailure {
 }
 
 impl Error for ExecutorFailure {}
+
+struct ReentrantRevocationObserver {
+    kernel: Weak<CapabilityKernel>,
+    calls: Arc<AtomicUsize>,
+    failure: Option<&'static str>,
+}
+
+impl RevocationObserver for ReentrantRevocationObserver {
+    fn discard_cached_decisions(&self) -> Result<(), RevocationObserverError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let kernel = self.kernel.upgrade().ok_or_else(|| {
+            RevocationObserverError::new("reentrant-observer", "kernel was dropped")
+        })?;
+        // The callback must run after the exclusive state guard is released.
+        // A read through the same kernel would deadlock if propagation happened
+        // while revoke still held that guard.
+        kernel.authorization_epoch().map_err(|error| {
+            RevocationObserverError::new("reentrant-observer", error.to_string())
+        })?;
+        self.failure.map_or(Ok(()), |reason| {
+            Err(RevocationObserverError::new("cache", reason))
+        })
+    }
+}
 
 fn time(ticks: u64) -> MonotonicTime {
     MonotonicTime::from_ticks(ticks)
@@ -317,6 +345,87 @@ fn active_capability_inspection_preserves_subject_and_lifecycle_binding() {
             .is_empty(),
         "metadata inspection must not fabricate an external effect attempt"
     );
+}
+
+// Requirement: an inspection callback error releases its shared guard so a
+// later exclusive revoke cannot be stranded. Category: concurrency/error.
+// Risk: critical.
+#[test]
+fn failed_active_capability_inspection_releases_the_guard() {
+    let (kernel, root_id) = kernel_with_root();
+
+    assert_eq!(
+        kernel.with_active_capability(&root_subject_id(), &root_id, time(30), |_| Err::<(), _>(
+            ExecutorFailure
+        ),),
+        Err(CapabilityInspectionError::Inspection(ExecutorFailure))
+    );
+    assert_eq!(
+        kernel.revoke_held_by(&root_subject_id(), &root_id),
+        Ok(RevocationStatus::NewlyRevoked)
+    );
+}
+
+// Requirement: revocation commits before observer propagation, invokes every
+// observer, and reports the first failure while keeping later authorization
+// denied. Category: observer/concurrency/error. Risk: critical.
+#[test]
+fn observer_failure_does_not_undo_revoke_or_skip_later_observers() {
+    let (kernel, root_id) = kernel_with_root();
+    let kernel = Arc::new(kernel);
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    let weak = Arc::downgrade(&kernel);
+
+    kernel
+        .register_revocation_observer(Arc::new(ReentrantRevocationObserver {
+            kernel: weak.clone(),
+            calls: Arc::clone(&first_calls),
+            failure: Some("cache flush timed out"),
+        }))
+        .expect("first observer registration must succeed");
+    kernel
+        .register_revocation_observer(Arc::new(ReentrantRevocationObserver {
+            kernel: weak,
+            calls: Arc::clone(&second_calls),
+            failure: None,
+        }))
+        .expect("second observer registration must succeed");
+
+    let error = kernel
+        .revoke_held_by(&root_subject_id(), &root_id)
+        .expect_err("observer failure must be visible to the caller");
+    assert_eq!(
+        error,
+        CapabilityKernelError::RevocationNotPropagated(RevocationObserverError::new(
+            "cache",
+            "cache flush timed out",
+        ))
+    );
+    assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(second_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        kernel.authorization_epoch().map(AuthorizationEpoch::as_u64),
+        Ok(1)
+    );
+
+    let executor_calls = Cell::new(0_u8);
+    assert_eq!(
+        kernel.authorize_and_execute_classified(
+            &root_subject_id(),
+            &root_id,
+            &read_request(30, &["src", "main.rs"]),
+            |_| {
+                executor_calls.set(executor_calls.get() + 1);
+                EffectExecution::<_, Infallible>::Committed {
+                    value: (),
+                    receipt: None,
+                }
+            },
+        ),
+        Err(EffectCommitError::NotAuthorized)
+    );
+    assert_eq!(executor_calls.get(), 0);
 }
 
 // Requirement: revoke cannot complete while an earlier authority inspection

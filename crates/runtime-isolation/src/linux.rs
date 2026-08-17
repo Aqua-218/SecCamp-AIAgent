@@ -62,6 +62,12 @@ mod implementation {
         | LANDLOCK_ACCESS_FS_MAKE_REG
         | LANDLOCK_ACCESS_FS_REFER
         | LANDLOCK_ACCESS_FS_TRUNCATE;
+    /// `PROC_SUPER_MAGIC`, the `statfs` filesystem type that identifies a real procfs.
+    ///
+    /// `statfs::f_type` is `__fsword_t` on glibc and `c_ulong` on musl, so the constant is
+    /// declared in a width both fit and compared through [`filesystem_type`] rather than being
+    /// spelled with one libc's type name.
+    const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
     const SECCOMP_DATA_NR_OFFSET: u32 = 0;
     const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
     const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
@@ -181,6 +187,7 @@ mod implementation {
         expected_parent_pid: Option<libc::pid_t>,
         workspace_source: Option<PinnedWorkspaceSource>,
         child_entry_failure: Option<BackendError>,
+        staged_procfs: bool,
     }
 
     impl LinuxBackend {
@@ -195,6 +202,7 @@ mod implementation {
                 expected_parent_pid: None,
                 workspace_source: None,
                 child_entry_failure: None,
+                staged_procfs: false,
             }
         }
     }
@@ -267,7 +275,25 @@ mod implementation {
                         .split_whitespace()
                         .any(|controller| controller == "pids")
             });
-            let control_files = ["memory.max", "pids.max", "cgroup.procs"];
+            // `prepare_cgroup` writes both limits inside the child cgroup it creates under this
+            // root, so the prerequisite is what the root delegates to its children, not what the
+            // root itself carries. A cgroup only receives `memory.max` and `pids.max` when its
+            // parent enabled that controller through `cgroup.subtree_control`, and the root of a
+            // hierarchy has no parent to enable anything: `/sys/fs/cgroup/memory.max` does not
+            // exist on any correctly configured host. Probing the root's own interface files
+            // therefore refuses every hierarchy root, which is what every configuration in this
+            // repository names.
+            let subtree_control = config.cgroup.root.join("cgroup.subtree_control");
+            let subtree_control = fs::read_to_string(&subtree_control);
+            let delegated_controllers = subtree_control.as_ref().is_ok_and(|value| {
+                value
+                    .split_whitespace()
+                    .any(|controller| controller == "memory")
+                    && value
+                        .split_whitespace()
+                        .any(|controller| controller == "pids")
+            });
+            let control_files = ["cgroup.procs", "cgroup.subtree_control"];
             let control_files = control_files
                 .iter()
                 .map(|name| {
@@ -277,10 +303,16 @@ mod implementation {
                 .collect::<Vec<_>>();
             let controls_available = control_files.iter().all(|(_, available)| *available);
             let root_writable = access_path(&config.cgroup.root, libc::W_OK | libc::X_OK);
-            report.cgroup_v2_available =
-                required_controllers && root_writable && controls_available;
+            report.cgroup_v2_available = required_controllers
+                && delegated_controllers
+                && root_writable
+                && controls_available;
             if !report.cgroup_v2_available {
                 let controller_status = controllers.as_ref().map_or_else(
+                    |error| format!("unreadable ({error})"),
+                    |value| value.trim().to_owned(),
+                );
+                let subtree_status = subtree_control.as_ref().map_or_else(
                     |error| format!("unreadable ({error})"),
                     |value| value.trim().to_owned(),
                 );
@@ -310,7 +342,7 @@ mod implementation {
                 report
                     .reasons
                     .push(format!(
-                        "configured cgroup v2 root or required control files are absent or not writable: controllers={controller_status:?}, root_writable={root_writable}, controls={control_status}, kernel_cgroups={kernel_cgroup_status:?}, current_cgroup={current_cgroup:?}, cgroup_mount={cgroup_mount:?}"
+                        "configured cgroup v2 root cannot delegate the required controllers to a child cgroup: controllers={controller_status:?}, subtree_control={subtree_status:?}, root_writable={root_writable}, controls={control_status}, kernel_cgroups={kernel_cgroup_status:?}, current_cgroup={current_cgroup:?}, cgroup_mount={cgroup_mount:?}"
                     ));
             }
             report.seccomp_available = seccomp_is_available();
@@ -393,7 +425,7 @@ mod implementation {
                 IsolationStep::LimitedTmpfs => {
                     mount_tmpfs(step, &config.tmpfs.target, config.tmpfs.size_bytes)
                 }
-                IsolationStep::MaskProc => mount_procfs(step, Path::new("/proc")),
+                IsolationStep::MaskProc => self.mask_proc(step),
                 IsolationStep::MaskDevices => mask_mount(step, Path::new("/dev")),
                 IsolationStep::CloseInheritedFileDescriptors => {
                     let notifier_fd = self.startup_notifier_fd.ok_or_else(|| {
@@ -843,6 +875,15 @@ mod implementation {
                     &workspace_source,
                 )
                 .map_err(|error| with_context(error, "rootfs-stage-workspace"))?;
+                // The kernel refuses a fresh procfs inside a user namespace unless a fully
+                // visible procfs already exists in the mount namespace, and the pivot below
+                // detaches the one this child inherited. Staging the private procfs here, while
+                // the inherited mount is still visible, is the only point at which the mount can
+                // be created; `MaskProc` keeps ownership of the resulting boundary and verifies
+                // it. This mirrors the workspace, which is also staged here and finalized by the
+                // step that owns it.
+                stage_procfs_mount(step, &rootfs.mount_target)
+                    .map_err(|error| with_context(error, "rootfs-stage-proc"))?;
                 Ok::<(), BackendError>(())
             })();
             if let Err(error) = setup_result {
@@ -887,8 +928,24 @@ mod implementation {
             }
             if result.is_ok() {
                 self.workspace_source = Some(workspace_source);
+                self.staged_procfs = true;
             }
             result
+        }
+
+        /// Establishes the boundary that `/proc` exposes only this PID namespace.
+        ///
+        /// A rootfs that was pivoted into carries a procfs staged by `ReadOnlyRootfs`, because
+        /// the kernel accepts a new procfs in a user namespace only while a fully visible one
+        /// still exists. Verifying that staged mount here keeps this step the single owner of
+        /// the `/proc` boundary. A guest that kept its already-immutable root never lost sight
+        /// of its inherited procfs, so it still receives a fresh mount.
+        fn mask_proc(&mut self, step: IsolationStep) -> Result<(), BackendError> {
+            if self.staged_procfs {
+                self.staged_procfs = false;
+                return verify_masked_procfs(step, Path::new("/proc"));
+            }
+            mount_procfs(step, Path::new("/proc"))
         }
 
         fn mount_workspace(
@@ -1205,6 +1262,61 @@ mod implementation {
             libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
             Some(&data),
         )
+    }
+
+    /// Widens `statfs::f_type` to a type every libc's spelling of it fits.
+    ///
+    /// The field is signed on glibc and unsigned on musl. Both hold a small kernel magic number,
+    /// so widening is lossless in either direction and keeps the comparison free of a
+    /// libc-specific type name.
+    #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
+    fn filesystem_type(details: &libc::statfs) -> u64 {
+        details.f_type as u64
+    }
+
+    fn stage_procfs_mount(step: IsolationStep, rootfs_target: &Path) -> Result<(), BackendError> {
+        let target = rootfs_path(rootfs_target, Path::new("/proc")).ok_or_else(|| {
+            BackendError::new(step, "procfs target escaped the staged rootfs", None)
+        })?;
+        mount_procfs(step, &target)
+    }
+
+    /// Confirms the staged procfs still is a procfs carrying every required restriction.
+    ///
+    /// `MaskProc` owns this boundary whether or not the mount was created in this step, so the
+    /// restrictions are re-read from the kernel rather than assumed from the staging call.
+    fn verify_masked_procfs(step: IsolationStep, target: &Path) -> Result<(), BackendError> {
+        let path = c_path(step, target)?;
+        let mut kind = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `kind` is writable for the syscall output.
+        if unsafe { libc::statfs(path.as_ptr(), kind.as_mut_ptr()) } == -1 {
+            return Err(last_error(step, "inspect masked procfs filesystem type"));
+        }
+        // SAFETY: statfs initialized the complete structure on success.
+        let kind = unsafe { kind.assume_init() };
+        if filesystem_type(&kind) != PROC_SUPER_MAGIC {
+            return Err(BackendError::new(
+                step,
+                "masked /proc is not a procfs mount",
+                None,
+            ));
+        }
+        let mut details = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `details` is writable for the syscall output.
+        if unsafe { libc::statvfs(path.as_ptr(), details.as_mut_ptr()) } == -1 {
+            return Err(last_error(step, "inspect masked procfs mount flags"));
+        }
+        // SAFETY: statvfs initialized the complete structure on success.
+        let details = unsafe { details.assume_init() };
+        let required = libc::ST_RDONLY | libc::ST_NOSUID | libc::ST_NODEV | libc::ST_NOEXEC;
+        if details.f_flag & required != required {
+            return Err(BackendError::new(
+                step,
+                "masked procfs mount lost a required restriction",
+                None,
+            ));
+        }
+        Ok(())
     }
 
     fn mount_procfs(step: IsolationStep, target: &Path) -> Result<(), BackendError> {
@@ -2843,8 +2955,7 @@ mod implementation {
         }
 
         fn standard_descriptors_are_sanitized() -> bool {
-            (libc::STDIN_FILENO..=libc::STDERR_FILENO)
-                .all(|descriptor| descriptor_is_null_device(descriptor))
+            (libc::STDIN_FILENO..=libc::STDERR_FILENO).all(descriptor_is_null_device)
         }
 
         fn descriptor_is_null_device(descriptor: RawFd) -> bool {

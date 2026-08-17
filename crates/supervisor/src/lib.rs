@@ -27,7 +27,9 @@ pub use linux_host::{
 
 #[cfg(target_os = "linux")]
 pub use control_socket::{
-    AcceptedControlConnection, ConnectionRebindError, ControlSocketError, CredentialResolveError,
+    AcceptedControlConnection, ConnectionRebindError, ControlSocketError, ControlSocketTimeoutKind,
+    ControlSocketTimeouts, CredentialResolveError, DEFAULT_CONTROL_RECEIVE_TIMEOUT,
+    DEFAULT_CONTROL_SEND_TIMEOUT, MAX_CONTROL_SOCKET_BACKLOG, MAX_CONTROL_SOCKET_TIMEOUT,
     SubjectControlListener, SubjectCredential, SubjectCredentialResolver,
 };
 

@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use firecracker_runtime::{FileSystem, RuntimeError};
+use firecracker_runtime::{FileSystem, RuntimeError, Sha256Digest};
 
 use crate::{BackendError, SessionIdentity, WorkspaceBackend, WorkspaceLease, WorkspaceTemplateId};
 
@@ -312,6 +312,11 @@ where
         state.filesystem.read(path)
     }
 
+    fn digest(&mut self, path: &Path) -> Result<Sha256Digest, RuntimeError> {
+        let mut state = self.state.lock().map_err(|_| poisoned_runtime_error())?;
+        state.filesystem.digest(path)
+    }
+
     fn bind_block_device(
         &mut self,
         source: &Path,
@@ -553,6 +558,7 @@ mod tests {
         clones: Vec<(PathBuf, PathBuf)>,
         images: Vec<(PathBuf, PathBuf, u64)>,
         reads: Vec<PathBuf>,
+        digests: Vec<PathBuf>,
         block_device_binds: Vec<(PathBuf, PathBuf)>,
         block_bindings: Vec<(PathBuf, PathBuf)>,
         block_device_unbinds: Vec<(PathBuf, PathBuf)>,
@@ -573,12 +579,23 @@ mod tests {
 
     impl FileSystem for FakeFileSystem {
         fn read(&mut self, path: &Path) -> Result<Vec<u8>, RuntimeError> {
+            let mut state = self.state.lock().expect("fake state must not be poisoned");
+            state.reads.push(path.to_owned());
+            if path == Path::new("/jailer/snapshots/memory") {
+                return Err(RuntimeError::InvalidConfig(
+                    "pinned artifact exceeds 64 MiB test read bound".to_owned(),
+                ));
+            }
+            Ok(b"artifact".to_vec())
+        }
+
+        fn digest(&mut self, path: &Path) -> Result<Sha256Digest, RuntimeError> {
             self.state
                 .lock()
                 .expect("fake state must not be poisoned")
-                .reads
+                .digests
                 .push(path.to_owned());
-            Ok(b"artifact".to_vec())
+            Ok(Sha256Digest::from_bytes([0xa5; 32]))
         }
 
         fn clone_workspace(
@@ -731,6 +748,25 @@ mod tests {
                 .clones
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn over_64_mib_snapshot_digest_forwards_without_using_bounded_read() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let (_, mut runtime_filesystem) = adapters(Arc::clone(&state));
+        let snapshot_memory = Path::new("/jailer/snapshots/memory");
+
+        let digest = runtime_filesystem
+            .digest(snapshot_memory)
+            .expect("snapshot digest must use the underlying bounded streaming digest");
+
+        assert_eq!(digest, Sha256Digest::from_bytes([0xa5; 32]));
+        let state = state.lock().expect("fake state must not be poisoned");
+        assert_eq!(state.digests, [snapshot_memory.to_owned()]);
+        assert!(
+            state.reads.is_empty(),
+            "snapshot digest must not fall back to the bounded read path"
         );
     }
 

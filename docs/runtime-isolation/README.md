@@ -73,9 +73,9 @@ flowchart TB
 
 ## 実装範囲と検証境界
 
-ポリシー型と 13 step の順序制御、seccomp allowlist の検査は完成していて、mock backend で検証済み。実際に syscall を叩く [`LinuxBackend`](../../crates/runtime-isolation/src/linux.rs) は書いてあるが、user namespace と cgroup v2 と Landlock が揃った環境でしか動かせないため、CI では capability detection の分岐までしか通っていない。
+ポリシー型と 13 step の順序制御、seccomp allowlist の検査に加え、実 syscall を叩く [`LinuxBackend`](../../crates/runtime-isolation/src/linux.rs) と、guest の `workload-isolation-launcher` から呼ぶ実行経路が実装されている。`scripts/ci/verify-privileged-isolation.sh` は user namespace、cgroup v2、Landlock ABI 3、seccomp が揃った host で staged rootfs の 13 step を実測する。
 
-つまり「隔離が実際に効いている」ことはまだ確認できていない。詳細は[検証対応表](verification.md)。
+ただし privileged probe は launcher の inherited start gate と `execve` 後の workload を直接通さず、staged rootfs で観測する。したがって post-exec enforcement、`rootfs.source == "/"`、mount rollback、VM 境界は未検証である。詳細は[検証対応表](verification.md)。
 
 ## 文書一覧
 

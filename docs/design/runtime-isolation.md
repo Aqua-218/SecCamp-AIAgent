@@ -75,7 +75,7 @@ guest の composition は [`guest-supervisor-init`](../../crates/supervisor/src/
 
 workload の起動は supervisor が任意の command を受け取る API ではない。`LinuxHostResources` は image-configured `workload-isolation-launcher` を unnamed socketpair の stdin/stdout だけで起動し、launcher が正確な `ready` を返すまで release byte を送らない。launcher は `RuntimeIsolation::spawn_isolated` の child startup に加えて、CLOEXEC の exec-status writer を workload child に渡す。exec 成功時は fd が閉じて EOF になり、exec 失敗・不正 marker・timeout は `isolated` を返さず fail closed にする。supervisor/launcher の両方が ambient environment を clear し、必要な identity / channel fd だけを明示する。
 
-これは実装された guest path である。ただし runtime-isolation の privileged probe は launcher と `execve` を直接呼ばないため、post-exec の kernel enforcement と `rootfs.source == "/"` は別の verification boundary として残る。
+これは実装されたguest pathである。runtime-isolationのprivileged probeはproduction launcherと`execve`後のworkloadを直接通し、post-execのkernel enforcementを確認する。mutableなhost rootを試験都合でremountしないため、`rootfs.source == "/"` はreadonly SquashFS rootを使うKVM SessionOwner gateで確認する。
 
 ## コンテナを起動する順番
 
@@ -154,7 +154,7 @@ sequenceDiagram
 
 同じ snapshot から複数 VM を起動すると、乱数や ID まで複製され得る。そこで snapshot にセッション固有状態を入れず、restore 後に VM / session / subject / Capability / request ID を作り直す。workspace block image も clone ごとに分ける。[Firecracker snapshot security](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md?plain=1)
 
-実装上は `WorkloadStopped` から Firecracker の pause acknowledgement を受けて `SnapshotPaused` に遷移してから snapshot files を書く。pause 自体の応答が失われた場合は `SnapshotPauseUnknown`、write/hash が失敗した場合も paused state を再利用せず shutdown に進む。fake/runtime test ではこの fail-closed 状態機械を確認済みだが、実 Firecracker の snapshot/restore 動作は未検証である。
+実装上は `WorkloadStopped` から Firecracker の pause acknowledgement を受けて `SnapshotPaused` に遷移してから snapshot files を書く。pause 自体の応答が失われた場合は `SnapshotPauseUnknown`、write/hash が失敗した場合も paused state を再利用せず shutdown に進む。fake/runtime testでfail-closed状態機械を、production SessionOwner KVM gateでclean snapshot capture／restore、rebind、resumeを確認済みである。
 
 ## 関連
 

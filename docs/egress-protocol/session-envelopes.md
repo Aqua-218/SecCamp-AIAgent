@@ -69,20 +69,15 @@ response outcome の保持先と connection close は transport / Broker の責�
 | `PublicFetch` | canonical `HttpFetchRequest` | raw URL、任意 method、header、body、credential |
 | `GitHub` | canonical `GitHubRequest` | 任意 provider URL、任意 JSON body、token |
 
-この型は実ネットワークを実行しない。transport decoder は canonical CBOR をこの union に復元し、authorization、replay guard、session budget を通過させた後にだけ、将来の provider adapter へ値を渡す。その adapter の実装はまだ残っている。
+この型は実ネットワークを実行しない。sibling crate `egress-broker` の transport decoder は canonical CBOR をこの union に復元し、authorization、replay guard、session budget を通過させた後にだけ、実装済みの typed provider adapter へ値を渡す。
 
 `frame.rs` は 4 byte big-endian length prefix と 1 MiB 上限を実装済みである。streaming transport は prefix を読んだ直後に `ValidatedFrameLength` で検査し、その値を超える allocation をしない。buffered decoder も truncated prefix/payload、trailing bytes、oversized length を拒否する。
 
-[canonical CBOR schema と decoder](canonical-cbor.md) はこの crate に実装済みである。outer envelope は transmitted payload hash と embedded canonical operation payload を持ち、decoder は payload を hash して値が一致することを確認する。vsock I/O はまだこの crate に入れていない。
+[canonical CBOR schema と decoder](canonical-cbor.md) はこの crate に実装済みである。outer envelope は transmitted payload hash と embedded canonical operation payload を持ち、decoder は payload を hash して値が一致することを確認する。vsock I/O はこの protocol crate ではなく `egress-broker` と `session-orchestrator` が所有する。
 
-## 何がまだ必要か
+## crate 境界
 
-- vsock listener、session handshake、connection close と response cache。
-- closed operation union を実際の provider adapter へつなぐ dispatch。
-- redirect / DNS / public-IP / TLS / response streaming の強制。
-- session budget を authority と replay guard を通る typed dispatch へ接続すること。
-
-この順に分けることで、任意の raw frame や retry が credential を使う操作を二重に dispatch する抜け道を作らない。
+この crate は wire schema、replay、budget と guest client を所有する。listener、connection close、durable response cache、Authority Core、redirect / DNS / public-IP / TLS、typed GitHub provider への接続は `egress-broker` が所有し、production Firecracker UDS の生成と shutdown は `session-orchestrator` が所有する。
 
 ## 正確な保証範囲
 

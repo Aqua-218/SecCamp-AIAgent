@@ -88,7 +88,7 @@ production adapter は Reqwest の rustls backend、redirect 無効、proxy 探�
 
 ## 検証状態
 
-dispatch、DNS/IP policy、redirect、応答上限、GitHub の publish 事前条件、wire frame は deterministic fake または module test で検証済みである。加えて repository の opt-in KVM test は、Firecracker guest の CID 2 / fixed port 接続を Firecracker per-port Unix socket で受け、実 `BrokerDispatcher` が canonical `NotAuthorized` response を返し public / GitHub adapter を呼ばないことを確認する。実 DNS/HTTPS、実 GitHub API、ホスト secret を用いた provider、guest supervisor からの任意 capability dispatch は未検証である。
+dispatch、DNS/IP policy、redirect、応答上限、GitHubのpublish事前条件、wire frameはdeterministic fake／module testで検証済みである。privileged HTTPS gateはsystem DNS、TLS/SNI、address pin、redirect後の再解決とrebindingを実socketで確認する。KVM SessionOwner gateはguest supervisorから全13 CapFS effectを経てFirecracker per-port Unix socketへ接続し、実`BrokerDispatcher`のcanonical `NotAuthorized` responseとadapter非実行を確認する。実GitHub APIとhost secretを用いるlive provider gateだけはoperator credential不在でblockedである。
 
 ## 文書一覧
 

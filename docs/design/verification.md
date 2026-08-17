@@ -8,7 +8,7 @@
 
 全部を1つの形式手法で証明しようとはしない。純粋関数、状態遷移、並行処理、Linux kernel との接続では、効く道具が違うからである。
 
-この文書の「実装済み」は repository に code/API があること、「mock/contract 検証済み」は fake、mock、module test、local contract test の結果である。`firecracker-runtime` の guest control だけは KVM host で実 Firecracker、dm-verity、guest `AF_VSOCK` を通す。その他の特権 kernel、外部 DNS/HTTPS/provider、guest-to-host egress end-to-end は未検証であり、full isolation や VM 境界全体を完成と判定しない。
+この文書の「実装済み」は repository に code/API があること、「mock/contract 検証済み」は fake、mock、module test、local contract test の結果である。privileged isolation probe は実Linux syscall境界を、`firecracker-runtime` のKVM試験は実Firecracker、dm-verity、v2 guest control、guest supervisor/isolation launcher、guest-to-host Brokerを通す。外部 DNS/HTTPS/provider、production `Runtime::launch` のjailer/snapshot lifecycleは未検証であり、VM 境界全体を完成と判定しない。
 
 ## どの道具を、どこに当てるか
 
@@ -55,9 +55,9 @@ flowchart LR
 | link 対応 | 実 mount の攻撃テスト | 解決後 path での認可、root 脱出の拒否、rename 後の再解決、alias を持つ inode の全名前認可 | 深い chain と cycle（kernel の `ELOOP` に委譲）、体系的な backing 差し替え |
 | SSRF | resolver / redirect test | 非公開宛先と rebinding の拒否 | fake resolver/connector、実 DNS は未検証 |
 | Host Egress Broker | module/contract test + opt-in KVM test | frame、replay、budget、typed dispatch、公開 HTTPS、GitHub plan | Firecracker guest-to-host canonical rejection は実機確認、外部 provider は未検証 |
-| runtime isolation | mock backend + capability detection | ordered apply/rollback と policy validation | mock 検証済み、privileged apply は未検証 |
-| Firecracker runtime | fake command/filesystem/API + Unix socket test + opt-in KVM test | artifact、jailer/API 順序、snapshot state、identity/workload gate | 実 Firecracker + dm-verity + guest `AF_VSOCK` identity gate を確認。jailer / snapshot restore は未検証 |
-| Supervisor | protocol module test + `FakeResources` | identity binding、subject lifecycle、handle cleanup | mock/contract 検証済み、Linux resource は未検証 |
+| runtime isolation | mock backend + privileged probe | ordered apply/rollback、policy validation、実kernelのnamespace/seccomp/Landlock/rootfs/device/fd/capability境界 | staged rootfsへのprivileged applyを確認。post-exec、`rootfs.source == "/"`、rollbackは未検証 |
+| Firecracker runtime | fake command/filesystem/API + Unix socket test + opt-in KVM test | artifact、jailer/API 順序、snapshot state、identity/workload gate | 実 Firecracker + dm-verity + v2 guest gate + guest `AF_VSOCK` Brokerを確認。jailer / snapshot restore は未検証 |
+| Supervisor | protocol module test + `FakeResources` + opt-in KVM runtime image | identity binding、subject lifecycle、handle cleanup、guest readinessとlauncher composition | guest supervisorから隔離workloadへのBroker channelを実KVMで確認。CapFS全effectは未検証 |
 | Supervisor control socket | 実 `SOCK_SEQPACKET` の module test | accept 時の `SO_PEERCRED` 束縛、decode 前の subject 確定、bounded datagram | 実 socket で検証済み、guest からの end-to-end は未検証 |
 | Session orchestrator | mock state-machine test + production adapter composition | lease binding、startup rollback、stop retry、durable identity、Authority/Broker/Firecracker/workspace adapter | test-double 境界まで検証済み、実 guest capfs/isolation・実 VM は未検証 |
 | VM 境界 | escape 試行 | 実際の jailer、kernel、mount、seccomp 設定 | 実機未検証 |
@@ -87,15 +87,15 @@ Direct-I/O FUSE adapterのmodule testは、許可範囲と祖先だけのmetadat
 
 ### runtime isolation
 
-`runtime-isolation` は `IsolationConfig::validate` の path/limit/syscall 検査、13 段階の apply 順序、failure 時の completed step 逆順 rollback、capability 不足と Landlock ABI 不足の事前拒否を mock backend で検査する。`LinuxBackend` の capability detection test は host の namespace、cgroup v2、seccomp、Landlock 状態を読むが、十分な環境で privileged apply を実行する test ではない。workload の実行、escape 試行、Firecracker 内の isolation は未検証である。
+`runtime-isolation` は `IsolationConfig::validate` の path/limit/syscall 検査、13 段階の apply 順序、failure 時の completed step 逆順 rollback、capability 不足と Landlock ABI 不足の事前拒否を mock backend で検査する。さらに [`verify-privileged-isolation.sh`](../../scripts/ci/verify-privileged-isolation.sh) は staged rootfs に実際の Linux namespace、mount、cgroup v2、seccomp、Landlock、capability、fd 制約を適用し、許可操作とescape試行を確認する。probe 自体の post-exec、`rootfs.source == "/"`、実 unmount rollback は未検証である。
 
 ### Firecracker runtime
 
-`firecracker-runtime` の test は artifact digest、mutable `latest` path、network device、workspace overlap、jailer/verity/API の順序、API error rollback、snapshot fingerprint、stale/duplicate identity、identity injection 前の workload gate を fake boundary で検査する。さらに [`verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は static PID 1 image を作り、実 dm-verity mapper を read-only で開き、実 Firecracker を boot して guest `AF_VSOCK` control channel の `409` gate、identity injection、workload release、guest-to-host Broker canonical rejection を確認する。`Runtime::launch` の jailer、workspace drive、snapshot/restore、VM escape は未検証である。詳細は [Firecracker runtime](../firecracker-runtime/README.md) を参照する。
+`firecracker-runtime` の test は artifact digest、mutable `latest` path、network device、workspace overlap、jailer/verity/API の順序、API error rollback、snapshot fingerprint、stale/duplicate identity、identity injection 前の workload gate を fake boundary で検査する。さらに [`verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は static PID 1 image を作り、実 dm-verity mapper を read-only で開き、実 Firecracker を boot して guest `AF_VSOCK` control channel の `409` gate、v2 policy-digest-bound identity/start ACK、guest supervisor/isolation launcher、guest-to-host Broker canonical rejectionを確認する。`Runtime::launch` の jailer、snapshot/restore、VM escape は未検証である。詳細は [Firecracker runtime](../firecracker-runtime/README.md) を参照する。
 
 ### Supervisor
 
-wire module test は version、closed tag、4 KiB size、field length、body length、trailing bytes を検査する。supervisor test は `CapabilityKernel`、`StaticCallerResolver`、`FakeResources` を使い、resource setup 順、partial rollback、connection identity 優先、root/derive/revoke、stale handle、cleanup failure と `Closing` の fail-closed retry を検査する。Linux namespace/cgroup/mount、実 socket credential、実 workload、guest supervisor control channel は未検証である。詳細は [Supervisor adapter](../supervisor/README.md) を参照する。
+wire module test は version、closed tag、4 KiB size、field length、body length、trailing bytes を検査する。supervisor test は `CapabilityKernel`、`StaticCallerResolver`、`FakeResources` を使い、resource setup 順、partial rollback、connection identity 優先、root/derive/revoke、stale handle、cleanup failure と `Closing` の fail-closed retry を検査する。local `SOCK_SEQPACKET` credential boundaryと、実KVM内のguest supervisor readiness、workspace mount、isolation launcher、workload Broker channelも確認済みである。CapFSの全effectとhost control-planeからのfull lifecycleは未検証である。詳細は [Supervisor adapter](../supervisor/README.md) を参照する。
 
 ### Session orchestrator
 

@@ -124,11 +124,17 @@ restore の失敗が resource を残さないので、retry が安全に書け�
 
 authority encoding version、guest repository/effect/path policy、guest init、kernel/rootfs、または
 seccomp を変更したら snapshot を再作成し、host と image を同じ release 単位で展開する。現行
-snapshot manifest の fingerprint は boot artifact を束縛するが policy digest 自体はまだ保持しない。
-このため誤った組み合わせは guest の独立 digest gate で fail closed するものの restore 後の遅い
-失敗になる。snapshot manifest での事前拒否と durable cross-domain revoke receipt は Proposed の
+production snapshot template は policy digest を保持する。daemon が grant から計算した digest は
+session preparation request に入り、template digest と不一致なら artifact copy や restore より前に
+fail closed する。コピー後の snapshot manifest と capability lease でも同じ比較を繰り返し、最後に
+guest が image 内の typed policy から独立再計算する。
+
+cross-domain revoke は session recovery intent を identity reservation より前に永続化する。通常停止は
+host の guest/Broker roots を revoke してから VM を停止し、失敗時は `Stopping` のまま同じ resource
+ownership を再試行する。process crash 後も recovery journal から VM/cgroup、mapper、jail を順に回収し、
+termination を確認するまで intent を完了しない。この実装により
 [ADR 0018](../decisions/0018-bind-host-and-guest-authority-with-a-policy-digest-and-revocation-barrier.md)
-の残件であり、達成前に ADR を Accepted と扱わない。
+は Accepted である。
 
 ## 正確な保証範囲
 

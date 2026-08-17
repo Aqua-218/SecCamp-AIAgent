@@ -207,7 +207,11 @@ impl<F> firecracker_runtime::FileSystem for session_orchestrator::firecracker_wo
 pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::bind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::clone_workspace(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::create_workspace_image(&mut self, &std::path::Path, &std::path::Path, u64) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::digest(&mut self, &std::path::Path) -> core::result::Result<firecracker_runtime::Sha256Digest, firecracker_runtime::RuntimeError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::prepare_jailer_resources(&mut self, &std::path::Path, &std::path::Path, &std::path::Path, u32, u32) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::read(&mut self, &std::path::Path) -> core::result::Result<alloc::vec::Vec<u8>, firecracker_runtime::RuntimeError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::register_jailer_root(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::remove_jail(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::remove_workspace(&mut self, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::unbind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn session_orchestrator::firecracker_workspace::FirecrackerFileSystem<F>::verify_block_device_binding(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>

@@ -23,7 +23,8 @@
 | receipt が成功後に書き換わらない | 純粋関数 | `receipt_is_immutable_after_success` |
 | 既定 policy の BPF が非 allowlist syscall を `EPERM` に落とす | 生成した命令列の検査 | `seccomp_filter_denies_every_non_allowlisted_syscall` |
 | allowlist が 1 個でも filter が正しく分岐する | 生成した命令列の検査 | `seccomp_filter_without_mmap_reaches_errno_for_unknown_syscalls` |
-| workspace mask に device / socket / FIFO / symlink 作成が含まれない | 定数の bit 検査 | `landlock_workspace_rights_do_not_include_special_file_creation` |
+| workspace mask はCapFS管理下のsymlinkを許し、device / socket / FIFO作成は許さない | 定数の bit 検査 | `landlock_workspace_rights_allow_capfs_symlinks_but_not_special_files` |
+| Rust標準filesystem APIが実際に使うpath syscallを既定seccomp policyが許す | allowlist検査 | `conservative_seccomp_policy_covers_standard_library_capfs_operations` |
 | capability detection が不足理由を必ず添える | 実 host への query | `privileged_integration_prerequisites_are_reported_without_an_ignored_test` |
 
 test double は 1 つだけ。`IsolationBackend` を実装した記録型 mock が、呼ばれた step と順序を `Vec` に積む。この mock は syscall を一切呼ばず、失敗を注入するときも errno を捏造する。したがってこの層で言えるのは「順序と設定検査が仕様どおり」までで、`LinuxBackend` が kernel に何をさせるかは何も言えない。
@@ -64,7 +65,7 @@ Landlock の証拠に tmpfs を使うのは意図的である。rootfs は read-
 
 `launcher-post-exec` は libtest process から直接 kernel API を叩くのではなく、同じ package の production binary を起動する。workload binary 自身は probe の再 exec であり、report は隔離後も保持された supervisor control channel から親へ返す。Broker descriptor には host 上の `AF_VSOCK` local-CID pair を使うため、実際の descriptor validation（`SOCK_STREAM`、connected `AF_VSOCK`）も通る。
 
-`rootfs.source == "/"` は host root が起動前から readonly の場合だけ同じ launcher scenario で選択する。mutable な host root を test の都合で remount してから namespace clone することはしない（kernel が user namespace clone を `EPERM` にするうえ、host root の安全境界を壊すため）。その前提がない host では staged rootfs の post-exec 証拠を実行し、`/` branch は unavailable として別に記録する。
+`rootfs.source == "/"` は host root が起動前から readonly の場合だけ同じ launcher scenario で選択する。mutable な host root を test の都合で remount してから namespace clone することはしない。通常hostではstaged rootfsのpost-exec証拠を使い、別の`verify-real-session-owner.sh`がreadonly SquashFS guest rootでliteral `/` branchと`/run`、`/sys`、`/proc`、`/dev` maskをproduction経路から実行する。
 
 `limited-tmpfs-failure` は debug build にだけコンパイルされる test-only seam を環境変数で有効にし、実際の `LinuxBackend` が `LimitedTmpfs` syscall を呼ぶ直前に `BackendError` を返す。rootfs pivot と workspace bind mount は完了済みなので、production coordinator の逆順 rollback が workspace を unmount し、cgroup は launcher が child を reap した後に削除する。親 probe は child の mount namespace が消えたこと、probe staging tree 以下の host mount table に新しい mount が残っていないこと、workload report が存在しないことを確認する。root pivot 自体は不可逆であるため、これは「完了済み reversible mount の rollback と host cleanup」の証拠であり、pivot を元へ戻せる証拠ではない。
 
@@ -82,6 +83,7 @@ cargo clippy --manifest-path crates/runtime-isolation/Cargo.toml --all-targets -
 
 # 特権環境でのみ境界を実測する。CI と local の共通入口を通す。
 scripts/ci/verify-privileged-isolation.sh
+scripts/ci/verify-real-session-owner.sh
 ```
 
 wrapper は先に production の `workload-isolation-launcher` binary を build し、その binary を
@@ -97,8 +99,6 @@ wrapper は先に production の `workload-isolation-launcher` binary を build 
 | 未検証の対象 | なぜ未検証か | 何があれば検証できるか |
 |---|---|---|
 | mount syscall の部分成功後に失敗した場合の rollback | privileged probe は `LimitedTmpfs` syscall の前に失敗させるため、失敗した呼び出し自身が mount を残すケースは実測していない | `mount(2)` の戻り値を含む test-only fault seam と、対象 mount namespace を保持した観測 helper |
-| mutable host での `rootfs.source == "/"` | source `/` は起動前から readonly である必要がある。mutable host root を test が remount することはせず、`rootfs_source_slash=unavailable:...` と記録する。readonly guest root では同じ launcher scenario が `/` branch を選ぶ | readonly guest image、または rootfs `/` が最初から readonly の privileged runner |
-| privileged probe による実 supervisor 経由の起動 | host probe は production launcher の gate / exec / Broker descriptor validation を通すが、`guest-supervisor-init` と CapFS の全 effect は同時に通さない | CapFS の全 effect と `Runtime::launch` lifecycle を同時に通す実 KVM 試験 |
 | x86_64 以外の syscall 番号 | `number()` が `None` を返すため `validate` が通らない | 対象 arch の番号表と、その arch での CI runner |
 
 mock test が全部通っても、VM 実起動や full isolation の完成とは判断しない。この方針は [docs/README.md](../README.md) の宣言に従う。特権 test が通ったことも、上の表の範囲を超えては主張しない。

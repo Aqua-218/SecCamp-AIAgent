@@ -17,7 +17,11 @@ install -o root -g root -m 0755 target/release/host-sessiond /usr/local/bin/host
 Before enabling the unit, provision the account and device access explicitly:
 
 ```sh
-useradd --system --home-dir /var/lib/host-sessiond --shell /usr/sbin/nologin host-sessiond
+getent group host-sessiond >/dev/null || groupadd --system --gid 961 host-sessiond
+getent passwd host-sessiond >/dev/null || useradd --system --uid 961 --gid 961 \
+  --home-dir /var/lib/host-sessiond --shell /usr/sbin/nologin host-sessiond
+test "$(id -u host-sessiond)" = 961
+test "$(id -g host-sessiond)" = 961
 usermod --append --groups kvm host-sessiond
 # The device-mapper control node is normally root-only.  Install a narrowly scoped udev rule
 # (and reload udev) so this service account can open only the control node and its own mapper
@@ -42,8 +46,22 @@ systemctl enable --now host-sessiond.service
 
 The example uses `--egress-authority none` and contains no GitHub token. Public HTTPS or GitHub
 must be enabled by an explicit unit/configuration change. A GitHub token, when that profile is
-selected, is host-only input (`EGRESS_GITHUB_TOKEN`) and must come from a runtime secret manager;
-it must not be committed to the environment file.
+selected, is host-only input and must come from a runtime secret manager; it must not be committed
+to the environment file. `RustlsGitHubProvider` first accepts `EGRESS_GITHUB_TOKEN` for non-systemd
+launches and otherwise reads the bounded `github-token` systemd credential. For production, use an
+encrypted credential and a unit drop-in:
+
+```sh
+systemd-creds encrypt --name=github-token /secure/input/github-token \
+  /etc/credstore.encrypted/host-sessiond.github-token
+systemctl edit host-sessiond.service <<'EOF'
+[Service]
+LoadCredentialEncrypted=github-token:/etc/credstore.encrypted/host-sessiond.github-token
+EOF
+```
+
+The provider validates the credential file as a singly linked, non-symlink regular file, bounds it
+to 4096 bytes, strips one line ending, and zeroizes its retained token buffer on drop.
 
 `publish-branch` additionally requires a host-owned plan manifest. Keep it outside the environment
 file, for example in `/var/lib/host-sessiond/github-publish-plans.tsv`, with an owner-only parent
@@ -74,6 +92,29 @@ start and reopens the same owner-validated journal on later starts. Use `create`
 provisioning a new, absent journal and `open` when an existing journal is intentionally being
 recovered; an existing journal is never overwritten.
 
+## Snapshot provisioning
+
+`HOST_SESSIOND_SNAPSHOT_STATE` and `HOST_SESSIOND_SNAPSHOT_MEMORY` are mandatory inputs, not files
+the daemon guesses or creates. Build the guest kernel and dm-verity image with the repository
+scripts, boot that exact kernel/rootfs/seccomp combination without injecting a session identity,
+pause the VM at the closed pre-session gate, and issue Firecracker's `Full` snapshot request. Move
+the resulting state and memory files into a root-owned, non-writable artifact directory, calculate
+their SHA-256 values, and set all four snapshot path/digest variables together. Then run:
+
+```sh
+sha256sum --check <<EOF
+${HOST_SESSIOND_SNAPSHOT_STATE_SHA256}  ${HOST_SESSIOND_SNAPSHOT_STATE}
+${HOST_SESSIOND_SNAPSHOT_MEMORY_SHA256}  ${HOST_SESSIOND_SNAPSHOT_MEMORY}
+EOF
+systemd-analyze verify /etc/systemd/system/host-sessiond.service
+sudo -u host-sessiond test -r "${HOST_SESSIOND_SNAPSHOT_STATE}"
+sudo -u host-sessiond test -r "${HOST_SESSIOND_SNAPSHOT_MEMORY}"
+```
+
+Any kernel, rootfs, verity root, Firecracker, seccomp, machine-size, boot-argument, or snapshot
+change requires a new snapshot and new digests. The daemon recomputes the compatibility
+fingerprint and both file digests before restore; it never falls back to an older snapshot.
+
 The process needs `/dev/kvm`, `/dev/vhost-vsock`, and narrowly scoped device-mapper access, plus
 permission to create the configured cgroup and mount/pid namespaces. The unit grants only that
 host-side envelope and keeps `PrivateNetwork=no` because public HTTPS/GitHub egress is performed
@@ -87,3 +128,8 @@ capability IDs and fixed event names; it never contains credentials, authority b
 backend error text. `SIGTERM`, `SIGINT`, and the stop file trigger dependency-ordered cleanup for
 `HOST_SESSIOND_SHUTDOWN_TIMEOUT_MILLIS`; a timeout exits non-zero so the durable recovery path is
 used on the next start.
+
+If a custom persistent stop-file path is configured, remove it only after confirming no daemon or
+recovery process is live, then start the unit. The default `/run/host-sessiond/stop` is removed with
+the systemd runtime directory. Never delete recovery journals, Broker WALs, mapper devices, or jail
+trees manually; a non-zero shutdown leaves their exact durable recovery stage for the next start.

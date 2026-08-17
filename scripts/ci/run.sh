@@ -134,8 +134,13 @@ case "${command_name}" in
   real-runtime-lifecycle)
     scripts/ci/verify-real-runtime-lifecycle.sh
     ;;
+  real-session-owner)
+    scripts/ci/verify-real-session-owner.sh
+    ;;
   post-exec-isolation)
-    scripts/ci/verify-post-exec-isolation.sh
+    # Backward-compatible entry point: the production-launcher post-exec
+    # scenario is one of the required privileged-isolation scenarios.
+    scripts/ci/verify-privileged-isolation.sh
     ;;
   real-public-https)
     scripts/ci/verify-real-public-https.sh

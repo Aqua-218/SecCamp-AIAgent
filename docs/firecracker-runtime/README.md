@@ -6,7 +6,7 @@
 
 > **対象読者:** Firecracker 統合担当者、ホスト隔離のレビュー担当者、運用担当者
 
-`firecracker-runtime` はホスト側から 1 台の microVM を起動・snapshot・restore・停止するための crate である。artifact の digest 固定、dm-verity mapping、jailer 経由の起動、Firecracker API の呼び出し順序、restore 後の identity 再生成までを所有する。
+`firecracker-runtime` はホスト側から 1 台の microVM を起動・snapshot・restore・停止するための crate である。artifact（`veritysetup` と workspace formatter を含む 8 個）の digest 固定、dm-verity mapping、jailer 経由の起動、Firecracker API の呼び出し順序、restore 後の identity 再生成までを所有する。
 
 VM の中で workload を閉じ込める部分は [runtime-isolation](../runtime-isolation/README.md)、複数 backend をまたぐ session の lifecycle は [session-orchestrator](../session-orchestrator/README.md) の担当。この crate は「VM が 1 台立ち上がって、正しい identity を持っている」ところまでを見る。
 
@@ -19,8 +19,8 @@ flowchart TB
     subgraph fr["firecracker-runtime（host 側）"]
         direction TB
         cfg["RuntimeConfig::validate<br/>純粋。副作用の前"]
-        verify["verify_artifacts<br/>SHA-256 × 6"]
-        rt["Runtime<br/>8 状態の lifecycle<br/>launch / snapshot / restore / stop"]
+        verify["verify_artifacts<br/>SHA-256 × 8"]
+        rt["Runtime<br/>lifecycle<br/>launch / pause+snapshot / restore / stop"]
         ids["IdentityBundle<br/>restore 後に 5 値を再生成"]
     end
 
@@ -71,7 +71,7 @@ flowchart TB
 
 lifecycle、API 呼び出し順序、rollback、identity gate は fake command runner / filesystem / API client を使う test で検証済み。`UnixApiClient` は本物の HTTP/1.x を local Unix socket 上で話す test まで通っている。
 
-実機 test は direct Firecracker API で boot し、identity 注入前の workload start が `409` になること、canonical acknowledgement、dm-verity rootfs、guest-to-host Broker の canonical authorization rejection を確認する。`Runtime::launch` 経由の実 jailer、snapshot restore、workspace drive、外部 host egress は対象外である。詳細は[検証対応表](verification.md)。
+実機 test は direct Firecracker API で boot し、identity 注入前の workload start が `409` になること、production と同じ v2 policy-digest-bound canonical acknowledgement、dm-verity rootfs、guest runtime image（guest supervisor / isolation launcher を含む）の Broker round trip を確認する。`Runtime::launch` 経由の実 jailer、snapshot restore、外部 host egress は対象外である。詳細は[検証対応表](verification.md)。
 
 ## 文書一覧
 
@@ -79,7 +79,7 @@ lifecycle、API 呼び出し順序、rollback、identity gate は fake command r
 |---|---|---|
 | [artifact の固定と fingerprint](pinned-artifacts.md) | [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) | SHA-256 による artifact 固定、dm-verity との結び付け、config fingerprint |
 | [起動の順序と rollback](launch-sequence.md) | [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) | workspace clone から `InstanceStart` までの順序、失敗時の巻き戻し |
-| [snapshot と identity gate](snapshot-and-identity.md) | [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) | 8 状態の lifecycle、restore 後の identity 再生成、workload の解放条件 |
+| [snapshot と identity gate](snapshot-and-identity.md) | [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) | pause acknowledgement を含む lifecycle、restore 後の identity 再生成、workload の解放条件 |
 | [workspace clone](workspace-clone.md) | [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) | symlink / hard link を許さない再帰 copy、上限、所有権 marker |
 | [ホスト隔離プロファイル](host-isolation.md) | [`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) | jailer の namespace、cgroup、seccomp の必須 deny |
 | [検証対応表](verification.md) | — | fake で見た範囲と、実機で未確認の範囲 |

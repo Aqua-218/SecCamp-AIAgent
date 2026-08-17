@@ -57,7 +57,8 @@ use crate::{
     WorkspaceTemplateId,
     authority_backend::{AuthorityCoreBackend, AuthorityRootGrant},
     egress_backend::{
-        BrokerBackend, BrokerRuntimeFactory, BuiltBrokerRuntime, ProductionBrokerBackend,
+        BrokerBackend, BrokerRuntimeFactory, BuiltBrokerRuntime, FirecrackerPeerCredentials,
+        ProductionBrokerBackend,
     },
     firecracker_backend::{
         FirecrackerVmBackend, FirecrackerWorkloadBackend, new_firecracker_backends,
@@ -1258,6 +1259,10 @@ impl ProductionSessionRuntimeBuilder {
             jail_root,
         );
         let broker_runtime_config = self.config.firecracker.runtime.clone();
+        let firecracker_peer_credentials = FirecrackerPeerCredentials::new(
+            broker_runtime_config.jailer_config.uid,
+            broker_runtime_config.jailer_config.gid,
+        );
         let deferred = DeferredFirecrackerFactory::new(
             firecracker_factory,
             runtime_filesystem,
@@ -1280,7 +1285,7 @@ impl ProductionSessionRuntimeBuilder {
             limits: self.config.broker_limits,
         };
         let endpoint = self.config.broker_endpoint;
-        let broker = BrokerBackend::firecracker(
+        let broker = BrokerBackend::firecracker_with_peer_credentials(
             broker_runtime_factory,
             move |identity| {
                 rebind_runtime_config(&broker_runtime_config, *identity)
@@ -1290,6 +1295,7 @@ impl ProductionSessionRuntimeBuilder {
             endpoint.expected_guest_cid,
             endpoint.port,
             endpoint.backlog,
+            firecracker_peer_credentials,
         )
         .map_err(ProductionBuildError::Broker)?;
         let owner = SessionOwner::new(
@@ -1593,6 +1599,11 @@ impl WorkloadBackend for DeferredFirecrackerWorkload {
         vm: &VmLease,
         capability: &CapabilityLease,
     ) -> Result<WorkloadLease, BackendError> {
+        if capability.policy_digest().is_none() {
+            return Err(BackendError::new(
+                "production Firecracker workload release requires a policy-bound capability lease",
+            ));
+        }
         let mut state = lock_deferred(&self.shared)?;
         if state.prepared_identity != Some(*identity) {
             return Err(BackendError::new(
@@ -2337,6 +2348,14 @@ mod tests {
             ))
         }
 
+        fn verify_verity(
+            &mut self,
+            _veritysetup: &PinnedArtifact,
+            _expected: &DmVerityConfig,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
         fn start_owned(
             &mut self,
             _command: &CommandSpec,
@@ -2744,6 +2763,7 @@ mod tests {
             kernel: artifact(jail_root.join("artifacts/kernel")),
             rootfs: rootfs.clone(),
             verity_hash: verity.clone(),
+            veritysetup: artifact(root.join("veritysetup-v1")),
             dm_verity: DmVerityConfig {
                 data_device: rootfs.path.clone(),
                 hash_device: verity.path.clone(),
@@ -2807,7 +2827,9 @@ mod tests {
             network_devices: Vec::new(),
             vcpu_count: 1,
             memory_mib: 128,
-            boot_args: "console=ttyS0".to_owned(),
+            boot_args:
+                "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init"
+                    .to_owned(),
         }
     }
 

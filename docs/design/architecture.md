@@ -122,7 +122,7 @@ flowchart BT
 
 `host-sessiond` は `ProductionSessionRuntimeBuilder`、実 workspace/Broker/Firecracker/authority backend を組み立てる deployable one-session daemon で、systemd unit と environment manifest も `deploy/` / `service/` にある。guest 側には [`guest-supervisor-init`](../../crates/supervisor/src/bin/guest-supervisor-init.rs) があり、固定 image の repository/effect/path policy から guest `CapabilityKernel`、CapFS runtime、`LinuxHostResources` を組み立て、`workload-isolation-launcher` へ接続する。[`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) はその前段の PID 1 gate として、host-originated identity injection と image-configured supervisor release だけを受け付ける。どちらも host から任意 command、credential、authority body を受け取らない。
 
-この構成は実装済みで、production と同じ v2 policy-digest-bound guest gate と guest supervisor composition は実 KVM でも確認している。ただし `Runtime::launch` の実 jailer/workspace/snapshot lifecycle、`rootfs.source == "/"` の privileged probe、mount rollback は別の未検証境界として残る。crate 単体の test が通ることとシステム全体の実機証拠を混同しない。
+この構成は実装済みで、productionと同じv2 policy-digest-bound guest gate、guest supervisor composition、`Runtime::launch`のjailer/workspace lifecycle、clean snapshot capture／restore、`rootfs.source == "/"`、mount rollback、全13 CapFS effectを実KVM SessionOwner gateでも確認している。これは列挙したproduction経路の実機証拠であり、Firecracker／KVM／host kernelそのもののVM escape耐性を証明するものではない。
 
 ## 副作用は 1 つの API に集まる
 
@@ -228,7 +228,7 @@ orchestrator の `SubjectId` と `authority_core` の `SubjectId` は名前が�
 
 | 線 | 現状 | 繋ぐのに要るもの |
 |---|---|---|
-| supervisor → runtime-isolation | `guest-supervisor-init` → `LinuxHostResources` → image-configured `workload-isolation-launcher` の inherited start gate と close-on-exec acknowledgement が実装済み | privileged probe は launcher/exec を直接通さない。`rootfs.source == "/"` と post-exec の別実機証拠 |
+| supervisor → runtime-isolation | `guest-supervisor-init` → `LinuxHostResources` → image-configured `workload-isolation-launcher` の inherited start gate と close-on-exec acknowledgement が実装済み | privileged probeがlauncher／exec後の境界を確認し、KVM SessionOwner gateが`rootfs.source == "/"`を確認 |
 | guest composition | `guest-supervisor-init` が固定 policy から guest kernel/CapFS/control/workload を組み立て、readiness marker を返す | real KVM runtime image はこの composition を起動するが、全 CapFS effect を証明するものではない |
 | authority binding | `AuthorityPolicyDigest`、v2 canonical request/ack、bound lease、v1 compatibility parser は実装済み。production workload release は policy-bound lease を要求する | direct real KVM test で v2 digest-bound injection/start と exact ACK を確認済み。`Runtime::launch` lifecycle との一体試験は別境界 |
 | host の vsock/UDS listener | `FirecrackerUnixListener` は private path、CID、Linux `SO_PEERCRED` の UID/GID/PID を検査して fail closed。deadline-aware transport API も実装済み | direct `AF_VSOCK` bind/accept、production owner の absolute connection-deadline wiring、長時間/並行 stream |

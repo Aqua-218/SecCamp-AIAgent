@@ -395,8 +395,8 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HEADER_BYTES, MAX_WIRE_REQUEST_BYTES, MAX_WIRE_RESPONSE_BYTES, RefusalCode,
-        WireDecodeError, WireEncodeError, WireRequest, WireResponse,
+        HEADER_BYTES, MAX_FIELD_BYTES, MAX_WIRE_REQUEST_BYTES, MAX_WIRE_RESPONSE_BYTES,
+        RefusalCode, WireDecodeError, WireEncodeError, WireRequest, WireResponse,
     };
     use authority_core::{capability::SubjectId, handle::HandleId};
 
@@ -447,6 +447,52 @@ mod tests {
                 declared: 9,
                 actual: 10,
             })
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_trailing_bytes_after_a_complete_request() {
+        let mut encoded = WireRequest::CloseSubject {
+            claimed_subject: SubjectId::new("subject"),
+        }
+        .encode()
+        .expect("valid request must encode");
+        encoded[2..4].copy_from_slice(&10_u16.to_be_bytes());
+        encoded.push(0);
+
+        assert_eq!(
+            WireRequest::decode(&encoded),
+            Err(WireDecodeError::TrailingBytes)
+        );
+    }
+
+    #[test]
+    fn encoder_and_decoder_accept_exact_field_limit() {
+        let request = WireRequest::CloseHandle {
+            claimed_subject: SubjectId::new("s".repeat(MAX_FIELD_BYTES)),
+            handle: HandleId::new("h".repeat(MAX_FIELD_BYTES)),
+        };
+
+        let encoded = request.encode().expect("maximum fields must encode");
+        assert_eq!(WireRequest::decode(&encoded), Ok(request));
+    }
+
+    #[test]
+    fn decoder_accepts_request_at_datagram_limit_before_schema_validation() {
+        let mut bytes = vec![0_u8; MAX_WIRE_REQUEST_BYTES];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        bytes[2..4].copy_from_slice(
+            &u16::try_from(MAX_WIRE_REQUEST_BYTES - HEADER_BYTES)
+                .expect("request size bound must fit in u16")
+                .to_be_bytes(),
+        );
+        bytes[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        bytes[6] = b'a';
+
+        assert_eq!(
+            WireRequest::decode(&bytes),
+            Err(WireDecodeError::TrailingBytes)
         );
     }
 
@@ -551,6 +597,23 @@ mod tests {
             Err(WireDecodeError::TooLarge {
                 actual: MAX_WIRE_RESPONSE_BYTES + 1
             })
+        );
+    }
+
+    #[test]
+    fn decoder_accepts_response_at_datagram_limit_before_schema_validation() {
+        let mut bytes = vec![0_u8; MAX_WIRE_RESPONSE_BYTES];
+        bytes[0] = 1;
+        bytes[1] = 1;
+        bytes[2..4].copy_from_slice(
+            &u16::try_from(MAX_WIRE_RESPONSE_BYTES - HEADER_BYTES)
+                .expect("response size bound must fit in u16")
+                .to_be_bytes(),
+        );
+
+        assert_eq!(
+            WireResponse::decode(&bytes),
+            Err(WireDecodeError::TrailingBytes)
         );
     }
 

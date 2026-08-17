@@ -63,6 +63,7 @@ stateDiagram-v2
 | [0015](0015-persist-the-identity-ledger-across-restarts.md) | identity ledger を永続化し、restart をまたいで非再利用にする | Accepted |
 | [0016](0016-terminate-the-child-after-an-unrollbackable-isolation-failure.md) | rollback 不可能な isolation step の失敗後は child を終了させる | Accepted |
 | [0017](0017-authorize-an-aliased-inode-on-every-name.md) | alias を持つ inode は全ての名前で認可する | Accepted |
+| [0018](0018-bind-host-and-guest-authority-with-a-policy-digest-and-revocation-barrier.md) | host と guest の authority を policy digest と revocation barrier で結ぶ | Proposed |
 
 ## 遡及分について
 

@@ -25,6 +25,8 @@ jobs:
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+    with:
+      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
   security:
     name: Re-run security gates
@@ -33,6 +35,8 @@ jobs:
       contents: read
       packages: read
       security-events: write
+    with:
+      checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
   package:
     name: Build and attest release

@@ -83,7 +83,8 @@ repository_path_is_real() {
 }
 
 check_evidence_command() {
-  local command_line="$1" label="$2" executable="${command_line%% *}"
+  local command_line="$1" label="$2" executable
+  executable="${command_line%% *}"
   case "${executable}" in
     cargo)
       [[ "${command_line}" == *' --locked '* || "${command_line}" == *' --locked' ]] \

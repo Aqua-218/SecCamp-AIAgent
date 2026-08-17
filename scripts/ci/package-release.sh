@@ -56,6 +56,19 @@ if [[ ! "${source_revision}" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'source revision is not a full commit SHA\n' >&2
   exit 1
 fi
+if ! git diff --quiet --exit-code HEAD -- || \
+  [[ -n "$(git ls-files --others --exclude-standard | grep -Ev '^dist/' || true)" ]]; then
+  printf 'release source tree contains tracked or untracked changes outside dist/\n' >&2
+  exit 1
+fi
+if git rev-parse --verify --quiet "refs/tags/${release_tag}^{commit}" > /dev/null; then
+  readonly tagged_revision="$(git rev-parse "refs/tags/${release_tag}^{commit}")"
+  if [[ "${tagged_revision}" != "${source_revision}" ]]; then
+    printf 'release tag %s resolves to %s, not checked-out revision %s\n' \
+      "${release_tag}" "${tagged_revision}" "${source_revision}" >&2
+    exit 1
+  fi
+fi
 if [[ "${host_triple}" != "${target_triple}" ]]; then
   printf 'release runner host %s does not match artifact target %s\n' \
     "${host_triple}" "${target_triple}" >&2

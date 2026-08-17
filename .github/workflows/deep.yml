@@ -252,6 +252,24 @@ jobs:
       - name: Verify Runtime::launch through the real jailer lifecycle
         run: scripts/ci/run.sh real-runtime-lifecycle
 
+  session_owner_kvm:
+    name: Full SessionOwner KVM verification
+    # Runs the production composition from clean snapshot capture through all
+    # 13 CapFS effects, durable Broker evidence, stop, and resource cleanup.
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, x64, kvm, ephemeral]
+    timeout-minutes: 75
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Verify the full production SessionOwner lifecycle
+        run: scripts/ci/run.sh real-session-owner
+
   real_capfs:
     name: Real CapFS FUSE verification
     # Requires root and a readable/writable /dev/fuse. The gate is protected so
@@ -351,6 +369,7 @@ jobs:
       - benchmarks
       - real_vm
       - real_runtime_lifecycle
+      - session_owner_kvm
       - real_capfs
       - egress_real_https
       - external_provider_smoke

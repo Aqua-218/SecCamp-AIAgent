@@ -42,27 +42,34 @@ if self.issued.contains(identity) || !pending.insert(*identity) {
 
 | 定数 | 値 |
 |---|---|
-| `LEDGER_MAGIC` | `b"SORLEDG1"` |
-| `LEDGER_VERSION` | `1` |
-| `LEDGER_HEADER_BYTES` | `32` |
+| current magic / version | `b"SORLEDG2"` / `2` |
+| current commit header | 64 bytes × 2 slots |
+| data offset | 128 bytes |
 | `LEDGER_RECORD_BYTES` | `32` |
 | `MAX_LEDGER_RECORDS` | `1_048_576` |
-| `MAX_LEDGER_BYTES` | `33_554_464`（約 32 MiB） |
+| `MAX_LEDGER_BYTES` | `33_554_560`（約 32 MiB） |
 | checksum | CRC-32、reversed poly `0xEDB8_8320` |
 
-header は magic、version、header 長、reserved、record 数、data 長、CRC-32。record は version、kind tag、reserved、sequence、identity、CRC-32。
+新規 ledger は generation 付き commit header を2スロット持つ。各 header は magic、version、
+物理 slot、generation、record 数、commit 済み data 長、reserved、CRC-32 を持つ。record は
+version、kind tag、reserved、sequence、identity、CRC-32。旧 `SORLEDG1` は移行のため完全検証後に
+読み書きできるが、新規作成には使わない。
 
 1 session あたり 7 record なので、上限は 149,796 session。超えると `CapacityExceeded` を返し、以降の session が全部止まる。fail closed。
 
 file 全体を `read_to_end` で memory に読むので、size の上限がそのまま allocation の上限になっている。
 
-open 時の検査は 5 つ。
+open 時には次を検査する。
 
-- header と全 record の CRC-32。bit rot が identity field を書き換えても検出する。
+- 2 header の CRC、slot、generation、件数、data 長。generation が同じ healthy header 同士の
+  内容が食い違えば拒否する。初期 generation 0 は両 slot が揃わなければ拒否する。
+- 選択した最新 commit と全 committed record の CRC-32。
 - record の sequence が 0 から連続していること。中間の record を消すと検出する。
-- header が commit した data 長を超える trailing bytes が無いこと。crash で残った部分 record を黙って無視しない。
+- commit 範囲外の tail は、次 sequence から始まる完全に妥当な staged record と、最後の
+  構造的に妥当な partial record の組み合わせだけを許し、sync 済み committed length まで戻す。
+  1 byte の無関係な suffix や checksum 不正の完全 record は拒否して保存する。
 - 同じ 16 bytes が 2 度出ないこと。
-- version が 1 であること。違えば `UnsupportedVersion` で、best-effort な parse はしない。
+- file length、header 宣言件数、append 後の長さがすべて hard bound 内であること。
 
 ## 書き込みの durability 順序
 
@@ -70,12 +77,12 @@ open 時の検査は 5 つ。
 poison 検査
   -> 重複検査
   -> 容量検査
-  -> record を末尾に write_all
-  -> sync_data          ← record は durable、header はまだ古い commit 範囲
-  -> header を先頭に write_all
-  -> sync_data          ← 新しい件数を公開
+  -> current committed length に record を write_all
+  -> sync_all           ← record は staged、最新 header はまだ旧 commit 範囲
+  -> inactive slot に generation+1 header を write_all
+  -> sync_all           ← 新しい件数を公開
   -> in-memory の issued と next_sequence を更新
-  -> seek(End)          ← 失敗しても Ok。poison するだけ
+  -> parent/lock/path/inode/length を再検証
 ```
 
 ```mermaid
@@ -86,19 +93,19 @@ sequenceDiagram
 
     L->>L: poison / 重複 / 容量 の検査
     L->>F: 末尾に record を write_all
-    L->>F: sync_data
+    L->>F: sync_all
     Note over F: record は durable。<br/>header はまだ旧件数なので<br/>この時点で crash しても整合する
-    L->>F: 先頭に新 header を write_all
-    L->>F: sync_data
+    L->>F: inactive slot に generation+1 header
+    L->>F: sync_all
     Note over F: 新件数を公開
     L->>M: issued と next_sequence を更新
-    L->>F: seek(End)
-    Note over L,F: ここで失敗しても Ok。<br/>poison するだけで、commit 済みの<br/>identity を free と誤報しない
+    L->>F: path / inode / length 再検証
+    Note over L,F: 不一致なら instance を poison。<br/>再 open は durable header から復旧する
 ```
 
-**record の sync が header の write より前にある。** 逆にすると、crash 時に「header は N 件と言っているが実際は N-1 件」という file ができる。再 open すると `Truncated` になり、その identity は `issued` から落ちて再利用可能になる。ledger の存在意義がそこで消える。
-
-2 つ目の `sync_data` までは、途中で失敗しても `issued` が durable な内容と一致する（あるいはその部分集合になる）。sync が終わった時点で予約は commit しているので、そこで in-memory を更新する。
+**record の sync が commit header の write より前にある。** header 書き込み中に crash しても
+もう一方の slot が直前の commit を残す。record は揃っているが新 header が未 commit の場合だけ、
+再 open が staged tail として安全に検証・破棄する。
 
 ## poison
 
@@ -112,30 +119,34 @@ if self.poisoned {
 
 部分的に書けた batch の後、in-memory の `issued` と file が食い違う。続行すると、free だと思っている identity が既に disk 上にある（あるいは逆）状態で払い出す。
 
-`Err` は「その identity がまだ free である」ことを意味する。両方の `sync_data` が終わった時点で予約は commit しており、そこから先の失敗で `Err` を返すと、disk 上に永久に残った値を caller が free だと解釈する。同じ値を再 open 後に retry すれば `Duplicate` になるので、`IdentityLedger` trait の doc と食い違う。そのため in-memory の更新を先に済ませ、最後の `seek(End)` が失敗しても `Ok` を返して poison だけする。次の append が未知の offset に書くことは、poison が止める。
-
-**`poisoned` は process-local で永続しない。** restart すると fail-closed 状態が消える。復旧は `parse_ledger` が trailing suffix を見つけるかどうかだけに依存し、失敗した batch が disk に何も残さなかった場合、再起動した process はそれらの identity を free として扱う。
+commit header の `sync_all` 後は disk 上の予約が正本である。以降の再検証が失敗した場合は
+`Err` と同時に instance を poison し、caller は同じ session 開始を成功扱いしない。再 open は
+2 header と staged tail を照合するため、commit 済み identity が free pool に戻ることはない。
+header に到達しなかった batch は未 commit なので、その session attempt 自体を失敗として扱う。
 
 ## 排他所有
 
-`<ledger path>.lock` という sidecar file を `create_new` で作る。中身は所有 process の PID と改行。`ExclusiveLedgerLock::drop` が消す。
+`<ledger path>.lock` は消さない stable sidecar で、ledger owner はその `0600` regular file に
+kernel の exclusive file lock を保持する。process 終了時は descriptor close により自動解放され、
+次 owner は同じ inode を開いて lock を取得する。
 
 2 つの orchestrator process が同じ ledger を書くと、それぞれが自分の `issued` と `next_sequence` を持ち、衝突する offset に append し、両方が同じ identity を free だと信じる。
 
-**この機構には制約がある。**
-
-- `stale_lock` は Linux 以外では compile 時の no-op。crash した所有者の lock file を回収できない。
-- Linux でも `/proc/<pid>` の存在しか見ない。PID が再利用されると、死んだ所有者が生きて見え、永久に `Locked` になる。
-- `create_new` と PID の `write_all` の間で crash すると、0 byte の lock が残る。中身が parse できず、これも永久に `Locked`。operator が消すまで復旧しない。
-- `flock` ではなく sidecar file なので、advisory であって強制ではない。
+lock file の path/inode、owner、mode、link count は取得時と append 前後に再検証する。同一 process、
+cross-process、crash 後の再取得、hardlink/cross-path alias は test で固定されている。advisory lock
+なので ledger/lock の parent は owner-controlled でなければならず、権限検査を回避できる配置は拒否する。
 
 ## path の検査
 
-ledger path と lock path は、symlink でも非 regular file でもないことを確認する。open の前（`validate_ledger_path`）と後（`reject_non_regular_or_symlink`）の 2 回。
+parent directory を先に開いて inode を保持し、Linux ではその `/proc/self/fd/<dirfd>/name` を
+`O_NOFOLLOW` 付きで開く。ledger と lock は regular file、single-link、effective UID owner、
+exact `0600` であることを要求する。各 append は held descriptor と現在の path の device/inode、
+親 directory identity、file length を再照合する。
 
 symlink を許すと、低権限の user が orchestrator の書き込みを自分の file へ向けられる。あるいは、orchestrator が write 権を持つ任意の host file に 32 byte の record を append させられる。
 
-**ただし `O_NOFOLLOW` を使っていない。** 検査 2 回は別の syscall で、open 後の検査は fd が regular file であることを見るが、検証した inode と同じであることは見ない。その窓で path を差し替えると、append が別の regular file へ向く。
+symlink、path replacement、unsafe parent、mode/owner/link-count drift は fail closed になり、live
+writer は以後 poison される。
 
 ## checksum は MAC ではない
 
@@ -151,21 +162,29 @@ on-disk format が固定長 record なので、破損した位置を offset で�
 
 ## 正確な保証範囲
 
-- `SessionOrchestrator` 経由で `DurableIdentityLedger` を動かす test が無い。`tests/orchestration.rs` は in-memory ledger か failing stub を使い、`tests/ledger.rs` は durable ledger を直接叩く。`new_durable` はどの test からも呼ばれていない。
-- crash consistency の主張が fault injection されていない。record の sync と header の write の間で process を落とす test は無い。「header が commit した範囲の外に trailing bytes がある」分岐は未検証。
-- `poisoned` 経路を実 `DurableIdentityLedger` で起こす test が無い。mock が `WriteFailed` / `SyncFailed` を返すだけ。実際の write 失敗が、次の open で拒否される状態を残すことは示されていない。
-- `CapacityExceeded` を起こす test が無い。定数の値を assert しているだけで、append 時、file size、header 宣言件数の 3 つの bound はいずれも未実行。
-- stale lock の回収が未検証。既存 test は同じ process から 2 回 open するので `pid != std::process::id()` が偽になり、`/proc` を一度も見ない。cross-process の排他も、死んだ所有者からの復旧も未検証。
-- 並行性の test が皆無。2 thread も 2 process も `open` / `reserve_batch` を競わせていない。排他の主張は sidecar file と `create_new` に依存していて、contention 下で検証されていない。
-- `OsEntropy` を実行する test が無い。identity は `[0x01; 16]` のような決定的 mock から来る。`/dev/urandom` を開くこと、16 bytes 読むこと、予測不可能であることは、いずれも確認していない。
-- `Symlink`、`NotRegularFile`、`UnsupportedVersion`、file 内 `Duplicate`、非連続 sequence、未知の kind tag、非ゼロ reserved はすべて未到達。
+- unit test は redundant header の全1-byte tear、inactive slot 破損、committed record 破損、
+  valid staged tail、invalid suffix、path/length replacement、unsafe parent、ledger/lock symlink、
+  exact mode、同一/cross-process lock を実行する。
+- production composition は recovery intent を先に永続化し、その後の7 identity reservation と
+  journal checkpoint を照合する。部分予約、foreign fingerprint、ledger と recovery history の不一致を
+  owner 構築前に拒否する。
+- [`tests/ledger.rs`](../../crates/session-orchestrator/tests/ledger.rs) は public API の reopen、duplicate、
+  corrupt/truncated input、live second owner を固定する。`SessionOrchestrator::new_durable` も専用 ledger
+  を取得して初期状態を構築できることを unit test する。
+- entropy の「予測不可能性」は deterministic test では証明できない。production の `OsEntropy` は
+  host kernel の `/dev/urandom` から exact 16 bytes を読み、I/O failure と all-zero を拒否する。
+- CRC-32 は偶発破損検出であり MAC ではない。host root または ledger owner が file を意図的に
+  正しく再符号化する脅威は、filesystem ownership と host trust boundary の外側である。
 
 ## 変更時の確認点
 
 - `allocate_session_identity` は `draw_identities` に kind の列を渡し、結果を名前で分配する。**リストを 2 本に分けない。** 以前は `kinds` 配列と位置読みが独立していて、並べ替えると compile が通ったまま全 record の `IdentityKind` がずれ、Capability 用に引いた値が `broker_session_id` に入った。`zip` による切り捨てで 8 個目が黙って予約されないこともあった。現在はどちらも compile error になる。
 - kind を増やすときは、`draw_identities` に渡す配列と分配側の `let [...]` を同時に直す。長さが合わなければ compile が通らない。
-- `ledger_header` は `header[9] = 32` と literal を書き、`parse_ledger` は `LEDGER_HEADER_BYTES` と比較する。定数を変えると、自分が書いた file を読めなくなる。`header[28..]`、`record[28..]`、`checksum(&..[..28])` も offset 28 を hard-code しているので、`LEDGER_RECORD_BYTES` を上げると compile は通って実行時に `copy_from_slice` が panic する。
-- `LEDGER_MAGIC` は末尾に format version の数字を持ち、`LEDGER_VERSION` と重複している。format を変えるときは両方上げる。片方だけだと、古い file が `Corrupt`（magic）と `UnsupportedVersion`（byte 8）に分かれて現れる。
+- v2 header の slot、generation、record count、data length、reserved range、checksum range は
+  on-disk contract である。offset を変える場合は encoder、両 slot parser、tear/corruption test、
+  `MAX_LEDGER_BYTES` を同じ変更で更新する。
+- `LEDGER_V2_MAGIC` と `LEDGER_V2_VERSION` は別々に検査される。format を変えるときは新しい
+  parser/migration を追加し、v1/v2 を best-effort に読み替えない。
 - identity newtype の `Display` は lib.rs の外で load-bearing である。`firecracker_workspace.rs` が clone directory を `clone_root.join(workspace_id.to_string())` で作り、`firecracker_backend.rs` が `config.workspace.clone_id` に入れ、`authority_backend.rs` が Authority Core の subject / capability id を `to_string()` から導く。**hex の書式を変えると、on-disk path と Authority Core の subject 名が黙って変わる。**
 - `SessionOrchestrator::new` の default type parameter を変えない。production が `new_durable` を忘れる事故は、現在 module doc と README でしか警告していない。
 

@@ -25,6 +25,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  plan:
+    name: Plan security gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      gates: ${{ steps.plan.outputs.gates }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Install pinned pipeline parser
+        run: scripts/ci/install-pipeline-tools.sh
+      - name: Materialize the manifest-owned security plan
+        id: plan
+        env:
+          PLAN_EVENT: ${{ github.event_name }}
+          PLAN_PLATFORM: github
+          PLAN_TIER: ${{ github.event_name == 'schedule' && 'deep' || 'standard' }}
+        run: |
+          set -euo pipefail
+          scripts/ci/plan-pipeline.sh --workflow security.yml --output plan.json >/dev/null
+          echo "gates=$(cat plan.json)" >> "${GITHUB_OUTPUT}"
+
   codeql:
     name: CodeQL Rust analysis
     runs-on: ubuntu-24.04
@@ -219,18 +244,27 @@ jobs:
     name: Security complete
     if: ${{ always() }}
     needs:
+      - plan
       - codeql
       - dependency_audit
       - dependency_policy
       - sast
       - secrets
       - supply_chain_inventory
+      - scorecard
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Enforce all security gates
+      - name: Check out fan-in implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Reconcile observed jobs with the manifest plan
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          jq -e 'all(.[]; .result == "success")' <<< "${NEEDS_JSON}"
+          printf '%s\n' '${{ needs.plan.outputs.gates }}' > plan.json
+          scripts/ci/collect-gate-results.sh --from-needs --output results.tsv >/dev/null
+          scripts/ci/check-gate-results.sh --plan plan.json --results results.tsv

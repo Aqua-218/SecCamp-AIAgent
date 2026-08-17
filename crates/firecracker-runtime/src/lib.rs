@@ -32,8 +32,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
-    AtFlags, CWD, Gid, Mode, OFlags, RawDir, RenameFlags, Uid, fchown, fcntl_getfl, fcntl_setfl,
-    open, openat, renameat_with, statfs, unlinkat,
+    AtFlags, CWD, Gid, Mode, OFlags, RawDir, RenameFlags, Uid, fchmod, fchown, fcntl_getfl,
+    fcntl_setfl, open, openat, renameat_with, statfs, unlinkat,
 };
 use rustix::mount::{UnmountFlags, mount_bind, unmount};
 use sha2::{Digest, Sha256};
@@ -79,7 +79,10 @@ pub const MIN_WORKSPACE_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 /// Largest sparse raw ext4 image a session may provision.
 pub const MAX_WORKSPACE_IMAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const WORKSPACE_IMAGE_BLOCK_BYTES: u64 = 4096;
-const WORKSPACE_IMAGE_FILE_SUFFIX: &str = ".ext4";
+// Firecracker persists this guest-visible path in full snapshots.  Keep the filename stable
+// across session identity rebinding; the containing jail root already supplies per-session
+// ownership and isolation.
+const WORKSPACE_IMAGE_FILE_NAME: &str = "workspace.ext4";
 const ID_LENGTH: usize = 16;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -204,10 +207,14 @@ impl WorkspaceConfig {
     }
 
     /// Returns the guest workspace's session-owned raw ext4 image path.
+    ///
+    /// The filename is deliberately independent of `clone_id`: Firecracker records the
+    /// jail-relative backing path in snapshots, while every session receives a distinct jail
+    /// root.  Binding the filename to a fresh session identity would make a clean template
+    /// snapshot impossible to restore.
     #[must_use]
     pub fn image_path(&self) -> PathBuf {
-        self.clone_root
-            .join(format!("{}{}", self.clone_id, WORKSPACE_IMAGE_FILE_SUFFIX))
+        self.clone_root.join(WORKSPACE_IMAGE_FILE_NAME)
     }
 }
 
@@ -3243,6 +3250,7 @@ impl RealFileSystem {
         flags: OFlags,
         uid: u32,
         gid: u32,
+        mode: Mode,
     ) -> Result<(), RuntimeError> {
         let descriptor = open(
             path,
@@ -3252,20 +3260,24 @@ impl RealFileSystem {
         .map_err(|error| RuntimeError::Io(error.to_string()))?;
         let file = File::from(descriptor);
         fchown(&file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
-            .map_err(|error| RuntimeError::Io(error.to_string()))
+            .map_err(|error| RuntimeError::Io(error.to_string()))?;
+        fchmod(&file, mode).map_err(|error| RuntimeError::Io(error.to_string()))?;
+        let metadata = file.metadata().map_err(RuntimeError::from)?;
+        if metadata.uid() != uid || metadata.gid() != gid || metadata.mode() & 0o777 != mode.bits()
+        {
+            return Err(workspace_error(format!(
+                "jailer resource ownership or permissions did not persist: {}",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     fn workspace_image_path(workspace: &Path) -> Result<PathBuf, RuntimeError> {
         let parent = workspace
             .parent()
             .ok_or_else(|| workspace_error("workspace clone has no parent directory"))?;
-        let name = workspace
-            .file_name()
-            .ok_or_else(|| workspace_error("workspace clone has no final component"))?;
-        Ok(parent.join(format!(
-            "{}{WORKSPACE_IMAGE_FILE_SUFFIX}",
-            name.to_string_lossy()
-        )))
+        Ok(parent.join(WORKSPACE_IMAGE_FILE_NAME))
     }
 
     fn prepare_clone(
@@ -3823,17 +3835,15 @@ impl RealFileSystem {
         let Some(ownership) = self.owned_workspace_images.get(workspace).copied() else {
             return Ok(());
         };
-        let image = workspace
-            .parent()
-            .ok_or_else(|| workspace_error("workspace clone has no parent directory"))?
-            .join(format!(
-                "{}{}",
-                workspace
-                    .file_name()
-                    .ok_or_else(|| workspace_error("workspace clone has no final component"))?
-                    .to_string_lossy(),
-                WORKSPACE_IMAGE_FILE_SUFFIX
-            ));
+        let image = Self::workspace_image_path(workspace)?;
+        let metadata = match fs::symlink_metadata(&image) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.owned_workspace_images.remove(workspace);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let parent = image
             .parent()
             .ok_or_else(|| workspace_error("workspace image has no parent directory"))?;
@@ -3844,14 +3854,6 @@ impl RealFileSystem {
                 parent.display()
             )));
         }
-        let metadata = match fs::symlink_metadata(&image) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.owned_workspace_images.remove(workspace);
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
-        };
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
             || metadata.nlink() != 1
@@ -4010,7 +4012,7 @@ impl FileSystem for RealFileSystem {
                 image.display()
             )));
         }
-        Self::transfer_opened_ownership(&image, OFlags::RDWR, uid, gid)?;
+        Self::transfer_opened_ownership(&image, OFlags::RDWR, uid, gid, Mode::RUSR | Mode::WUSR)?;
 
         let binding = self
             .block_devices
@@ -4037,7 +4039,7 @@ impl FileSystem for RealFileSystem {
                 jailed_device.display()
             )));
         }
-        Self::transfer_opened_ownership(jailed_device, OFlags::RDONLY, uid, gid)
+        Self::transfer_opened_ownership(jailed_device, OFlags::RDONLY, uid, gid, Mode::RUSR)
     }
 
     fn remove_jail(&mut self, jail_root: &Path) -> Result<(), RuntimeError> {
@@ -4297,6 +4299,14 @@ impl FileSystem for RealFileSystem {
         if image.parent() != Some(parent) {
             return Err(workspace_error(format!(
                 "workspace image must be adjacent to its clone: {}",
+                image.display()
+            )));
+        }
+        let expected_image = Self::workspace_image_path(workspace)?;
+        if image != expected_image {
+            return Err(workspace_error(format!(
+                "workspace image must use the stable snapshot path {}: {}",
+                expected_image.display(),
                 image.display()
             )));
         }
@@ -7642,6 +7652,14 @@ mod tests {
         session.dm_verity.mapper_name = "rootfs-verity-session-b".to_owned();
         session.dm_verity.jailed_device_path = jail_root.join("dev/rootfs");
 
+        let base_workspace_image = base
+            .jail_path("workspace block image", &base.workspace.image_path())
+            .expect("base workspace image must be jail-relative");
+        let session_workspace_image = session
+            .jail_path("workspace block image", &session.workspace.image_path())
+            .expect("session workspace image must be jail-relative");
+        assert_eq!(base_workspace_image, Path::new("/workspace/workspace.ext4"));
+        assert_eq!(session_workspace_image, base_workspace_image);
         assert_eq!(session.snapshot_fingerprint(), base.snapshot_fingerprint());
         assert_ne!(session.instance_fingerprint(), base.instance_fingerprint());
     }
@@ -7853,7 +7871,7 @@ mod tests {
             .iter()
             .position(|event| event.contains("firecracker:Patch:/drives/workspace:"))
             .expect("restore must bind the fresh workspace through Firecracker");
-        assert!(events[workspace].contains("\"path_on_host\":\"/workspace/session-a.ext4\""));
+        assert!(events[workspace].contains("\"path_on_host\":\"/workspace/workspace.ext4\""));
         let verifies = events
             .iter()
             .enumerate()
@@ -7867,7 +7885,7 @@ mod tests {
         let resources = events
             .iter()
             .position(|event| {
-                event == "firecracker:verify-resources:/workspace/session-a.ext4:/run/session-a.vsock:42"
+                event == "firecracker:verify-resources:/workspace/workspace.ext4:/run/session-a.vsock:42"
             })
             .expect("restore must observe the exact Firecracker device bindings");
         assert!(
@@ -7884,24 +7902,24 @@ mod tests {
         let valid = r#"{
             "drives":[
                 {"drive_id":"rootfs","path_on_host":"/dev/rootfs"},
-                {"drive_id":"workspace","path_on_host":"/workspace/session-a.ext4"}
+                {"drive_id":"workspace","path_on_host":"/workspace/workspace.ext4"}
             ],
             "vsock":{"guest_cid":42,"uds_path":"/run/session-a.vsock"},
             "machine-config":{"vcpu_count":2}
         }"#;
         verify_exported_restore_resources(
             valid,
-            Path::new("/workspace/session-a.ext4"),
+            Path::new("/workspace/workspace.ext4"),
             Path::new("/run/session-a.vsock"),
             42,
         )
         .expect("exact exported resource bindings must verify");
 
-        let wrong_workspace = valid.replace("/workspace/session-a.ext4", "/workspace/stale.ext4");
+        let wrong_workspace = valid.replace("/workspace/workspace.ext4", "/workspace/stale.ext4");
         assert!(matches!(
             verify_exported_restore_resources(
                 &wrong_workspace,
-                Path::new("/workspace/session-a.ext4"),
+                Path::new("/workspace/workspace.ext4"),
                 Path::new("/run/session-a.vsock"),
                 42,
             ),
@@ -7911,7 +7929,7 @@ mod tests {
         assert!(matches!(
             verify_exported_restore_resources(
                 &wrong_vsock,
-                Path::new("/workspace/session-a.ext4"),
+                Path::new("/workspace/workspace.ext4"),
                 Path::new("/run/session-a.vsock"),
                 42,
             ),
@@ -7921,7 +7939,7 @@ mod tests {
         assert!(matches!(
             verify_exported_restore_resources(
                 &duplicate_key,
-                Path::new("/workspace/session-a.ext4"),
+                Path::new("/workspace/workspace.ext4"),
                 Path::new("/run/session-a.vsock"),
                 42,
             ),

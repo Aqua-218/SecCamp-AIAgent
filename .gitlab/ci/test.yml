@@ -4,10 +4,25 @@ rust_tests:
   timeout: 25m
   parallel:
     matrix:
-      - SHARD: ["1", "2", "3", "4"]
+      - SHARD: ["1"]
+        PACKAGE: ["authority-core"]
+      - SHARD: ["2"]
+        PACKAGE: ["capfs"]
+      - SHARD: ["3"]
+        PACKAGE: ["egress-broker"]
+      - SHARD: ["4"]
+        PACKAGE: ["egress-protocol"]
+      - SHARD: ["5"]
+        PACKAGE: ["firecracker-runtime"]
+      - SHARD: ["6"]
+        PACKAGE: ["runtime-isolation"]
+      - SHARD: ["7"]
+        PACKAGE: ["session-orchestrator"]
+      - SHARD: ["8"]
+        PACKAGE: ["supervisor"]
   script:
     - scripts/ci/install-cargo-tools.sh nextest
-    - scripts/ci/run.sh test "$SHARD"
+    - scripts/ci/run.sh test-package "$PACKAGE"
   artifacts:
     when: always
     expire_in: 14 days

@@ -61,9 +61,10 @@ guest kernel build toolchain を必要とする。jailer が chroot 内で Firec
 mount flags と statfs、および全 ancestor の所有者・mode を検査して `noexec` や共有 writable
 の候補を fail closed で拒否する。`REAL_SESSION_TEMP_PARENT` で別の専用 parent を指定する
 場合も、同じ検査を通過する必要がある。egress adapter は意図的に closed/rejecting で、
-外部 HTTP/GitHub provider の到達性や mutation はこの gate の対象外である。guest 内の
-CapFS/supervisor が readiness まで進むことは確認するが、全ての file effect、FUSE/OS の
-意味論、外部 provider の安全性をこの test だけで証明するものではない。
+外部 HTTP/GitHub provider の到達性や mutation はこの gate の対象外である。guest 内では
+CapFS/supervisor readiness後に全13 file effectを実行し、その後のBroker requestがdurable WALに
+Finalとして残ることで順序を固定する。これは対象操作の実FUSE/OS経路を実証するが、全kernel
+scheduling、VM escape、外部providerの安全性まで証明するものではない。
 
 ## 未検証の境界
 
@@ -79,15 +80,15 @@ CapFS/supervisor が readiness まで進むことは確認するが、全ての 
 
 `tests/production_adapters.rs` が示すのは identity が adapter を貫通することだけ。実機 gate は
 Firecracker 起動、dm-verity/seccomp、guest-control の identity gate、guest supervisor readiness、
-Broker listener の生存、依存順 cleanup までを追加で確認する。ただし Broker の egress は closed
-であり、外部 provider の接続・mutation、任意の CapFS effect と OS/FUSE の全挙動は示さない。
+全13 CapFS effect、Broker listenerとdurable WAL、依存順cleanupまでを追加で確認する。ただし
+Brokerのegressはclosedであり、外部providerの接続・mutationや全kernel interleavingは示さない。
 
 ### 検査があるのに test が無いもの
 
 | 対象 | 何が未検証か |
 |---|---|
-| `validate_workspace` | `CrossSessionLease` 経路と、その clone 解放は `foreign_workspace_lease_isolates_the_clone_before_returning` で検証済み。`LeaseIdentityMismatch` 側の分岐は未検証 |
-| `SessionOrchestrator::new_durable` | public integration test は実 `start_session` の7 record commit、backend effect前のfile state、stop後のreopenを固定する。実 `SessionOwner` / production builder の経路は別の ignored gateに依存する |
+| lease identity validation | `CrossSessionLease`に加え、workspace／Broker／VM／Capability／Workloadの同一session内ID mismatchを検証し、各committed stageの逆順cleanupと後段未到達を固定した |
+| `SessionOrchestrator::new_durable` | public integration test は実 `start_session` の7 record commit、backend effect前のfile state、stop後のreopenを固定する。実 `SessionOwner` / production builder の経路はrequired KVM gateで実行する |
 | ledger の crash consistency | valid staged tail の再open破棄、部分 tail、header redundancy、rename/length drift、write/sync fault は実 file と private deterministic seam で固定した。ledger 自身に rename syscall はなく、path replacement は実 `fs::rename` で検証する |
 | `poisoned` 経路 | rename/length drift と write/sync syscall failure 後の typed error、同一 handle の `Unavailable`、reopen 後の safe reuse/duplicate rejection を固定した。header sync は syscall が実際に header を反映してから失敗する場合もあるため、reopen の両結果を安全条件として検証する |
 | `CapacityExceeded` | request batch、header declared count、file size の3 hard bound に加え、最大件数ちょうどを実データで埋めた成功、次 record の拒否、reopen 後の件数を固定した |
@@ -95,13 +96,13 @@ Broker listener の生存、依存順 cleanup までを追加で確認する。�
 | 並行性 | 2 process の `open` contention は固定した。lock保持中に2つのwriterが同時にreserve成功する競合試験は、exclusive openで成立しないため未実行 |
 | `OsEntropy` | Linux `/dev/urandom` のopenと16 bytes読出し、2回の値がall-zeroでないこと、public allocation の all-zero bounded retry と persistent-zero typed failure、entropy I/O failure の typed propagation を固定した。予測不可能性や kernel/host entropy品質は証明せず、host OS RNG を TCB とする |
 | ledger の error variant | `Symlink`、`NotRegularFile`、`UnsupportedVersion`、`Corrupt`、`Truncated`、`Duplicate`、`CapacityExceeded`、`PathIdentityChanged`、`LengthChanged`、`Unavailable`、未知kind、非連続 sequence、非ゼロ reserved は実行済み |
-| 空 failure の `StopError::Cleanup` | flag が false で lease が `None` の場合に `Stopping` へ永久固着する。structural に防いでおらず test も無い |
-| `rollback_failures` の完全性 | index 0 しか確認していない test が 1 本。gate で飛ばした stage が failure に現れないことを固定する test が無い |
+| cleanup内部不整合 | pending flagに対応lease／VM start attemptが無い場合も該当stageのtyped failureを返し、空の`StopError::Cleanup`を作らないunit testを固定した |
+| `rollback_failures` の完全性 | 同時に失敗した全attempted stageを順序付きで記録し、dependency gateで未実行のworkspace isolationをfailureへ偽装しないmatrix testを固定した |
 | `LifecycleState` の中間値 | `state()` から観測できないため、`WorkspaceCloned` 等を確認する test は存在しえない |
 
 ### この crate が構造的に確認しないこと
 
-snapshot image を一度も読まない。`SnapshotDescriptor` は呼び出し側の申告なので、「この snapshot に session identity は無い」は caller の主張である。**中身が汚れていて descriptor が綺麗な image は素通りする。**
+一般の`SnapshotDescriptor`は呼び出し側の申告であり、任意の第三者snapshotを意味解析しない。required KVM gateでは例外的に、このcheckoutからguest-control-readyなclean snapshotを作り、state/memoryのdigestをpinし、その同じartifactだけをrestoreしてfresh identityを注入する。従ってその生成経路は実証済みだが、descriptorだけを偽装した外部snapshotを安全化する機能ではない。
 
 ledger の CRC-32 は MAC ではない。file に書ける者は record を削除して CRC を計算し直せる。防御は filesystem permission と advisory な sidecar lock だけ。
 

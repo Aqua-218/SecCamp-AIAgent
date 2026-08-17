@@ -114,10 +114,10 @@ clone_workspace が成功
 ## 正確な保証範囲
 
 - backend はすべて trait 越し。この file が行う I/O は ledger file と `/dev/urandom` だけ。
-- `validate_workspace` の `CrossSessionLease` 経路と、その rollback は test 済み。`LeaseIdentityMismatch` 側の分岐は未検証。
-- `StopError::Cleanup` が空の failure vector を持つ場合（flag が false で lease が `None`）は、`Stopping` に永久に固着する。structural には防いでいない。test も無い。
-- `rollback_failures` の完全性を確認する test が無い。gate で飛ばされた stage は failure に現れないが、その挙動を固定した test が無い。
-- production adapter の composition test は外部 command/filesystem/API を fake に置き換えている。identity が adapter を貫通することは示すが、Firecracker が起動すること、dm-verity や seccomp が適用されることは示さない。Broker の Firecracker per-port Unix listenerは別の module / opt-in KVM test で確認する。
+- 全resourceの`CrossSessionLease`と、workspace／Broker／VM／Capability／Workloadの`LeaseIdentityMismatch`をtestし、各committed stageの逆順rollbackと後段未到達を固定する。
+- cleanup flagがpendingなのに対応lease／VM start attemptが無い内部不整合は、空の`StopError::Cleanup`にせず、該当するtyped `CleanupFailure`を必ず返してfail-stopするunit testがある。
+- 同時に失敗した全attempted cleanup stageを順序付きで`rollback_failures`へ記録し、VM／Broker cleanupが失敗したときworkspace isolationをdependency-blockedとして呼ばないmatrix testがある。
+- production compositionのfake境界に加え、required KVM gateが実Firecracker、dm-verity、seccomp、Broker per-port listener、全13 CapFS effect、SessionOwner cleanupを確認する。
 - `SessionOrchestrator::new` は default type parameter で process-local ledger を選ぶ。production host が `new_durable` を忘れても compile は通り、contract test も全部通る。
 
 ## 変更時の確認点

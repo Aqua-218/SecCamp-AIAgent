@@ -10,7 +10,7 @@ set -euo pipefail
 
 usage() {
   printf '%s\n' \
-    'usage: build-guest-control-image.sh --base-rootfs PATH --guest-control-init PATH --workload PATH --port PORT --output-rootfs PATH --output-hash PATH' >&2
+    'usage: build-guest-control-image.sh --base-rootfs PATH --guest-control-init PATH --workload PATH [--workload-name NAME] --port PORT --output-rootfs PATH --output-hash PATH' >&2
 }
 
 fail() {
@@ -55,6 +55,7 @@ require_private_output_directory() {
 base_rootfs=''
 guest_control_init=''
 workload=''
+workload_name='guest-workload'
 port=''
 output_rootfs=''
 output_hash=''
@@ -74,6 +75,11 @@ while [[ "$#" -gt 0 ]]; do
     --workload)
       [[ "$#" -ge 2 ]] || { usage; exit 2; }
       workload="$2"
+      shift 2
+      ;;
+    --workload-name)
+      [[ "$#" -ge 2 ]] || { usage; exit 2; }
+      workload_name="$2"
       shift 2
       ;;
     --port)
@@ -104,6 +110,8 @@ done
 }
 [[ "${port}" =~ ^[0-9]+$ ]] || fail 'port must be decimal'
 ((port > 0 && port < 4294967295)) || fail 'port must be explicit, non-zero, and non-wildcard'
+[[ "${workload_name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
+  || fail 'workload name must be a bounded non-hidden ASCII filename'
 
 require_absolute_file 'base rootfs' "${base_rootfs}"
 require_absolute_file 'guest-control init' "${guest_control_init}"
@@ -148,7 +156,7 @@ trap cleanup EXIT
 
 unsquashfs -f -d "${staging}/root" "${base_rootfs}" >/dev/null
 install -D -m 0755 "${guest_control_init}" "${staging}/root/usr/local/libexec/guest-control-init"
-install -D -m 0755 "${workload}" "${staging}/root/usr/local/libexec/guest-workload"
+install -D -m 0755 "${workload}" "${staging}/root/usr/local/libexec/${workload_name}"
 mksquashfs "${staging}/root" "${staging}/rootfs" -noappend -all-root -comp xz >/dev/null
 veritysetup format "${staging}/rootfs" "${staging}/rootfs.hash" >"${staging}/rootfs.verity"
 
@@ -168,4 +176,4 @@ sha256sum "${output_rootfs}" | awk '{print $1}'
 printf 'hash SHA-256: '
 sha256sum "${output_hash}" | awk '{print $1}'
 grep -E '^Root hash:' "${output_verity}"
-printf 'boot args: console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init -- --port %s --workload /usr/local/libexec/guest-workload\n' "${port}"
+printf 'boot args: console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/libexec/guest-control-init -- --port %s --workload /usr/local/libexec/%s\n' "${port}" "${workload_name}"

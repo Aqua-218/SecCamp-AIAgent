@@ -18,6 +18,7 @@ use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
@@ -31,7 +32,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{
-    CWD, Mode, OFlags, RenameFlags, fcntl_getfl, fcntl_setfl, open, openat, renameat_with, statfs,
+    AtFlags, CWD, Gid, Mode, OFlags, RawDir, RenameFlags, Uid, fchown, fcntl_getfl, fcntl_setfl,
+    open, openat, renameat_with, statfs, unlinkat,
 };
 use rustix::mount::{UnmountFlags, mount_bind, unmount};
 use sha2::{Digest, Sha256};
@@ -1051,6 +1053,35 @@ pub trait CommandRunner {
             "command runner does not implement live dm-verity verification".to_owned(),
         ))
     }
+    /// Opens the expected dm-verity mapping.
+    ///
+    /// The default command retains the explicit `--readonly` request used by the mock boundary.
+    /// Production `veritysetup` versions differ here: dm-verity mappings are intrinsically
+    /// read-only, while some packaged `veritysetup` releases reject that optional flag.  The real
+    /// runner therefore supplies the same read-only kernel primitive without relying on the
+    /// version-specific spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the mapping command cannot be started or exits unsuccessfully.
+    fn open_verity(
+        &mut self,
+        veritysetup: &PinnedArtifact,
+        expected: &DmVerityConfig,
+    ) -> Result<(), RuntimeError> {
+        self.run(&CommandSpec::pinned(
+            veritysetup,
+            [
+                "open".to_owned(),
+                "--readonly".to_owned(),
+                expected.data_device.display().to_string(),
+                expected.mapper_name.clone(),
+                expected.hash_device.display().to_string(),
+                expected.root_hash.to_hex(),
+            ],
+        ))
+        .map(|_| ())
+    }
     /// Starts a jailer and binds the resulting Firecracker task to an observable ownership scope.
     ///
     /// A returned handle retains cleanup ownership even when startup has not produced a live
@@ -1118,6 +1149,52 @@ pub trait FileSystem {
         Err(RuntimeError::Io(
             "filesystem adapter cannot verify jailed block-device bindings".to_owned(),
         ))
+    }
+    /// Registers the exact jailer root and its instance parent for rollback ownership.
+    ///
+    /// This boundary is intentionally separate from [`Self::prepare_jailer_resources`]: the
+    /// runtime must establish the cleanup identity before a later resource-transfer operation
+    /// can fail.  A production adapter records stable object identities and refuses replacements;
+    /// test doubles that do not create a jail tree may retain the default no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the root or its parent cannot be verified as an owned real
+    /// directory.
+    fn register_jailer_root(&mut self, _jail_root: &Path) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    /// Transfers ownership of the exact workspace image and jailed root-device binding to the
+    /// dedicated non-root jailer identity before Firecracker is exec'd.
+    ///
+    /// The default is a compatibility no-op for non-production test doubles.  The production
+    /// filesystem adapter must verify its ownership records and perform this operation on opened
+    /// descriptors, never on an untrusted path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when ownership cannot be transferred safely.
+    fn prepare_jailer_resources(
+        &mut self,
+        _workspace: &Path,
+        _jailed_device: &Path,
+        _jail_root: &Path,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    /// Removes the exact jailer root after all process, mount, and workspace resources are gone.
+    ///
+    /// The production adapter must retain the root identity from launch preparation and refuse
+    /// to follow replacements.  The default keeps existing lifecycle test doubles source
+    /// compatible; they do not create a real jail tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when the owned jail cannot be removed safely.
+    fn remove_jail(&mut self, _jail_root: &Path) -> Result<(), RuntimeError> {
+        Ok(())
     }
     /// Bind-mounts a verified host block device at an owner-owned path inside the jail.
     ///
@@ -2460,6 +2537,28 @@ impl CommandRunner for RealCommandRunner {
         recovery::validate_live_verity_status(&output.stdout, expected)
     }
 
+    fn open_verity(
+        &mut self,
+        veritysetup: &PinnedArtifact,
+        expected: &DmVerityConfig,
+    ) -> Result<(), RuntimeError> {
+        // dm-verity is a read-only target by definition.  The `--readonly` spelling is accepted
+        // by some util-linux/cryptsetup builds but rejected by the veritysetup package shipped on
+        // the supported host image, so do not make the kernel primitive depend on that optional
+        // CLI flag.  `verify_verity` immediately below checks the resulting target is readonly.
+        self.run(&CommandSpec::pinned(
+            veritysetup,
+            [
+                "open".to_owned(),
+                expected.data_device.display().to_string(),
+                expected.mapper_name.clone(),
+                expected.hash_device.display().to_string(),
+                expected.root_hash.to_hex(),
+            ],
+        ))
+        .map(|_| ())
+    }
+
     #[allow(clippy::too_many_lines)] // Ownership setup and launch observation are one atomic gate.
     fn start_owned(
         &mut self,
@@ -2725,6 +2824,12 @@ struct BlockDeviceBinding {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JailOwnership {
+    root: ObjectIdentity,
+    parent: ObjectIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SourceSnapshot {
     identity: ObjectIdentity,
     kind: WorkspaceNodeKind,
@@ -2880,12 +2985,206 @@ fn sort_workspace_paths(nodes: &HashMap<PathBuf, OwnedWorkspaceNode>) -> Vec<Pat
     paths
 }
 
+#[allow(clippy::too_many_lines)] // Descriptor-relative cleanup keeps identity checks adjacent to each unlink.
+fn remove_jail_tree(
+    root: &Path,
+    root_identity: ObjectIdentity,
+    parent_identity: ObjectIdentity,
+) -> Result<(), RuntimeError> {
+    #[allow(clippy::too_many_lines)] // Recursive descriptor cleanup revalidates each entry before removal.
+    fn remove_directory(
+        directory: &File,
+        root_device: u64,
+        depth: usize,
+        entries: &mut usize,
+    ) -> Result<(), RuntimeError> {
+        if depth > MAX_WORKSPACE_DEPTH {
+            return Err(workspace_error(format!(
+                "jailer root exceeds the maximum cleanup depth of {MAX_WORKSPACE_DEPTH}"
+            )));
+        }
+        let scan = File::from(
+            openat(
+                directory,
+                ".",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| RuntimeError::Io(error.to_string()))?,
+        );
+        let mut buffer = [MaybeUninit::uninit(); 8192];
+        let mut iterator = RawDir::new(&scan, &mut buffer);
+        while let Some(entry) = iterator.next() {
+            let entry = entry.map_err(|error| RuntimeError::Io(error.to_string()))?;
+            let bytes = entry.file_name().to_bytes();
+            if matches!(bytes, b"." | b"..") {
+                continue;
+            }
+            let name = OsStr::from_bytes(bytes);
+            *entries = entries
+                .checked_add(1)
+                .ok_or_else(|| workspace_error("jailer root cleanup entry count overflow"))?;
+            if *entries > MAX_WORKSPACE_ENTRIES {
+                return Err(workspace_error(format!(
+                    "jailer root exceeds the maximum cleanup entry count of {MAX_WORKSPACE_ENTRIES}"
+                )));
+            }
+            let child = File::from(
+                openat(
+                    &scan,
+                    name,
+                    OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+                .map_err(|error| RuntimeError::Io(error.to_string()))?,
+            );
+            let metadata = child.metadata().map_err(RuntimeError::from)?;
+            let identity = ObjectIdentity::from_metadata(&metadata);
+            if metadata.is_dir() {
+                if metadata.dev() != root_device {
+                    return Err(workspace_error(format!(
+                        "jailer root cleanup encountered a mounted descendant: {}",
+                        name.to_string_lossy()
+                    )));
+                }
+                let child_directory = File::from(
+                    openat(
+                        &scan,
+                        name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                        Mode::empty(),
+                    )
+                    .map_err(|error| RuntimeError::Io(error.to_string()))?,
+                );
+                let child_metadata = child_directory.metadata().map_err(RuntimeError::from)?;
+                if !child_metadata.is_dir()
+                    || ObjectIdentity::from_metadata(&child_metadata) != identity
+                {
+                    return Err(workspace_error(format!(
+                        "jailer root directory changed before recursive cleanup: {}",
+                        name.to_string_lossy()
+                    )));
+                }
+                remove_directory(&child_directory, root_device, depth + 1, entries)?;
+                let current = File::from(
+                    openat(
+                        &scan,
+                        name,
+                        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                        Mode::empty(),
+                    )
+                    .map_err(|error| RuntimeError::Io(error.to_string()))?,
+                );
+                let current_metadata = current.metadata().map_err(RuntimeError::from)?;
+                if !current_metadata.is_dir()
+                    || ObjectIdentity::from_metadata(&current_metadata) != identity
+                {
+                    return Err(workspace_error(format!(
+                        "jailer root directory changed before removal: {}",
+                        name.to_string_lossy()
+                    )));
+                }
+                unlinkat(&scan, name, AtFlags::REMOVEDIR)
+                    .map_err(|error| RuntimeError::Io(error.to_string()))?;
+            } else {
+                let current = File::from(
+                    openat(
+                        &scan,
+                        name,
+                        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                        Mode::empty(),
+                    )
+                    .map_err(|error| RuntimeError::Io(error.to_string()))?,
+                );
+                let current_metadata = current.metadata().map_err(RuntimeError::from)?;
+                if current_metadata.is_dir()
+                    || ObjectIdentity::from_metadata(&current_metadata) != identity
+                {
+                    return Err(workspace_error(format!(
+                        "jailer root entry changed before removal: {}",
+                        name.to_string_lossy()
+                    )));
+                }
+                unlinkat(&scan, name, AtFlags::empty())
+                    .map_err(|error| RuntimeError::Io(error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    let parent = root
+        .parent()
+        .ok_or_else(|| workspace_error("jailer root has no parent directory"))?;
+    let parent_file = File::from(
+        open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| RuntimeError::Io(error.to_string()))?,
+    );
+    let observed_parent = parent_file.metadata().map_err(RuntimeError::from)?;
+    if !observed_parent.is_dir()
+        || ObjectIdentity::from_metadata(&observed_parent) != parent_identity
+    {
+        return Err(workspace_error(format!(
+            "jailer root parent changed before cleanup: {}",
+            parent.display()
+        )));
+    }
+    let name = root
+        .file_name()
+        .ok_or_else(|| workspace_error("jailer root has no final component"))?;
+    let root_file = File::from(
+        openat(
+            &parent_file,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| RuntimeError::Io(error.to_string()))?,
+    );
+    let metadata = root_file.metadata().map_err(RuntimeError::from)?;
+    if !metadata.is_dir()
+        || metadata.dev() != observed_parent.dev()
+        || ObjectIdentity::from_metadata(&metadata) != root_identity
+    {
+        return Err(workspace_error(format!(
+            "jailer root was replaced or mounted before cleanup: {}",
+            root.display()
+        )));
+    }
+    let mut entries = 0;
+    remove_directory(&root_file, metadata.dev(), 0, &mut entries)?;
+    let current = File::from(
+        openat(
+            &parent_file,
+            name,
+            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| RuntimeError::Io(error.to_string()))?,
+    );
+    let current_metadata = current.metadata().map_err(RuntimeError::from)?;
+    if !current_metadata.is_dir()
+        || ObjectIdentity::from_metadata(&current_metadata) != root_identity
+    {
+        return Err(workspace_error(format!(
+            "jailer root changed during cleanup: {}",
+            root.display()
+        )));
+    }
+    unlinkat(&parent_file, name, AtFlags::REMOVEDIR)
+        .map_err(|error| RuntimeError::Io(error.to_string()))
+}
+
 /// Production filesystem adapter with symlink-safe recursive workspace copying.
 #[derive(Debug, Default)]
 pub struct RealFileSystem {
     owned_workspaces: HashMap<PathBuf, WorkspaceOwnership>,
     owned_workspace_images: HashMap<PathBuf, WorkspaceImageOwnership>,
     block_devices: HashMap<PathBuf, BlockDeviceBinding>,
+    owned_jails: HashMap<PathBuf, JailOwnership>,
 }
 
 struct CloneContext {
@@ -2937,6 +3236,36 @@ impl RealFileSystem {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn transfer_opened_ownership(
+        path: &Path,
+        flags: OFlags,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), RuntimeError> {
+        let descriptor = open(
+            path,
+            flags | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| RuntimeError::Io(error.to_string()))?;
+        let file = File::from(descriptor);
+        fchown(&file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+            .map_err(|error| RuntimeError::Io(error.to_string()))
+    }
+
+    fn workspace_image_path(workspace: &Path) -> Result<PathBuf, RuntimeError> {
+        let parent = workspace
+            .parent()
+            .ok_or_else(|| workspace_error("workspace clone has no parent directory"))?;
+        let name = workspace
+            .file_name()
+            .ok_or_else(|| workspace_error("workspace clone has no final component"))?;
+        Ok(parent.join(format!(
+            "{}{WORKSPACE_IMAGE_FILE_SUFFIX}",
+            name.to_string_lossy()
+        )))
     }
 
     fn prepare_clone(
@@ -3579,6 +3908,186 @@ impl FileSystem for RealFileSystem {
 
     fn digest(&mut self, path: &Path) -> Result<Sha256Digest, RuntimeError> {
         digest_bounded_regular_file(path, MAX_SNAPSHOT_FILE_BYTES)
+    }
+
+    fn register_jailer_root(&mut self, jail_root: &Path) -> Result<(), RuntimeError> {
+        let root_metadata = metadata_at(jail_root)?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(workspace_error(format!(
+                "jailer root is not a real directory: {}",
+                jail_root.display()
+            )));
+        }
+        let parent = jail_root.parent().ok_or_else(|| {
+            workspace_error("jailer root has no ownership-tracked parent directory")
+        })?;
+        let parent_metadata = metadata_at(parent)?;
+        if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+            return Err(workspace_error(format!(
+                "jailer root parent is not a real directory: {}",
+                parent.display()
+            )));
+        }
+        let ownership = JailOwnership {
+            root: ObjectIdentity::from_metadata(&root_metadata),
+            parent: ObjectIdentity::from_metadata(&parent_metadata),
+        };
+        if let Some(previous) = self.owned_jails.get(jail_root) {
+            if *previous != ownership {
+                return Err(workspace_error(format!(
+                    "jailer root ownership changed before launch: {}",
+                    jail_root.display()
+                )));
+            }
+        } else {
+            self.owned_jails.insert(jail_root.to_path_buf(), ownership);
+        }
+        Ok(())
+    }
+
+    fn prepare_jailer_resources(
+        &mut self,
+        workspace: &Path,
+        jailed_device: &Path,
+        jail_root: &Path,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), RuntimeError> {
+        if uid == 0 || gid == 0 {
+            return Err(RuntimeError::InvalidConfig(
+                "jailer resource owner must be a dedicated non-root identity".to_owned(),
+            ));
+        }
+        let jail_ownership = self.owned_jails.get(jail_root).copied().ok_or_else(|| {
+            workspace_error(format!(
+                "jailer resource preparation requires a registered jailer root: {}",
+                jail_root.display()
+            ))
+        })?;
+        let root_metadata = metadata_at(jail_root)?;
+        let parent = jail_root.parent().ok_or_else(|| {
+            workspace_error("jailer root has no ownership-tracked parent directory")
+        })?;
+        let parent_metadata = metadata_at(parent)?;
+        if root_metadata.file_type().is_symlink()
+            || !root_metadata.is_dir()
+            || ObjectIdentity::from_metadata(&root_metadata) != jail_ownership.root
+            || parent_metadata.file_type().is_symlink()
+            || !parent_metadata.is_dir()
+            || ObjectIdentity::from_metadata(&parent_metadata) != jail_ownership.parent
+        {
+            return Err(workspace_error(format!(
+                "jailer root or parent changed before resource preparation: {}",
+                jail_root.display()
+            )));
+        }
+        let ownership = self.owned_workspaces.get(workspace).ok_or_else(|| {
+            workspace_error(format!(
+                "jailer resource preparation requires an owned workspace: {}",
+                workspace.display()
+            ))
+        })?;
+        Self::validate_owned_tree(workspace, ownership)?;
+        let image = Self::workspace_image_path(workspace)?;
+        let image_ownership = self
+            .owned_workspace_images
+            .get(workspace)
+            .copied()
+            .ok_or_else(|| {
+                workspace_error(format!(
+                    "jailer resource preparation requires an owned workspace image: {}",
+                    image.display()
+                ))
+            })?;
+        let image_metadata = metadata_at(&image)?;
+        if image_metadata.file_type().is_symlink()
+            || !image_metadata.is_file()
+            || image_metadata.nlink() != 1
+            || ObjectIdentity::from_metadata(&image_metadata) != image_ownership.image
+        {
+            return Err(workspace_error(format!(
+                "workspace image was replaced before jailer ownership transfer: {}",
+                image.display()
+            )));
+        }
+        Self::transfer_opened_ownership(&image, OFlags::RDWR, uid, gid)?;
+
+        let binding = self
+            .block_devices
+            .get(jailed_device)
+            .copied()
+            .ok_or_else(|| {
+                workspace_error(format!(
+                    "jailer resource preparation requires an owned block-device bind: {}",
+                    jailed_device.display()
+                ))
+            })?;
+        if binding.state != BlockDeviceBindingState::Mounted {
+            return Err(workspace_error(format!(
+                "jailer resource block-device bind is not mounted: {}",
+                jailed_device.display()
+            )));
+        }
+        let device_metadata = fs::metadata(jailed_device).map_err(RuntimeError::from)?;
+        if !device_metadata.file_type().is_block_device()
+            || ObjectIdentity::from_metadata(&device_metadata) != binding.source
+        {
+            return Err(workspace_error(format!(
+                "jailed block-device bind changed before jailer ownership transfer: {}",
+                jailed_device.display()
+            )));
+        }
+        Self::transfer_opened_ownership(jailed_device, OFlags::RDONLY, uid, gid)
+    }
+
+    fn remove_jail(&mut self, jail_root: &Path) -> Result<(), RuntimeError> {
+        let Some(ownership) = self.owned_jails.get(jail_root).copied() else {
+            return match fs::symlink_metadata(jail_root) {
+                Ok(_) => Err(workspace_error(format!(
+                    "jailer root is not owned by this filesystem instance: {}",
+                    jail_root.display()
+                ))),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            };
+        };
+        match fs::symlink_metadata(jail_root) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || ObjectIdentity::from_metadata(&metadata) != ownership.root
+                {
+                    return Err(workspace_error(format!(
+                        "jailer root was replaced before cleanup: {}",
+                        jail_root.display()
+                    )));
+                }
+                remove_jail_tree(jail_root, ownership.root, ownership.parent)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let parent = jail_root
+            .parent()
+            .ok_or_else(|| workspace_error("jailer root has no parent directory"))?;
+        let parent_metadata = metadata_at(parent)?;
+        if parent_metadata.file_type().is_symlink()
+            || !parent_metadata.is_dir()
+            || ObjectIdentity::from_metadata(&parent_metadata) != ownership.parent
+        {
+            return Err(workspace_error(format!(
+                "jailer root parent was replaced before cleanup: {}",
+                parent.display()
+            )));
+        }
+        fs::remove_dir(parent).map_err(|error| {
+            RuntimeError::Io(format!(
+                "removing empty jailer instance directory {} failed: {error}",
+                parent.display()
+            ))
+        })?;
+        self.owned_jails.remove(jail_root);
+        Ok(())
     }
 
     fn bind_block_device(
@@ -4288,6 +4797,7 @@ pub enum RuntimeState {
 
 /// A live runtime process and its rollback resources.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // Cleanup flags independently record each owned resource.
 pub struct RuntimeInstance {
     state: RuntimeState,
     process: ProcessHandle,
@@ -4295,6 +4805,7 @@ pub struct RuntimeInstance {
     workspace: PathBuf,
     jail_root: PathBuf,
     workspace_removed: bool,
+    jail_removed: bool,
     mapper_name: String,
     verity_opened: bool,
     block_device_state: BlockDeviceState,
@@ -4368,6 +4879,7 @@ struct PendingCleanup {
     block_device: Option<(PathBuf, PathBuf)>,
     verity_opened: bool,
     workspace: Option<PathBuf>,
+    jail_root: Option<PathBuf>,
     mapper_name: String,
     veritysetup: PinnedArtifact,
 }
@@ -4379,6 +4891,7 @@ struct RollbackResources<'a> {
     block_device_bound: bool,
     workspace_cloned: bool,
     workspace: &'a Path,
+    jail_root: Option<&'a Path>,
     mapper_name: &'a str,
     veritysetup: &'a PinnedArtifact,
     jailed_device: &'a Path,
@@ -4390,6 +4903,7 @@ impl PendingCleanup {
             && self.block_device.is_none()
             && !self.verity_opened
             && self.workspace.is_none()
+            && self.jail_root.is_none()
     }
 }
 
@@ -4425,13 +4939,13 @@ where
             return;
         };
         let failures = self.cleanup_pending(&mut pending);
-        if pending.process.is_some() {
+        if !pending.is_complete() {
             let error = RuntimeError::Cleanup(if failures.is_empty() {
-                "owned process remained live after drop cleanup".to_owned()
+                "owned runtime resources remained after drop cleanup".to_owned()
             } else {
                 failures.join("; ")
             });
-            abort_cleanup("dropping a runtime with pending process cleanup", &error);
+            abort_cleanup("dropping a runtime with pending cleanup", &error);
         }
     }
 
@@ -4484,10 +4998,12 @@ where
     /// Returns a validation, artifact, adapter, API, or rollback error when any
     /// launch precondition or lifecycle step fails. When rollback also fails,
     /// [`Self::retry_pending_cleanup`] can retry the retained cleanup state.
+    #[allow(clippy::too_many_lines)] // Launch ordering and rollback ownership form one atomic gate.
     pub fn launch(&mut self, config: &RuntimeConfig) -> Result<RuntimeInstance, RuntimeError> {
         self.ensure_no_pending_cleanup()?;
         config.validate()?;
         self.verify_artifacts(config)?;
+        let jail_root = config.jail_root()?;
         let workspace = config.workspace.clone_path();
         if let Err(error) = self
             .filesystem
@@ -4499,6 +5015,7 @@ where
                 block_device_bound: false,
                 workspace_cloned: true,
                 workspace: &workspace,
+                jail_root: None,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
                 veritysetup: &config.veritysetup,
@@ -4512,6 +5029,7 @@ where
                 block_device_bound: false,
                 workspace_cloned: true,
                 workspace: &workspace,
+                jail_root: None,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
                 veritysetup: &config.veritysetup,
@@ -4522,14 +5040,24 @@ where
         let mut verity_opened = false;
         let mut block_device_bound = false;
         let mut process = None;
+        let mut jail_root_prepared = false;
 
         let result = (|| {
+            self.filesystem.register_jailer_root(&jail_root)?;
+            jail_root_prepared = true;
             self.open_verity_mapping(config)?;
             verity_opened = true;
             self.verify_open_verity(config)?;
             self.bind_verity_device(config)?;
             block_device_bound = true;
             self.verify_verity_binding(config)?;
+            self.filesystem.prepare_jailer_resources(
+                &workspace,
+                &config.dm_verity.jailed_device_path,
+                &jail_root,
+                config.jailer_config.uid,
+                config.jailer_config.gid,
+            )?;
             let handle = self.start_jailer(config)?;
             process = Some(handle);
             self.command_runner.verify_running(handle)?;
@@ -4547,6 +5075,7 @@ where
                 workspace: workspace.clone(),
                 jail_root: config.jail_root()?,
                 workspace_removed: false,
+                jail_removed: false,
                 mapper_name: config.dm_verity.mapper_name.clone(),
                 verity_opened: true,
                 block_device_state: BlockDeviceState::Bound,
@@ -4566,6 +5095,7 @@ where
                     block_device_bound,
                     workspace_cloned,
                     workspace: &workspace,
+                    jail_root: jail_root_prepared.then_some(jail_root.as_path()),
                     mapper_name: &config.dm_verity.mapper_name,
                     jailed_device: &config.dm_verity.jailed_device_path,
                     veritysetup: &config.veritysetup,
@@ -4695,6 +5225,7 @@ where
         let snapshot_jail_path = config.jail_path("snapshot path", &snapshot.snapshot_path)?;
         let memory_jail_path = config.jail_path("snapshot memory path", &snapshot.memory_path)?;
         self.verify_artifacts(config)?;
+        let jail_root = config.jail_root()?;
         let workspace = config.workspace.clone_path();
         if let Err(error) = self
             .filesystem
@@ -4706,6 +5237,7 @@ where
                 block_device_bound: false,
                 workspace_cloned: true,
                 workspace: &workspace,
+                jail_root: None,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
                 veritysetup: &config.veritysetup,
@@ -4719,6 +5251,7 @@ where
                 block_device_bound: false,
                 workspace_cloned: true,
                 workspace: &workspace,
+                jail_root: None,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
                 veritysetup: &config.veritysetup,
@@ -4729,13 +5262,23 @@ where
         let mut verity_opened = false;
         let mut block_device_bound = false;
         let mut process = None;
+        let mut jail_root_prepared = false;
         let result = (|| {
+            self.filesystem.register_jailer_root(&jail_root)?;
+            jail_root_prepared = true;
             self.open_verity_mapping(config)?;
             verity_opened = true;
             self.verify_open_verity(config)?;
             self.bind_verity_device(config)?;
             block_device_bound = true;
             self.verify_verity_binding(config)?;
+            self.filesystem.prepare_jailer_resources(
+                &workspace,
+                &config.dm_verity.jailed_device_path,
+                &jail_root,
+                config.jailer_config.uid,
+                config.jailer_config.gid,
+            )?;
             let handle = self.start_jailer(config)?;
             process = Some(handle);
             self.command_runner.verify_running(handle)?;
@@ -4761,6 +5304,7 @@ where
                 workspace: workspace.clone(),
                 jail_root: config.jail_root()?,
                 workspace_removed: false,
+                jail_removed: false,
                 mapper_name: config.dm_verity.mapper_name.clone(),
                 verity_opened: true,
                 block_device_state: BlockDeviceState::Bound,
@@ -4780,6 +5324,7 @@ where
                     block_device_bound,
                     workspace_cloned,
                     workspace: &workspace,
+                    jail_root: jail_root_prepared.then_some(jail_root.as_path()),
                     mapper_name: &config.dm_verity.mapper_name,
                     jailed_device: &config.dm_verity.jailed_device_path,
                     veritysetup: &config.veritysetup,
@@ -4819,6 +5364,7 @@ where
         self.restore_with_identities(config, snapshot, identities)
     }
 
+    #[allow(clippy::too_many_lines)] // Restore sequencing and rollback ownership form one gate.
     fn restore_with_allocated_identities(
         &mut self,
         config: &RuntimeConfig,
@@ -4834,6 +5380,7 @@ where
         let snapshot_jail_path = config.jail_path("snapshot path", &snapshot.snapshot_path)?;
         let memory_jail_path = config.jail_path("snapshot memory path", &snapshot.memory_path)?;
         self.verify_artifacts(config)?;
+        let jail_root = config.jail_root()?;
         let workspace = config.workspace.clone_path();
         if let Err(error) = self
             .filesystem
@@ -4845,6 +5392,7 @@ where
                 block_device_bound: false,
                 workspace_cloned: true,
                 workspace: &workspace,
+                jail_root: None,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
                 veritysetup: &config.veritysetup,
@@ -4858,6 +5406,7 @@ where
                 block_device_bound: false,
                 workspace_cloned: true,
                 workspace: &workspace,
+                jail_root: None,
                 mapper_name: &config.dm_verity.mapper_name,
                 jailed_device: &config.dm_verity.jailed_device_path,
                 veritysetup: &config.veritysetup,
@@ -4868,13 +5417,23 @@ where
         let mut verity_opened = false;
         let mut block_device_bound = false;
         let mut process = None;
+        let mut jail_root_prepared = false;
         let result = (|| {
+            self.filesystem.register_jailer_root(&jail_root)?;
+            jail_root_prepared = true;
             self.open_verity_mapping(config)?;
             verity_opened = true;
             self.verify_open_verity(config)?;
             self.bind_verity_device(config)?;
             block_device_bound = true;
             self.verify_verity_binding(config)?;
+            self.filesystem.prepare_jailer_resources(
+                &workspace,
+                &config.dm_verity.jailed_device_path,
+                &jail_root,
+                config.jailer_config.uid,
+                config.jailer_config.gid,
+            )?;
             let handle = self.start_jailer(config)?;
             process = Some(handle);
             self.command_runner.verify_running(handle)?;
@@ -4898,6 +5457,7 @@ where
                 workspace: workspace.clone(),
                 jail_root: config.jail_root()?,
                 workspace_removed: false,
+                jail_removed: false,
                 mapper_name: config.dm_verity.mapper_name.clone(),
                 verity_opened: true,
                 block_device_state: BlockDeviceState::Bound,
@@ -4917,6 +5477,7 @@ where
                     block_device_bound,
                     workspace_cloned,
                     workspace: &workspace,
+                    jail_root: jail_root_prepared.then_some(jail_root.as_path()),
                     mapper_name: &config.dm_verity.mapper_name,
                     jailed_device: &config.dm_verity.jailed_device_path,
                     veritysetup: &config.veritysetup,
@@ -5193,6 +5754,16 @@ where
                 Err(error) => failures.push(error.to_string()),
             }
         }
+        if instance.process_stopped
+            && !instance.verity_opened
+            && instance.workspace_removed
+            && !instance.jail_removed
+        {
+            match self.filesystem.remove_jail(&instance.jail_root) {
+                Ok(()) => instance.jail_removed = true,
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
         if failures.is_empty() {
             instance.state = RuntimeState::Stopped;
             Ok(())
@@ -5295,18 +5866,8 @@ where
     }
 
     fn open_verity_mapping(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
-        let command = CommandSpec::pinned(
-            &config.veritysetup,
-            [
-                "open".to_owned(),
-                "--readonly".to_owned(),
-                config.dm_verity.data_device.display().to_string(),
-                config.dm_verity.mapper_name.clone(),
-                config.dm_verity.hash_device.display().to_string(),
-                config.dm_verity.root_hash.to_hex(),
-            ],
-        );
-        self.command_runner.run(&command).map(|_| ())
+        self.command_runner
+            .open_verity(&config.veritysetup, &config.dm_verity)
     }
 
     fn verify_open_verity(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
@@ -5545,6 +6106,7 @@ where
             workspace: resources
                 .workspace_cloned
                 .then(|| resources.workspace.to_path_buf()),
+            jail_root: resources.jail_root.map(Path::to_path_buf),
             mapper_name: resources.mapper_name.to_owned(),
             veritysetup: resources.veritysetup.clone(),
         };
@@ -5577,6 +6139,12 @@ where
         if let Some(workspace) = pending.workspace.as_deref() {
             match self.filesystem.remove_workspace(workspace) {
                 Ok(()) => pending.workspace = None,
+                Err(error) => return vec![error.to_string()],
+            }
+        }
+        if let Some(jail_root) = pending.jail_root.as_deref() {
+            match self.filesystem.remove_jail(jail_root) {
+                Ok(()) => pending.jail_root = None,
                 Err(error) => return vec![error.to_string()],
             }
         }
@@ -6133,6 +6701,34 @@ mod tests {
     }
 
     #[test]
+    fn jail_cleanup_unlinks_symlink_without_following_external_target() {
+        let directory = unique_test_path("jail-cleanup-symlink");
+        let parent = directory.join("instance");
+        let root = parent.join("root");
+        let external = directory.join("external");
+        fs::create_dir_all(&root).expect("jail cleanup root");
+        fs::create_dir(&external).expect("external target");
+        fs::write(external.join("sentinel"), b"must survive").expect("external sentinel");
+        std::os::unix::fs::symlink(&external, root.join("escape")).expect("jail symlink fixture");
+
+        let root_identity = ObjectIdentity::from_metadata(
+            &fs::metadata(&root).expect("root metadata must resolve"),
+        );
+        let parent_identity = ObjectIdentity::from_metadata(
+            &fs::metadata(&parent).expect("parent metadata must resolve"),
+        );
+        remove_jail_tree(&root, root_identity, parent_identity)
+            .expect("owned jail cleanup must remove the root");
+
+        assert!(!root.exists());
+        assert!(external.join("sentinel").exists());
+        fs::remove_file(external.join("sentinel")).expect("external sentinel cleanup");
+        fs::remove_dir(external).expect("external target cleanup");
+        fs::remove_dir(parent).expect("instance parent cleanup");
+        fs::remove_dir(directory).expect("fixture cleanup");
+    }
+
+    #[test]
     fn cgroup_parent_components_accept_the_standard_systemd_hierarchy() {
         for accepted in [
             "user.slice",
@@ -6424,11 +7020,44 @@ mod tests {
     #[derive(Default)]
     struct LifecycleFileSystem {
         events: Rc<RefCell<Vec<String>>>,
+        fail_prepare: bool,
     }
 
     impl FileSystem for LifecycleFileSystem {
         fn read(&mut self, _path: &Path) -> Result<Vec<u8>, RuntimeError> {
             Ok(b"artifact".to_vec())
+        }
+
+        fn register_jailer_root(&mut self, jail_root: &Path) -> Result<(), RuntimeError> {
+            self.events
+                .borrow_mut()
+                .push(format!("register-jail:{}", jail_root.display()));
+            Ok(())
+        }
+
+        fn prepare_jailer_resources(
+            &mut self,
+            _workspace: &Path,
+            _jailed_device: &Path,
+            _jail_root: &Path,
+            _uid: u32,
+            _gid: u32,
+        ) -> Result<(), RuntimeError> {
+            self.events.borrow_mut().push("prepare-jail".to_owned());
+            if self.fail_prepare {
+                Err(RuntimeError::Io(
+                    "injected jailer resource preparation failure".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn remove_jail(&mut self, jail_root: &Path) -> Result<(), RuntimeError> {
+            self.events
+                .borrow_mut()
+                .push(format!("remove-jail:{}", jail_root.display()));
+            Ok(())
         }
 
         fn bind_block_device(
@@ -6680,6 +7309,7 @@ mod tests {
                 },
                 LifecycleFileSystem {
                     events: Rc::clone(&events),
+                    fail_prepare: false,
                 },
                 LifecycleApi {
                     label: "firecracker",
@@ -6697,6 +7327,37 @@ mod tests {
             ),
             events,
         )
+    }
+
+    #[test]
+    fn jail_resource_preparation_failure_rolls_back_registered_root() {
+        let config = test_config();
+        let (mut runtime, events) = lifecycle_runtime([], []);
+        runtime.filesystem.fail_prepare = true;
+
+        let error = runtime
+            .launch(&config)
+            .expect_err("injected jailer resource failure must reject launch");
+        assert!(matches!(
+            error,
+            RuntimeError::Io(message) if message.contains("injected jailer resource preparation failure")
+        ));
+        assert!(!runtime.has_pending_cleanup());
+
+        let events = events.borrow();
+        let registered = events
+            .iter()
+            .position(|event| event.starts_with("register-jail:"))
+            .expect("launch must register the jail root before resource preparation");
+        let prepared = events
+            .iter()
+            .position(|event| event == "prepare-jail")
+            .expect("launch must reach the injected preparation failure");
+        let removed = events
+            .iter()
+            .position(|event| event.starts_with("remove-jail:"))
+            .expect("failed preparation must remove the registered jail root");
+        assert!(registered < prepared && prepared < removed);
     }
 
     fn test_snapshot(config: &RuntimeConfig) -> Snapshot {
@@ -7669,6 +8330,7 @@ mod tests {
             block_device_bound: false,
             workspace_cloned: true,
             workspace: Path::new("/workspace/session"),
+            jail_root: None,
             mapper_name: "session-root",
             jailed_device: Path::new("/jail/dev/rootfs"),
             veritysetup: &veritysetup,
@@ -7704,6 +8366,7 @@ mod tests {
             block_device_bound: false,
             workspace_cloned: true,
             workspace: Path::new("/workspace/session"),
+            jail_root: None,
             mapper_name: "session-root",
             jailed_device: Path::new("/jail/dev/rootfs"),
             veritysetup: &veritysetup,
@@ -8122,6 +8785,7 @@ mod tests {
                 block_device: None,
                 verity_opened: true,
                 workspace: Some(PathBuf::from("/workspace/session")),
+                jail_root: None,
                 mapper_name: "session-root".to_owned(),
                 veritysetup: test_artifact("/usr/sbin/veritysetup"),
             });

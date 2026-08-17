@@ -61,18 +61,22 @@ fi
 
 cgroup_empty() {
     local cgroup_path="$1"
-    local procs populated key value remainder
+    local procs populated key value remainder seen_populated
     [[ -d "${cgroup_path}" && ! -L "${cgroup_path}" ]] || return 1
     [[ -r "${cgroup_path}/cgroup.procs" && -r "${cgroup_path}/cgroup.events" ]] || return 1
     procs="$(< "${cgroup_path}/cgroup.procs")"
     [[ -z "${procs//[[:space:]]/}" ]] || return 1
     populated=""
+    seen_populated=0
     while read -r key value remainder; do
+        [[ -n "${key}" && -n "${value}" && -z "${remainder}" ]] || return 1
         if [[ "${key}" == populated ]]; then
+            [[ "${seen_populated}" == 0 && ("${value}" == 0 || "${value}" == 1) ]] || return 1
             populated="${value}"
+            seen_populated=1
         fi
     done < "${cgroup_path}/cgroup.events"
-    [[ "${populated}" == 0 ]]
+    [[ "${seen_populated}" == 1 && "${populated}" == 0 ]]
 }
 
 cleanup_test_cgroup() {

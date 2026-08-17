@@ -63,6 +63,12 @@ fn require_fuse_or_skip() -> bool {
     false
 }
 
+fn unmount_session(session: BackgroundSession) {
+    session
+        .umount_and_join()
+        .expect("FUSE test mount must unmount and its worker must stop");
+}
+
 fn mount_directory_view() -> MountedDirectoryView {
     let backing = tempdir().expect("temporary backing directory must be creatable");
     let mountpoint = tempdir().expect("temporary mountpoint must be creatable");
@@ -231,7 +237,7 @@ fn mounted_read_only_view_denies_read_after_revoke() {
     );
 
     drop(file);
-    drop(session);
+    unmount_session(session);
 }
 
 // Requirement: O_TRUNC, WRITE, and SETATTR(size) must all stay behind their
@@ -336,7 +342,7 @@ fn mounted_view_denies_write_after_revoke() {
     );
 
     drop(file);
-    drop(session);
+    unmount_session(session);
 }
 
 // Requirement: a real FUSE write that races with revoke is either linearized
@@ -490,7 +496,7 @@ fn mounted_view_linearizes_backing_mutation_against_revoke() {
         "no backing mutation may occur after the revoke linearization point"
     );
 
-    drop(session);
+    unmount_session(session);
 }
 
 // Requirement: FUSE CREATE and MKDIR publish the shared namespace only after
@@ -600,7 +606,8 @@ fn mounted_view_creates_files_and_directories_with_capability_effects() {
     );
     assert!(!backing.path().join("scoped/revoked-dir").exists());
 
-    drop(session);
+    drop(scoped_directory);
+    unmount_session(session);
 }
 
 // Requirement: FUSE UNLINK, RMDIR, and no-replace RENAME reach the same
@@ -708,7 +715,8 @@ fn mounted_view_removes_and_renames_only_with_live_effects() {
     );
     assert!(scoped_backing.join("revoked.txt").is_file());
 
-    drop(session);
+    drop(scoped_directory);
+    unmount_session(session);
 }
 
 // Requirement: FUSE SETATTR(mode) requires SetMetadata even on an existing
@@ -818,7 +826,7 @@ fn mounted_view_authorizes_metadata_changes_and_rechecks_after_revoke() {
     );
 
     drop(file);
-    drop(session);
+    unmount_session(session);
 }
 
 // Requirement: READDIR requires ListDirectory and returns direct visible
@@ -848,7 +856,7 @@ fn mounted_directory_view_lists_only_its_authorized_prefix() {
         .collect::<Vec<_>>();
     assert_eq!(names, ["alpha.txt", "zeta.txt"]);
 
-    drop(session);
+    unmount_session(session);
 }
 
 // Requirement: an existing directory stream reauthorizes each kernel READDIR
@@ -888,7 +896,7 @@ fn mounted_directory_stream_denies_readdir_after_revoke() {
         );
     }
     drop(directory);
-    drop(session);
+    unmount_session(session);
 }
 
 // Requirement: a directory stream reports EAGAIN after a namespace mutation,
@@ -937,7 +945,7 @@ fn mounted_directory_stream_requires_restart_after_namespace_mutation() {
         );
     }
     drop(directory);
-    drop(session);
+    unmount_session(session);
 }
 
 // Requirement: closing a subject revokes every capability it holds, so it must
@@ -1034,7 +1042,7 @@ fn mounted_view_denies_cached_read_after_subject_close() {
     );
 
     drop(file);
-    drop(session);
+    unmount_session(session);
 }
 
 // Requirement: the capability kernel keeps registered observers for its own
@@ -1070,7 +1078,7 @@ fn revoke_after_unmount_reports_no_propagation_failure() {
         .revoke_held_by(&subject, &first_capability)
         .expect("revoking while the mount is live must propagate");
 
-    drop(session);
+    unmount_session(session);
 
     // The observer is still registered, but its mount is gone.
     kernel
@@ -1176,7 +1184,7 @@ fn cached_read_handle_observes_writes_made_through_a_direct_handle() {
     );
 
     drop(reader);
-    drop(session);
+    unmount_session(session);
 }
 
 /// A mounted view with one capability over `prefix` carrying exactly `effects`.
@@ -1260,6 +1268,88 @@ fn mount_with_effects(
     }
 }
 
+// Requirement: the production guest probe's complete filesystem sequence must be accepted by one
+// real FUSE mount when, and only when, the subject owns every corresponding effect. Keeping this
+// sequence here makes a guest failure attributable to CapFS rather than merely observing that the
+// later Broker request never arrived. Category: FUSE/all-effects. Risk: critical.
+#[test]
+fn mounted_view_executes_the_complete_guest_effect_sequence() {
+    if !require_fuse_or_skip() {
+        return;
+    }
+
+    let mount = mount_with_effects(
+        "fuse-all-effects",
+        &[],
+        &[
+            FileEffect::ReadData,
+            FileEffect::ListDirectory,
+            FileEffect::WriteData,
+            FileEffect::Truncate,
+            FileEffect::CreateFile,
+            FileEffect::CreateDirectory,
+            FileEffect::RemoveFile,
+            FileEffect::RemoveDirectory,
+            FileEffect::Rename,
+            FileEffect::SetMetadata,
+            FileEffect::ReadLink,
+            FileEffect::CreateSymlink,
+            FileEffect::CreateHardLink,
+        ],
+        |_| {},
+    );
+    let root = mount.mountpoint.path();
+    fs::read_dir(root)
+        .expect("the authorized root must be listable")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("every authorized root entry must be readable");
+
+    let directory = root.join(".capfs-vm-effect-probe");
+    let created = directory.join("created.txt");
+    let hard_link = directory.join("hard-link.txt");
+    let renamed = directory.join("renamed-hard-link.txt");
+    let symbolic_link = directory.join("symbolic-link.txt");
+    fs::create_dir(&directory).expect("CreateDirectory must create the probe directory");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&created)
+        .expect("CreateFile must create the probe file");
+    file.write_all(b"capfs-vm-all-effects")
+        .expect("WriteData must write probe data");
+    drop(file);
+    fs::set_permissions(&created, fs::Permissions::from_mode(0o600))
+        .expect("SetMetadata must change probe permissions");
+    fs::hard_link(&created, &hard_link).expect("CreateHardLink must create a probe alias");
+    std::os::unix::fs::symlink("created.txt", &symbolic_link)
+        .expect("CreateSymlink must create the probe symlink");
+    assert_eq!(
+        fs::read_link(&symbolic_link).expect("ReadLink must return the probe target"),
+        Path::new("created.txt")
+    );
+    fs::rename(&hard_link, &renamed).expect("Rename must move the probe alias");
+    OpenOptions::new()
+        .write(true)
+        .open(&created)
+        .and_then(|file| file.set_len(0))
+        .expect("Truncate must empty the probe file");
+    OpenOptions::new()
+        .write(true)
+        .open(&created)
+        .and_then(|mut file| file.write_all(b"rewritten"))
+        .expect("WriteData must rewrite the probe file");
+    assert_eq!(
+        fs::read(&created).expect("ReadData must return rewritten probe data"),
+        b"rewritten"
+    );
+    fs::remove_file(&symbolic_link).expect("RemoveFile must remove the probe symlink");
+    fs::remove_file(&renamed).expect("RemoveFile must remove the probe alias");
+    fs::remove_file(&created).expect("RemoveFile must remove the probe file");
+    fs::remove_dir(&directory).expect("RemoveDirectory must remove the probe directory");
+
+    unmount_session(mount.session);
+}
+
 // Requirement: a symbolic link is created, read back, and followed through the
 // mount, and following it is authorized on the path it resolves to rather than
 // on the link's own path. Category: FUSE/links. Risk: critical.
@@ -1329,7 +1419,7 @@ fn mounted_view_creates_reads_and_follows_symlinks_inside_its_range() {
         b"hidden contents"
     );
 
-    drop(mount.session);
+    unmount_session(mount.session);
 }
 
 // Requirement: a link body that the mount cannot prove stays inside the
@@ -1383,7 +1473,7 @@ fn mounted_view_refuses_symlink_targets_that_leave_the_repository() {
     assert!(!mount.backing.path().join("scoped/escape").exists());
     assert!(!mount.backing.path().join("scoped/interior").exists());
 
-    drop(mount.session);
+    unmount_session(mount.session);
 }
 
 // Requirement: a mounted object remains bound to its imported backing inode;
@@ -1451,7 +1541,7 @@ fn mounted_view_rejects_backing_replacement_and_symlink_substitution() {
         b"secret"
     );
 
-    drop(mount.session);
+    unmount_session(mount.session);
 }
 
 // Requirement: bounded deep symlink resolution may succeed when contained,
@@ -1503,7 +1593,7 @@ fn mounted_view_handles_deep_symlink_chains_and_cycles() {
         "a symlink cycle must report ELOOP, got {cycle:?}"
     );
 
-    drop(mount.session);
+    unmount_session(mount.session);
 }
 
 // Requirement: a real nested FUSE mount inside the backing tree is rejected by
@@ -1583,7 +1673,7 @@ fn mounted_view_rejects_a_real_nested_mount_during_preflight() {
             if path == CanonicalPath::new(["nested"]).expect("test path must be canonical")
     ));
 
-    drop(session);
+    unmount_session(session);
 }
 
 // Requirement: SYMLINK and READLINK each require their own effect. Category:
@@ -1630,7 +1720,7 @@ fn mounted_view_gates_symlink_creation_and_reading_on_their_own_effects() {
         fs::read_link(scoped.join("existing.txt")).expect("ReadLink must still authorize READLINK"),
         Path::new("target.txt")
     );
-    drop(without_create.session);
+    unmount_session(without_create.session);
 
     let without_readlink = mount_with_effects(
         "fuse-symlink-noread",
@@ -1650,7 +1740,7 @@ fn mounted_view_gates_symlink_creation_and_reading_on_their_own_effects() {
         io::ErrorKind::PermissionDenied,
         "unexpected error reading a link without its effect: {denied:?}"
     );
-    drop(without_readlink.session);
+    unmount_session(without_readlink.session);
 }
 
 // Requirement: a hard link needs CreateHardLink on the new name and on every
@@ -1710,7 +1800,7 @@ fn mounted_view_creates_hard_links_only_within_its_authorized_range() {
     );
     assert!(!mount.backing.path().join("smuggled.txt").exists());
 
-    drop(mount.session);
+    unmount_session(mount.session);
 }
 
 // Requirement: authority over a hard-linked inode is the intersection of the
@@ -1770,7 +1860,7 @@ fn mounted_view_denies_an_inode_whose_other_name_is_out_of_range() {
         "an inode with an out-of-range name must not be advertised: {listed:?}"
     );
 
-    drop(mount.session);
+    unmount_session(mount.session);
 }
 
 // Requirement: object kinds outside the modelled universe are refused as policy
@@ -1808,5 +1898,6 @@ fn mounted_view_refuses_device_and_fifo_creation_with_eperm() {
     );
     assert!(!mount.backing.path().join("scoped/pipe").exists());
 
-    drop(mount.session);
+    drop(scoped);
+    unmount_session(mount.session);
 }

@@ -428,7 +428,12 @@ where
         let request_id = envelope.request();
         let response_cap = self.operation_response_cap(request.operation());
         let had_retained_outcome = self.outcomes.contains_key(&request_id);
-        let acceptance = self.admit(envelope, response_cap, had_retained_outcome)?;
+        let acceptance = self.admit(
+            envelope,
+            request.canonical_payload(),
+            response_cap,
+            had_retained_outcome,
+        )?;
         if acceptance == EnvelopeAcceptance::New && self.durable.is_some() {
             self.outcomes
                 .insert(request_id, CachedOutcome::AcceptedPending { response_cap });
@@ -511,6 +516,7 @@ where
     fn admit(
         &mut self,
         envelope: egress_protocol::session::BrokerEnvelope,
+        canonical_payload: &[u8],
         response_cap: u64,
         had_retained_outcome: bool,
     ) -> Result<EnvelopeAcceptance, DispatchError> {
@@ -555,7 +561,7 @@ where
             self.sealed = true;
             return Err(DispatchError::DurableUnavailable);
         };
-        match replay.accept(envelope) {
+        match replay.accept_payload(envelope, canonical_payload) {
             Ok(acceptance) => Ok(acceptance),
             Err(error) => {
                 if !had_retained_outcome {

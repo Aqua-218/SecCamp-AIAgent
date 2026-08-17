@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     capability::AuthorityBody,
-    file::{FileEffect, FileEffects},
+    file::FileEffects,
     github::{BranchPattern, GitHubOperation, GitHubOperations},
     http::{HttpFetchMethod, HttpFetchMethods, UrlPathPattern},
     path::PathPattern,
@@ -128,27 +128,11 @@ fn encode_authority(canonical: &mut CanonicalPolicy, authority: &AuthorityBody) 
 }
 
 fn file_effect_bits(effects: FileEffects) -> u16 {
-    const EFFECTS: [FileEffect; 13] = [
-        FileEffect::ReadData,
-        FileEffect::ListDirectory,
-        FileEffect::WriteData,
-        FileEffect::Truncate,
-        FileEffect::CreateFile,
-        FileEffect::CreateDirectory,
-        FileEffect::RemoveFile,
-        FileEffect::RemoveDirectory,
-        FileEffect::Rename,
-        FileEffect::SetMetadata,
-        FileEffect::ReadLink,
-        FileEffect::CreateSymlink,
-        FileEffect::CreateHardLink,
-    ];
-    EFFECTS
+    crate::file::FileEffect::ALL
         .iter()
-        .enumerate()
-        .fold(0_u16, |bits, (index, effect)| {
+        .fold(0_u16, |bits, effect| {
             bits | if effects.contains(*effect) {
-                1_u16 << index
+                1_u16 << effect.tag()
             } else {
                 0
             }
@@ -231,6 +215,8 @@ impl CanonicalPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::AuthorityPolicyDigest;
     use crate::{
         capability::AuthorityBody,
@@ -291,5 +277,18 @@ mod tests {
             baseline,
             AuthorityPolicyDigest::for_root(validity(), &read, true)
         );
+    }
+
+    #[test]
+    fn every_file_effect_has_a_distinct_policy_digest() {
+        let digests = FileEffect::ALL.map(|effect| {
+            AuthorityPolicyDigest::for_root(
+                validity(),
+                &authority(FileEffects::only(effect)),
+                false,
+            )
+        });
+        let unique = digests.into_iter().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), FileEffect::ALL.len());
     }
 }

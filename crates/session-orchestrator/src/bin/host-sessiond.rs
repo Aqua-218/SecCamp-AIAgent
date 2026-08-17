@@ -102,7 +102,11 @@ fn run() -> Result<(), String> {
         config.snapshot_id,
         config.runtime.clone(),
         GuestArtifactTemplate::new(config.kernel_source, config.seccomp_source),
-        SnapshotTemplate::new(config.snapshot_state, config.snapshot_memory),
+        SnapshotTemplate::new(
+            config.snapshot_state,
+            config.snapshot_memory,
+            config.grant.policy_digest(),
+        ),
     );
     let egress = SystemEgressFactory::new(config.github_egress);
     let mut runtime =
@@ -1187,7 +1191,7 @@ fn usage() -> &'static str {
   [--github-installation ID --github-credential-handle INTEGER --github-operations CANONICAL-LIST \\
    --github-base-branch-pattern exact:BRANCH|prefix:BRANCH \\
   --github-head-branch-pattern exact:BRANCH|prefix:BRANCH \\
-  --github-publish-plans PATH]\n\nThe stop file must be absent at startup. SIGTERM and SIGINT, or the stop file, request a dependency-ordered shutdown. Cleanup retries only until --shutdown-timeout-millis; a timeout exits non-zero and leaves the durable recovery records for the next start. Readiness and lifecycle records are JSON lines on stdout and, when --status-file is set, in an owner-readable status file. They contain opaque lifecycle IDs only; credentials, authority bodies, paths, and backend error text are never written to the status record. Select exactly one egress profile: `none` issues no external authority, `public` issues a host/path/method-limited HTTPS authority, and `github` issues a typed GitHub authority. A GitHub `publish-branch` authority also requires an owner-readable `--github-publish-plans` manifest; `create-pull-request` alone does not. GitHub tokens are read only from EGRESS_GITHUB_TOKEN."
+  --github-publish-plans PATH]\n\nThe stop file must be absent at startup. SIGTERM and SIGINT, or the stop file, request a dependency-ordered shutdown. Cleanup retries only until --shutdown-timeout-millis; a timeout exits non-zero and leaves the durable recovery records for the next start. Readiness and lifecycle records are JSON lines on stdout and, when --status-file is set, in an owner-readable status file. They contain opaque lifecycle IDs only; credentials, authority bodies, paths, and backend error text are never written to the status record. Select exactly one egress profile: `none` issues no external authority, `public` issues a host/path/method-limited HTTPS authority, and `github` issues a typed GitHub authority. A GitHub `publish-branch` authority also requires an owner-readable `--github-publish-plans` manifest; `create-pull-request` alone does not. GitHub tokens are read from the systemd credential `github-token` when available, with EGRESS_GITHUB_TOKEN retained as the explicit non-systemd fallback."
 }
 
 #[cfg(test)]

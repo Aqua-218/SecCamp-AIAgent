@@ -6,7 +6,7 @@
 
 > **対象読者:** listener を組み込む実装者、guest への情報流出をレビューする人
 
-[`server.rs`](../../crates/egress-broker/src/server.rs) は accept した 1 本の `AF_VSOCK` stream を、`max_requests` 回の request / response 往復として処理する。dispatch そのものは [dispatch.rs](dispatch.md) が持つ。
+[`server.rs`](../../crates/egress-broker/src/server.rs) は accept した 1 本の `AF_VSOCK` stream（または Firecracker が転送した host Unix stream）を、`max_requests` 回の request / response 往復として処理する。dispatch そのものは [dispatch.rs](dispatch.md) が持つ。
 
 ## peer CID を kernel から取る
 
@@ -99,7 +99,7 @@ connection 単位の責務が 1 関数に収まっている。何回読むか、
 - direct kernel `AF_VSOCK` の bind / accept は未検証。module test は in-memory の stream を使うが、repository の opt-in KVM test は Firecracker が転送する Unix stream を使い、実 `BrokerDispatcher` の 1 request / 1 canonical rejection を確認する。
 - peer CID の照合は `accept_peer` が返す値に依存する。kernel から正しく取れることは、この crate では確認していない。
 - `ConnectionReport` は `requests_served` と `accounting_invariant_closed` を返すが、これを使った運用側の処理は無い。
-- timeout も idle 検出も無い。`max_requests` 回読み切るか、失敗するまで connection は開いたまま。
+- `serve_connection_with_policy` / `serve_expected_peer_with_policy` は per-read/per-write と absolute connection deadline を `DeadlineStream` に適用し、期限到達時は typed error で fail closed する。generic `serve_connection` は互換の plain path であり timeout を主張しない。現行 `session-orchestrator::BuiltBrokerRuntime` は plain path を使うため、production Firecracker UDS の absolute connection deadline wiring は未完了である。
 - `serve_connection` は caller / capability の identity と clock を別々に受け取り、request ごとに `DispatchContext` を作り直す。clock の実装が実時刻を返すことは、この crate では検証していない。
 
 ## 変更時の確認点
@@ -110,6 +110,7 @@ connection 単位の責務が 1 関数に収まっている。何回読むか、
 - `max_requests` を `usize` に変えない。0 を表現できることが型として問題になる。
 - `AccountingInvariant` と `CommittedButUnrecorded` で閉じる挙動を外さない。前者は壊れた会計のまま session が続き、後者は未突合の外部副作用を抱えたまま取引が続く。
 - clock を identity に畳み込まない。1 connection で 1 つの時刻を使い回すと、有効期間の切れた capability が認可を通り続ける。
+- production socket owner を追加するときは `DeadlineStream` + `serve_connection_with_policy` を選び、plain `serve_connection` に戻さない。期限到達や socket shutdown 後の stream を再利用しない。
 
 ## 関連
 

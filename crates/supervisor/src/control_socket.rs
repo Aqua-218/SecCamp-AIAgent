@@ -19,6 +19,7 @@ use std::{
     error::Error,
     fmt, io,
     os::fd::{AsFd, OwnedFd},
+    os::unix::fs::{FileTypeExt as _, MetadataExt as _},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -473,9 +474,110 @@ fn send_error(error: rustix::io::Errno) -> ControlSocketError {
 pub struct SubjectControlListener {
     socket: OwnedFd,
     path: PathBuf,
+    path_identity: SocketPathIdentity,
     subject: SubjectId,
     credential: SubjectCredential,
     timeouts: ControlSocketTimeouts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketPathIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl SocketPathIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+fn validate_socket_parent(path: &Path) -> Result<SocketPathIdentity, ControlSocketError> {
+    if !path.is_absolute()
+        || path.components().count() < 2
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(ControlSocketError::InvalidPath(path.to_path_buf()));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| ControlSocketError::InvalidPath(path.to_path_buf()))?;
+    let effective_uid = rustix::process::geteuid().as_raw();
+    let mut current = PathBuf::from("/");
+    for component in parent.components().skip(1) {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+            ControlSocketError::Io(io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot inspect control socket ancestor {}: {error}",
+                    current.display()
+                ),
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ControlSocketError::InvalidPath(path.to_path_buf()));
+        }
+        let mode = metadata.mode();
+        if mode & 0o022 != 0 && !(metadata.uid() == 0 && mode & 0o1000 != 0) {
+            return Err(ControlSocketError::InvalidPath(path.to_path_buf()));
+        }
+    }
+    let metadata = std::fs::symlink_metadata(parent).map_err(ControlSocketError::Io)?;
+    if metadata.uid() != effective_uid || metadata.mode() & 0o022 != 0 {
+        return Err(ControlSocketError::InvalidPath(path.to_path_buf()));
+    }
+    Ok(SocketPathIdentity::from_metadata(&metadata))
+}
+
+fn inspect_owned_socket(
+    path: &Path,
+    parent_identity: SocketPathIdentity,
+) -> Result<SocketPathIdentity, ControlSocketError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ControlSocketError::InvalidPath(path.to_path_buf()))?;
+    let current_parent = std::fs::symlink_metadata(parent).map_err(ControlSocketError::Io)?;
+    if current_parent.file_type().is_symlink()
+        || !current_parent.is_dir()
+        || SocketPathIdentity::from_metadata(&current_parent) != parent_identity
+    {
+        return Err(ControlSocketError::InvalidPath(path.to_path_buf()));
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(ControlSocketError::Io)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(ControlSocketError::InvalidPath(path.to_path_buf()));
+    }
+    Ok(SocketPathIdentity::from_metadata(&metadata))
+}
+
+fn remove_owned_socket(path: &Path, identity: SocketPathIdentity) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !metadata.file_type().is_symlink()
+        && metadata.file_type().is_socket()
+        && SocketPathIdentity::from_metadata(&metadata) == identity
+    {
+        drop(std::fs::remove_file(path));
+    }
+}
+
+impl Drop for SubjectControlListener {
+    fn drop(&mut self) {
+        remove_owned_socket(&self.path, self.path_identity);
+    }
 }
 
 impl SubjectControlListener {
@@ -516,11 +618,14 @@ impl SubjectControlListener {
         timeouts: ControlSocketTimeouts,
     ) -> Result<Self, ControlSocketError> {
         let path = path.into();
-        if !path.is_absolute() || path.components().count() < 2 {
-            return Err(ControlSocketError::InvalidPath(path));
-        }
+        let parent_identity = validate_socket_parent(&path)?;
         validate_backlog(backlog)?;
         timeouts.validate()?;
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ControlSocketError::Io(error)),
+            Ok(_) => return Err(ControlSocketError::InvalidPath(path)),
+        }
         let address = SocketAddrUnix::new(&path)
             .map_err(|_| ControlSocketError::InvalidPath(path.clone()))?;
         let socket = socket_with(
@@ -530,12 +635,31 @@ impl SubjectControlListener {
             None,
         )?;
         bind(&socket, &address)?;
+        let path_identity = match inspect_owned_socket(&path, parent_identity) {
+            Ok(identity) => identity,
+            Err(error) => {
+                drop(std::fs::remove_file(&path));
+                return Err(error);
+            }
+        };
         // The node exists only after bind, so its mode is narrowed before anything can connect.
-        chmodat(CWD, &path, Mode::RUSR | Mode::WUSR, AtFlags::empty())?;
-        listen(&socket, backlog)?;
+        let setup = chmodat(
+            CWD,
+            &path,
+            Mode::RUSR | Mode::WUSR,
+            AtFlags::empty(),
+        )
+        .map_err(ControlSocketError::from)
+        .and_then(|()| inspect_owned_socket(&path, parent_identity).map(|_| ()))
+        .and_then(|()| listen(&socket, backlog).map_err(ControlSocketError::from));
+        if let Err(error) = setup {
+            remove_owned_socket(&path, path_identity);
+            return Err(error);
+        }
         Ok(Self {
             socket,
             path,
+            path_identity,
             subject,
             credential,
             timeouts,
@@ -650,6 +774,7 @@ mod tests {
     use rustix::net::connect;
     use std::{
         os::fd::OwnedFd,
+        os::unix::fs::PermissionsExt as _,
         sync::atomic::{AtomicU64, Ordering},
         thread,
         time::Duration,
@@ -657,11 +782,15 @@ mod tests {
 
     fn socket_path(label: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
+        let directory = std::env::temp_dir().join(format!(
             "supervisor-control-{label}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        std::fs::create_dir(&directory).expect("private control fixture directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("private control fixture mode");
+        let path = directory.join("control.sock");
         drop(std::fs::remove_file(&path));
         path
     }
@@ -789,6 +918,45 @@ mod tests {
             Err(CredentialResolveError::Unbound { socket_id: 1 })
         ));
         drop(std::fs::remove_file(&path));
+    }
+
+    #[test]
+    fn accepted_socket_identities_are_global_across_subject_listeners() {
+        let path_a = socket_path("global-a");
+        let path_b = socket_path("global-b");
+        let mut listener_a = SubjectControlListener::bind(
+            &path_a,
+            SubjectId::new("subject-a"),
+            self_credential(),
+            4,
+        )
+        .expect("first listener must bind");
+        let mut listener_b = SubjectControlListener::bind(
+            &path_b,
+            SubjectId::new("subject-b"),
+            self_credential(),
+            4,
+        )
+        .expect("second listener must bind");
+        let mut resolver = SubjectCredentialResolver::new();
+        let client_a = connect_client(&path_a);
+        let first = listener_a.accept(&mut resolver).expect("first accept");
+        let client_b = connect_client(&path_b);
+        let second = listener_b.accept(&mut resolver).expect("second accept");
+
+        assert_eq!(first.identity().socket_id(), 0);
+        assert_eq!(second.identity().socket_id(), 1);
+        assert_eq!(
+            resolver.resolve(&first.identity()).map(|id| id.to_string()),
+            Ok("subject-a".to_owned())
+        );
+        assert_eq!(
+            resolver
+                .resolve(&second.identity())
+                .map(|id| id.to_string()),
+            Ok("subject-b".to_owned())
+        );
+        drop((client_a, client_b));
     }
 
     #[test]

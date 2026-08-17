@@ -1,0 +1,129 @@
+[Unit]
+Description=Single-session Firecracker host owner
+Documentation=https://github.com/Aqua-218/SecCamp-AIAgent
+Wants=dev-kvm.device dev-vhost\x2dvsock.device
+After=local-fs.target dev-kvm.device dev-vhost\x2dvsock.device
+ConditionPathExists=/etc/host-sessiond/host-sessiond.env
+ConditionPathExists=/dev/kvm
+ConditionPathExists=/dev/vhost-vsock
+ConditionPathExists=/dev/mapper/control
+
+[Service]
+Type=simple
+User=host-sessiond
+Group=host-sessiond
+SupplementaryGroups=kvm
+WorkingDirectory=/var/lib/host-sessiond
+RuntimeDirectory=host-sessiond
+RuntimeDirectoryMode=0750
+StateDirectory=host-sessiond
+StateDirectoryMode=0750
+EnvironmentFile=/etc/host-sessiond/host-sessiond.env
+ExecStart=/usr/local/bin/host-sessiond \
+  --firecracker ${HOST_SESSIOND_FIRECRACKER} \
+  --firecracker-sha256 ${HOST_SESSIOND_FIRECRACKER_SHA256} \
+  --jailer ${HOST_SESSIOND_JAILER} \
+  --jailer-sha256 ${HOST_SESSIOND_JAILER_SHA256} \
+  --kernel-source ${HOST_SESSIOND_KERNEL_SOURCE} \
+  --kernel-source-sha256 ${HOST_SESSIOND_KERNEL_SOURCE_SHA256} \
+  --rootfs ${HOST_SESSIOND_ROOTFS} \
+  --rootfs-sha256 ${HOST_SESSIOND_ROOTFS_SHA256} \
+  --verity-hash ${HOST_SESSIOND_VERITY_HASH} \
+  --verity-hash-sha256 ${HOST_SESSIOND_VERITY_HASH_SHA256} \
+  --rootfs-verity-root-hash ${HOST_SESSIOND_ROOTFS_VERITY_ROOT_HASH} \
+  --workspace-formatter ${HOST_SESSIOND_WORKSPACE_FORMATTER} \
+  --workspace-formatter-sha256 ${HOST_SESSIOND_WORKSPACE_FORMATTER_SHA256} \
+  --workspace-source ${HOST_SESSIOND_WORKSPACE_SOURCE} \
+  --seccomp-source ${HOST_SESSIOND_SECCOMP_SOURCE} \
+  --seccomp-source-sha256 ${HOST_SESSIOND_SECCOMP_SOURCE_SHA256} \
+  --snapshot-id ${HOST_SESSIOND_SNAPSHOT_ID} \
+  --snapshot-state ${HOST_SESSIOND_SNAPSHOT_STATE} \
+  --snapshot-state-sha256 ${HOST_SESSIOND_SNAPSHOT_STATE_SHA256} \
+  --snapshot-memory ${HOST_SESSIOND_SNAPSHOT_MEMORY} \
+  --snapshot-memory-sha256 ${HOST_SESSIOND_SNAPSHOT_MEMORY_SHA256} \
+  --veritysetup ${HOST_SESSIOND_VERITYSETUP} \
+  --veritysetup-sha256 ${HOST_SESSIOND_VERITYSETUP_SHA256} \
+  --dmsetup ${HOST_SESSIOND_DMSETUP} \
+  --dmsetup-sha256 ${HOST_SESSIOND_DMSETUP_SHA256} \
+  --jailer-chroot-base ${HOST_SESSIOND_JAILER_CHROOT_BASE} \
+  --cgroup-parent ${HOST_SESSIOND_CGROUP_PARENT} \
+  --jailer-uid ${HOST_SESSIOND_JAILER_UID} \
+  --jailer-gid ${HOST_SESSIOND_JAILER_GID} \
+  --verity-mapper-prefix ${HOST_SESSIOND_VERITY_MAPPER_PREFIX} \
+  --workspace-image-bytes ${HOST_SESSIOND_WORKSPACE_IMAGE_BYTES} \
+  --memory-max-bytes ${HOST_SESSIOND_MEMORY_MAX_BYTES} \
+  --cpu-quota-micros ${HOST_SESSIOND_CPU_QUOTA_MICROS} \
+  --cpu-period-micros ${HOST_SESSIOND_CPU_PERIOD_MICROS} \
+  --guest-cid ${HOST_SESSIOND_GUEST_CID} \
+  --vcpu-count ${HOST_SESSIOND_VCPU_COUNT} \
+  --memory-mib ${HOST_SESSIOND_MEMORY_MIB} \
+  --boot-args "${HOST_SESSIOND_BOOT_ARGS}" \
+  --issuer ${HOST_SESSIOND_ISSUER} \
+  --workspace-template ${HOST_SESSIOND_WORKSPACE_TEMPLATE} \
+  --identity-ledger ${HOST_SESSIOND_IDENTITY_LEDGER} \
+  --recovery-journal ${HOST_SESSIOND_RECOVERY_JOURNAL} \
+  --authority-audit ${HOST_SESSIOND_AUTHORITY_AUDIT} \
+  --authority-audit-mode ${HOST_SESSIOND_AUTHORITY_AUDIT_MODE} \
+  --broker-wal-root ${HOST_SESSIOND_BROKER_WAL_ROOT} \
+  --broker-host-cid ${HOST_SESSIOND_BROKER_HOST_CID} \
+  --broker-port ${HOST_SESSIOND_BROKER_PORT} \
+  --broker-backlog ${HOST_SESSIOND_BROKER_BACKLOG} \
+  --guest-control-port ${HOST_SESSIOND_GUEST_CONTROL_PORT} \
+  --broker-replay-capacity ${HOST_SESSIOND_BROKER_REPLAY_CAPACITY} \
+  --broker-budget-requests ${HOST_SESSIOND_BROKER_BUDGET_REQUESTS} \
+  --broker-budget-response-bytes ${HOST_SESSIOND_BROKER_BUDGET_RESPONSE_BYTES} \
+  --broker-budget-concurrent ${HOST_SESSIOND_BROKER_BUDGET_CONCURRENT} \
+  --github-response-cap-bytes ${HOST_SESSIOND_GITHUB_RESPONSE_CAP_BYTES} \
+  --broker-max-connection-requests ${HOST_SESSIOND_BROKER_MAX_CONNECTION_REQUESTS} \
+  --repository ${HOST_SESSIOND_REPOSITORY} \
+  --file-effects ${HOST_SESSIOND_FILE_EFFECTS} \
+  --path-prefix ${HOST_SESSIOND_PATH_PREFIX} \
+  --egress-authority none \
+  --stop-file ${HOST_SESSIOND_STOP_FILE} \
+  --poll-millis ${HOST_SESSIOND_POLL_MILLIS} \
+  --shutdown-timeout-millis ${HOST_SESSIOND_SHUTDOWN_TIMEOUT_MILLIS} \
+  --status-file ${HOST_SESSIOND_STATUS_FILE}
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=infinity
+TimeoutStopSec=45s
+KillMode=mixed
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
+UMask=0077
+
+# Firecracker/Jailer needs KVM/vsock, dm-verity, cgroup v2, and mount/pid namespace setup.
+# The configured jailer UID/GID should be this same dedicated account; these capabilities are
+# the minimum host-side privilege envelope for that composition and are not guest capabilities.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL
+NoNewPrivileges=yes
+DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/vhost-vsock rw
+DeviceAllow=/dev/mapper/control rw
+DeviceAllow=/dev/mapper/host-sessiond-rootfs-* rw
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=no
+Delegate=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateTmp=yes
+PrivateMounts=no
+RestrictNamespaces=~user
+RestrictAddressFamilies=AF_UNIX AF_VSOCK AF_INET AF_INET6
+SystemCallArchitectures=native
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+LimitNOFILE=65536
+ReadWritePaths=/var/lib/host-sessiond /run/host-sessiond /var/lib/host-sessiond/jailer /var/lib/host-sessiond/workspace-source
+
+[Install]
+WantedBy=multi-user.target

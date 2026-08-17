@@ -684,14 +684,11 @@ gates:
     stage: system
     tier: deep
     scopes: [rust]
-    status: planned
-    github: null
-    gitlab: null
-    workflow: null
-    include: null
-    why_planned: >-
-      No executable protected KVM gate currently drives a real SessionOwner
-      lifecycle through CapFS, isolation, Firecracker, Broker, and recovery.
+    status: implemented
+    github: session_owner_kvm
+    gitlab: session_owner_kvm
+    workflow: deep.yml
+    include: deep.yml
 
   - id: external_provider_smoke
     title: Protected external provider smoke

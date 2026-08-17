@@ -2276,8 +2276,8 @@ mod tests {
         os::unix::fs::PermissionsExt,
         path::PathBuf,
         process::Command,
-        sync::Arc,
         sync::atomic::{AtomicU64, Ordering},
+        sync::{Arc, Mutex, MutexGuard},
         thread,
     };
 
@@ -2298,14 +2298,24 @@ mod tests {
     };
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+    // `Command::spawn` may briefly inherit every open file description in this
+    // multithreaded test process before `exec` applies close-on-exec. Serializing
+    // journal fixtures prevents the cross-process lock test from transiently
+    // inheriting another test's writer lock and making that test spuriously see
+    // `DurableAuditError::Locked` after its own writer has been dropped.
+    static TEST_JOURNAL_SERIAL: Mutex<()> = Mutex::new(());
     const CROSS_PROCESS_LOCK_PATH: &str = "AUTHORITY_CORE_TEST_AUDIT_LOCK_PATH";
 
     struct TestJournal {
         path: PathBuf,
+        _serial_guard: MutexGuard<'static, ()>,
     }
 
     impl TestJournal {
         fn new() -> Self {
+            let serial_guard = TEST_JOURNAL_SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let serial = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "authority-core-durable-audit-{}-{serial}.wal",
@@ -2315,7 +2325,10 @@ mod tests {
             if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
                 let _ = fs::remove_file(parent.join(durable_lock_name(name)));
             }
-            Self { path }
+            Self {
+                path,
+                _serial_guard: serial_guard,
+            }
         }
 
         fn lock_path(&self) -> PathBuf {
@@ -3096,6 +3109,7 @@ mod tests {
             Err(DurableAuditError::InvalidRecord(message))
                 if message == "CommitUnknown evidence cannot be empty"
         ));
+        drop(empty);
 
         let oversized =
             journal_with_raw_unknown(&vec![0x5a; MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES + 1]);

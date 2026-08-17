@@ -28,9 +28,7 @@ use std::{
 use authority_core::time::MonotonicTime;
 use egress_broker::{
     dispatch::DispatchContext,
-    server::{
-        ConnectionCloseReason, RequestDispatcher, ServerError, serve_connection_with_policy,
-    },
+    server::{ConnectionCloseReason, RequestDispatcher, ServerError, serve_connection_with_policy},
     transport::{
         AfVsockListener, DeadlineStream, TransportError, TransportPolicy, VsockShutdownHandle,
         VsockStream,
@@ -320,7 +318,10 @@ fn ensure_private_socket_parent(path: &Path) -> io::Result<()> {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let ancestor = parent.parent().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "Broker socket parent has no ancestor")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Broker socket parent has no ancestor",
+                )
             })?;
             validate_private_directory_chain(ancestor)?;
             let mut builder = std::fs::DirBuilder::new();

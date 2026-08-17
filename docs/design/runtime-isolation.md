@@ -69,6 +69,14 @@ flowchart TB
 
 credential が host 側の枠から出ていないことも図に含めてある。guest はどの経路でも token に触れない。
 
+## guest composition と workload gate
+
+guest の composition は [`guest-supervisor-init`](../../crates/supervisor/src/bin/guest-supervisor-init.rs) が所有する。PID 1 の [`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は host CID 2 から identity bundle を一度受け取り、image に固定された guest supervisor を起動する。supervisor は固定された repository / file effect / path policy から guest `CapabilityKernel` と CapFS runtime を作り、control listener と Broker channel を準備してから `guest-supervisor-ready/v1` を返す。readiness を返す前に workspace mount、CapFS、subject bootstrap、isolation control listener、workload 側接続を全て成立させる。
+
+workload の起動は supervisor が任意の command を受け取る API ではない。`LinuxHostResources` は image-configured `workload-isolation-launcher` を unnamed socketpair の stdin/stdout だけで起動し、launcher が正確な `ready` を返すまで release byte を送らない。launcher は `RuntimeIsolation::spawn_isolated` の child startup に加えて、CLOEXEC の exec-status writer を workload child に渡す。exec 成功時は fd が閉じて EOF になり、exec 失敗・不正 marker・timeout は `isolated` を返さず fail closed にする。supervisor/launcher の両方が ambient environment を clear し、必要な identity / channel fd だけを明示する。
+
+これは実装された guest path である。ただし runtime-isolation の privileged probe は launcher と `execve` を直接呼ばないため、post-exec の kernel enforcement と `rootfs.source == "/"` は別の verification boundary として残る。
+
 ## コンテナを起動する順番
 
 ```mermaid
@@ -84,6 +92,10 @@ sequenceDiagram
     S->>C: Landlock envelope を適用
     S->>C: Linux capability を全 drop
     S->>C: no_new_privs + seccomp
+    S->>C: inherited start gate の ready を受信
+    S->>C: release byte を送信
+    S->>C: 13 step isolation を適用
+    S->>C: close-on-exec EOF を確認
     S->>C: workload を execve
 ```
 
@@ -128,9 +140,11 @@ sequenceDiagram
 
     H->>V: guest boot
     V->>V: session 初期化前の待機点へ
-    H->>H: snapshot を保存
+    H->>V: pause を要求
+    V-->>H: pause acknowledgement
+    H->>H: snapshot を保存したまま paused
     Note over H,V: root / subject / credential / user workspace はまだ無い
-    H->>V: snapshot restore
+    H->>V: snapshot restore（resume_vm=false）
     H->>V: 専用 workspace を接続
     V->>V: 新しい ID と乱数状態を用意
     V->>B: 新しい vsock session を確立
@@ -139,6 +153,8 @@ sequenceDiagram
 ```
 
 同じ snapshot から複数 VM を起動すると、乱数や ID まで複製され得る。そこで snapshot にセッション固有状態を入れず、restore 後に VM / session / subject / Capability / request ID を作り直す。workspace block image も clone ごとに分ける。[Firecracker snapshot security](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md?plain=1)
+
+実装上は `WorkloadStopped` から Firecracker の pause acknowledgement を受けて `SnapshotPaused` に遷移してから snapshot files を書く。pause 自体の応答が失われた場合は `SnapshotPauseUnknown`、write/hash が失敗した場合も paused state を再利用せず shutdown に進む。fake/runtime test ではこの fail-closed 状態機械を確認済みだが、実 Firecracker の snapshot/restore 動作は未検証である。
 
 ## 関連
 

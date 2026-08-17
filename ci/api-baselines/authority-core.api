@@ -241,6 +241,10 @@ pub authority_core::file::FileEffect::Rename
 pub authority_core::file::FileEffect::SetMetadata
 pub authority_core::file::FileEffect::Truncate
 pub authority_core::file::FileEffect::WriteData
+impl authority_core::file::FileEffect
+pub const authority_core::file::FileEffect::ALL: [Self; 13]
+pub const fn authority_core::file::FileEffect::from_tag(u8) -> core::option::Option<Self>
+pub const fn authority_core::file::FileEffect::tag(self) -> u8
 pub struct authority_core::file::FileAuthority
 impl authority_core::file::FileAuthority
 pub const fn authority_core::file::FileAuthority::effects(&self) -> authority_core::file::FileEffects

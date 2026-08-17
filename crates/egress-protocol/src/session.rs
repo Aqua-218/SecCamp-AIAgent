@@ -83,9 +83,35 @@ pub struct BrokerEnvelope {
 }
 
 impl BrokerEnvelope {
-    /// Creates an envelope for one canonical request payload.
+    /// Creates an envelope and derives its payload hash from the exact bytes
+    /// that will be sent on the wire.
+    ///
+    /// This is the preferred constructor for every transport ingress. Keeping
+    /// the payload and its digest in one call prevents a caller from hashing
+    /// one operation while sending another operation under the same request
+    /// identity.
     #[must_use]
-    pub const fn new(
+    pub fn from_canonical_payload(
+        session: BrokerSessionId,
+        sequence: u64,
+        request: BrokerRequestId,
+        payload: &[u8],
+    ) -> Self {
+        Self::new(
+            session,
+            sequence,
+            request,
+            PayloadHash::of_canonical_payload(payload),
+        )
+    }
+
+    /// Reconstructs an envelope after this crate has validated the payload hash.
+    ///
+    /// Keeping this constructor crate-private makes it impossible for an
+    /// external transport to supply unrelated payload and digest values. Public
+    /// callers must use [`Self::from_canonical_payload`].
+    #[must_use]
+    pub(crate) const fn new(
         session: BrokerSessionId,
         sequence: u64,
         request: BrokerRequestId,
@@ -121,6 +147,13 @@ impl BrokerEnvelope {
     #[must_use]
     pub const fn payload_hash(&self) -> PayloadHash {
         self.payload_hash
+    }
+
+    /// Returns whether `payload` is exactly the canonical byte sequence bound
+    /// by this envelope.
+    #[must_use]
+    pub fn binds_canonical_payload(&self, payload: &[u8]) -> bool {
+        self.payload_hash == PayloadHash::of_canonical_payload(payload)
     }
 }
 
@@ -165,6 +198,8 @@ pub enum EnvelopeError {
         /// Request identity that was reused inconsistently.
         request: BrokerRequestId,
     },
+    /// The supplied payload did not match the envelope's claimed digest.
+    PayloadHashMismatch,
     /// The bounded deduplication table cannot retain another request outcome.
     RequestCapacityExhausted,
 }
@@ -182,6 +217,9 @@ impl fmt::Display for EnvelopeError {
             Self::SequenceExhausted => formatter.write_str("broker session sequence is exhausted"),
             Self::RequestIdentityMismatch { .. } => {
                 formatter.write_str("broker request ID was reused with a different envelope")
+            }
+            Self::PayloadHashMismatch => {
+                formatter.write_str("broker envelope payload does not match its digest")
             }
             Self::RequestCapacityExhausted => {
                 formatter.write_str("broker session deduplication capacity is exhausted")
@@ -242,7 +280,7 @@ impl SessionReplayGuard {
     ///
     /// Returns an error without changing state when the session, order,
     /// request identity, sequence range, or bounded retention limit is wrong.
-    pub fn accept(
+    pub(crate) fn accept(
         &mut self,
         envelope: BrokerEnvelope,
     ) -> Result<EnvelopeAcceptance, EnvelopeError> {
@@ -285,6 +323,32 @@ impl SessionReplayGuard {
         self.next_sequence = envelope.sequence.checked_add(1);
         Ok(EnvelopeAcceptance::New)
     }
+
+    /// Validates the payload binding before admitting an envelope.
+    ///
+    /// This is the safe public ingress for callers that have both the decoded
+    /// envelope and the canonical payload bytes. A mismatch is rejected before
+    /// any replay-table or sequence state changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvelopeError::PayloadHashMismatch`] when `payload` is not
+    /// the exact byte sequence bound by `envelope`. Otherwise returns the same
+    /// session, ordering, identity, capacity, and exhaustion errors as
+    /// [`Self::accept`].
+    pub fn accept_payload(
+        &mut self,
+        envelope: BrokerEnvelope,
+        payload: &[u8],
+    ) -> Result<EnvelopeAcceptance, EnvelopeError> {
+        if envelope.session != self.session {
+            return self.accept(envelope);
+        }
+        if !envelope.binds_canonical_payload(payload) {
+            return Err(EnvelopeError::PayloadHashMismatch);
+        }
+        self.accept(envelope)
+    }
 }
 
 #[cfg(test)]
@@ -310,12 +374,7 @@ mod tests {
         request: BrokerRequestId,
         payload: &[u8],
     ) -> BrokerEnvelope {
-        BrokerEnvelope::new(
-            session,
-            sequence,
-            request,
-            PayloadHash::of_canonical_payload(payload),
-        )
+        BrokerEnvelope::from_canonical_payload(session, sequence, request, payload)
     }
 
     #[test]
@@ -347,6 +406,52 @@ mod tests {
         assert_eq!(guard.next_sequence(), Some(1));
         assert_eq!(guard.accept(first), Ok(EnvelopeAcceptance::Duplicate));
         assert_eq!(guard.accepted_request_count(), 1);
+    }
+
+    #[test]
+    fn payload_ingress_rejects_hash_mismatch_without_consuming_sequence_or_capacity() {
+        let current_session = session(9);
+        let envelope = envelope(current_session, 0, request(9), b"declared");
+        let mut guard = SessionReplayGuard::new(
+            current_session,
+            NonZeroUsize::new(1).expect("test capacity must be non-zero"),
+        );
+
+        assert_eq!(
+            guard.accept_payload(envelope, b"different"),
+            Err(EnvelopeError::PayloadHashMismatch)
+        );
+        assert_eq!(guard.next_sequence(), Some(0));
+        assert_eq!(guard.accepted_request_count(), 0);
+        assert_eq!(
+            guard.accept_payload(envelope, b"declared"),
+            Ok(EnvelopeAcceptance::New)
+        );
+        assert_eq!(
+            guard.accept_payload(envelope, b"declared"),
+            Ok(EnvelopeAcceptance::Duplicate)
+        );
+    }
+
+    #[test]
+    fn fresh_restore_session_rejects_every_pre_restore_envelope() {
+        let previous_session = session(10);
+        let restored_session = session(11);
+        let previous = envelope(previous_session, 0, request(10), b"before-restore");
+        let mut restored = SessionReplayGuard::new(
+            restored_session,
+            NonZeroUsize::new(1).expect("test capacity must be non-zero"),
+        );
+
+        assert_eq!(
+            restored.accept_payload(previous, b"before-restore"),
+            Err(EnvelopeError::WrongSession {
+                expected: restored_session,
+                received: previous_session,
+            })
+        );
+        assert_eq!(restored.next_sequence(), Some(0));
+        assert_eq!(restored.accepted_request_count(), 0);
     }
 
     #[test]
@@ -411,13 +516,43 @@ mod tests {
         );
         final_sequence_guard.next_sequence = Some(u64::MAX);
         assert_eq!(
-            final_sequence_guard.accept(envelope(current_session, u64::MAX, request(3), b"last")),
+            final_sequence_guard.accept_payload(
+                envelope(current_session, u64::MAX, request(3), b"last"),
+                b"last",
+            ),
             Ok(EnvelopeAcceptance::New)
         );
         assert_eq!(final_sequence_guard.next_sequence(), None);
         assert_eq!(
             final_sequence_guard.accept(envelope(current_session, 0, request(4), b"wrapped")),
             Err(EnvelopeError::SequenceExhausted)
+        );
+    }
+
+    #[test]
+    fn capacity_exhaustion_is_terminal_and_does_not_advance_on_retries() {
+        let current_session = session(12);
+        let mut guard = SessionReplayGuard::new(
+            current_session,
+            NonZeroUsize::new(1).expect("test capacity must be non-zero"),
+        );
+        let first = envelope(current_session, 0, request(12), b"first");
+        let second = envelope(current_session, 1, request(13), b"second");
+
+        assert_eq!(
+            guard.accept_payload(first, b"first"),
+            Ok(EnvelopeAcceptance::New)
+        );
+        assert_eq!(guard.next_sequence(), Some(1));
+        assert_eq!(
+            guard.accept_payload(second, b"second"),
+            Err(EnvelopeError::RequestCapacityExhausted)
+        );
+        assert_eq!(guard.next_sequence(), Some(1));
+        assert_eq!(guard.accepted_request_count(), 1);
+        assert_eq!(
+            guard.accept_payload(second, b"second"),
+            Err(EnvelopeError::RequestCapacityExhausted)
         );
     }
 }

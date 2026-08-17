@@ -24,7 +24,7 @@ sequenceDiagram
     participant API as ApiClient
 
     R->>R: config.validate()
-    R->>FS: 6 artifact を読んで digest 照合
+    R->>FS: 8 artifact を読んで digest 照合
     R->>FS: clone_workspace(source, clone)
     Note over R,FS: ここで失敗したら remove_workspace のみ
     R->>CR: dm-verity open
@@ -101,7 +101,7 @@ API 呼び出しが 1 関数に閉じているため、Firecracker の API 仕�
 fake adapter を使う限りにおいて、順序と rollback が上記のとおり動くことは test で確認している。
 
 - [`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) は実 Firecracker に `machine-config`、`boot-source`、read-only root drive、`vsock`、`InstanceStart` をこの順に送って boot する。workspace drive、`Runtime::launch` の jailer 経路、snapshot restore は同 test の対象外である。
-- `veritysetup` と `jailer` の実際のコマンドラインと実行結果は未検証。`RealCommandRunner` は本物のプロセスを起動する test を持つが、対象は出力量と終了処理の確認であって Firecracker ではない。
+- `veritysetup`、`jailer`、workspace formatter の実際の helper 実行結果は未検証。pinned command は `O_NOFOLLOW` → sealed executable memfd → `/proc/self/fd/<n>` と `env_clear()` を通るが、`RealCommandRunner` の実プロセス test は出力量と終了処理の確認であって、実 Firecracker/jailer/mapper の成立を証明しない。
 - rollback が実際に host resource を解放することは未検証。fake filesystem は削除要求を記録するだけ。
 - 起動したプロセスが jailer 配下で隔離されているかはこの crate では確認できない。[ホスト隔離プロファイル](host-isolation.md)が扱うのは config の検査までで、実効果ではない。
 - guest 内部は対象外。[runtime-isolation](../runtime-isolation/README.md) と [supervisor](../supervisor/README.md) の担当。

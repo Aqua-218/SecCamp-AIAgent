@@ -91,7 +91,7 @@ mock/contract 検証は完了している。opt-in KVM test は Firecracker gues
 
 launch は `RuntimeState::WorkloadStopped` で戻り、restore は `IdentityRegenerated` で止まる。`inject_identity` が成功して初めて `IdentityInjected`、`start_workload` が成功して `Running` へ進む。artifact、workspace、verity、jailer、API failure には rollback がある。
 
-fake command/filesystem/API/identity source による contract test と local Unix socket HTTP exchange に加え、[`verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は実 Firecracker process、実 dm-verity device、guest kernel、guest `AF_VSOCK` control channel、guest-to-host Broker port を通す。jailer が作る namespace/cgroup、snapshot/restore、workspace drive、VM escape、CapabilityKernel/capfs を含む guest supervisor は未検証である。したがって Phase 6 は「identity gate と閉じた Broker round trip を持つ VM boot を実証済み」だが「VM 隔離全体が完成」ではない。
+fake command/filesystem/API/identity source による contract test と local Unix socket HTTP exchange に加え、[`verify-real-guest-control.sh`](../../scripts/ci/verify-real-guest-control.sh) は実 Firecracker process、実 dm-verity device、guest kernel、v2 policy-digest-bound guest `AF_VSOCK` control channel、guest supervisor/isolation launcher、guest-to-host Broker port を通す。`Runtime::launch` のjailer namespace/cgroup、snapshot/restore、VM escape、CapabilityKernel/capfs の全 effect は未検証である。したがって Phase 6 は「v2 identity gate と閉じた Broker round trip を持つ VM boot とguest compositionを実証済み」だが「VM 隔離全体が完成」ではない。
 
 ## 7. Supervisor / session orchestrator
 

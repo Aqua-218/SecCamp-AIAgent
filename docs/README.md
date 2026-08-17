@@ -90,8 +90,8 @@ flowchart TB
 | `egress-protocol` | [Broker session envelope](egress-protocol/session-envelopes.md)、[Canonical CBOR](egress-protocol/canonical-cbor.md) | bounded frame、canonical CBOR、session と sequence、budget | module test |
 | `egress-broker` | [Host Egress Broker](egress-broker/README.md) | frame、replay、budget、公開 HTTPS、型付き GitHub adapter | fake resolver / connector / provider。Firecracker guest-to-host の canonical rejection は opt-in 実機 test、外部 DNS / HTTPS / GitHub は未検証 |
 | `firecracker-runtime` | [Firecracker runtime](firecracker-runtime/README.md) | artifact 固定、dm-verity、jailer、API 順序、snapshot / restore、identity gate、guest-control PID 1 | 実 Firecracker + dm-verity + guest `AF_VSOCK` identity gate を opt-in test で確認。jailer / snapshot restore は未検証 |
-| `runtime-isolation` | [runtime-isolation](runtime-isolation/README.md) | exec 直前の 13 step。namespace、mount、cgroup、Landlock、capability、seccomp | mock backend と純粋関数。実 syscall は未検証 |
-| `supervisor` | [Supervisor adapter](supervisor/README.md) | 認証済み connection の subject binding、wire protocol、subject lifecycle | `CapabilityKernel` と `FakeResources`。Linux resource と実 socket は未検証 |
+| `runtime-isolation` | [runtime-isolation](runtime-isolation/README.md) | exec 直前の 13 step。namespace、mount、cgroup、Landlock、capability、seccomp | mock backendに加え特権hostの実syscall probe。post-exec、rootfs `/`、rollbackは未検証 |
+| `supervisor` | [Supervisor adapter](supervisor/README.md) | 認証済み connection の subject binding、wire protocol、subject lifecycle | local socketと実KVM runtime imageでguest supervisor/isolation launcherを確認。CapFS全effectは未検証 |
 | `session-orchestrator` | [Session orchestrator](session-orchestrator/README.md) | session identity、backend lease、startup / rollback / stop | production adapter composition test。実 VM は未検証 |
 
 ## Authority core 文書

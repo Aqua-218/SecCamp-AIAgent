@@ -6,7 +6,7 @@
 
 > **対象読者:** capfs の実装者、レビュー担当者、統合 test を書く人
 
-capfs はこの repository で最も実環境に近い test を持つ。実 directory、実 file、実 symlink、実 hard link を作り、実 FUSE mount 上で操作する test がある。それでも VM の中では一度も動いていない。
+capfs はこの repository で最も実環境に近い test を持つ。実 directory、実 file、実 symlink、実 hard link を作り、実 FUSE mount 上で操作する testに加え、KVM guest内のproduction Supervisor/隔離経路から全13 effectを実行するtestがある。
 
 ## local test で確認したこと
 
@@ -78,6 +78,7 @@ link については、実 mount 上で次を確認している。
 | backing の同種 inode 差し替えと symlink 置換を実 mount 上で `EIO` にし、replacement / outside content を返さない | `mounted_view_rejects_backing_replacement_and_symlink_substitution` |
 | contained な深い symlink chain は解決し、cycle は kernel の `ELOOP` を返す | `mounted_view_handles_deep_symlink_chains_and_cycles` |
 | backing 配下の実 nested FUSE mount を fresh preflight が `NestedMount` として拒否 | `mounted_view_rejects_a_real_nested_mount_during_preflight` |
+| guest probeと同じ全13 effect sequenceが一つの実mountで完走し、symlinkもfollowせずunlinkできる | `mounted_view_executes_the_complete_guest_effect_sequence` |
 
 ## 実行コマンド
 
@@ -89,17 +90,18 @@ cargo clippy --manifest-path crates/capfs/Cargo.toml --all-targets -- -D warning
 scripts/ci/verify-real-capfs.sh
 ```
 
-通常の `cargo test` では、`/dev/fuse` が無い hosted 環境に限って実 mount test を skip する。実 kernel の証拠を作るときは `scripts/ci/verify-real-capfs.sh` を使う。この script は Linux、root、読み書き可能な `/dev/fuse` を先に確認し、`CAPFS_REQUIRE_FUSE=1` を設定して全 21 件の実 FUSE test を一件も skip せずに実行する。device が無い、mount が拒否される、または test 側が skip を検出した場合は exit 2 または test failure になり、green にはならない。
+通常の `cargo test` では、`/dev/fuse` が無い hosted 環境に限って実 mount test を skip する。実 kernel の証拠を作るときは `scripts/ci/verify-real-capfs.sh` を使う。この script は Linux、root、読み書き可能な `/dev/fuse` を先に確認し、`CAPFS_REQUIRE_FUSE=1` を設定して全22件の実FUSE testを一件もskipせずに実行する。device が無い、mount が拒否される、または test 側が skip を検出した場合は exit 2 または test failure になり、green にはならない。
+
+`scripts/ci/verify-real-guest-control.sh`と`scripts/ci/verify-real-session-owner.sh`は、guest内でCapFSをmountし、List/CreateDirectory/CreateFile/Write/SetMetadata/CreateHardLink/CreateSymlink/ReadLink/Rename/Truncate/Read/RemoveFile/RemoveDirectoryを実行する。最後のBroker requestが到達したことを、前の全操作が完了したsequencing evidenceとして使う。
 
 ## 未検証の境界
 
 | 未検証の対象 | なぜ |
 |---|---|
-| 全ての変更系 operation と revoke の並行競合 | 実 FUSE write と revoke の線形化競合は `mounted_view_linearizes_backing_mutation_against_revoke` で確認済み。rename / unlink / create / metadata の全 interleaving と、全 kernel scheduling は未検証 |
+| 全ての変更系 operation と revoke の無限な並行組合せ | boundedなwrite/open/close/rename/unlink/revoke raceは検証済みだが、全scheduler interleavingを列挙した証明ではない |
 | cross-filesystem / bind mount を含む全 nested mount の越境 | backing 配下の実 FUSE nested mount は gate で確認済みだが、全種類の mount topology と全 kernel mount namespace 組合せは未検証 |
 | 敵対的な backing 差し替えの全 race | 実 FUSE 上で同種 regular file と symlink の置換を bounded deterministic case として確認済み。連続 rename/create race、全 scheduler interleaving、別 process の無制限 mutation は未検証 |
 | symlink chain の全長・全 topology | 8 段の contained chain と 2-node cycle の `ELOOP` は gate で確認済み。kernel の上限近傍、複雑な相互参照、全 chain 長は未検証 |
-| VM 内での動作 | guest の中で capfs を mount して agent が触る経路は一度も実行していない |
 | 全 interleaving の loom model | [Authorization guard](../authority-core/authorization-guard.md) の loom は Authority Core 側の同期境界だけを扱う。capfs の namespace lock は対象外 |
 | `MNT_ID` を返さない kernel での実挙動 | required mask の fail-closed test はあるが、実際に MNT_ID を欠落させる kernel / filesystem はこの host で再現していない |
 | lock poisoning 後の復旧 | namespace / node と backing identity registry が poison 後に拒否することは test 済み。復旧は意図せず、全 interleaving や process restart 後の運用は対象外 |

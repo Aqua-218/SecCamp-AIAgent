@@ -68,7 +68,7 @@ if [[ ! "${claim_count}" =~ ^[0-9]+$ || "${claim_count}" -eq 0 ]]; then
 fi
 
 declare -A seen_ids=()
-readonly allowed_statuses=' verified unverified '
+readonly allowed_statuses=' verified unverified blocked '
 readonly allowed_scopes=' hosted privileged kvm external '
 
 repository_path_is_real() {
@@ -82,13 +82,52 @@ repository_path_is_real() {
   [[ -e "${current}" ]]
 }
 
+command_is_safe_shape() {
+  local command_line="$1" label="$2"
+
+  # Evidence is recorded for humans and is never executed by this checker. It
+  # is nevertheless a command contract, not an arbitrary shell fragment. A
+  # newline or shell operator would make a copied command ambiguous and could
+  # turn a review-only field into an injection primitive.
+  if [[ -z "${command_line}" || "${command_line}" =~ [[:cntrl:]] ||
+    "${command_line}" =~ [\;\|\&\$\`\<\>\(\)\{\}] ]]; then
+    fail "${label}: command must be one non-empty, single-line argv shape"
+    return 1
+  fi
+  if [[ "${command_line}" == *' || true'* || "${command_line}" == *' || :'* ||
+    "${command_line}" == *'continue-on-error'* || "${command_line}" == *'allow_failure'* ]]; then
+    fail "${label}: command cannot make a failed verification look successful"
+    return 1
+  fi
+  return 0
+}
+
+command_has_forbidden_test_mode() {
+  local command_line="$1"
+  local token
+  for token in --ignored --include-ignored --no-run --list --skip --exclude; do
+    if [[ "${command_line}" =~ (^|[[:space:]])${token}([[:space:]]|$) ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 check_evidence_command() {
-  local command_line="$1" label="$2" executable
+  local command_line="$1" label="$2" mode="${3:-evidence}" executable
+  command_is_safe_shape "${command_line}" "${label}" || return 0
   executable="${command_line%% *}"
+  [[ -n "${executable}" && "${executable}" != "." && "${executable}" != ".." ]] || {
+    fail "${label}: command executable is empty"
+    return
+  }
   case "${executable}" in
     cargo)
       [[ "${command_line}" == *' --locked '* || "${command_line}" == *' --locked' ]] \
         || fail "${label}: cargo evidence must use --locked"
+      if [[ "${mode}" == verified ]] && command_has_forbidden_test_mode "${command_line}"; then
+        fail "${label}: verified cargo evidence cannot use an ignored, skipped, listed, or non-executing test mode"
+      fi
       ;;
     scripts/*)
       if ! repository_path_is_real "${executable}" \
@@ -100,9 +139,25 @@ check_evidence_command() {
   esac
 }
 
+check_required_wrapper() {
+  local command_line="$1" label="$2" executable
+  executable="${command_line%% *}"
+  [[ "${executable}" == scripts/* ]] || return 0
+  if ! grep -qE '^[[:space:]]*set[[:space:]]+-euo[[:space:]]+pipefail([[:space:]]|$)' "${repository_root}/${executable}"; then
+    fail "${label}: required wrapper must use set -euo pipefail so a failed prerequisite cannot look green"
+  fi
+  case "${executable}" in
+    scripts/ci/verify-*)
+      if ! grep -qE '(^|[[:space:]])exit[[:space:]]+[1-9]([[:space:]]|$)' "${repository_root}/${executable}"; then
+        fail "${label}: verification wrapper must have a non-zero prerequisite/failure exit path"
+      fi
+      ;;
+  esac
+}
+
 check_string_array() {
-  local index="$1" field="$2" label="$3"
-  local array_type length item item_index
+  local index="$1" field="$2" label="$3" claim_status="${4:-unverified}"
+  local array_type length item item_type item_index
   array_type="$(yq eval -r ".claims[${index}].evidence.${field} | type" "${manifest}")"
   if [[ "${array_type}" != '!!seq' ]]; then
     fail "${label}: expected a sequence"
@@ -114,20 +169,23 @@ check_string_array() {
     return
   fi
   for ((item_index = 0; item_index < length; item_index++)); do
+    item_type="$(yq eval -r ".claims[${index}].evidence.${field}[${item_index}] | type" "${manifest}")"
     item="$(yq eval -r ".claims[${index}].evidence.${field}[${item_index}] // \"\"" "${manifest}")"
-    if [[ -z "${item}" || "${item}" == 'null' ]]; then
+    if [[ "${item_type}" != '!!str' ]]; then
+      fail "${label}[${item_index}]: entry must be a string"
+    elif [[ -z "${item}" || "${item}" == 'null' ]]; then
       fail "${label}[${item_index}]: entry is empty"
     elif [[ "${item}" == *$'\n'* || "${item}" == *$'\r'* ]]; then
       fail "${label}[${item_index}]: entry contains a line break"
     elif [[ "${field}" == commands ]]; then
-      check_evidence_command "${item}" "${label}[${item_index}]"
+      check_evidence_command "${item}" "${label}[${item_index}]" "${claim_status}"
     fi
   done
 }
 
 check_path_array() {
   local index="$1" field="$2" label="$3"
-  local array_type length item item_index
+  local array_type length item item_type item_index
   array_type="$(yq eval -r ".claims[${index}].evidence.${field} | type" "${manifest}")"
   if [[ "${array_type}" != '!!seq' ]]; then
     fail "${label}: expected a sequence"
@@ -139,7 +197,12 @@ check_path_array() {
     return
   fi
   for ((item_index = 0; item_index < length; item_index++)); do
+    item_type="$(yq eval -r ".claims[${index}].evidence.${field}[${item_index}] | type" "${manifest}")"
     item="$(yq eval -r ".claims[${index}].evidence.${field}[${item_index}] // \"\"" "${manifest}")"
+    if [[ "${item_type}" != '!!str' ]]; then
+      fail "${label}[${item_index}]: path must be a string"
+      continue
+    fi
     if [[ -z "${item}" || "${item}" == 'null' ]]; then
       fail "${label}[${item_index}]: path is empty"
       continue
@@ -156,6 +219,98 @@ check_path_array() {
   done
 }
 
+check_prerequisites() {
+  local index="$1"
+  local label="claims[${index}].prerequisites"
+  local prerequisites_type length item_type prerequisite_id prerequisite_id_type description description_type check check_type index_name
+  prerequisites_type="$(yq eval -r ".claims[${index}].prerequisites | type" "${manifest}")"
+  if [[ "${prerequisites_type}" != '!!seq' ]]; then
+    fail "${label}: required sequence is missing"
+    return
+  fi
+  length="$(yq eval -r ".claims[${index}].prerequisites | length" "${manifest}")"
+  if [[ "${length}" -eq 0 ]]; then
+    fail "${label}: at least one prerequisite is required; use an explicit condition instead of an empty list"
+    return
+  fi
+  for ((index_name = 0; index_name < length; index_name++)); do
+    item_type="$(yq eval -r ".claims[${index}].prerequisites[${index_name}] | type" "${manifest}")"
+    if [[ "${item_type}" != '!!map' ]]; then
+      fail "${label}[${index_name}]: prerequisite must be a map with id, description, and check"
+      continue
+    fi
+    prerequisite_id_type="$(yq eval -r ".claims[${index}].prerequisites[${index_name}].id | type" "${manifest}")"
+    description_type="$(yq eval -r ".claims[${index}].prerequisites[${index_name}].description | type" "${manifest}")"
+    check_type="$(yq eval -r ".claims[${index}].prerequisites[${index_name}].check | type" "${manifest}")"
+    prerequisite_id="$(yq eval -r ".claims[${index}].prerequisites[${index_name}].id // \"\"" "${manifest}")"
+    description="$(yq eval -r ".claims[${index}].prerequisites[${index_name}].description // \"\"" "${manifest}")"
+    check="$(yq eval -r ".claims[${index}].prerequisites[${index_name}].check // \"\"" "${manifest}")"
+    [[ "${prerequisite_id_type}" == '!!str' && "${prerequisite_id}" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
+      fail "${label}[${index_name}].id: required stable identifier"
+    [[ "${description_type}" == '!!str' && -n "${description}" && "${description}" != 'null' ]] ||
+      fail "${label}[${index_name}].description: required non-empty description"
+    [[ "${check_type}" == '!!str' && -n "${check}" && "${check}" != 'null' && "${check}" != *$'\n'* && "${check}" != *$'\r'* ]] ||
+      fail "${label}[${index_name}].check: required one-line condition or probe"
+  done
+}
+
+check_gate() {
+  local index="$1" claim_status="$2"
+  local label="claims[${index}].gate"
+  local gate_type gate_id gate_result prerequisite_policy commands_type length command command_index
+  gate_type="$(yq eval -r ".claims[${index}].gate | type" "${manifest}")"
+  if [[ "${gate_type}" != '!!map' ]]; then
+    fail "${label}: required map with id and commands is missing"
+    return
+  fi
+  gate_id="$(yq eval -r ".claims[${index}].gate.id // \"\"" "${manifest}")"
+  [[ "${gate_id}" =~ ^[a-z0-9][a-z0-9_-]*$ ]] ||
+    fail "${label}.id: required stable gate identifier"
+  gate_result="$(yq eval -r ".claims[${index}].gate.result // \"\"" "${manifest}")"
+  [[ "${gate_result}" == required ]] ||
+    fail "${label}.result: must be 'required'; optional or advisory gates cannot verify a claim"
+  prerequisite_policy="$(yq eval -r ".claims[${index}].gate.on_prerequisite_failure // \"\"" "${manifest}")"
+  [[ "${prerequisite_policy}" == fail ]] ||
+    fail "${label}.on_prerequisite_failure: must be 'fail'; unavailable prerequisites cannot look green"
+  commands_type="$(yq eval -r ".claims[${index}].gate.commands | type" "${manifest}")"
+  if [[ "${commands_type}" != '!!seq' ]]; then
+    fail "${label}.commands: required sequence is missing"
+    return
+  fi
+  length="$(yq eval -r ".claims[${index}].gate.commands | length" "${manifest}")"
+  if [[ "${length}" -eq 0 ]]; then
+    fail "${label}.commands: at least one executable gate command is required"
+    return
+  fi
+  for ((command_index = 0; command_index < length; command_index++)); do
+    command="$(yq eval -r ".claims[${index}].gate.commands[${command_index}] // \"\"" "${manifest}")"
+    if [[ -z "${command}" || "${command}" == 'null' ]]; then
+      fail "${label}.commands[${command_index}]: command is empty"
+    else
+      check_evidence_command "${command}" "${label}.commands[${command_index}]" "${claim_status}"
+      check_required_wrapper "${command}" "${label}.commands[${command_index}]"
+    fi
+  done
+}
+
+check_verification_page() {
+  local index="$1"
+  local page label="claims[${index}].verification_page"
+  page="$(yq eval -r ".claims[${index}].verification_page // \"\"" "${manifest}")"
+  if [[ -z "${page}" || "${page}" == 'null' ]]; then
+    fail "${label}: required repository-relative verification page"
+    return
+  fi
+  if [[ "${page}" == /* || "${page}" == '.' || "${page}" == '..' || "${page}" == */../* ||
+    "${page}" == ../* || "${page}" == */.. || "${page}" == *$'\n'* || "${page}" == *$'\r'* ]]; then
+    fail "${label}: path must be repository-relative and single-line: ${page}"
+    return
+  fi
+  if ! repository_path_is_real "${page}" || [[ ! -f "${repository_root}/${page}" ]]; then
+    fail "${label}: page is missing or crosses a symlink: ${page}"
+  fi
+}
+
 for ((index = 0; index < claim_count; index++)); do
   id="$(yq eval -r ".claims[${index}].id // \"\"" "${manifest}")"
   component="$(yq eval -r ".claims[${index}].component // \"\"" "${manifest}")"
@@ -166,6 +321,13 @@ for ((index = 0; index < claim_count; index++)); do
   [[ -n "${id}" && "${id}" != 'null' ]] || fail "claims[${index}].id: required"
   [[ -n "${component}" && "${component}" != 'null' ]] || fail "claims[${index}].component: required"
   [[ -n "${summary}" && "${summary}" != 'null' ]] || fail "claims[${index}].summary: required"
+
+  if [[ ! "${id}" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    fail "claims[${index}].id: must be a stable lowercase identifier"
+  fi
+  if [[ ! "${component}" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    fail "claims[${index}].component: must be a stable lowercase identifier"
+  fi
 
   if [[ -n "${id}" && "${id}" != 'null' ]]; then
     if [[ -n "${seen_ids[${id}]+present}" ]]; then
@@ -178,14 +340,18 @@ for ((index = 0; index < claim_count; index++)); do
     fail "claims[${index}].scope: expected hosted, privileged, kvm, or external; found ${scope:-<empty>}"
   fi
   if [[ "${allowed_statuses}" != *" ${status} "* ]]; then
-    fail "claims[${index}].status: expected verified or unverified; found ${status:-<empty>}"
+    fail "claims[${index}].status: expected verified, unverified, or blocked; found ${status:-<empty>}"
   fi
+
+  check_verification_page "${index}"
+  check_prerequisites "${index}"
+  check_gate "${index}" "${status}"
 
   evidence_type="$(yq eval -r ".claims[${index}].evidence | type" "${manifest}")"
   if [[ "${evidence_type}" != '!!map' ]]; then
     fail "claims[${index}].evidence: required map is missing"
   else
-    check_string_array "${index}" commands "claims[${index}].evidence.commands"
+    check_string_array "${index}" commands "claims[${index}].evidence.commands" "${status}"
     check_path_array "${index}" sources "claims[${index}].evidence.sources"
     check_path_array "${index}" tests "claims[${index}].evidence.tests"
   fi
@@ -195,8 +361,8 @@ for ((index = 0; index < claim_count; index++)); do
     fail "claims[${index}].residual_reasons: required sequence is missing"
   else
     reasons_length="$(yq eval -r ".claims[${index}].residual_reasons | length" "${manifest}")"
-    if [[ "${status}" == 'unverified' && "${reasons_length}" -eq 0 ]]; then
-      fail "claims[${index}].residual_reasons: unverified claims require a reason"
+    if [[ ( "${status}" == 'unverified' || "${status}" == 'blocked' ) && "${reasons_length}" -eq 0 ]]; then
+      fail "claims[${index}].residual_reasons: unverified or blocked claims require a reason"
     elif [[ "${status}" == 'verified' && "${reasons_length}" -ne 0 ]]; then
       fail "claims[${index}].residual_reasons: verified claims cannot carry residual reasons"
     fi

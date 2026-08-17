@@ -281,7 +281,8 @@ done
 
 # -------------------------------------------------------- platform -> manifest --
 
-mapfile -t gate_ids < <(yq eval '.gates[].id' "${manifest}")
+mapfile -t gate_ids < <(yq eval '.gates[] | select(.status == "implemented") | .id' "${manifest}")
+mapfile -t planned_gate_ids < <(yq eval '.gates[] | select(.status == "planned") | .id' "${manifest}")
 mapfile -t gitlab_job_names < <(yq eval '.gates[] | select(.gitlab != null) | .gitlab' "${manifest}")
 
 while IFS= read -r -d '' workflow_file; do
@@ -290,6 +291,10 @@ while IFS= read -r -d '' workflow_file; do
   while IFS= read -r job_id; do
     [[ -n "${job_id}" ]] || continue
     if contains "${job_id}" "${github_orchestration_jobs[@]}"; then
+      continue
+    fi
+    if contains "${job_id}" "${planned_gate_ids[@]}"; then
+      fail "${workflow_file}: planned gate '${job_id}' must not have a platform job"
       continue
     fi
     if contains "${job_id}" "${gate_ids[@]}"; then

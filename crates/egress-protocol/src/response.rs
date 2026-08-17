@@ -1673,6 +1673,50 @@ mod tests {
     }
 
     #[test]
+    fn canonical_chunk_boundaries_round_trip_after_wire_decode() {
+        // Requirement: every canonical response split remains request-bound,
+        // digest-bound, and byte-identical after each chunk crosses the wire.
+        // Boundary classes: empty body, one byte, just below/at/above a chunk
+        // payload boundary, and a response spanning three canonical chunks.
+        let body_lengths = [
+            0,
+            1,
+            MAX_RESPONSE_CHUNK_BYTES.saturating_sub(256),
+            MAX_RESPONSE_CHUNK_BYTES,
+            MAX_RESPONSE_CHUNK_BYTES.saturating_add(256),
+            MAX_RESPONSE_CHUNK_BYTES
+                .saturating_mul(2)
+                .saturating_add(17),
+        ];
+
+        for (value, body_length) in body_lengths.into_iter().enumerate() {
+            let fill = u8::try_from(value).expect("boundary fixture index must fit in one byte");
+            let response = public_with_body(vec![fill; body_length]);
+            let chunks = response.chunks().expect("bounded response must split");
+            assert!(!chunks.is_empty());
+            let expected_digest = chunks[0].digest();
+            assert!(chunks.iter().all(|chunk| {
+                chunk.request() == request()
+                    && chunk.digest() == expected_digest
+                    && chunk.total_length() > 0
+            }));
+
+            let encoded = chunks
+                .iter()
+                .map(|chunk| chunk.encode().expect("canonical chunk must encode"))
+                .collect::<Vec<_>>();
+            let decoded = encoded
+                .iter()
+                .map(|payload| {
+                    CanonicalResponseChunk::decode(payload).expect("canonical chunk must decode")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(decoded, chunks);
+            assert_eq!(CanonicalBrokerResponse::from_chunks(&decoded), Ok(response));
+        }
+    }
+
+    #[test]
     fn reassembly_distinguishes_missing_duplicate_and_reordered_chunks() {
         let response = public_with_body(vec![0x5a; MAX_RESPONSE_CHUNK_BYTES]);
         let chunks = response

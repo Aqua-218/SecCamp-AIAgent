@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
 # Applies the 13 isolation steps through the real `LinuxBackend` and asks the kernel what it
-# enforces against the isolated child.
+# enforces against the isolated child. The target also runs the production
+# `workload-isolation-launcher`, reaches the fixed workload through a real `execve`, and repeats
+# the hostile checks after exec. It also runs the real LinuxBackend mount-failure rollback probe.
 #
 # This is intentionally a privileged Linux verification job. Every other runtime-isolation test
 # drives a recording mock that never enters the kernel, so nothing else in this repository can
@@ -45,18 +47,23 @@ done
 cd -- "${repository_root}"
 
 # The target is `test = false`, so it is named explicitly rather than picked up by a default
-# test run. Its output is the record of which boundaries the kernel confirmed.
+# test run. Build the production launcher first: the hostile post-exec scenario executes this
+# exact binary, not a test-only substitute.
+cargo build --locked -p runtime-isolation --bin workload-isolation-launcher
+export RUNTIME_ISOLATION_LAUNCHER="${repository_root}/target/debug/workload-isolation-launcher"
+
+# Its output is the record of which boundaries the kernel confirmed.
 status=0
 output="$(cargo test --locked -p runtime-isolation --test privileged_isolation 2>&1)" || status=$?
 printf '%s\n' "${output}"
 
-if [[ "${status}" -ne 0 ]]; then
-  exit "${status}"
-fi
-
-if printf '%s' "${output}" | grep -q 'privileged runtime isolation verification unavailable'; then
+if printf '%s' "${output}" | grep -q 'privileged .*verification unavailable'; then
   printf '%s\n' 'privileged isolation verification did not run; refusing to report an unverified boundary as passed' >&2
   exit 2
+fi
+
+if [[ "${status}" -ne 0 ]]; then
+  exit "${status}"
 fi
 
 printf '%s\n' 'privileged isolation verification: boundary confirmed by the kernel'

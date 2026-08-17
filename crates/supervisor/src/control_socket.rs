@@ -472,9 +472,11 @@ fn send_error(error: rustix::io::Errno) -> ControlSocketError {
 /// "1 connection = 1 subject" a property of the transport instead of a check somebody can forget.
 #[derive(Debug)]
 pub struct SubjectControlListener {
-    socket: OwnedFd,
+    socket: Option<OwnedFd>,
     path: PathBuf,
+    parent_identity: SocketPathIdentity,
     path_identity: SocketPathIdentity,
+    remove_on_drop: bool,
     subject: SubjectId,
     credential: SubjectCredential,
     timeouts: ControlSocketTimeouts,
@@ -562,21 +564,60 @@ fn inspect_owned_socket(
     Ok(SocketPathIdentity::from_metadata(&metadata))
 }
 
-fn remove_owned_socket(path: &Path, identity: SocketPathIdentity) {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return;
+fn remove_owned_socket_checked(
+    path: &Path,
+    parent_identity: SocketPathIdentity,
+    identity: SocketPathIdentity,
+) -> Result<(), ControlSocketError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ControlSocketError::InvalidPath(path.to_path_buf()))?;
+    let parent_metadata = match std::fs::symlink_metadata(parent) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ControlSocketError::InvalidPath(path.to_path_buf()));
+        }
+        Err(error) => return Err(ControlSocketError::Io(error)),
     };
-    if !metadata.file_type().is_symlink()
-        && metadata.file_type().is_socket()
-        && SocketPathIdentity::from_metadata(&metadata) == identity
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || SocketPathIdentity::from_metadata(&parent_metadata) != parent_identity
     {
-        drop(std::fs::remove_file(path));
+        return Err(ControlSocketError::InvalidPath(path.to_path_buf()));
     }
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ControlSocketError::Io(error)),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || SocketPathIdentity::from_metadata(&metadata) != identity
+    {
+        return Err(ControlSocketError::InvalidPath(path.to_path_buf()));
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ControlSocketError::Io(error)),
+    }
+}
+
+fn remove_owned_socket(
+    path: &Path,
+    parent_identity: SocketPathIdentity,
+    identity: SocketPathIdentity,
+) {
+    drop(remove_owned_socket_checked(path, parent_identity, identity));
 }
 
 impl Drop for SubjectControlListener {
     fn drop(&mut self) {
-        remove_owned_socket(&self.path, self.path_identity);
+        if self.remove_on_drop {
+            remove_owned_socket(&self.path, self.parent_identity, self.path_identity);
+        }
     }
 }
 
@@ -648,17 +689,42 @@ impl SubjectControlListener {
             .and_then(|()| inspect_owned_socket(&path, parent_identity).map(|_| ()))
             .and_then(|()| listen(&socket, backlog).map_err(ControlSocketError::from));
         if let Err(error) = setup {
-            remove_owned_socket(&path, path_identity);
+            remove_owned_socket(&path, parent_identity, path_identity);
             return Err(error);
         }
         Ok(Self {
-            socket,
+            socket: Some(socket),
             path,
+            parent_identity,
             path_identity,
+            remove_on_drop: true,
             subject,
             credential,
             timeouts,
         })
+    }
+
+    fn active_socket(&self) -> Result<&OwnedFd, ControlSocketError> {
+        self.socket.as_ref().ok_or_else(|| {
+            ControlSocketError::Io(io::Error::other("control listener descriptor is closed"))
+        })
+    }
+
+    /// Reports whether this listener still has an open descriptor.
+    #[must_use]
+    pub(crate) fn is_open(&self) -> bool {
+        self.socket.is_some()
+    }
+
+    /// Closes the descriptor while retaining the owned socket node for unlink retry.
+    pub(crate) fn close_fd_preserving_path(&mut self) {
+        self.socket.take();
+        self.remove_on_drop = false;
+    }
+
+    /// Removes the socket node if it is still the exact node this listener created.
+    pub(crate) fn remove_owned_socket_node(&self) -> Result<(), ControlSocketError> {
+        remove_owned_socket_checked(&self.path, self.parent_identity, self.path_identity)
     }
 
     /// Returns the filesystem path this listener owns.
@@ -687,7 +753,7 @@ impl SubjectControlListener {
         &mut self,
         resolver: &mut SubjectCredentialResolver,
     ) -> Result<AcceptedControlConnection, ControlSocketError> {
-        let socket = accept(&self.socket)?;
+        let socket = accept(self.active_socket()?)?;
         let peer = socket_peercred(&socket)?;
         apply_socket_timeouts(&socket, self.timeouts)?;
         let socket_id = resolver.allocate(self.subject.clone(), self.credential)?;

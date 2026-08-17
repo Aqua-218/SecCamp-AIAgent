@@ -9,18 +9,20 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
-    io::{Read, Write},
+    io::{self, Read, Write},
+    net::Shutdown,
     os::fd::{AsFd, AsRawFd, OwnedFd},
     os::unix::net::UnixStream,
     os::unix::{ffi::OsStringExt, process::CommandExt},
     path::{Component, Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use runtime_isolation::{
     BindMountConfig, CgroupConfig, ChildExit, ChildStartupStatus, ControlChannelConfig,
-    EgressChannelConfig, IdentityMap, IsolationConfig, LandlockConfig, LinuxBackend, RootfsConfig,
-    RuntimeIsolation, SeccompPolicy, SpawnOutcome, TmpfsConfig,
+    EgressChannelConfig, ExecStatusChannelConfig, IdentityMap, IsolationConfig, LandlockConfig,
+    LinuxBackend, RootfsConfig, RuntimeIsolation, SeccompPolicy, SpawnOutcome, TmpfsConfig,
 };
 use rustix::{
     io::{FdFlags, fcntl_getfd, fcntl_setfd},
@@ -29,13 +31,14 @@ use rustix::{
 
 const LANDLOCK_ABI: u32 = 3;
 const ISOLATION_READY: &[u8; 8] = b"isolated";
+const EXEC_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+const EXEC_FAILED: [u8; 1] = [1];
 const EGRESS_BROKER_FD_ENV: &str = "EGRESS_BROKER_FD";
 const EGRESS_BROKER_SESSION_ENV: &str = "EGRESS_BROKER_SESSION_ID";
 
 #[derive(Debug)]
 struct LauncherConfig {
     isolation: IsolationConfig,
-    start_gate: PathBuf,
     control_socket: PathBuf,
     egress_broker_fd: i32,
     egress_broker_session: String,
@@ -57,10 +60,27 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), String> {
     let config = parse_config(env::args_os().skip(1))?;
-    let mut start_gate = wait_for_start_gate(&config.start_gate)?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut start_gate_input = stdin.lock();
+    let mut start_gate_output = stdout.lock();
+    wait_for_start_gate(&mut start_gate_input, &mut start_gate_output)?;
     let control_channel = connect_control_channel(&config.control_socket)?;
     let control_channel_fd = control_channel.as_raw_fd();
     preserve_for_workload(&control_channel, "supervisor control channel")?;
+    let (mut exec_status_reader, mut exec_status_writer) = UnixStream::pair()
+        .map_err(|error| format!("creating workload exec-status channel: {error}"))?;
+    exec_status_reader
+        .shutdown(Shutdown::Write)
+        .map_err(|error| format!("restricting workload exec-status reader: {error}"))?;
+    exec_status_writer
+        .shutdown(Shutdown::Read)
+        .map_err(|error| format!("restricting workload exec-status writer: {error}"))?;
+    exec_status_reader
+        .set_read_timeout(Some(EXEC_STATUS_TIMEOUT))
+        .map_err(|error| format!("bounding workload exec-status wait: {error}"))?;
+    require_close_on_exec(&exec_status_writer, "workload exec-status channel")?;
+    let exec_status_fd = exec_status_writer.as_raw_fd();
     let isolation = config
         .isolation
         .clone()
@@ -71,10 +91,19 @@ fn run() -> Result<(), String> {
         .with_egress_channel(
             EgressChannelConfig::new(config.egress_broker_fd)
                 .map_err(|error| format!("configuring egress Broker channel: {error}"))?,
+        )
+        .with_exec_status_channel(
+            ExecStatusChannelConfig::new(exec_status_fd)
+                .map_err(|error| format!("configuring workload exec-status channel: {error}"))?,
         );
     let mut backend = LinuxBackend::new();
-    match RuntimeIsolation::spawn_isolated(&mut backend, &isolation, |_| {
-        execute_workload(&config, control_channel_fd, config.egress_broker_fd)
+    match RuntimeIsolation::spawn_isolated(&mut backend, &isolation, move |_| {
+        execute_workload(
+            &config,
+            control_channel_fd,
+            config.egress_broker_fd,
+            &mut exec_status_writer,
+        )
     }) {
         Ok(SpawnOutcome::Parent(mut child)) => {
             match child
@@ -82,9 +111,20 @@ fn run() -> Result<(), String> {
                 .map_err(|error| format!("waiting for isolated workload startup: {error}"))?
             {
                 ChildStartupStatus::Ready(_) => {
-                    start_gate.write_all(ISOLATION_READY).map_err(|error| {
-                        format!("confirming isolated workload startup to parent: {error}")
-                    })?;
+                    wait_for_exec(&mut exec_status_reader)?;
+                    if let Some(exit) = child.try_wait().map_err(|error| {
+                        format!("checking workload immediately after exec: {error}")
+                    })? {
+                        return Err(format!(
+                            "isolated workload exited before its exec acknowledgement was delivered: {exit:?}"
+                        ));
+                    }
+                    start_gate_output
+                        .write_all(ISOLATION_READY)
+                        .and_then(|()| start_gate_output.flush())
+                        .map_err(|error| {
+                            format!("confirming executed workload startup to parent: {error}")
+                        })?;
                 }
                 ChildStartupStatus::Failed(failure) => {
                     return Err(format!(
@@ -145,22 +185,45 @@ fn preserve_for_workload(descriptor: impl AsFd, label: &str) -> Result<(), Strin
         .map_err(|error| format!("preserving {label} descriptor: {error}"))
 }
 
-fn wait_for_start_gate(path: &Path) -> Result<UnixStream, String> {
-    let mut gate = UnixStream::connect(path).map_err(|error| {
-        format!(
-            "connecting to parent-controlled workload start gate {}: {error}",
-            path.display()
-        )
-    })?;
-    gate.write_all(b"ready")
+fn require_close_on_exec(descriptor: impl AsFd, label: &str) -> Result<(), String> {
+    let descriptor_flags = fcntl_getfd(&descriptor)
+        .map_err(|error| format!("reading {label} descriptor flags: {error}"))?;
+    fcntl_setfd(&descriptor, descriptor_flags | FdFlags::CLOEXEC)
+        .map_err(|error| format!("making {label} close on exec: {error}"))
+}
+
+fn wait_for_start_gate(input: &mut impl Read, output: &mut impl Write) -> Result<(), String> {
+    output
+        .write_all(b"ready")
+        .and_then(|()| output.flush())
         .map_err(|error| format!("announcing workload start-gate readiness: {error}"))?;
     let mut release = [0_u8; 1];
-    gate.read_exact(&mut release)
+    input
+        .read_exact(&mut release)
         .map_err(|error| format!("waiting for workload start-gate release: {error}"))?;
     if release == [1] {
-        Ok(gate)
+        Ok(())
     } else {
         Err("parent refused workload start-gate release".to_owned())
+    }
+}
+
+fn wait_for_exec(reader: &mut impl Read) -> Result<(), String> {
+    let mut marker = [0_u8; 1];
+    loop {
+        match reader.read(&mut marker) {
+            Ok(0) => return Ok(()),
+            Ok(_) if marker == EXEC_FAILED => {
+                return Err("isolated workload reported that execve failed".to_owned());
+            }
+            Ok(_) => return Err("isolated workload sent an invalid exec-status marker".to_owned()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                return Err(format!(
+                    "waiting for the isolated workload to reach execve: {error}"
+                ));
+            }
+        }
     }
 }
 
@@ -168,6 +231,7 @@ fn execute_workload(
     config: &LauncherConfig,
     control_channel_fd: i32,
     egress_broker_fd: i32,
+    exec_status: &mut impl Write,
 ) -> Result<(), String> {
     let error = Command::new(&config.program)
         .args(&config.arguments)
@@ -181,10 +245,17 @@ fn execute_workload(
         // this transaction. Do not reopen `/dev/null` here: the device tree is intentionally
         // hidden before the workload is execed.
         .exec();
-    Err(format!(
+    let detail = format!(
         "execing configured workload {} after isolation: {error}",
         config.program.display()
-    ))
+    );
+    exec_status
+        .write_all(&EXEC_FAILED)
+        .and_then(|()| exec_status.flush())
+        .map_err(|status_error| {
+            format!("{detail}; reporting exec failure to launcher also failed: {status_error}")
+        })?;
+    Err(detail)
 }
 
 #[allow(clippy::similar_names, clippy::too_many_lines)]
@@ -203,7 +274,6 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
     let pids_max = required_u64(&mut arguments, "--pids-max")?;
     let host_uid = required_u32(&mut arguments, "--host-uid")?;
     let host_gid = required_u32(&mut arguments, "--host-gid")?;
-    let start_gate = required_path(&mut arguments, "--start-gate")?;
     let control_socket = required_path(&mut arguments, "--control-socket")?;
     let egress_broker_fd = required_descriptor(&mut arguments, "--egress-broker-fd")?;
     let egress_broker_session = required_identity(&mut arguments, "--egress-broker-session")?;
@@ -256,7 +326,6 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Launche
 
     Ok(LauncherConfig {
         isolation,
-        start_gate,
         control_socket,
         egress_broker_fd,
         egress_broker_session,
@@ -400,7 +469,7 @@ fn is_absolute_lexical_path(path: &Path) -> bool {
 }
 
 fn usage() -> String {
-    "usage: workload-isolation-launcher --rootfs-source <absolute-path> --rootfs-mount-target <absolute-path> --old-root <absolute-path> --workspace-source <absolute-path> --workspace-target <absolute-path> --tmpfs-target <absolute-path> --tmpfs-size-bytes <u64> --cgroup-root <absolute-path> --cgroup-name <safe-name> --memory-max-bytes <u64> --pids-max <u64> --host-uid <u32> --host-gid <u32> --start-gate <absolute-path> --control-socket <absolute-path> --egress-broker-fd <fd> --egress-broker-session <identity> --landlock-read-only <absolute-path>... --landlock-writable <absolute-path>... [--env NAME=VALUE]... --program <absolute-path> -- [arguments...]".to_owned()
+    "usage: workload-isolation-launcher --rootfs-source <absolute-path> --rootfs-mount-target <absolute-path> --old-root <absolute-path> --workspace-source <absolute-path> --workspace-target <absolute-path> --tmpfs-target <absolute-path> --tmpfs-size-bytes <u64> --cgroup-root <absolute-path> --cgroup-name <safe-name> --memory-max-bytes <u64> --pids-max <u64> --host-uid <u32> --host-gid <u32> --control-socket <absolute-path> --egress-broker-fd <fd> --egress-broker-session <identity> --landlock-read-only <absolute-path>... --landlock-writable <absolute-path>... [--env NAME=VALUE]... --program <absolute-path> -- [arguments...]".to_owned()
 }
 
 #[cfg(test)]
@@ -435,8 +504,6 @@ mod tests {
             "1000",
             "--host-gid",
             "1000",
-            "--start-gate",
-            "/run/supervisor/start-gate.sock",
             "--control-socket",
             "/run/supervisor/subject-a.sock",
             "--egress-broker-fd",
@@ -517,5 +584,23 @@ mod tests {
         arguments[index] = OsString::from("00112233445566778899AABBCCDDEEFF");
         let error = parse_config(arguments).expect_err("upper-case identity must be refused");
         assert!(error.contains("non-zero lower hexadecimal identity"));
+    }
+
+    #[test]
+    fn start_gate_uses_exact_inherited_streams() {
+        let mut input = io::Cursor::new(vec![1]);
+        let mut output = Vec::new();
+        wait_for_start_gate(&mut input, &mut output).expect("release marker must open the gate");
+        assert_eq!(output, b"ready");
+
+        let mut refused = io::Cursor::new(vec![0]);
+        assert!(wait_for_start_gate(&mut refused, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn exec_status_accepts_only_close_without_a_failure_marker() {
+        assert!(wait_for_exec(&mut io::Cursor::new(Vec::<u8>::new())).is_ok());
+        assert!(wait_for_exec(&mut io::Cursor::new(EXEC_FAILED)).is_err());
+        assert!(wait_for_exec(&mut io::Cursor::new([7])).is_err());
     }
 }

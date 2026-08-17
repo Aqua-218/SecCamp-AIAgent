@@ -121,13 +121,22 @@ matrices:
   isolation_packages:
     source: packages
 
-  # `cargo check` never links, so a cross target needs only the std component.
-  # deny.toml already carries the same triples for its advisory graph.
+  # `cargo check` does not link the final Rust binaries, but native build scripts
+  # (notably ring's C/assembly boundary) still need a target C compiler. Keep the
+  # Debian package and compiler name beside the triple so both CI platforms use
+  # the same toolchain contract. deny.toml carries the same triples for its
+  # advisory graph.
   cross_targets:
     values:
       - triple: aarch64-unknown-linux-gnu
+        cc: aarch64-linux-gnu-gcc
+        linker: aarch64-linux-gnu-gcc
+        debian_package: gcc-aarch64-linux-gnu
         why: Non-x86 host support for the supervisor and authority kernel.
       - triple: x86_64-unknown-linux-musl
+        cc: musl-gcc
+        linker: musl-gcc
+        debian_package: musl-tools
         why: Static-linkage target; catches glibc-only assumptions in the syscall layer.
 
   # Miri interprets Rust; it cannot execute the real syscalls that the isolation
@@ -136,23 +145,59 @@ matrices:
   miri_packages:
     values:
       - package: authority-core
-        why: Durable audit framing and GitHub metadata hold the pointer-level unsafe.
+        filter: capability::tests
+        why: Pure capability matching and delegation invariants run under Miri isolation.
+      - package: authority-core
+        filter: file::tests
+        why: Pure file-authority containment and effect-set invariants run under Miri isolation.
+      - package: authority-core
+        filter: github::tests
+        why: Pure GitHub authority containment and branch grammar run under Miri isolation.
+      - package: authority-core
+        filter: http::tests
+        why: Pure canonical host, URL, and HTTP authority checks run under Miri isolation.
+      - package: authority-core
+        filter: path::tests
+        why: Pure canonical repository path and pattern checks run under Miri isolation.
+      - package: authority-core
+        filter: policy::tests
+        why: Pure policy digest encoding and stability checks run under Miri isolation.
+      - package: authority-core
+        filter: repository::tests
+        why: Pure repository identity checks run under Miri isolation.
+      - package: authority-core
+        filter: state::tests
+        why: Pure capability state transition checks run under Miri isolation.
+      - package: authority-core
+        filter: time::tests
+        why: Pure time-window containment checks run under Miri isolation.
       - package: egress-protocol
-        why: Length-prefixed frame and canonical CBOR decoding of untrusted bytes.
+        filter: budget::tests
+        why: Pure budget accounting and exhaustion checks run under Miri isolation.
+      - package: egress-protocol
+        filter: cbor::tests
+        why: Canonical CBOR decoding of untrusted bytes runs under Miri isolation.
+      - package: egress-protocol
+        filter: frame::tests
+        why: Length-prefixed frame validation runs under Miri isolation.
+      - package: egress-protocol
+        filter: operation::tests
+        why: Closed operation conversion checks run under Miri isolation.
+      - package: egress-protocol
+        filter: session::tests
+        why: Session replay and payload-hash checks run under Miri isolation.
 
   # LeakSanitizer is implied by AddressSanitizer; ThreadSanitizer needs an
   # instrumented std (`-Zbuild-std`) and is deliberately not run here.
   sanitizer_modes:
     values:
       - mode: address
-        package: capfs
-      - mode: address
-        package: runtime-isolation
+        package: egress-protocol
       - mode: leak
-        package: egress-broker
+        package: egress-protocol
 
-  # libFuzzer targets live in crates/*/fuzz. See docs/ci-cd.md for the one-time
-  # lockfile bootstrap they require.
+  # libFuzzer targets live in the separate root fuzz workspace. Its committed
+  # lockfile and seed corpora keep the bounded CI runs reproducible.
   fuzz_targets:
     values:
       - package: egress-protocol
@@ -232,12 +277,11 @@ gates:
     stage: validate
     tier: fast
     scopes: [always]
-    status: planned
-    why_planned: No script validates commit message shape; the convention lives only in review.
-    github: null
-    gitlab: null
-    workflow: null
-    include: null
+    status: implemented
+    github: commit_policy
+    gitlab: commit_policy
+    workflow: ci.yml
+    include: validate.yml
 
   - id: repository_hygiene
     title: Repository hygiene
@@ -322,12 +366,11 @@ gates:
     stage: quality
     tier: fast
     scopes: [rust]
-    status: planned
-    why_planned: cargo-public-api is not pinned in install-cargo-tools.sh and no baseline is committed.
-    github: null
-    gitlab: null
-    workflow: null
-    include: null
+    status: implemented
+    github: api_surface
+    gitlab: api_surface
+    workflow: ci.yml
+    include: validate.yml
 
   - id: crate_isolation
     title: Per-crate isolation build
@@ -416,28 +459,26 @@ gates:
     stage: verify
     tier: deep
     scopes: [rust]
-    status: planned
-    why_planned: Miri needs a pinned nightly toolchain that rust-toolchain.toml does not provide.
+    status: implemented
     matrix: miri_packages
-    github: null
-    gitlab: null
-    workflow: null
-    include: null
+    github: miri
+    gitlab: miri
+    workflow: deep.yml
+    include: deep.yml
 
   - id: sanitizers
     title: Sanitizer run
     stage: verify
     tier: deep
     scopes: [rust]
-    status: planned
-    why_planned: Sanitizers need a pinned nightly toolchain that rust-toolchain.toml does not provide.
+    status: implemented
     matrix: sanitizer_modes
+    github: sanitizers
+    gitlab: sanitizers
+    workflow: deep.yml
+    include: deep.yml
 
   # ----------------------------------------------------------------- analyze --
-    github: null
-    gitlab: null
-    workflow: null
-    include: null
   - id: coverage
     title: Workspace coverage
     stage: analyze
@@ -454,40 +495,37 @@ gates:
     stage: analyze
     tier: deep
     scopes: [rust]
-    status: planned
-    why_planned: cargo-mutants is not pinned in install-cargo-tools.sh.
+    status: implemented
     matrix: mutation_shards
-    github: null
-    gitlab: null
-    workflow: null
-    include: null
+    github: mutation
+    gitlab: mutation
+    workflow: deep.yml
+    include: deep.yml
 
   - id: fuzz
     title: Fuzz targets
     stage: analyze
     tier: deep
     scopes: [rust]
-    status: planned
-    why_planned: The workspace contains no fuzz targets for the reserved matrix to run.
+    status: implemented
     matrix: fuzz_targets
-    github: null
-    gitlab: null
-    workflow: null
-    include: null
+    github: fuzz
+    gitlab: fuzz
+    workflow: deep.yml
+    include: deep.yml
 
   - id: benchmarks
     title: Benchmark regression
     stage: analyze
     tier: deep
     scopes: [rust]
-    status: planned
-    why_planned: The workspace contains no benches and no committed baseline to regress against.
+    status: implemented
+    github: benchmarks
+    gitlab: benchmarks
+    workflow: deep.yml
+    include: deep.yml
 
   # ---------------------------------------------------------------- delivery --
-    github: null
-    gitlab: null
-    workflow: null
-    include: null
   - id: release_dry_run
     title: Release dry run
     stage: delivery

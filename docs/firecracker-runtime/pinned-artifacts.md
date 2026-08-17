@@ -6,7 +6,7 @@
 
 > **対象読者:** boot artifact を差し替える運用担当者、供給経路をレビューする人
 
-VM を起動するのに必要な実行ファイルと image は 6 つある。firecracker、jailer、kernel、rootfs、dm-verity hash image、seccomp filter。[`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) はこの 6 つ全てを `PinnedArtifact`、つまり path と SHA-256 digest の組として受け取る。
+`RuntimeConfig` の起動 profile に含まれる実行ファイルと image は 8 つある。firecracker、kernel、rootfs、dm-verity hash image、veritysetup、workspace image formatter、jailer、seccomp filter。[`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) はこの 8 つ全てを `PinnedArtifact`、つまり path と SHA-256 digest の組として受け取る。crash recovery の `RecoveryTools` はこれとは別に `veritysetup` と `dmsetup` を pinned artifact として検証する。
 
 ## path だけで指定すると何が起きるか
 
@@ -18,13 +18,13 @@ digest を持っていれば、起動前に読んで照合できる。
 fn validate_artifact(label: &str, artifact: &PinnedArtifact) -> ...
 ```
 
-`Runtime::launch` は `config.validate()` の直後に `verify_artifacts(config)` を呼ぶ。ここで 6 つ全部を読み、`sha256()` の結果と `PinnedArtifact` の digest を比較する。1 つでも合わなければ、workspace を clone する前、dm-verity を開く前、jailer を起動する前に止まる。
+`Runtime::launch` は `config.validate()` の直後に `verify_artifacts(config)` を呼ぶ。ここで 8 つ全部を読み、`sha256()` の結果と `PinnedArtifact` の digest を比較する。1 つでも合わなければ、workspace を clone する前、dm-verity を開く前、jailer を起動する前に止まる。
 
 ```mermaid
 flowchart TB
     start["launch(config)"] --> val["config.validate()<br/>純粋関数、副作用なし"]
     val -->|InvalidConfig| stop1["中断"]
-    val --> ver["verify_artifacts()<br/>6 artifact を読んで digest 照合"]
+    val --> ver["verify_artifacts()<br/>8 artifact を読んで digest 照合"]
     ver -->|DigestMismatch| stop2["中断<br/>まだ何も作っていない"]
     ver --> clone["workspace clone"]
     clone --> verity["dm-verity open"]
@@ -95,11 +95,10 @@ snapshot の互換性判定が 1 つの digest 比較になっているので、
 
 ## 正確な保証範囲
 
-digest 照合が保証するのは、`verify_artifacts` を実行した時点で、指定 path の内容が指定 digest と一致していたことだけ。
+`verify_artifacts` は指定 path の digest を side effect の前に照合する。さらに、digest 付きで実行する host command と recovery tool は、実行時に `O_NOFOLLOW` で開いた regular file を sealed executable memfd へコピーし、`/proc/self/fd/<n>` を program として起動する。`RealCommandRunner` / detached launcher は ambient environment を `env_clear()` で消す。このため、以前の「照合後に path を再解決するため TOCTOU が残る」という説明は現状実装には当たらない。
 
-- 照合と実行の間に file が差し替わる余地は残る。TOCTOU を閉じるには fd を保持して同じ fd から exec する必要があるが、jailer 経由の起動ではそれができていない。
-- digest が正しいことは、その artifact が安全であることを意味しない。信頼するのは供給元であって、この crate は同一性しか見ていない。
-- dm-verity mapping が実際に作られ、hash tree の検証が有効になっていることは未検証。`open_verity` は fake command runner 越しにしか実行していない。
+- digest 照合と memfd sealing は artifact の同一性を保証するが、artifact 自体の供給元・安全性は証明しない。信頼するのは供給元であり、この crate は同一性しか見ていない。
+- 実 `veritysetup` / `dmsetup` の mapping と hash-tree 検証、jailer 配下での実起動は未検証。pinned command の no-follow・memfd・環境消去は実装済みだが、実 helper と kernel mapper の効果まではこの crate の local test で証明していない。
 - `sha2` crate の実装の正しさは仮定している。test vector 2 本では、実装が壊れていないことの弱い証拠にしかならない。
 - config fingerprint の計算対象が「変わったら snapshot を無効にすべき全項目」を漏れなく含んでいることは、証明していない。
 

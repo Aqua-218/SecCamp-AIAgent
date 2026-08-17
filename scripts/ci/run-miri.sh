@@ -47,6 +47,15 @@ readonly nightly_toolchain="$(scripts/ci/install-nightly-toolchain.sh)"
 printf 'Miri: package=%s filter=%s toolchain=%s\n' \
   "${package}" "${test_filter}" "${nightly_toolchain}"
 
+listed_tests="$(
+  cargo test --locked --package "${package}" --lib "${test_filter}" -- --list
+)"
+readonly listed_tests
+if ! grep -qE ': test$' <<< "${listed_tests}"; then
+  printf 'Miri filter selected no tests: %s %s\n' "${package}" "${test_filter}" >&2
+  exit 1
+fi
+
 # Do not disable Miri isolation. These tests are deliberately pure; disabling
 # isolation would turn a passing check into a test of the host filesystem.
 RUSTUP_TOOLCHAIN="${nightly_toolchain}" \

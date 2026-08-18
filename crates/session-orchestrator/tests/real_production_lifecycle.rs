@@ -55,6 +55,7 @@ const GUEST_CID: u32 = 42;
 const GUEST_CONTROL_PORT: u32 = 19_002;
 const BROKER_PORT: u32 = 19_001;
 const API_TIMEOUT: Duration = Duration::from_secs(10);
+const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(50);
 const CGROUP_MEMORY_MAX: u64 = 768 * 1024 * 1024;
 const CGROUP_CPU_QUOTA: u64 = 100_000;
 const CGROUP_CPU_PERIOD: u64 = 100_000;
@@ -82,10 +83,30 @@ impl TemporaryDirectory {
         // The jailer puts API/vsock sockets below this directory. Keep the component short so
         // the resulting Unix socket paths stay below SUN_LEN even when the wrapper uses a
         // private parent such as `/root/so.XXXXXX`.
-        let path = parent.join(format!("s-{}", std::process::id()));
-        fs::create_dir(&path).unwrap_or_else(|error| {
+        let fixed_name = std::env::var("REAL_SESSION_FIXED_DIRECTORY").ok();
+        if let Some(name) = fixed_name.as_deref() {
+            assert!(
+                !name.is_empty()
+                    && name.len() <= 48
+                    && name.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'-'),
+                "REAL_SESSION_FIXED_DIRECTORY must be a bounded lowercase identifier"
+            );
+        }
+        let path = fixed_name.map_or_else(
+            || parent.join(format!("s-{}", std::process::id())),
+            |name| parent.join(name),
+        );
+        fs::create_dir_all(&path).unwrap_or_else(|error| {
             panic!("cannot create private real lifecycle staging directory: {error}")
         });
+        let metadata = fs::symlink_metadata(&path)
+            .expect("real lifecycle staging directory must remain inspectable");
+        assert!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "real lifecycle staging path must remain a non-symlink directory"
+        );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
             .expect("real lifecycle staging directory must be private");
         Self { path }
@@ -238,7 +259,7 @@ fn runtime_profile(
         },
         PathBuf::from,
     );
-    fs::create_dir(&cgroup_parent).unwrap_or_else(|error| {
+    fs::create_dir_all(&cgroup_parent).unwrap_or_else(|error| {
         panic!(
             "cannot create production session cgroup parent {}: {error}",
             cgroup_parent.display()
@@ -391,7 +412,10 @@ fn capture_clean_snapshot(root: &Path, config: &RuntimeConfig) -> (PathBuf, Path
 }
 
 fn wait_for_clean_guest_control_listener(config: &RuntimeConfig) {
-    let deadline = Instant::now() + API_TIMEOUT;
+    // Repeated KVM boots on a loaded protected runner can take longer than an
+    // individual Firecracker API call. Keep the readiness budget aligned with
+    // the production guest-control window while retaining a hard upper bound.
+    let deadline = Instant::now() + GUEST_READY_TIMEOUT;
     loop {
         let mut probe = FirecrackerVsockApiClient::new(
             &config.vsock.uds_path,
@@ -544,11 +568,16 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
     let identity_ledger = durability_root.join("identity.ledger");
     let recovery_journal = durability_root.join("session-recovery.wal");
     let authority_wal = durability_root.join("authority.wal");
+    let authority_mode = if authority_wal.exists() {
+        AuthorityAuditMode::OpenExisting(authority_wal.clone())
+    } else {
+        AuthorityAuditMode::CreateNew(authority_wal.clone())
+    };
     let config = ProductionSessionConfig::new(
         ProductionDurabilityConfig::new(
             &identity_ledger,
             &recovery_journal,
-            AuthorityAuditMode::CreateNew(authority_wal.clone()),
+            authority_mode,
             &broker_wal_root,
         ),
         IssuerId::new("real-session-owner-lifecycle"),

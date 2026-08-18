@@ -53,7 +53,12 @@ plan の object ID は 40 文字（SHA-1）または 64 文字（SHA-256）の h
 
 installation から選ぶのは `CredentialHandle` で、これは token ではない。token bytes へ変換する API も持たない。
 
-production の `RustlsGitHubProvider` は host adapter の内側だけで環境変数 `EGRESS_GITHUB_TOKEN` を読む。`Debug` 実装は token を `<redacted>` と表示する。redirect と proxy 探索は無効。
+production の `RustlsGitHubProvider` はhost adapterの内側だけでsystemd credential
+`github-token`を読む。`CREDENTIALS_DIRECTORY`が宣言されている場合はこの経路が必須で、
+欠損・unsafe file・読取失敗をambient `EGRESS_GITHUB_TOKEN`へfallbackしない。非systemd実行時だけ
+環境変数を明示的fallbackとして使う。credentialはsymlinkを一切たどらないdescriptorで開き、
+regular file、単一link、4 KiB上限、読取前後のinode/size/owner/mode/mtime/ctimeを照合する。
+`Debug` 実装は token を `<redacted>` と表示する。redirect と proxy 探索は無効。
 
 token が現れない場所を並べると次のとおり。
 
@@ -111,7 +116,8 @@ scripts/ci/verify-live-github.sh
 
 | 環境変数 | 用途 |
 |---|---|
-| `EGRESS_GITHUB_TOKEN` | host-only GitHub credential。test は `RustlsGitHubProvider::from_environment` だけで読む |
+| `CREDENTIALS_DIRECTORY/github-token` | 優先されるsystemd credential。directory宣言時は必須で、環境変数へ降格しない |
+| `EGRESS_GITHUB_TOKEN` | 非systemd実行だけのhost-only fallback。test は `RustlsGitHubProvider::from_environment` だけで読む |
 | `EGRESS_GITHUB_INSTALLATION_ID` | exact GitHub App installation identity |
 | `EGRESS_GITHUB_DISPOSABLE_REPOSITORY` | mutation 対象の exact `owner/name` |
 | `EGRESS_GITHUB_BASE_BRANCH` / `EGRESS_GITHUB_HEAD_BRANCH` | exact base/head branch |
@@ -133,7 +139,7 @@ token の権限全体ではなく 2 操作分だけが guest に見える。新�
 
 ## 正確な保証範囲
 
-`TypedGitHubAdapter` と fake provider による module test で、opaque credential、publish plan、rate-limit metadata、provider 呼び出し前の拒否、branch route の encoding、応答 budget を検証している。credential validator の欠損 / 制御文字拒否と、provider `Debug` / typed error の token redact も local test で確認している。
+`TypedGitHubAdapter` と fake provider による module test で、opaque credential、publish plan、rate-limit metadata、provider 呼び出し前の拒否、branch route の encoding、応答 budget を検証している。credential validator の欠損 / 制御文字拒否、systemd credentialのdescriptor固定・link拒否・優先順位、provider `Debug` / typed error の token redact も local test で確認している。
 
 - ignored `live_github_disposable_repository_smoke` と `scripts/ci/verify-live-github.sh` は実 GitHub API、認証、応答形式、expected-old conflict、typed pull-request success を検査する。ただし、保護された disposable credential を使った実行 evidence はこの checkout には無く、live provider の status は未検証のままである。
 - 実環境変数と実 credential の読み込み経路は、必要な環境変数を揃えた opt-in gate のみが実行する。通常の local test は token を読まない。

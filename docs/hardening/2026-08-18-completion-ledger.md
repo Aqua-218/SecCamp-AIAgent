@@ -67,6 +67,7 @@ can reach the 9.8 exit threshold only with the gate in the final column above.
 | 3 runtime variance | high-risk raw syscalls, 20 full privileged repetitions, two pinned Firecracker releases | 9.7 | 9.2 | 9.7 | 9.6 | 9.1 | 9.4 | 9.0 | 9.6 | 9.7 | 9.8 | continue: real aarch64, privileged TCB, and multi-session remain |
 | 4 control surfaces | sealed command construction, HMAC admission, durable quotas/no-reuse, controller fencing, signed-review import | 9.8 | 9.1 | 9.7 | 9.5 | 9.3 | 9.4 | 9.0 | 9.7 | 9.8 | 9.8 | continue: production helper/worker integration and external evidence remain |
 | 5 fail-closed challenge | transient journal path loss, pre-effect revalidation, fork/exec lock inheritance, readiness timing, worker health cleanup, signed report/disposition digest binding | 9.8 | 9.2 | 9.8 | 9.7 | 9.4 | 9.5 | 9.0 | 9.8 | 9.8 | 9.8 | stop: remaining gaps require new architecture, hardware, credentials, or an independent reviewer |
+| 6 operational replay | all 11 KVM crash points, panic fallback cleanup, stale mapper/loop/cgroup residue, post-run host probe | 9.8 | 9.2 | 9.8 | 9.8 | 9.7 | 9.6 | 9.1 | 9.8 | 9.8 | 9.8 | stop: every locally satisfiable track is green; only declared external/architectural ceilings remain |
 
 ## External ceilings
 

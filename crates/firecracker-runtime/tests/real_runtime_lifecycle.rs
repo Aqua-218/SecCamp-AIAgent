@@ -168,6 +168,8 @@ fn configure_test_profile() -> (tempfile::TempDir, RuntimeConfig, PathBuf) {
     let veritysetup = required_path("REAL_VERITYSETUP");
     let formatter = required_path("REAL_WORKSPACE_FORMATTER");
     let seccomp = required_path("REAL_FIRECRACKER_SECCOMP");
+    let seccomp_policy = required_path("REAL_FIRECRACKER_SECCOMP_POLICY");
+    let seccomp_compiler = required_path("REAL_FIRECRACKER_SECCOMP_COMPILER");
     let root_hash = required_root_hash();
     let clone_id = required_lifecycle_name("REAL_RUNTIME_LIFECYCLE_CLONE_ID");
     let mapper_name = required_lifecycle_name("REAL_RUNTIME_LIFECYCLE_MAPPER_NAME");
@@ -276,15 +278,21 @@ fn configure_test_profile() -> (tempfile::TempDir, RuntimeConfig, PathBuf) {
                 cpu_period_micros: CGROUP_CPU_PERIOD,
             },
             seccomp: SeccompConfig {
+                compiler: PinnedArtifact::new(
+                    &seccomp_compiler,
+                    sha256(&fs::read(&seccomp_compiler).unwrap()),
+                ),
                 filter: jail_seccomp,
+                policy: PinnedArtifact::new(
+                    &seccomp_policy,
+                    sha256(&fs::read(&seccomp_policy).unwrap()),
+                ),
                 blocked_syscalls: [
                     "bpf",
-                    "connect",
                     "mount",
                     "perf_event_open",
                     "ptrace",
                     "setns",
-                    "socket",
                     "unshare",
                 ]
                 .into_iter()

@@ -64,7 +64,7 @@ flowchart TB
     class file,urandom data;
 ```
 
-この crate が直接触る I/O は ledger file と `/dev/urandom` だけ。残りは全部 trait 越しで、紫の継ぎ目に test の fake が入る。
+この crate が直接触る I/O はidentity/recovery/control journalと`/dev/urandom`である。残りは全部trait越しで、紫の継ぎ目にtestのfakeが入る。図は一つのworker内部を示す。複数workerを所有する`control_plane` coreは別層であり、production control daemonにはまだ接続していない。
 
 ## 文書一覧
 
@@ -74,6 +74,7 @@ flowchart TB
 | [identity と ledger](identity-ledger.md) | [`lib.rs`](../../crates/session-orchestrator/src/lib.rs) | 7 つの identity、on-disk format、durability 順序、排他所有 |
 | [lease の binding](lease-binding.md) | [`lib.rs`](../../crates/session-orchestrator/src/lib.rs) | backend が返す lease の照合、型で守る順序 |
 | [production backend 契約](contracts.md) | [`authority_backend.rs`](../../crates/session-orchestrator/src/authority_backend.rs) ほか | adapter 実装者の義務 |
+| multi-session scheduler core | [`control_plane.rs`](../../crates/session-orchestrator/src/control_plane.rs) | HMAC admission、quota、durable no-reuse、controller fencing、restart reconciliation |
 | [検証対応表](verification.md) | — | mock で見た範囲と、実機・並行性で未検証の範囲 |
 
 ## 特に注意する点

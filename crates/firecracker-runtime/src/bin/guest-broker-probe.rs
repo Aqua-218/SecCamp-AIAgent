@@ -14,6 +14,7 @@ use std::{
     os::fd::{FromRawFd, IntoRawFd, OwnedFd},
     os::unix::fs::{PermissionsExt, symlink},
     path::Path,
+    thread,
 };
 
 use authority_core::http::{CanonicalHost, CanonicalUrlPath, HttpFetchMethod, HttpFetchRequest};
@@ -58,7 +59,7 @@ fn run() -> Result<(), String> {
         env::var(SUPERVISOR_READINESS_ENV).ok().as_deref(),
         &mut io::stdout().lock(),
     )?;
-    let transport = parse_transport(env::args().skip(1))?;
+    let (transport, hold) = parse_transport(env::args().skip(1))?;
     exercise_capfs_if_present()?;
     let session = match transport {
         Transport::Inherited => broker_session_from_environment()?,
@@ -84,6 +85,11 @@ fn run() -> Result<(), String> {
         return Err(
             "host did not return the expected detail-free authorization rejection".to_owned(),
         );
+    }
+    if hold {
+        loop {
+            thread::park();
+        }
     }
     Ok(())
 }
@@ -176,22 +182,34 @@ fn signal_supervisor_readiness(
     }
 }
 
-fn parse_transport(mut arguments: impl Iterator<Item = String>) -> Result<Transport, String> {
-    let Some(flag) = arguments.next() else {
-        return Ok(Transport::Inherited);
+fn parse_transport(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(Transport, bool), String> {
+    let mut transport = Transport::Inherited;
+    let mut next = arguments.next();
+    if next.as_deref() == Some("--port") {
+        let port = arguments
+            .next()
+            .ok_or_else(usage)?
+            .parse::<u32>()
+            .map_err(|_| usage())?;
+        if port == 0 || port == u32::MAX {
+            return Err(usage());
+        }
+        transport = Transport::DirectVsock(port);
+        next = arguments.next();
+    }
+    let hold = if next.as_deref() == Some("--hold-after-probe") {
+        true
+    } else if next.is_some() {
+        return Err(usage());
+    } else {
+        false
     };
-    if flag != "--port" {
+    if arguments.next().is_some() {
         return Err(usage());
     }
-    let port = arguments
-        .next()
-        .ok_or_else(usage)?
-        .parse::<u32>()
-        .map_err(|_| usage())?;
-    if port == 0 || port == u32::MAX || arguments.next().is_some() {
-        return Err(usage());
-    }
-    Ok(Transport::DirectVsock(port))
+    Ok((transport, hold))
 }
 
 fn open_transport(transport: Transport) -> Result<OwnedFd, String> {
@@ -262,7 +280,7 @@ fn broker_session_from_environment() -> Result<BrokerSessionId, String> {
 
 fn usage() -> String {
     format!(
-        "usage: guest-broker-probe [--port <1..{}>] (without --port requires the inherited Broker channel)",
+        "usage: guest-broker-probe [--port <1..{}>] [--hold-after-probe] (without --port requires the inherited Broker channel)",
         u32::MAX - 1
     )
 }
@@ -278,7 +296,7 @@ mod tests {
     fn accepts_one_explicit_non_wildcard_port() {
         assert_eq!(
             parse_transport(["--port".to_owned(), "18081".to_owned()].into_iter()),
-            Ok(Transport::DirectVsock(18081))
+            Ok((Transport::DirectVsock(18081), false))
         );
     }
 
@@ -286,8 +304,17 @@ mod tests {
     fn uses_the_inherited_broker_channel_without_arguments() {
         assert_eq!(
             parse_transport(std::iter::empty()),
-            Ok(Transport::Inherited)
+            Ok((Transport::Inherited, false))
         );
+    }
+
+    #[test]
+    fn accepts_only_the_exact_explicit_post_probe_hold() {
+        assert_eq!(
+            parse_transport(["--hold-after-probe".to_owned()].into_iter()),
+            Ok((Transport::Inherited, true))
+        );
+        assert!(parse_transport(["--hold-after-probe=true".to_owned()].into_iter()).is_err());
     }
 
     #[test]

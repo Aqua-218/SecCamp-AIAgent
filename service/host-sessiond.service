@@ -34,8 +34,12 @@ ExecStart=/usr/local/bin/host-sessiond \
   --workspace-formatter ${HOST_SESSIOND_WORKSPACE_FORMATTER} \
   --workspace-formatter-sha256 ${HOST_SESSIOND_WORKSPACE_FORMATTER_SHA256} \
   --workspace-source ${HOST_SESSIOND_WORKSPACE_SOURCE} \
+  --seccomp-compiler ${HOST_SESSIOND_SECCOMP_COMPILER} \
+  --seccomp-compiler-sha256 ${HOST_SESSIOND_SECCOMP_COMPILER_SHA256} \
   --seccomp-source ${HOST_SESSIOND_SECCOMP_SOURCE} \
   --seccomp-source-sha256 ${HOST_SESSIOND_SECCOMP_SOURCE_SHA256} \
+  --seccomp-policy-source ${HOST_SESSIOND_SECCOMP_POLICY_SOURCE} \
+  --seccomp-policy-source-sha256 ${HOST_SESSIOND_SECCOMP_POLICY_SOURCE_SHA256} \
   --snapshot-id ${HOST_SESSIOND_SNAPSHOT_ID} \
   --snapshot-state ${HOST_SESSIOND_SNAPSHOT_STATE} \
   --snapshot-state-sha256 ${HOST_SESSIOND_SNAPSHOT_STATE_SHA256} \

@@ -640,6 +640,7 @@ mod tests {
     #[test]
     fn conservative_seccomp_policy_covers_standard_library_capfs_operations() {
         let policy = SeccompPolicy::conservative();
+        #[cfg(target_arch = "x86_64")]
         for syscall in [
             Syscall::Mkdir,
             Syscall::Openat,
@@ -657,6 +658,24 @@ mod tests {
                 "the fixed guest CapFS probe requires {syscall}"
             );
         }
+        #[cfg(target_arch = "aarch64")]
+        for syscall in [
+            Syscall::Mkdirat,
+            Syscall::Openat,
+            Syscall::Fchmodat,
+            Syscall::Linkat,
+            Syscall::Symlinkat,
+            Syscall::Readlinkat,
+            Syscall::Renameat,
+            Syscall::Ftruncate,
+            Syscall::Unlinkat,
+        ] {
+            assert!(
+                policy.allows(syscall),
+                "the fixed guest CapFS probe requires {syscall}"
+            );
+        }
+        assert!(policy.validate_for_platform().is_ok());
     }
 
     #[test]

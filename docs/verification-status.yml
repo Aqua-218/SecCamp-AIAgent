@@ -336,6 +336,33 @@ claims:
     residual_reasons:
       - No live GitHub installation credential, provider mutation, or ref race is exercised in the available environment.
 
+  - id: repository-independent-review
+    component: session-orchestrator
+    scope: external
+    status: blocked
+    summary: A protected gate can verify a repository-external Ed25519-signed, exact-revision review report and zero open critical/high findings, but no independent reviewer report is available in this working tree.
+    verification_page: docs/hardening/2026-08-18-completion-ledger.md
+    prerequisites:
+      - id: external-reviewer-attestation
+        description: A genuinely independent reviewer must sign the complete-repository report, and the protected environment must supply its separately pinned public-key fingerprint.
+        check: scripts/ci/verify-external-review.sh prerequisites
+    gate:
+      id: external_review_attestation
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/run.sh external-review
+    evidence:
+      commands:
+        - scripts/ci/verify-external-review.sh
+      sources:
+        - scripts/ci/verify-external-review.sh
+        - scripts/ci/verify-external-review-from-env.sh
+      tests:
+        - scripts/ci/tests/test-external-review.sh
+    residual_reasons:
+      - Repository-owned automation cannot independently review itself; a revision-bound external signature has not been supplied.
+
   - id: egress-privileged-public-https
     component: egress-broker
     scope: privileged
@@ -523,27 +550,53 @@ claims:
     component: runtime-isolation
     scope: privileged
     status: blocked
-    summary: The syscall-number policy is intentionally x86_64-only and no alternate-architecture runner currently establishes a complete boundary.
+    summary: The syscall-number and audit-architecture policy supports x86_64 and aarch64, but no completed privileged aarch64 runner result currently establishes the alternate-architecture boundary.
     verification_page: docs/runtime-isolation/verification.md
     prerequisites:
       - id: alternate-architecture-runner
-        description: An architecture-specific Linux runner and syscall table are required before this boundary can be exercised.
-        check: aarch64 privileged CI runner
+        description: A real privileged aarch64 Linux runner with delegated cgroup v2 controllers is required before this boundary can be exercised.
+        check: scripts/ci/verify-privileged-isolation-aarch64.sh prerequisites
     gate:
-      id: runtime-isolation-architecture
+      id: privileged_isolation_aarch64
       result: required
       on_prerequisite_failure: fail
       commands:
-        - cargo test --locked -p runtime-isolation --all-targets
+        - scripts/ci/verify-privileged-isolation-aarch64.sh
     evidence:
       commands:
-        - cargo test --locked -p runtime-isolation --all-targets
+        - cargo check --locked -p runtime-isolation --all-targets --target aarch64-unknown-linux-gnu
       sources:
         - crates/runtime-isolation/src/syscall.rs
       tests:
         - crates/runtime-isolation/tests/capability_detection.rs
     residual_reasons:
-      - x86_64 is the only architecture with a privileged syscall-number evidence path in this repository.
+      - The aarch64 syscall table cross-checks successfully, but the required privileged aarch64 kernel gate has not produced evidence in this working tree.
+
+  - id: runtime-isolation-adversarial-soak
+    component: runtime-isolation
+    scope: privileged
+    status: verified
+    summary: The real privileged envelope denied a bounded high-risk raw-syscall corpus before and after exec and completed twenty full isolation, rollback, cleanup, and residue-check iterations on x86_64.
+    verification_page: docs/runtime-isolation/verification.md
+    prerequisites:
+      - id: privileged-soak-host
+        description: Root and the complete no-skip privileged isolation prerequisite set are required for every bounded iteration.
+        check: scripts/ci/verify-runtime-isolation-soak.sh prerequisites
+    gate:
+      id: runtime_isolation_soak
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-runtime-isolation-soak.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-runtime-isolation-soak.sh
+      sources:
+        - crates/runtime-isolation/src/linux.rs
+        - crates/runtime-isolation/tests/privileged_isolation.rs
+      tests:
+        - crates/runtime-isolation/tests/privileged_isolation.rs
+    residual_reasons: []
 
   - id: firecracker-runtime-hosted
     component: firecracker-runtime
@@ -571,6 +624,61 @@ claims:
       tests:
         - crates/firecracker-runtime/tests/runtime.rs
     residual_reasons: []
+
+  - id: firecracker-runtime-sealed-command-boundary
+    component: firecracker-runtime
+    scope: hosted
+    status: verified
+    summary: Production command specifications are externally unconstructable and immutable; only crate-owned typed lifecycle operations can feed the real runner, whose executable sealing, empty environment, output limit, timeout, and owned-process cleanup are tested.
+    verification_page: docs/firecracker-runtime/verification.md
+    prerequisites:
+      - id: locked-rust-toolchain
+        description: Repository-pinned Rust toolchain and locked dependency graph are available.
+        check: rust-toolchain.toml and Cargo.lock
+    gate:
+      id: firecracker-runtime-hosted
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p firecracker-runtime --all-targets
+        - cargo test --locked -p firecracker-runtime --doc
+    evidence:
+      commands:
+        - cargo test --locked -p firecracker-runtime --all-targets
+        - cargo test --locked -p firecracker-runtime --doc
+      sources:
+        - crates/firecracker-runtime/src/lib.rs
+      tests:
+        - crates/firecracker-runtime/src/lib.rs
+    residual_reasons: []
+
+  - id: firecracker-runtime-privileged-process-separation
+    component: firecracker-runtime
+    scope: privileged
+    status: unverified
+    summary: The production command vocabulary is sealed, but host-sessiond still owns privileged runtime setup and cleanup in-process; no separately sandboxed helper and authenticated bounded IPC boundary has been implemented or exercised.
+    verification_page: docs/firecracker-runtime/verification.md
+    prerequisites:
+      - id: privileged-helper-composition
+        description: A separately sandboxed helper exposing only typed fixed operations, an unprivileged controller, and real-KVM crash/replay tests are required.
+        check: privileged helper architecture and integration gate
+    gate:
+      id: firecracker-runtime-privileged-process-separation
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-runtime-lifecycle.sh
+    evidence:
+      commands:
+        - cargo test --locked -p firecracker-runtime --all-targets
+      sources:
+        - crates/firecracker-runtime/src/lib.rs
+        - crates/session-orchestrator/src/production_runtime.rs
+        - crates/session-orchestrator/src/bin/host-sessiond.rs
+      tests:
+        - crates/firecracker-runtime/tests/real_runtime_lifecycle.rs
+    residual_reasons:
+      - Sealing CommandSpec prevents arbitrary library callers from supplying commands but does not move privileged filesystem, device-mapper, cgroup, or launcher operations out of host-sessiond.
 
   - id: firecracker-runtime-kvm
     component: firecracker-runtime
@@ -625,6 +733,32 @@ claims:
         - crates/firecracker-runtime/tests/runtime.rs
         - crates/firecracker-runtime/tests/real_runtime_lifecycle.rs
         - crates/session-orchestrator/tests/real_production_lifecycle.rs
+    residual_reasons: []
+
+  - id: firecracker-runtime-version-matrix
+    component: firecracker-runtime
+    scope: kvm
+    status: verified
+    summary: The exact production launch and cleanup lifecycle completed on the same real x86_64 KVM host with checksum-pinned Firecracker 1.15.1 and 1.16.1.
+    verification_page: docs/firecracker-runtime/verification.md
+    prerequisites:
+      - id: real-kvm-version-matrix-host
+        description: Root, KVM, vhost-vsock, cgroup v2, device-mapper, and access to the exact pinned Firecracker release assets are required.
+        check: scripts/ci/verify-real-runtime-version-matrix.sh prerequisites
+    gate:
+      id: real_runtime_version_matrix
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-runtime-version-matrix.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-real-runtime-version-matrix.sh
+      sources:
+        - scripts/ci/install-firecracker.sh
+        - scripts/ci/verify-real-runtime-lifecycle.sh
+      tests:
+        - crates/firecracker-runtime/tests/real_runtime_lifecycle.rs
     residual_reasons: []
 
   - id: firecracker-runtime-guest-capfs
@@ -683,6 +817,59 @@ claims:
         - crates/session-orchestrator/tests
     residual_reasons: []
 
+  - id: session-orchestrator-multi-session-core
+    component: session-orchestrator
+    scope: hosted
+    status: verified
+    summary: The hosted scheduler core authenticates closed start/stop operations, enforces global and per-principal quotas, durably burns request/session IDs before worker creation, reconciles stale workers, and fences a second controller.
+    verification_page: docs/session-orchestrator/verification.md
+    prerequisites:
+      - id: private-control-journal
+        description: An owner-controlled non-group/world-writable directory is available for the append-only control journal and stable lock.
+        check: control_plane journal prerequisites
+    gate:
+      id: session-orchestrator-hosted
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p session-orchestrator control_plane
+        - cargo clippy --locked -p session-orchestrator --all-targets -- -D warnings
+    evidence:
+      commands:
+        - cargo test --locked -p session-orchestrator control_plane
+      sources:
+        - crates/session-orchestrator/src/control_plane.rs
+      tests:
+        - crates/session-orchestrator/src/control_plane.rs
+    residual_reasons: []
+
+  - id: session-orchestrator-multi-session-production
+    component: session-orchestrator
+    scope: kvm
+    status: unverified
+    summary: No production adapter or authenticated control daemon currently binds the scheduler core to multiple concurrent one-session host-sessiond workers and real Firecracker resource trees.
+    verification_page: docs/session-orchestrator/verification.md
+    prerequisites:
+      - id: multi-worker-kvm-composition
+        description: An unprivileged authenticated controller, separately privileged one-session worker adapter, and a disposable KVM host sized for concurrent workers are required.
+        check: production multi-session integration prerequisites
+    gate:
+      id: session-orchestrator-multi-session-production
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - cargo test --locked -p session-orchestrator control_plane
+    evidence:
+      commands:
+        - cargo test --locked -p session-orchestrator control_plane
+      sources:
+        - crates/session-orchestrator/src/control_plane.rs
+        - crates/session-orchestrator/src/bin/host-sessiond.rs
+      tests:
+        - crates/session-orchestrator/src/control_plane.rs
+    residual_reasons:
+      - Hosted workers establish scheduler invariants but do not provide concurrent real-KVM or production privilege-separation evidence.
+
   - id: session-orchestrator-kvm
     component: session-orchestrator
     scope: kvm
@@ -712,7 +899,7 @@ claims:
   - id: session-orchestrator-crash-recovery-kvm
     component: session-orchestrator
     scope: kvm
-    status: unverified
+    status: verified
     summary: The protected crash matrix externally kills the real production process at every declared startup and cleanup checkpoint, then reopens the exact durable and host-resource paths.
     verification_page: docs/session-orchestrator/verification.md
     prerequisites:
@@ -733,8 +920,7 @@ claims:
         - crates/session-orchestrator/src/production_runtime.rs
       tests:
         - crates/session-orchestrator/tests/real_production_lifecycle.rs
-    residual_reasons:
-      - The new real KVM crash matrix has not yet completed in this working tree.
+    residual_reasons: []
 
   - id: session-orchestrator-durable-ledger
     component: session-orchestrator

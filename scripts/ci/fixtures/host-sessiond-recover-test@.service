@@ -1,0 +1,20 @@
+[Unit]
+Description=Ephemeral host-controld recovery probe %i
+After=host-sessiond@%i.service
+Conflicts=host-sessiond@%i.service
+
+[Service]
+Type=oneshot
+User=daemon
+Group=daemon
+ExecStart=/usr/bin/true
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+

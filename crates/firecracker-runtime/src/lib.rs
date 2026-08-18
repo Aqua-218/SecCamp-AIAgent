@@ -1155,6 +1155,9 @@ pub struct CommandSpec {
     /// executable memfd and executes that descriptor. The source path therefore cannot be swapped
     /// between verification and `execve`.
     expected_digest: Option<Sha256Digest>,
+    /// Whether the sealed helper must run with UID/GID 0 inside the caller's existing systemd
+    /// sandbox. Only the private veritysetup constructor can enable this.
+    run_as_root: bool,
 }
 
 impl CommandSpec {
@@ -1185,6 +1188,7 @@ impl CommandSpec {
             program: program.into(),
             args: args.into_iter().collect(),
             expected_digest: None,
+            run_as_root: false,
         }
     }
 
@@ -1198,6 +1202,24 @@ impl CommandSpec {
             program: artifact.path.clone(),
             args: args.into_iter().collect(),
             expected_digest: Some(artifact.digest),
+            run_as_root: false,
+        }
+    }
+
+    /// Creates the one elevated helper command permitted by the runtime.
+    ///
+    /// Packaged `veritysetup` rejects its regular-file loopback path solely from a non-root UID,
+    /// even when the caller already holds the required bounded device and `CAP_SYS_ADMIN` access.
+    /// Keep this constructor private so external adapters cannot mark another program elevated.
+    fn pinned_veritysetup(
+        artifact: &PinnedArtifact,
+        args: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            program: artifact.path.clone(),
+            args: args.into_iter().collect(),
+            expected_digest: Some(artifact.digest),
+            run_as_root: true,
         }
     }
 }
@@ -2347,6 +2369,11 @@ fn seal_command_executable(
 }
 
 fn spawn_detached(command: &CommandSpec) -> Result<Child, RuntimeError> {
+    if command.run_as_root {
+        return Err(RuntimeError::InvalidConfig(
+            "elevated helper commands cannot become long-lived children".to_owned(),
+        ));
+    }
     let sealed = seal_command_executable(command)?;
     let program = sealed.as_ref().map_or(
         command.program.as_path(),
@@ -2679,6 +2706,9 @@ impl CommandRunner for RealCommandRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
+        if command.run_as_root {
+            process.gid(0).uid(0);
+        }
         let mut command_child = CommandChild::new(process.spawn().map_err(RuntimeError::from)?);
         let child = &mut command_child.child;
         let pid = child.id();
@@ -2778,7 +2808,7 @@ impl CommandRunner for RealCommandRunner {
         veritysetup: &PinnedArtifact,
         expected: &DmVerityConfig,
     ) -> Result<(), RuntimeError> {
-        let output = self.run(&CommandSpec::pinned(
+        let output = self.run(&CommandSpec::pinned_veritysetup(
             veritysetup,
             ["status".to_owned(), expected.mapper_name.clone()],
         ))?;
@@ -2869,7 +2899,7 @@ impl CommandRunner for RealCommandRunner {
         // by some util-linux/cryptsetup builds but rejected by the veritysetup package shipped on
         // the supported host image, so do not make the kernel primitive depend on that optional
         // CLI flag.  `verify_verity` immediately below checks the resulting target is readonly.
-        self.run(&CommandSpec::pinned(
+        self.run(&CommandSpec::pinned_veritysetup(
             veritysetup,
             [
                 "open".to_owned(),
@@ -6225,8 +6255,10 @@ where
         veritysetup: &PinnedArtifact,
         mapper_name: &str,
     ) -> Result<(), RuntimeError> {
-        let command =
-            CommandSpec::pinned(veritysetup, ["close".to_owned(), mapper_name.to_owned()]);
+        let command = CommandSpec::pinned_veritysetup(
+            veritysetup,
+            ["close".to_owned(), mapper_name.to_owned()],
+        );
         self.command_runner.run(&command).map(|_| ())
     }
 

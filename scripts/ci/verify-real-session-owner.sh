@@ -281,28 +281,125 @@ root_hash="$(awk '/^Root hash:/ {print $3}' "${image_rootfs}.verity")"
 test_root="$(mktemp -d "${test_parent%/}/so.XXXXXX")"
 chmod 0700 -- "${test_root}"
 
-REAL_SESSION_OWNER_LIFECYCLE=1 \
-REAL_SESSION_TEMP_ROOT="${test_root}" \
-REAL_SESSION_CGROUP_PARENT="${cleanup_cgroup_parent}" \
-REAL_SESSION_MAPPER_NAME="${cleanup_mapper_base}" \
-REAL_SESSION_CLEANUP_STATE="${cleanup_state}" \
-REAL_SESSION_FIRECRACKER_BIN="${firecracker}" \
-REAL_SESSION_FIRECRACKER_JAILER="${jailer}" \
-REAL_SESSION_KERNEL="${kernel}" \
-REAL_SESSION_ROOTFS="${image_rootfs}" \
-REAL_SESSION_VERITY_HASH="${image_hash}" \
-REAL_SESSION_ROOT_HASH="${root_hash}" \
-REAL_SESSION_SECCOMP="${staging}/seccomp.bin" \
-REAL_SESSION_VERITYSETUP="$(realpath -e -- "$(command -v veritysetup)")" \
-REAL_SESSION_DMSETUP="$(realpath -e -- "$(command -v dmsetup)")" \
-REAL_SESSION_WORKSPACE_FORMATTER="$(realpath -e -- "$(command -v mkfs.ext4)")" \
-  cargo test \
+run_lifecycle() {
+  local fixed_directory="${1:-}"
+  local crash_checkpoint="${2:-}"
+  local crash_marker="${3:-}"
+  local -a crash_environment=()
+  if [[ -n "${fixed_directory}" ]]; then
+    crash_environment+=(REAL_SESSION_FIXED_DIRECTORY="${fixed_directory}")
+  fi
+  if [[ -n "${crash_checkpoint}" ]]; then
+    crash_environment+=(
+      SESSION_ORCHESTRATOR_CRASH_CHECKPOINT="${crash_checkpoint}"
+      SESSION_ORCHESTRATOR_CRASH_READY_FILE="${crash_marker}"
+    )
+  fi
+
+  env \
+    -u SESSION_ORCHESTRATOR_CRASH_CHECKPOINT \
+    -u SESSION_ORCHESTRATOR_CRASH_READY_FILE \
+    "${crash_environment[@]}" \
+    REAL_SESSION_OWNER_LIFECYCLE=1 \
+    REAL_SESSION_TEMP_ROOT="${test_root}" \
+    REAL_SESSION_CGROUP_PARENT="${cleanup_cgroup_parent}" \
+    REAL_SESSION_MAPPER_NAME="${cleanup_mapper_base}" \
+    REAL_SESSION_CLEANUP_STATE="${cleanup_state}" \
+    REAL_SESSION_FIRECRACKER_BIN="${firecracker}" \
+    REAL_SESSION_FIRECRACKER_JAILER="${jailer}" \
+    REAL_SESSION_KERNEL="${kernel}" \
+    REAL_SESSION_ROOTFS="${image_rootfs}" \
+    REAL_SESSION_VERITY_HASH="${image_hash}" \
+    REAL_SESSION_ROOT_HASH="${root_hash}" \
+    REAL_SESSION_SECCOMP="${staging}/seccomp.bin" \
+    REAL_SESSION_VERITYSETUP="$(realpath -e -- "$(command -v veritysetup)")" \
+    REAL_SESSION_DMSETUP="$(realpath -e -- "$(command -v dmsetup)")" \
+    REAL_SESSION_WORKSPACE_FORMATTER="$(realpath -e -- "$(command -v mkfs.ext4)")" \
+    cargo test \
     --manifest-path "${repository_root}/Cargo.toml" \
     -p session-orchestrator \
     --test real_production_lifecycle \
+    --features crash-test-hooks \
     --locked \
     -- \
     --ignored \
     --nocapture \
     --exact \
     real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_resource
+}
+
+run_crash_case() {
+  local checkpoint="$1"
+  # The production Broker and Firecracker vsock endpoints are Unix sockets.
+  # Keep the restart-stable component intentionally tiny so even the longest
+  # nested endpoint remains below Linux SUN_LEN. The recovery run removes this
+  # directory before the next matrix case reuses the name.
+  local fixed_directory='c'
+  local marker="${test_root}/marker-${checkpoint}"
+  local log="${staging}/crash-${checkpoint}.log"
+  local cargo_pid test_pid observed_checkpoint command_line status
+  rm -f -- "${marker}" "${log}"
+
+  run_lifecycle "${fixed_directory}" "${checkpoint}" "${marker}" >"${log}" 2>&1 &
+  cargo_pid=$!
+  for _ in $(seq 1 2400); do
+    [[ -s "${marker}" ]] && break
+    if ! kill -0 "${cargo_pid}" 2>/dev/null; then
+      wait "${cargo_pid}" || true
+      tail -n 80 -- "${log}" >&2 || true
+      fail "crash checkpoint ${checkpoint} exited before publishing its marker"
+    fi
+    sleep 0.1
+  done
+  [[ -s "${marker}" && ! -L "${marker}" ]] \
+    || fail "crash checkpoint ${checkpoint} did not publish a regular marker before timeout"
+  test_pid="$(awk -F= '$1 == "pid" {print $2}' "${marker}")"
+  observed_checkpoint="$(awk -F= '$1 == "checkpoint" {print $2}' "${marker}")"
+  [[ "${test_pid}" =~ ^[1-9][0-9]*$ && "${observed_checkpoint}" == "${checkpoint}" ]] \
+    || fail "crash checkpoint ${checkpoint} published an invalid marker"
+  [[ -r "/proc/${test_pid}/cmdline" ]] \
+    || fail "crash checkpoint ${checkpoint} test process disappeared before SIGKILL"
+  command_line="$(tr '\0' ' ' <"/proc/${test_pid}/cmdline")"
+  [[ "${command_line}" == *real_production_lifecycle* \
+    && "${command_line}" == *real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_resource* ]] \
+    || fail "refusing to kill process ${test_pid} with unexpected command line"
+  kill -KILL "${test_pid}"
+  set +e
+  wait "${cargo_pid}"
+  status=$?
+  set -e
+  [[ "${status}" -ne 0 ]] \
+    || fail "crash checkpoint ${checkpoint} unexpectedly exited successfully after SIGKILL"
+
+  rm -f -- "${marker}"
+  run_lifecycle "${fixed_directory}" '' ''
+  printf 'real session-owner crash recovery: %s killed externally and recovered\n' "${checkpoint}"
+}
+
+if [[ "${REAL_SESSION_CRASH_MATRIX:-0}" == 1 ]]; then
+  requested_checkpoint="${REAL_SESSION_CRASH_MATRIX_CASE:-}"
+  matched_checkpoint=0
+  for checkpoint in \
+    identity-reserved \
+    workspace-cloned \
+    broker-established \
+    vm-started \
+    root-capability-injected \
+    workload-released \
+    running \
+    cleanup-capability-revoked \
+    cleanup-vm-killed \
+    cleanup-broker-closed \
+    cleanup-workspace-isolated; do
+    if [[ -n "${requested_checkpoint}" && "${checkpoint}" != "${requested_checkpoint}" ]]; then
+      continue
+    fi
+    matched_checkpoint=1
+    run_crash_case "${checkpoint}"
+  done
+  [[ "${matched_checkpoint}" -eq 1 ]] \
+    || fail "unknown REAL_SESSION_CRASH_MATRIX_CASE: ${requested_checkpoint}"
+  printf '%s\n' 'real session-owner crash recovery: every lifecycle checkpoint recovered without residue'
+else
+  run_lifecycle '' '' ''
+fi

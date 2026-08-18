@@ -179,6 +179,17 @@ cleanup() {
   set +e
   if [[ "${deployment_started}" -eq 1 ]]; then
     systemctl stop host-controld.service >/dev/null 2>&1
+    while read -r session; do
+      [[ "${session}" =~ ^[0-9a-f]{32}$ ]] && sessions+=("${session}")
+    done < <(
+      for instance_root in \
+        "${worker_state_root}/instances" \
+        "${worker_runtime_root}/instances" \
+        "${worker_jail_root}"; do
+        [[ -d "${instance_root}" ]] \
+          && find "${instance_root}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n'
+      done | sort -u
+    )
     for session in "${sessions[@]}"; do
       if [[ "${session}" =~ ^[0-9a-f]{32}$ ]]; then
         systemctl stop "host-sessiond@${session}.service" >/dev/null 2>&1
@@ -389,10 +400,10 @@ install -o root -g root -m 0644 -- "${repository_root}/deploy/70-host-sessiond-d
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=misc --subsystem-match=block --action=add
 udevadm settle
-[[ "$(stat -Lc '%u:%g' /dev/mapper/control)" == "${worker_uid}:${worker_gid}" ]] \
-  || fail 'udev did not grant the worker identity device-mapper control ownership'
-[[ "$(stat -Lc '%u:%g' /dev/loop-control)" == "${worker_uid}:${worker_gid}" ]] \
-  || fail 'udev did not grant the worker identity loop-control ownership'
+[[ "$(stat -Lc '%u:%g' /dev/mapper/control)" == "0:${worker_gid}" ]] \
+  || fail 'udev did not grant the worker group device-mapper control access'
+[[ "$(stat -Lc '%u:%g' /dev/loop-control)" == "0:${worker_gid}" ]] \
+  || fail 'udev did not grant the worker group loop-control access'
 
 install -o root -g root -m 0644 -- "${repository_root}/service/host-sessiond@.service" "${worker_unit}"
 install -o root -g root -m 0644 -- "${repository_root}/service/host-sessiond-recover@.service" "${recovery_unit}"
@@ -459,6 +470,9 @@ assert_worker_ready() {
   mapper="host-sessiond-rootfs-${session}-${worker_workspace_id}"
   dmsetup info --noheadings -c -- "${mapper}" >/dev/null \
     || fail "worker dm-verity mapper is absent: ${mapper}"
+  [[ "$(stat -Lc '%u:%g:%a' "/dev/mapper/${mapper}")" == \
+      "${worker_uid}:${worker_gid}:400" ]] \
+    || fail "worker dm-verity node did not retain its exact jailer ownership: ${mapper}"
   control_group="$(systemctl show --property=ControlGroup --value "${unit}")"
   cgroup_root="/sys/fs/cgroup${control_group}"
   worker_firecracker_pid=''

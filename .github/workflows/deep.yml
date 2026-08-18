@@ -304,6 +304,40 @@ jobs:
       - name: Kill and recover every durable SessionOwner lifecycle checkpoint
         run: scripts/ci/run.sh real-session-crash-recovery
 
+  systemd_control_plane:
+    name: Authenticated systemd control-plane verification
+    # Uses real systemd, polkit, SO_PEERCRED, and an unprivileged controller.
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, x64, kvm, ephemeral]
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Verify authenticated fixed-unit systemd composition and crash reconciliation
+        run: scripts/ci/run.sh systemd-control-plane
+
+  concurrent_session_owners:
+    name: Concurrent SessionOwner KVM verification
+    # Requires capacity for two production Firecracker guests at once.
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, x64, kvm, ephemeral]
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Verify two concurrent production owners and independent cleanup
+        run: scripts/ci/run.sh concurrent-session-owners
+
   real_capfs:
     name: Real CapFS FUSE verification
     # Requires root and a readable/writable /dev/fuse. The gate is protected so
@@ -467,6 +501,8 @@ jobs:
       - real_runtime_version_matrix
       - session_owner_kvm
       - session_owner_crash_recovery
+      - systemd_control_plane
+      - concurrent_session_owners
       - real_capfs
       - egress_real_https
       - external_provider_smoke

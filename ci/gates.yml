@@ -690,6 +690,17 @@ gates:
     workflow: deep.yml
     include: deep.yml
 
+  - id: session_owner_crash_recovery
+    title: SessionOwner external-crash recovery matrix
+    stage: system
+    tier: deep
+    scopes: [rust]
+    status: implemented
+    github: session_owner_crash_recovery
+    gitlab: session_owner_crash_recovery
+    workflow: deep.yml
+    include: deep.yml
+
   - id: external_provider_smoke
     title: Protected external provider smoke
     stage: security

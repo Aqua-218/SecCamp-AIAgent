@@ -149,6 +149,12 @@ case "${command_name}" in
   real-session-crash-recovery)
     scripts/ci/verify-real-session-crash-recovery.sh
     ;;
+  systemd-control-plane)
+    scripts/ci/verify-real-systemd-control-plane.sh
+    ;;
+  concurrent-session-owners)
+    scripts/ci/verify-real-concurrent-session-owners.sh
+    ;;
   post-exec-isolation)
     # Backward-compatible entry point: the production-launcher post-exec
     # scenario is one of the required privileged-isolation scenarios.

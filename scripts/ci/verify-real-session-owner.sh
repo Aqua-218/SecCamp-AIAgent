@@ -11,7 +11,7 @@ umask 022
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repository_root
 readonly tools_root="${CI_TOOLS_DIR:-${repository_root}/.ci-tools}"
-readonly firecracker_version="1.16.1"
+readonly firecracker_version="${FIRECRACKER_VERSION:-1.16.1}"
 readonly firecracker="${tools_root}/firecracker/v${firecracker_version}/firecracker"
 readonly jailer="${tools_root}/firecracker/v${firecracker_version}/jailer"
 readonly archive="${tools_root}/downloads/firecracker-v${firecracker_version}-x86_64.tgz"
@@ -159,22 +159,41 @@ test_root=''
 
 remove_mapper() {
   local mapper="$1"
-  if dmsetup info --noheadings --exists -- "${mapper}" >/dev/null 2>&1; then
-    dmsetup remove -- "${mapper}" >/dev/null 2>&1 || true
-  fi
+  local attempt
+  dmsetup info --noheadings -c -- "${mapper}" >/dev/null 2>&1 || return 0
+  for attempt in $(seq 1 50); do
+    if dmsetup remove -- "${mapper}" >/dev/null 2>&1; then
+      return 0
+    fi
+    dmsetup info --noheadings -c -- "${mapper}" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  printf 'real session-owner cleanup: mapper remains after bounded removal: %s\n' \
+    "${mapper}" >&2
+  return 0
 }
 
 remove_cgroup() {
   local cgroup="$1"
+  local attempt
   [[ -d "${cgroup}" && ! -L "${cgroup}" ]] || return 0
   if [[ -f "${cgroup}/cgroup.kill" ]]; then
     printf '1\n' >"${cgroup}/cgroup.kill" || true
   fi
   for _ in $(seq 1 50); do
-    [[ ! -s "${cgroup}/cgroup.procs" ]] && break
+    [[ -z "$(<"${cgroup}/cgroup.procs")" ]] && break
     sleep 0.1
   done
-  rmdir -- "${cgroup}" >/dev/null 2>&1 || true
+  for attempt in $(seq 1 50); do
+    if rmdir -- "${cgroup}" >/dev/null 2>&1; then
+      return 0
+    fi
+    [[ -d "${cgroup}" ]] || return 0
+    sleep 0.1
+  done
+  printf 'real session-owner cleanup: cgroup remains after bounded removal: %s\n' \
+    "${cgroup}" >&2
+  return 0
 }
 
 cleanup() {

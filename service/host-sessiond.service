@@ -1,8 +1,7 @@
 [Unit]
 Description=Single-session Firecracker host owner
 Documentation=https://github.com/Aqua-218/SecCamp-AIAgent
-Wants=dev-kvm.device dev-vhost\x2dvsock.device
-After=local-fs.target dev-kvm.device dev-vhost\x2dvsock.device
+After=local-fs.target
 ConditionPathExists=/etc/host-sessiond/host-sessiond.env
 ConditionPathExists=/dev/kvm
 ConditionPathExists=/dev/vhost-vsock

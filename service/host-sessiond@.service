@@ -1,8 +1,7 @@
 [Unit]
 Description=Isolated Firecracker session worker %i
 Documentation=https://github.com/Aqua-218/SecCamp-AIAgent
-Wants=dev-kvm.device dev-vhost\x2dvsock.device
-After=local-fs.target dev-kvm.device dev-vhost\x2dvsock.device
+After=local-fs.target
 Conflicts=host-sessiond-recover@%i.service
 ConditionPathExists=/etc/host-sessiond/worker.env
 ConditionPathExists=/dev/kvm

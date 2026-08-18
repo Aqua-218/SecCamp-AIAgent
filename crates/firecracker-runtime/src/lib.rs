@@ -38,16 +38,17 @@ use rustix::fs::{
 use rustix::mount::{UnmountFlags, mount_bind, unmount};
 use sha2::{Digest, Sha256};
 
-const REQUIRED_BLOCKED_SYSCALLS: [&str; 8] = [
+const REQUIRED_BLOCKED_SYSCALLS: [&str; 6] = [
     "bpf",
-    "connect",
     "mount",
     "perf_event_open",
     "ptrace",
     "setns",
-    "socket",
     "unshare",
 ];
+const SECCOMP_MAX_PROFILE_BYTES: usize = 1024 * 1024;
+const SECCOMP_AF_UNIX: u64 = 1;
+const SECCOMP_SOCK_STREAM_CLOEXEC: u64 = 524_289;
 const HTTP_HEADER_LIMIT: usize = 64 * 1024;
 /// Maximum request or response body retained by the Unix API adapter.
 pub const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
@@ -339,12 +340,16 @@ pub struct JailerConfig {
     pub cgroup_version: CgroupVersion,
 }
 
-/// Deny-list properties of the host seccomp profile.
+/// Pinned compiled filter and its auditable source policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SeccompConfig {
-    /// Pinned seccomp profile consumed by jailer.
+    /// Pinned compiler used to prove that `filter` was produced from `policy`.
+    pub compiler: PinnedArtifact,
+    /// Pinned compiled seccomp filter consumed by jailer.
     pub filter: PinnedArtifact,
-    /// Syscalls that the profile explicitly denies.
+    /// Pinned JSON policy from which `filter` was compiled.
+    pub policy: PinnedArtifact,
+    /// Syscalls that every policy thread filter must deny.
     pub blocked_syscalls: Vec<String>,
 }
 
@@ -414,7 +419,9 @@ impl RuntimeConfig {
         validate_artifact("veritysetup", &self.veritysetup)?;
         validate_artifact("workspace image formatter", &self.workspace.image.formatter)?;
         validate_artifact("jailer", &self.jailer)?;
+        validate_artifact("seccomp compiler", &self.isolation.seccomp.compiler)?;
         validate_artifact("seccomp filter", &self.isolation.seccomp.filter)?;
+        validate_artifact("seccomp policy", &self.isolation.seccomp.policy)?;
         validate_boot_args(&self.boot_args)?;
         validate_absolute_path("API socket", &self.api_socket)?;
         validate_absolute_path("jailer chroot base", &self.jailer_config.chroot_base_dir)?;
@@ -515,19 +522,7 @@ impl RuntimeConfig {
                     .to_owned(),
             ));
         }
-        for required in REQUIRED_BLOCKED_SYSCALLS {
-            if !self
-                .isolation
-                .seccomp
-                .blocked_syscalls
-                .iter()
-                .any(|name| name == required)
-            {
-                return Err(RuntimeError::InvalidConfig(format!(
-                    "seccomp profile must block required syscall '{required}'"
-                )));
-            }
-        }
+        validate_seccomp_declaration(&self.isolation.seccomp.blocked_syscalls)?;
         self.cgroup_parent()?;
         self.jail_path("API socket", &self.api_socket)?;
         self.jail_path("kernel", &self.kernel.path)?;
@@ -718,6 +713,12 @@ impl RuntimeConfig {
             self,
             &self.isolation.seccomp.filter,
         );
+        fingerprint_artifact(
+            &mut bytes,
+            "seccomp.compiler",
+            &self.isolation.seccomp.compiler,
+        );
+        fingerprint_artifact(&mut bytes, "seccomp.policy", &self.isolation.seccomp.policy);
         fingerprint_string_set(
             &mut bytes,
             "seccomp.blocked_syscalls",
@@ -760,6 +761,16 @@ impl RuntimeConfig {
             &mut bytes,
             "seccomp.filter.path",
             &self.isolation.seccomp.filter.path,
+        );
+        fingerprint_path(
+            &mut bytes,
+            "seccomp.compiler.path",
+            &self.isolation.seccomp.compiler.path,
+        );
+        fingerprint_path(
+            &mut bytes,
+            "seccomp.policy.path",
+            &self.isolation.seccomp.policy.path,
         );
         fingerprint_path(
             &mut bytes,
@@ -859,6 +870,156 @@ fn validate_artifact(label: &str, artifact: &PinnedArtifact) -> Result<(), Runti
     Ok(())
 }
 
+fn validate_seccomp_declaration(blocked_syscalls: &[String]) -> Result<(), RuntimeError> {
+    let declared = blocked_syscalls
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if declared.len() != blocked_syscalls.len() {
+        return Err(RuntimeError::InvalidConfig(
+            "seccomp blocked-syscall declaration contains a duplicate".to_owned(),
+        ));
+    }
+    let required = REQUIRED_BLOCKED_SYSCALLS
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if declared != required {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "seccomp blocked-syscall declaration must equal the required set: {}",
+            REQUIRED_BLOCKED_SYSCALLS.join(",")
+        )));
+    }
+    Ok(())
+}
+
+fn validate_seccomp_profile_bytes(bytes: &[u8]) -> Result<(), RuntimeError> {
+    if bytes.is_empty() || bytes.len() > SECCOMP_MAX_PROFILE_BYTES {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "seccomp JSON profile must contain 1-{SECCOMP_MAX_PROFILE_BYTES} bytes"
+        )));
+    }
+    let document: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| {
+        RuntimeError::InvalidConfig("seccomp profile must be valid JSON".to_owned())
+    })?;
+    let profiles = document.as_object().ok_or_else(|| {
+        RuntimeError::InvalidConfig("seccomp profile root must be an object".to_owned())
+    })?;
+    if profiles.is_empty() {
+        return Err(RuntimeError::InvalidConfig(
+            "seccomp profile must define at least one thread filter".to_owned(),
+        ));
+    }
+    for (thread_name, profile) in profiles {
+        validate_seccomp_thread_profile(thread_name, profile)?;
+    }
+    Ok(())
+}
+
+fn validate_seccomp_thread_profile(
+    thread_name: &str,
+    profile: &serde_json::Value,
+) -> Result<(), RuntimeError> {
+    if thread_name.is_empty()
+        || thread_name.len() > 128
+        || !thread_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(RuntimeError::InvalidConfig(
+            "seccomp thread-filter name is not canonical".to_owned(),
+        ));
+    }
+    let profile = profile.as_object().ok_or_else(|| {
+        RuntimeError::InvalidConfig(format!(
+            "seccomp thread filter '{thread_name}' must be an object"
+        ))
+    })?;
+    let default_action = profile
+        .get("default_action")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            RuntimeError::InvalidConfig(format!(
+                "seccomp thread filter '{thread_name}' has no default action"
+            ))
+        })?;
+    if !matches!(
+        default_action,
+        "trap" | "kill_process" | "kill_thread" | "errno"
+    ) {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "seccomp thread filter '{thread_name}' is not default-deny"
+        )));
+    }
+    if profile
+        .get("filter_action")
+        .and_then(serde_json::Value::as_str)
+        != Some("allow")
+    {
+        return Err(RuntimeError::InvalidConfig(format!(
+            "seccomp thread filter '{thread_name}' must use an allow-list"
+        )));
+    }
+    let rules = profile
+        .get("filter")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            RuntimeError::InvalidConfig(format!(
+                "seccomp thread filter '{thread_name}' has no rule array"
+            ))
+        })?;
+    for rule in rules {
+        let rule = rule.as_object().ok_or_else(|| {
+            RuntimeError::InvalidConfig(format!(
+                "seccomp thread filter '{thread_name}' contains a non-object rule"
+            ))
+        })?;
+        let syscall = rule
+            .get("syscall")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                RuntimeError::InvalidConfig(format!(
+                    "seccomp thread filter '{thread_name}' contains a rule without a syscall"
+                ))
+            })?;
+        if REQUIRED_BLOCKED_SYSCALLS.contains(&syscall) {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "seccomp thread filter '{thread_name}' allows required-deny syscall '{syscall}'"
+            )));
+        }
+        if syscall == "socket" && !seccomp_socket_rule_is_exact(rule) {
+            return Err(RuntimeError::InvalidConfig(format!(
+                "seccomp thread filter '{thread_name}' has a socket rule outside exact AF_UNIX SOCK_STREAM|SOCK_CLOEXEC"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn seccomp_socket_rule_is_exact(rule: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let Some(arguments) = rule.get("args").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    if arguments.len() != 3 {
+        return false;
+    }
+    let expected = [
+        (0_u64, SECCOMP_AF_UNIX),
+        (1_u64, SECCOMP_SOCK_STREAM_CLOEXEC),
+        (2_u64, 0_u64),
+    ];
+    expected.into_iter().all(|(index, value)| {
+        arguments.iter().any(|argument| {
+            let Some(argument) = argument.as_object() else {
+                return false;
+            };
+            argument.get("index").and_then(serde_json::Value::as_u64) == Some(index)
+                && argument.get("type").and_then(serde_json::Value::as_str) == Some("dword")
+                && argument.get("op").and_then(serde_json::Value::as_str) == Some("eq")
+                && argument.get("val").and_then(serde_json::Value::as_u64) == Some(value)
+        })
+    })
+}
+
 fn validate_boot_args(boot_args: &str) -> Result<(), RuntimeError> {
     if boot_args.is_empty()
         || boot_args.len() > MAX_BOOT_ARGS_BYTES
@@ -945,10 +1106,10 @@ fn validate_cgroup_component(value: &str) -> Result<(), RuntimeError> {
         || value.starts_with('.')
         || !value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'@'))
     {
         return Err(RuntimeError::InvalidConfig(format!(
-            "cgroup parent component must be a non-hidden name of ASCII letters, digits, '_', '-' or '.': {value}"
+            "cgroup parent component must be a non-hidden name of ASCII letters, digits, '_', '-', '.', or '@': {value}"
         )));
     }
     Ok(())
@@ -999,8 +1160,8 @@ pub struct CommandSpec {
 impl CommandSpec {
     /// Returns the sealed executable path for adapter observation.
     ///
-    /// There is intentionally no public constructor or mutable accessor: only this crate's
-    /// closed runtime operations can create a production command.
+    /// Construction is limited to the digest-pinned constructor; callers cannot mutate a command
+    /// after handing it to a runner.
     #[must_use]
     pub fn program(&self) -> &Path {
         &self.program
@@ -1027,7 +1188,12 @@ impl CommandSpec {
         }
     }
 
-    fn pinned(artifact: &PinnedArtifact, args: impl IntoIterator<Item = String>) -> Self {
+    /// Creates an immutable command bound to the exact executable bytes in `artifact`.
+    ///
+    /// Production callers must still keep their argument grammar closed; pinning the executable
+    /// prevents path replacement but does not make arbitrary arguments safe.
+    #[must_use]
+    pub fn pinned(artifact: &PinnedArtifact, args: impl IntoIterator<Item = String>) -> Self {
         Self {
             program: artifact.path.clone(),
             args: args.into_iter().collect(),
@@ -1096,6 +1262,22 @@ pub trait CommandRunner {
     ) -> Result<(), RuntimeError> {
         Err(RuntimeError::Command(
             "command runner does not implement live dm-verity verification".to_owned(),
+        ))
+    }
+    /// Recompiles the exact verified JSON bytes with the pinned compiler and requires byte-for-byte
+    /// equality with the compiled filter that will be passed to the jailer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an adapter error when compilation fails or produces any different byte.
+    fn verify_seccomp_compilation(
+        &mut self,
+        _compiler: &PinnedArtifact,
+        _policy: &[u8],
+        _filter: &[u8],
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::Command(
+            "command runner does not implement seccomp source-to-filter verification".to_owned(),
         ))
     }
     /// Opens the expected dm-verity mapping.
@@ -2601,6 +2783,81 @@ impl CommandRunner for RealCommandRunner {
             ["status".to_owned(), expected.mapper_name.clone()],
         ))?;
         recovery::validate_live_verity_status(&output.stdout, expected)
+    }
+
+    fn verify_seccomp_compilation(
+        &mut self,
+        compiler: &PinnedArtifact,
+        policy: &[u8],
+        filter: &[u8],
+    ) -> Result<(), RuntimeError> {
+        let architecture = match std::env::consts::ARCH {
+            "x86_64" => "x86_64",
+            "aarch64" => "aarch64",
+            other => {
+                return Err(RuntimeError::InvalidConfig(format!(
+                    "seccomp compiler target architecture is unsupported: {other}"
+                )));
+            }
+        };
+        let directory = tempfile::Builder::new()
+            .prefix("firecracker-seccomp-verify-")
+            .tempdir()
+            .map_err(RuntimeError::from)?;
+        let policy_path = directory.path().join("policy.json");
+        let output_path = directory.path().join("filter.bin");
+        let mut policy_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&policy_path)
+            .map_err(RuntimeError::from)?;
+        policy_file.write_all(policy).map_err(RuntimeError::from)?;
+        policy_file.sync_all().map_err(RuntimeError::from)?;
+        drop(policy_file);
+
+        self.run(&CommandSpec::pinned(
+            compiler,
+            [
+                "--target-arch".to_owned(),
+                architecture.to_owned(),
+                "--input-file".to_owned(),
+                policy_path.display().to_string(),
+                "--output-file".to_owned(),
+                output_path.display().to_string(),
+            ],
+        ))?;
+
+        let output_descriptor = open(
+            &output_path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| RuntimeError::Io(error.to_string()))?;
+        let mut output_file = File::from(output_descriptor);
+        let metadata = output_file.metadata().map_err(RuntimeError::from)?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.len() == 0
+            || metadata.len() > MAX_ARTIFACT_BYTES
+        {
+            return Err(RuntimeError::InvalidConfig(
+                "seccomp compiler output is not one bounded regular file".to_owned(),
+            ));
+        }
+        let mut compiled_filter =
+            Vec::with_capacity(usize::try_from(metadata.len()).map_err(|_| {
+                RuntimeError::InvalidConfig("seccomp compiler output is too large".to_owned())
+            })?);
+        output_file
+            .read_to_end(&mut compiled_filter)
+            .map_err(RuntimeError::from)?;
+        if compiled_filter != filter {
+            return Err(RuntimeError::InvalidConfig(
+                "compiled seccomp filter does not exactly match its pinned JSON policy".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn open_verity(
@@ -5842,6 +6099,8 @@ where
     }
 
     fn verify_artifacts(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
+        let mut seccomp_filter = None;
+        let mut seccomp_policy = None;
         for (label, artifact) in [
             ("firecracker", &config.firecracker),
             ("kernel", &config.kernel),
@@ -5853,9 +6112,12 @@ where
                 &config.workspace.image.formatter,
             ),
             ("jailer", &config.jailer),
+            ("seccomp compiler", &config.isolation.seccomp.compiler),
             ("seccomp filter", &config.isolation.seccomp.filter),
+            ("seccomp policy", &config.isolation.seccomp.policy),
         ] {
-            let actual = sha256(&self.filesystem.read(&artifact.path)?);
+            let bytes = self.filesystem.read(&artifact.path)?;
+            let actual = sha256(&bytes);
             if actual != artifact.digest {
                 return Err(RuntimeError::ArtifactDigestMismatch {
                     label: label.to_owned(),
@@ -5864,8 +6126,22 @@ where
                     actual,
                 });
             }
+            if label == "seccomp policy" {
+                validate_seccomp_profile_bytes(&bytes)?;
+                seccomp_policy = Some(bytes);
+            } else if label == "seccomp filter" {
+                seccomp_filter = Some(bytes);
+            }
         }
-        Ok(())
+        self.command_runner.verify_seccomp_compilation(
+            &config.isolation.seccomp.compiler,
+            seccomp_policy.as_deref().ok_or_else(|| {
+                RuntimeError::InvalidConfig("seccomp policy is missing".to_owned())
+            })?,
+            seccomp_filter.as_deref().ok_or_else(|| {
+                RuntimeError::InvalidConfig("seccomp filter is missing".to_owned())
+            })?,
+        )
     }
 
     fn create_workspace_block_image(
@@ -6764,6 +7040,8 @@ mod tests {
 
     use super::*;
 
+    const TEST_SECCOMP_PROFILE: &[u8] = br#"{"vmm":{"default_action":"trap","filter_action":"allow","filter":[{"syscall":"read"},{"syscall":"socket","args":[{"index":0,"type":"dword","op":"eq","val":1},{"index":1,"type":"dword","op":"eq","val":524289},{"index":2,"type":"dword","op":"eq","val":0}]}]}}"#;
+
     #[test]
     fn production_snapshot_digest_rejects_symlinks_and_oversized_files() {
         let directory = unique_test_path("snapshot-digest-boundary");
@@ -7007,7 +7285,15 @@ mod tests {
                     cpu_period_micros: 100_000,
                 },
                 seccomp: SeccompConfig {
-                    filter: test_artifact(jail_root.join("artifacts/seccomp").to_str().unwrap()),
+                    compiler: test_artifact("/artifacts/seccompiler"),
+                    filter: PinnedArtifact::new(
+                        jail_root.join("artifacts/seccomp"),
+                        sha256(b"artifact"),
+                    ),
+                    policy: PinnedArtifact::new(
+                        "/artifacts/seccomp-policy.json",
+                        sha256(TEST_SECCOMP_PROFILE),
+                    ),
                     blocked_syscalls: REQUIRED_BLOCKED_SYSCALLS
                         .into_iter()
                         .map(str::to_owned)
@@ -7023,6 +7309,62 @@ mod tests {
             memory_mib: 256,
             boot_args: format!("console=ttyS0 reboot=k panic=1 pci=off init={REQUIRED_GUEST_INIT}"),
         }
+    }
+
+    #[test]
+    fn seccomp_profile_requires_default_deny_and_exact_socket_scope() {
+        validate_seccomp_profile_bytes(TEST_SECCOMP_PROFILE)
+            .expect("the minimal exact AF_UNIX profile must be accepted");
+
+        for invalid in [
+            br#"{"vmm":{"default_action":"allow","filter_action":"allow","filter":[]}}"#.as_slice(),
+            br#"{"vmm":{"default_action":"trap","filter_action":"allow","filter":[{"syscall":"mount"}]}}"#.as_slice(),
+            br#"{"vmm":{"default_action":"trap","filter_action":"allow","filter":[{"syscall":"socket"}]}}"#.as_slice(),
+            br#"{"vmm":{"default_action":"trap","filter_action":"allow","filter":[{"syscall":"socket","args":[{"index":0,"type":"dword","op":"eq","val":2},{"index":1,"type":"dword","op":"eq","val":524289},{"index":2,"type":"dword","op":"eq","val":0}]}]}}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                validate_seccomp_profile_bytes(invalid),
+                Err(RuntimeError::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn seccomp_profile_rejects_malformed_empty_and_oversized_inputs() {
+        for invalid in [b"not-json".as_slice(), b"{}".as_slice(), b"[]".as_slice()] {
+            assert!(matches!(
+                validate_seccomp_profile_bytes(invalid),
+                Err(RuntimeError::InvalidConfig(_))
+            ));
+        }
+        let oversized = vec![b' '; SECCOMP_MAX_PROFILE_BYTES + 1];
+        assert!(matches!(
+            validate_seccomp_profile_bytes(&oversized),
+            Err(RuntimeError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn seccomp_declaration_must_equal_the_enforced_set() {
+        let exact = REQUIRED_BLOCKED_SYSCALLS
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        validate_seccomp_declaration(&exact).expect("exact declaration must be accepted");
+
+        let mut missing = exact.clone();
+        missing.pop();
+        assert!(matches!(
+            validate_seccomp_declaration(&missing),
+            Err(RuntimeError::InvalidConfig(_))
+        ));
+
+        let mut duplicate = exact;
+        duplicate.push("mount".to_owned());
+        assert!(matches!(
+            validate_seccomp_declaration(&duplicate),
+            Err(RuntimeError::InvalidConfig(_))
+        ));
     }
 
     #[test]
@@ -7082,6 +7424,15 @@ mod tests {
             Ok(())
         }
 
+        fn verify_seccomp_compilation(
+            &mut self,
+            _compiler: &PinnedArtifact,
+            _policy: &[u8],
+            _filter: &[u8],
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
         fn start_owned(
             &mut self,
             command: &CommandSpec,
@@ -7112,8 +7463,12 @@ mod tests {
     }
 
     impl FileSystem for LifecycleFileSystem {
-        fn read(&mut self, _path: &Path) -> Result<Vec<u8>, RuntimeError> {
-            Ok(b"artifact".to_vec())
+        fn read(&mut self, path: &Path) -> Result<Vec<u8>, RuntimeError> {
+            if path.file_name() == Some(OsStr::new("seccomp-policy.json")) {
+                Ok(TEST_SECCOMP_PROFILE.to_vec())
+            } else {
+                Ok(b"artifact".to_vec())
+            }
         }
 
         fn register_jailer_root(&mut self, jail_root: &Path) -> Result<(), RuntimeError> {
@@ -7316,11 +7671,13 @@ mod tests {
 
     impl FileSystem for LateMutationFileSystem {
         fn read(&mut self, path: &Path) -> Result<Vec<u8>, RuntimeError> {
-            Ok(self
-                .files
-                .get(path)
-                .cloned()
-                .unwrap_or_else(|| b"artifact".to_vec()))
+            if let Some(bytes) = self.files.get(path) {
+                return Ok(bytes.clone());
+            }
+            if path.file_name() == Some(OsStr::new("seccomp-policy.json")) {
+                return Ok(TEST_SECCOMP_PROFILE.to_vec());
+            }
+            Ok(b"artifact".to_vec())
         }
 
         fn bind_block_device(
@@ -7692,6 +8049,18 @@ mod tests {
             "seccomp.filter.digest",
             |config: &mut RuntimeConfig| {
                 config.isolation.seccomp.filter.digest = sha256(b"changed-seccomp");
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "seccomp.policy.path",
+            |config: &mut RuntimeConfig| {
+                config.isolation.seccomp.policy.path.push("changed");
+            }
+        );
+        assert_mutation_changes_fingerprint!(
+            "seccomp.policy.digest",
+            |config: &mut RuntimeConfig| {
+                config.isolation.seccomp.policy.digest = sha256(b"changed-seccomp-policy");
             }
         );
         assert_mutation_changes_fingerprint!(

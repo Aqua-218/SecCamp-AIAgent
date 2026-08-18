@@ -4,7 +4,21 @@
 //! bounded public HTTPS adapter and, only when explicitly configured, the GitHub adapter that
 //! reads its token inside the host process.
 
-use std::{collections::BTreeSet, error::Error, fmt, fs, path::Path, time::Instant};
+use std::{
+    collections::BTreeSet,
+    error::Error,
+    fmt,
+    fs::{self, File},
+    io::Read,
+    path::Path,
+    time::Instant,
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+
+#[cfg(unix)]
+use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 
 use authority_core::{
     github::GitHubAuthority,
@@ -132,16 +146,24 @@ pub fn load_publish_plan_manifest(
     path: impl AsRef<Path>,
 ) -> Result<Vec<HostPublishPlanConfig>, String> {
     let path = path.as_ref();
-    validate_manifest_path(path)?;
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("inspect publish-plan manifest: {error}"))?;
+    let mut file = open_publish_plan_manifest(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect opened publish-plan manifest: {error}"))?;
     if metadata.len() > MAX_PUBLISH_PLAN_MANIFEST_BYTES as u64 {
         return Err(format!(
             "publish-plan manifest exceeds {MAX_PUBLISH_PLAN_MANIFEST_BYTES} bytes"
         ));
     }
     let expected_len = metadata.len();
-    let bytes = fs::read(path).map_err(|error| format!("read publish-plan manifest: {error}"))?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(expected_len)
+            .map_err(|_| "publish-plan manifest length does not fit this platform".to_owned())?,
+    );
+    file.by_ref()
+        .take((MAX_PUBLISH_PLAN_MANIFEST_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read publish-plan manifest: {error}"))?;
     if bytes.len() as u64 != expected_len {
         return Err("publish-plan manifest changed while it was being read".to_owned());
     }
@@ -150,6 +172,7 @@ pub fn load_publish_plan_manifest(
             "publish-plan manifest exceeds {MAX_PUBLISH_PLAN_MANIFEST_BYTES} bytes"
         ));
     }
+    validate_open_manifest_unchanged(path, &file, &metadata)?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| "publish-plan manifest must be UTF-8".to_owned())?;
     if text.is_empty() {
@@ -281,36 +304,100 @@ pub fn validate_publish_plans_for_authority(
     Ok(plans)
 }
 
-fn validate_manifest_path(path: &Path) -> Result<(), String> {
+#[cfg(unix)]
+fn open_publish_plan_manifest(path: &Path) -> Result<File, String> {
+    let descriptor = openat2(
+        CWD,
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|error| format!("securely open publish-plan manifest: {error}"))?;
+    let file = File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect opened publish-plan manifest: {error}"))?;
+    let uid = rustix::process::geteuid().as_raw();
+    if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != uid {
+        return Err(
+            "publish-plan manifest must be a singly-linked regular file owned by the daemon user"
+                .to_owned(),
+        );
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(
+            "publish-plan manifest must not be group/world-readable or writable".to_owned(),
+        );
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "publish-plan manifest has no parent directory".to_owned())?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|error| format!("inspect publish-plan parent: {error}"))?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != uid
+        || parent_metadata.mode() & 0o077 != 0
+    {
+        return Err("publish-plan parent must be an owner-only directory".to_owned());
+    }
+    validate_open_manifest_unchanged(path, &file, &metadata)?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_publish_plan_manifest(path: &Path) -> Result<File, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("inspect publish-plan manifest: {error}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("publish-plan manifest must be a regular non-symlink file".to_owned());
     }
-    #[cfg(unix)]
+    File::open(path).map_err(|error| format!("open publish-plan manifest: {error}"))
+}
+
+#[cfg(unix)]
+fn validate_open_manifest_unchanged(
+    path: &Path,
+    file: &File,
+    expected: &fs::Metadata,
+) -> Result<(), String> {
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("reinspect opened publish-plan manifest: {error}"))?;
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("reinspect publish-plan manifest path: {error}"))?;
+    if path_metadata.file_type().is_symlink()
+        || !opened.is_file()
+        || opened.nlink() != 1
+        || opened.dev() != expected.dev()
+        || opened.ino() != expected.ino()
+        || opened.len() != expected.len()
+        || path_metadata.dev() != opened.dev()
+        || path_metadata.ino() != opened.ino()
     {
-        use std::os::unix::fs::MetadataExt as _;
-        let uid = rustix::process::geteuid().as_raw();
-        if metadata.uid() != uid {
-            return Err("publish-plan manifest must be owned by the daemon user".to_owned());
-        }
-        if metadata.mode() & 0o077 != 0 {
-            return Err(
-                "publish-plan manifest must not be group/world-readable or writable".to_owned(),
-            );
-        }
-        let parent = path
-            .parent()
-            .ok_or_else(|| "publish-plan manifest has no parent directory".to_owned())?;
-        let parent_metadata = fs::symlink_metadata(parent)
-            .map_err(|error| format!("inspect publish-plan parent: {error}"))?;
-        if parent_metadata.file_type().is_symlink()
-            || !parent_metadata.is_dir()
-            || parent_metadata.uid() != uid
-            || parent_metadata.mode() & 0o077 != 0
-        {
-            return Err("publish-plan parent must be an owner-only directory".to_owned());
-        }
+        return Err("publish-plan manifest changed while it was being read".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_open_manifest_unchanged(
+    path: &Path,
+    file: &File,
+    expected: &fs::Metadata,
+) -> Result<(), String> {
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("reinspect opened publish-plan manifest: {error}"))?;
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("reinspect publish-plan manifest path: {error}"))?;
+    if path_metadata.file_type().is_symlink()
+        || !opened.is_file()
+        || opened.len() != expected.len()
+        || path_metadata.len() != opened.len()
+    {
+        return Err("publish-plan manifest changed while it was being read".to_owned());
     }
     Ok(())
 }
@@ -643,6 +730,30 @@ mod tests {
                 .expect_err("group-readable manifest must fail")
                 .contains("group/world")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_manifest_rejects_hard_links_and_symlinked_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let hard_linked = manifest(&valid_line("00112233445566778899aabbccddeeff"), 0o600);
+        fs::hard_link(&hard_linked.path, hard_linked.directory.join("plans.alias"))
+            .expect("create hard-link attack fixture");
+        assert!(
+            load_publish_plan_manifest(&hard_linked.path)
+                .expect_err("multiply linked manifest must fail")
+                .contains("singly-linked")
+        );
+
+        let linked_ancestor = manifest(&valid_line("10112233445566778899aabbccddeeff"), 0o600);
+        let link = linked_ancestor.directory.with_extension("link");
+        let _ = fs::remove_file(&link);
+        symlink(&linked_ancestor.directory, &link).expect("create ancestor symlink fixture");
+        let error = load_publish_plan_manifest(link.join("plans.tsv"))
+            .expect_err("a symlink in the manifest path must fail");
+        assert!(error.contains("securely open"));
+        fs::remove_file(link).expect("remove ancestor symlink fixture");
     }
 
     #[test]

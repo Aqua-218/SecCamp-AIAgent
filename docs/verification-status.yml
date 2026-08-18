@@ -709,6 +709,33 @@ claims:
         - crates/session-orchestrator/tests/real_production_lifecycle.rs
     residual_reasons: []
 
+  - id: session-orchestrator-crash-recovery-kvm
+    component: session-orchestrator
+    scope: kvm
+    status: unverified
+    summary: The protected crash matrix externally kills the real production process at every declared startup and cleanup checkpoint, then reopens the exact durable and host-resource paths.
+    verification_page: docs/session-orchestrator/verification.md
+    prerequisites:
+      - id: full-session-crash-kvm-host
+        description: A root KVM host with production artifacts, SIGKILL process control, and disposable durable/resource paths is required.
+        check: scripts/ci/verify-real-session-crash-recovery.sh prerequisites
+    gate:
+      id: session-owner-crash-recovery
+      result: required
+      on_prerequisite_failure: fail
+      commands:
+        - scripts/ci/verify-real-session-crash-recovery.sh
+    evidence:
+      commands:
+        - scripts/ci/verify-real-session-crash-recovery.sh
+      sources:
+        - crates/session-orchestrator/src/lib.rs
+        - crates/session-orchestrator/src/production_runtime.rs
+      tests:
+        - crates/session-orchestrator/tests/real_production_lifecycle.rs
+    residual_reasons:
+      - The new real KVM crash matrix has not yet completed in this working tree.
+
   - id: session-orchestrator-durable-ledger
     component: session-orchestrator
     scope: hosted

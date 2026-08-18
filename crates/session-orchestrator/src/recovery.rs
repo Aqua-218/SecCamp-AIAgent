@@ -13,6 +13,8 @@ use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
 };
 
 use firecracker_runtime::Sha256Digest;
@@ -47,6 +49,8 @@ const RECORD_IDENTITY_OFFSET: usize = 20;
 const RECORD_FINGERPRINT_OFFSET: usize = RECORD_IDENTITY_OFFSET + ENCODED_IDENTITY_BYTES;
 const RECORD_RESERVED_OFFSET: usize = RECORD_FINGERPRINT_OFFSET + CONFIG_FINGERPRINT_BYTES;
 const RECORD_CHECKSUM_OFFSET: usize = JOURNAL_RECORD_BYTES - 4;
+const TRANSIENT_FORK_LOCK_RETRY: Duration = Duration::from_millis(250);
+const TRANSIENT_FORK_LOCK_POLL: Duration = Duration::from_millis(2);
 #[cfg(target_os = "linux")]
 const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(unix)]
@@ -1144,19 +1148,28 @@ fn acquire_journal_lock(
             ));
         }
     };
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            return Err(SessionRecoveryError::Locked {
-                path: journal_path.to_path_buf(),
-            });
-        }
-        Err(TryLockError::Error(error)) => {
-            return Err(SessionRecoveryError::io(
-                SessionRecoveryOperation::Lock,
-                &display_path,
-                &error,
-            ));
+    let deadline = Instant::now() + TRANSIENT_FORK_LOCK_RETRY;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                // A concurrent `fork` can retain a just-dropped CLOEXEC descriptor until `exec`.
+                // Retry only the kernel lock on this already-opened stable sidecar. The exact
+                // directory, inode, link count, owner, and mode are revalidated after acquisition.
+                thread::sleep(TRANSIENT_FORK_LOCK_POLL);
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(SessionRecoveryError::Locked {
+                    path: journal_path.to_path_buf(),
+                });
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(SessionRecoveryError::io(
+                    SessionRecoveryOperation::Lock,
+                    &display_path,
+                    &error,
+                ));
+            }
         }
     }
     validate_open_lock(directory, &file)?;

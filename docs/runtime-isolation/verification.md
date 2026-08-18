@@ -42,6 +42,7 @@ guest 起動側の protocol は別 crate の unit test で固定している。`
 | 13 step が実 syscall で完走する | launcher が `ChildStartupStatus::Ready` を受け取る | `enforce` |
 | PID namespace が分離されている | workload の `getpid()` が `1` | `enforce` |
 | seccomp filter が実際に効く | `socket(2)` と `unshare(2)` が `EPERM` | `enforce` |
+| 高リスク syscall corpus が既定拒否される | `bpf`、`clone3`、`io_uring_setup`、`open_tree`、`pidfd_open`、`userfaultfd` の raw syscall が全て `EPERM` | `enforce`, `launcher-post-exec` |
 | Landlock ruleset が実際に効く | mount 上は書ける tmpfs への作成が `EACCES` | `enforce` |
 | workspace は書けるままである | `/workspace` への作成が成功する | `enforce` |
 | rootfs が read-only で mount されている | `/etc` への作成が `EROFS` | `enforce` |
@@ -83,12 +84,25 @@ cargo clippy --manifest-path crates/runtime-isolation/Cargo.toml --all-targets -
 
 # 特権環境でのみ境界を実測する。CI と local の共通入口を通す。
 scripts/ci/verify-privileged-isolation.sh
+scripts/ci/verify-runtime-isolation-soak.sh
 scripts/ci/verify-real-session-owner.sh
+
+# 実 aarch64 host でのみ実行する。別 architecture では明示的に exit 2。
+scripts/ci/verify-privileged-isolation-aarch64.sh
 ```
 
 wrapper は先に production の `workload-isolation-launcher` binary を build し、その binary を
 `launcher-post-exec` scenario へ渡す。kernel feature / privilege が不足して probe が実行できない
 場合は `unavailable` を stderr に出して exit 2 とし、skip を green として扱わない。
+
+`verify-runtime-isolation-soak.sh` は同じ no-skip privileged gate を既定 20 回繰り返す。
+`RUNTIME_ISOLATION_SOAK_ITERATIONS` は 1..100 の整数だけを受け入れ、無制限 run を作らない。
+各反復は enforce、post-exec、Landlock failure、実 mount rollback の 4 scenario と終了後の
+resource residue を再確認する。2026-08-18 の x86_64 KVM host では既定 20 回が完走した。
+
+syscall corpus は安全な不正引数を使う。filter が退行しても kernel object を作らない値で
+呼び出し、予期せず descriptor が返れば即座に close して test を失敗させる。これは選んだ
+6 syscall の deny 証拠であり、Linux の全 syscall と全 argument 組合せの証明ではない。
 
 `capability_detection.rs` と `privileged_isolation.rs` はどちらも `#[ignore]` を使っていない。権限や kernel feature が足りない環境では、`CapabilityReport` の不足理由を stderr に出したうえで detection 分岐そのものを検証する。CI で「skip されたので緑」という状態を作らないための書き方。
 
@@ -99,7 +113,8 @@ wrapper は先に production の `workload-isolation-launcher` binary を build 
 | 未検証の対象 | なぜ未検証か | 何があれば検証できるか |
 |---|---|---|
 | mount syscall の部分成功後に失敗した場合の rollback | privileged probe は `LimitedTmpfs` syscall の前に失敗させるため、失敗した呼び出し自身が mount を残すケースは実測していない | `mount(2)` の戻り値を含む test-only fault seam と、対象 mount namespace を保持した観測 helper |
-| x86_64 以外の syscall 番号 | `number()` が `None` を返すため `validate` が通らない | 対象 arch の番号表と、その arch での CI runner |
+| aarch64 の実 kernel 上の isolation envelope | aarch64 syscall 番号表、audit architecture、cross-target build は実装・検査済みだが、実 aarch64 privileged gate はこの working tree では未実行 | delegated cgroup v2、Landlock、seccomp、namespace、AF_VSOCK を備えた root aarch64 runner |
+| x86_64 / aarch64 以外の syscall 番号 | 対応表を持たない architecture は `number()` が `None` を返すため `validate` が fail closed する | 対象 arch の監査済み番号表と、その arch での privileged CI runner |
 
 mock test が全部通っても、VM 実起動や full isolation の完成とは判断しない。この方針は [docs/README.md](../README.md) の宣言に従う。特権 test が通ったことも、上の表の範囲を超えては主張しない。
 

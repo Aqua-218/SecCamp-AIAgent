@@ -74,7 +74,7 @@ require_sha256 "${single_worker}" '06577eb79e4ecdb98c231cb696f6e2fc4d2b572c10de6
 require_sha256 "${polkit_rule}" '58041aab07b6b490a75dd941c71d921af9a11a036e4cc048c29f4f97fbe3ab6b'
 require_sha256 "${udev_rule}" '1af47a833fcec709a533edbdd7865dd4308f9634d81de3f6ad572f5307c3c4bc'
 require_sha256 "${controller_environment}" 'fc12a7d45db0c41e79877c0e9ac6eaf427fb2275127f9f32e51d6636469fbb21'
-require_sha256 "${worker_environment}" '40eb72dba53d8ddce485510a451199953772acf89b10cbdfd5f2ce95ffefcdff'
+require_sha256 "${worker_environment}" '964c50f0623ad45b5f12ac32a01e42ca8bd1987a71b94d342bf3a93a52483761'
 require_sha256 "${deployment_readme}" 'c046fb147293bf5205f7137921a5b775d909a2bc8f304a5400ee350b8eb970b4'
 
 # host-controld checks both the socket parent and the HMAC key against --client-gid. Its primary

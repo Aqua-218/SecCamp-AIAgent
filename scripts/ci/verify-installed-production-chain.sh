@@ -451,7 +451,7 @@ assert_worker_ready() {
   worker_workspace_id="$(sed -n 's/.*"workspace_id":"\([0-9a-f]\{32\}\)".*/\1/p' "${status_file}")"
   [[ "${worker_workspace_id}" =~ ^[0-9a-f]{32}$ ]] \
     || fail "worker status omitted its workspace identity: ${unit}"
-  [[ -S "${worker_state_root}/instances/${session}/firecracker/${worker_workspace_id}/root/run/vsock.sock" ]] \
+  [[ -S "${worker_state_root}/instances/${session}/jailer/firecracker/${worker_workspace_id}/root/run/vsock.sock" ]] \
     || fail "worker did not expose its session-scoped Firecracker UDS: ${unit}"
   mapper="host-sessiond-rootfs-${session}-${worker_workspace_id}"
   dmsetup info --noheadings -c -- "${mapper}" >/dev/null \

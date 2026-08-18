@@ -761,7 +761,7 @@ impl DaemonConfig {
         let snapshot_memory = arguments.pinned("snapshot-memory")?;
         let veritysetup = arguments.pinned("veritysetup")?;
         let dmsetup = arguments.pinned("dmsetup")?;
-        let chroot_base = scoped_directory(
+        let chroot_base = scoped_jailer_directory(
             &arguments.absolute_path("jailer-chroot-base")?,
             control_session,
         );
@@ -1237,8 +1237,11 @@ impl ControlInstance {
     }
 }
 
-fn scoped_directory(base: &Path, instance: Option<ControlInstance>) -> PathBuf {
-    instance.map_or_else(|| base.to_owned(), |instance| base.join(instance.name()))
+fn scoped_jailer_directory(base: &Path, instance: Option<ControlInstance>) -> PathBuf {
+    instance.map_or_else(
+        || base.to_owned(),
+        |instance| base.join(instance.name()).join("jailer"),
+    )
 }
 
 fn scoped_file(base: &Path, instance: Option<ControlInstance>, leaf: &str) -> PathBuf {
@@ -1577,14 +1580,16 @@ fn usage() -> &'static str {
 mod tests {
     use std::{
         fs,
+        path::Path,
         sync::atomic::{AtomicUsize, Ordering},
     };
 
     use super::{
-        Arguments, MAX_SHUTDOWN_TIMEOUT_MILLIS, ShutdownRequest, file_authority, json_string,
-        parse_branch_pattern, parse_cgroup_parent, parse_egress_profile, parse_file_effects,
-        parse_github_operations, parse_hex_16, parse_http_methods, parse_path_prefix, status_line,
-        stop_file_present, systemd_arguments, validate_absolute_path, validate_shutdown_timeout,
+        Arguments, ControlInstance, MAX_SHUTDOWN_TIMEOUT_MILLIS, ShutdownRequest, file_authority,
+        json_string, parse_branch_pattern, parse_cgroup_parent, parse_egress_profile,
+        parse_file_effects, parse_github_operations, parse_hex_16, parse_http_methods,
+        parse_path_prefix, scoped_file, scoped_jailer_directory, status_line, stop_file_present,
+        systemd_arguments, validate_absolute_path, validate_shutdown_timeout,
     };
     use authority_core::{capability::AuthorityBody, repository::RepoId};
     use session_orchestrator::system_egress::GitHubEgressConfig;
@@ -1625,6 +1630,22 @@ mod tests {
         assert_eq!(
             argument_value(&arguments, "--control-session-id"),
             Some("00112233445566778899aabbccddeeff")
+        );
+    }
+
+    #[test]
+    fn systemd_worker_jailer_and_durability_paths_are_disjoint() {
+        let instance = ControlInstance::parse("00112233445566778899aabbccddeeff")
+            .expect("canonical instance must parse");
+        let base = Path::new("/var/lib/host-sessiond/instances");
+
+        assert_eq!(
+            scoped_jailer_directory(base, Some(instance)),
+            base.join("00112233445566778899aabbccddeeff/jailer")
+        );
+        assert_eq!(
+            scoped_file(base, Some(instance), "identity-ledger"),
+            base.join("00112233445566778899aabbccddeeff/identity-ledger")
         );
     }
 

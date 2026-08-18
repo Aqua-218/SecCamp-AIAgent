@@ -26,8 +26,35 @@ scripts/ci/check-pipeline-parity.sh
 scripts/ci/test-pipeline-planner.sh
 scripts/ci/tests/test-external-review.sh
 cargo test -p session-orchestrator --all-targets --features crash-test-hooks --locked
+uvx --from semgrep semgrep scan --config .semgrep.yml --error --metrics off --exclude target --exclude lean/.lake crates
+# Every declared entry in ci/gates.yml was run through the matching bounded gate.
+while IFS=$'\t' read -r package filter; do scripts/ci/run-miri.sh "$package" "$filter"; done < <(.ci-tools/bin/yq -o=tsv '.matrices.miri_packages.values[] | [.package, .filter]' ci/gates.yml)
+scripts/ci/run-sanitizer.sh address egress-protocol
+scripts/ci/run-sanitizer.sh leak egress-protocol
+scripts/ci/run-fuzz.sh authority-core canonical_path
+scripts/ci/run-fuzz.sh egress-protocol cbor_request_decode
+scripts/ci/run-fuzz.sh egress-protocol frame_decode
+scripts/ci/run-fuzz.sh egress-protocol response_decode
+scripts/ci/run-fuzz.sh egress-protocol session_accept
+scripts/ci/run-mutation.sh 1 authority-core
+scripts/ci/run-mutation.sh 2 egress-protocol
+scripts/ci/run.sh coverage
+scripts/ci/run.sh benchmarks
+scripts/ci/run.sh audit
+scripts/ci/run.sh deny
+scripts/ci/check-cross-targets.sh
+scripts/ci/collect-supply-chain-inventory.sh
+scripts/ci/check-release-dry-run.sh
+scripts/ci/check-release-reproducibility.sh
+scripts/ci/verify-real-capfs.sh
+scripts/ci/verify-real-public-https.sh
+scripts/ci/verify-real-guest-control.sh
+scripts/ci/verify-real-session-owner.sh
 scripts/ci/verify-real-session-crash-recovery.sh
 ```
+
+Release dry-run と reproducibility は、未commitのhardening差分をそのまま適用して一時commitした
+隔離clean cloneで実行した。元の作業treeをcommitしたり、publish/signingを実行したりしていない。
 
 最後のコマンドは root、KVM、vhost-vsock、device-mapper、cgroup v2 を要求し、不足時は
 成功扱いにしない。
@@ -68,6 +95,7 @@ can reach the 9.8 exit threshold only with the gate in the final column above.
 | 4 control surfaces | sealed command construction, HMAC admission, durable quotas/no-reuse, controller fencing, signed-review import | 9.8 | 9.1 | 9.7 | 9.5 | 9.3 | 9.4 | 9.0 | 9.7 | 9.8 | 9.8 | continue: production helper/worker integration and external evidence remain |
 | 5 fail-closed challenge | transient journal path loss, pre-effect revalidation, fork/exec lock inheritance, readiness timing, worker health cleanup, signed report/disposition digest binding | 9.8 | 9.2 | 9.8 | 9.7 | 9.4 | 9.5 | 9.0 | 9.8 | 9.8 | 9.8 | stop: remaining gaps require new architecture, hardware, credentials, or an independent reviewer |
 | 6 operational replay | all 11 KVM crash points, panic fallback cleanup, stale mapper/loop/cgroup residue, post-run host probe | 9.8 | 9.2 | 9.8 | 9.8 | 9.7 | 9.6 | 9.1 | 9.8 | 9.8 | 9.8 | stop: every locally satisfiable track is green; only declared external/architectural ceilings remain |
+| 7 downgrade and path-race reopen | production v1 rejection, descriptor-sealed publish plans and systemd credentials, credential-source precedence, atomic control-journal creation, stop/control metadata failure | 9.8 | 9.2 | 9.8 | 9.8 | 9.8 | 9.7 | 9.1 | 9.8 | 9.8 | 9.8 | stop: fresh hostile review found no further locally executable high-risk repair; external/architectural ceilings remain explicit |
 
 ## External ceilings
 

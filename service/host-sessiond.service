@@ -101,8 +101,8 @@ UMask=0077
 # Firecracker/Jailer needs KVM/vsock, dm-verity, cgroup v2, and mount/pid namespace setup.
 # The configured jailer UID/GID should be this same dedicated account; these capabilities are
 # the minimum host-side privilege envelope for that composition and are not guest capabilities.
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_MKNOD CAP_KILL
-AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_MKNOD CAP_KILL
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_MKNOD CAP_KILL
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_MKNOD CAP_KILL
 NoNewPrivileges=yes
 DevicePolicy=closed
 DeviceAllow=/dev/kvm rw

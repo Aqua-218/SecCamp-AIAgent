@@ -68,9 +68,9 @@ done
 # owner-reviewed gate, so a second permissive capability assignment or polkit rule cannot hide
 # behind the required secure lines below.
 require_sha256 "${controller}" '8fb7ef8ba3735570675b29436bbcd7df150dafaed7abcf73882a0d3b917c35fc'
-require_sha256 "${worker}" 'bba32ae7b995f303054b745c366cda214b3eba398acd50db21398d21efb65b9d'
+require_sha256 "${worker}" 'ceee8cf909824ab611ab83c0786bbdfb687b5e3404f28860c1868cf1445762cb'
 require_sha256 "${recovery}" '1ba6404050d1471066a108e2ea0e7122080178173ee47362fa8945333758cae0'
-require_sha256 "${single_worker}" 'd7b566d16cf0b53e5a8dadc043c01cae1e3be2f46f1144bbbcd9a07120652ca4'
+require_sha256 "${single_worker}" '98989c0f7221ebef228d04dcae942dddd3ea51c7f7a871a6857ca89f4f5aec39'
 require_sha256 "${polkit_rule}" '58041aab07b6b490a75dd941c71d921af9a11a036e4cc048c29f4f97fbe3ab6b'
 require_sha256 "${udev_rule}" 'ee003a6e5852e5ac0f5710e0f9e6ba644ab3a7672c643693c8637e7819a6a602'
 require_sha256 "${controller_environment}" 'fc12a7d45db0c41e79877c0e9ac6eaf427fb2275127f9f32e51d6636469fbb21'
@@ -125,8 +125,8 @@ reject_line "${worker}" 'After=local-fs.target dev-kvm.device dev-vhost\x2dvsock
 require_line "${worker}" 'ExecStart=/usr/local/bin/host-sessiond --systemd-instance %i --mode run'
 require_line "${worker}" 'Restart=no'
 require_line "${worker}" 'DelegateSubgroup=daemon'
-require_line "${worker}" 'CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_MKNOD CAP_KILL'
-require_line "${worker}" 'AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_MKNOD CAP_KILL'
+require_line "${worker}" 'CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_MKNOD CAP_KILL'
+require_line "${worker}" 'AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_MKNOD CAP_KILL'
 require_line "${recovery}" 'Type=oneshot'
 require_line "${recovery}" 'StateDirectory=host-sessiond/instances/%i/broker-wal'
 require_line "${recovery}" 'StateDirectory=host-jails/%i/fc'
@@ -142,8 +142,8 @@ reject_line "${single_worker}" 'Wants=dev-kvm.device dev-vhost\x2dvsock.device'
 reject_line "${single_worker}" 'After=local-fs.target dev-kvm.device dev-vhost\x2dvsock.device'
 require_line "${single_worker}" 'ReadOnlyPaths=/var/lib/host-sessiond/workspace-source'
 require_line "${single_worker}" 'DelegateSubgroup=daemon'
-require_line "${single_worker}" 'CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_MKNOD CAP_KILL'
-require_line "${single_worker}" 'AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_MKNOD CAP_KILL'
+require_line "${single_worker}" 'CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_MKNOD CAP_KILL'
+require_line "${single_worker}" 'AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_MKNOD CAP_KILL'
 require_line "${single_worker}" 'DevicePolicy=closed'
 require_line "${single_worker}" 'DeviceAllow=/dev/loop-control rw'
 require_line "${single_worker}" 'DeviceAllow=block-loop rw'
@@ -188,7 +188,7 @@ require_line "${deployment_readme}" 'reviewed_manifest_sha256=REPLACE_WITH_EXTER
 require_line "${deployment_readme}" 'set -Eeuo pipefail'
 require_line "${deployment_readme}" '(cd "${install_staging}" && sha256sum --check --strict host-sessiond-binaries.sha256)'
 require_line "${deployment_readme}" 'The legacy unit must reuse `/usr/local/bin/host-sessiond` installed by the authenticated revision,'
-if grep -E '^(CapabilityBoundingSet|AmbientCapabilities)=.*(CAP_CHOWN|CAP_MKNOD|CAP_DAC_OVERRIDE)' -- \
+if grep -E '^(CapabilityBoundingSet|AmbientCapabilities)=.*(CAP_CHOWN|CAP_FOWNER|CAP_MKNOD|CAP_DAC_OVERRIDE)' -- \
   "${recovery}" >/dev/null; then
   fail "${recovery}: jailer-only capabilities leaked into recovery mode"
 fi

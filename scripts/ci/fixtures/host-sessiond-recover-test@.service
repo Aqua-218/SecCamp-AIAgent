@@ -7,7 +7,7 @@ Conflicts=host-sessiond@%i.service
 Type=oneshot
 User=daemon
 Group=daemon
-ExecStart=/usr/bin/true
+ExecStart=/bin/sh /run/host-sessiond-control-test/recover %i
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -17,4 +17,3 @@ ProtectSystem=strict
 ProtectHome=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX
-

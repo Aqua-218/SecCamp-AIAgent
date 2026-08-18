@@ -17,8 +17,21 @@ umask 022
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repository_root
 readonly tools_root="${CI_TOOLS_DIR:-${repository_root}/.ci-tools}"
-readonly firecracker_version="1.16.1"
-readonly firecracker_archive_sha256="382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6"
+readonly firecracker_version="${FIRECRACKER_VERSION:-1.16.1}"
+case "${firecracker_version}" in
+  1.16.1)
+    firecracker_archive_sha256="382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6"
+    ;;
+  1.15.1)
+    firecracker_archive_sha256="d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a"
+    ;;
+  *)
+    printf 'real Runtime lifecycle: unsupported unpinned FIRECRACKER_VERSION: %s\n' \
+      "${firecracker_version}" >&2
+    exit 2
+    ;;
+esac
+readonly firecracker_archive_sha256
 readonly firecracker="${tools_root}/firecracker/v${firecracker_version}/firecracker"
 readonly jailer="${tools_root}/firecracker/v${firecracker_version}/jailer"
 readonly archive="${tools_root}/downloads/firecracker-v${firecracker_version}-x86_64.tgz"

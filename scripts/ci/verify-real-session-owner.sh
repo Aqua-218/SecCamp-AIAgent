@@ -303,6 +303,7 @@ run_lifecycle() {
   local crash_checkpoint="${2:-}"
   local crash_marker="${3:-}"
   local -a crash_environment=()
+  local test_name="${REAL_SESSION_TEST_NAME:-real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_resource}"
   if [[ -n "${fixed_directory}" ]]; then
     crash_environment+=(REAL_SESSION_FIXED_DIRECTORY="${fixed_directory}")
   fi
@@ -329,6 +330,8 @@ run_lifecycle() {
     REAL_SESSION_VERITY_HASH="${image_hash}" \
     REAL_SESSION_ROOT_HASH="${root_hash}" \
     REAL_SESSION_SECCOMP="${staging}/seccomp.bin" \
+    REAL_SESSION_SECCOMP_POLICY="${staging}/seccomp.json" \
+    REAL_SESSION_SECCOMP_COMPILER="${staging}/seccompiler" \
     REAL_SESSION_VERITYSETUP="$(realpath -e -- "$(command -v veritysetup)")" \
     REAL_SESSION_DMSETUP="$(realpath -e -- "$(command -v dmsetup)")" \
     REAL_SESSION_WORKSPACE_FORMATTER="$(realpath -e -- "$(command -v mkfs.ext4)")" \
@@ -342,7 +345,7 @@ run_lifecycle() {
     --ignored \
     --nocapture \
     --exact \
-    real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_resource
+    "${test_name}"
 }
 
 run_crash_case() {
@@ -394,6 +397,8 @@ run_crash_case() {
 }
 
 if [[ "${REAL_SESSION_CRASH_MATRIX:-0}" == 1 ]]; then
+  [[ -z "${REAL_SESSION_TEST_NAME:-}" ]] \
+    || fail 'REAL_SESSION_TEST_NAME cannot be combined with REAL_SESSION_CRASH_MATRIX'
   requested_checkpoint="${REAL_SESSION_CRASH_MATRIX_CASE:-}"
   matched_checkpoint=0
   for checkpoint in \

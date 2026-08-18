@@ -2,7 +2,7 @@
 
 AI Agent が生成したコードを、明示的な権限・隔離・監査の境界内で実行するための Linux / Firecracker 基盤です。Agent や Tool を信頼せず、ファイル操作と外部通信を副作用が発生する地点で Capability により認可します。
 
-> **重要:** 現在のproduction運用単位は **1 daemon = 1 session = 1 microVM** です。実行・停止・永続的な復旧記録に加え、複数のone-session workerを認証・quota・no-reuse journal付きで所有するscheduler coreは実装されています。ただし、そのcoreを実workerへ接続するcontrol daemon、複数KVMのproduction gate、特権worker分離、HAは未実装です。
+> **重要:** production の実行単位は **1 worker = 1 session = 1 microVM** のままです。非特権 `host-controld` が認証・quota・no-reuse journal・controller fencingを担い、systemd/polkit越しに複数の特権分離workerを所有します。実systemdでのfailed-worker recoveryとcontroller crash reconciliation、x86_64 KVM上の2 worker/2 Broker同時生存・独立cleanupまで検証済みです。multi-host HA、分散revoke、複製Broker stateは現行single-host trust modelの対象外です。
 
 ## まず読む
 
@@ -61,7 +61,8 @@ flowchart TB
     external["Public HTTPS / GitHub API"]
 
     subgraph host["Trusted host"]
-        orchestrator["host-sessiond / session-orchestrator<br/>one-session lifecycle / durable recovery"]
+        controller["host-controld<br/>authenticated multi-session admission"]
+        orchestrator["host-sessiond@.service<br/>one-session worker / durable recovery"]
         hostAuthority["authority-core<br/>host CapabilityKernel"]
         runtime["firecracker-runtime<br/>artifact / jailer / snapshot"]
         broker["egress-broker<br/>typed provider adapters"]
@@ -79,7 +80,8 @@ flowchart TB
         agent["Agent / Tool process"]
     end
 
-    operator -->|"start / SIGTERM / stop file"| orchestrator
+    operator -->|"authenticated start / stop"| controller
+    controller -->|"fixed systemd template + polkit"| orchestrator
     orchestrator -->|"reserve / recover"| ledger
     orchestrator -->|"restore paused VM"| runtime
     orchestrator -->|"issue exact roots"| hostAuthority
@@ -103,7 +105,7 @@ flowchart TB
     classDef untrusted fill:#b71c1c,color:#fff,stroke:#7f0000;
     classDef storage fill:#ef6c00,color:#fff,stroke:#e65100;
     classDef outside fill:#616161,color:#fff,stroke:#424242;
-    class orchestrator,hostAuthority,runtime,broker trusted;
+    class controller,orchestrator,hostAuthority,runtime,broker trusted;
     class guestControl,supervisor,guestAuthority,capfs,isolation guestService;
     class agent untrusted;
     class ledger,credential,workspace storage;
@@ -124,9 +126,9 @@ startup は `workspace → Broker → VM → Capability → workload` の順に 
 | Runtime isolation | 特権 host で検証済み | namespace、cgroup v2、seccomp、Landlock、read-only rootfs、device、fd、capability |
 | Firecracker guest path | 実 KVM で検証済み | dm-verity boot、v2 identity gate、guest Supervisor、全13 CapFS effect、isolation後のBroker channel |
 | production `Runtime::launch` / `SessionOwner` | 実 KVM で検証済み | 実jailer、clean snapshot create/restore、durable Broker/ledger、stopと全resource cleanup |
-| CI / supply chain | 実装済み | GitHub / GitLab 49 gate parity、audit、deny、SBOM、SAST、secret scan、再現可能 release、外部review署名取込 |
+| CI / supply chain | 実装済み | GitHub / GitLab 52 gate parity、audit、deny、SBOM、SAST、secret scan、再現可能 release、外部review署名取込 |
 | 外部 provider | 一部blocked | controlled DNS/HTTPS/TLSは実kernelで検証済み。実GitHub credential mutationは資格情報未提供のためblocked |
-| multi-session control plane | hosted core検証済み・production未接続 | HMAC admission、quota、durable no-reuse、controller fencingは検証済み。実`host-sessiond` worker/socket/HAは未検証 |
+| multi-session control plane | single-host components検証済み、exact installed chain未検証 | HMAC admission、`SO_PEERCRED`、quota、durable no-reuse、controller fencing、実systemd/polkit fixture、failed-worker/controller crash reconciliation、2つのlive KVM worker/Brokerと独立cleanup |
 
 > **注意:** 「実 KVM test が通る」ことを VM 隔離全体の証明とは扱いません。crate ごとの仮定と残存境界は `docs/<crate>/verification.md` に明記しています。
 

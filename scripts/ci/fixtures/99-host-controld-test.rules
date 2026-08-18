@@ -1,0 +1,16 @@
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units" ||
+        subject.user !== "nobody") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    var worker = /^host-sessiond@[0-9a-f]{32}\.service$/;
+    var recovery = /^host-sessiond-recover@[0-9a-f]{32}\.service$/;
+    if ((verb === "start" && (worker.test(unit) || recovery.test(unit))) ||
+        (verb === "stop" && worker.test(unit))) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});
+

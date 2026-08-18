@@ -112,7 +112,7 @@ crash 後に「分からない」を「分からない」として読める。�
 
 - **改竄は検出しない。** FNV-1a は keyed MAC ではない。file に書ける者は frame を作り直せる。comment にもそう書いてある。tamper evidence、署名、遠隔保管は上位 transport の責務。
 - `MAX_JOURNAL_BYTES` は `open()` と append の両方で検査する。frame を追加して 128 MiB を超える場合、その frame は書かれずに `JournalFull` になる。稼働中に上限を越えて次の open で初めて拒否される、ということは起きない。
-- cross-process の writer 調整はこの module が持つ。`open()` は journal の横に stable な lock file を作り、`flock` で排他を取る。別 process が既に writer なら `Locked` を返す。実 process を起動する test で確認している。
+- cross-process の writer 調整はこの module が持つ。`open()` は journal の横に stable な lock file を作り、`flock` で排他を取る。`fork`から`exec`まで一時継承されるCLOEXEC descriptorを実writerと誤認しないよう、既に開いたfileへの`WouldBlock`だけを250ms以内で再試行する。期限後も別 process がwriterなら`Locked`を返し、取得後のpath/inode/owner/mode検査は省略しない。実 process を起動する test で確認している。
 - `ATTEMPT_PAYLOAD_VERSION` と START payload は `DurableAttempt::metadata()` で復号できる。復号が扱うのは version 1 と 2 の両方で、version 1 の record は capability-state instance 0 として読む。
 - kernel が receipt を持たない成功に付ける token は `b"kernel-executor-returned-success"` という 32 byte の literal。**disk 上では、同じ literal を返す adapter と区別できない。**
 - `unusable` は process-local で永続しない。restart で消える。

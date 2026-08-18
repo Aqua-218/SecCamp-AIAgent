@@ -7,6 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+crash-test-hooks = []
+
 [lints]
 workspace = true
 

@@ -23,6 +23,8 @@ readonly required_paths=(
   '.gitlab-ci.yml'
   'scripts/ci/'
   'ci/'
+  'service/'
+  'deploy/'
   'guest/'
   'deny.toml'
   '.semgrep.yml'

@@ -70,7 +70,9 @@ fn run() -> Result<(), String> {
         .listen(LISTEN_BACKLOG)
         .map_err(|error| format!("listening on AF_VSOCK port {}: {error}", config.port))?;
 
-    let mut server = GuestControlServer::new();
+    // Production images refuse the legacy identity protocol. Every workload release must bind
+    // the restored VM challenge and identity bundle to the canonical authority-policy digest.
+    let mut server = GuestControlServer::new_bound_only();
     let mut workload = None;
     loop {
         let (mut stream, peer) = listener

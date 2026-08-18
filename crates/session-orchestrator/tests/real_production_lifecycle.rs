@@ -455,27 +455,72 @@ fn wait_for_completed_guest_effect_probe(
 ) -> egress_broker::durable::DurableBrokerView {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match egress_broker::durable::DurableBrokerView::open(broker_wal) {
-            Ok(view) => {
-                assert_eq!(
-                    view.requests().len(),
-                    1,
-                    "the Broker worker exited without the request that follows all 13 guest CapFS effects"
-                );
-                assert!(matches!(
+        let observation = match egress_broker::durable::DurableBrokerView::open(broker_wal) {
+            Ok(view) if view.requests().is_empty() => {
+                "the Broker WAL contains no guest request yet".to_owned()
+            }
+            Ok(view) if view.requests().len() == 1 => {
+                if matches!(
                     view.requests()[0].phase(),
                     egress_broker::durable::DurableRequestPhase::Final(_)
-                ));
-                return view;
+                ) {
+                    return view;
+                }
+                format!(
+                    "the guest request is not final yet: {:?}",
+                    view.requests()[0].phase()
+                )
             }
-            Err(error) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "guest effect proof did not reach its durable Broker record before the deadline: {error}"
-                );
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
+            Ok(view) => panic!(
+                "the guest effect probe produced more than one Broker request: {}",
+                view.requests().len()
+            ),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "guest effect proof did not reach its durable Broker record before the deadline: {observation}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_live_completed_guest_effect_probe(
+    broker_wal: &Path,
+    snapshot_wal: &Path,
+) -> egress_broker::durable::DurableBrokerView {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let observation = match fs::copy(broker_wal, snapshot_wal) {
+            Ok(_) => match egress_broker::durable::DurableBrokerView::open(snapshot_wal) {
+                Ok(view) if view.requests().is_empty() => {
+                    "the live Broker WAL snapshot contains no guest request yet".to_owned()
+                }
+                Ok(view) if view.requests().len() == 1 => {
+                    if matches!(
+                        view.requests()[0].phase(),
+                        egress_broker::durable::DurableRequestPhase::Final(_)
+                    ) {
+                        return view;
+                    }
+                    format!(
+                        "the live Broker WAL snapshot request is not final yet: {:?}",
+                        view.requests()[0].phase()
+                    )
+                }
+                Ok(view) => panic!(
+                    "the live guest effect probe produced more than one Broker request: {}",
+                    view.requests().len()
+                ),
+                Err(error) => error.to_string(),
+            },
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "live guest effect proof did not reach a durable Broker record before the deadline: {observation}"
+        );
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -705,14 +750,6 @@ fn real_production_two_session_owners_run_concurrently_and_clean_independently()
         let _ = first.stop();
         panic!("second concurrent owner failed: {error}");
     });
-    assert_eq!(
-        first.poll(OwnerPollRequest::Continue).unwrap(),
-        OwnerPollOutcome::Running(first_started)
-    );
-    assert_eq!(
-        second.poll(OwnerPollRequest::Continue).unwrap(),
-        OwnerPollOutcome::Running(second_started)
-    );
     let first_workspace = first_started.identity().workspace_id().to_string();
     let second_workspace = second_started.identity().workspace_id().to_string();
     assert_ne!(first_workspace, second_workspace);
@@ -723,6 +760,31 @@ fn real_production_two_session_owners_run_concurrently_and_clean_independently()
     assert_ne!(first_firecracker_pid, second_firecracker_pid);
     assert!(Path::new(&format!("/proc/{first_firecracker_pid}")).exists());
     assert!(Path::new(&format!("/proc/{second_firecracker_pid}")).exists());
+
+    // Snapshot the fully fsynced WAL while each guest intentionally holds its Broker connection.
+    // Opening the live WAL directly would correctly contend with the writer's exclusive lock.
+    drop(wait_for_live_completed_guest_effect_probe(
+        &first_broker_root.join(format!(
+            "{}.wal",
+            first_started.identity().broker_session_id()
+        )),
+        &first_root.join("live-broker-snapshot.wal"),
+    ));
+    drop(wait_for_live_completed_guest_effect_probe(
+        &second_broker_root.join(format!(
+            "{}.wal",
+            second_started.identity().broker_session_id()
+        )),
+        &second_root.join("live-broker-snapshot.wal"),
+    ));
+    assert_eq!(
+        first.poll(OwnerPollRequest::Continue).unwrap(),
+        OwnerPollOutcome::Running(first_started)
+    );
+    assert_eq!(
+        second.poll(OwnerPollRequest::Continue).unwrap(),
+        OwnerPollOutcome::Running(second_started)
+    );
 
     assert_eq!(
         first.stop().unwrap(),

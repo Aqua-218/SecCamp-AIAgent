@@ -151,6 +151,12 @@ impl StartSessionRequest {
     pub const fn request(self) -> ControlRequestId {
         self.request
     }
+
+    /// Returns the fixed-width authentication tag for transport encoding.
+    #[must_use]
+    pub const fn tag(self) -> ControlTag {
+        self.tag
+    }
 }
 
 /// Exact authenticated request to stop one owned worker.
@@ -183,6 +189,24 @@ impl StopSessionRequest {
     #[must_use]
     pub const fn session(self) -> ControlSessionId {
         self.session
+    }
+
+    /// Returns the requesting principal.
+    #[must_use]
+    pub const fn principal(self) -> PrincipalId {
+        self.principal
+    }
+
+    /// Returns the non-reusable request identity.
+    #[must_use]
+    pub const fn request(self) -> ControlRequestId {
+        self.request
+    }
+
+    /// Returns the fixed-width authentication tag for transport encoding.
+    #[must_use]
+    pub const fn tag(self) -> ControlTag {
+        self.tag
     }
 }
 
@@ -835,8 +859,7 @@ impl ControlJournal {
         }
         let lock_identity = validate_private_file(&lock_path, &lock)?;
 
-        let created = !path.exists();
-        let mut file = open_private(path)?;
+        let (mut file, created) = open_or_create_private_journal(path)?;
         let file_identity = validate_private_file(path, &file)?;
         if created {
             let header = encode_header();
@@ -1296,6 +1319,37 @@ fn open_private(path: &Path) -> Result<File, ControlError> {
         .map_err(|error| journal_io("opening private controller file", path, &error))
 }
 
+fn open_or_create_private_journal(path: &Path) -> Result<(File, bool), ControlError> {
+    let mut create = OpenOptions::new();
+    create.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    create.mode(0o600).custom_flags(
+        i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+            .expect("O_NOFOLLOW flag fits platform custom flags"),
+    );
+    match create.open(path) {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let mut existing = OpenOptions::new();
+            existing.read(true).write(true);
+            #[cfg(unix)]
+            existing.custom_flags(
+                i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+                    .expect("O_NOFOLLOW flag fits platform custom flags"),
+            );
+            existing
+                .open(path)
+                .map(|file| (file, false))
+                .map_err(|error| journal_io("opening existing controller journal", path, &error))
+        }
+        Err(error) => Err(journal_io(
+            "atomically creating controller journal",
+            path,
+            &error,
+        )),
+    }
+}
+
 #[cfg(unix)]
 fn validate_parent(path: &Path) -> Result<(), ControlError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1377,7 +1431,7 @@ mod tests {
     };
 
     #[cfg(unix)]
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 
     use super::*;
 
@@ -1527,6 +1581,22 @@ mod tests {
             random,
         )
         .expect("controller")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_creation_rejects_dangling_links_without_initializing_their_target() {
+        let fixture = Fixture::new();
+        let missing_target = fixture.directory.join("missing-target");
+        symlink(&missing_target, &fixture.path).expect("create dangling journal link");
+        assert!(matches!(
+            ControlJournal::open(&fixture.path),
+            Err(ControlError::Journal(_))
+        ));
+        assert!(
+            !missing_target.exists(),
+            "rejecting a dangling journal link must not initialize its target"
+        );
     }
 
     #[test]

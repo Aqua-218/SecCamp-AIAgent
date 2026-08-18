@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_or_foreign_supervisor_readiness() {
-        let (mut readiness, mut child) = child_writing_readiness("foreign-ready", true);
+        let (mut readiness, mut child) = child_writing_readiness("guest-supervisor-ready/v2", true);
         let error = wait_for_supervisor_readiness_with_timeout(
             &mut readiness,
             &mut child,

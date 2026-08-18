@@ -128,7 +128,10 @@ header に到達しなかった batch は未 commit なので、その session a
 
 `<ledger path>.lock` は消さない stable sidecar で、ledger owner はその `0600` regular file に
 kernel の exclusive file lock を保持する。process 終了時は descriptor close により自動解放され、
-次 owner は同じ inode を開いて lock を取得する。
+次 owner は同じ inode を開いて lock を取得する。multi-thread processの`fork`から`exec`までの間は
+別threadがdropしたCLOEXEC descriptorをchildが一時保持し得るため、同じ検証済みsidecarに対する
+`WouldBlock`だけを250ms以内で再試行する。期限後もownerが残る場合は`Locked`でfail closedし、
+permission/path/inode/link-count検査はlock取得後に再度行う。
 
 2 つの orchestrator process が同じ ledger を開こうとしても、stable sidecar の kernel lock を同時に保持できるのは一方だけである。後から来た process は `Locked` で停止し、両方が同じ offset に append する経路はこの所有境界を通過しない。
 

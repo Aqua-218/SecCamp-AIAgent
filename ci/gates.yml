@@ -668,6 +668,17 @@ gates:
     workflow: deep.yml
     include: deep.yml
 
+  - id: real_runtime_version_matrix
+    title: Pinned Firecracker Runtime version matrix
+    stage: system
+    tier: deep
+    scopes: [rust]
+    status: implemented
+    github: real_runtime_version_matrix
+    gitlab: real_runtime_version_matrix
+    workflow: deep.yml
+    include: deep.yml
+
   - id: egress_real_https
     title: Real public HTTPS verification
     stage: security
@@ -713,6 +724,18 @@ gates:
     workflow: deep.yml
     include: deep.yml
 
+  - id: external_review_attestation
+    title: Independent review attestation
+    stage: security
+    tier: deep
+    scopes: [always]
+    events: [workflow_dispatch, web, api]
+    status: implemented
+    github: external_review_attestation
+    gitlab: external_review_attestation
+    workflow: deep.yml
+    include: deep.yml
+
   - id: pin_inventory
     title: Pin inventory
     stage: validate
@@ -732,6 +755,28 @@ gates:
     status: implemented
     github: privileged_isolation
     gitlab: privileged_isolation
+    workflow: deep.yml
+    include: deep.yml
+
+  - id: privileged_isolation_aarch64
+    title: Privileged aarch64 runtime isolation verification
+    stage: system
+    tier: deep
+    scopes: [rust]
+    status: implemented
+    github: privileged_isolation_aarch64
+    gitlab: privileged_isolation_aarch64
+    workflow: deep.yml
+    include: deep.yml
+
+  - id: runtime_isolation_soak
+    title: Privileged runtime isolation soak
+    stage: system
+    tier: deep
+    scopes: [rust]
+    status: implemented
+    github: runtime_isolation_soak
+    gitlab: runtime_isolation_soak
     workflow: deep.yml
     include: deep.yml
 

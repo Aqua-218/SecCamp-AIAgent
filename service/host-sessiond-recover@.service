@@ -14,6 +14,7 @@ Group=host-sessiond
 SupplementaryGroups=kvm
 EnvironmentFile=/etc/host-sessiond/worker.env
 StateDirectory=host-sessiond/instances/%i
+StateDirectory=host-sessiond/instances/%i/broker-wal
 StateDirectoryMode=0750
 RuntimeDirectory=host-sessiond/instances/%i
 RuntimeDirectoryMode=0750

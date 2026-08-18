@@ -159,9 +159,8 @@ test_root=''
 
 remove_mapper() {
   local mapper="$1"
-  local attempt
   dmsetup info --noheadings -c -- "${mapper}" >/dev/null 2>&1 || return 0
-  for attempt in $(seq 1 50); do
+  for _ in {1..50}; do
     if dmsetup remove -- "${mapper}" >/dev/null 2>&1; then
       return 0
     fi
@@ -175,7 +174,6 @@ remove_mapper() {
 
 remove_cgroup() {
   local cgroup="$1"
-  local attempt
   [[ -d "${cgroup}" && ! -L "${cgroup}" ]] || return 0
   if [[ -f "${cgroup}/cgroup.kill" ]]; then
     printf '1\n' >"${cgroup}/cgroup.kill" || true
@@ -184,7 +182,7 @@ remove_cgroup() {
     [[ -z "$(<"${cgroup}/cgroup.procs")" ]] && break
     sleep 0.1
   done
-  for attempt in $(seq 1 50); do
+  for _ in {1..50}; do
     if rmdir -- "${cgroup}" >/dev/null 2>&1; then
       return 0
     fi

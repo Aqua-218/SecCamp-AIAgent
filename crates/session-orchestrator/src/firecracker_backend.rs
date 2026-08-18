@@ -502,6 +502,9 @@ mod tests {
         SubjectId, VmId, WorkspaceId,
     };
 
+    const TEST_SECCOMP_POLICY: &[u8] =
+        br#"{"vmm":{"default_action":"trap","filter_action":"allow","filter":[]}}"#;
+
     #[derive(Default)]
     struct TestRunner {
         next_pid: u32,
@@ -526,6 +529,15 @@ mod tests {
             &mut self,
             _veritysetup: &PinnedArtifact,
             _expected: &DmVerityConfig,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        fn verify_seccomp_compilation(
+            &mut self,
+            _compiler: &PinnedArtifact,
+            _policy: &[u8],
+            _filter: &[u8],
         ) -> Result<(), RuntimeError> {
             Ok(())
         }
@@ -556,8 +568,12 @@ mod tests {
     }
 
     impl FileSystem for TestFileSystem {
-        fn read(&mut self, _path: &Path) -> Result<Vec<u8>, RuntimeError> {
-            Ok(Vec::new())
+        fn read(&mut self, path: &Path) -> Result<Vec<u8>, RuntimeError> {
+            if path == Path::new("/test/seccomp-policy.json") {
+                Ok(TEST_SECCOMP_POLICY.to_vec())
+            } else {
+                Ok(Vec::new())
+            }
         }
 
         fn bind_block_device(
@@ -809,20 +825,23 @@ mod tests {
                     cpu_period_micros: 1,
                 },
                 seccomp: SeccompConfig {
+                    compiler: artifact("/test/seccompiler"),
                     filter: artifact(
                         jail_root
                             .join("artifacts/seccomp")
                             .to_str()
                             .expect("test seccomp path must be UTF-8"),
                     ),
+                    policy: PinnedArtifact::new(
+                        "/test/seccomp-policy.json",
+                        sha256(TEST_SECCOMP_POLICY),
+                    ),
                     blocked_syscalls: [
                         "bpf",
-                        "connect",
                         "mount",
                         "perf_event_open",
                         "ptrace",
                         "setns",
-                        "socket",
                         "unshare",
                     ]
                     .into_iter()

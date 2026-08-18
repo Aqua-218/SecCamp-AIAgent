@@ -156,6 +156,7 @@ fn verify_enforced_boundary() {
         errno_name(libc::EPERM),
         "seccomp must deny namespace creation with EPERM"
     );
+    assert_escape_corpus_denied(&child);
     assert_eq!(
         field(&child, "dev_null"),
         errno_name(libc::ENOENT),
@@ -315,6 +316,7 @@ fn verify_launcher_post_exec_boundary() {
     );
     assert_eq!(field(&child, "socket"), errno_name(libc::EPERM));
     assert_eq!(field(&child, "unshare"), errno_name(libc::EPERM));
+    assert_escape_corpus_denied(&child);
     assert_eq!(field(&child, "workspace_write"), "0");
     assert_eq!(field(&child, "tmpfs_write"), errno_name(libc::EACCES));
     assert_eq!(field(&child, "rootfs_write"), errno_name(libc::EROFS));
@@ -880,6 +882,7 @@ fn run_post_exec_probe() {
             ))
         ),
     ];
+    lines.extend(escape_corpus_report());
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     for (field, label) in [
         ("CapEff:", "capeff"),
@@ -1452,6 +1455,7 @@ fn report_from_child() {
             ))
         ),
     ];
+    lines.extend(escape_corpus_report());
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     for (field, label) in [
         ("CapEff:", "capeff"),
@@ -1583,6 +1587,70 @@ fn errno_of_denied_unshare() -> i32 {
         return 0;
     }
     last_errno()
+}
+
+fn escape_corpus_report() -> Vec<String> {
+    [
+        ("bpf", libc::SYS_bpf),
+        ("clone3", libc::SYS_clone3),
+        ("io_uring_setup", libc::SYS_io_uring_setup),
+        ("open_tree", libc::SYS_open_tree),
+        ("pidfd_open", libc::SYS_pidfd_open),
+        ("userfaultfd", libc::SYS_userfaultfd),
+    ]
+    .into_iter()
+    .map(|(label, number)| {
+        format!(
+            "escape_{label}={}",
+            errno_name(errno_of_denied_raw_syscall(number))
+        )
+    })
+    .collect()
+}
+
+fn errno_of_denied_raw_syscall(number: libc::c_long) -> i32 {
+    // Every corpus entry receives deliberately invalid scalar/pointer arguments,
+    // so none can commit an effect if the seccomp rule regresses. A surprising
+    // nonnegative descriptor is closed before the failed assertion is reported.
+    // SAFETY: syscall accepts scalar varargs; the null pointer is never
+    // dereferenced in userspace and the kernel validates it.
+    let result = unsafe {
+        libc::syscall(
+            number,
+            libc::c_ulong::MAX,
+            std::ptr::null::<libc::c_void>(),
+            libc::c_ulong::MAX,
+            libc::c_ulong::MAX,
+            libc::c_ulong::MAX,
+            libc::c_ulong::MAX,
+        )
+    };
+    if result >= 0 {
+        if let Ok(descriptor) = libc::c_int::try_from(result) {
+            // SAFETY: an fd-producing syscall returned this descriptor. EBADF
+            // from a non-fd result is harmless in the already-failing branch.
+            unsafe { libc::close(descriptor) };
+        }
+        return 0;
+    }
+    last_errno()
+}
+
+fn assert_escape_corpus_denied(report: &[String]) {
+    for label in [
+        "escape_bpf",
+        "escape_clone3",
+        "escape_io_uring_setup",
+        "escape_open_tree",
+        "escape_pidfd_open",
+        "escape_userfaultfd",
+    ] {
+        assert_eq!(
+            field(report, label),
+            errno_name(libc::EPERM),
+            "the hostile syscall corpus must be denied at {label}: {report:?}"
+        );
+    }
 }
 
 fn last_errno() -> i32 {

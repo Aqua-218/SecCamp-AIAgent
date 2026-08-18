@@ -782,6 +782,17 @@ impl DaemonConfig {
             .join(firecracker_name)
             .join(TEMPLATE_CLONE_ID)
             .join("root");
+        // A systemd worker path contains both the controller session ID and the runtime workspace
+        // ID. Compact in-jail names keep the host-visible endpoint within Linux sockaddr_un even
+        // for a maximum-width u32 guest port; direct single-session mode retains descriptive names.
+        let (api_socket, vsock_uds_path) = if control_session.is_some() {
+            (template_root.join("a"), template_root.join("v"))
+        } else {
+            (
+                template_root.join("run/firecracker.sock"),
+                template_root.join("run/vsock.sock"),
+            )
+        };
         let guest_cid = arguments.number("guest-cid")?;
         let runtime = RuntimeConfig {
             firecracker,
@@ -818,7 +829,7 @@ impl DaemonConfig {
                 chroot_base_dir: chroot_base,
                 cgroup_version: CgroupVersion::V2,
             },
-            api_socket: template_root.join("run/firecracker.sock"),
+            api_socket,
             isolation: HostIsolationConfig {
                 namespaces: NamespaceConfig {
                     user: false,
@@ -851,7 +862,7 @@ impl DaemonConfig {
             },
             vsock: VsockConfig {
                 guest_cid,
-                uds_path: template_root.join("run/vsock.sock"),
+                uds_path: vsock_uds_path,
             },
             network_devices: Vec::new(),
             vcpu_count: arguments.number("vcpu-count")?,
@@ -1238,10 +1249,7 @@ impl ControlInstance {
 }
 
 fn scoped_jailer_directory(base: &Path, instance: Option<ControlInstance>) -> PathBuf {
-    instance.map_or_else(
-        || base.to_owned(),
-        |instance| base.join(instance.name()).join("jailer"),
-    )
+    instance.map_or_else(|| base.to_owned(), |instance| base.join(instance.name()))
 }
 
 fn scoped_file(base: &Path, instance: Option<ControlInstance>, leaf: &str) -> PathBuf {
@@ -1580,6 +1588,7 @@ fn usage() -> &'static str {
 mod tests {
     use std::{
         fs,
+        os::unix::ffi::OsStrExt,
         path::Path,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -1592,6 +1601,7 @@ mod tests {
         systemd_arguments, validate_absolute_path, validate_shutdown_timeout,
     };
     use authority_core::{capability::AuthorityBody, repository::RepoId};
+    use firecracker_runtime::firecracker_guest_port_path;
     use session_orchestrator::system_egress::GitHubEgressConfig;
 
     fn arguments(values: &[&str]) -> Arguments {
@@ -1637,15 +1647,28 @@ mod tests {
     fn systemd_worker_jailer_and_durability_paths_are_disjoint() {
         let instance = ControlInstance::parse("00112233445566778899aabbccddeeff")
             .expect("canonical instance must parse");
-        let base = Path::new("/var/lib/host-sessiond/instances");
+        let jail_base = Path::new("/var/lib/host-jails");
+        let durability_base = Path::new("/var/lib/host-sessiond/instances");
 
         assert_eq!(
-            scoped_jailer_directory(base, Some(instance)),
-            base.join("00112233445566778899aabbccddeeff/jailer")
+            scoped_jailer_directory(jail_base, Some(instance)),
+            jail_base.join("00112233445566778899aabbccddeeff")
         );
         assert_eq!(
-            scoped_file(base, Some(instance), "identity-ledger"),
-            base.join("00112233445566778899aabbccddeeff/identity-ledger")
+            scoped_file(durability_base, Some(instance), "identity-ledger"),
+            durability_base.join("00112233445566778899aabbccddeeff/identity-ledger")
+        );
+
+        let maximum_port_path = firecracker_guest_port_path(
+            jail_base
+                .join("00112233445566778899aabbccddeeff")
+                .join("fc/ffeeddccbbaa99887766554433221100/root/v"),
+            u32::MAX - 1,
+        )
+        .expect("canonical systemd vsock endpoint must derive");
+        assert!(
+            maximum_port_path.as_os_str().as_bytes().len() < 108,
+            "the maximum systemd guest-port endpoint must fit sockaddr_un"
         );
     }
 

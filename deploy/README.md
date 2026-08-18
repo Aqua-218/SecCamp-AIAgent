@@ -104,7 +104,10 @@ udevadm settle
 
 Provision the immutable workspace template, controller configuration, and the exact 32-byte HMAC
 key. Replace every placeholder digest with the digest of the artifact on disk, including
-`/usr/bin/systemctl`.
+`/usr/bin/systemctl`. Install the pinned Firecracker executable as `/opt/firecracker/fc` exactly;
+the compact basename and `/var/lib/host-jails` base keep the two 128-bit identity components and
+every valid guest port below Linux's Unix-socket pathname limit. Do not replace either with a
+symlink.
 
 ```bash
 set -Eeuo pipefail

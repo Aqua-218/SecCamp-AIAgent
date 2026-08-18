@@ -68,14 +68,14 @@ done
 # owner-reviewed gate, so a second permissive capability assignment or polkit rule cannot hide
 # behind the required secure lines below.
 require_sha256 "${controller}" '8fb7ef8ba3735570675b29436bbcd7df150dafaed7abcf73882a0d3b917c35fc'
-require_sha256 "${worker}" '6ecc3b8c68e01c29b6999652dca28f5c8736b6da834e7067d53f65517b2f5df7'
-require_sha256 "${recovery}" '615a666ca395db816966af1cedca3ac18edb574996be5cc51c4497e55a6bec87'
+require_sha256 "${worker}" '791597da482356df21c85d952d37fb3da17b75da538b9fe86079f77c8af12016'
+require_sha256 "${recovery}" '1ba6404050d1471066a108e2ea0e7122080178173ee47362fa8945333758cae0'
 require_sha256 "${single_worker}" '110e96c71b831d9d87d3e6872ea1a7eca782cd9df8513593aaeb942e4e1303d4'
 require_sha256 "${polkit_rule}" '58041aab07b6b490a75dd941c71d921af9a11a036e4cc048c29f4f97fbe3ab6b'
 require_sha256 "${udev_rule}" '1af47a833fcec709a533edbdd7865dd4308f9634d81de3f6ad572f5307c3c4bc'
 require_sha256 "${controller_environment}" 'fc12a7d45db0c41e79877c0e9ac6eaf427fb2275127f9f32e51d6636469fbb21'
-require_sha256 "${worker_environment}" '865c85b79b2b3b4088dbc2ebfe7ecd4b16541547358cbbd0911080e06608e242'
-require_sha256 "${deployment_readme}" 'c046fb147293bf5205f7137921a5b775d909a2bc8f304a5400ee350b8eb970b4'
+require_sha256 "${worker_environment}" 'c2e030dba30173f14c046d10f4b9388524afe4e684a67a0c20621c8303a83b91'
+require_sha256 "${deployment_readme}" '27a565a782f051edd57e41edd68d199fc266bd5ea9c868d5207b3a33a35f6fb5'
 
 # host-controld checks both the socket parent and the HMAC key against --client-gid. Its primary
 # group therefore has to be the client group; a supplementary group does not affect systemd's
@@ -111,6 +111,7 @@ for unit in "${worker}" "${recovery}"; do
   require_line "${unit}" 'DeviceAllow=block-loop rw'
   require_line "${unit}" 'DeviceAllow=block-device-mapper rw'
   reject_line "${unit}" 'DeviceAllow=/dev/mapper/host-sessiond-rootfs-* rw'
+  require_line "${unit}" 'ReadWritePaths=/var/lib/host-sessiond/instances/%i /var/lib/host-jails/%i /run/host-sessiond/instances/%i'
   require_line "${unit}" 'ReadOnlyPaths=/var/lib/host-sessiond/workspace-source'
   if grep -E '^ReadWritePaths=.*workspace-source' -- "${unit}" >/dev/null; then
     fail "${unit}: immutable workspace source is writable"
@@ -119,7 +120,7 @@ done
 
 require_line "${worker}" 'Type=notify'
 require_line "${worker}" 'StateDirectory=host-sessiond/instances/%i/broker-wal'
-require_line "${worker}" 'StateDirectory=host-sessiond/instances/%i/jailer/firecracker'
+require_line "${worker}" 'StateDirectory=host-jails/%i/fc'
 require_line "${worker}" 'After=local-fs.target'
 reject_line "${worker}" 'Wants=dev-kvm.device dev-vhost\x2dvsock.device'
 reject_line "${worker}" 'After=local-fs.target dev-kvm.device dev-vhost\x2dvsock.device'
@@ -127,7 +128,7 @@ require_line "${worker}" 'ExecStart=/usr/local/bin/host-sessiond --systemd-insta
 require_line "${worker}" 'Restart=no'
 require_line "${recovery}" 'Type=oneshot'
 require_line "${recovery}" 'StateDirectory=host-sessiond/instances/%i/broker-wal'
-require_line "${recovery}" 'StateDirectory=host-sessiond/instances/%i/jailer/firecracker'
+require_line "${recovery}" 'StateDirectory=host-jails/%i/fc'
 require_line "${recovery}" 'ExecStart=/usr/local/bin/host-sessiond --systemd-instance %i --mode recover'
 
 # Keep the legacy one-session unit at least as restrictive around the source template.
@@ -169,6 +170,8 @@ require_line "${worker_environment}" 'HOST_SESSIOND_JAILER_UID=961'
 require_line "${worker_environment}" 'HOST_SESSIOND_JAILER_GID=961'
 require_line "${worker_environment}" 'HOST_SESSIOND_GUEST_CID=42'
 require_line "${worker_environment}" 'HOST_SESSIOND_BROKER_PORT=5001'
+require_line "${worker_environment}" 'HOST_SESSIOND_FIRECRACKER=/opt/firecracker/fc'
+require_line "${worker_environment}" 'HOST_SESSIOND_JAILER_CHROOT_BASE=/var/lib/host-jails'
 require_line "${worker_environment}" 'HOST_SESSIOND_BROKER_REPLAY_CAPACITY=256'
 require_line "${worker_environment}" 'HOST_SESSIOND_BROKER_BUDGET_REQUESTS=1000'
 require_line "${worker_environment}" 'HOST_SESSIOND_BROKER_MAX_CONNECTION_REQUESTS=256'

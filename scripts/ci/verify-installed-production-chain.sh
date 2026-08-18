@@ -23,6 +23,7 @@ readonly controller_config_root=/etc/host-controld
 readonly worker_config_root=/etc/host-sessiond
 readonly controller_state_root=/var/lib/host-controld
 readonly worker_state_root=/var/lib/host-sessiond
+readonly worker_jail_root=/var/lib/host-jails
 readonly controller_runtime_root=/run/host-controld
 readonly worker_runtime_root=/run/host-sessiond
 readonly firecracker_root=/opt/firecracker
@@ -116,6 +117,7 @@ for target in \
   "${worker_config_root}" \
   "${controller_state_root}" \
   "${worker_state_root}" \
+  "${worker_jail_root}" \
   "${controller_runtime_root}" \
   "${worker_runtime_root}" \
   "${firecracker_root}" \
@@ -203,6 +205,7 @@ cleanup() {
       "${worker_config_root}" \
       "${controller_state_root}" \
       "${worker_state_root}" \
+      "${worker_jail_root}" \
       "${controller_runtime_root}" \
       "${worker_runtime_root}" \
       "${firecracker_root}" \
@@ -263,7 +266,7 @@ for binary in host-sessiond host-controld host-control; do
 done
 
 install -d -o root -g root -m 0555 -- "${firecracker_root}" "${guest_root}"
-install -o root -g root -m 0555 -- "${artifact_root}/firecracker" "${firecracker_root}/firecracker"
+install -o root -g root -m 0555 -- "${artifact_root}/firecracker" "${firecracker_root}/fc"
 install -o root -g root -m 0555 -- "${artifact_root}/jailer" "${firecracker_root}/jailer"
 install -o root -g root -m 0555 -- "${artifact_root}/seccompiler" "${firecracker_root}/seccompiler"
 install -o root -g root -m 0444 -- "${artifact_root}/seccomp.bin" "${firecracker_root}/seccomp.bin"
@@ -285,7 +288,7 @@ install -o root -g host-sessiond -m 0440 /dev/null \
 systemctl_digest="$(sha256sum /usr/bin/systemctl | awk '{ print $1 }')"
 root_hash="$(sed -n '1p' "${artifact_root}/rootfs.root-hash")"
 [[ "${root_hash}" =~ ^[0-9a-f]{64}$ ]] || fail 'artifact root hash is not canonical'
-firecracker_digest="$(sha256sum "${firecracker_root}/firecracker" | awk '{ print $1 }')"
+firecracker_digest="$(sha256sum "${firecracker_root}/fc" | awk '{ print $1 }')"
 jailer_digest="$(sha256sum "${firecracker_root}/jailer" | awk '{ print $1 }')"
 seccompiler_digest="$(sha256sum "${firecracker_root}/seccompiler" | awk '{ print $1 }')"
 seccomp_digest="$(sha256sum "${firecracker_root}/seccomp.bin" | awk '{ print $1 }')"
@@ -314,7 +317,7 @@ chown host-controld:host-control -- "${controller_config_root}/control.key"
 chmod 0440 -- "${controller_config_root}/control.key"
 
 install -o root -g host-sessiond -m 0640 /dev/stdin "${worker_config_root}/worker.env" <<EOF
-HOST_SESSIOND_FIRECRACKER=${firecracker_root}/firecracker
+HOST_SESSIOND_FIRECRACKER=${firecracker_root}/fc
 HOST_SESSIOND_FIRECRACKER_SHA256=${firecracker_digest}
 HOST_SESSIOND_JAILER=${firecracker_root}/jailer
 HOST_SESSIOND_JAILER_SHA256=${jailer_digest}
@@ -343,7 +346,7 @@ HOST_SESSIOND_VERITYSETUP=${veritysetup}
 HOST_SESSIOND_VERITYSETUP_SHA256=${veritysetup_digest}
 HOST_SESSIOND_DMSETUP=${dmsetup}
 HOST_SESSIOND_DMSETUP_SHA256=${dmsetup_digest}
-HOST_SESSIOND_JAILER_CHROOT_BASE=${worker_state_root}/instances
+HOST_SESSIOND_JAILER_CHROOT_BASE=${worker_jail_root}
 HOST_SESSIOND_CGROUP_PARENT=system.slice
 HOST_SESSIOND_IDENTITY_LEDGER_ROOT=${worker_state_root}/instances
 HOST_SESSIOND_RECOVERY_JOURNAL_ROOT=${worker_state_root}/instances
@@ -451,7 +454,7 @@ assert_worker_ready() {
   worker_workspace_id="$(sed -n 's/.*"workspace_id":"\([0-9a-f]\{32\}\)".*/\1/p' "${status_file}")"
   [[ "${worker_workspace_id}" =~ ^[0-9a-f]{32}$ ]] \
     || fail "worker status omitted its workspace identity: ${unit}"
-  [[ -S "${worker_state_root}/instances/${session}/jailer/firecracker/${worker_workspace_id}/root/run/vsock.sock" ]] \
+  [[ -S "${worker_jail_root}/${session}/fc/${worker_workspace_id}/root/v" ]] \
     || fail "worker did not expose its session-scoped Firecracker UDS: ${unit}"
   mapper="host-sessiond-rootfs-${session}-${worker_workspace_id}"
   dmsetup info --noheadings -c -- "${mapper}" >/dev/null \
@@ -462,7 +465,7 @@ assert_worker_ready() {
   while read -r candidate_pid; do
     [[ "${candidate_pid}" =~ ^[1-9][0-9]*$ && -e "/proc/${candidate_pid}/exe" ]] || continue
     executable="$(readlink -f "/proc/${candidate_pid}/exe" 2>/dev/null || true)"
-    if [[ "${executable##*/}" == firecracker ]]; then
+    if [[ "${executable##*/}" == fc ]]; then
       worker_firecracker_pid="${candidate_pid}"
       break
     fi

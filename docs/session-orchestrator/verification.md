@@ -36,6 +36,9 @@ test には、mock backend による state machine test、durable ledger を直�
 | controller二重openのkernel lock fencing、再起動時のreserved/active worker cleanup、session ID非再利用 | 実fileとworker factoryを使う`control_plane` unit test |
 | live journalのpath消失・inode/length driftを恒久poisonし、start/stop/poll/shutdown/recoveryのworker effect前に拒否 | 実rename/appendを使う`control_plane` unit test |
 | worker health不能時の即時cleanup、cleanup失敗時のworker保持、任意error文字列を通さないclosed code | `control_plane` unit test |
+| control journalの初期作成 | `create_new`で作成者を原子的に確定し、競合生成・metadata I/O error・dangling symlinkを新規journalとして初期化しない | `journal_creation_rejects_dangling_links_without_initializing_their_target` |
+| GitHub publish-plan manifest | symlinkを含む祖先とhard linkを拒否し、owner-only descriptorからbounded readした前後でinode/size/owner/mode/mtime/ctimeを再照合する | `system_egress` manifest tests |
+| daemon stop file | 不在とmetadata I/O failureを区別し、観測不能ならdependency-order cleanupを実行して非zero終了する | `stop_file_observation_distinguishes_absence_from_io_failure` |
 | workspace clone、listener 所有、snapshot binding、Firecracker identity 注入、Authority subject の閉包 | production adapter composition test（全境界 fake） |
 | production `SessionOwner` の build → 実 Firecracker snapshot restore → guest readiness → `Continue` poll → stop → `Closed` | `real_production_lifecycle.rs`（実 `Runtime`、jailer、dm-verity、filesystem、AF_VSOCK、durable Broker、guest supervisor。`REAL_SESSION_OWNER_LIFECYCLE=1` の ignored gate） |
 | production process をstartup 7点・cleanup 4点で外部`SIGKILL`し、同じdurable pathから再起動 | `verify-real-session-crash-recovery.sh`。各点で旧cgroup、exact dm-verity bind/mapper、jail/workspaceを限定回収し、fresh identityの新session完走とresidue不在を確認 |
@@ -53,7 +56,7 @@ cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-target
 cleanup完了後だけ`Closed`をsyncする。restart時は未closeの全sessionをstable ID順で
 `ControlWorkerFactory::recover`へ渡し、exact cleanupが成功しない限りcontrollerを開かない。
 HMAC keyはhost-only inputで、tag比較はHMAC実装のconstant-time verifyを使い、drop時に保持bufferを
-zeroizeする。journalとstable lockはowner-only fileであり、unsafe parent、symlink、mode変更、
+zeroizeする。journalは原子的なexclusive create、stable lockはowner-only createを使い、unsafe parent、symlink、mode変更、
 checksum/transition破損をfail closedにする。open後も各worker effect前とappend直前にpath/inode/lengthを
 再検査し、最初の不整合以後は同じcontroller handleを恒久poisonする。
 worker境界のerrorは4個のclosed codeだけで、任意長文字列やcredentialをcontroller logへ運べない。

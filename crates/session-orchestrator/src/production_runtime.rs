@@ -2428,6 +2428,9 @@ mod tests {
     use crate::recovery::SessionRecoveryLease;
     use crate::{IdentityKind, IdentityLedger};
 
+    const TEST_SECCOMP_POLICY: &[u8] =
+        br#"{"vmm":{"default_action":"trap","filter_action":"allow","filter":[]}}"#;
+
     struct TestApi;
 
     impl ApiClient for TestApi {
@@ -2476,6 +2479,15 @@ mod tests {
             Ok(())
         }
 
+        fn verify_seccomp_compilation(
+            &mut self,
+            _compiler: &PinnedArtifact,
+            _policy: &[u8],
+            _filter: &[u8],
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
         fn start_owned(
             &mut self,
             _command: &CommandSpec,
@@ -2502,8 +2514,12 @@ mod tests {
     }
 
     impl FileSystem for ExecutionFileSystem {
-        fn read(&mut self, _path: &Path) -> Result<Vec<u8>, RuntimeError> {
-            Ok(b"pinned".to_vec())
+        fn read(&mut self, path: &Path) -> Result<Vec<u8>, RuntimeError> {
+            if path == Path::new("/test/seccomp-policy.json") {
+                Ok(TEST_SECCOMP_POLICY.to_vec())
+            } else {
+                Ok(b"pinned".to_vec())
+            }
         }
 
         fn bind_block_device(
@@ -2924,15 +2940,18 @@ mod tests {
                     cpu_period_micros: 100_000,
                 },
                 seccomp: SeccompConfig {
+                    compiler: artifact("/test/seccompiler"),
                     filter: artifact(jail_root.join("artifacts/seccomp")),
+                    policy: PinnedArtifact::new(
+                        "/test/seccomp-policy.json",
+                        sha256(TEST_SECCOMP_POLICY),
+                    ),
                     blocked_syscalls: [
                         "bpf",
-                        "connect",
                         "mount",
                         "perf_event_open",
                         "ptrace",
                         "setns",
-                        "socket",
                         "unshare",
                     ]
                     .into_iter()

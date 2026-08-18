@@ -1789,20 +1789,52 @@ mod tests {
         }
     }
 
-    fn short_socket_root(label: &str) -> PathBuf {
+    fn short_socket_root_below(workspace: &Path, label: &str) -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let effective_uid = super::effective_uid().expect("test effective UID must be available");
+        // Cargo starts unit tests in the package directory. Select the shortest safe writable
+        // ancestor so the checkout location cannot consume the Unix socket path budget.
+        let base = workspace
+            .ancestors()
+            .filter(|candidate| candidate.parent().is_some())
+            .filter(|candidate| {
+                std::fs::symlink_metadata(candidate).is_ok_and(|metadata| {
+                    metadata.is_dir()
+                        && metadata.uid() == effective_uid
+                        && metadata.mode() & 0o200 != 0
+                        && super::validate_private_directory_chain(candidate).is_ok()
+                })
+            })
+            .last()
+            .expect("test workspace must have a writable private owned ancestor");
         let tag = label
             .bytes()
             .next()
             .filter(u8::is_ascii_alphanumeric)
             .map_or('x', char::from);
-        std::env::current_dir()
+        base.join(format!(
+            "v{tag}{:x}{:x}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn short_socket_root(label: &str) -> PathBuf {
+        short_socket_root_below(
+            &std::env::current_dir().expect("test workspace must be available"),
+            label,
+        )
+    }
+
+    #[test]
+    fn short_socket_root_does_not_inherit_a_long_workspace_path() {
+        let workspace = std::env::current_dir()
             .expect("test workspace must be available")
-            .join(format!(
-                "v{tag}{:x}{:x}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ))
+            .join("w".repeat(128));
+        let root = short_socket_root_below(&workspace, "long");
+
+        assert!(!root.starts_with(&workspace));
+        assert!(workspace.starts_with(root.parent().expect("test root must have a parent")));
     }
 
     #[test]

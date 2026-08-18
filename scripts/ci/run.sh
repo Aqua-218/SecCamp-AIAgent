@@ -128,11 +128,20 @@ case "${command_name}" in
   privileged-isolation)
     scripts/ci/verify-privileged-isolation.sh
     ;;
+  privileged-isolation-aarch64)
+    scripts/ci/verify-privileged-isolation-aarch64.sh
+    ;;
+  runtime-isolation-soak)
+    scripts/ci/verify-runtime-isolation-soak.sh
+    ;;
   real-capfs)
     scripts/ci/verify-real-capfs.sh
     ;;
   real-runtime-lifecycle)
     scripts/ci/verify-real-runtime-lifecycle.sh
+    ;;
+  real-runtime-version-matrix)
+    scripts/ci/verify-real-runtime-version-matrix.sh
     ;;
   real-session-owner)
     scripts/ci/verify-real-session-owner.sh
@@ -150,6 +159,9 @@ case "${command_name}" in
     ;;
   live-github)
     scripts/ci/verify-live-github.sh
+    ;;
+  external-review)
+    scripts/ci/verify-external-review-from-env.sh
     ;;
   repository-policy)
     scripts/ci/check-adr-index.sh

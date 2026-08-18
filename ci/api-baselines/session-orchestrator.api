@@ -27,6 +27,103 @@ impl session_orchestrator::CapabilityBackend<session_orchestrator::authority_bac
 pub fn session_orchestrator::authority_backend::AuthorityCoreBackend::inject_root_capability(&mut self, &session_orchestrator::SessionIdentity, &session_orchestrator::authority_backend::AuthorityRootGrant) -> core::result::Result<session_orchestrator::CapabilityLease, session_orchestrator::BackendError>
 pub type session_orchestrator::authority_backend::AuthorityBackend = session_orchestrator::authority_backend::AuthorityCoreBackend
 pub type session_orchestrator::authority_backend::AuthorityRootSpec = session_orchestrator::authority_backend::AuthorityRootGrant
+pub mod session_orchestrator::control_plane
+pub enum session_orchestrator::control_plane::ControlError
+pub session_orchestrator::control_plane::ControlError::Authentication
+pub session_orchestrator::control_plane::ControlError::Entropy(alloc::string::String)
+pub session_orchestrator::control_plane::ControlError::Fenced(std::path::PathBuf)
+pub session_orchestrator::control_plane::ControlError::GlobalQuota
+pub session_orchestrator::control_plane::ControlError::IdentityExhausted
+pub session_orchestrator::control_plane::ControlError::InvalidIdentity
+pub session_orchestrator::control_plane::ControlError::InvalidLimits
+pub session_orchestrator::control_plane::ControlError::Journal(alloc::string::String)
+pub session_orchestrator::control_plane::ControlError::PrincipalQuota(session_orchestrator::control_plane::PrincipalId)
+pub session_orchestrator::control_plane::ControlError::Recovery(session_orchestrator::control_plane::ControlWorkerError)
+pub session_orchestrator::control_plane::ControlError::RequestReplay(session_orchestrator::control_plane::ControlRequestId)
+pub session_orchestrator::control_plane::ControlError::UnknownSession(session_orchestrator::control_plane::ControlSessionId)
+pub session_orchestrator::control_plane::ControlError::WorkerPoll
+pub session_orchestrator::control_plane::ControlError::WorkerPoll::cleanup_error: core::option::Option<session_orchestrator::control_plane::ControlWorkerError>
+pub session_orchestrator::control_plane::ControlError::WorkerPoll::error: session_orchestrator::control_plane::ControlWorkerError
+pub session_orchestrator::control_plane::ControlError::WorkerStart(session_orchestrator::control_plane::ControlWorkerError)
+pub session_orchestrator::control_plane::ControlError::WorkerStop(session_orchestrator::control_plane::ControlWorkerError)
+impl core::convert::From<session_orchestrator::EntropyError> for session_orchestrator::control_plane::ControlError
+pub fn session_orchestrator::control_plane::ControlError::from(session_orchestrator::EntropyError) -> Self
+impl core::error::Error for session_orchestrator::control_plane::ControlError
+impl core::fmt::Display for session_orchestrator::control_plane::ControlError
+pub fn session_orchestrator::control_plane::ControlError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::control_plane::ControlWorkerError
+pub session_orchestrator::control_plane::ControlWorkerError::CleanupIncomplete
+pub session_orchestrator::control_plane::ControlWorkerError::OwnershipMismatch
+pub session_orchestrator::control_plane::ControlWorkerError::StartupFailed
+pub session_orchestrator::control_plane::ControlWorkerError::StatusUnavailable
+impl core::fmt::Display for session_orchestrator::control_plane::ControlWorkerError
+pub fn session_orchestrator::control_plane::ControlWorkerError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum session_orchestrator::control_plane::ControlWorkerStatus
+pub session_orchestrator::control_plane::ControlWorkerStatus::Closed
+pub session_orchestrator::control_plane::ControlWorkerStatus::Running
+pub struct session_orchestrator::control_plane::ControlAuthenticator
+impl session_orchestrator::control_plane::ControlAuthenticator
+pub const fn session_orchestrator::control_plane::ControlAuthenticator::new([u8; 32]) -> Self
+pub fn session_orchestrator::control_plane::ControlAuthenticator::sign_start(&self, session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlRequestId) -> session_orchestrator::control_plane::StartSessionRequest
+pub fn session_orchestrator::control_plane::ControlAuthenticator::sign_stop(&self, session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlRequestId, session_orchestrator::control_plane::ControlSessionId) -> session_orchestrator::control_plane::StopSessionRequest
+impl core::ops::drop::Drop for session_orchestrator::control_plane::ControlAuthenticator
+pub fn session_orchestrator::control_plane::ControlAuthenticator::drop(&mut self)
+pub struct session_orchestrator::control_plane::ControlLimits
+impl session_orchestrator::control_plane::ControlLimits
+pub const fn session_orchestrator::control_plane::ControlLimits::max_sessions(self) -> usize
+pub const fn session_orchestrator::control_plane::ControlLimits::max_sessions_per_principal(self) -> usize
+pub const fn session_orchestrator::control_plane::ControlLimits::new(usize, usize) -> core::result::Result<Self, session_orchestrator::control_plane::ControlError>
+pub struct session_orchestrator::control_plane::ControlRequestId(_)
+impl session_orchestrator::control_plane::ControlRequestId
+pub const fn session_orchestrator::control_plane::ControlRequestId::as_bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::control_plane::ControlRequestId::new([u8; 16]) -> Self
+impl core::fmt::Display for session_orchestrator::control_plane::ControlRequestId
+pub fn session_orchestrator::control_plane::ControlRequestId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::control_plane::ControlSessionId(_)
+impl session_orchestrator::control_plane::ControlSessionId
+pub const fn session_orchestrator::control_plane::ControlSessionId::as_bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::control_plane::ControlSessionId::new([u8; 16]) -> Self
+impl core::fmt::Display for session_orchestrator::control_plane::ControlSessionId
+pub fn session_orchestrator::control_plane::ControlSessionId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::control_plane::ControlTag(_)
+impl session_orchestrator::control_plane::ControlTag
+pub const fn session_orchestrator::control_plane::ControlTag::as_bytes(self) -> [u8; 32]
+pub const fn session_orchestrator::control_plane::ControlTag::new([u8; 32]) -> Self
+impl core::fmt::Debug for session_orchestrator::control_plane::ControlTag
+pub fn session_orchestrator::control_plane::ControlTag::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::control_plane::MultiSessionController<F, R> where F: session_orchestrator::control_plane::ControlWorkerFactory, R: session_orchestrator::CryptographicRandom
+impl<F, R> session_orchestrator::control_plane::MultiSessionController<F, R> where F: session_orchestrator::control_plane::ControlWorkerFactory, R: session_orchestrator::CryptographicRandom
+pub fn session_orchestrator::control_plane::MultiSessionController<F, R>::active_sessions(&self) -> usize
+pub fn session_orchestrator::control_plane::MultiSessionController<F, R>::active_sessions_for(&self, session_orchestrator::control_plane::PrincipalId) -> usize
+pub fn session_orchestrator::control_plane::MultiSessionController<F, R>::journal_path(&self) -> &std::path::Path
+pub fn session_orchestrator::control_plane::MultiSessionController<F, R>::open(impl core::convert::AsRef<std::path::Path>, session_orchestrator::control_plane::ControlLimits, session_orchestrator::control_plane::ControlAuthenticator, F, R) -> core::result::Result<Self, session_orchestrator::control_plane::ControlError>
+pub fn session_orchestrator::control_plane::MultiSessionController<F, R>::owns(&self, session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlSessionId) -> bool
+pub fn session_orchestrator::control_plane::MultiSessionController<F, R>::poll_all(&mut self) -> core::result::Result<(), session_orchestrator::control_plane::ControlError>
+pub fn session_orchestrator::control_plane::MultiSessionController<F, R>::shutdown_all(&mut self) -> core::result::Result<(), session_orchestrator::control_plane::ControlError>
+pub fn session_orchestrator::control_plane::MultiSessionController<F, R>::start(&mut self, session_orchestrator::control_plane::StartSessionRequest) -> core::result::Result<session_orchestrator::control_plane::ControlSessionId, session_orchestrator::control_plane::ControlError>
+pub fn session_orchestrator::control_plane::MultiSessionController<F, R>::stop(&mut self, session_orchestrator::control_plane::StopSessionRequest) -> core::result::Result<(), session_orchestrator::control_plane::ControlError>
+pub struct session_orchestrator::control_plane::PrincipalId(_)
+impl session_orchestrator::control_plane::PrincipalId
+pub const fn session_orchestrator::control_plane::PrincipalId::as_bytes(self) -> [u8; 16]
+pub const fn session_orchestrator::control_plane::PrincipalId::new([u8; 16]) -> Self
+impl core::fmt::Display for session_orchestrator::control_plane::PrincipalId
+pub fn session_orchestrator::control_plane::PrincipalId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct session_orchestrator::control_plane::StartSessionRequest
+impl session_orchestrator::control_plane::StartSessionRequest
+pub const fn session_orchestrator::control_plane::StartSessionRequest::new(session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlRequestId, session_orchestrator::control_plane::ControlTag) -> Self
+pub const fn session_orchestrator::control_plane::StartSessionRequest::principal(self) -> session_orchestrator::control_plane::PrincipalId
+pub const fn session_orchestrator::control_plane::StartSessionRequest::request(self) -> session_orchestrator::control_plane::ControlRequestId
+pub struct session_orchestrator::control_plane::StopSessionRequest
+impl session_orchestrator::control_plane::StopSessionRequest
+pub const fn session_orchestrator::control_plane::StopSessionRequest::new(session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlRequestId, session_orchestrator::control_plane::ControlSessionId, session_orchestrator::control_plane::ControlTag) -> Self
+pub const fn session_orchestrator::control_plane::StopSessionRequest::session(self) -> session_orchestrator::control_plane::ControlSessionId
+pub trait session_orchestrator::control_plane::ControlWorker
+pub fn session_orchestrator::control_plane::ControlWorker::poll(&mut self) -> core::result::Result<session_orchestrator::control_plane::ControlWorkerStatus, session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::control_plane::ControlWorker::stop(&mut self) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub trait session_orchestrator::control_plane::ControlWorkerFactory
+pub type session_orchestrator::control_plane::ControlWorkerFactory::Worker: session_orchestrator::control_plane::ControlWorker
+pub fn session_orchestrator::control_plane::ControlWorkerFactory::recover(&mut self, session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::control_plane::ControlWorkerFactory::spawn(&mut self, session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<Self::Worker, session_orchestrator::control_plane::ControlWorkerError>
 pub mod session_orchestrator::egress_backend
 pub enum session_orchestrator::egress_backend::BrokerConnectionExit
 pub session_orchestrator::egress_backend::BrokerConnectionExit::AccountingInvariant
@@ -714,6 +811,8 @@ pub struct session_orchestrator::EntropyError
 impl session_orchestrator::EntropyError
 pub fn session_orchestrator::EntropyError::message(&self) -> &str
 pub fn session_orchestrator::EntropyError::new(impl core::convert::Into<alloc::string::String>) -> Self
+impl core::convert::From<session_orchestrator::EntropyError> for session_orchestrator::control_plane::ControlError
+pub fn session_orchestrator::control_plane::ControlError::from(session_orchestrator::EntropyError) -> Self
 impl core::error::Error for session_orchestrator::EntropyError
 impl core::fmt::Display for session_orchestrator::EntropyError
 pub fn session_orchestrator::EntropyError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

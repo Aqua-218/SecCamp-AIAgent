@@ -11,6 +11,7 @@ ConditionPathExists=/dev/mapper/control
 
 [Service]
 Type=notify
+Slice=system.slice
 NotifyAccess=main
 User=host-sessiond
 Group=host-sessiond

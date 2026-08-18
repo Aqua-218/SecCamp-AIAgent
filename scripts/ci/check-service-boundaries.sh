@@ -68,8 +68,8 @@ done
 # owner-reviewed gate, so a second permissive capability assignment or polkit rule cannot hide
 # behind the required secure lines below.
 require_sha256 "${controller}" '8fb7ef8ba3735570675b29436bbcd7df150dafaed7abcf73882a0d3b917c35fc'
-require_sha256 "${worker}" 'f1f08d2b87f5feb7c0fda7864f06c38be715dae47ac64ecff76ee8ad7addc277'
-require_sha256 "${recovery}" 'd8b8822a933c2eb77c2c4062ddc6b4f20a62e58763a50fe4b3f40960dab9245f'
+require_sha256 "${worker}" 'a93f09a69cc238ab9ddc03da3ca26fd42b30cfbf52d1f7d811543ebe60035cfc'
+require_sha256 "${recovery}" 'c91ddea37777e4ca2d21dbd7861752a287f6ac6bc1ee7f8d12035f79eb475621'
 require_sha256 "${single_worker}" '82417c248b88b1c0570bf8db38d55d08ba2a749265c8eac4a1eaec0db2271873'
 require_sha256 "${polkit_rule}" '58041aab07b6b490a75dd941c71d921af9a11a036e4cc048c29f4f97fbe3ab6b'
 require_sha256 "${udev_rule}" '1af47a833fcec709a533edbdd7865dd4308f9634d81de3f6ad572f5307c3c4bc'
@@ -98,6 +98,7 @@ for unit in "${worker}" "${recovery}"; do
   require_line "${unit}" 'Group=host-sessiond'
   require_line "${unit}" 'SupplementaryGroups=kvm'
   require_line "${unit}" 'EnvironmentFile=/etc/host-sessiond/worker.env'
+  require_line "${unit}" 'Slice=system.slice'
   require_line "${unit}" 'NoNewPrivileges=yes'
   require_line "${unit}" 'CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL'
   require_line "${unit}" 'AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL'

@@ -107,6 +107,7 @@ NoNewPrivileges=yes
 DevicePolicy=closed
 DeviceAllow=/dev/kvm rwm
 DeviceAllow=/dev/net/tun m
+DeviceAllow=/dev/userfaultfd m
 DeviceAllow=/dev/vhost-vsock rw
 DeviceAllow=/dev/mapper/control rw
 DeviceAllow=/dev/loop-control rw

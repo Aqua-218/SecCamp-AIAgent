@@ -239,13 +239,15 @@ fn recovery_fingerprint<'a>(
     seals: impl IntoIterator<Item = &'a ParentSeal>,
 ) -> Sha256Digest {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"firecracker-recovery-ownership-v3\0");
+    bytes.extend_from_slice(b"firecracker-recovery-ownership-v4\0");
     bytes.extend_from_slice(&runtime_fingerprint.as_bytes());
     for seal in seals {
         append_fingerprint_field(&mut bytes, seal.expected_parent.as_os_str().as_bytes());
         bytes.extend_from_slice(&seal.ancestor_identity.device.to_be_bytes());
         bytes.extend_from_slice(&seal.ancestor_identity.inode.to_be_bytes());
-        bytes.extend_from_slice(&seal.mount_id.to_be_bytes());
+        // mount IDs are local to the systemd mount namespace and legitimately change when a
+        // recovery unit reopens the same persistent inode. ParentSeal still checks mount_id
+        // within one process; the durable fingerprint binds namespace-stable attributes only.
         bytes.extend_from_slice(&seal.owner.to_be_bytes());
         bytes.extend_from_slice(&seal.mode.to_be_bytes());
     }

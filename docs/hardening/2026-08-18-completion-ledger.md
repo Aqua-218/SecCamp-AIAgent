@@ -24,6 +24,7 @@ scripts/ci/check-docs.sh
 scripts/ci/validate-pipelines.sh
 scripts/ci/check-pipeline-parity.sh
 scripts/ci/test-pipeline-planner.sh
+scripts/ci/tests/test-external-review.sh
 cargo test -p session-orchestrator --all-targets --features crash-test-hooks --locked
 scripts/ci/verify-real-session-crash-recovery.sh
 ```
@@ -45,12 +46,12 @@ scripts/ci/verify-real-session-crash-recovery.sh
 
 ## Acceptance tracks
 
-| Track | Initial state | Exit condition |
+| Track | Current state | Exit condition |
 |---|---|---|
-| Real crash recovery | partial | Every declared durable lifecycle checkpoint is killed from outside the daemon; restart either completes cleanup or refuses reuse, and the host residue probe is empty. |
-| Runtime variance | partial | Bounded soak/escape gates exist, have resource and time ceilings, and protected CI runs the declared kernel/Firecracker/architecture matrix without treating unavailable runners as success. |
-| Privileged host TCB | open | Privileged mutations are behind a closed, authenticated, bounded helper protocol; the ordinary controller has no generic command/path primitive and runs without the helper's privileges. |
-| Multi-session control plane | out of scope | A bounded authenticated scheduler owns multiple one-session workers, durably prevents identity/workspace reuse, enforces per-principal quotas, and fences a second controller. |
+| Real crash recovery | verified | Every declared durable lifecycle checkpoint is killed from outside the daemon; restart either completes cleanup or refuses reuse, and the host residue probe is empty. |
+| Runtime variance | partial | Bounded x86_64 soak/escape and Firecracker 1.15.1/1.16.1 gates pass with resource/time ceilings; protected aarch64 execution remains required and unavailable runners are never success. |
+| Privileged host TCB | partial | Arbitrary external `CommandSpec` construction is sealed; a separate privileged helper process and unprivileged-controller production composition are still required. |
+| Multi-session control plane | partial | The authenticated, quota-bound, crash-recovering scheduler core and controller fencing pass hosted tests; production worker/socket integration and concurrent real-KVM evidence remain. |
 | Live external provider | blocked | The protected destructive gate succeeds with an exact disposable repository and least-privilege installation credential. |
 | Independent review | blocked | A named external reviewer supplies a revision-bound report and the import gate verifies its scope, revision, and disposition without accepting a repository-authored substitute. |
 
@@ -62,6 +63,10 @@ can reach the 9.8 exit threshold only with the gate in the final column above.
 | Cycle | Attack lens | Threat | Performance | Regression | Operations | Review | Rollout | Cost | Observability | Abuse resistance | Release | Verdict |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | 1 baseline | surviving TCB, crash and scope boundaries | 9.5 | 9.0 | 9.5 | 8.8 | 8.5 | 8.8 | 9.0 | 8.8 | 9.3 | 9.8 | continue: operational crash proof is the first weak axis |
+| 2 crash matrix | external SIGKILL at 11 durable lifecycle boundaries | 9.7 | 8.9 | 9.7 | 9.6 | 9.0 | 9.2 | 8.8 | 9.5 | 9.6 | 9.8 | continue: runtime variance and privileged TCB remain |
+| 3 runtime variance | high-risk raw syscalls, 20 full privileged repetitions, two pinned Firecracker releases | 9.7 | 9.2 | 9.7 | 9.6 | 9.1 | 9.4 | 9.0 | 9.6 | 9.7 | 9.8 | continue: real aarch64, privileged TCB, and multi-session remain |
+| 4 control surfaces | sealed command construction, HMAC admission, durable quotas/no-reuse, controller fencing, signed-review import | 9.8 | 9.1 | 9.7 | 9.5 | 9.3 | 9.4 | 9.0 | 9.7 | 9.8 | 9.8 | continue: production helper/worker integration and external evidence remain |
+| 5 fail-closed challenge | transient journal path loss, pre-effect revalidation, fork/exec lock inheritance, readiness timing, worker health cleanup, signed report/disposition digest binding | 9.8 | 9.2 | 9.8 | 9.7 | 9.4 | 9.5 | 9.0 | 9.8 | 9.8 | 9.8 | stop: remaining gaps require new architecture, hardware, credentials, or an independent reviewer |
 
 ## External ceilings
 
@@ -72,6 +77,21 @@ can reach the 9.8 exit threshold only with the gate in the final column above.
   automation can validate an imported report but cannot create independence.
 - Host kernel, KVM, Firecracker, hardware, and microarchitectural behavior remain upstream or
   physical TCB unless the deployment chooses a different isolation architecture.
+
+The independent-review artifact is one canonical LF-terminated TSV record:
+
+```text
+external-security-review-v1<TAB>commit<TAB>tree<TAB>repository<TAB>reviewer<TAB>organization<TAB>affirmed<TAB>report-sha256<TAB>disposition-sha256<TAB>0<TAB>0<TAB>approve
+```
+
+The reviewer signs those exact bytes with Ed25519. The signed digests bind a full review artifact
+and a canonical disposition ledger whose header is `external-review-disposition-v1` and whose
+remaining rows are `finding-id<TAB>severity<TAB>status`. Duplicate IDs, unknown values, and any
+critical/high row not marked `fixed` are rejected. The manifest, full report, disposition,
+signature, and public key must be injected from outside the checkout; the public-key SHA-256 must
+be a separate protected variable. The import gate also requires a clean worktree and exact `HEAD`
+commit/tree equality. Its local self-test creates a temporary signer only to test positive/negative
+parser, digest, disposition, and signature behavior; that fixture is never review evidence.
 
 ## 未検証の境界
 

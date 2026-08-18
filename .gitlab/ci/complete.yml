@@ -44,6 +44,8 @@ pipeline_complete:
       artifacts: false
     - job: repository_hygiene
       artifacts: false
+    - job: service_boundaries
+      artifacts: false
     - job: codeowners_coverage
       artifacts: false
     - job: toolchain_consistency

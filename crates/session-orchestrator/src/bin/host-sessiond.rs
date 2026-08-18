@@ -128,6 +128,7 @@ fn run() -> Result<(), String> {
         Ok(started) => started,
         Err(error) => {
             status.emit("failed", "starting", None, Some("session-start-failed"));
+            eprintln!("host-sessiond: session start failed before cleanup: {error}");
             return Err(format!("starting production session: {error}"));
         }
     };

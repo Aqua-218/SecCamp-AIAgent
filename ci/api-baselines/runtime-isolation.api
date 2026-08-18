@@ -83,6 +83,7 @@ pub runtime_isolation::Syscall::ExitGroup
 pub runtime_isolation::Syscall::FanotifyInit
 pub runtime_isolation::Syscall::FanotifyMark
 pub runtime_isolation::Syscall::Fchmod
+pub runtime_isolation::Syscall::Fchmodat
 pub runtime_isolation::Syscall::FinitModule
 pub runtime_isolation::Syscall::Fork
 pub runtime_isolation::Syscall::Fsconfig
@@ -184,6 +185,7 @@ pub runtime_isolation::Syscall::Statx
 pub runtime_isolation::Syscall::Swapoff
 pub runtime_isolation::Syscall::Swapon
 pub runtime_isolation::Syscall::Symlink
+pub runtime_isolation::Syscall::Symlinkat
 pub runtime_isolation::Syscall::Syslog
 pub runtime_isolation::Syscall::Umount2
 pub runtime_isolation::Syscall::Unlink

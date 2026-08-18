@@ -1,6 +1,6 @@
 # Device nodes required by the dedicated Firecracker worker account. The systemd device policy
 # separately restricts the unit to KVM/vsock, loop, and device-mapper classes.
-KERNEL=="device-mapper", GROUP="host-sessiond", MODE="0660"
+KERNEL=="device-mapper", OWNER="root", GROUP="host-sessiond", MODE="0660"
 KERNEL=="dm-*", ENV{DM_NAME}=="host-sessiond-rootfs-*", OWNER="host-sessiond", GROUP="host-sessiond", MODE="0660"
-KERNEL=="loop-control", GROUP="host-sessiond", MODE="0660"
-KERNEL=="loop[0-9]*", GROUP="host-sessiond", MODE="0660"
+KERNEL=="loop-control", OWNER="root", GROUP="host-sessiond", MODE="0660"
+KERNEL=="loop[0-9]*", OWNER="root", GROUP="host-sessiond", MODE="0660"

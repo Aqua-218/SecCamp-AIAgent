@@ -13,7 +13,8 @@ set -euo pipefail
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repository_root
 readonly tools_root="${CI_TOOLS_DIR:-${repository_root}/.ci-tools}"
-readonly firecracker="${tools_root}/firecracker/v1.16.1/firecracker"
+readonly firecracker_version="${FIRECRACKER_VERSION:-1.16.1}"
+readonly firecracker="${tools_root}/firecracker/v${firecracker_version}/firecracker"
 readonly base_rootfs="${tools_root}/guest/v1.12/ubuntu-24.04.squashfs"
 busybox="$(command -v busybox || true)"
 readonly busybox

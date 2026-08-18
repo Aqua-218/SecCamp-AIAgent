@@ -113,17 +113,37 @@ impl session_orchestrator::control_plane::StartSessionRequest
 pub const fn session_orchestrator::control_plane::StartSessionRequest::new(session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlRequestId, session_orchestrator::control_plane::ControlTag) -> Self
 pub const fn session_orchestrator::control_plane::StartSessionRequest::principal(self) -> session_orchestrator::control_plane::PrincipalId
 pub const fn session_orchestrator::control_plane::StartSessionRequest::request(self) -> session_orchestrator::control_plane::ControlRequestId
+pub const fn session_orchestrator::control_plane::StartSessionRequest::tag(self) -> session_orchestrator::control_plane::ControlTag
 pub struct session_orchestrator::control_plane::StopSessionRequest
 impl session_orchestrator::control_plane::StopSessionRequest
 pub const fn session_orchestrator::control_plane::StopSessionRequest::new(session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlRequestId, session_orchestrator::control_plane::ControlSessionId, session_orchestrator::control_plane::ControlTag) -> Self
+pub const fn session_orchestrator::control_plane::StopSessionRequest::principal(self) -> session_orchestrator::control_plane::PrincipalId
+pub const fn session_orchestrator::control_plane::StopSessionRequest::request(self) -> session_orchestrator::control_plane::ControlRequestId
 pub const fn session_orchestrator::control_plane::StopSessionRequest::session(self) -> session_orchestrator::control_plane::ControlSessionId
+pub const fn session_orchestrator::control_plane::StopSessionRequest::tag(self) -> session_orchestrator::control_plane::ControlTag
 pub trait session_orchestrator::control_plane::ControlWorker
 pub fn session_orchestrator::control_plane::ControlWorker::poll(&mut self) -> core::result::Result<session_orchestrator::control_plane::ControlWorkerStatus, session_orchestrator::control_plane::ControlWorkerError>
 pub fn session_orchestrator::control_plane::ControlWorker::stop(&mut self) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+impl<M: session_orchestrator::systemd_worker::FixedServiceManager> session_orchestrator::control_plane::ControlWorker for session_orchestrator::systemd_worker::SystemdWorker<M>
+pub fn session_orchestrator::systemd_worker::SystemdWorker<M>::poll(&mut self) -> core::result::Result<session_orchestrator::control_plane::ControlWorkerStatus, session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::SystemdWorker<M>::stop(&mut self) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
 pub trait session_orchestrator::control_plane::ControlWorkerFactory
 pub type session_orchestrator::control_plane::ControlWorkerFactory::Worker: session_orchestrator::control_plane::ControlWorker
 pub fn session_orchestrator::control_plane::ControlWorkerFactory::recover(&mut self, session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
 pub fn session_orchestrator::control_plane::ControlWorkerFactory::spawn(&mut self, session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<Self::Worker, session_orchestrator::control_plane::ControlWorkerError>
+impl<M: session_orchestrator::systemd_worker::FixedServiceManager> session_orchestrator::control_plane::ControlWorkerFactory for session_orchestrator::systemd_worker::SystemdWorkerFactory<M>
+pub type session_orchestrator::systemd_worker::SystemdWorkerFactory<M>::Worker = session_orchestrator::systemd_worker::SystemdWorker<M>
+pub fn session_orchestrator::systemd_worker::SystemdWorkerFactory<M>::recover(&mut self, session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::SystemdWorkerFactory<M>::spawn(&mut self, session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<Self::Worker, session_orchestrator::control_plane::ControlWorkerError>
+pub mod session_orchestrator::control_transport
+pub enum session_orchestrator::control_transport::ControlResponse
+pub session_orchestrator::control_transport::ControlResponse::Denied
+pub session_orchestrator::control_transport::ControlResponse::Started(session_orchestrator::control_plane::ControlSessionId)
+pub session_orchestrator::control_transport::ControlResponse::Stopped
+pub fn session_orchestrator::control_transport::decode_response(&[u8]) -> core::option::Option<session_orchestrator::control_transport::ControlResponse>
+pub fn session_orchestrator::control_transport::encode_start(session_orchestrator::control_plane::StartSessionRequest) -> alloc::vec::Vec<u8>
+pub fn session_orchestrator::control_transport::encode_stop(session_orchestrator::control_plane::StopSessionRequest) -> alloc::vec::Vec<u8>
+pub fn session_orchestrator::control_transport::principal_for_uid(u32) -> session_orchestrator::control_plane::PrincipalId
 pub mod session_orchestrator::egress_backend
 pub enum session_orchestrator::egress_backend::BrokerConnectionExit
 pub session_orchestrator::egress_backend::BrokerConnectionExit::AccountingInvariant
@@ -635,6 +655,40 @@ impl session_orchestrator::production_runtime::PerSessionEgressFactory for sessi
 pub fn session_orchestrator::system_egress::SystemEgressFactory::prepare(&self, &session_orchestrator::production_runtime::SessionEgressRequest) -> core::result::Result<session_orchestrator::production_runtime::PreparedEgressSession, session_orchestrator::BackendError>
 pub fn session_orchestrator::system_egress::load_publish_plan_manifest(impl core::convert::AsRef<std::path::Path>) -> core::result::Result<alloc::vec::Vec<session_orchestrator::system_egress::HostPublishPlanConfig>, alloc::string::String>
 pub fn session_orchestrator::system_egress::validate_publish_plans_for_authority(&authority_core::github::GitHubAuthority, alloc::vec::Vec<session_orchestrator::system_egress::HostPublishPlanConfig>) -> core::result::Result<alloc::vec::Vec<session_orchestrator::system_egress::HostPublishPlanConfig>, alloc::string::String>
+pub mod session_orchestrator::systemd_worker
+pub enum session_orchestrator::systemd_worker::FixedUnitState
+pub session_orchestrator::systemd_worker::FixedUnitState::Failed
+pub session_orchestrator::systemd_worker::FixedUnitState::Inactive
+pub session_orchestrator::systemd_worker::FixedUnitState::Owned
+pub struct session_orchestrator::systemd_worker::PinnedSystemdManager
+impl session_orchestrator::systemd_worker::PinnedSystemdManager
+pub const fn session_orchestrator::systemd_worker::PinnedSystemdManager::new(firecracker_runtime::PinnedArtifact) -> Self
+impl session_orchestrator::systemd_worker::FixedServiceManager for session_orchestrator::systemd_worker::PinnedSystemdManager
+pub fn session_orchestrator::systemd_worker::PinnedSystemdManager::recover_worker(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::PinnedSystemdManager::start_worker(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::PinnedSystemdManager::stop_worker(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::PinnedSystemdManager::worker_state(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<session_orchestrator::systemd_worker::FixedUnitState, session_orchestrator::control_plane::ControlWorkerError>
+pub struct session_orchestrator::systemd_worker::SystemdWorker<M>
+impl<M: session_orchestrator::systemd_worker::FixedServiceManager> session_orchestrator::control_plane::ControlWorker for session_orchestrator::systemd_worker::SystemdWorker<M>
+pub fn session_orchestrator::systemd_worker::SystemdWorker<M>::poll(&mut self) -> core::result::Result<session_orchestrator::control_plane::ControlWorkerStatus, session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::SystemdWorker<M>::stop(&mut self) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub struct session_orchestrator::systemd_worker::SystemdWorkerFactory<M>
+impl<M> session_orchestrator::systemd_worker::SystemdWorkerFactory<M>
+pub const fn session_orchestrator::systemd_worker::SystemdWorkerFactory<M>::new(M) -> Self
+impl<M: session_orchestrator::systemd_worker::FixedServiceManager> session_orchestrator::control_plane::ControlWorkerFactory for session_orchestrator::systemd_worker::SystemdWorkerFactory<M>
+pub type session_orchestrator::systemd_worker::SystemdWorkerFactory<M>::Worker = session_orchestrator::systemd_worker::SystemdWorker<M>
+pub fn session_orchestrator::systemd_worker::SystemdWorkerFactory<M>::recover(&mut self, session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::SystemdWorkerFactory<M>::spawn(&mut self, session_orchestrator::control_plane::PrincipalId, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<Self::Worker, session_orchestrator::control_plane::ControlWorkerError>
+pub trait session_orchestrator::systemd_worker::FixedServiceManager: core::clone::Clone
+pub fn session_orchestrator::systemd_worker::FixedServiceManager::recover_worker(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::FixedServiceManager::start_worker(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::FixedServiceManager::stop_worker(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::FixedServiceManager::worker_state(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<session_orchestrator::systemd_worker::FixedUnitState, session_orchestrator::control_plane::ControlWorkerError>
+impl session_orchestrator::systemd_worker::FixedServiceManager for session_orchestrator::systemd_worker::PinnedSystemdManager
+pub fn session_orchestrator::systemd_worker::PinnedSystemdManager::recover_worker(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::PinnedSystemdManager::start_worker(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::PinnedSystemdManager::stop_worker(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<(), session_orchestrator::control_plane::ControlWorkerError>
+pub fn session_orchestrator::systemd_worker::PinnedSystemdManager::worker_state(&self, session_orchestrator::control_plane::ControlSessionId) -> core::result::Result<session_orchestrator::systemd_worker::FixedUnitState, session_orchestrator::control_plane::ControlWorkerError>
 pub enum session_orchestrator::CleanupStage
 pub session_orchestrator::CleanupStage::BrokerClose
 pub session_orchestrator::CleanupStage::CapabilityRevoke

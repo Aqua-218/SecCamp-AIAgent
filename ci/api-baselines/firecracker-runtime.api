@@ -220,6 +220,7 @@ pub struct firecracker_runtime::CommandSpec
 impl firecracker_runtime::CommandSpec
 pub fn firecracker_runtime::CommandSpec::arguments(&self) -> &[alloc::string::String]
 pub const fn firecracker_runtime::CommandSpec::expected_digest(&self) -> core::option::Option<firecracker_runtime::Sha256Digest>
+pub fn firecracker_runtime::CommandSpec::pinned(&firecracker_runtime::PinnedArtifact, impl core::iter::traits::collect::IntoIterator<Item = alloc::string::String>) -> Self
 pub fn firecracker_runtime::CommandSpec::program(&self) -> &std::path::Path
 pub struct firecracker_runtime::DmVerityConfig
 pub firecracker_runtime::DmVerityConfig::data_device: std::path::PathBuf
@@ -276,6 +277,8 @@ pub struct firecracker_runtime::ProcessOwnership
 pub firecracker_runtime::ProcessOwnership::cgroup_path: std::path::PathBuf
 pub firecracker_runtime::ProcessOwnership::firecracker_digest: firecracker_runtime::Sha256Digest
 pub firecracker_runtime::ProcessOwnership::firecracker_executable: std::path::PathBuf
+pub firecracker_runtime::ProcessOwnership::gid: u32
+pub firecracker_runtime::ProcessOwnership::uid: u32
 pub struct firecracker_runtime::RealCommandRunner
 impl firecracker_runtime::RealCommandRunner
 pub fn firecracker_runtime::RealCommandRunner::new() -> Self
@@ -290,6 +293,7 @@ pub fn firecracker_runtime::RealCommandRunner::start(&mut self, &firecracker_run
 pub fn firecracker_runtime::RealCommandRunner::start_owned(&mut self, &firecracker_runtime::CommandSpec, &firecracker_runtime::ProcessOwnership) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::stop(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::verify_running(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::verify_seccomp_compilation(&mut self, &firecracker_runtime::PinnedArtifact, &[u8], &[u8]) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::verify_verity(&mut self, &firecracker_runtime::PinnedArtifact, &firecracker_runtime::DmVerityConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub struct firecracker_runtime::RealFileSystem
 impl firecracker_runtime::RealFileSystem
@@ -352,7 +356,9 @@ pub const fn firecracker_runtime::RuntimeInstance::state(&self) -> firecracker_r
 pub fn firecracker_runtime::RuntimeInstance::workspace(&self) -> &std::path::Path
 pub struct firecracker_runtime::SeccompConfig
 pub firecracker_runtime::SeccompConfig::blocked_syscalls: alloc::vec::Vec<alloc::string::String>
+pub firecracker_runtime::SeccompConfig::compiler: firecracker_runtime::PinnedArtifact
 pub firecracker_runtime::SeccompConfig::filter: firecracker_runtime::PinnedArtifact
+pub firecracker_runtime::SeccompConfig::policy: firecracker_runtime::PinnedArtifact
 pub struct firecracker_runtime::Sha256Digest(_)
 impl firecracker_runtime::Sha256Digest
 pub const fn firecracker_runtime::Sha256Digest::as_bytes(self) -> [u8; 32]
@@ -428,6 +434,7 @@ pub fn firecracker_runtime::CommandRunner::start(&mut self, &firecracker_runtime
 pub fn firecracker_runtime::CommandRunner::start_owned(&mut self, &firecracker_runtime::CommandSpec, &firecracker_runtime::ProcessOwnership) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::CommandRunner::stop(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::CommandRunner::verify_running(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::CommandRunner::verify_seccomp_compilation(&mut self, &firecracker_runtime::PinnedArtifact, &[u8], &[u8]) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::CommandRunner::verify_verity(&mut self, &firecracker_runtime::PinnedArtifact, &firecracker_runtime::DmVerityConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 impl firecracker_runtime::CommandRunner for firecracker_runtime::RealCommandRunner
 pub fn firecracker_runtime::RealCommandRunner::open_verity(&mut self, &firecracker_runtime::PinnedArtifact, &firecracker_runtime::DmVerityConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
@@ -436,6 +443,7 @@ pub fn firecracker_runtime::RealCommandRunner::start(&mut self, &firecracker_run
 pub fn firecracker_runtime::RealCommandRunner::start_owned(&mut self, &firecracker_runtime::CommandSpec, &firecracker_runtime::ProcessOwnership) -> core::result::Result<firecracker_runtime::ProcessHandle, firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::stop(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::verify_running(&mut self, firecracker_runtime::ProcessHandle) -> core::result::Result<(), firecracker_runtime::RuntimeError>
+pub fn firecracker_runtime::RealCommandRunner::verify_seccomp_compilation(&mut self, &firecracker_runtime::PinnedArtifact, &[u8], &[u8]) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub fn firecracker_runtime::RealCommandRunner::verify_verity(&mut self, &firecracker_runtime::PinnedArtifact, &firecracker_runtime::DmVerityConfig) -> core::result::Result<(), firecracker_runtime::RuntimeError>
 pub trait firecracker_runtime::FileSystem
 pub fn firecracker_runtime::FileSystem::bind_block_device(&mut self, &std::path::Path, &std::path::Path) -> core::result::Result<(), firecracker_runtime::RuntimeError>

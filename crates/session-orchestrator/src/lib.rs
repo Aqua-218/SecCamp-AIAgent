@@ -60,6 +60,43 @@ pub const ID_BYTES: usize = 16;
 
 const MAX_ZERO_IDENTITY_RETRIES: usize = 8;
 
+/// Blocks at an explicitly armed lifecycle checkpoint until an external crash harness kills the
+/// process.  The hook is absent from default production builds; even feature-enabled builds stay
+/// inert unless both exact environment variables are supplied.
+#[cfg(feature = "crash-test-hooks")]
+fn crash_test_checkpoint(checkpoint: &'static str) {
+    use std::{process, thread, time::Duration};
+
+    if std::env::var("SESSION_ORCHESTRATOR_CRASH_CHECKPOINT").as_deref() != Ok(checkpoint) {
+        return;
+    }
+    let marker = std::env::var_os("SESSION_ORCHESTRATOR_CRASH_READY_FILE")
+        .map(PathBuf::from)
+        .expect("armed crash checkpoint requires SESSION_ORCHESTRATOR_CRASH_READY_FILE");
+    assert!(
+        marker.is_absolute(),
+        "crash checkpoint marker must be absolute"
+    );
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&marker)
+        .unwrap_or_else(|error| panic!("cannot create crash checkpoint marker: {error}"));
+    writeln!(file, "schema=session-orchestrator-crash/v1")
+        .and_then(|()| writeln!(file, "checkpoint={checkpoint}"))
+        .and_then(|()| writeln!(file, "pid={}", process::id()))
+        .and_then(|()| file.sync_all())
+        .unwrap_or_else(|error| panic!("cannot persist crash checkpoint marker: {error}"));
+    loop {
+        thread::park_timeout(Duration::from_secs(60));
+    }
+}
+
+#[cfg(not(feature = "crash-test-hooks"))]
+const fn crash_test_checkpoint(_checkpoint: &'static str) {}
+
 macro_rules! fixed_identity {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
@@ -229,47 +266,49 @@ enum LedgerFaultPoint {
 }
 
 #[cfg(test)]
-use std::sync::{Mutex, MutexGuard, OnceLock, atomic::AtomicU8};
+use std::cell::Cell;
 
 #[cfg(test)]
-static LEDGER_FAULT_POINT: AtomicU8 = AtomicU8::new(0);
-
-#[cfg(test)]
-static LEDGER_FAULT_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
-
-#[cfg(test)]
-struct LedgerFaultGuard {
-    _serial: MutexGuard<'static, ()>,
+thread_local! {
+    /// Fault injection is deliberately local to the test thread. A process-wide
+    /// switch can be consumed by an unrelated ledger test when the Rust test
+    /// harness runs cases concurrently.
+    static LEDGER_FAULT_POINT: Cell<u8> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
+struct LedgerFaultGuard;
+
+#[cfg(test)]
 fn arm_ledger_fault(point: LedgerFaultPoint) -> LedgerFaultGuard {
-    let serial = LEDGER_FAULT_SERIAL
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("ledger fault serial lock must not be poisoned");
-    LEDGER_FAULT_POINT.store(point as u8, std::sync::atomic::Ordering::Release);
-    LedgerFaultGuard { _serial: serial }
+    LEDGER_FAULT_POINT.with(|armed| {
+        assert_eq!(
+            armed.replace(point as u8),
+            0,
+            "only one durable-ledger fault may be armed per test thread"
+        );
+    });
+    LedgerFaultGuard
 }
 
 #[cfg(test)]
 impl Drop for LedgerFaultGuard {
     fn drop(&mut self) {
-        LEDGER_FAULT_POINT.store(0, std::sync::atomic::Ordering::Release);
+        LEDGER_FAULT_POINT.with(|armed| armed.set(0));
     }
 }
 
 fn consume_ledger_fault(point: LedgerFaultPoint) -> bool {
     #[cfg(test)]
     {
-        LEDGER_FAULT_POINT
-            .compare_exchange(
-                point as u8,
-                0,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
+        LEDGER_FAULT_POINT.with(|armed| {
+            if armed.get() == point as u8 {
+                armed.set(0);
+                true
+            } else {
+                false
+            }
+        })
     }
     #[cfg(not(test))]
     {
@@ -3084,6 +3123,7 @@ where
         let identity = self
             .allocate_session_identity()
             .map_err(|failure| StartError::new(StartStage::IdentityAllocation, failure))?;
+        crash_test_checkpoint("identity-reserved");
         let info = SessionInfo { identity };
         let workspace = match workspace_backend.clone_workspace(&identity, workspace_template) {
             Ok(lease) => {
@@ -3107,6 +3147,7 @@ where
                     ));
                 }
                 self.state = LifecycleState::WorkspaceCloned;
+                crash_test_checkpoint("workspace-cloned");
                 lease
             }
             Err(error) => {
@@ -3138,6 +3179,7 @@ where
                     ));
                 }
                 self.state = LifecycleState::BrokerEstablished;
+                crash_test_checkpoint("broker-established");
                 lease
             }
             Err(error) => {
@@ -3178,6 +3220,7 @@ where
                     ));
                 }
                 self.state = LifecycleState::VmStarted;
+                crash_test_checkpoint("vm-started");
                 lease
             }
             Err(error) => {
@@ -3217,6 +3260,7 @@ where
                     ));
                 }
                 self.state = LifecycleState::RootCapabilityInjected;
+                crash_test_checkpoint("root-capability-injected");
                 lease
             }
             Err(error) => {
@@ -3270,6 +3314,7 @@ where
                     ));
                 }
                 self.state = LifecycleState::WorkloadReleased;
+                crash_test_checkpoint("workload-released");
             }
             Err(error) => {
                 let rollback = cleanup_active(
@@ -3289,6 +3334,7 @@ where
         }
         self.state = LifecycleState::Running;
         self.active = Some(active);
+        crash_test_checkpoint("running");
         Ok(info)
     }
 
@@ -3503,7 +3549,10 @@ where
     if !active.cleanup.capability_revoked {
         if let Some(capability) = active.capability.as_ref() {
             match capability_backend.revoke_root_capability(capability) {
-                Ok(()) => active.cleanup.capability_revoked = true,
+                Ok(()) => {
+                    active.cleanup.capability_revoked = true;
+                    crash_test_checkpoint("cleanup-capability-revoked");
+                }
                 Err(error) => failures.push(CleanupFailure {
                     stage: CleanupStage::CapabilityRevoke,
                     error,
@@ -3535,7 +3584,10 @@ where
         };
         if let Some(result) = result {
             match result {
-                Ok(()) => active.cleanup.vm_killed = true,
+                Ok(()) => {
+                    active.cleanup.vm_killed = true;
+                    crash_test_checkpoint("cleanup-vm-killed");
+                }
                 Err(error) => failures.push(CleanupFailure {
                     stage: CleanupStage::VmKill,
                     error,
@@ -3547,7 +3599,10 @@ where
     if !active.cleanup.broker_closed {
         if let Some(broker) = active.broker.as_ref() {
             match broker_backend.close_broker_session(broker) {
-                Ok(()) => active.cleanup.broker_closed = true,
+                Ok(()) => {
+                    active.cleanup.broker_closed = true;
+                    crash_test_checkpoint("cleanup-broker-closed");
+                }
                 Err(error) => failures.push(CleanupFailure {
                     stage: CleanupStage::BrokerClose,
                     error,
@@ -3568,7 +3623,10 @@ where
         && !active.cleanup.workspace_isolated
     {
         match workspace_backend.isolate_workspace(&active.workspace) {
-            Ok(()) => active.cleanup.workspace_isolated = true,
+            Ok(()) => {
+                active.cleanup.workspace_isolated = true;
+                crash_test_checkpoint("cleanup-workspace-isolated");
+            }
             Err(error) => failures.push(CleanupFailure {
                 stage: CleanupStage::WorkspaceIsolation,
                 error,

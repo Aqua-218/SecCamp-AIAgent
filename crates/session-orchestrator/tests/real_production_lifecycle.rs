@@ -9,6 +9,7 @@
 #![cfg(target_os = "linux")]
 
 use std::{
+    ffi::OsStr,
     fs::{self, File},
     io::{self, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -148,6 +149,18 @@ fn root_hash() -> firecracker_runtime::Sha256Digest {
         .expect("REAL_SESSION_ROOT_HASH must be set by the real lifecycle wrapper");
     firecracker_runtime::Sha256Digest::from_hex(value.trim())
         .expect("REAL_SESSION_ROOT_HASH must be one 64-character hex digest")
+}
+
+fn snapshot_export_requires_held_workload(export_root: Option<&OsStr>) -> bool {
+    export_root.is_some()
+}
+
+#[test]
+fn snapshot_export_keeps_the_guest_broker_connection_live() {
+    assert!(!snapshot_export_requires_held_workload(None));
+    assert!(snapshot_export_requires_held_workload(Some(OsStr::new(
+        "/secure/export"
+    ))));
 }
 
 fn make_directory(path: &Path, mode: u32) {
@@ -874,6 +887,11 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
     let seccomp = required_file("REAL_SESSION_SECCOMP");
     let seccomp_policy = required_file("REAL_SESSION_SECCOMP_POLICY");
     let seccomp_compiler = required_file("REAL_SESSION_SECCOMP_COMPILER");
+    // The installed-chain consumer needs the Broker worker to remain live after its durable
+    // probe. A normal single-owner gate can let the fixed probe exit before host-initiated stop.
+    let hold_workload_after_probe = snapshot_export_requires_held_workload(
+        std::env::var_os("REAL_SESSION_ARTIFACT_EXPORT_ROOT").as_deref(),
+    );
 
     eprintln!("real session-owner phase: preparing template");
     let staging = TemporaryDirectory::new();
@@ -892,7 +910,7 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
         &seccomp_compiler,
         GUEST_CID,
         BROKER_PORT,
-        false,
+        hold_workload_after_probe,
     );
     let (snapshot_state, snapshot_memory) =
         capture_clean_snapshot(staging.path(), &template_runtime);
@@ -1017,7 +1035,14 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
         .poll(OwnerPollRequest::Continue)
         .unwrap_or_else(|error| panic!("production SessionOwner Continue poll failed: {error}"));
     assert_eq!(polled, OwnerPollOutcome::Running(started));
-    let guest_effect_proof = wait_for_completed_guest_effect_probe(&broker_wal);
+    let guest_effect_proof = if hold_workload_after_probe {
+        wait_for_live_completed_guest_effect_probe(
+            &broker_wal,
+            &durability_root.join("live-broker-wal.snapshot"),
+        )
+    } else {
+        wait_for_completed_guest_effect_probe(&broker_wal)
+    };
     drop(guest_effect_proof);
 
     let workspace_id = identity.workspace_id().to_string();

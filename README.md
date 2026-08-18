@@ -2,7 +2,7 @@
 
 AI Agent が生成したコードを、明示的な権限・隔離・監査の境界内で実行するための Linux / Firecracker 基盤です。Agent や Tool を信頼せず、ファイル操作と外部通信を副作用が発生する地点で Capability により認可します。
 
-> **重要:** 現在の運用単位は **1 daemon = 1 session = 1 microVM** です。実行・停止・永続的な復旧記録まで実装されていますが、複数 session を受け付ける API、利用者認証、scheduler、HA はこの repository の責務に含みません。
+> **重要:** 現在のproduction運用単位は **1 daemon = 1 session = 1 microVM** です。実行・停止・永続的な復旧記録に加え、複数のone-session workerを認証・quota・no-reuse journal付きで所有するscheduler coreは実装されています。ただし、そのcoreを実workerへ接続するcontrol daemon、複数KVMのproduction gate、特権worker分離、HAは未実装です。
 
 ## まず読む
 
@@ -124,9 +124,9 @@ startup は `workspace → Broker → VM → Capability → workload` の順に 
 | Runtime isolation | 特権 host で検証済み | namespace、cgroup v2、seccomp、Landlock、read-only rootfs、device、fd、capability |
 | Firecracker guest path | 実 KVM で検証済み | dm-verity boot、v2 identity gate、guest Supervisor、全13 CapFS effect、isolation後のBroker channel |
 | production `Runtime::launch` / `SessionOwner` | 実 KVM で検証済み | 実jailer、clean snapshot create/restore、durable Broker/ledger、stopと全resource cleanup |
-| CI / supply chain | 実装済み | GitHub / GitLab 44 gate parity、audit、deny、SBOM、SAST、secret scan、再現可能 release |
+| CI / supply chain | 実装済み | GitHub / GitLab 49 gate parity、audit、deny、SBOM、SAST、secret scan、再現可能 release、外部review署名取込 |
 | 外部 provider | 一部blocked | controlled DNS/HTTPS/TLSは実kernelで検証済み。実GitHub credential mutationは資格情報未提供のためblocked |
-| multi-session control plane | 未実装 | API、認証、scheduler、HA は scope 外 |
+| multi-session control plane | hosted core検証済み・production未接続 | HMAC admission、quota、durable no-reuse、controller fencingは検証済み。実`host-sessiond` worker/socket/HAは未検証 |
 
 > **注意:** 「実 KVM test が通る」ことを VM 隔離全体の証明とは扱いません。crate ごとの仮定と残存境界は `docs/<crate>/verification.md` に明記しています。
 

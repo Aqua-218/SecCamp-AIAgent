@@ -17,6 +17,8 @@ use std::{
     num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     sync::OnceLock,
+    thread,
+    time::{Duration, Instant},
 };
 
 #[cfg(target_os = "linux")]
@@ -53,6 +55,8 @@ const MAX_FINAL_WIRE_PAYLOADS: usize =
 const MAX_TERMINAL_RECORD_OVERHEAD: usize = MAX_RECORD_PAYLOAD_BYTES - 32 * 1024 * 1024;
 #[cfg(test)]
 const MAX_FINAL_APPEND_TRANSIENT_DATA_BYTES: usize = MAX_RECORD_PAYLOAD_BYTES * 2;
+const TRANSIENT_FORK_LOCK_RETRY: Duration = Duration::from_millis(250);
+const TRANSIENT_FORK_LOCK_POLL: Duration = Duration::from_millis(2);
 #[cfg(target_os = "linux")]
 const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(unix)]
@@ -2461,18 +2465,32 @@ fn durable_lock_name(wal_name: &OsStr) -> OsString {
 }
 
 fn acquire_exclusive_lock(file: &File) -> Result<(), DurableWalError> {
-    match file.try_lock() {
-        Ok(()) => Ok(()),
-        Err(TryLockError::WouldBlock) => Err(DurableWalError::Locked),
-        Err(TryLockError::Error(error)) => Err(DurableWalError::Io(error)),
+    let deadline = Instant::now() + TRANSIENT_FORK_LOCK_RETRY;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(TRANSIENT_FORK_LOCK_POLL);
+            }
+            Err(TryLockError::WouldBlock) => return Err(DurableWalError::Locked),
+            Err(TryLockError::Error(error)) => return Err(DurableWalError::Io(error)),
+        }
     }
 }
 
 fn acquire_shared_lock(file: &File) -> Result<(), DurableWalError> {
-    match file.try_lock_shared() {
-        Ok(()) => Ok(()),
-        Err(TryLockError::WouldBlock) => Err(DurableWalError::Locked),
-        Err(TryLockError::Error(error)) => Err(DurableWalError::Io(error)),
+    let deadline = Instant::now() + TRANSIENT_FORK_LOCK_RETRY;
+    loop {
+        match file.try_lock_shared() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                // Only a transient kernel-lock conflict on this pre-opened file is retried. All
+                // path, inode, link, owner, and mode checks remain mandatory after acquisition.
+                thread::sleep(TRANSIENT_FORK_LOCK_POLL);
+            }
+            Err(TryLockError::WouldBlock) => return Err(DurableWalError::Locked),
+            Err(TryLockError::Error(error)) => return Err(DurableWalError::Io(error)),
+        }
     }
 }
 

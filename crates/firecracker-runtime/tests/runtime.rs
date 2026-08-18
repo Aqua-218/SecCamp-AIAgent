@@ -32,6 +32,7 @@ const SNAPSHOT_STATE_PATH: &str = "/srv/jailer/firecracker/clone-a/root/snapshot
 const SNAPSHOT_MEMORY_PATH: &str = "/srv/jailer/firecracker/clone-a/root/snapshots/memory";
 const SNAPSHOT_STATE_BYTES: &[u8] = b"snapshot-state";
 const SNAPSHOT_MEMORY_BYTES: &[u8] = b"snapshot-memory";
+const SECCOMP_PROFILE_BYTES: &[u8] = br#"{"vmm":{"default_action":"trap","filter_action":"allow","filter":[{"syscall":"read"},{"syscall":"socket","args":[{"index":0,"type":"dword","op":"eq","val":1},{"index":1,"type":"dword","op":"eq","val":524289},{"index":2,"type":"dword","op":"eq","val":0}]}]}}"#;
 
 static UNIX_API_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -125,6 +126,15 @@ impl CommandRunner for MockRunner {
         &mut self,
         _veritysetup: &PinnedArtifact,
         _expected: &DmVerityConfig,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    fn verify_seccomp_compilation(
+        &mut self,
+        _compiler: &PinnedArtifact,
+        _policy: &[u8],
+        _filter: &[u8],
     ) -> Result<(), RuntimeError> {
         Ok(())
     }
@@ -410,21 +420,24 @@ fn config() -> RuntimeConfig {
                 cpu_period_micros: 100_000,
             },
             seccomp: SeccompConfig {
+                compiler: artifact("/artifacts/seccompiler", "seccompiler"),
                 filter: artifact(
                     jail_root
-                        .join("artifacts/seccomp.json")
+                        .join("artifacts/seccomp.bin")
                         .to_str()
                         .expect("fixture path is UTF-8"),
-                    "seccomp",
+                    "compiled-seccomp",
+                ),
+                policy: artifact(
+                    "/artifacts/seccomp-policy.json",
+                    std::str::from_utf8(SECCOMP_PROFILE_BYTES).expect("seccomp fixture is UTF-8"),
                 ),
                 blocked_syscalls: [
                     "bpf",
-                    "connect",
                     "mount",
                     "perf_event_open",
                     "ptrace",
                     "setns",
-                    "socket",
                     "unshare",
                 ]
                 .into_iter()
@@ -456,7 +469,15 @@ fn filesystem_for(config: &RuntimeConfig, events: Events) -> MockFileSystem {
         (&config.veritysetup.path, b"veritysetup".as_slice()),
         (&config.workspace.image.formatter.path, b"mke2fs".as_slice()),
         (&config.jailer.path, b"jailer".as_slice()),
-        (&config.isolation.seccomp.filter.path, b"seccomp".as_slice()),
+        (
+            &config.isolation.seccomp.compiler.path,
+            b"seccompiler".as_slice(),
+        ),
+        (
+            &config.isolation.seccomp.filter.path,
+            b"compiled-seccomp".as_slice(),
+        ),
+        (&config.isolation.seccomp.policy.path, SECCOMP_PROFILE_BYTES),
         (&PathBuf::from(SNAPSHOT_STATE_PATH), SNAPSHOT_STATE_BYTES),
         (&PathBuf::from(SNAPSHOT_MEMORY_PATH), SNAPSHOT_MEMORY_BYTES),
     ] {

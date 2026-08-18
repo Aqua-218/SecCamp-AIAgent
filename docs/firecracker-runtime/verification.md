@@ -96,6 +96,7 @@ symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` �
 | identity gate | identity 注入前の workload start は `409 Conflict` になる |
 | identity injection | 5 個の session-bound identity と authority policy digest を canonical v2 JSON で注入し、guest の digest-bound ACK を返す |
 | workload release | 同じ v2 policy digest に束縛した start だけが canonical ACK を返し、image に固定した workload を起動する |
+| downgrade exclusion | production PID 1 はbound-only serverを構築し、legacy v1 identity/start endpointを404として扱う。v1 parser互換性はproduction外のhosted testだけに残す |
 | guest runtime composition | 別の runtime image test が `guest-supervisor-init`、readiness、`workload-isolation-launcher`、inherited gate、Broker probe を通して workload を起動する |
 | workspace drive | runtime image test が writable ext4 workspace drive を guest supervisor に渡す |
 | guest CapFS effects | 隔離後の固定workloadがCapFS mount上で全13 file effectを実行し、作成物を全て回収する |

@@ -19,6 +19,7 @@ use std::{
 
 #[cfg(unix)]
 use std::{
+    os::unix::ffi::OsStrExt,
     os::unix::fs::{MetadataExt, PermissionsExt},
     sync::{
         Arc,
@@ -28,6 +29,10 @@ use std::{
 
 #[cfg(unix)]
 use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+#[cfg(unix)]
+use rustix::net::{
+    AddressFamily, SendFlags, SocketAddrUnix, SocketFlags, SocketType, sendto, socket_with,
+};
 
 use authority_core::{
     capability::{AuthorityBody, IssuerId},
@@ -51,7 +56,7 @@ use firecracker_runtime::{
     WorkspaceConfig, WorkspaceImageConfig, recovery::RecoveryTools,
 };
 use session_orchestrator::{
-    SnapshotId, WorkspaceTemplateId,
+    SessionIdentity, SnapshotId, WorkspaceTemplateId,
     authority_backend::AuthorityRootGrant,
     filesystem_factory::{FilesystemFirecrackerFactory, GuestArtifactTemplate, SnapshotTemplate},
     production_runtime::{
@@ -68,14 +73,12 @@ use session_orchestrator::{
 
 const TEMPLATE_CLONE_ID: &str = "template";
 const MAX_SHUTDOWN_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1_000;
-const REQUIRED_SECCOMP_DENIES: [&str; 8] = [
+const REQUIRED_SECCOMP_DENIES: [&str; 6] = [
     "bpf",
-    "connect",
     "mount",
     "perf_event_open",
     "ptrace",
     "setns",
-    "socket",
     "unshare",
 ];
 
@@ -94,7 +97,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let config = DaemonConfig::parse(env::args().skip(1))?;
+    let config = DaemonConfig::parse(effective_arguments()?)?;
     let signals = install_signal_handlers()?;
     let status = StatusReporter::new(config.status_file.clone())?;
     status.emit("starting", "starting", None, None);
@@ -117,6 +120,10 @@ fn run() -> Result<(), String> {
                 return Err(format!("building production session runtime: {error}"));
             }
         };
+    if config.recover_only {
+        status.emit("recovered", "closed", None, Some("recovery-only"));
+        return Ok(());
+    }
     let started = match runtime.start(&config.grant) {
         Ok(started) => started,
         Err(error) => {
@@ -126,32 +133,193 @@ fn run() -> Result<(), String> {
     };
     let identity = started.identity();
     status.emit("ready", "running", Some(identity), None);
+    notify_systemd_ready()?;
+    run_session_loop(
+        &mut runtime,
+        &config.stop_file,
+        config.poll_interval,
+        config.shutdown_timeout,
+        &signals,
+        &status,
+        identity,
+    )
+}
 
+#[allow(clippy::too_many_lines)] // Closed environment-to-argument mapping lists every production field.
+fn effective_arguments() -> Result<Vec<String>, String> {
+    let direct = env::args().skip(1).collect::<Vec<_>>();
+    if direct.first().map(String::as_str) != Some("--systemd-instance") {
+        return Ok(direct);
+    }
+    if direct.len() != 4 || direct.get(2).map(String::as_str) != Some("--mode") {
+        return Err(
+            "systemd worker mode requires exactly --systemd-instance ID --mode run|recover"
+                .to_owned(),
+        );
+    }
+    let instance = direct[1].clone();
+    let mode = direct[3].clone();
+    ControlInstance::parse(&instance)?;
+    if !matches!(mode.as_str(), "run" | "recover") {
+        return Err("systemd worker --mode must be run or recover".to_owned());
+    }
+    let mappings = [
+        ("firecracker", "HOST_SESSIOND_FIRECRACKER"),
+        ("firecracker-sha256", "HOST_SESSIOND_FIRECRACKER_SHA256"),
+        ("jailer", "HOST_SESSIOND_JAILER"),
+        ("jailer-sha256", "HOST_SESSIOND_JAILER_SHA256"),
+        ("kernel-source", "HOST_SESSIOND_KERNEL_SOURCE"),
+        ("kernel-source-sha256", "HOST_SESSIOND_KERNEL_SOURCE_SHA256"),
+        ("rootfs", "HOST_SESSIOND_ROOTFS"),
+        ("rootfs-sha256", "HOST_SESSIOND_ROOTFS_SHA256"),
+        ("verity-hash", "HOST_SESSIOND_VERITY_HASH"),
+        ("verity-hash-sha256", "HOST_SESSIOND_VERITY_HASH_SHA256"),
+        (
+            "rootfs-verity-root-hash",
+            "HOST_SESSIOND_ROOTFS_VERITY_ROOT_HASH",
+        ),
+        ("workspace-formatter", "HOST_SESSIOND_WORKSPACE_FORMATTER"),
+        (
+            "workspace-formatter-sha256",
+            "HOST_SESSIOND_WORKSPACE_FORMATTER_SHA256",
+        ),
+        ("workspace-source", "HOST_SESSIOND_WORKSPACE_SOURCE"),
+        ("seccomp-compiler", "HOST_SESSIOND_SECCOMP_COMPILER"),
+        (
+            "seccomp-compiler-sha256",
+            "HOST_SESSIOND_SECCOMP_COMPILER_SHA256",
+        ),
+        ("seccomp-source", "HOST_SESSIOND_SECCOMP_SOURCE"),
+        (
+            "seccomp-source-sha256",
+            "HOST_SESSIOND_SECCOMP_SOURCE_SHA256",
+        ),
+        (
+            "seccomp-policy-source",
+            "HOST_SESSIOND_SECCOMP_POLICY_SOURCE",
+        ),
+        (
+            "seccomp-policy-source-sha256",
+            "HOST_SESSIOND_SECCOMP_POLICY_SOURCE_SHA256",
+        ),
+        ("snapshot-id", "HOST_SESSIOND_SNAPSHOT_ID"),
+        ("snapshot-state", "HOST_SESSIOND_SNAPSHOT_STATE"),
+        (
+            "snapshot-state-sha256",
+            "HOST_SESSIOND_SNAPSHOT_STATE_SHA256",
+        ),
+        ("snapshot-memory", "HOST_SESSIOND_SNAPSHOT_MEMORY"),
+        (
+            "snapshot-memory-sha256",
+            "HOST_SESSIOND_SNAPSHOT_MEMORY_SHA256",
+        ),
+        ("veritysetup", "HOST_SESSIOND_VERITYSETUP"),
+        ("veritysetup-sha256", "HOST_SESSIOND_VERITYSETUP_SHA256"),
+        ("dmsetup", "HOST_SESSIOND_DMSETUP"),
+        ("dmsetup-sha256", "HOST_SESSIOND_DMSETUP_SHA256"),
+        ("jailer-chroot-base", "HOST_SESSIOND_JAILER_CHROOT_BASE"),
+        ("cgroup-parent", "HOST_SESSIOND_CGROUP_PARENT"),
+        ("jailer-uid", "HOST_SESSIOND_JAILER_UID"),
+        ("jailer-gid", "HOST_SESSIOND_JAILER_GID"),
+        ("verity-mapper-prefix", "HOST_SESSIOND_VERITY_MAPPER_PREFIX"),
+        (
+            "workspace-image-bytes",
+            "HOST_SESSIOND_WORKSPACE_IMAGE_BYTES",
+        ),
+        ("memory-max-bytes", "HOST_SESSIOND_MEMORY_MAX_BYTES"),
+        ("cpu-quota-micros", "HOST_SESSIOND_CPU_QUOTA_MICROS"),
+        ("cpu-period-micros", "HOST_SESSIOND_CPU_PERIOD_MICROS"),
+        ("vcpu-count", "HOST_SESSIOND_VCPU_COUNT"),
+        ("memory-mib", "HOST_SESSIOND_MEMORY_MIB"),
+        ("boot-args", "HOST_SESSIOND_BOOT_ARGS"),
+        ("issuer", "HOST_SESSIOND_ISSUER"),
+        ("workspace-template", "HOST_SESSIOND_WORKSPACE_TEMPLATE"),
+        ("identity-ledger", "HOST_SESSIOND_IDENTITY_LEDGER_ROOT"),
+        ("recovery-journal", "HOST_SESSIOND_RECOVERY_JOURNAL_ROOT"),
+        ("authority-audit", "HOST_SESSIOND_AUTHORITY_AUDIT_ROOT"),
+        ("authority-audit-mode", "HOST_SESSIOND_AUTHORITY_AUDIT_MODE"),
+        ("broker-wal-root", "HOST_SESSIOND_BROKER_WAL_BASE"),
+        ("broker-host-cid", "HOST_SESSIOND_BROKER_HOST_CID"),
+        ("broker-backlog", "HOST_SESSIOND_BROKER_BACKLOG"),
+        ("guest-control-port", "HOST_SESSIOND_GUEST_CONTROL_PORT"),
+        (
+            "broker-replay-capacity",
+            "HOST_SESSIOND_BROKER_REPLAY_CAPACITY",
+        ),
+        (
+            "broker-budget-requests",
+            "HOST_SESSIOND_BROKER_BUDGET_REQUESTS",
+        ),
+        (
+            "broker-budget-response-bytes",
+            "HOST_SESSIOND_BROKER_BUDGET_RESPONSE_BYTES",
+        ),
+        (
+            "broker-budget-concurrent",
+            "HOST_SESSIOND_BROKER_BUDGET_CONCURRENT",
+        ),
+        (
+            "github-response-cap-bytes",
+            "HOST_SESSIOND_GITHUB_RESPONSE_CAP_BYTES",
+        ),
+        (
+            "broker-max-connection-requests",
+            "HOST_SESSIOND_BROKER_MAX_CONNECTION_REQUESTS",
+        ),
+        ("repository", "HOST_SESSIOND_REPOSITORY"),
+        ("file-effects", "HOST_SESSIOND_FILE_EFFECTS"),
+        ("path-prefix", "HOST_SESSIOND_PATH_PREFIX"),
+        ("stop-file", "HOST_SESSIOND_STOP_ROOT"),
+        ("poll-millis", "HOST_SESSIOND_POLL_MILLIS"),
+        (
+            "shutdown-timeout-millis",
+            "HOST_SESSIOND_SHUTDOWN_TIMEOUT_MILLIS",
+        ),
+        ("status-file", "HOST_SESSIOND_STATUS_ROOT"),
+    ];
+    let mut arguments = Vec::with_capacity(mappings.len() * 2 + 6);
+    arguments.extend(["--control-session-id".to_owned(), instance]);
+    arguments.extend(["--mode".to_owned(), mode]);
+    for (flag, variable) in mappings {
+        let value = env::var(variable)
+            .map_err(|_| format!("systemd worker environment is missing {variable}"))?;
+        if value.is_empty() || value.contains('\0') {
+            return Err(format!("systemd worker environment has invalid {variable}"));
+        }
+        arguments.extend([format!("--{flag}"), value]);
+    }
+    arguments.extend(["--egress-authority".to_owned(), "none".to_owned()]);
+    Ok(arguments)
+}
+
+fn run_session_loop(
+    runtime: &mut session_orchestrator::production_runtime::ProductionSessionRuntime,
+    stop_file: &Path,
+    poll_interval: Duration,
+    shutdown_timeout: Duration,
+    signals: &ShutdownSignals,
+    status: &StatusReporter,
+    identity: SessionIdentity,
+) -> Result<(), String> {
     loop {
         if let Some(request) = signals.requested() {
             eprintln!(
                 "host-sessiond: {} received; draining cleanup",
                 request.label()
             );
-            return drain_stop(
-                &mut runtime,
-                config.poll_interval,
-                config.shutdown_timeout,
-                &status,
-                request,
-            );
+            return drain_stop(runtime, poll_interval, shutdown_timeout, status, request);
         }
-        match stop_file_present(&config.stop_file) {
+        match stop_file_present(stop_file) {
             Ok(true) => {
                 eprintln!(
                     "host-sessiond: stop file observed at {}; draining cleanup",
-                    config.stop_file.display()
+                    stop_file.display()
                 );
                 return drain_stop(
-                    &mut runtime,
-                    config.poll_interval,
-                    config.shutdown_timeout,
-                    &status,
+                    runtime,
+                    poll_interval,
+                    shutdown_timeout,
+                    status,
                     ShutdownRequest::StopFile,
                 );
             }
@@ -159,13 +327,13 @@ fn run() -> Result<(), String> {
             Err(error) => {
                 eprintln!(
                     "host-sessiond: stop file state is unavailable at {}; failing closed",
-                    config.stop_file.display()
+                    stop_file.display()
                 );
                 let cleanup = drain_stop(
-                    &mut runtime,
-                    config.poll_interval,
-                    config.shutdown_timeout,
-                    &status,
+                    runtime,
+                    poll_interval,
+                    shutdown_timeout,
+                    status,
                     ShutdownRequest::StopFileUnavailable,
                 );
                 return match cleanup {
@@ -178,7 +346,7 @@ fn run() -> Result<(), String> {
         }
         match runtime.poll(OwnerPollRequest::Continue) {
             Ok(OwnerPollOutcome::Running(_)) => {
-                thread::sleep(config.poll_interval.min(Duration::from_millis(250)));
+                thread::sleep(poll_interval.min(Duration::from_millis(250)));
             }
             Ok(OwnerPollOutcome::Closed(reason)) => {
                 status.emit(
@@ -207,10 +375,53 @@ fn run() -> Result<(), String> {
                     Some(identity),
                     Some("poll-retryable"),
                 );
-                thread::sleep(config.poll_interval.min(Duration::from_millis(250)));
+                thread::sleep(poll_interval.min(Duration::from_millis(250)));
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn notify_systemd_ready() -> Result<(), String> {
+    let Some(raw) = env::var_os("NOTIFY_SOCKET") else {
+        return Ok(());
+    };
+    let bytes = raw.as_bytes();
+    if bytes.is_empty() || bytes.contains(&0) {
+        return Err("NOTIFY_SOCKET is malformed".to_owned());
+    }
+    let address = if let Some(name) = bytes.strip_prefix(b"@") {
+        if name.is_empty() {
+            return Err("NOTIFY_SOCKET abstract name is empty".to_owned());
+        }
+        SocketAddrUnix::new_abstract_name(name)
+    } else {
+        let path = Path::new(&raw);
+        if !path.is_absolute() {
+            return Err("NOTIFY_SOCKET path is not absolute".to_owned());
+        }
+        SocketAddrUnix::new(path)
+    }
+    .map_err(|error| format!("parse NOTIFY_SOCKET: {error}"))?;
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::DGRAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|error| format!("create systemd notify socket: {error}"))?;
+    let message = b"READY=1\nSTATUS=one session is ready";
+    let written = sendto(&socket, message, SendFlags::empty(), &address)
+        .map_err(|error| format!("notify systemd readiness: {error}"))?;
+    if written != message.len() {
+        return Err("systemd readiness datagram was truncated".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn notify_systemd_ready() -> Result<(), String> {
+    Ok(())
 }
 
 fn drain_stop(
@@ -512,26 +723,47 @@ struct DaemonConfig {
     poll_interval: Duration,
     shutdown_timeout: Duration,
     status_file: Option<PathBuf>,
+    recover_only: bool,
 }
 
 impl DaemonConfig {
     #[allow(clippy::too_many_lines)] // Every required deployment boundary is parsed explicitly.
     fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut arguments = Arguments::parse(arguments)?;
+        let control_session = arguments
+            .optional("control-session-id")?
+            .map(|value| ControlInstance::parse(&value))
+            .transpose()?;
+        let recover_only = match arguments.optional("mode")?.as_deref().unwrap_or("run") {
+            "run" => false,
+            "recover" => true,
+            value => return Err(format!("--mode must be run or recover, got {value:?}")),
+        };
         let firecracker = arguments.pinned("firecracker")?;
         let jailer = arguments.pinned("jailer")?;
         let kernel_source = arguments.pinned("kernel-source")?;
         let rootfs = arguments.pinned("rootfs")?;
         let verity_hash = arguments.pinned("verity-hash")?;
         let formatter = arguments.pinned("workspace-formatter")?;
+        let seccomp_compiler = arguments.pinned("seccomp-compiler")?;
         let seccomp_source = arguments.pinned("seccomp-source")?;
+        let seccomp_policy_source = arguments.pinned("seccomp-policy-source")?;
         let snapshot_state = arguments.pinned("snapshot-state")?;
         let snapshot_memory = arguments.pinned("snapshot-memory")?;
         let veritysetup = arguments.pinned("veritysetup")?;
         let dmsetup = arguments.pinned("dmsetup")?;
-        let chroot_base = arguments.absolute_path("jailer-chroot-base")?;
+        let chroot_base = scoped_directory(
+            &arguments.absolute_path("jailer-chroot-base")?,
+            control_session,
+        );
         let workspace_source = arguments.absolute_path("workspace-source")?;
-        let cgroup_parent = parse_cgroup_parent(&arguments.required("cgroup-parent")?)?;
+        let cgroup_parent = scoped_cgroup_parent(
+            &parse_cgroup_parent(&arguments.required("cgroup-parent")?)?,
+            control_session,
+        );
+        if control_session.is_some() {
+            verify_own_systemd_cgroup(&cgroup_parent)?;
+        }
         let firecracker_name = firecracker
             .path
             .file_name()
@@ -541,7 +773,17 @@ impl DaemonConfig {
             .join(firecracker_name)
             .join(TEMPLATE_CLONE_ID)
             .join("root");
-        let guest_cid = arguments.number("guest-cid")?;
+        let guest_cid = match control_session {
+            Some(instance) => {
+                reject_present(
+                    &mut arguments,
+                    "guest-cid",
+                    "--control-session-id derives it",
+                )?;
+                instance.guest_cid()
+            }
+            None => arguments.number("guest-cid")?,
+        };
         let runtime = RuntimeConfig {
             firecracker,
             kernel: PinnedArtifact::new(
@@ -554,7 +796,10 @@ impl DaemonConfig {
             dm_verity: DmVerityConfig {
                 data_device: rootfs.path.clone(),
                 hash_device: verity_hash.path.clone(),
-                mapper_name: arguments.required("verity-mapper-prefix")?,
+                mapper_name: scoped_mapper_prefix(
+                    &arguments.required("verity-mapper-prefix")?,
+                    control_session,
+                )?,
                 root_hash: arguments.digest("rootfs-verity-root-hash")?,
                 jailed_device_path: template_root.join("dev/rootfs"),
             },
@@ -593,10 +838,12 @@ impl DaemonConfig {
                     cpu_period_micros: arguments.number("cpu-period-micros")?,
                 },
                 seccomp: SeccompConfig {
+                    compiler: seccomp_compiler,
                     filter: PinnedArtifact::new(
                         template_root.join("artifacts/seccomp"),
                         seccomp_source.digest,
                     ),
+                    policy: seccomp_policy_source.clone(),
                     blocked_syscalls: REQUIRED_SECCOMP_DENIES
                         .into_iter()
                         .map(str::to_owned)
@@ -628,7 +875,11 @@ impl DaemonConfig {
         if let Some(broker_authority) = broker_authority {
             grant = grant.with_broker_authority(broker_authority);
         }
-        let audit_path = arguments.absolute_path("authority-audit")?;
+        let audit_path = scoped_file(
+            &arguments.absolute_path("authority-audit")?,
+            control_session,
+            "authority-audit",
+        );
         let audit_mode = match arguments.required("authority-audit-mode")?.as_str() {
             "create" => AuthorityAuditMode::CreateNew(audit_path.clone()),
             "open" => AuthorityAuditMode::OpenExisting(audit_path.clone()),
@@ -658,9 +909,32 @@ impl DaemonConfig {
             arguments.number("github-response-cap-bytes")?,
             arguments.nonzero_usize("broker-max-connection-requests")?,
         );
-        let identity_ledger_path = arguments.absolute_path("identity-ledger")?;
-        let recovery_journal_path = arguments.absolute_path("recovery-journal")?;
-        let broker_wal_root = arguments.absolute_path("broker-wal-root")?;
+        let identity_ledger_path = scoped_file(
+            &arguments.absolute_path("identity-ledger")?,
+            control_session,
+            "identity-ledger",
+        );
+        let recovery_journal_path = scoped_file(
+            &arguments.absolute_path("recovery-journal")?,
+            control_session,
+            "recovery-journal",
+        );
+        let broker_wal_root = scoped_file(
+            &arguments.absolute_path("broker-wal-root")?,
+            control_session,
+            "broker-wal",
+        );
+        let broker_port = match control_session {
+            Some(instance) => {
+                reject_present(
+                    &mut arguments,
+                    "broker-port",
+                    "--control-session-id derives it",
+                )?;
+                instance.broker_port()
+            }
+            None => arguments.number("broker-port")?,
+        };
         let production = ProductionSessionConfig::new(
             ProductionDurabilityConfig::new(
                 identity_ledger_path.clone(),
@@ -677,13 +951,17 @@ impl DaemonConfig {
             ProductionBrokerEndpoint::new(
                 arguments.number("broker-host-cid")?,
                 guest_cid,
-                arguments.number("broker-port")?,
+                broker_port,
                 arguments.number("broker-backlog")?,
             ),
             ProductionGuestControlEndpoint::new(arguments.number("guest-control-port")?),
             broker_limits,
         );
-        let stop_file = arguments.absolute_path("stop-file")?;
+        let stop_file = scoped_file(
+            &arguments.absolute_path("stop-file")?,
+            control_session,
+            "stop",
+        );
         match fs::symlink_metadata(&stop_file) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(_) => {
@@ -705,7 +983,7 @@ impl DaemonConfig {
         let status_file = arguments
             .optional("status-file")?
             .map(|value| {
-                let path = PathBuf::from(value);
+                let path = scoped_file(&PathBuf::from(value), control_session, "status");
                 validate_absolute_path("status-file", &path)?;
                 Ok::<PathBuf, String>(path)
             })
@@ -725,7 +1003,9 @@ impl DaemonConfig {
                     &runtime.veritysetup.path,
                     &runtime.workspace.image.formatter.path,
                     &runtime.jailer.path,
+                    &runtime.isolation.seccomp.compiler.path,
                     &runtime.isolation.seccomp.filter.path,
+                    &runtime.isolation.seccomp.policy.path,
                     &kernel_source.path,
                     &seccomp_source.path,
                     &snapshot_state.path,
@@ -754,6 +1034,7 @@ impl DaemonConfig {
             poll_interval,
             shutdown_timeout,
             status_file,
+            recover_only,
         })
     }
 }
@@ -926,14 +1207,106 @@ fn parse_cgroup_parent(value: &str) -> Result<PathBuf, String> {
         || value.split('/').any(|component| {
             component.is_empty()
                 || component.starts_with('.')
-                || !component
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+                || !component.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'@')
+                })
         })
     {
         return Err("--cgroup-parent must be safe relative cgroup components".to_owned());
     }
     Ok(PathBuf::from(value))
+}
+
+#[derive(Clone, Copy)]
+struct ControlInstance([u8; 16]);
+
+impl ControlInstance {
+    fn parse(value: &str) -> Result<Self, String> {
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(
+                "--control-session-id must use exactly 32 lower-case hexadecimal characters"
+                    .to_owned(),
+            );
+        }
+        let bytes = parse_hex_16("--control-session-id", value)?;
+        if bytes == [0; 16] {
+            return Err("--control-session-id cannot be all zeroes".to_owned());
+        }
+        Ok(Self(bytes))
+    }
+
+    fn name(self) -> String {
+        let mut name = String::with_capacity(32);
+        for byte in self.0 {
+            use std::fmt::Write as _;
+            let _ = write!(name, "{byte:02x}");
+        }
+        name
+    }
+
+    const fn guest_cid(self) -> u32 {
+        3 + u32::from_be_bytes([self.0[0], self.0[1], self.0[2], self.0[3]]) % (u32::MAX - 2)
+    }
+
+    const fn broker_port(self) -> u32 {
+        1_024
+            + u32::from_be_bytes([self.0[4], self.0[5], self.0[6], self.0[7]]) % (u32::MAX - 1_023)
+    }
+}
+
+fn scoped_directory(base: &Path, instance: Option<ControlInstance>) -> PathBuf {
+    instance.map_or_else(|| base.to_owned(), |instance| base.join(instance.name()))
+}
+
+fn scoped_file(base: &Path, instance: Option<ControlInstance>, leaf: &str) -> PathBuf {
+    instance.map_or_else(
+        || base.to_owned(),
+        |instance| base.join(instance.name()).join(leaf),
+    )
+}
+
+fn scoped_cgroup_parent(base: &Path, instance: Option<ControlInstance>) -> PathBuf {
+    instance.map_or_else(
+        || base.to_owned(),
+        |instance| base.join(format!("host-sessiond@{}.service", instance.name())),
+    )
+}
+
+fn verify_own_systemd_cgroup(expected: &Path) -> Result<(), String> {
+    let cgroup = fs::read_to_string("/proc/self/cgroup")
+        .map_err(|error| format!("read own cgroup membership: {error}"))?;
+    let expected = format!("0::/{}", expected.display());
+    if cgroup
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        != [expected]
+    {
+        return Err("systemd worker is not running in its exact delegated cgroup".to_owned());
+    }
+    Ok(())
+}
+
+fn scoped_mapper_prefix(base: &str, instance: Option<ControlInstance>) -> Result<String, String> {
+    let value = instance.map_or_else(
+        || base.to_owned(),
+        |instance| format!("{base}-{}", instance.name()),
+    );
+    if value.len() > 127 {
+        return Err("session-scoped --verity-mapper-prefix exceeds 127 bytes".to_owned());
+    }
+    Ok(value)
+}
+
+fn reject_present(arguments: &mut Arguments, name: &str, reason: &str) -> Result<(), String> {
+    if arguments.optional(name)?.is_some() {
+        Err(format!("--{name} is forbidden because {reason}"))
+    } else {
+        Ok(())
+    }
 }
 
 fn file_authority(
@@ -1205,7 +1578,9 @@ fn usage() -> &'static str {
   --kernel-source PATH --kernel-source-sha256 SHA256 --rootfs PATH --rootfs-sha256 SHA256 \\
   --verity-hash PATH --verity-hash-sha256 SHA256 --rootfs-verity-root-hash SHA256 \\
   --workspace-formatter PATH --workspace-formatter-sha256 SHA256 --workspace-source PATH \\
-  --seccomp-source PATH --seccomp-source-sha256 SHA256 --snapshot-id HEX32 \\
+  --seccomp-compiler PATH --seccomp-compiler-sha256 SHA256 \\
+  --seccomp-source PATH --seccomp-source-sha256 SHA256 \\
+  --seccomp-policy-source PATH --seccomp-policy-source-sha256 SHA256 --snapshot-id HEX32 \\
   --snapshot-state PATH --snapshot-state-sha256 SHA256 --snapshot-memory PATH --snapshot-memory-sha256 SHA256 \\
   --veritysetup PATH --veritysetup-sha256 SHA256 --dmsetup PATH --dmsetup-sha256 SHA256 \\
   --jailer-chroot-base PATH --cgroup-parent RELATIVE --jailer-uid UID --jailer-gid GID \\

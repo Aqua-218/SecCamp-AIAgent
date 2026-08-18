@@ -175,6 +175,7 @@ case "${command_name}" in
     scripts/ci/check-codeowners-coverage.sh
     scripts/ci/check-repository-hygiene.sh
     scripts/ci/check-lean-hygiene.sh
+    scripts/ci/check-service-boundaries.sh
     scripts/ci/collect-pin-inventory.sh
     ;;
   crate-isolation)

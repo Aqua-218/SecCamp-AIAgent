@@ -3,6 +3,10 @@
 /.gitlab/ @Aqua-218
 /.gitlab-ci.yml @Aqua-218
 /scripts/ci/ @Aqua-218
+# Production privilege, device, and authorization boundaries must not drift without the same
+# explicit owner review as their verification gates.
+/service/ @Aqua-218
+/deploy/ @Aqua-218
 # The gate manifest decides which checks must pass. Without an owner on it, a
 # change could move a gate from `implemented` to `planned` and remove it from
 # both pipelines without anyone reviewing the removal.

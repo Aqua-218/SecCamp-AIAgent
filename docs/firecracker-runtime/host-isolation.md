@@ -20,7 +20,7 @@ flowchart TB
     ns -->|no| deny["InvalidConfig<br/>起動しない"]
     ns -->|yes| cg{"cgroup path が / でなく<br/>memory と CPU 上限が非ゼロ?"}
     cg -->|no| deny
-    cg -->|yes| sec{"seccomp に 8 個の<br/>必須 syscall が宣言済み?"}
+    cg -->|yes| sec{"seccomp source は全threadで<br/>default-deny allowlist?"}
     sec -->|no| deny
     sec -->|yes| net{"network_devices が空?"}
     net -->|no| forbidden["NetworkDeviceForbidden"]
@@ -54,22 +54,32 @@ if self.isolation.cgroup.memory_max_bytes == 0
 
 上限がゼロの場合を拒否するのは、`0` が「制限なし」を意味しかねないから。cgroup v2 の `memory.max` は `max` という文字列で無制限を表すが、数値の `0` を書くとすべての割り当てが失敗する。どちらの解釈でも意図した動作にならないので、設定の時点で落とす。`Default` で初期化したまま渡す事故もここで止まる。
 
-## seccomp は 8 個の deny 宣言を必須にする
+## seccomp source・compiler・BPF を一体で検証する
 
 ```rust
-const REQUIRED_BLOCKED_SYSCALLS: [&str; 8] = [
-    "bpf", "connect", "mount", "perf_event_open",
-    "ptrace", "setns", "socket", "unshare",
+const REQUIRED_BLOCKED_SYSCALLS: [&str; 6] = [
+    "bpf", "mount", "perf_event_open", "ptrace", "setns", "unshare",
 ];
 ```
 
-`SeccompConfig` は filter 本体を `PinnedArtifact` として持ち、それとは別に `blocked_syscalls` の一覧を宣言する。`validate` は 8 個すべてが宣言に含まれることを確認する。
+`SeccompConfig` は pinned JSON policy、pinned `seccompiler`、jailer が読む pinned BPF filter、
+および6 syscallのexact deny宣言を持つ。起動前に全artifactのdigestを検査した上で、JSONを
+最大1 MiBに制限してparseし、各thread profileがdefault-deny（`trap`、`kill_process`、
+`kill_thread`、`errno`）かつ`filter_action=allow`であることを要求する。6 syscallはどのthreadの
+allowlistにも存在できない。宣言側も、この6個と集合が完全一致しなければ拒否する。
 
-ここは検査の性質を誤解しやすい。**この crate は filter を解析していない。** 宣言された一覧を文字列比較しているだけで、実際の BPF が本当にこれらを拒否するかは見ていない。宣言と実体がずれても検出できない。
+`socket`を全面禁止するとFirecracker自身のUnix API/vsock backendも壊れるため、allowできるのは
+引数がexact `AF_UNIX`、`SOCK_STREAM|SOCK_CLOEXEC`、protocol 0のruleだけである。`connect`は
+default-deny allowlistの中でFirecrackerのUnix-domain接続に必要なため、名前だけで禁止したとは
+主張しない。host network deviceは別の`NetworkDeviceForbidden`で常に拒否する。
 
-それでも入れている理由は、profile を差し替えるときに「この 8 個は落とすな」という要求が config に残るから。宣言を消せば起動しなくなるので、意図せず緩めることはできない。実 launch gate は pinned filter が Firecracker にロードされ、task の `Seccomp: 2` になることを確認するが、各 syscall の deny 動作までは確認しない。
+最後に、検査済みJSON bytesをprivate temporary directoryへ書き、pinned compilerを固定引数で
+再実行する。出力が単一のbounded regular fileであり、jailerへ渡すBPFとbyte-for-byte一致する
+場合だけ起動する。これにより「宣言とJSON」「JSONとcompiled BPF」のずれは起動前に閉じる。
+実launch gateはさらにtaskの`Seccomp: 2`を観測する。
 
-8 個の選び方は、VM 脱出後に最初に試されるものを並べている。`socket` と `connect` で外部通信、`mount` と `unshare` と `setns` で隔離の張り直し、`ptrace` で他プロセスへの干渉、`bpf` と `perf_event_open` で kernel への到達。
+6個のdenyは、VM escape後のnamespace張り直し、他process干渉、kernel attack surfaceへの到達を
+狙う操作である。default-denyなので、ここに列挙していないsyscallもallowlistになければ拒否される。
 
 [runtime-isolation の seccomp allowlist](../runtime-isolation/seccomp-allowlist.md) とは層が違う。あちらは VM 内の workload、こちらは host 上の Firecracker プロセス。同じ syscall 名が出てくるが、対象プロセスが別。
 
@@ -92,17 +102,18 @@ profile を緩める変更が起動失敗として現れる。静かに緩んだ
 この crate が保証するのは、config が上記の条件を満たさなければ起動しないことと、opt-in の実 launch gate が指定 host 上の一部の設置状態を観測することまでである。**これを VM escape proof と解釈してはいけない。**
 
 - `scripts/ci/verify-real-runtime-lifecycle.sh` は実 jailer/Firecracker を通り、PID/mount namespace、cgroup leaf と memory/cpu 上限、dedicated UID、pinned executable digest、`Seccomp: 2` を観測する。
-- seccomp filter の中身は解析していない。`blocked_syscalls` は宣言であって deny の検証結果ではない。宣言と filter が食い違っていても、各 syscall を実行しない限り検出しない。
+- seccomp JSONの全threadを解析し、default-deny allowlist、6個の必須deny不在、exact Unix-stream `socket` ruleを検査する。pinned compilerで再生成したBPFはjailer入力とbyte一致を要求する。
+- allowlistに載る全syscallの全引数意味論を一般化して証明するものではない。引数を特別検査するのは`socket`であり、host kernelとpinned compilerはTCBに残る。
 - wrapper の gate は jailer の期待する CLI、workspace/mapper/bind、shutdown cleanup も確認するが、VM escape、snapshot restore、guest CapFS、host の AppArmor/SELinux/seccomp は対象外である。
 - VM 脱出が起きたときに実際に被害が VM 1 台に留まるかは、上記が全部効いていることが前提。現時点でその前提は確認できていない。
-- host 側の他の防御（AppArmor、SELinux、host の seccomp）はこの crate の対象外。
+- host 側の他の防御（AppArmor、SELinux）はこの crate の対象外。
 
 ## 変更時の確認点
 
-- `REQUIRED_BLOCKED_SYSCALLS` から要素を削るときは、その syscall で VM 脱出後に何ができるようになるかを ADR に書く。8 個は最小要求であって推奨構成ではない。
-- 逆に足すときは、既存の filter artifact の宣言も同時に更新する。片方だけだと既存の profile で起動できなくなる。
+- `REQUIRED_BLOCKED_SYSCALLS` から要素を削るときは、その syscall で VM 脱出後に何ができるようになるかを ADR に書く。6個はdefault-deny policy上の必須denyであって、allowlist全体ではない。
+- 逆に足すときは、JSON policy、compiled BPF、宣言を同時に更新する。どれか1つだけならsource検査またはbyte一致で起動できない。
 - `NamespaceConfig` の bool を 1 つでも省略可能にするときは、[隔離基盤の設計](../design/runtime-isolation.md)の脅威モデルを先に読み直す。
-- `blocked_syscalls` の検査を「filter を解析して確認する」に強化する場合は、この文書の保証範囲の記述も同時に直す。現状は宣言の照合であることを明記している。
+- seccomp JSON parserが認識するaction、rule shape、argument制約を変える場合は、pinned compilerとの再生成試験とこの保証範囲を同時に更新する。
 - `network_devices` フィールドを消す判断をするなら、`NetworkDeviceForbidden` を返す経路が無くなることを踏まえて、[ネットワークと外部副作用の設計](../design/network-egress.md)の前提を確認する。
 
 ## 関連

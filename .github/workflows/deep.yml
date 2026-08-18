@@ -252,6 +252,22 @@ jobs:
       - name: Verify Runtime::launch through the real jailer lifecycle
         run: scripts/ci/run.sh real-runtime-lifecycle
 
+  real_runtime_version_matrix:
+    name: Pinned Firecracker Runtime version matrix
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, x64, kvm, ephemeral]
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Verify production lifecycle across pinned Firecracker releases
+        run: scripts/ci/run.sh real-runtime-version-matrix
+
   session_owner_kvm:
     name: Full SessionOwner KVM verification
     # Runs the production composition from clean snapshot capture through all
@@ -356,6 +372,33 @@ jobs:
       - name: Verify the typed live GitHub provider path
         run: scripts/ci/run.sh live-github
 
+  external_review_attestation:
+    name: Independent review attestation
+    # The report and key are injected by the protected environment. The
+    # repository can validate an external signature but cannot create an
+    # independent review of itself.
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref_protected == true && github.event.repository.fork == false }}
+    environment: independent-review
+    runs-on: [self-hosted, linux, x64, ephemeral]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      EXTERNAL_REVIEW_REPORT_B64: ${{ secrets.EXTERNAL_REVIEW_REPORT_B64 }}
+      EXTERNAL_REVIEW_SIGNATURE_B64: ${{ secrets.EXTERNAL_REVIEW_SIGNATURE_B64 }}
+      EXTERNAL_REVIEW_PUBLIC_KEY_B64: ${{ secrets.EXTERNAL_REVIEW_PUBLIC_KEY_B64 }}
+      EXTERNAL_REVIEW_ARTIFACT_B64: ${{ secrets.EXTERNAL_REVIEW_ARTIFACT_B64 }}
+      EXTERNAL_REVIEW_DISPOSITION_B64: ${{ secrets.EXTERNAL_REVIEW_DISPOSITION_B64 }}
+      EXTERNAL_REVIEW_TRUSTED_KEY_SHA256: ${{ secrets.EXTERNAL_REVIEW_TRUSTED_KEY_SHA256 }}
+    steps:
+      - name: Check out exact reviewed revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify revision-bound external signature and disposition
+        run: scripts/ci/run.sh external-review
+
   privileged_isolation:
     name: Privileged runtime isolation verification
     # Requires root and a cgroup v2 root that delegates memory and pids. No KVM.
@@ -373,6 +416,40 @@ jobs:
       - name: Apply the 13 isolation steps and question the kernel
         run: scripts/ci/run.sh privileged-isolation
 
+  privileged_isolation_aarch64:
+    name: Privileged aarch64 runtime isolation verification
+    # This must execute on a real aarch64 kernel. A cross-compiled artifact on
+    # an x86_64 runner is deliberately rejected by the wrapper.
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, arm64, privileged, ephemeral]
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Apply the architecture-bound isolation policy and question the kernel
+        run: scripts/ci/run.sh privileged-isolation-aarch64
+
+  runtime_isolation_soak:
+    name: Privileged runtime isolation soak
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, x64, privileged, ephemeral]
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Repeat the full privileged boundary and escape corpus
+        run: scripts/ci/run.sh runtime-isolation-soak
+
   deep_complete:
     name: Deep verification complete
     if: ${{ always() }}
@@ -387,12 +464,16 @@ jobs:
       - benchmarks
       - real_vm
       - real_runtime_lifecycle
+      - real_runtime_version_matrix
       - session_owner_kvm
       - session_owner_crash_recovery
       - real_capfs
       - egress_real_https
       - external_provider_smoke
+      - external_review_attestation
       - privileged_isolation
+      - privileged_isolation_aarch64
+      - runtime_isolation_soak
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

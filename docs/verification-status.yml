@@ -656,29 +656,41 @@ claims:
     component: firecracker-runtime
     scope: privileged
     status: unverified
-    summary: The production command vocabulary is sealed, but host-sessiond still owns privileged runtime setup and cleanup in-process; no separately sandboxed helper and authenticated bounded IPC boundary has been implemented or exercised.
+    summary: Separate required gates verify the no-capability authenticated controller with fixed systemd recovery and the production KVM worker/Broker resource tree, but no gate yet runs the exact installed production controller and worker units through one end-to-end VM session.
     verification_page: docs/firecracker-runtime/verification.md
     prerequisites:
       - id: privileged-helper-composition
-        description: A separately sandboxed helper exposing only typed fixed operations, an unprivileged controller, and real-KVM crash/replay tests are required.
-        check: privileged helper architecture and integration gate
+        description: A real systemd/polkit host and a disposable x86_64 KVM host must exercise the unprivileged controller, fixed worker templates, concurrent resource trees, and crash recovery.
+        check: systemd control-plane and production worker integration gates
     gate:
       id: firecracker-runtime-privileged-process-separation
       result: required
       on_prerequisite_failure: fail
       commands:
-        - scripts/ci/verify-real-runtime-lifecycle.sh
+        - scripts/ci/verify-real-systemd-control-plane.sh
+        - scripts/ci/verify-real-concurrent-session-owners.sh
+        - scripts/ci/verify-real-session-crash-recovery.sh
     evidence:
       commands:
-        - cargo test --locked -p firecracker-runtime --all-targets
+        - scripts/ci/check-service-boundaries.sh
+        - scripts/ci/verify-real-systemd-control-plane.sh
+        - scripts/ci/verify-real-concurrent-session-owners.sh
+        - scripts/ci/verify-real-session-crash-recovery.sh
       sources:
         - crates/firecracker-runtime/src/lib.rs
         - crates/session-orchestrator/src/production_runtime.rs
         - crates/session-orchestrator/src/bin/host-sessiond.rs
+        - crates/session-orchestrator/src/bin/host-controld.rs
+        - crates/session-orchestrator/src/systemd_worker.rs
+        - service/host-controld.service
+        - service/host-sessiond@.service
+        - service/host-sessiond-recover@.service
       tests:
         - crates/firecracker-runtime/tests/real_runtime_lifecycle.rs
+        - crates/session-orchestrator/tests/real_production_lifecycle.rs
+        - scripts/ci/verify-real-systemd-control-plane.sh
     residual_reasons:
-      - Sealing CommandSpec prevents arbitrary library callers from supplying commands but does not move privileged filesystem, device-mapper, cgroup, or launcher operations out of host-sessiond.
+      - The real systemd gate deliberately uses a resource-bearing worker fixture, while the real KVM gate invokes production SessionOwner directly; an exact installed-unit-to-VM integration run is not repository evidence yet.
 
   - id: firecracker-runtime-kvm
     component: firecracker-runtime
@@ -847,7 +859,7 @@ claims:
     component: session-orchestrator
     scope: kvm
     status: unverified
-    summary: No production adapter or authenticated control daemon currently binds the scheduler core to multiple concurrent one-session host-sessiond workers and real Firecracker resource trees.
+    summary: Separate required gates verify authenticated systemd worker ownership, failed-unit resource recovery, quota release, controller-crash reconciliation, and two concurrent production SessionOwner/Broker trees, but not the exact installed production units and KVM workers in one execution.
     verification_page: docs/session-orchestrator/verification.md
     prerequisites:
       - id: multi-worker-kvm-composition
@@ -858,17 +870,30 @@ claims:
       result: required
       on_prerequisite_failure: fail
       commands:
-        - cargo test --locked -p session-orchestrator control_plane
+        - scripts/ci/verify-real-systemd-control-plane.sh
+        - scripts/ci/verify-real-concurrent-session-owners.sh
+        - scripts/ci/verify-real-session-crash-recovery.sh
     evidence:
       commands:
-        - cargo test --locked -p session-orchestrator control_plane
+        - scripts/ci/check-service-boundaries.sh
+        - scripts/ci/verify-real-systemd-control-plane.sh
+        - scripts/ci/verify-real-concurrent-session-owners.sh
+        - scripts/ci/verify-real-session-crash-recovery.sh
       sources:
         - crates/session-orchestrator/src/control_plane.rs
         - crates/session-orchestrator/src/bin/host-sessiond.rs
+        - crates/session-orchestrator/src/bin/host-controld.rs
+        - crates/session-orchestrator/src/bin/host-control.rs
+        - crates/session-orchestrator/src/systemd_worker.rs
+        - service/host-controld.service
+        - service/host-sessiond@.service
+        - service/host-sessiond-recover@.service
       tests:
         - crates/session-orchestrator/src/control_plane.rs
+        - crates/session-orchestrator/tests/real_production_lifecycle.rs
+        - scripts/ci/verify-real-systemd-control-plane.sh
     residual_reasons:
-      - Hosted workers establish scheduler invariants but do not provide concurrent real-KVM or production privilege-separation evidence.
+      - The systemd control-plane fixture and production KVM worker gates converge on statically locked deployment contracts but have not been executed as one exact installed production chain.
 
   - id: session-orchestrator-kvm
     component: session-orchestrator

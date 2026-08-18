@@ -28,6 +28,7 @@ use rustix::{
         openat2, unlinkat,
     },
     io::Errno,
+    mount::{UnmountFlags, unmount},
 };
 
 use super::{
@@ -65,6 +66,7 @@ pub struct SessionResourceOwnership {
     jail_parent_seal: ParentSeal,
     jail_leaf: OsString,
     jail_root: PathBuf,
+    jailed_device: PathBuf,
     workspace: PathBuf,
     mapper_name: String,
     data_device: PathBuf,
@@ -125,6 +127,7 @@ impl SessionResourceOwnership {
             jail_parent_seal,
             jail_leaf: jail_leaf.to_os_string(),
             jail_root,
+            jailed_device: config.dm_verity.jailed_device_path.clone(),
             workspace: config.workspace.clone_path(),
             mapper_name: config.dm_verity.mapper_name.clone(),
             data_device: config.dm_verity.data_device.clone(),
@@ -342,7 +345,8 @@ pub trait FirecrackerRecoveryBackend {
     /// Returns [`RuntimeError`] while the exact cgroup cannot be verified empty and absent.
     fn recover_cgroup(&mut self, ownership: &SessionResourceOwnership) -> Result<(), RuntimeError>;
 
-    /// Verifies and closes the exact dm-verity mapping, or observes it absent.
+    /// Verifies and unmounts its exact jailed bind, then closes the exact dm-verity mapping, or
+    /// observes both absent.
     ///
     /// # Errors
     ///
@@ -584,7 +588,9 @@ impl FirecrackerRecoveryBackend for LinuxFirecrackerRecovery {
     }
 
     fn recover_mapper(&mut self, ownership: &SessionResourceOwnership) -> Result<(), RuntimeError> {
-        let Some(mapper) = find_kernel_mapper(&ownership.mapper_name)? else {
+        let mapper = find_kernel_mapper(&ownership.mapper_name)?;
+        recover_jailed_device_binding(ownership, mapper.as_ref(), self.deadline)?;
+        let Some(mapper) = mapper else {
             return Ok(());
         };
         let tools = self.sealed_tools()?.paths();
@@ -593,6 +599,153 @@ impl FirecrackerRecoveryBackend for LinuxFirecrackerRecovery {
 
     fn recover_jail(&mut self, ownership: &SessionResourceOwnership) -> Result<(), RuntimeError> {
         recover_jail(ownership)
+    }
+}
+
+fn recover_jailed_device_binding(
+    ownership: &SessionResourceOwnership,
+    mapper: Option<&KernelMapperIdentity>,
+    timeout: Duration,
+) -> Result<(), RuntimeError> {
+    let jail_parent = ownership.jail_parent_seal.open_verified_parent()?;
+    let relative = ownership
+        .jailed_device
+        .strip_prefix(&ownership.jail_parent)
+        .map_err(|_| {
+            RuntimeError::InvalidConfig(
+                "jailed recovery device is outside its sealed jail parent".to_owned(),
+            )
+        })?;
+    let relative_parent = relative.parent().ok_or_else(|| {
+        RuntimeError::InvalidConfig("jailed recovery device has no relative parent".to_owned())
+    })?;
+    let leaf = relative.file_name().ok_or_else(|| {
+        RuntimeError::InvalidConfig("jailed recovery device has no leaf".to_owned())
+    })?;
+    let device_parent = match openat2(
+        &jail_parent,
+        relative_parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        RESOLVE_CHILD,
+    ) {
+        Ok(directory) => File::from(directory),
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(RuntimeError::Io(error.to_string())),
+    };
+    let target = match openat2(
+        &device_parent,
+        leaf,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        ResolveFlags::BENEATH.union(RESOLVE_NO_LINKS),
+    ) {
+        Ok(target) => File::from(target),
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => return Err(RuntimeError::Io(error.to_string())),
+    };
+    let metadata = target.metadata().map_err(RuntimeError::from)?;
+    if metadata.file_type().is_block_device() {
+        let mapper = mapper.ok_or_else(|| {
+            RuntimeError::Command(
+                "jailed recovery device remains mounted after its mapper disappeared".to_owned(),
+            )
+        })?;
+        let parent_mount_id = descriptor_mount_id(&device_parent)?;
+        let target_mount_id = descriptor_mount_id(&target)?;
+        let target_identity = super::ObjectIdentity::from_metadata(&metadata);
+        if major(metadata.rdev()) != mapper.major
+            || minor(metadata.rdev()) != mapper.minor
+            || target_mount_id == parent_mount_id
+        {
+            return Err(RuntimeError::Command(
+                "jailed recovery device is not the exact mapper bind mount".to_owned(),
+            ));
+        }
+        // An O_PATH descriptor on the mountpoint itself keeps a non-lazy
+        // unmount busy. Retain only the sealed identity values across umount.
+        drop(target);
+        unmount_jailed_mapper_with_retry(
+            &device_parent,
+            leaf,
+            &ownership.jailed_device,
+            mapper,
+            target_identity,
+            target_mount_id,
+            timeout,
+        )?;
+        let unmounted = File::from(
+            openat2(
+                &device_parent,
+                leaf,
+                OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+                ResolveFlags::BENEATH.union(RESOLVE_NO_LINKS),
+            )
+            .map_err(|error| RuntimeError::Io(error.to_string()))?,
+        );
+        let unmounted_metadata = unmounted.metadata().map_err(RuntimeError::from)?;
+        if !unmounted_metadata.is_file()
+            || unmounted_metadata.file_type().is_symlink()
+            || unmounted_metadata.nlink() != 1
+            || descriptor_mount_id(&unmounted)? != descriptor_mount_id(&device_parent)?
+        {
+            return Err(RuntimeError::Command(
+                "jailed recovery target changed after exact bind unmount".to_owned(),
+            ));
+        }
+    } else if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.nlink() != 1
+        || descriptor_mount_id(&target)? != descriptor_mount_id(&device_parent)?
+    {
+        return Err(RuntimeError::Command(
+            "jailed recovery target has an unexpected type or mount identity".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn unmount_jailed_mapper_with_retry(
+    device_parent: &File,
+    leaf: &OsStr,
+    jailed_device: &Path,
+    mapper: &KernelMapperIdentity,
+    target_identity: super::ObjectIdentity,
+    target_mount_id: u64,
+    timeout: Duration,
+) -> Result<(), RuntimeError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match unmount(jailed_device, UnmountFlags::NOFOLLOW) {
+            Ok(()) => return Ok(()),
+            Err(Errno::BUSY) if Instant::now() < deadline => {
+                let current = File::from(
+                    openat2(
+                        device_parent,
+                        leaf,
+                        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                        Mode::empty(),
+                        ResolveFlags::BENEATH.union(RESOLVE_NO_LINKS),
+                    )
+                    .map_err(|error| RuntimeError::Io(error.to_string()))?,
+                );
+                let metadata = current.metadata().map_err(RuntimeError::from)?;
+                if !metadata.file_type().is_block_device()
+                    || major(metadata.rdev()) != mapper.major
+                    || minor(metadata.rdev()) != mapper.minor
+                    || super::ObjectIdentity::from_metadata(&metadata) != target_identity
+                    || descriptor_mount_id(&current)? != target_mount_id
+                {
+                    return Err(RuntimeError::Command(
+                        "jailed recovery mapper bind changed while unmount was busy".to_owned(),
+                    ));
+                }
+                drop(current);
+                thread::sleep(PROCESS_POLL_INTERVAL);
+            }
+            Err(error) => return Err(RuntimeError::Io(error.to_string())),
+        }
     }
 }
 
@@ -1075,15 +1228,24 @@ fn validate_dmsetup_info(
         || fields[1] != mapper.uuid
         || fields[2] != mapper.major.to_string()
         || fields[3] != mapper.minor.to_string()
-        || !matches!(readonly, Some("read-only" | "1"))
+        // dmsetup's column renderer emits `Read-only` on current releases;
+        // older releases use `read-only` or the numeric form. Accept only
+        // those three documented true spellings, never a case-folded or
+        // prefix match.
+        || !dmsetup_reports_readonly(readonly)
         || fields[5] != "1"
         || !mapper.readonly
     {
-        return Err(RuntimeError::Command(
-            "dmsetup info does not match exact kernel mapper identity".to_owned(),
-        ));
+        return Err(RuntimeError::Command(format!(
+            "dmsetup info does not match exact kernel mapper identity: expected name={} uuid={} device={}:{} readonly=true segments=1, observed={fields:?}, sysfs_readonly={}",
+            ownership.mapper_name, mapper.uuid, mapper.major, mapper.minor, mapper.readonly,
+        )));
     }
     Ok(())
+}
+
+fn dmsetup_reports_readonly(value: Option<&str>) -> bool {
+    matches!(value, Some("Read-only" | "read-only" | "1"))
 }
 
 fn validate_verity_status(
@@ -1494,6 +1656,17 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn dmsetup_readonly_parser_accepts_only_explicit_true_spellings() {
+        for accepted in ["Read-only", "read-only", "1"] {
+            assert!(dmsetup_reports_readonly(Some(accepted)));
+        }
+        for rejected in ["Read-write", "read-write", "0", "READ-ONLY", "true", ""] {
+            assert!(!dmsetup_reports_readonly(Some(rejected)));
+        }
+        assert!(!dmsetup_reports_readonly(None));
+    }
+
     fn temp_directory(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "firecracker-recovery-{label}-{}-{}",
@@ -1575,6 +1748,7 @@ mod tests {
             jail_parent_seal: parent_seal,
             jail_leaf: OsString::from("session-a"),
             jail_root: PathBuf::from("/srv/jailer/firecracker/session-a/root"),
+            jailed_device: PathBuf::from("/srv/jailer/firecracker/session-a/root/dev/rootfs"),
             workspace: PathBuf::from("/srv/jailer/firecracker/session-a/root/workspace/session-a"),
             mapper_name: "root-session-a".to_owned(),
             data_device: PathBuf::from("/srv/images/root"),

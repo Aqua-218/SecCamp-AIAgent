@@ -100,6 +100,7 @@ struct Config {
     broker_port: u32,
     isolation_launcher: PathBuf,
     workload: PathBuf,
+    hold_workload_after_probe: bool,
     repository: RepoId,
     effects: FileEffects,
     path: PathPattern,
@@ -325,11 +326,16 @@ fn run_session(
         broker_channel.as_raw_fd(),
         identity.session.clone(),
     );
+    let workload_arguments = if config.hold_workload_after_probe {
+        vec![OsString::from("--hold-after-probe")]
+    } else {
+        Vec::new()
+    };
     let host = LinuxHostResources::new(LinuxHostConfig::new(
         &config.cgroup_parent,
         &control_directory,
         &config.workload,
-        std::iter::empty::<OsString>(),
+        workload_arguments,
         isolation,
         SubjectCredential::new(geteuid().as_raw(), getegid().as_raw()),
     ))
@@ -1160,6 +1166,16 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Config,
             .into_string()
             .map_err(|_| "--path-prefix value must be UTF-8".to_owned())?,
     )?;
+    let hold_workload_after_probe = match arguments.next() {
+        Some(flag) if flag == "--hold-workload-after-probe" => true,
+        Some(unexpected) => {
+            return Err(format!(
+                "unexpected trailing fixed argument: {}",
+                unexpected.to_string_lossy()
+            ));
+        }
+        None => false,
+    };
     if let Some(unexpected) = arguments.next() {
         return Err(format!(
             "unexpected trailing fixed argument: {}",
@@ -1173,6 +1189,7 @@ fn parse_config(arguments: impl IntoIterator<Item = OsString>) -> Result<Config,
         broker_port,
         isolation_launcher,
         workload,
+        hold_workload_after_probe,
         repository: RepoId::new(repository),
         effects,
         path,
@@ -1402,6 +1419,7 @@ mod tests {
             broker_port: 18_081,
             isolation_launcher: PathBuf::from("/usr/local/libexec/workload-isolation-launcher"),
             workload: PathBuf::from("/usr/local/libexec/agent-workload"),
+            hold_workload_after_probe: false,
             repository: RepoId::new("workspace"),
             effects: FileEffects::from_effects([
                 FileEffect::ReadData,

@@ -373,8 +373,21 @@ fn validate_open_manifest_unchanged(
         || opened.dev() != expected.dev()
         || opened.ino() != expected.ino()
         || opened.len() != expected.len()
+        || opened.uid() != expected.uid()
+        || opened.gid() != expected.gid()
+        || opened.mode() != expected.mode()
+        || opened.mtime() != expected.mtime()
+        || opened.mtime_nsec() != expected.mtime_nsec()
+        || opened.ctime() != expected.ctime()
+        || opened.ctime_nsec() != expected.ctime_nsec()
         || path_metadata.dev() != opened.dev()
         || path_metadata.ino() != opened.ino()
+        || path_metadata.len() != opened.len()
+        || path_metadata.nlink() != opened.nlink()
+        || path_metadata.mtime() != opened.mtime()
+        || path_metadata.mtime_nsec() != opened.mtime_nsec()
+        || path_metadata.ctime() != opened.ctime()
+        || path_metadata.ctime_nsec() != opened.ctime_nsec()
     {
         return Err("publish-plan manifest changed while it was being read".to_owned());
     }

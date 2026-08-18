@@ -296,6 +296,17 @@ gates:
     workflow: ci.yml
     include: validate.yml
 
+  - id: service_boundaries
+    title: Privileged service boundaries
+    stage: validate
+    tier: fast
+    scopes: [always]
+    status: implemented
+    github: service_boundaries
+    gitlab: service_boundaries
+    workflow: ci.yml
+    include: validate.yml
+
   - id: codeowners_coverage
     title: CODEOWNERS coverage
     stage: validate

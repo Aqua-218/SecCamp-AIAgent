@@ -15,6 +15,7 @@ pipeline_self_test:
     - scripts/ci/test-pipeline-planner.sh
     - scripts/ci/run.sh commit-policy-self-test
     - scripts/ci/tests/test-mutation-gate.sh
+    - scripts/ci/tests/test-external-review.sh
 
 adr_index:
   stage: validate

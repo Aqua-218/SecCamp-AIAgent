@@ -344,7 +344,7 @@ fn runtime_profile(
             chroot_base_dir: jailer_base,
             cgroup_version: CgroupVersion::V2,
         },
-        api_socket: jail_root.join("run/firecracker.sock"),
+        api_socket: jail_root.join("a"),
         isolation: HostIsolationConfig {
             namespaces: NamespaceConfig {
                 user: false,
@@ -379,7 +379,7 @@ fn runtime_profile(
         },
         vsock: VsockConfig {
             guest_cid,
-            uds_path: jail_root.join("run/vsock.sock"),
+            uds_path: jail_root.join("v"),
         },
         network_devices: Vec::new(),
         vcpu_count: 1,
@@ -1042,8 +1042,8 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
     ));
     let workspace_clone = jail_root.join("workspace").join(&workspace_id);
     let workspace_image = jail_root.join("workspace").join("workspace.ext4");
-    let api_socket = jail_root.join("run/firecracker.sock");
-    let vsock_socket = jail_root.join("run/vsock.sock");
+    let api_socket = jail_root.join("a");
+    let vsock_socket = jail_root.join("v");
 
     eprintln!("real session-owner phase: stopping production owner");
     let closed = match runtime.stop() {

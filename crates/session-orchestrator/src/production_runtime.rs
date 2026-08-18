@@ -2923,7 +2923,7 @@ mod tests {
                 chroot_base_dir: root.join("jailer"),
                 cgroup_version: CgroupVersion::V2,
             },
-            api_socket: jail_root.join("run/firecracker.sock"),
+            api_socket: jail_root.join("a"),
             isolation: HostIsolationConfig {
                 namespaces: NamespaceConfig {
                     user: false,
@@ -2961,7 +2961,7 @@ mod tests {
             },
             vsock: VsockConfig {
                 guest_cid: 7,
-                uds_path: jail_root.join("run/vsock.sock"),
+                uds_path: jail_root.join("v"),
             },
             network_devices: Vec::new(),
             vcpu_count: 1,
@@ -3870,7 +3870,7 @@ mod tests {
             capture.restored_resources,
             Some((
                 PathBuf::from("/workspace/workspace.ext4"),
-                PathBuf::from("/run/vsock.sock"),
+                PathBuf::from("/v"),
                 prepared.vsock.guest_cid,
             ))
         );
@@ -4284,7 +4284,7 @@ mod tests {
             config
                 .vsock
                 .uds_path
-                .with_file_name(format!("vsock.sock_{broker_port}"))
+                .with_file_name(format!("v_{broker_port}"))
         );
         assert_ne!(endpoint, template_endpoint);
     }

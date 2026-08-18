@@ -783,17 +783,10 @@ impl DaemonConfig {
             .join(firecracker_name)
             .join(TEMPLATE_CLONE_ID)
             .join("root");
-        // A systemd worker path contains both the controller session ID and the runtime workspace
-        // ID. Compact in-jail names keep the host-visible endpoint within Linux sockaddr_un even
-        // for a maximum-width u32 guest port; direct single-session mode retains descriptive names.
-        let (api_socket, vsock_uds_path) = if control_session.is_some() {
-            (template_root.join("a"), template_root.join("v"))
-        } else {
-            (
-                template_root.join("run/firecracker.sock"),
-                template_root.join("run/vsock.sock"),
-            )
-        };
+        // A production path can contain both controller-session and runtime-workspace identities.
+        // Canonical compact names keep every host-visible endpoint within Linux sockaddr_un.
+        let api_socket = template_root.join("a");
+        let vsock_uds_path = template_root.join("v");
         let guest_cid = arguments.number("guest-cid")?;
         let runtime = RuntimeConfig {
             firecracker,

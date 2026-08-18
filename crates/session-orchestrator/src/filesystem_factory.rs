@@ -29,8 +29,8 @@ const KERNEL_RELATIVE_PATH: &str = "artifacts/kernel";
 const SECCOMP_RELATIVE_PATH: &str = "artifacts/seccomp";
 const SNAPSHOT_STATE_RELATIVE_PATH: &str = "snapshots/state";
 const SNAPSHOT_MEMORY_RELATIVE_PATH: &str = "snapshots/memory";
-const API_SOCKET_RELATIVE_PATH: &str = "run/firecracker.sock";
-const VSOCK_SOCKET_RELATIVE_PATH: &str = "run/vsock.sock";
+const API_SOCKET_RELATIVE_PATH: &str = "a";
+const VSOCK_SOCKET_RELATIVE_PATH: &str = "v";
 const JAILED_ROOTFS_RELATIVE_PATH: &str = "dev/rootfs";
 const WORKSPACE_RELATIVE_PATH: &str = "workspace";
 

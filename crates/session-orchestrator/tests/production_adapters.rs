@@ -1270,10 +1270,16 @@ fn production_owner_keeps_worker_live_then_cancels_joins_and_closes() {
             "revoke",
             "kill",
             "broker-stream-shutdown",
-            "broker-worker-exit",
             "broker-joined",
             "isolate",
         ],
+    );
+    // Cancellation wakes the worker before the owner invokes the stream shutdown handle, so
+    // these concurrent cleanup events have no defined order relative to each other. Both must
+    // still finish before the owner reports that the worker was joined.
+    assert_event_order(
+        &lifecycle,
+        &["kill", "broker-worker-exit", "broker-joined", "isolate"],
     );
 }
 

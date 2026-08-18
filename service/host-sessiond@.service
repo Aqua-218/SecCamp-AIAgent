@@ -1,0 +1,65 @@
+[Unit]
+Description=Isolated Firecracker session worker %i
+Documentation=https://github.com/Aqua-218/SecCamp-AIAgent
+Wants=dev-kvm.device dev-vhost\x2dvsock.device
+After=local-fs.target dev-kvm.device dev-vhost\x2dvsock.device
+Conflicts=host-sessiond-recover@%i.service
+ConditionPathExists=/etc/host-sessiond/worker.env
+ConditionPathExists=/dev/kvm
+ConditionPathExists=/dev/vhost-vsock
+ConditionPathExists=/dev/mapper/control
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=host-sessiond
+Group=host-sessiond
+SupplementaryGroups=kvm
+EnvironmentFile=/etc/host-sessiond/worker.env
+StateDirectory=host-sessiond/instances/%i
+StateDirectoryMode=0750
+RuntimeDirectory=host-sessiond/instances/%i
+RuntimeDirectoryMode=0750
+WorkingDirectory=/var/lib/host-sessiond/instances/%i
+ExecStart=/usr/local/bin/host-sessiond --systemd-instance %i --mode run
+Restart=no
+TimeoutStartSec=5min
+TimeoutStopSec=5min
+KillMode=mixed
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
+UMask=0077
+
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL
+NoNewPrivileges=yes
+DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/vhost-vsock rw
+DeviceAllow=/dev/mapper/control rw
+DeviceAllow=/dev/mapper/host-sessiond-rootfs-* rw
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=no
+Delegate=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateTmp=yes
+PrivateMounts=no
+RestrictNamespaces=~user
+RestrictAddressFamilies=AF_UNIX AF_VSOCK AF_INET AF_INET6
+SystemCallArchitectures=native
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+LimitNOFILE=65536
+LimitCORE=0
+KeyringMode=private
+ProtectProc=invisible
+ReadWritePaths=/var/lib/host-sessiond/instances/%i /run/host-sessiond/instances/%i /var/lib/host-sessiond/workspace-source
+

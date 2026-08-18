@@ -83,6 +83,7 @@ mod implementation {
     const BPF_K: u16 = 0x00;
     const BPF_STMT: u16 = 0x06;
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+    const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
     const SECCOMP_DATA_MMAP_FLAGS_OFFSET: u32 = 16 + (3 * 8);
     const MAP_SHARED_FLAG: u32 = libc::MAP_SHARED as u32;
     const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
@@ -2233,6 +2234,8 @@ mod implementation {
     ) -> Result<Vec<SockFilter>, BackendError> {
         let architecture = if cfg!(target_arch = "x86_64") {
             AUDIT_ARCH_X86_64
+        } else if cfg!(target_arch = "aarch64") {
+            AUDIT_ARCH_AARCH64
         } else {
             return Err(BackendError::new(
                 step,

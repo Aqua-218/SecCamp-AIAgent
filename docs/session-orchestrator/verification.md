@@ -39,6 +39,8 @@ test には、mock backend による state machine test、durable ledger を直�
 | control journalの初期作成 | `create_new`で作成者を原子的に確定し、競合生成・metadata I/O error・dangling symlinkを新規journalとして初期化しない | `journal_creation_rejects_dangling_links_without_initializing_their_target` |
 | GitHub publish-plan manifest | symlinkを含む祖先とhard linkを拒否し、owner-only descriptorからbounded readした前後でinode/size/owner/mode/mtime/ctimeを再照合する | `system_egress` manifest tests |
 | daemon stop file | 不在とmetadata I/O failureを区別し、観測不能ならdependency-order cleanupを実行して非zero終了する | `stop_file_observation_distinguishes_absence_from_io_failure` |
+| 認証済みcontrol socketと特権process分離 | 実systemd、polkit、`SO_PEERCRED`、HMAC、非特権controller、固定unit adapterで2 workerを起動し、worker `SIGKILL`後の強制recoveryとquota解放、controller `SIGKILL`後のrestart reconciliationまで実行 | `scripts/ci/verify-real-systemd-control-plane.sh` |
+| 2つのproduction ownerの同時実行 | 異なるidentity、guest CID、Broker port、cgroup、mapper、jailを持つ2つの実Firecracker VM/Brokerがguest effectのdurable Final後も同時生存し、一方のstop中も他方がhealth pollを通してから独立cleanupする | `scripts/ci/verify-real-concurrent-session-owners.sh` |
 | workspace clone、listener 所有、snapshot binding、Firecracker identity 注入、Authority subject の閉包 | production adapter composition test（全境界 fake） |
 | production `SessionOwner` の build → 実 Firecracker snapshot restore → guest readiness → `Continue` poll → stop → `Closed` | `real_production_lifecycle.rs`（実 `Runtime`、jailer、dm-verity、filesystem、AF_VSOCK、durable Broker、guest supervisor。`REAL_SESSION_OWNER_LIFECYCLE=1` の ignored gate） |
 | production process をstartup 7点・cleanup 4点で外部`SIGKILL`し、同じdurable pathから再起動 | `verify-real-session-crash-recovery.sh`。各点で旧cgroup、exact dm-verity bind/mapper、jail/workspaceを限定回収し、fresh identityの新session完走とresidue不在を確認 |
@@ -49,6 +51,9 @@ test には、mock backend による state machine test、durable ledger を直�
 cargo fmt --manifest-path crates/session-orchestrator/Cargo.toml -- --check
 cargo test --manifest-path crates/session-orchestrator/Cargo.toml
 cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-targets -- -D warnings
+scripts/ci/check-service-boundaries.sh
+scripts/ci/verify-real-systemd-control-plane.sh
+scripts/ci/verify-real-concurrent-session-owners.sh
 ```
 
 `MultiSessionController` は複数workloadを一つのownerへ押し込まず、各sessionを別の
@@ -101,6 +106,27 @@ exact invocation prefixのmapperを`dmsetup info`で確認してbounded remove�
 2026-08-18の最終再走査では11 checkpointの復旧後に、対象prefixのmapper、deleted loop、cgroup、
 staging tree、processがすべて不在であることを別probeでも確認した。
 
+## multi-session production gate
+
+process境界は実systemd gate、VM resource境界は実KVM gate、checked-in deploymentの結線は
+`check-service-boundaries.sh`に分けて固定する。systemd gateは非特権`host-controld`と
+`host-control`を実行し、kernel peer UIDからprincipalを決め、HMAC、quota、固定unit名だけを
+許すpolkit rule、別UIDのworker process、worker `SIGKILL`時のstop/recovery、controller crash後の
+orphan停止を通す。KVM gateは2つのproduction `SessionOwner`を同時に起動し、双方のguest CapFS
+effectとdurable Broker Final recordをlive WAL snapshotで確認後、両方のBroker health pollを通す。
+一方を停止しても他方のFirecracker PIDとBroker healthが生存することを外部観測し、最後に両方の
+resource residue不在を確認する。
+
+deployment gateは`host-controld`のprimary GID、socket parent、HMAC key、`--client-gid`が同じ
+`host-control` groupになること、controllerのcapability setが空であること、worker/recoveryが
+固定CLIだけを受けること、workspace sourceがread-onlyであること、polkitのunit/verb集合が
+閉じていることを検査する。さらにunit、polkit、udev、environment全体のdigestとCODEOWNERSを
+固定し、secureな必須行の後ろへ弱い設定を追加する迂回も拒否する。この分割により実systemd gateの軽量worker fixtureとKVM gateの
+production workerが同じchecked-in service contractへ収束する。ただし、これは構成要素ごとの
+証拠を静的contractで結合したものであり、checked-in production unitを実際にinstallして
+controller → systemd worker → Firecrackerまで一度に通した証拠ではない。そのexact installed
+chainは未検証としてverification manifestに残す。
+
 ## 未検証の境界
 
 ### test double が代わりに立っているもの
@@ -112,6 +138,7 @@ staging tree、processがすべて不在であることを別probeでも確認�
 | `AF_VSOCK` listener | `ListenerFactory` |
 | entropy | `SequenceRandom`（`[0x01; 16]` などの決定的な値） |
 | durable ledger（通常の state-machine test） | `InMemoryIdentityLedger` と `FailingLedger`。実 durable path は下記 `tests/ledger.rs` |
+| exact installed multi-session chain | systemd gateはresource-bearing fixture、KVM gateはproduction `SessionOwner`直接起動。checked-in contractは静的digest gateで固定 |
 
 `tests/production_adapters.rs` が示すのは identity が adapter を貫通することだけ。実機 gate は
 Firecracker 起動、dm-verity/seccomp、guest-control の identity gate、guest supervisor readiness、
@@ -137,10 +164,11 @@ Brokerのegressはclosedであり、外部providerの接続・mutationや全kern
 
 ### この crate が構造的に確認しないこと
 
-`MultiSessionController` のscheduler coreは実装済みだが、production `host-sessiond` workerを
-生成・監視・復旧する特権分離adapterと、認証済みUnix control socket daemonは未接続である。
-従って複数のtest workerを同時所有できることは確認済みでも、複数の実Firecracker VMを同時に
-動かしたproduction証拠ではない。現行deployment unitは引き続きone-session ownerである。
+`host-controld`はsingle-host controllerである。各`host-sessiond@.service`は引き続き
+one-session ownerであり、複数workloadを一つのprivileged processやmicroVMへ同居させない。
+multi-host failover、分散revoke、別hostへのsession移送、複製Broker stateは現行state machineの
+保証範囲ではなく、導入時はidentity、journal fencing、revoke linearization、provider commitの
+対象を分散systemとして再設計・再検証する。
 
 一般の`SnapshotDescriptor`は呼び出し側の申告であり、任意の第三者snapshotを意味解析しない。required KVM gateでは例外的に、このcheckoutからguest-control-readyなclean snapshotを作り、state/memoryのdigestをpinし、その同じartifactだけをrestoreしてfresh identityを注入する。従ってその生成経路は実証済みだが、descriptorだけを偽装した外部snapshotを安全化する機能ではない。
 

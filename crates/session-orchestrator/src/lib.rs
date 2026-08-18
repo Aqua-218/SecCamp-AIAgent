@@ -30,6 +30,7 @@
 use authority_core::policy::AuthorityPolicyDigest;
 
 pub mod authority_backend;
+pub mod control_plane;
 pub mod egress_backend;
 pub mod filesystem_factory;
 pub mod firecracker_backend;
@@ -48,6 +49,8 @@ use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
 };
 
 #[cfg(target_os = "linux")]
@@ -59,6 +62,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 pub const ID_BYTES: usize = 16;
 
 const MAX_ZERO_IDENTITY_RETRIES: usize = 8;
+const TRANSIENT_FORK_LOCK_RETRY: Duration = Duration::from_millis(250);
+const TRANSIENT_FORK_LOCK_POLL: Duration = Duration::from_millis(2);
 
 /// Blocks at an explicitly armed lifecycle checkpoint until an external crash harness kills the
 /// process.  The hook is absent from default production builds; even feature-enabled builds stay
@@ -1279,19 +1284,29 @@ fn acquire_ledger_lock(
             ));
         }
     };
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            return Err(LedgerError::Locked {
-                path: ledger_path.to_path_buf(),
-            });
-        }
-        Err(TryLockError::Error(error)) => {
-            return Err(LedgerError::io(
-                LedgerOperation::Lock,
-                &display_path,
-                &error,
-            ));
+    let deadline = Instant::now() + TRANSIENT_FORK_LOCK_RETRY;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                // `fork` temporarily duplicates every process descriptor. A concurrently dropped
+                // owner can therefore remain locked until that child reaches `exec` and closes
+                // its CLOEXEC copy. Retry only this exact kernel-lock result on the already-opened
+                // stable sidecar; all identity and permission checks still run after acquisition.
+                thread::sleep(TRANSIENT_FORK_LOCK_POLL);
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(LedgerError::Locked {
+                    path: ledger_path.to_path_buf(),
+                });
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(LedgerError::io(
+                    LedgerOperation::Lock,
+                    &display_path,
+                    &error,
+                ));
+            }
         }
     }
     validate_open_lock(directory, &file)?;

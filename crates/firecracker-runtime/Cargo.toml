@@ -17,9 +17,10 @@ workspace = true
 authority-core = { path = "../authority-core" }
 egress-protocol = { path = "../egress-protocol" }
 rustix = { version = "1.1.4", features = ["fs", "mount"] }
+serde_json = "1.0.149"
 sha2 = "0.10.9"
 socket2 = { version = "0.6.5", features = ["all"] }
+tempfile = "3.27.0"
 
 [dev-dependencies]
 egress-broker = { path = "../egress-broker" }
-tempfile = "3.27.0"

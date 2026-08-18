@@ -68,9 +68,9 @@ done
 # owner-reviewed gate, so a second permissive capability assignment or polkit rule cannot hide
 # behind the required secure lines below.
 require_sha256 "${controller}" '8fb7ef8ba3735570675b29436bbcd7df150dafaed7abcf73882a0d3b917c35fc'
-require_sha256 "${worker}" '7872e01a50f3c7b471c6c1443bb74f43cc8e3489334607bcbc0c3760a091dfed'
-require_sha256 "${recovery}" 'e3df7b35245cfdce479516b6e993052f4e389f017cdaea2c7cee66fd4e23704e'
-require_sha256 "${single_worker}" '08c0a565162e43d2e6a3397ad71d25b11f9eca0da9a03c35dfdb040df464b91c'
+require_sha256 "${worker}" '6ecc3b8c68e01c29b6999652dca28f5c8736b6da834e7067d53f65517b2f5df7'
+require_sha256 "${recovery}" '615a666ca395db816966af1cedca3ac18edb574996be5cc51c4497e55a6bec87'
+require_sha256 "${single_worker}" '110e96c71b831d9d87d3e6872ea1a7eca782cd9df8513593aaeb942e4e1303d4'
 require_sha256 "${polkit_rule}" '58041aab07b6b490a75dd941c71d921af9a11a036e4cc048c29f4f97fbe3ab6b'
 require_sha256 "${udev_rule}" '1af47a833fcec709a533edbdd7865dd4308f9634d81de3f6ad572f5307c3c4bc'
 require_sha256 "${controller_environment}" 'fc12a7d45db0c41e79877c0e9ac6eaf427fb2275127f9f32e51d6636469fbb21'
@@ -119,6 +119,7 @@ done
 
 require_line "${worker}" 'Type=notify'
 require_line "${worker}" 'StateDirectory=host-sessiond/instances/%i/broker-wal'
+require_line "${worker}" 'StateDirectory=host-sessiond/instances/%i/jailer/firecracker'
 require_line "${worker}" 'After=local-fs.target'
 reject_line "${worker}" 'Wants=dev-kvm.device dev-vhost\x2dvsock.device'
 reject_line "${worker}" 'After=local-fs.target dev-kvm.device dev-vhost\x2dvsock.device'
@@ -126,11 +127,13 @@ require_line "${worker}" 'ExecStart=/usr/local/bin/host-sessiond --systemd-insta
 require_line "${worker}" 'Restart=no'
 require_line "${recovery}" 'Type=oneshot'
 require_line "${recovery}" 'StateDirectory=host-sessiond/instances/%i/broker-wal'
+require_line "${recovery}" 'StateDirectory=host-sessiond/instances/%i/jailer/firecracker'
 require_line "${recovery}" 'ExecStart=/usr/local/bin/host-sessiond --systemd-instance %i --mode recover'
 
 # Keep the legacy one-session unit at least as restrictive around the source template.
 require_line "${single_worker}" 'After=local-fs.target'
 require_line "${single_worker}" 'StateDirectory=host-sessiond/broker-wal'
+require_line "${single_worker}" 'StateDirectory=host-sessiond/jailer/firecracker'
 reject_line "${single_worker}" 'Wants=dev-kvm.device dev-vhost\x2dvsock.device'
 reject_line "${single_worker}" 'After=local-fs.target dev-kvm.device dev-vhost\x2dvsock.device'
 require_line "${single_worker}" 'ReadOnlyPaths=/var/lib/host-sessiond/workspace-source'

@@ -17,6 +17,7 @@ RuntimeDirectory=host-sessiond
 RuntimeDirectoryMode=0750
 StateDirectory=host-sessiond
 StateDirectory=host-sessiond/broker-wal
+StateDirectory=host-sessiond/jailer/firecracker
 StateDirectoryMode=0750
 EnvironmentFile=/etc/host-sessiond/host-sessiond.env
 ExecStart=/usr/local/bin/host-sessiond \

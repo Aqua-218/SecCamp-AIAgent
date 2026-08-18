@@ -18,6 +18,7 @@ SupplementaryGroups=kvm
 EnvironmentFile=/etc/host-sessiond/worker.env
 StateDirectory=host-sessiond/instances/%i
 StateDirectory=host-sessiond/instances/%i/broker-wal
+StateDirectory=host-sessiond/instances/%i/jailer/firecracker
 StateDirectoryMode=0750
 RuntimeDirectory=host-sessiond/instances/%i
 RuntimeDirectoryMode=0750

@@ -368,6 +368,7 @@ impl GuestControlHttpResponse {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GuestControlServer {
     state: GuestControlState,
+    require_bound: bool,
 }
 
 impl GuestControlServer {
@@ -376,6 +377,20 @@ impl GuestControlServer {
     pub const fn new() -> Self {
         Self {
             state: GuestControlState::AwaitingIdentity,
+            require_bound: false,
+        }
+    }
+
+    /// Creates a production endpoint that accepts only policy-digest-bound requests.
+    ///
+    /// Legacy v1 actions remain available through [`Self::new`] for compatibility tests and
+    /// explicitly legacy images. Production guest init should use this constructor so a caller
+    /// cannot downgrade identity injection or workload release to an unbound protocol path.
+    #[must_use]
+    pub const fn new_bound_only() -> Self {
+        Self {
+            state: GuestControlState::AwaitingIdentity,
+            require_bound: true,
         }
     }
 
@@ -394,6 +409,9 @@ impl GuestControlServer {
         let Some(action) = GuestControlAction::from_path(path) else {
             return response(404, String::new(), None);
         };
+        if self.require_bound && !action.is_bound() {
+            return response(404, String::new(), None);
+        }
         let Ok(body) = std::str::from_utf8(body) else {
             return response(400, String::new(), None);
         };
@@ -1284,6 +1302,46 @@ mod tests {
         assert_eq!(
             started.body(),
             request.canonical_bound_acknowledgement(GuestControlAction::StartWorkload)
+        );
+    }
+
+    #[test]
+    fn bound_only_server_hides_every_legacy_action_and_releases_only_on_v2() {
+        let legacy = request(72);
+        let bound = bound_request(72, 13);
+        let mut server = GuestControlServer::new_bound_only();
+
+        for (action, body) in [
+            (GuestControlAction::InjectIdentity, legacy.canonical_body()),
+            (
+                GuestControlAction::StartWorkload,
+                bound.canonical_bound_body(),
+            ),
+        ] {
+            let rejected = server.handle("PUT", action.path(), body.as_bytes());
+            assert_eq!(rejected.status(), 404);
+            assert_eq!(rejected.outcome(), None);
+            assert_eq!(server.state(), &GuestControlState::AwaitingIdentity);
+        }
+
+        let body = bound.canonical_bound_body();
+        let injected = server.handle(
+            "PUT",
+            GuestControlAction::InjectIdentityBound.path(),
+            body.as_bytes(),
+        );
+        assert_eq!(
+            injected.outcome(),
+            Some(GuestControlOutcome::IdentityInjected)
+        );
+        let started = server.handle(
+            "PUT",
+            GuestControlAction::StartWorkloadBound.path(),
+            body.as_bytes(),
+        );
+        assert_eq!(
+            started.outcome(),
+            Some(GuestControlOutcome::WorkloadStarted)
         );
     }
 

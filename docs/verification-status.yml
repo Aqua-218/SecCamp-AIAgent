@@ -261,7 +261,7 @@ claims:
     component: egress-broker
     scope: hosted
     status: verified
-    summary: Bounded transport, typed dispatch, replay and budget admission, policy checks, and fake provider paths are covered by locked hosted tests and Clippy.
+    summary: Bounded transport, typed dispatch, replay and budget admission, policy checks, descriptor-sealed systemd credential loading with no ambient downgrade, and fake provider paths are covered by locked hosted tests and Clippy.
     verification_page: docs/egress-broker/verification.md
     prerequisites:
       - id: locked-rust-toolchain
@@ -602,7 +602,7 @@ claims:
     component: firecracker-runtime
     scope: hosted
     status: verified
-    summary: Artifact validation, API sequencing, workspace handling, identity gates, and rollback state contracts are covered by locked hosted doubles and Clippy.
+    summary: Artifact validation, API sequencing, workspace handling, production bound-only v2 identity gates, and rollback state contracts are covered by locked hosted doubles and Clippy.
     verification_page: docs/firecracker-runtime/verification.md
     prerequisites:
       - id: locked-rust-toolchain
@@ -794,7 +794,7 @@ claims:
     component: session-orchestrator
     scope: hosted
     status: verified
-    summary: Lifecycle transitions, durable identity records, and production adapter composition with controlled doubles are covered by locked hosted tests and Clippy.
+    summary: Lifecycle transitions, atomically created durable identity/control records, descriptor-sealed publish plans, fail-closed stop-file observation, and production adapter composition with controlled doubles are covered by locked hosted tests and Clippy.
     verification_page: docs/session-orchestrator/verification.md
     prerequisites:
       - id: locked-rust-toolchain

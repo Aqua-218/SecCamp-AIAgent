@@ -54,6 +54,7 @@ scripts/ci/verify-real-session-crash-recovery.sh
 scripts/ci/check-service-boundaries.sh
 scripts/ci/verify-real-systemd-control-plane.sh
 scripts/ci/verify-real-concurrent-session-owners.sh
+scripts/ci/run.sh installed-production-chain
 ```
 
 Release dry-run と reproducibility は、未commitのhardening差分をそのまま適用して一時commitした
@@ -80,8 +81,8 @@ Release dry-run と reproducibility は、未commitのhardening差分をその�
 |---|---|---|
 | Real crash recovery | verified | Every declared durable lifecycle checkpoint is killed from outside the daemon; restart either completes cleanup or refuses reuse, and the host residue probe is empty. |
 | Runtime variance | partial | Bounded x86_64 soak/escape and Firecracker 1.15.1/1.16.1 gates pass with resource/time ceilings; protected aarch64 execution remains required and unavailable runners are never success. |
-| Privileged host TCB | partial | Exact checked-in service digests, no-capability controller separation, failed-worker resource recovery, concurrent KVM resources, and crash cleanup pass separately; the exact installed production unit-to-VM chain is not yet exercised. |
-| Multi-session control plane | partial | Authenticated admission, quota/no-reuse/fencing, real systemd failed-worker/controller-crash reconciliation, and two concurrent live KVM/Broker owners pass separately; one installed end-to-end production execution remains. |
+| Privileged host TCB | verified | The exact checked-in binaries, units, policy, udev rules, environment, sealed privileged helpers, jailer UID drop, and two real KVM worker trees execute together; normal stop and failed-worker cleanup leave no owned residue. |
+| Multi-session control plane | verified | Authenticated admission, unauthorized and quota rejection, two concurrent live KVM/Broker owners, independent stop, failed-worker recovery, quota release, controller restart reconciliation, and a fresh final session pass through the installed production chain. |
 | Live external provider | blocked | The protected destructive gate succeeds with an exact disposable repository and least-privilege installation credential. |
 | Independent review | blocked | A named external reviewer supplies a revision-bound report and the import gate verifies its scope, revision, and disposition without accepting a repository-authored substitute. |
 
@@ -100,6 +101,7 @@ can reach the 9.8 exit threshold only with the gate in the final column above.
 | 6 operational replay | all 11 KVM crash points, panic fallback cleanup, stale mapper/loop/cgroup residue, post-run host probe | 9.8 | 9.2 | 9.8 | 9.8 | 9.7 | 9.6 | 9.1 | 9.8 | 9.8 | 9.8 | stop: every locally satisfiable track is green; only declared external/architectural ceilings remain |
 | 7 downgrade and path-race reopen | production v1 rejection, descriptor-sealed publish plans and systemd credentials, credential-source precedence, atomic control-journal creation, stop/control metadata failure | 9.8 | 9.2 | 9.8 | 9.8 | 9.8 | 9.7 | 9.1 | 9.8 | 9.8 | 9.8 | stop: fresh hostile review found no further locally executable high-risk repair; external/architectural ceilings remain explicit |
 | 8 production composition review | exact-digest systemd/polkit boundary, failed-unit recovery, root-owned workspace source, two simultaneous live KVM/Broker owners, independent stop | 9.7 | 9.2 | 9.8 | 9.8 | 9.6 | 9.7 | 9.1 | 9.8 | 9.8 | 9.7 | continue: exact installed production controller-to-VM execution remains separate from its component gates |
+| 9 exact installed production chain | checked-in production paths, authenticated caller, concurrent KVM workers, quota rejection, worker crash, controller restart, final residue audit | 9.8 | 9.2 | 9.8 | 9.8 | 9.8 | 9.8 | 9.1 | 9.8 | 9.8 | 9.8 | stop: all locally executable x86_64 system tracks are green; declared external and alternate-architecture ceilings remain |
 
 ## External ceilings
 
@@ -108,9 +110,6 @@ can reach the 9.8 exit threshold only with the gate in the final column above.
   is not runtime evidence.
 - Independent review requires a genuinely independent person or organization.  Repository-owned
   automation can validate an imported report but cannot create independence.
-- Exact installed controller-to-worker-to-VM evidence requires a disposable production-shaped host
-  on which the checked-in accounts, units, policy, environment, artifacts, and binaries can be
-  provisioned together; component gates do not substitute for that execution.
 - Multi-host failover, distributed revoke, and replicated Broker state are outside the current
   single-host state machine. Adding them changes the trust model rather than completing an
   unimplemented branch of this design.
@@ -134,10 +133,11 @@ parser, digest, disposition, and signature behavior; that fixture is never revie
 
 ## 未検証の境界
 
-この wave の開始時点では acceptance table の `partial`、`open`、`out of scope`、`blocked`
-がそのまま未検証境界である。実装だけで外部前提を満たしたことにはしない。特に protected
-runner が無い architecture、operator credential が無い live provider、repository の作者と
-独立していない review は、local green でも `verified` へ進めない。
+acceptance table の `partial`、`open`、`out of scope`、`blocked` は未検証境界である。実装だけで
+外部前提を満たしたことにはしない。特に protected runner が無い alternate architecture、
+operator credential が無い live provider、repository の作者と独立していない review は、
+local greenでも `verified` へ進めない。x86_64のexact installed production chainはこのhostで
+実行済みであり、これら外部境界には含めない。
 
 ## 関連
 

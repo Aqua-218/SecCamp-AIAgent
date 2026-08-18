@@ -291,9 +291,20 @@ inside `HOST_SESSIOND_BOOT_ARGS` must also equal the corresponding worker enviro
 The process needs `/dev/kvm`, `/dev/vhost-vsock`, and narrowly scoped device-mapper access, plus
 permission to create the configured cgroup and mount/pid namespaces. The unit grants only that
 host-side envelope and keeps `PrivateNetwork=no` because public HTTPS/GitHub egress is performed
-by the host broker. `NoNewPrivileges=yes` is compatible with the unit because the Jailer and helper
-processes receive their explicit ambient capability set; the service account's configured jailer
-UID/GID must match the account. Do not use root for those values.
+by the host broker. The service daemon stays at UID/GID 961 with the explicit ambient capability
+set locked by `check-service-boundaries.sh`. Only the digest-sealed `veritysetup` command performs
+a bounded root one-shot transition. The digest-sealed Jailer starts as root so it can create its
+chroot, cgroup, and required device nodes, then drops the long-lived Firecracker process to the
+configured UID/GID; runtime ownership validation rejects any different Firecracker identity.
+`NoNewPrivileges=yes` prevents any executable from acquiring capabilities outside the unit's
+bounding set. Do not configure root as the jailer UID/GID.
+
+`DelegateSubgroup=daemon` keeps the delegated service cgroup root free of processes: systemd places
+the worker daemon below `daemon`, while the Jailer creates a sibling per-session Firecracker cgroup.
+The closed device policy grants `mknod` only for the Jailer-required KVM, TUN, and userfaultfd nodes;
+TUN and userfaultfd receive no host-side read/write access. The udev rule keeps the device-mapper
+control and loop controls root-owned while granting the worker group access, and exposes only this
+service's `host-sessiond-rootfs-*` mapper nodes to the service identity.
 
 Readiness and lifecycle state are JSON lines on the journal and in
 `/run/host-sessiond/status.json`. The record contains only opaque session/workspace/subject/

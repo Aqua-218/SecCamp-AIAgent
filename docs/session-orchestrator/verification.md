@@ -121,11 +121,12 @@ deployment gateは`host-controld`のprimary GID、socket parent、HMAC key、`--
 `host-control` groupになること、controllerのcapability setが空であること、worker/recoveryが
 固定CLIだけを受けること、workspace sourceがread-onlyであること、polkitのunit/verb集合が
 閉じていることを検査する。さらにunit、polkit、udev、environment全体のdigestとCODEOWNERSを
-固定し、secureな必須行の後ろへ弱い設定を追加する迂回も拒否する。この分割により実systemd gateの軽量worker fixtureとKVM gateの
-production workerが同じchecked-in service contractへ収束する。ただし、これは構成要素ごとの
-証拠を静的contractで結合したものであり、checked-in production unitを実際にinstallして
-controller → systemd worker → Firecrackerまで一度に通した証拠ではない。そのexact installed
-chainは未検証としてverification manifestに残す。
+固定し、secureな必須行の後ろへ弱い設定を追加する迂回も拒否する。さらに
+`scripts/ci/run.sh installed-production-chain` はclean snapshot bundleを生成し、checked-inの
+binary、unit、polkit、udev、environmentをdisposable hostのproduction pathへinstallする。
+認証済みcallerから2つの実KVM workerを同時起動し、unauthorized/over-quota拒否、別resource tree、
+normal stop、worker `SIGKILL`後のrecoveryとquota release、controller restart reconciliation、
+fresh session、最終residue不在まで一度に確認する。
 
 ## 未検証の境界
 
@@ -138,7 +139,6 @@ chainは未検証としてverification manifestに残す。
 | `AF_VSOCK` listener | `ListenerFactory` |
 | entropy | `SequenceRandom`（`[0x01; 16]` などの決定的な値） |
 | durable ledger（通常の state-machine test） | `InMemoryIdentityLedger` と `FailingLedger`。実 durable path は下記 `tests/ledger.rs` |
-| exact installed multi-session chain | systemd gateはresource-bearing fixture、KVM gateはproduction `SessionOwner`直接起動。checked-in contractは静的digest gateで固定 |
 
 `tests/production_adapters.rs` が示すのは identity が adapter を貫通することだけ。実機 gate は
 Firecracker 起動、dm-verity/seccomp、guest-control の identity gate、guest supervisor readiness、

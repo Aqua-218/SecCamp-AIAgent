@@ -147,13 +147,15 @@ scripts/ci/verify-real-concurrent-session-owners.sh
 productionのprivilege splitでは、認証・quota・journalを持つ`host-controld`にdevice accessも
 Linux capabilityも与えず、固定operationのsystemd/polkit adapterだけを許す。実際の
 mount、device-mapper、cgroup、jailer操作はsessionごとの`host-sessiond@.service` workerに残り、
-worker自体はTCBである。実systemd gateが別UID process、固定unit/verb、failed workerの
+worker自体はTCBである。worker daemonはUID/GID 961のままbounded capability setを持ち、digestで
+sealした`veritysetup`だけをroot one-shotとして起動する。digestでsealしたjailerはrootで開始して
+chroot/device/cgroupを構成した後、Firecrackerを設定済みUID/GID 961へdropする。実systemd gateが別UID process、固定unit/verb、failed workerの
 stop/recoveryとsystemd tombstone保持、controller crash後のreconciliationを、KVM gateが2つのliveな
 production worker/Broker resource treeと独立cleanupを、crash gateが
 11 durable checkpointからの限定回収を確認する。checked-in unitとpolkitの結線は
-`scripts/ci/check-service-boundaries.sh`が固定する。これらは別実行の証拠であり、checked-in
-production controller/worker unitをinstallしてcontroller requestから実Firecracker sessionまで
-一度に通すexact chainは未検証である。
+`scripts/ci/check-service-boundaries.sh`が固定する。`scripts/ci/run.sh installed-production-chain`は
+そのchecked-in production contractを実pathへinstallし、controller requestから2つの実Firecracker
+session、worker crash recovery、controller restart reconciliation、最終cleanupまで一度に通す。
 
 ## 未検証の境界
 
@@ -161,7 +163,6 @@ production controller/worker unitをinstallしてcontroller requestから実Fire
 |---|---|---|
 | VM escape を含む実 jailer の完全な隔離効果 | lifecycle gate は PID/mount namespace、UID、cgroup、seccomp installation を観測するが、攻撃者が escape できないことまでは証明しない | syscall deny と host boundary を含む hostile guest test |
 | seccomp filterの全syscall・全引数に対する意味論 | privileged post-exec gateは代表的deny、KVM guestは標準filesystem APIに必要なallowを実測するが、Linux全syscall/引数空間を列挙しない | syscall/argument corpusを持つhostile guest test |
-| exact installed controller → worker → KVM chain | systemd fixtureとproduction KVM gateは別実行で、静的service contractを介して結合している | disposable hostへchecked-in unit/env/binariesをinstallするend-to-end deployment gate |
 
 test double は 4 種。`CommandRunner`、`FileSystem`、`ApiClient`（Firecracker 用と guest control 用）、`IdentitySource`。実 guest-control test は Firecracker API と guest control API の両方を production transport で置き換えるが、`Runtime::launch` が使う他の境界を置き換えるものではない。
 

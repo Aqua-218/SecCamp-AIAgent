@@ -415,8 +415,7 @@ systemd-analyze verify "${controller_unit}" "${worker_unit}" "${recovery_unit}"
 systemctl start host-controld.service
 
 wait_for_controller() {
-  local attempt
-  for attempt in $(seq 1 500); do
+  for _ in $(seq 1 500); do
     [[ -S "${controller_runtime_root}/control.sock" ]] && return 0
     [[ "$(systemctl is-active host-controld.service || true)" == active ]] || break
     sleep 0.02
@@ -493,8 +492,8 @@ assert_worker_ready() {
 
 wait_for_recovery() {
   local session="$1"
-  local attempt result status
-  for attempt in $(seq 1 1800); do
+  local result status
+  for _ in $(seq 1 1800); do
     result="$(systemctl show --property=Result --value "host-sessiond-recover@${session}.service" 2>/dev/null || true)"
     status="$(systemctl show --property=ExecMainStatus --value "host-sessiond-recover@${session}.service" 2>/dev/null || true)"
     if [[ "${result}" == success && "${status}" == 0 \

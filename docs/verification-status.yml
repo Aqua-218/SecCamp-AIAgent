@@ -655,27 +655,24 @@ claims:
   - id: firecracker-runtime-privileged-process-separation
     component: firecracker-runtime
     scope: privileged
-    status: unverified
-    summary: Separate required gates verify the no-capability authenticated controller with fixed systemd recovery and the production KVM worker/Broker resource tree, but no gate yet runs the exact installed production controller and worker units through one end-to-end VM session.
+    status: verified
+    summary: The required exact installation gate runs an authenticated no-capability controller through the checked-in systemd, polkit, udev, and environment contracts into two concurrent real KVM workers, verifies the jailer-dropped Firecracker UID/GID and isolated resource trees, and exercises normal stop, failed-worker recovery, quota release, and controller-restart reconciliation.
     verification_page: docs/firecracker-runtime/verification.md
     prerequisites:
       - id: privileged-helper-composition
-        description: A real systemd/polkit host and a disposable x86_64 KVM host must exercise the unprivileged controller, fixed worker templates, concurrent resource trees, and crash recovery.
-        check: systemd control-plane and production worker integration gates
+        description: A disposable x86_64 host with root, systemd/polkit, KVM/vsock, cgroup v2, device-mapper, and the pinned Firecracker and guest build prerequisites must be available.
+        check: scripts/ci/run.sh installed-production-chain prerequisites
     gate:
       id: firecracker-runtime-privileged-process-separation
       result: required
       on_prerequisite_failure: fail
       commands:
-        - scripts/ci/verify-real-systemd-control-plane.sh
-        - scripts/ci/verify-real-concurrent-session-owners.sh
-        - scripts/ci/verify-real-session-crash-recovery.sh
+        - scripts/ci/run.sh installed-production-chain
     evidence:
       commands:
         - scripts/ci/check-service-boundaries.sh
-        - scripts/ci/verify-real-systemd-control-plane.sh
-        - scripts/ci/verify-real-concurrent-session-owners.sh
-        - scripts/ci/verify-real-session-crash-recovery.sh
+        - scripts/ci/run.sh installed-production-chain
+        - scripts/ci/verify-installed-production-chain.sh
       sources:
         - crates/firecracker-runtime/src/lib.rs
         - crates/session-orchestrator/src/production_runtime.rs
@@ -685,12 +682,12 @@ claims:
         - service/host-controld.service
         - service/host-sessiond@.service
         - service/host-sessiond-recover@.service
+        - scripts/ci/verify-installed-production-chain.sh
       tests:
         - crates/firecracker-runtime/tests/real_runtime_lifecycle.rs
         - crates/session-orchestrator/tests/real_production_lifecycle.rs
-        - scripts/ci/verify-real-systemd-control-plane.sh
-    residual_reasons:
-      - The real systemd gate deliberately uses a resource-bearing worker fixture, while the real KVM gate invokes production SessionOwner directly; an exact installed-unit-to-VM integration run is not repository evidence yet.
+        - scripts/ci/verify-installed-production-chain.sh
+    residual_reasons: []
 
   - id: firecracker-runtime-kvm
     component: firecracker-runtime
@@ -858,27 +855,24 @@ claims:
   - id: session-orchestrator-multi-session-production
     component: session-orchestrator
     scope: kvm
-    status: unverified
-    summary: Separate required gates verify authenticated systemd worker ownership, failed-unit resource recovery, quota release, controller-crash reconciliation, and two concurrent production SessionOwner/Broker trees, but not the exact installed production units and KVM workers in one execution.
+    status: verified
+    summary: The required exact installation gate authenticates a real caller, starts two checked-in systemd worker instances backed by real KVM SessionOwner/Broker trees, rejects unauthorized and over-quota starts, then verifies independent stop, failed-worker recovery, quota release, controller restart reconciliation, and residue-free final cleanup.
     verification_page: docs/session-orchestrator/verification.md
     prerequisites:
       - id: multi-worker-kvm-composition
-        description: An unprivileged authenticated controller, separately privileged one-session worker adapter, and a disposable KVM host sized for concurrent workers are required.
-        check: production multi-session integration prerequisites
+        description: A disposable x86_64 systemd/polkit KVM host sized for two workers and the pinned production artifact prerequisites are required.
+        check: scripts/ci/run.sh installed-production-chain prerequisites
     gate:
       id: session-orchestrator-multi-session-production
       result: required
       on_prerequisite_failure: fail
       commands:
-        - scripts/ci/verify-real-systemd-control-plane.sh
-        - scripts/ci/verify-real-concurrent-session-owners.sh
-        - scripts/ci/verify-real-session-crash-recovery.sh
+        - scripts/ci/run.sh installed-production-chain
     evidence:
       commands:
         - scripts/ci/check-service-boundaries.sh
-        - scripts/ci/verify-real-systemd-control-plane.sh
-        - scripts/ci/verify-real-concurrent-session-owners.sh
-        - scripts/ci/verify-real-session-crash-recovery.sh
+        - scripts/ci/run.sh installed-production-chain
+        - scripts/ci/verify-installed-production-chain.sh
       sources:
         - crates/session-orchestrator/src/control_plane.rs
         - crates/session-orchestrator/src/bin/host-sessiond.rs
@@ -888,12 +882,12 @@ claims:
         - service/host-controld.service
         - service/host-sessiond@.service
         - service/host-sessiond-recover@.service
+        - scripts/ci/verify-installed-production-chain.sh
       tests:
         - crates/session-orchestrator/src/control_plane.rs
         - crates/session-orchestrator/tests/real_production_lifecycle.rs
-        - scripts/ci/verify-real-systemd-control-plane.sh
-    residual_reasons:
-      - The systemd control-plane fixture and production KVM worker gates converge on statically locked deployment contracts but have not been executed as one exact installed production chain.
+        - scripts/ci/verify-installed-production-chain.sh
+    residual_reasons: []
 
   - id: session-orchestrator-kvm
     component: session-orchestrator

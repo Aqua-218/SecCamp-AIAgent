@@ -61,6 +61,7 @@ expect_status 'pull request' real_runtime_lifecycle skipped "${pull_request_plan
 expect_status 'pull request' session_owner_kvm skipped "${pull_request_plan}"
 expect_status 'pull request' systemd_control_plane skipped "${pull_request_plan}"
 expect_status 'pull request' concurrent_session_owners skipped "${pull_request_plan}"
+expect_status 'pull request' installed_production_chain skipped "${pull_request_plan}"
 expect_status 'pull request' real_capfs skipped "${pull_request_plan}"
 expect_status 'pull request' egress_real_https skipped "${pull_request_plan}"
 expect_status 'pull request' external_provider_smoke skipped "${pull_request_plan}"
@@ -73,6 +74,7 @@ expect_status 'schedule' real_runtime_lifecycle required "${schedule_plan}"
 expect_status 'schedule' session_owner_kvm required "${schedule_plan}"
 expect_status 'schedule' systemd_control_plane required "${schedule_plan}"
 expect_status 'schedule' concurrent_session_owners required "${schedule_plan}"
+expect_status 'schedule' installed_production_chain required "${schedule_plan}"
 expect_status 'schedule' real_capfs required "${schedule_plan}"
 expect_status 'schedule' egress_real_https required "${schedule_plan}"
 expect_status 'schedule' external_provider_smoke skipped "${schedule_plan}"
@@ -94,6 +96,7 @@ deep_workflow_plan="$(PLAN_EVENT=schedule PLAN_PLATFORM=github \
 expect_status 'deep workflow' session_owner_kvm required "${deep_workflow_plan}"
 expect_status 'deep workflow' systemd_control_plane required "${deep_workflow_plan}"
 expect_status 'deep workflow' concurrent_session_owners required "${deep_workflow_plan}"
+expect_status 'deep workflow' installed_production_chain required "${deep_workflow_plan}"
 
 # ------------------------------------------------------ platform availability --
 

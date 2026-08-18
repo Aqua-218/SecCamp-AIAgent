@@ -745,6 +745,17 @@ gates:
     workflow: deep.yml
     include: deep.yml
 
+  - id: installed_production_chain
+    title: Exact installed production-chain verification
+    stage: system
+    tier: deep
+    scopes: [rust, pipeline]
+    status: implemented
+    github: installed_production_chain
+    gitlab: installed_production_chain
+    workflow: deep.yml
+    include: deep.yml
+
   - id: external_provider_smoke
     title: Protected external provider smoke
     stage: security

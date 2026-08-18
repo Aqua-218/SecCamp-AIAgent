@@ -75,7 +75,7 @@ require_sha256 "${polkit_rule}" '58041aab07b6b490a75dd941c71d921af9a11a036e4cc04
 require_sha256 "${udev_rule}" 'ee003a6e5852e5ac0f5710e0f9e6ba644ab3a7672c643693c8637e7819a6a602'
 require_sha256 "${controller_environment}" 'fc12a7d45db0c41e79877c0e9ac6eaf427fb2275127f9f32e51d6636469fbb21'
 require_sha256 "${worker_environment}" '9b93306e5b38d2efa704a3eca4f9ad7f84216c528fb3ec4a19c422e9ef3b83fd'
-require_sha256 "${deployment_readme}" '27a565a782f051edd57e41edd68d199fc266bd5ea9c868d5207b3a33a35f6fb5'
+require_sha256 "${deployment_readme}" '95e2f53574b6fb23de370f3b34831c9687797e423a1a8716171876c5184c4db2'
 
 # host-controld checks both the socket parent and the HMAC key against --client-gid. Its primary
 # group therefore has to be the client group; a supplementary group does not affect systemd's

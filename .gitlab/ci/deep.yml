@@ -213,6 +213,19 @@ concurrent_session_owners:
   script:
     - scripts/ci/run.sh concurrent-session-owners
 
+installed_production_chain:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 120m
+  interruptible: false
+  tags:
+    - kvm
+    - ephemeral
+  script:
+    - scripts/ci/run.sh installed-production-chain
+
 real_capfs:
   extends:
     - .rust_job

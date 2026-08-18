@@ -338,6 +338,24 @@ jobs:
       - name: Verify two concurrent production owners and independent cleanup
         run: scripts/ci/run.sh concurrent-session-owners
 
+  installed_production_chain:
+    name: Exact installed production-chain verification
+    # Builds a clean snapshot bundle, installs the checked-in production units
+    # on an ephemeral host, then exercises authenticated concurrent KVM workers.
+    if: ${{ github.ref_protected == true && github.event.repository.fork == false }}
+    runs-on: [self-hosted, linux, x64, kvm, ephemeral]
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+      - name: Verify the exact installed controller-to-VM chain
+        run: scripts/ci/run.sh installed-production-chain
+
   real_capfs:
     name: Real CapFS FUSE verification
     # Requires root and a readable/writable /dev/fuse. The gate is protected so
@@ -503,6 +521,7 @@ jobs:
       - session_owner_crash_recovery
       - systemd_control_plane
       - concurrent_session_owners
+      - installed_production_chain
       - real_capfs
       - egress_real_https
       - external_provider_smoke

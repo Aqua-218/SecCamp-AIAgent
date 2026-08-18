@@ -155,6 +155,31 @@ case "${command_name}" in
   concurrent-session-owners)
     scripts/ci/verify-real-concurrent-session-owners.sh
     ;;
+  installed-production-chain)
+    [[ "$(id -u)" -eq 0 ]] || {
+      printf 'installed-production-chain requires root\n' >&2
+      exit 2
+    }
+    installed_chain_root="$(mktemp -d /root/.installed-chain.XXXXXX)"
+    readonly installed_chain_root
+    installed_chain_artifacts="${installed_chain_root}/artifacts"
+    readonly installed_chain_artifacts
+    cleanup_installed_chain_artifacts() {
+      if [[ -d "${installed_chain_root}" && ! -L "${installed_chain_root}" ]]; then
+        find "${installed_chain_root}" -depth -delete
+      fi
+    }
+    trap cleanup_installed_chain_artifacts EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    REAL_SESSION_ARTIFACT_EXPORT_ROOT="${installed_chain_artifacts}" \
+      scripts/ci/verify-real-session-owner.sh
+    INSTALLED_CHAIN_ARTIFACT_ROOT="${installed_chain_artifacts}" \
+      scripts/ci/verify-installed-production-chain.sh
+    cleanup_installed_chain_artifacts
+    trap - EXIT HUP INT TERM
+    ;;
   post-exec-isolation)
     # Backward-compatible entry point: the production-launcher post-exec
     # scenario is one of the required privileged-isolation scenarios.

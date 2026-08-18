@@ -74,7 +74,7 @@ require_sha256 "${single_worker}" '08c0a565162e43d2e6a3397ad71d25b11f9eca0da9a03
 require_sha256 "${polkit_rule}" '58041aab07b6b490a75dd941c71d921af9a11a036e4cc048c29f4f97fbe3ab6b'
 require_sha256 "${udev_rule}" '1af47a833fcec709a533edbdd7865dd4308f9634d81de3f6ad572f5307c3c4bc'
 require_sha256 "${controller_environment}" 'fc12a7d45db0c41e79877c0e9ac6eaf427fb2275127f9f32e51d6636469fbb21'
-require_sha256 "${worker_environment}" '964c50f0623ad45b5f12ac32a01e42ca8bd1987a71b94d342bf3a93a52483761'
+require_sha256 "${worker_environment}" '865c85b79b2b3b4088dbc2ebfe7ecd4b16541547358cbbd0911080e06608e242'
 require_sha256 "${deployment_readme}" 'c046fb147293bf5205f7137921a5b775d909a2bc8f304a5400ee350b8eb970b4'
 
 # host-controld checks both the socket parent and the HMAC key against --client-gid. Its primary
@@ -166,6 +166,9 @@ require_line "${worker_environment}" 'HOST_SESSIOND_JAILER_UID=961'
 require_line "${worker_environment}" 'HOST_SESSIOND_JAILER_GID=961'
 require_line "${worker_environment}" 'HOST_SESSIOND_GUEST_CID=42'
 require_line "${worker_environment}" 'HOST_SESSIOND_BROKER_PORT=5001'
+require_line "${worker_environment}" 'HOST_SESSIOND_BROKER_REPLAY_CAPACITY=256'
+require_line "${worker_environment}" 'HOST_SESSIOND_BROKER_BUDGET_REQUESTS=1000'
+require_line "${worker_environment}" 'HOST_SESSIOND_BROKER_MAX_CONNECTION_REQUESTS=256'
 require_line "${worker_environment}" 'HOST_SESSIOND_GUEST_CONTROL_PORT=5000'
 require_line "${worker_environment}" 'HOST_SESSIOND_BOOT_ARGS=console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/usr/local/libexec/guest-control-init -- --port 5000 --workload /usr/local/libexec/guest-supervisor-init --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port 5001 --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository workspace --file-effects read-data,list-directory,write-data,truncate,create-file,create-directory,remove-file,remove-directory,rename,set-metadata,read-link,create-symlink,create-hard-link --path-prefix /'
 require_line "${deployment_readme}" 'udevadm trigger --subsystem-match=misc --subsystem-match=block --action=add'

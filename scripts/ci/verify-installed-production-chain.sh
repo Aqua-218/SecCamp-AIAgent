@@ -152,7 +152,8 @@ record_device_metadata() {
   local device
   : >"${device_metadata}"
   shopt -s nullglob
-  for device in /dev/kvm /dev/vhost-vsock /dev/loop-control /dev/loop[0-9]* /dev/dm-*; do
+  for device in \
+    /dev/kvm /dev/vhost-vsock /dev/mapper/control /dev/loop-control /dev/loop[0-9]* /dev/dm-*; do
     [[ -e "${device}" && ! -L "${device}" ]] || continue
     stat -Lc '%n %u %g %a' -- "${device}" >>"${device_metadata}"
   done
@@ -164,7 +165,7 @@ restore_device_metadata() {
   [[ -f "${device_metadata}" ]] || return 0
   while read -r device owner group mode; do
     case "${device}" in
-      /dev/kvm | /dev/vhost-vsock | /dev/loop-control | /dev/loop[0-9]* | /dev/dm-*)
+      /dev/kvm | /dev/vhost-vsock | /dev/mapper/control | /dev/loop-control | /dev/loop[0-9]* | /dev/dm-*)
         if [[ -e "${device}" && ! -L "${device}" ]]; then
           chown "${owner}:${group}" -- "${device}" >/dev/null 2>&1 || true
           chmod "${mode}" -- "${device}" >/dev/null 2>&1 || true

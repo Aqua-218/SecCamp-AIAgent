@@ -148,6 +148,19 @@ real_runtime_lifecycle:
   script:
     - scripts/ci/run.sh real-runtime-lifecycle
 
+real_runtime_version_matrix:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 120m
+  interruptible: false
+  tags:
+    - kvm
+    - ephemeral
+  script:
+    - scripts/ci/run.sh real-runtime-version-matrix
+
 session_owner_kvm:
   extends:
     - .rust_job
@@ -213,6 +226,19 @@ external_provider_smoke:
   script:
     - scripts/ci/run.sh live-github
 
+external_review_attestation:
+  extends:
+    - .rust_job
+    - .external_provider_rules
+  stage: security
+  timeout: 10m
+  interruptible: false
+  tags:
+    - external
+    - ephemeral
+  script:
+    - scripts/ci/run.sh external-review
+
 privileged_isolation:
   extends:
     - .rust_job
@@ -225,3 +251,32 @@ privileged_isolation:
     - ephemeral
   script:
     - scripts/ci/run.sh privileged-isolation
+
+privileged_isolation_aarch64:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 20m
+  interruptible: false
+  tags:
+    - arm64
+    - privileged
+    - ephemeral
+  script:
+    - scripts/ci/run.sh privileged-isolation-aarch64
+
+runtime_isolation_soak:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 45m
+  interruptible: false
+  tags:
+    - privileged
+    - ephemeral
+  variables:
+    RUNTIME_ISOLATION_SOAK_ITERATIONS: "20"
+  script:
+    - scripts/ci/run.sh runtime-isolation-soak

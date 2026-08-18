@@ -51,6 +51,9 @@ use session_orchestrator::{
     },
 };
 
+const TEST_SECCOMP_POLICY: &[u8] =
+    br#"{"vmm":{"default_action":"trap","filter_action":"allow","filter":[]}}"#;
+
 type LifecycleEvents = Arc<Mutex<Vec<&'static str>>>;
 
 fn record_event(events: &LifecycleEvents, event: &'static str) {
@@ -86,8 +89,10 @@ impl FileSystem for TestFileSystem {
             PathBuf::from("/usr/sbin/veritysetup"),
             PathBuf::from("/test/mke2fs"),
             PathBuf::from("/test/jailer"),
+            PathBuf::from("/test/seccompiler"),
             jail_root.join("artifacts/kernel"),
             jail_root.join("artifacts/seccomp"),
+            PathBuf::from("/test/seccomp-policy.json"),
             jail_root.join("snapshots/state"),
             jail_root.join("snapshots/memory"),
         ];
@@ -102,7 +107,11 @@ impl FileSystem for TestFileSystem {
             .lock()
             .expect("filesystem read log must not be poisoned")
             .push(path.to_owned());
-        Ok(Vec::new())
+        if path == Path::new("/test/seccomp-policy.json") {
+            Ok(TEST_SECCOMP_POLICY.to_vec())
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn bind_block_device(
@@ -269,6 +278,15 @@ impl CommandRunner for TestRunner {
         &mut self,
         _veritysetup: &PinnedArtifact,
         _expected: &DmVerityConfig,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    fn verify_seccomp_compilation(
+        &mut self,
+        _compiler: &PinnedArtifact,
+        _policy: &[u8],
+        _filter: &[u8],
     ) -> Result<(), RuntimeError> {
         Ok(())
     }
@@ -1006,20 +1024,23 @@ fn runtime_config() -> RuntimeConfig {
                 cpu_period_micros: 1,
             },
             seccomp: SeccompConfig {
+                compiler: artifact("/test/seccompiler"),
                 filter: artifact(
                     jail_root
                         .join("artifacts/seccomp")
                         .to_str()
                         .expect("test seccomp path must be UTF-8"),
                 ),
+                policy: PinnedArtifact::new(
+                    "/test/seccomp-policy.json",
+                    sha256(TEST_SECCOMP_POLICY),
+                ),
                 blocked_syscalls: [
                     "bpf",
-                    "connect",
                     "mount",
                     "perf_event_open",
                     "ptrace",
                     "setns",
-                    "socket",
                     "unshare",
                 ]
                 .into_iter()

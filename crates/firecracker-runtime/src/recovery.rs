@@ -60,7 +60,7 @@ const RESOLVE_CHILD: ResolveFlags = ResolveFlags::BENEATH
 pub struct SessionResourceOwnership {
     config_fingerprint: Sha256Digest,
     cgroup_parent: PathBuf,
-    cgroup_parent_seal: ParentSeal,
+    cgroup_parent_seal: Option<ParentSeal>,
     cgroup_leaf: OsString,
     jail_parent: PathBuf,
     jail_parent_seal: ParentSeal,
@@ -112,12 +112,13 @@ impl SessionResourceOwnership {
             ));
         }
 
-        let cgroup_parent_seal = ParentSeal::capture(cgroup_parent)?;
+        let cgroup_parent_seal = ParentSeal::capture_optional(cgroup_parent)?;
         let jail_parent_seal = ParentSeal::capture(jail_parent)?;
-        let config_fingerprint = recovery_fingerprint(
-            config.instance_fingerprint(),
-            [&cgroup_parent_seal, &jail_parent_seal],
-        );
+        // A systemd unit cgroup is ephemeral and may be removed atomically with a killed worker.
+        // The full cgroup path remains bound by the runtime fingerprint; the durable ownership
+        // fingerprint seals the persistent jail ancestor that encloses the remaining resources.
+        let config_fingerprint =
+            recovery_fingerprint(config.instance_fingerprint(), [&jail_parent_seal]);
         Ok(Self {
             config_fingerprint,
             cgroup_parent: cgroup_parent.to_path_buf(),
@@ -184,22 +185,28 @@ struct ParentSeal {
 
 impl ParentSeal {
     fn capture(expected_parent: &Path) -> Result<Self, RuntimeError> {
-        validate_absolute_normal_path(expected_parent)?;
-        let directory = open_absolute_directory_optional(expected_parent)?.ok_or_else(|| {
+        Self::capture_optional(expected_parent)?.ok_or_else(|| {
             RuntimeError::InvalidConfig(format!(
                 "recovery parent must be pre-existing: {}",
                 expected_parent.display()
             ))
-        })?;
+        })
+    }
+
+    fn capture_optional(expected_parent: &Path) -> Result<Option<Self>, RuntimeError> {
+        validate_absolute_normal_path(expected_parent)?;
+        let Some(directory) = open_absolute_directory_optional(expected_parent)? else {
+            return Ok(None);
+        };
         let metadata = directory.metadata().map_err(RuntimeError::from)?;
         validate_trusted_parent_metadata(expected_parent, &metadata)?;
-        Ok(Self {
+        Ok(Some(Self {
             expected_parent: expected_parent.to_path_buf(),
             ancestor_identity: super::ObjectIdentity::from_metadata(&metadata),
             mount_id: descriptor_mount_id(&directory)?,
             owner: metadata.uid(),
             mode: metadata.mode(),
-        })
+        }))
     }
 
     fn open_verified_parent(&self) -> Result<File, RuntimeError> {
@@ -232,7 +239,7 @@ fn recovery_fingerprint<'a>(
     seals: impl IntoIterator<Item = &'a ParentSeal>,
 ) -> Sha256Digest {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"firecracker-recovery-ownership-v2\0");
+    bytes.extend_from_slice(b"firecracker-recovery-ownership-v3\0");
     bytes.extend_from_slice(&runtime_fingerprint.as_bytes());
     for seal in seals {
         append_fingerprint_field(&mut bytes, seal.expected_parent.as_os_str().as_bytes());
@@ -924,7 +931,17 @@ fn recover_cgroup(
     ownership: &SessionResourceOwnership,
     timeout: Duration,
 ) -> Result<(), RuntimeError> {
-    let parent = ownership.cgroup_parent_seal.open_verified_parent()?;
+    let Some(parent_seal) = &ownership.cgroup_parent_seal else {
+        return if open_absolute_directory_optional(&ownership.cgroup_parent)?.is_none() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Command(format!(
+                "absent recovery cgroup parent appeared after ownership capture: {}",
+                ownership.cgroup_parent.display()
+            )))
+        };
+    };
+    let parent = parent_seal.open_verified_parent()?;
     let Some(directory) = open_optional_child_directory(&parent, &ownership.cgroup_leaf)? else {
         return Ok(());
     };
@@ -1755,7 +1772,7 @@ mod tests {
         SessionResourceOwnership {
             config_fingerprint: Sha256Digest::from_bytes([1; 32]),
             cgroup_parent: PathBuf::from("/sys/fs/cgroup/luna"),
-            cgroup_parent_seal: parent_seal.clone(),
+            cgroup_parent_seal: Some(parent_seal.clone()),
             cgroup_leaf: OsString::from("session-a"),
             jail_parent: PathBuf::from("/srv/jailer/firecracker"),
             jail_parent_seal: parent_seal,
@@ -1905,12 +1922,36 @@ mod tests {
         let base = temp_directory("parent-seal");
         let missing = base.join("parent");
         assert!(ParentSeal::capture(&missing).is_err());
+        assert_eq!(
+            ParentSeal::capture_optional(&missing).expect("optional missing parent"),
+            None
+        );
         fs::create_dir(&missing).expect("create expected parent");
         let exact_seal = ParentSeal::capture(&missing).expect("capture exact parent");
         assert!(exact_seal.open_verified_parent().is_ok());
         fs::rename(&missing, base.join("retained-old-parent")).expect("retain old inode");
         fs::create_dir(&missing).expect("replace sealed parent");
         assert!(exact_seal.open_verified_parent().is_err());
+        fs::remove_dir_all(base).expect("remove test tree");
+    }
+
+    #[test]
+    fn absent_cgroup_parent_is_complete_unless_it_reappears() {
+        let base = temp_directory("absent-cgroup-parent");
+        let parent = base.join("retired-worker-unit");
+        let mut ownership = ownership();
+        ownership.cgroup_parent = parent.clone();
+        ownership.cgroup_parent_seal = None;
+        ownership.cgroup_leaf = OsString::from("retired-firecracker");
+
+        recover_cgroup(&ownership, Duration::from_millis(10))
+            .expect("a child cannot survive an absent cgroup parent");
+        fs::create_dir(&parent).expect("recreate parent after capture");
+        assert!(matches!(
+            recover_cgroup(&ownership, Duration::from_millis(10)),
+            Err(RuntimeError::Command(message)) if message.contains("appeared")
+        ));
+
         fs::remove_dir_all(base).expect("remove test tree");
     }
 

@@ -24,6 +24,8 @@ pub enum FixedUnitState {
     Owned,
     /// The unit is inactive and systemd owns no worker process.
     Inactive,
+    /// The unit exited unsuccessfully and requires explicit cleanup before ownership is released.
+    Failed,
 }
 
 /// Fixed lifecycle operations required from a service manager.
@@ -45,13 +47,13 @@ pub trait FixedServiceManager: Clone {
     ///
     /// # Errors
     ///
-    /// Returns a closed worker error while the exact unit is not proven inactive.
+    /// Returns a closed worker error while the exact stop transaction does not prove ownership ended.
     fn stop_worker(&self, session: ControlSessionId) -> Result<(), ControlWorkerError>;
     /// Runs the exact recovery-only template for one session namespace.
     ///
     /// # Errors
     ///
-    /// Returns a closed worker error unless recovery succeeds and the worker remains inactive.
+    /// Returns a closed worker error unless recovery succeeds after systemd owns no worker process.
     fn recover_worker(&self, session: ControlSessionId) -> Result<(), ControlWorkerError>;
 }
 
@@ -100,17 +102,23 @@ impl PinnedSystemdManager {
                 ],
             ))
             .map_err(|_| ControlWorkerError::StatusUnavailable)?;
-        let value = std::str::from_utf8(&output.stdout)
-            .map_err(|_| ControlWorkerError::StatusUnavailable)?;
-        let states = value.lines().collect::<Vec<_>>();
-        if states.len() != 2 || states[0] != "loaded" {
-            return Err(ControlWorkerError::StatusUnavailable);
-        }
-        match states[1] {
-            "active" | "activating" | "deactivating" | "reloading" => Ok(FixedUnitState::Owned),
-            "inactive" | "failed" => Ok(FixedUnitState::Inactive),
-            _ => Err(ControlWorkerError::StatusUnavailable),
-        }
+        parse_unit_state(&output.stdout)
+    }
+}
+
+fn parse_unit_state(output: &[u8]) -> Result<FixedUnitState, ControlWorkerError> {
+    let value = std::str::from_utf8(output).map_err(|_| ControlWorkerError::StatusUnavailable)?;
+    let states = value.lines().collect::<Vec<_>>();
+    if states.len() != 2 || states[0] != "loaded" {
+        return Err(ControlWorkerError::StatusUnavailable);
+    }
+    match states[1] {
+        "active" | "activating" | "deactivating" | "reloading" => Ok(FixedUnitState::Owned),
+        "inactive" => Ok(FixedUnitState::Inactive),
+        // A failed unit can retain VM, mapper, cgroup, jail, or workspace resources. It must take
+        // the controller's fail-closed cleanup path instead of being journaled as a clean exit.
+        "failed" => Ok(FixedUnitState::Failed),
+        _ => Err(ControlWorkerError::StatusUnavailable),
     }
 }
 
@@ -120,7 +128,9 @@ impl FixedServiceManager for PinnedSystemdManager {
             .map_err(|_| ControlWorkerError::StartupFailed)?;
         match self.state(session)? {
             FixedUnitState::Owned => Ok(()),
-            FixedUnitState::Inactive => Err(ControlWorkerError::StartupFailed),
+            FixedUnitState::Inactive | FixedUnitState::Failed => {
+                Err(ControlWorkerError::StartupFailed)
+            }
         }
     }
 
@@ -135,7 +145,7 @@ impl FixedServiceManager for PinnedSystemdManager {
         self.run("stop", worker_unit(session))
             .map_err(|_| ControlWorkerError::CleanupIncomplete)?;
         match self.state(session) {
-            Ok(FixedUnitState::Inactive) => Ok(()),
+            Ok(FixedUnitState::Inactive | FixedUnitState::Failed) => Ok(()),
             _ => Err(ControlWorkerError::CleanupIncomplete),
         }
     }
@@ -144,7 +154,9 @@ impl FixedServiceManager for PinnedSystemdManager {
         self.run("start", recovery_unit(session))
             .map_err(|_| ControlWorkerError::CleanupIncomplete)?;
         match self.state(session) {
-            Ok(FixedUnitState::Inactive) => Ok(()),
+            // `failed` is a sticky systemd tombstone. It is safe only here, after an exact stop
+            // transaction and a successful recovery unit; poll never treats it as clean closure.
+            Ok(FixedUnitState::Inactive | FixedUnitState::Failed) => Ok(()),
             _ => Err(ControlWorkerError::CleanupIncomplete),
         }
     }
@@ -174,6 +186,7 @@ impl<M: FixedServiceManager> ControlWorker for SystemdWorker<M> {
         match self.manager.worker_state(self.session)? {
             FixedUnitState::Owned => Ok(ControlWorkerStatus::Running),
             FixedUnitState::Inactive => Ok(ControlWorkerStatus::Closed),
+            FixedUnitState::Failed => Err(ControlWorkerError::StatusUnavailable),
         }
     }
 
@@ -296,6 +309,40 @@ mod tests {
         assert_eq!(
             recovery_unit(session),
             "host-sessiond-recover@cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd.service"
+        );
+    }
+
+    #[test]
+    fn failed_systemd_state_is_never_reported_as_cleanly_inactive() {
+        assert_eq!(
+            parse_unit_state(b"loaded\nfailed\n"),
+            Ok(FixedUnitState::Failed)
+        );
+        assert_eq!(
+            parse_unit_state(b"loaded\ninactive\n"),
+            Ok(FixedUnitState::Inactive)
+        );
+    }
+
+    #[test]
+    fn failed_worker_poll_requires_the_exact_stop_and_recovery_path() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let session = ControlSessionId::new([0xef; 16]);
+        let manager = FakeManager {
+            events: Arc::clone(&events),
+            state: Arc::new(Mutex::new(FixedUnitState::Failed)),
+        };
+        let mut worker = SystemdWorker { manager, session };
+
+        assert_eq!(worker.poll(), Err(ControlWorkerError::StatusUnavailable));
+        worker.stop().unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                format!("poll:{session}"),
+                format!("stop:{session}"),
+                format!("recover:{session}"),
+            ]
         );
     }
 }

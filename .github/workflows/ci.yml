@@ -168,6 +168,20 @@ jobs:
       - name: Check tracked file modes, sizes, and endings
         run: scripts/ci/check-repository-hygiene.sh
 
+  service_boundaries:
+    name: Privileged service boundaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Check privileged service, policy, device, and environment contracts
+        run: scripts/ci/check-service-boundaries.sh
+
   lean_hygiene:
     name: Lean proof hygiene
     runs-on: ubuntu-24.04
@@ -532,6 +546,7 @@ jobs:
       - commit_policy
       - codeowners_coverage
       - repository_hygiene
+      - service_boundaries
       - lean_hygiene
       - pin_inventory
       - crate_isolation

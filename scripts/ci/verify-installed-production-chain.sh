@@ -389,10 +389,10 @@ install -o root -g root -m 0644 -- "${repository_root}/deploy/70-host-sessiond-d
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=misc --subsystem-match=block --action=add
 udevadm settle
-[[ "$(stat -Lc '%g' /dev/mapper/control)" == "${worker_gid}" ]] \
-  || fail 'udev did not grant the worker group device-mapper control access'
-[[ "$(stat -Lc '%g' /dev/loop-control)" == "${worker_gid}" ]] \
-  || fail 'udev did not grant the worker group loop-control access'
+[[ "$(stat -Lc '%u:%g' /dev/mapper/control)" == "${worker_uid}:${worker_gid}" ]] \
+  || fail 'udev did not grant the worker identity device-mapper control ownership'
+[[ "$(stat -Lc '%u:%g' /dev/loop-control)" == "${worker_uid}:${worker_gid}" ]] \
+  || fail 'udev did not grant the worker identity loop-control ownership'
 
 install -o root -g root -m 0644 -- "${repository_root}/service/host-sessiond@.service" "${worker_unit}"
 install -o root -g root -m 0644 -- "${repository_root}/service/host-sessiond-recover@.service" "${recovery_unit}"

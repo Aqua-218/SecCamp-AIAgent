@@ -72,7 +72,7 @@ require_sha256 "${worker}" '791597da482356df21c85d952d37fb3da17b75da538b9fe86079
 require_sha256 "${recovery}" '1ba6404050d1471066a108e2ea0e7122080178173ee47362fa8945333758cae0'
 require_sha256 "${single_worker}" '110e96c71b831d9d87d3e6872ea1a7eca782cd9df8513593aaeb942e4e1303d4'
 require_sha256 "${polkit_rule}" '58041aab07b6b490a75dd941c71d921af9a11a036e4cc048c29f4f97fbe3ab6b'
-require_sha256 "${udev_rule}" '1af47a833fcec709a533edbdd7865dd4308f9634d81de3f6ad572f5307c3c4bc'
+require_sha256 "${udev_rule}" '46713b10181616c73b48d2d220fe2bf243a93ddfa4aebe36d280f94e03b155ed'
 require_sha256 "${controller_environment}" 'fc12a7d45db0c41e79877c0e9ac6eaf427fb2275127f9f32e51d6636469fbb21'
 require_sha256 "${worker_environment}" 'c2e030dba30173f14c046d10f4b9388524afe4e684a67a0c20621c8303a83b91'
 require_sha256 "${deployment_readme}" '27a565a782f051edd57e41edd68d199fc266bd5ea9c868d5207b3a33a35f6fb5'
@@ -158,10 +158,10 @@ require_line "${polkit_rule}" '    var recovery = /^host-sessiond-recover@[0-9a-
 require_line "${polkit_rule}" '    if ((verb === "start" && (worker.test(unit) || recovery.test(unit))) ||'
 require_line "${polkit_rule}" '        (verb === "stop" && worker.test(unit))) {'
 
-require_line "${udev_rule}" 'KERNEL=="device-mapper", GROUP="host-sessiond", MODE="0660"'
-require_line "${udev_rule}" 'KERNEL=="dm-*", ENV{DM_NAME}=="host-sessiond-rootfs-*", GROUP="host-sessiond", MODE="0660"'
-require_line "${udev_rule}" 'KERNEL=="loop-control", GROUP="host-sessiond", MODE="0660"'
-require_line "${udev_rule}" 'KERNEL=="loop[0-9]*", GROUP="host-sessiond", MODE="0660"'
+require_line "${udev_rule}" 'KERNEL=="device-mapper", OWNER="host-sessiond", GROUP="host-sessiond", MODE="0660"'
+require_line "${udev_rule}" 'KERNEL=="dm-*", ENV{DM_NAME}=="host-sessiond-rootfs-*", OWNER="host-sessiond", GROUP="host-sessiond", MODE="0660"'
+require_line "${udev_rule}" 'KERNEL=="loop-control", OWNER="host-sessiond", GROUP="host-sessiond", MODE="0660"'
+require_line "${udev_rule}" 'KERNEL=="loop[0-9]*", OWNER="host-sessiond", GROUP="host-sessiond", MODE="0660"'
 
 require_line "${controller_environment}" 'HOST_CONTROLD_CLIENT_GID=2000'
 require_line "${controller_environment}" 'HOST_CONTROLD_SYSTEMCTL_SHA256=0000000000000000000000000000000000000000000000000000000000000000'

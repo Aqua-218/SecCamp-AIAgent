@@ -187,6 +187,32 @@ session_owner_crash_recovery:
   script:
     - scripts/ci/run.sh real-session-crash-recovery
 
+systemd_control_plane:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 20m
+  interruptible: false
+  tags:
+    - kvm
+    - ephemeral
+  script:
+    - scripts/ci/run.sh systemd-control-plane
+
+concurrent_session_owners:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 120m
+  interruptible: false
+  tags:
+    - kvm
+    - ephemeral
+  script:
+    - scripts/ci/run.sh concurrent-session-owners
+
 real_capfs:
   extends:
     - .rust_job

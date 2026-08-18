@@ -3078,12 +3078,17 @@ impl CommandRunner for RealCommandRunner {
                 }
             }
             match launcher.try_wait() {
-                Ok(Some(_)) | Err(_) => {
+                Ok(Some(status)) if !status.success() => {
                     return Ok(
                         self.retain_unverified_owned_launch(pid, launcher, ownership, observed)
                     );
                 }
-                Ok(None) => {}
+                Ok(Some(_) | None) => {}
+                Err(_) => {
+                    return Ok(
+                        self.retain_unverified_owned_launch(pid, launcher, ownership, observed)
+                    );
+                }
             }
             if Instant::now() >= deadline {
                 return Ok(self.retain_unverified_owned_launch(pid, launcher, ownership, observed));

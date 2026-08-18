@@ -2414,6 +2414,13 @@ fn spawn_detached(command: &CommandSpec) -> Result<Child, RuntimeError> {
         recovery::SealedExecutable::program,
     );
     let mut process = Command::new(program);
+    let stderr = if command.privilege == CommandPrivilege::RootDroppingLauncher {
+        // The jailer reports setup failures before --daemonize redirects the long-lived
+        // Firecracker process. The systemd journal is rate-limited and receives no child env.
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    };
     process
         .args(&command.args)
         // Host credentials belong to the Broker process. Firecracker, jailer,
@@ -2422,7 +2429,7 @@ fn spawn_detached(command: &CommandSpec) -> Result<Child, RuntimeError> {
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .process_group(0);
     if command.privilege == CommandPrivilege::RootDroppingLauncher {
         process.gid(0).uid(0);
@@ -6380,6 +6387,7 @@ where
             ),
             "--chroot-base-dir".to_owned(),
             config.jailer_config.chroot_base_dir.display().to_string(),
+            "--daemonize".to_owned(),
             "--new-pid-ns".to_owned(),
             "--".to_owned(),
             "--api-sock".to_owned(),
@@ -8243,6 +8251,7 @@ mod tests {
                 "cpu.max=100000 100000",
                 "--chroot-base-dir",
                 "/srv/jailer",
+                "--daemonize",
                 "--new-pid-ns",
                 "--",
                 "--api-sock",

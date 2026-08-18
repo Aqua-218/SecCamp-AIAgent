@@ -49,6 +49,12 @@ repository_hygiene:
   script:
     - scripts/ci/check-repository-hygiene.sh
 
+service_boundaries:
+  stage: validate
+  timeout: 10m
+  script:
+    - scripts/ci/check-service-boundaries.sh
+
 lean_hygiene:
   stage: validate
   timeout: 10m

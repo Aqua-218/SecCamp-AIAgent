@@ -5,8 +5,9 @@ Description=Ephemeral host-controld process-boundary probe %i
 Type=simple
 User=daemon
 Group=daemon
-ExecStart=/usr/bin/sleep infinity
+ExecStart=/bin/sh /run/host-sessiond-control-test/worker %i
 Restart=no
+KillMode=process
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -16,4 +17,3 @@ ProtectSystem=strict
 ProtectHome=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX
-

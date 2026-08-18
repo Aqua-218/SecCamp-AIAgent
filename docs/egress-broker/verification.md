@@ -21,7 +21,7 @@
 | response cap | streaming 中に上限超過を拒否し、`HEAD` は本文を読まない | fake response stream |
 | GitHub 事前条件 | expected-old plan がなければ provider を呼ばずに拒否する | fake provider |
 | provider error | rate-limit metadata は型付きで保持し、生 body は outcome に出さない | fake provider |
-| GitHub credential 境界 | 欠損 / 制御文字 credential を拒否し、provider `Debug` と typed error が token を redact する | `invalid_credential_environment_values_fail_closed`, `provider_debug_and_typed_errors_never_leak_the_token` |
+| GitHub credential 境界 | 欠損 / 制御文字 credential を拒否し、systemd credentialをsymlink非追跡descriptorで開いてhard linkと読取中のmetadata driftを拒否する。`CREDENTIALS_DIRECTORY`指定時はambient tokenへ降格せず、provider `Debug` と typed error はtokenをredactする | `invalid_credential_environment_values_fail_closed`, `systemd_credential_is_descriptor_sealed_and_rejects_links`, `provider_debug_and_typed_errors_never_leak_the_token` |
 | durable WAL lock | writer/shared-reader排他を保持し、fork/exec間の一時的CLOEXEC fd継承だけを検証済みfile上で250ms以内再試行する | same-process/cross-process durable module tests |
 | transport policy | zero/過大 timeout を拒否し、read/write/absolute connection deadline を typed error として fail closed | `transport_policy_rejects_zero_and_excessive_deadlines`, `deadline_transport_reports_typed_read_timeout`, `deadline_transport_reports_typed_write_timeout`, `deadline_transport_reports_expired_connection_before_io` |
 

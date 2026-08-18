@@ -145,9 +145,16 @@ fn run() -> Result<(), String> {
     )
 }
 
-#[allow(clippy::too_many_lines)] // Closed environment-to-argument mapping lists every production field.
 fn effective_arguments() -> Result<Vec<String>, String> {
     let direct = env::args().skip(1).collect::<Vec<_>>();
+    systemd_arguments(direct, |variable| env::var(variable).ok())
+}
+
+#[allow(clippy::too_many_lines)] // Closed environment-to-argument mapping lists every production field.
+fn systemd_arguments(
+    direct: Vec<String>,
+    mut environment: impl FnMut(&str) -> Option<String>,
+) -> Result<Vec<String>, String> {
     if direct.first().map(String::as_str) != Some("--systemd-instance") {
         return Ok(direct);
     }
@@ -229,6 +236,7 @@ fn effective_arguments() -> Result<Vec<String>, String> {
         ("memory-max-bytes", "HOST_SESSIOND_MEMORY_MAX_BYTES"),
         ("cpu-quota-micros", "HOST_SESSIOND_CPU_QUOTA_MICROS"),
         ("cpu-period-micros", "HOST_SESSIOND_CPU_PERIOD_MICROS"),
+        ("guest-cid", "HOST_SESSIOND_GUEST_CID"),
         ("vcpu-count", "HOST_SESSIOND_VCPU_COUNT"),
         ("memory-mib", "HOST_SESSIOND_MEMORY_MIB"),
         ("boot-args", "HOST_SESSIOND_BOOT_ARGS"),
@@ -240,6 +248,7 @@ fn effective_arguments() -> Result<Vec<String>, String> {
         ("authority-audit-mode", "HOST_SESSIOND_AUTHORITY_AUDIT_MODE"),
         ("broker-wal-root", "HOST_SESSIOND_BROKER_WAL_BASE"),
         ("broker-host-cid", "HOST_SESSIOND_BROKER_HOST_CID"),
+        ("broker-port", "HOST_SESSIOND_BROKER_PORT"),
         ("broker-backlog", "HOST_SESSIOND_BROKER_BACKLOG"),
         ("guest-control-port", "HOST_SESSIOND_GUEST_CONTROL_PORT"),
         (
@@ -281,8 +290,8 @@ fn effective_arguments() -> Result<Vec<String>, String> {
     arguments.extend(["--control-session-id".to_owned(), instance]);
     arguments.extend(["--mode".to_owned(), mode]);
     for (flag, variable) in mappings {
-        let value = env::var(variable)
-            .map_err(|_| format!("systemd worker environment is missing {variable}"))?;
+        let value = environment(variable)
+            .ok_or_else(|| format!("systemd worker environment is missing {variable}"))?;
         if value.is_empty() || value.contains('\0') {
             return Err(format!("systemd worker environment has invalid {variable}"));
         }
@@ -773,17 +782,7 @@ impl DaemonConfig {
             .join(firecracker_name)
             .join(TEMPLATE_CLONE_ID)
             .join("root");
-        let guest_cid = match control_session {
-            Some(instance) => {
-                reject_present(
-                    &mut arguments,
-                    "guest-cid",
-                    "--control-session-id derives it",
-                )?;
-                instance.guest_cid()
-            }
-            None => arguments.number("guest-cid")?,
-        };
+        let guest_cid = arguments.number("guest-cid")?;
         let runtime = RuntimeConfig {
             firecracker,
             kernel: PinnedArtifact::new(
@@ -924,17 +923,7 @@ impl DaemonConfig {
             control_session,
             "broker-wal",
         );
-        let broker_port = match control_session {
-            Some(instance) => {
-                reject_present(
-                    &mut arguments,
-                    "broker-port",
-                    "--control-session-id derives it",
-                )?;
-                instance.broker_port()
-            }
-            None => arguments.number("broker-port")?,
-        };
+        let broker_port = arguments.number("broker-port")?;
         let production = ProductionSessionConfig::new(
             ProductionDurabilityConfig::new(
                 identity_ledger_path.clone(),
@@ -1246,15 +1235,6 @@ impl ControlInstance {
         }
         name
     }
-
-    const fn guest_cid(self) -> u32 {
-        3 + u32::from_be_bytes([self.0[0], self.0[1], self.0[2], self.0[3]]) % (u32::MAX - 2)
-    }
-
-    const fn broker_port(self) -> u32 {
-        1_024
-            + u32::from_be_bytes([self.0[4], self.0[5], self.0[6], self.0[7]]) % (u32::MAX - 1_023)
-    }
 }
 
 fn scoped_directory(base: &Path, instance: Option<ControlInstance>) -> PathBuf {
@@ -1299,14 +1279,6 @@ fn scoped_mapper_prefix(base: &str, instance: Option<ControlInstance>) -> Result
         return Err("session-scoped --verity-mapper-prefix exceeds 127 bytes".to_owned());
     }
     Ok(value)
-}
-
-fn reject_present(arguments: &mut Arguments, name: &str, reason: &str) -> Result<(), String> {
-    if arguments.optional(name)?.is_some() {
-        Err(format!("--{name} is forbidden because {reason}"))
-    } else {
-        Ok(())
-    }
 }
 
 fn file_authority(
@@ -1612,7 +1584,7 @@ mod tests {
         Arguments, MAX_SHUTDOWN_TIMEOUT_MILLIS, ShutdownRequest, file_authority, json_string,
         parse_branch_pattern, parse_cgroup_parent, parse_egress_profile, parse_file_effects,
         parse_github_operations, parse_hex_16, parse_http_methods, parse_path_prefix, status_line,
-        stop_file_present, validate_absolute_path, validate_shutdown_timeout,
+        stop_file_present, systemd_arguments, validate_absolute_path, validate_shutdown_timeout,
     };
     use authority_core::{capability::AuthorityBody, repository::RepoId};
     use session_orchestrator::system_egress::GitHubEgressConfig;
@@ -1620,6 +1592,40 @@ mod tests {
     fn arguments(values: &[&str]) -> Arguments {
         Arguments::parse(values.iter().map(|value| (*value).to_owned()))
             .expect("test arguments must have complete flag/value pairs")
+    }
+
+    fn argument_value<'a>(arguments: &'a [String], flag: &str) -> Option<&'a str> {
+        arguments
+            .windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].as_str())
+    }
+
+    #[test]
+    fn systemd_workers_use_snapshot_compatible_vsock_values_from_the_environment() {
+        let arguments = systemd_arguments(
+            vec![
+                "--systemd-instance".to_owned(),
+                "00112233445566778899aabbccddeeff".to_owned(),
+                "--mode".to_owned(),
+                "run".to_owned(),
+            ],
+            |variable| {
+                Some(match variable {
+                    "HOST_SESSIOND_GUEST_CID" => "42".to_owned(),
+                    "HOST_SESSIOND_BROKER_PORT" => "5001".to_owned(),
+                    _ => "fixture".to_owned(),
+                })
+            },
+        )
+        .expect("complete systemd worker environment must map to daemon arguments");
+
+        assert_eq!(argument_value(&arguments, "--guest-cid"), Some("42"));
+        assert_eq!(argument_value(&arguments, "--broker-port"), Some("5001"));
+        assert_eq!(
+            argument_value(&arguments, "--control-session-id"),
+            Some("00112233445566778899aabbccddeeff")
+        );
     }
 
     #[test]

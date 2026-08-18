@@ -74,8 +74,8 @@ require_sha256 "${single_worker}" '82417c248b88b1c0570bf8db38d55d08ba2a749265c8e
 require_sha256 "${polkit_rule}" '58041aab07b6b490a75dd941c71d921af9a11a036e4cc048c29f4f97fbe3ab6b'
 require_sha256 "${udev_rule}" '1af47a833fcec709a533edbdd7865dd4308f9634d81de3f6ad572f5307c3c4bc'
 require_sha256 "${controller_environment}" 'fc12a7d45db0c41e79877c0e9ac6eaf427fb2275127f9f32e51d6636469fbb21'
-require_sha256 "${worker_environment}" '0bf2c80b8750907f2abdfac8c76780f0701eaccaf494c467fab450192f6b1a46'
-require_sha256 "${deployment_readme}" '4c8efa4c017176c5ec6f3b8b30e9f1455ef7fb3d88e2860474fea2560a0142ed'
+require_sha256 "${worker_environment}" '40eb72dba53d8ddce485510a451199953772acf89b10cbdfd5f2ce95ffefcdff'
+require_sha256 "${deployment_readme}" 'c046fb147293bf5205f7137921a5b775d909a2bc8f304a5400ee350b8eb970b4'
 
 # host-controld checks both the socket parent and the HMAC key against --client-gid. Its primary
 # group therefore has to be the client group; a supplementary group does not affect systemd's
@@ -154,6 +154,10 @@ require_line "${controller_environment}" 'HOST_CONTROLD_SYSTEMCTL_SHA256=0000000
 require_line "${worker_environment}" 'HOST_SESSIOND_WORKSPACE_SOURCE=/var/lib/host-sessiond/workspace-source'
 require_line "${worker_environment}" 'HOST_SESSIOND_JAILER_UID=961'
 require_line "${worker_environment}" 'HOST_SESSIOND_JAILER_GID=961'
+require_line "${worker_environment}" 'HOST_SESSIOND_GUEST_CID=42'
+require_line "${worker_environment}" 'HOST_SESSIOND_BROKER_PORT=5001'
+require_line "${worker_environment}" 'HOST_SESSIOND_GUEST_CONTROL_PORT=5000'
+require_line "${worker_environment}" 'HOST_SESSIOND_BOOT_ARGS=console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/usr/local/libexec/guest-control-init -- --port 5000 --workload /usr/local/libexec/guest-supervisor-init --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port 5001 --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository workspace --file-effects read-data,list-directory,write-data,truncate,create-file,create-directory,remove-file,remove-directory,rename,set-metadata,read-link,create-symlink,create-hard-link --path-prefix /'
 require_line "${deployment_readme}" 'udevadm trigger --subsystem-match=misc --subsystem-match=block --action=add'
 require_line "${deployment_readme}" 'udevadm settle'
 require_line "${deployment_readme}" 'install -d -o root -g host-sessiond -m 0550 \'

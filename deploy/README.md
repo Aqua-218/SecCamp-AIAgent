@@ -277,6 +277,14 @@ Any kernel, rootfs, verity root, Firecracker, seccomp, machine-size, boot-argume
 change requires a new snapshot and new digests. The daemon recomputes the compatibility
 fingerprint and both file digests before restore; it never falls back to an older snapshot.
 
+The worker `HOST_SESSIOND_GUEST_CID`, `HOST_SESSIOND_GUEST_CONTROL_PORT`, and
+`HOST_SESSIOND_BROKER_PORT` values must exactly match the values used while creating the snapshot;
+the guest CID and PID 1 arguments are retained by the snapshot. They are intentionally shared by
+all clones. Firecracker 1.16 or newer routes each clone through the worker's distinct overridden
+UDS path, so equal guest CIDs and guest ports do not merge host transports. Do not derive these
+snapshot-bound values from the controller session ID. The `--port` and `--broker-port` values
+inside `HOST_SESSIOND_BOOT_ARGS` must also equal the corresponding worker environment values.
+
 The process needs `/dev/kvm`, `/dev/vhost-vsock`, and narrowly scoped device-mapper access, plus
 permission to create the configured cgroup and mount/pid namespaces. The unit grants only that
 host-side envelope and keeps `PrivateNetwork=no` because public HTTPS/GitHub egress is performed

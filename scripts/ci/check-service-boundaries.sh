@@ -68,13 +68,13 @@ done
 # owner-reviewed gate, so a second permissive capability assignment or polkit rule cannot hide
 # behind the required secure lines below.
 require_sha256 "${controller}" '8fb7ef8ba3735570675b29436bbcd7df150dafaed7abcf73882a0d3b917c35fc'
-require_sha256 "${worker}" '791597da482356df21c85d952d37fb3da17b75da538b9fe86079f77c8af12016'
+require_sha256 "${worker}" 'f84ca7b2e357d85ccac15fefba1dda8f9e91a15e949fbbe873239d1a58c6e130'
 require_sha256 "${recovery}" '1ba6404050d1471066a108e2ea0e7122080178173ee47362fa8945333758cae0'
-require_sha256 "${single_worker}" '110e96c71b831d9d87d3e6872ea1a7eca782cd9df8513593aaeb942e4e1303d4'
+require_sha256 "${single_worker}" 'cccf935f223eccdf73fe073bd48448bc5820073628dd8753d16578a1482d2f91'
 require_sha256 "${polkit_rule}" '58041aab07b6b490a75dd941c71d921af9a11a036e4cc048c29f4f97fbe3ab6b'
 require_sha256 "${udev_rule}" 'ee003a6e5852e5ac0f5710e0f9e6ba644ab3a7672c643693c8637e7819a6a602'
 require_sha256 "${controller_environment}" 'fc12a7d45db0c41e79877c0e9ac6eaf427fb2275127f9f32e51d6636469fbb21'
-require_sha256 "${worker_environment}" 'c2e030dba30173f14c046d10f4b9388524afe4e684a67a0c20621c8303a83b91'
+require_sha256 "${worker_environment}" '9b93306e5b38d2efa704a3eca4f9ad7f84216c528fb3ec4a19c422e9ef3b83fd'
 require_sha256 "${deployment_readme}" '27a565a782f051edd57e41edd68d199fc266bd5ea9c868d5207b3a33a35f6fb5'
 
 # host-controld checks both the socket parent and the HMAC key against --client-gid. Its primary
@@ -100,8 +100,6 @@ for unit in "${worker}" "${recovery}"; do
   require_line "${unit}" 'EnvironmentFile=/etc/host-sessiond/worker.env'
   require_line "${unit}" 'Slice=system.slice'
   require_line "${unit}" 'NoNewPrivileges=yes'
-  require_line "${unit}" 'CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL'
-  require_line "${unit}" 'AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL'
   require_line "${unit}" 'ProtectSystem=strict'
   require_line "${unit}" 'DevicePolicy=closed'
   require_line "${unit}" 'DeviceAllow=/dev/kvm rw'
@@ -126,10 +124,14 @@ reject_line "${worker}" 'Wants=dev-kvm.device dev-vhost\x2dvsock.device'
 reject_line "${worker}" 'After=local-fs.target dev-kvm.device dev-vhost\x2dvsock.device'
 require_line "${worker}" 'ExecStart=/usr/local/bin/host-sessiond --systemd-instance %i --mode run'
 require_line "${worker}" 'Restart=no'
+require_line "${worker}" 'CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_MKNOD CAP_KILL'
+require_line "${worker}" 'AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_MKNOD CAP_KILL'
 require_line "${recovery}" 'Type=oneshot'
 require_line "${recovery}" 'StateDirectory=host-sessiond/instances/%i/broker-wal'
 require_line "${recovery}" 'StateDirectory=host-jails/%i/fc'
 require_line "${recovery}" 'ExecStart=/usr/local/bin/host-sessiond --systemd-instance %i --mode recover'
+require_line "${recovery}" 'CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL'
+require_line "${recovery}" 'AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL'
 
 # Keep the legacy one-session unit at least as restrictive around the source template.
 require_line "${single_worker}" 'After=local-fs.target'
@@ -138,8 +140,8 @@ require_line "${single_worker}" 'StateDirectory=host-sessiond/jailer/firecracker
 reject_line "${single_worker}" 'Wants=dev-kvm.device dev-vhost\x2dvsock.device'
 reject_line "${single_worker}" 'After=local-fs.target dev-kvm.device dev-vhost\x2dvsock.device'
 require_line "${single_worker}" 'ReadOnlyPaths=/var/lib/host-sessiond/workspace-source'
-require_line "${single_worker}" 'CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL'
-require_line "${single_worker}" 'AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH CAP_KILL'
+require_line "${single_worker}" 'CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_MKNOD CAP_KILL'
+require_line "${single_worker}" 'AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_MKNOD CAP_KILL'
 require_line "${single_worker}" 'DevicePolicy=closed'
 require_line "${single_worker}" 'DeviceAllow=/dev/loop-control rw'
 require_line "${single_worker}" 'DeviceAllow=block-loop rw'
@@ -184,11 +186,10 @@ require_line "${deployment_readme}" 'reviewed_manifest_sha256=REPLACE_WITH_EXTER
 require_line "${deployment_readme}" 'set -Eeuo pipefail'
 require_line "${deployment_readme}" '(cd "${install_staging}" && sha256sum --check --strict host-sessiond-binaries.sha256)'
 require_line "${deployment_readme}" 'The legacy unit must reuse `/usr/local/bin/host-sessiond` installed by the authenticated revision,'
-for unit in "${worker}" "${recovery}"; do
-  if grep -E '^(CapabilityBoundingSet|AmbientCapabilities)=.*CAP_CHOWN' -- "${unit}" >/dev/null; then
-    fail "${unit}: CAP_CHOWN must not replace the shared worker/jailer identity contract"
-  fi
-done
+if grep -E '^(CapabilityBoundingSet|AmbientCapabilities)=.*(CAP_CHOWN|CAP_MKNOD|CAP_DAC_OVERRIDE)' -- \
+  "${recovery}" >/dev/null; then
+  fail "${recovery}: jailer-only capabilities leaked into recovery mode"
+fi
 if grep -Ei '(token|password|secret)=' -- \
   "${controller_environment}" "${worker_environment}" >/dev/null; then
   fail 'deployment environment examples must not contain inline credentials'

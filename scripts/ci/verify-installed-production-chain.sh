@@ -486,6 +486,9 @@ assert_worker_ready() {
   done < <(find "${cgroup_root}" -name cgroup.procs -type f -exec awk 'NF { print }' {} + | sort -u)
   [[ "${worker_firecracker_pid}" =~ ^[1-9][0-9]*$ ]] \
     || fail "worker cgroup has no live Firecracker process: ${unit}"
+  [[ "$(stat -c '%u:%g' "/proc/${worker_firecracker_pid}")" == \
+      "${worker_uid}:${worker_gid}" ]] \
+    || fail "Firecracker did not retain the dedicated unprivileged identity: ${unit}"
 }
 
 wait_for_recovery() {

@@ -1155,9 +1155,15 @@ pub struct CommandSpec {
     /// executable memfd and executes that descriptor. The source path therefore cannot be swapped
     /// between verification and `execve`.
     expected_digest: Option<Sha256Digest>,
-    /// Whether the sealed helper must run with UID/GID 0 inside the caller's existing systemd
-    /// sandbox. Only the private veritysetup constructor can enable this.
-    run_as_root: bool,
+    /// Privilege transition permitted for this internally constructed command.
+    privilege: CommandPrivilege,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandPrivilege {
+    Inherit,
+    RootOneShot,
+    RootDroppingLauncher,
 }
 
 impl CommandSpec {
@@ -1188,7 +1194,7 @@ impl CommandSpec {
             program: program.into(),
             args: args.into_iter().collect(),
             expected_digest: None,
-            run_as_root: false,
+            privilege: CommandPrivilege::Inherit,
         }
     }
 
@@ -1202,7 +1208,7 @@ impl CommandSpec {
             program: artifact.path.clone(),
             args: args.into_iter().collect(),
             expected_digest: Some(artifact.digest),
-            run_as_root: false,
+            privilege: CommandPrivilege::Inherit,
         }
     }
 
@@ -1219,7 +1225,18 @@ impl CommandSpec {
             program: artifact.path.clone(),
             args: args.into_iter().collect(),
             expected_digest: Some(artifact.digest),
-            run_as_root: true,
+            privilege: CommandPrivilege::RootOneShot,
+        }
+    }
+
+    /// Creates the one elevated launcher that must drop to the configured jail identity before
+    /// it execs the long-lived process.
+    fn pinned_jailer(artifact: &PinnedArtifact, args: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            program: artifact.path.clone(),
+            args: args.into_iter().collect(),
+            expected_digest: Some(artifact.digest),
+            privilege: CommandPrivilege::RootDroppingLauncher,
         }
     }
 }
@@ -1240,6 +1257,10 @@ pub struct ProcessOwnership {
     pub firecracker_executable: PathBuf,
     /// Pinned digest expected from the executable copied into the jail.
     pub firecracker_digest: Sha256Digest,
+    /// Effective UID the jailer must install before executing Firecracker.
+    pub uid: u32,
+    /// Effective GID the jailer must install before executing Firecracker.
+    pub gid: u32,
 }
 
 /// Captured result of a short command.
@@ -2006,6 +2027,8 @@ struct OwnedCgroup {
     path: PathBuf,
     identity: ObjectIdentity,
     firecracker_digest: Sha256Digest,
+    uid: u32,
+    gid: u32,
 }
 
 impl RealCommandRunner {
@@ -2366,7 +2389,7 @@ fn seal_command_executable(
             )
         })
         .transpose()?;
-    if command.run_as_root {
+    if command.privilege != CommandPrivilege::Inherit {
         sealed
             .as_ref()
             .ok_or_else(|| {
@@ -2380,9 +2403,9 @@ fn seal_command_executable(
 }
 
 fn spawn_detached(command: &CommandSpec) -> Result<Child, RuntimeError> {
-    if command.run_as_root {
+    if command.privilege == CommandPrivilege::RootOneShot {
         return Err(RuntimeError::InvalidConfig(
-            "elevated helper commands cannot become long-lived children".to_owned(),
+            "elevated one-shot helper cannot become a long-lived child".to_owned(),
         ));
     }
     let sealed = seal_command_executable(command)?;
@@ -2401,7 +2424,19 @@ fn spawn_detached(command: &CommandSpec) -> Result<Child, RuntimeError> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
+    if command.privilege == CommandPrivilege::RootDroppingLauncher {
+        process.gid(0).uid(0);
+    }
     process.spawn().map_err(RuntimeError::from)
+}
+
+fn validate_one_shot_command(command: &CommandSpec) -> Result<(), RuntimeError> {
+    if command.privilege == CommandPrivilege::RootDroppingLauncher {
+        return Err(RuntimeError::InvalidConfig(
+            "root-dropping launcher must use owned-process supervision".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn open_owned_cgroup_file(
@@ -2476,13 +2511,23 @@ fn cgroup_tasks(ownership: &OwnedCgroup) -> Result<Vec<u32>, RuntimeError> {
 
 fn cgroup_has_firecracker(ownership: &OwnedCgroup, tasks: &[u32]) -> Result<bool, RuntimeError> {
     for pid in tasks {
-        let path = PathBuf::from(format!("/proc/{pid}/exe"));
-        let file = match File::open(&path) {
+        let process_path = PathBuf::from(format!("/proc/{pid}"));
+        let file = match File::open(process_path.join("exe")) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(RuntimeError::from(error)),
         };
         if digest_reader(file)? == ownership.firecracker_digest {
+            let metadata = match fs::metadata(&process_path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(RuntimeError::from(error)),
+            };
+            if metadata.uid() != ownership.uid || metadata.gid() != ownership.gid {
+                return Err(RuntimeError::Command(format!(
+                    "pinned Firecracker task {pid} retained an unexpected host identity"
+                )));
+            }
             return Ok(true);
         }
     }
@@ -2574,6 +2619,8 @@ fn observe_owned_cgroup(ownership: &ProcessOwnership) -> Result<Option<OwnedCgro
                 path: ownership.cgroup_path.clone(),
                 identity: ObjectIdentity::from_metadata(&metadata),
                 firecracker_digest: ownership.firecracker_digest,
+                uid: ownership.uid,
+                gid: ownership.gid,
             }))
         }
         Ok(_) => Err(RuntimeError::Command(format!(
@@ -2701,6 +2748,7 @@ fn stop_managed_child(
 
 impl CommandRunner for RealCommandRunner {
     fn run(&mut self, command: &CommandSpec) -> Result<CommandOutput, RuntimeError> {
+        validate_one_shot_command(command)?;
         let deadline = Instant::now() + self.command_timeout;
         let sealed = seal_command_executable(command)?;
         let program = sealed.as_ref().map_or(
@@ -2717,7 +2765,7 @@ impl CommandRunner for RealCommandRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
-        if command.run_as_root {
+        if command.privilege == CommandPrivilege::RootOneShot {
             process.gid(0).uid(0);
         }
         let mut command_child = CommandChild::new(process.spawn().map_err(RuntimeError::from)?);
@@ -6295,6 +6343,8 @@ where
                 cgroup_path: config.isolation.cgroup.path.clone(),
                 firecracker_executable: config.firecracker.path.clone(),
                 firecracker_digest: config.firecracker.digest,
+                uid: config.jailer_config.uid,
+                gid: config.jailer_config.gid,
             },
         )
     }
@@ -6337,7 +6387,7 @@ where
             "--seccomp-filter".to_owned(),
             seccomp_filter.display().to_string(),
         ];
-        Ok(CommandSpec::pinned(&config.jailer, args))
+        Ok(CommandSpec::pinned_jailer(&config.jailer, args))
     }
 
     fn bind_restored_workspace(&mut self, config: &RuntimeConfig) -> Result<(), RuntimeError> {
@@ -7871,6 +7921,7 @@ mod tests {
         cgroup: &Path,
         firecracker_executable: &Path,
     ) -> ProcessHandle {
+        let process_metadata = fs::metadata("/proc/self").expect("current process metadata");
         let launcher = spawn_detached(&CommandSpec::new(
             "/bin/sh",
             ["-c".to_owned(), "exit 0".to_owned()],
@@ -7888,6 +7939,8 @@ mod tests {
                     ),
                     firecracker_digest: digest_file(firecracker_executable)
                         .expect("fake Firecracker executable must be digestible"),
+                    uid: process_metadata.uid(),
+                    gid: process_metadata.gid(),
                 },
             },
         );
@@ -8168,6 +8221,7 @@ mod tests {
             .expect("valid jailer configuration must produce an argv");
 
         assert_eq!(command.program, Path::new("/artifacts/jailer"));
+        assert_eq!(command.privilege, CommandPrivilege::RootDroppingLauncher);
         assert_eq!(
             command.args,
             [
@@ -9011,6 +9065,27 @@ mod tests {
     }
 
     #[test]
+    fn elevated_command_modes_are_confined_to_their_supervision_paths() {
+        let artifact = PinnedArtifact::new(
+            "/bin/true",
+            digest_file(Path::new("/bin/true")).expect("true executable must be digestible"),
+        );
+        let one_shot = CommandSpec::pinned_veritysetup(&artifact, []);
+        assert!(matches!(
+            spawn_detached(&one_shot),
+            Err(RuntimeError::InvalidConfig(message))
+                if message.contains("one-shot helper")
+        ));
+
+        let launcher = CommandSpec::pinned_jailer(&artifact, []);
+        assert!(matches!(
+            RealCommandRunner::new().run(&launcher),
+            Err(RuntimeError::InvalidConfig(message))
+                if message.contains("owned-process supervision")
+        ));
+    }
+
+    #[test]
     fn sealed_command_executes_opened_bytes_after_source_replacement() {
         let directory = unique_test_path("sealed-command-replacement");
         fs::create_dir(&directory).expect("test directory must be creatable");
@@ -9066,6 +9141,27 @@ mod tests {
     }
 
     #[test]
+    fn owned_process_verification_rejects_root_or_wrong_identity_firecracker() {
+        let process_metadata = fs::metadata("/proc/self").expect("current process metadata");
+        let current_executable = std::env::current_exe().expect("test executable must resolve");
+        let ownership = OwnedCgroup {
+            path: PathBuf::from("/sys/fs/cgroup"),
+            identity: ObjectIdentity::from_metadata(
+                &fs::metadata("/sys/fs/cgroup").expect("cgroup root metadata"),
+            ),
+            firecracker_digest: digest_file(&current_executable)
+                .expect("test executable must be digestible"),
+            uid: process_metadata.uid().wrapping_add(1),
+            gid: process_metadata.gid(),
+        };
+        assert!(matches!(
+            cgroup_has_firecracker(&ownership, &[std::process::id()]),
+            Err(RuntimeError::Command(message))
+                if message.contains("unexpected host identity")
+        ));
+    }
+
+    #[test]
     fn owned_process_start_rejects_a_fake_cgroup_before_launch() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -9086,6 +9182,8 @@ mod tests {
                     firecracker_executable: PathBuf::from("/bin/sh"),
                     firecracker_digest: digest_file(Path::new("/bin/sh"))
                         .expect("test shell must be digestible"),
+                    uid: 0,
+                    gid: 0,
                 }
             ),
             Err(RuntimeError::Command(message)) if message.contains("not on cgroup v2")
@@ -9254,6 +9352,8 @@ mod tests {
                     ),
                     firecracker_digest: digest_file(Path::new("/bin/sleep"))
                         .expect("test executable must be digestible"),
+                    uid: 0,
+                    gid: 0,
                 },
             },
         );
@@ -9267,6 +9367,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // All child-table states share one admission boundary.
     fn command_runner_child_admission_is_bounded_and_recovers_after_stop() {
         let mut runner = RealCommandRunner::new();
         let mut direct_children = Vec::with_capacity(MAX_MANAGED_CHILDREN - 2);
@@ -9285,6 +9386,8 @@ mod tests {
             firecracker_executable: PathBuf::from("/bin/true"),
             firecracker_digest: digest_file(Path::new("/bin/true"))
                 .expect("test executable must be digestible"),
+            uid: 0,
+            gid: 0,
         };
         let pending_launcher = spawn_detached(&CommandSpec::new("/bin/sleep", ["30".to_owned()]))
             .expect("pending ownership fixture child must start");
@@ -9331,6 +9434,8 @@ mod tests {
                     cgroup_path: PathBuf::from("relative-cgroup"),
                     firecracker_executable: PathBuf::from("relative-firecracker"),
                     firecracker_digest: sha256(b"unused"),
+                    uid: 0,
+                    gid: 0,
                 },
             )
             .expect_err("owned admission must share the child limit");

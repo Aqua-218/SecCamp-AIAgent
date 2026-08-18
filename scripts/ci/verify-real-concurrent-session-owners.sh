@@ -8,5 +8,8 @@ set -euo pipefail
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly repository_root
 
-REAL_SESSION_TEST_NAME=real_production_two_session_owners_run_concurrently_and_clean_independently \
-  "${repository_root}/scripts/ci/verify-real-session-owner.sh"
+if ! REAL_SESSION_TEST_NAME=real_production_two_session_owners_run_concurrently_and_clean_independently \
+  "${repository_root}/scripts/ci/verify-real-session-owner.sh"; then
+  printf '%s\n' 'concurrent SessionOwner verification failed or its prerequisites are unavailable' >&2
+  exit 1
+fi

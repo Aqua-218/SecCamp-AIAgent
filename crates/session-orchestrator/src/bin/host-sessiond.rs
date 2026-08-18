@@ -141,18 +141,40 @@ fn run() -> Result<(), String> {
                 request,
             );
         }
-        if config.stop_file.exists() {
-            eprintln!(
-                "host-sessiond: stop file observed at {}; draining cleanup",
-                config.stop_file.display()
-            );
-            return drain_stop(
-                &mut runtime,
-                config.poll_interval,
-                config.shutdown_timeout,
-                &status,
-                ShutdownRequest::StopFile,
-            );
+        match stop_file_present(&config.stop_file) {
+            Ok(true) => {
+                eprintln!(
+                    "host-sessiond: stop file observed at {}; draining cleanup",
+                    config.stop_file.display()
+                );
+                return drain_stop(
+                    &mut runtime,
+                    config.poll_interval,
+                    config.shutdown_timeout,
+                    &status,
+                    ShutdownRequest::StopFile,
+                );
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!(
+                    "host-sessiond: stop file state is unavailable at {}; failing closed",
+                    config.stop_file.display()
+                );
+                let cleanup = drain_stop(
+                    &mut runtime,
+                    config.poll_interval,
+                    config.shutdown_timeout,
+                    &status,
+                    ShutdownRequest::StopFileUnavailable,
+                );
+                return match cleanup {
+                    Ok(()) => Err(format!("observing configured stop file: {error}")),
+                    Err(cleanup_error) => Err(format!(
+                        "observing configured stop file: {error}; cleanup also failed: {cleanup_error}"
+                    )),
+                };
+            }
         }
         match runtime.poll(OwnerPollRequest::Continue) {
             Ok(OwnerPollOutcome::Running(_)) => {
@@ -247,6 +269,7 @@ fn drain_stop(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownRequest {
     StopFile,
+    StopFileUnavailable,
     Sigterm,
     Sigint,
 }
@@ -255,9 +278,18 @@ impl ShutdownRequest {
     const fn label(self) -> &'static str {
         match self {
             Self::StopFile => "stop-file",
+            Self::StopFileUnavailable => "stop-file-unavailable",
             Self::Sigterm => "sigterm",
             Self::Sigint => "sigint",
         }
+    }
+}
+
+fn stop_file_present(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -1205,7 +1237,7 @@ mod tests {
         Arguments, MAX_SHUTDOWN_TIMEOUT_MILLIS, ShutdownRequest, file_authority, json_string,
         parse_branch_pattern, parse_cgroup_parent, parse_egress_profile, parse_file_effects,
         parse_github_operations, parse_hex_16, parse_http_methods, parse_path_prefix, status_line,
-        validate_absolute_path, validate_shutdown_timeout,
+        stop_file_present, validate_absolute_path, validate_shutdown_timeout,
     };
     use authority_core::{capability::AuthorityBody, repository::RepoId};
     use session_orchestrator::system_egress::GitHubEgressConfig;
@@ -1325,6 +1357,27 @@ mod tests {
         );
         assert!(validate_shutdown_timeout(MAX_SHUTDOWN_TIMEOUT_MILLIS).is_ok());
         assert!(validate_shutdown_timeout(MAX_SHUTDOWN_TIMEOUT_MILLIS + 1).is_err());
+    }
+
+    #[test]
+    fn stop_file_observation_distinguishes_absence_from_io_failure() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "host-sessiond-stop-file-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).expect("create stop-file fixture");
+        let stop = directory.join("stop");
+        assert!(!stop_file_present(&stop).expect("an absent stop file is observable"));
+        fs::write(&stop, b"stop").expect("create stop file");
+        assert!(stop_file_present(&stop).expect("a present stop file is observable"));
+
+        let not_a_directory = directory.join("not-a-directory");
+        fs::write(&not_a_directory, b"block traversal").expect("create traversal blocker");
+        assert!(stop_file_present(&not_a_directory.join("stop")).is_err());
+        fs::remove_dir_all(directory).expect("remove stop-file fixture");
     }
 
     #[test]

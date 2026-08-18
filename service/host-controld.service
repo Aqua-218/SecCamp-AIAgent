@@ -1,0 +1,61 @@
+[Unit]
+Description=Unprivileged authenticated Firecracker multi-session controller
+Documentation=https://github.com/Aqua-218/SecCamp-AIAgent
+After=local-fs.target dbus.service
+Wants=dbus.service
+ConditionPathExists=/etc/host-controld/controld.env
+ConditionPathExists=/etc/host-controld/control.key
+
+[Service]
+Type=simple
+User=host-controld
+Group=host-controld
+SupplementaryGroups=host-control
+EnvironmentFile=/etc/host-controld/controld.env
+StateDirectory=host-controld
+StateDirectoryMode=0750
+RuntimeDirectory=host-controld
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/bin/host-controld \
+  --socket /run/host-controld/control.sock \
+  --journal /var/lib/host-controld/control.journal \
+  --key-file /etc/host-controld/control.key \
+  --client-gid ${HOST_CONTROLD_CLIENT_GID} \
+  --systemctl /usr/bin/systemctl \
+  --systemctl-sha256 ${HOST_CONTROLD_SYSTEMCTL_SHA256} \
+  --max-sessions ${HOST_CONTROLD_MAX_SESSIONS} \
+  --max-sessions-per-principal ${HOST_CONTROLD_MAX_SESSIONS_PER_PRINCIPAL} \
+  --poll-millis ${HOST_CONTROLD_POLL_MILLIS}
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5min
+UMask=0027
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RemoveIPC=yes
+LimitNOFILE=1024
+LimitCORE=0
+KeyringMode=private
+ProtectProc=invisible
+ReadWritePaths=/var/lib/host-controld /run/host-controld
+
+[Install]
+WantedBy=multi-user.target

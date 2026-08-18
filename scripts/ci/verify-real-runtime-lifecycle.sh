@@ -168,6 +168,8 @@ REAL_FIRECRACKER_ROOTFS="${staging}/rootfs.squashfs" \
 REAL_FIRECRACKER_VERITY_HASH="${staging}/rootfs.hash" \
 REAL_FIRECRACKER_ROOT_HASH="${root_hash}" \
 REAL_FIRECRACKER_SECCOMP="${staging}/seccomp.bin" \
+REAL_FIRECRACKER_SECCOMP_POLICY="${staging}/seccomp.json" \
+REAL_FIRECRACKER_SECCOMP_COMPILER="${staging}/seccompiler" \
 REAL_VERITYSETUP="$(command -v veritysetup)" \
 REAL_WORKSPACE_FORMATTER="$(realpath -e -- "$(command -v mkfs.ext4)")" \
   cargo test \

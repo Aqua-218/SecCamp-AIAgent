@@ -19,7 +19,9 @@ use session_orchestrator::{
 };
 use zeroize::Zeroize;
 
-const IO_TIMEOUT: Duration = Duration::from_secs(2);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const START_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6 * 60);
+const STOP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(11 * 60);
 const MAX_RESPONSE_BYTES: usize = 18;
 
 fn main() -> ExitCode {
@@ -51,8 +53,12 @@ fn run() -> Result<(), String> {
     };
     let mut stream = UnixStream::connect(&socket)
         .map_err(|error| format!("connect {}: {error}", socket.display()))?;
-    stream.set_read_timeout(Some(IO_TIMEOUT)).ok();
-    stream.set_write_timeout(Some(IO_TIMEOUT)).ok();
+    stream
+        .set_read_timeout(Some(command.response_timeout()))
+        .map_err(|error| format!("set control response timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(WRITE_TIMEOUT))
+        .map_err(|error| format!("set control request timeout: {error}"))?;
     stream
         .write_all(&frame)
         .map_err(|error| format!("write control request: {error}"))?;
@@ -83,6 +89,15 @@ fn run() -> Result<(), String> {
 enum Command {
     Start,
     Stop(ControlSessionId),
+}
+
+impl Command {
+    const fn response_timeout(self) -> Duration {
+        match self {
+            Self::Start => START_RESPONSE_TIMEOUT,
+            Self::Stop(_) => STOP_RESPONSE_TIMEOUT,
+        }
+    }
 }
 
 fn parse_arguments(
@@ -199,5 +214,14 @@ mod tests {
         let mut extra = base.map(str::to_owned).to_vec();
         extra.push("extra".to_owned());
         assert!(parse_arguments(extra).is_err());
+    }
+
+    #[test]
+    fn response_timeouts_cover_the_systemd_worker_and_recovery_deadlines() {
+        assert_eq!(Command::Start.response_timeout(), Duration::from_secs(360));
+        assert_eq!(
+            Command::Stop(ControlSessionId::new([1; 16])).response_timeout(),
+            Duration::from_secs(660)
+        );
     }
 }

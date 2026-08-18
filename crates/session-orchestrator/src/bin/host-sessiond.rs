@@ -767,12 +767,15 @@ impl DaemonConfig {
             control_session,
         );
         let workspace_source = arguments.absolute_path("workspace-source")?;
-        let cgroup_parent = scoped_cgroup_parent(
-            &parse_cgroup_parent(&arguments.required("cgroup-parent")?)?,
-            control_session,
-        );
-        if control_session.is_some() {
-            verify_own_systemd_cgroup(&cgroup_parent)?;
+        let cgroup_base = parse_cgroup_parent(&arguments.required("cgroup-parent")?)?;
+        let cgroup_parent = scoped_cgroup_parent(&cgroup_base, control_session);
+        if let Some(control_session) = control_session {
+            let own_cgroup = if recover_only {
+                scoped_recovery_cgroup_parent(&cgroup_base, control_session)
+            } else {
+                cgroup_parent.clone()
+            };
+            verify_own_systemd_cgroup(&own_cgroup)?;
         }
         let firecracker_name = firecracker
             .path
@@ -1260,6 +1263,10 @@ fn scoped_cgroup_parent(base: &Path, instance: Option<ControlInstance>) -> PathB
     )
 }
 
+fn scoped_recovery_cgroup_parent(base: &Path, instance: ControlInstance) -> PathBuf {
+    base.join(format!("host-sessiond-recover@{}.service", instance.name()))
+}
+
 fn verify_own_systemd_cgroup(expected: &Path) -> Result<(), String> {
     let cgroup = fs::read_to_string("/proc/self/cgroup")
         .map_err(|error| format!("read own cgroup membership: {error}"))?;
@@ -1591,8 +1598,9 @@ mod tests {
         Arguments, ControlInstance, MAX_SHUTDOWN_TIMEOUT_MILLIS, ShutdownRequest, file_authority,
         json_string, parse_branch_pattern, parse_cgroup_parent, parse_egress_profile,
         parse_file_effects, parse_github_operations, parse_hex_16, parse_http_methods,
-        parse_path_prefix, scoped_file, scoped_jailer_directory, status_line, stop_file_present,
-        systemd_arguments, validate_absolute_path, validate_shutdown_timeout,
+        parse_path_prefix, scoped_cgroup_parent, scoped_file, scoped_jailer_directory,
+        scoped_recovery_cgroup_parent, status_line, stop_file_present, systemd_arguments,
+        validate_absolute_path, validate_shutdown_timeout,
     };
     use authority_core::{capability::AuthorityBody, repository::RepoId};
     use firecracker_runtime::firecracker_guest_port_path;
@@ -1634,6 +1642,23 @@ mod tests {
         assert_eq!(
             argument_value(&arguments, "--control-session-id"),
             Some("00112233445566778899aabbccddeeff")
+        );
+    }
+
+    #[test]
+    fn systemd_run_and_recovery_units_have_distinct_own_cgroups() {
+        let instance = ControlInstance::parse("00112233445566778899aabbccddeeff")
+            .expect("canonical systemd instance");
+        let base = Path::new("system.slice");
+        assert_eq!(
+            scoped_cgroup_parent(base, Some(instance)),
+            Path::new("system.slice/host-sessiond@00112233445566778899aabbccddeeff.service")
+        );
+        assert_eq!(
+            scoped_recovery_cgroup_parent(base, instance),
+            Path::new(
+                "system.slice/host-sessiond-recover@00112233445566778899aabbccddeeff.service"
+            )
         );
     }
 

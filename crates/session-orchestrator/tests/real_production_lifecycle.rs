@@ -10,8 +10,8 @@
 
 use std::{
     fs::{self, File},
-    io::Write,
-    os::unix::fs::PermissionsExt,
+    io::{self, Write},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -155,6 +155,43 @@ fn make_directory(path: &Path, mode: u32) {
         .unwrap_or_else(|error| panic!("cannot create {}: {error}", path.display()));
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .unwrap_or_else(|error| panic!("cannot set permissions on {}: {error}", path.display()));
+}
+
+fn export_snapshot_if_requested(snapshot_state: &Path, snapshot_memory: &Path) {
+    let Some(root) = std::env::var_os("REAL_SESSION_ARTIFACT_EXPORT_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    assert!(root.is_absolute(), "artifact export root must be absolute");
+    let metadata = fs::symlink_metadata(&root)
+        .expect("artifact export root must be created by the trusted wrapper");
+    assert!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == rustix::process::geteuid().as_raw()
+            && metadata.permissions().mode() & 0o022 == 0,
+        "artifact export root must be a secure directory owned by the test identity"
+    );
+    for (source, name) in [
+        (snapshot_state, "snapshot.state"),
+        (snapshot_memory, "snapshot.memory"),
+    ] {
+        let destination = root.join(name);
+        let mut input = File::open(source)
+            .unwrap_or_else(|error| panic!("cannot open snapshot export source: {error}"));
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .unwrap_or_else(|error| panic!("cannot create snapshot export {name}: {error}"));
+        io::copy(&mut input, &mut output)
+            .unwrap_or_else(|error| panic!("cannot copy snapshot export {name}: {error}"));
+        output
+            .sync_all()
+            .unwrap_or_else(|error| panic!("cannot sync snapshot export {name}: {error}"));
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o444))
+            .unwrap_or_else(|error| panic!("cannot protect snapshot export {name}: {error}"));
+    }
 }
 
 fn authority_grant() -> AuthorityRootGrant {
@@ -644,6 +681,8 @@ fn sole_cgroup_process(path: &Path) -> u32 {
 #[test]
 #[ignore = "requires root, KVM, cgroup-v2, dm-verity, AF_VSOCK, and two concurrent production guests"]
 #[allow(clippy::too_many_lines)]
+/// Enforces deploy/README.md "Snapshot provisioning": clones share snapshot-bound CID/ports
+/// while distinct jail-backed UDS paths keep both production transports independently live.
 fn real_production_two_session_owners_run_concurrently_and_clean_independently() {
     assert_eq!(
         std::env::var("REAL_SESSION_OWNER_LIFECYCLE").as_deref(),
@@ -666,8 +705,6 @@ fn real_production_two_session_owners_run_concurrently_and_clean_independently()
     make_directory(&first_root, 0o700);
     make_directory(&second_root, 0o700);
     let grant = authority_grant();
-    let second_guest_cid = GUEST_CID + 1;
-    let second_port = BROKER_PORT + 1;
     let (first_template, cgroup_parent, _) = runtime_profile(
         &first_root,
         &firecracker,
@@ -696,13 +733,13 @@ fn real_production_two_session_owners_run_concurrently_and_clean_independently()
         &seccomp,
         &seccomp_policy,
         &seccomp_compiler,
-        second_guest_cid,
-        second_port,
+        GUEST_CID,
+        BROKER_PORT,
         true,
     );
     assert_eq!(cgroup_parent, second_cgroup_parent);
     let (first_state, first_memory) = capture_clean_snapshot(&first_root, &first_template);
-    let (second_state, second_memory) = capture_clean_snapshot(&second_root, &second_template);
+    export_snapshot_if_requested(&first_state, &first_memory);
     let (mut first, first_broker_root) = build_real_production_runtime(
         &first_root.join("d"),
         first_template.clone(),
@@ -720,11 +757,11 @@ fn real_production_two_session_owners_run_concurrently_and_clean_independently()
     let (mut second, second_broker_root) = build_real_production_runtime(
         &second_root.join("d"),
         second_template.clone(),
-        &second_state,
-        &second_memory,
+        &first_state,
+        &first_memory,
         0xb2,
-        second_guest_cid,
-        second_port,
+        GUEST_CID,
+        BROKER_PORT,
         &kernel,
         &seccomp,
         &veritysetup,
@@ -859,6 +896,7 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
     );
     let (snapshot_state, snapshot_memory) =
         capture_clean_snapshot(staging.path(), &template_runtime);
+    export_snapshot_if_requested(&snapshot_state, &snapshot_memory);
     eprintln!("real session-owner phase: clean snapshot captured");
 
     let snapshot_id = session_orchestrator::SnapshotId::new([0xa5; session_orchestrator::ID_BYTES]);

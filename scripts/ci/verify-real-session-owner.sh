@@ -156,6 +156,9 @@ cleanup_state="${staging}/cleanup-state"
 cleanup_cgroup_parent="/sys/fs/cgroup/session-owner-real-ci-$$"
 cleanup_mapper_base="session-owner-real-ci-$$"
 test_root=''
+artifact_export_root="${REAL_SESSION_ARTIFACT_EXPORT_ROOT:-}"
+artifact_export_created=0
+artifact_export_complete=0
 
 remove_mapper() {
   local mapper="$1"
@@ -248,8 +251,24 @@ cleanup() {
     rm -rf -- "${test_root}"
   fi
   rm -rf -- "${staging}"
+  if [[ "${artifact_export_created}" -eq 1 && "${artifact_export_complete}" -ne 1 ]]; then
+    rm -rf -- "${artifact_export_root}"
+  fi
 }
 trap cleanup EXIT
+
+if [[ -n "${artifact_export_root}" ]]; then
+  [[ "${artifact_export_root}" == /* && "${artifact_export_root}" != / \
+    && "${artifact_export_root##*/}" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || fail 'REAL_SESSION_ARTIFACT_EXPORT_ROOT must be a safe absolute non-root path'
+  artifact_export_parent="${artifact_export_root%/*}"
+  [[ -n "${artifact_export_parent}" ]] || artifact_export_parent=/
+  assert_private_directory_chain "${artifact_export_parent}"
+  [[ ! -e "${artifact_export_root}" && ! -L "${artifact_export_root}" ]] \
+    || fail 'REAL_SESSION_ARTIFACT_EXPORT_ROOT must be absent before the gate'
+  install -d -o root -g root -m 0700 -- "${artifact_export_root}"
+  artifact_export_created=1
+fi
 
 # The published Ubuntu image is useful for broad guest-control verification, but it is too large
 # for RuntimeConfig's bounded artifact reader once the supervisor and isolation binaries are
@@ -348,6 +367,45 @@ run_lifecycle() {
     "${test_name}"
 }
 
+export_installed_chain_artifacts() {
+  [[ -n "${artifact_export_root}" ]] || return 0
+  for snapshot in snapshot.state snapshot.memory; do
+    [[ -f "${artifact_export_root}/${snapshot}" && ! -L "${artifact_export_root}/${snapshot}" ]] \
+      || fail "real lifecycle did not export ${snapshot}"
+  done
+  install -o root -g root -m 0555 -- "${firecracker}" "${artifact_export_root}/firecracker"
+  install -o root -g root -m 0555 -- "${jailer}" "${artifact_export_root}/jailer"
+  install -o root -g root -m 0555 -- "${staging}/seccompiler" "${artifact_export_root}/seccompiler"
+  install -o root -g root -m 0444 -- "${kernel}" "${artifact_export_root}/vmlinux"
+  install -o root -g root -m 0444 -- "${image_rootfs}" "${artifact_export_root}/rootfs.squashfs"
+  install -o root -g root -m 0444 -- "${image_hash}" "${artifact_export_root}/rootfs.verity"
+  install -o root -g root -m 0444 -- "${staging}/seccomp.bin" "${artifact_export_root}/seccomp.bin"
+  install -o root -g root -m 0444 -- "${staging}/seccomp.json" "${artifact_export_root}/seccomp.json"
+  printf '%s\n' "${root_hash}" >"${artifact_export_root}/rootfs.root-hash"
+  chmod 0444 -- "${artifact_export_root}/rootfs.root-hash"
+  (
+    cd -- "${artifact_export_root}"
+    sha256sum \
+      firecracker \
+      jailer \
+      seccompiler \
+      vmlinux \
+      rootfs.squashfs \
+      rootfs.verity \
+      seccomp.bin \
+      seccomp.json \
+      snapshot.state \
+      snapshot.memory \
+      rootfs.root-hash >SHA256SUMS
+    chmod 0444 SHA256SUMS
+    sha256sum --check --strict SHA256SUMS
+  )
+  artifact_export_complete=1
+  chmod 0555 -- "${artifact_export_root}"
+  printf 'real session-owner lifecycle: exported installed-chain artifacts to %s\n' \
+    "${artifact_export_root}"
+}
+
 run_crash_case() {
   local checkpoint="$1"
   # The production Broker and Firecracker vsock endpoints are Unix sockets.
@@ -397,6 +455,8 @@ run_crash_case() {
 }
 
 if [[ "${REAL_SESSION_CRASH_MATRIX:-0}" == 1 ]]; then
+  [[ -z "${artifact_export_root}" ]] \
+    || fail 'REAL_SESSION_ARTIFACT_EXPORT_ROOT cannot be combined with REAL_SESSION_CRASH_MATRIX'
   [[ -z "${REAL_SESSION_TEST_NAME:-}" ]] \
     || fail 'REAL_SESSION_TEST_NAME cannot be combined with REAL_SESSION_CRASH_MATRIX'
   requested_checkpoint="${REAL_SESSION_CRASH_MATRIX_CASE:-}"
@@ -424,4 +484,5 @@ if [[ "${REAL_SESSION_CRASH_MATRIX:-0}" == 1 ]]; then
   printf '%s\n' 'real session-owner crash recovery: every lifecycle checkpoint recovered without residue'
 else
   run_lifecycle '' '' ''
+  export_installed_chain_artifacts
 fi

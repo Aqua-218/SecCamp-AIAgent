@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # Reuses the pinned production guest-image preparation and selects the dedicated two-KVM-owner
-# test. Both owners remain live together, use distinct CID/port/cgroup/process resources, and are
-# stopped independently.
+# test. Both owners remain live together, reuse the snapshot-bound guest CID/ports through
+# distinct jail-backed UDS paths, use distinct cgroup/process resources, and stop independently.
 
 set -euo pipefail
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"

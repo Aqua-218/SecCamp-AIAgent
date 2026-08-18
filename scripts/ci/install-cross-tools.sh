@@ -17,8 +17,18 @@ if ! command -v yq > /dev/null 2>&1; then
   exit 1
 fi
 
+invalid_package_sets="$(
+  yq eval \
+    '[.matrices.cross_targets.values[] | select((.debian_packages | type) != "!!seq" or (.debian_packages | length) == 0)] | length' \
+    ci/gates.yml
+)"
+if [[ "${invalid_package_sets}" -ne 0 ]]; then
+  printf 'every cross target must declare a non-empty debian_packages list\n' >&2
+  exit 1
+fi
+
 mapfile -t packages < <(
-  yq eval '.matrices.cross_targets.values[].debian_package' ci/gates.yml | sort -u
+  yq eval '.matrices.cross_targets.values[].debian_packages[]' ci/gates.yml | sort -u
 )
 mapfile -t compilers < <(
   yq eval '.matrices.cross_targets.values[].cc' ci/gates.yml | sort -u
@@ -44,6 +54,15 @@ fi
 for compiler in "${compilers[@]}"; do
   if ! command -v "${compiler}" > /dev/null 2>&1; then
     printf 'installed package set did not provide required compiler %s\n' "${compiler}" >&2
+    exit 1
+  fi
+
+  # A cross GCC can exist without its target libc development headers when apt
+  # recommendations are disabled. Native crates such as ring then resolve the
+  # host stdint.h and fail later with a misleading missing bits/ header.
+  if ! printf '#include <stdint.h>\n' | "${compiler}" -x c -fsyntax-only -; then
+    printf 'installed package set did not provide usable target C headers for %s\n' \
+      "${compiler}" >&2
     exit 1
   fi
 done

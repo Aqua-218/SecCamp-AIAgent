@@ -124,21 +124,24 @@ matrices:
     source: packages
 
   # `cargo check` does not link the final Rust binaries, but native build scripts
-  # (notably ring's C/assembly boundary) still need a target C compiler. Keep the
-  # Debian package and compiler name beside the triple so both CI platforms use
-  # the same toolchain contract. deny.toml carries the same triples for its
-  # advisory graph.
+  # (notably ring's C/assembly boundary) still need a target C compiler and its
+  # target libc headers. Keep the complete Debian package set and compiler name
+  # beside the triple so both CI platforms use the same toolchain contract.
+  # deny.toml carries the same triples for its advisory graph.
   cross_targets:
     values:
       - triple: aarch64-unknown-linux-gnu
         cc: aarch64-linux-gnu-gcc
         linker: aarch64-linux-gnu-gcc
-        debian_package: gcc-aarch64-linux-gnu
+        debian_packages:
+          - gcc-aarch64-linux-gnu
+          - libc6-dev-arm64-cross
         why: Non-x86 host support for the supervisor and authority kernel.
       - triple: x86_64-unknown-linux-musl
         cc: musl-gcc
         linker: musl-gcc
-        debian_package: musl-tools
+        debian_packages:
+          - musl-tools
         why: Static-linkage target; catches glibc-only assumptions in the syscall layer.
 
   # Miri interprets Rust; it cannot execute the real syscalls that the isolation

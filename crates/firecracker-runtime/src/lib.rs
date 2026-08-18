@@ -87,6 +87,8 @@ const ID_LENGTH: usize = 16;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const GUEST_CONTROL_RETRY_TIMEOUT: Duration = Duration::from_secs(50);
+const GUEST_CONTROL_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
 
 /// A SHA-256 digest used to pin every executable and guest artifact.
@@ -2377,27 +2379,48 @@ fn stop_owned_cgroup(
             ownership.path.display()
         )));
     }
-    let metadata = fs::symlink_metadata(&ownership.path).map_err(RuntimeError::from)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || ObjectIdentity::from_metadata(&metadata) != ownership.identity
-    {
-        return Err(RuntimeError::Command(format!(
-            "owned cgroup was replaced before removal: {}",
-            ownership.path.display()
-        )));
-    }
     if statfs(&ownership.path)
         .map_err(|error| RuntimeError::Io(error.to_string()))?
         .f_type
         == CGROUP2_SUPER_MAGIC
     {
-        fs::remove_dir(&ownership.path).map_err(|error| {
-            RuntimeError::Command(format!(
-                "removing owned cgroup {} failed: {error}",
-                ownership.path.display()
-            ))
-        })?;
+        // A task can have left cgroup.procs while the kernel is still releasing
+        // the cgroup's internal references. In that narrow interval rmdir(2)
+        // returns EBUSY. Retry only that transient error within the caller's
+        // existing stop deadline, revalidating both identity and emptiness on
+        // every attempt so replacement or task migration still fails closed.
+        loop {
+            let metadata = fs::symlink_metadata(&ownership.path).map_err(RuntimeError::from)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || ObjectIdentity::from_metadata(&metadata) != ownership.identity
+            {
+                return Err(RuntimeError::Command(format!(
+                    "owned cgroup was replaced before removal: {}",
+                    ownership.path.display()
+                )));
+            }
+            if !cgroup_tasks(ownership)?.is_empty() {
+                return Err(RuntimeError::Command(format!(
+                    "owned cgroup {} gained a live task during removal",
+                    ownership.path.display()
+                )));
+            }
+            match fs::remove_dir(&ownership.path) {
+                Ok(()) => break,
+                Err(error)
+                    if error.kind() == io::ErrorKind::ResourceBusy && Instant::now() < deadline =>
+                {
+                    thread::sleep(PROCESS_POLL_INTERVAL);
+                }
+                Err(error) => {
+                    return Err(RuntimeError::Command(format!(
+                        "removing owned cgroup {} failed: {error}",
+                        ownership.path.display()
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -6085,7 +6108,26 @@ where
         request: ApiRequest,
         expected_ack: &str,
     ) -> Result<(), RuntimeError> {
-        let response = self.guest_client.request(&request)?;
+        // Firecracker can acknowledge the host-side CONNECT just before the
+        // restored guest listener is ready, then reset the stream while the
+        // HTTP request is being written. Identity injection and workload start
+        // are exact-retry operations in the guest state machine, so replay the
+        // identical request after transport-only failures within one bounded
+        // readiness window. Protocol, status, and identity errors are never
+        // retried.
+        let deadline = Instant::now() + GUEST_CONTROL_RETRY_TIMEOUT;
+        let response = loop {
+            match self.guest_client.request(&request) {
+                Ok(response) => break response,
+                Err(error @ RuntimeError::Io(_)) => {
+                    if Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    thread::sleep(GUEST_CONTROL_RETRY_INTERVAL);
+                }
+                Err(error) => return Err(error),
+            }
+        };
         if !(200..300).contains(&response.status) {
             return Err(RuntimeError::ApiStatus {
                 path: request.path,
@@ -7143,6 +7185,7 @@ mod tests {
     struct LifecycleApi {
         label: &'static str,
         events: Rc<RefCell<Vec<String>>>,
+        errors: VecDeque<RuntimeError>,
         statuses: VecDeque<u16>,
         response_bodies: VecDeque<String>,
     }
@@ -7153,6 +7196,9 @@ mod tests {
                 "{}:{:?}:{}:{}",
                 self.label, request.method, request.path, request.body
             ));
+            if let Some(error) = self.errors.pop_front() {
+                return Err(error);
+            }
             let body = self.response_bodies.pop_front().unwrap_or_else(|| {
                 let acknowledgement = match request.path.as_str() {
                     "/actions/inject-identity" => Some("identity-injected"),
@@ -7324,12 +7370,14 @@ mod tests {
                 LifecycleApi {
                     label: "firecracker",
                     events: Rc::clone(&events),
+                    errors: VecDeque::new(),
                     statuses: api_statuses.into_iter().collect(),
                     response_bodies: VecDeque::new(),
                 },
                 LifecycleApi {
                     label: "guest",
                     events: Rc::clone(&events),
+                    errors: VecDeque::new(),
                     statuses: guest_statuses.into_iter().collect(),
                     response_bodies: VecDeque::new(),
                 },
@@ -7770,12 +7818,14 @@ mod tests {
             LifecycleApi {
                 label: "firecracker",
                 events: Rc::clone(&events),
+                errors: VecDeque::new(),
                 statuses: VecDeque::new(),
                 response_bodies: VecDeque::new(),
             },
             LifecycleApi {
                 label: "guest",
                 events: Rc::clone(&events),
+                errors: VecDeque::new(),
                 statuses: VecDeque::new(),
                 response_bodies: VecDeque::new(),
             },
@@ -8078,6 +8128,36 @@ mod tests {
             .position(|event| event.contains("guest:Put:/actions/start-workload:"))
             .expect("workload start must be separately acknowledged");
         assert!(resume < inject && inject < start);
+    }
+
+    #[test]
+    fn identity_injection_retries_the_exact_request_after_a_transport_reset() {
+        let config = test_config();
+        let (mut runtime, events) = lifecycle_runtime([], []);
+        let snapshot = runtime
+            .verify_snapshot(&config, test_snapshot(&config))
+            .expect("test snapshot provenance must verify");
+        let mut instance = runtime
+            .restore(&config, &snapshot)
+            .expect("restore must remain paused");
+        runtime
+            .guest_client
+            .errors
+            .push_back(RuntimeError::Io("injected transport reset".to_owned()));
+
+        runtime
+            .inject_identity(&mut instance)
+            .expect("the exact idempotent request must survive one transport reset");
+        assert_eq!(instance.state(), RuntimeState::IdentityInjected);
+
+        let injection_events: Vec<_> = events
+            .borrow()
+            .iter()
+            .filter(|event| event.contains("guest:Put:/actions/inject-identity:"))
+            .cloned()
+            .collect();
+        assert_eq!(injection_events.len(), 2);
+        assert_eq!(injection_events[0], injection_events[1]);
     }
 
     #[test]

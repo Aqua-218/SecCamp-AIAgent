@@ -73,6 +73,7 @@ pub struct firecracker_runtime::guest_control::GuestControlServer
 impl firecracker_runtime::guest_control::GuestControlServer
 pub fn firecracker_runtime::guest_control::GuestControlServer::handle(&mut self, &str, &str, &[u8]) -> firecracker_runtime::guest_control::GuestControlHttpResponse
 pub const fn firecracker_runtime::guest_control::GuestControlServer::new() -> Self
+pub const fn firecracker_runtime::guest_control::GuestControlServer::new_bound_only() -> Self
 pub fn firecracker_runtime::guest_control::GuestControlServer::serve_once<S: std::io::Read + std::io::Write>(&mut self, &mut S) -> core::result::Result<firecracker_runtime::guest_control::GuestControlHttpResponse, firecracker_runtime::guest_control::GuestControlIoError>
 pub fn firecracker_runtime::guest_control::GuestControlServer::serve_once_with<S: std::io::Read + std::io::Write, F>(&mut self, &mut S, F) -> core::result::Result<firecracker_runtime::guest_control::GuestControlHttpResponse, firecracker_runtime::guest_control::GuestControlIoError> where F: core::ops::function::FnOnce() -> std::io::error::Result<()>
 pub fn firecracker_runtime::guest_control::GuestControlServer::serve_once_with_identity<S: std::io::Read + std::io::Write, F>(&mut self, &mut S, F) -> core::result::Result<firecracker_runtime::guest_control::GuestControlHttpResponse, firecracker_runtime::guest_control::GuestControlIoError> where F: core::ops::function::FnOnce(&firecracker_runtime::guest_control::GuestControlRequest) -> std::io::error::Result<()>

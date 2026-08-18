@@ -587,6 +587,10 @@ impl LinuxHostResources {
         if rustix::process::geteuid().as_raw() != 0 {
             return Err(LinuxHostError::SupervisorNotRoot);
         }
+        Self::new_after_privilege_check(config)
+    }
+
+    fn new_after_privilege_check(config: LinuxHostConfig) -> Result<Self, LinuxHostError> {
         validate_owned_directory(&config.cgroup_parent)?;
         validate_owned_directory(&config.control_socket_directory)?;
         validate_absolute_lexical_path(&config.workload_program)?;
@@ -1077,6 +1081,7 @@ mod tests {
     }
 
     struct Fixture {
+        root: PathBuf,
         cgroup_parent: PathBuf,
         socket_directory: PathBuf,
     }
@@ -1095,18 +1100,22 @@ mod tests {
     }
 
     impl Fixture {
-        /// Returns a fixture, or `None` on a host without a writable cgroup v2 hierarchy.
-        fn new(label: &str) -> Option<Self> {
-            let cgroup_parent = Path::new("/sys/fs/cgroup").join(unique(label));
-            if fs::create_dir(&cgroup_parent).is_err() {
-                return None;
-            }
-            let socket_directory = std::env::temp_dir().join(unique(label));
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(unique(label));
+            let cgroup_parent = root.join("cgroup");
+            let socket_directory = root.join("control");
+            fs::create_dir(&root).expect("fixture root must be creatable");
+            fs::create_dir(&cgroup_parent).expect("cgroup fixture must be creatable");
             fs::create_dir(&socket_directory).expect("socket directory must be creatable");
-            Some(Self {
+            fs::set_permissions(&cgroup_parent, fs::Permissions::from_mode(0o700))
+                .expect("cgroup fixture must be private");
+            fs::set_permissions(&socket_directory, fs::Permissions::from_mode(0o700))
+                .expect("socket fixture must be private");
+            Self {
+                root,
                 cgroup_parent,
                 socket_directory,
-            })
+            }
         }
 
         fn config(&self, program: &str, arguments: &[&str]) -> LinuxHostConfig {
@@ -1126,8 +1135,7 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            drop(fs::remove_dir_all(&self.socket_directory));
-            drop(fs::remove_dir(&self.cgroup_parent));
+            drop(fs::remove_dir_all(&self.root));
         }
     }
 
@@ -1244,11 +1252,10 @@ mod tests {
 
     #[test]
     fn one_subject_owns_at_most_one_cgroup_and_control_socket() {
-        let Some(fixture) = Fixture::new("exclusive") else {
-            return;
-        };
-        let mut host = LinuxHostResources::new(fixture.config("/bin/true", &[]))
-            .expect("validated host config must build");
+        let fixture = Fixture::new("exclusive");
+        let mut host =
+            LinuxHostResources::new_after_privilege_check(fixture.config("/bin/true", &[]))
+                .expect("validated host config must build");
         let subject = SubjectId::new("subject-a");
 
         let ResourceAcquisition::Acquired(cgroup) = host.create_cgroup(&subject) else {
@@ -1286,11 +1293,10 @@ mod tests {
 
     #[test]
     fn control_socket_cleanup_retains_token_until_stale_node_is_removed() {
-        let Some(fixture) = Fixture::new("control-retry") else {
-            return;
-        };
-        let mut host = LinuxHostResources::new(fixture.config("/bin/true", &[]))
-            .expect("validated host config must build");
+        let fixture = Fixture::new("control-retry");
+        let mut host =
+            LinuxHostResources::new_after_privilege_check(fixture.config("/bin/true", &[]))
+                .expect("validated host config must build");
         let subject = SubjectId::new("subject-a");
         let ResourceAcquisition::Acquired(control) = host.open_control_fd(&subject) else {
             panic!("control socket must bind");
@@ -1331,11 +1337,10 @@ mod tests {
 
     #[test]
     fn a_workload_cannot_borrow_another_subjects_tokens() {
-        let Some(fixture) = Fixture::new("foreign") else {
-            return;
-        };
-        let mut host = LinuxHostResources::new(fixture.config("/bin/true", &[]))
-            .expect("validated host config must build");
+        let fixture = Fixture::new("foreign");
+        let mut host =
+            LinuxHostResources::new_after_privilege_check(fixture.config("/bin/true", &[]))
+                .expect("validated host config must build");
         let owner = SubjectId::new("subject-a");
         let other = SubjectId::new("subject-b");
 
@@ -1363,11 +1368,10 @@ mod tests {
 
     #[test]
     fn subject_names_that_could_escape_their_directory_are_refused() {
-        let Some(fixture) = Fixture::new("names") else {
-            return;
-        };
-        let mut host = LinuxHostResources::new(fixture.config("/bin/true", &[]))
-            .expect("validated host config must build");
+        let fixture = Fixture::new("names");
+        let mut host =
+            LinuxHostResources::new_after_privilege_check(fixture.config("/bin/true", &[]))
+                .expect("validated host config must build");
 
         for name in ["../escape", "with/slash", "", ".hidden", "with space"] {
             let subject = SubjectId::new(name);
@@ -1383,11 +1387,10 @@ mod tests {
 
     #[test]
     fn handles_are_tracked_per_subject_and_close_is_idempotent() {
-        let Some(fixture) = Fixture::new("handles") else {
-            return;
-        };
-        let mut host = LinuxHostResources::new(fixture.config("/bin/true", &[]))
-            .expect("validated host config must build");
+        let fixture = Fixture::new("handles");
+        let mut host =
+            LinuxHostResources::new_after_privilege_check(fixture.config("/bin/true", &[]))
+                .expect("validated host config must build");
         let subject = SubjectId::new("subject-a");
         let handle = HandleId::new("handle-1");
 

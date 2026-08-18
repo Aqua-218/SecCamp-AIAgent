@@ -216,9 +216,10 @@ pub firecracker_runtime::CommandOutput::status: i32
 pub firecracker_runtime::CommandOutput::stderr: alloc::vec::Vec<u8>
 pub firecracker_runtime::CommandOutput::stdout: alloc::vec::Vec<u8>
 pub struct firecracker_runtime::CommandSpec
-pub firecracker_runtime::CommandSpec::args: alloc::vec::Vec<alloc::string::String>
-pub firecracker_runtime::CommandSpec::expected_digest: core::option::Option<firecracker_runtime::Sha256Digest>
-pub firecracker_runtime::CommandSpec::program: std::path::PathBuf
+impl firecracker_runtime::CommandSpec
+pub fn firecracker_runtime::CommandSpec::arguments(&self) -> &[alloc::string::String]
+pub const fn firecracker_runtime::CommandSpec::expected_digest(&self) -> core::option::Option<firecracker_runtime::Sha256Digest>
+pub fn firecracker_runtime::CommandSpec::program(&self) -> &std::path::Path
 pub struct firecracker_runtime::DmVerityConfig
 pub firecracker_runtime::DmVerityConfig::data_device: std::path::PathBuf
 pub firecracker_runtime::DmVerityConfig::hash_device: std::path::PathBuf

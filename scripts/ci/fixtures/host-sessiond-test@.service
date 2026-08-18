@@ -1,0 +1,19 @@
+[Unit]
+Description=Ephemeral host-controld process-boundary probe %i
+
+[Service]
+Type=simple
+User=daemon
+Group=daemon
+ExecStart=/usr/bin/sleep infinity
+Restart=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+

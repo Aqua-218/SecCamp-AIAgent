@@ -21,8 +21,21 @@ readonly downloads="${tools_root}/downloads"
 current_uid="$(id -u)"
 readonly current_uid
 
-readonly firecracker_version="1.16.1"
-readonly firecracker_sha256="382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6"
+firecracker_version="${FIRECRACKER_VERSION:-1.16.1}"
+case "${firecracker_version}" in
+  1.16.1)
+    firecracker_sha256="382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6"
+    ;;
+  1.15.1)
+    firecracker_sha256="d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a"
+    ;;
+  *)
+    printf 'install-firecracker: unsupported unpinned FIRECRACKER_VERSION: %s\n' \
+      "${firecracker_version}" >&2
+    exit 2
+    ;;
+esac
+readonly firecracker_version firecracker_sha256
 readonly firecracker_archive="${downloads}/firecracker-v${firecracker_version}-x86_64.tgz"
 readonly firecracker_url="https://github.com/firecracker-microvm/firecracker/releases/download/v${firecracker_version}/firecracker-v${firecracker_version}-x86_64.tgz"
 readonly install_root="${tools_root}/firecracker/v${firecracker_version}"

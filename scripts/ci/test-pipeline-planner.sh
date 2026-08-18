@@ -59,6 +59,8 @@ expect_status 'pull request' coverage required "${pull_request_plan}"
 expect_status 'pull request' real_vm skipped "${pull_request_plan}"
 expect_status 'pull request' real_runtime_lifecycle skipped "${pull_request_plan}"
 expect_status 'pull request' session_owner_kvm skipped "${pull_request_plan}"
+expect_status 'pull request' systemd_control_plane skipped "${pull_request_plan}"
+expect_status 'pull request' concurrent_session_owners skipped "${pull_request_plan}"
 expect_status 'pull request' real_capfs skipped "${pull_request_plan}"
 expect_status 'pull request' egress_real_https skipped "${pull_request_plan}"
 expect_status 'pull request' external_provider_smoke skipped "${pull_request_plan}"
@@ -69,6 +71,8 @@ schedule_plan="$(plan_for PLAN_EVENT=schedule PLAN_PLATFORM=github)"
 expect_status 'schedule' real_vm required "${schedule_plan}"
 expect_status 'schedule' real_runtime_lifecycle required "${schedule_plan}"
 expect_status 'schedule' session_owner_kvm required "${schedule_plan}"
+expect_status 'schedule' systemd_control_plane required "${schedule_plan}"
+expect_status 'schedule' concurrent_session_owners required "${schedule_plan}"
 expect_status 'schedule' real_capfs required "${schedule_plan}"
 expect_status 'schedule' egress_real_https required "${schedule_plan}"
 expect_status 'schedule' external_provider_smoke skipped "${schedule_plan}"
@@ -88,6 +92,8 @@ expect_status 'GitLab API pipeline' external_provider_smoke required "${gitlab_a
 deep_workflow_plan="$(PLAN_EVENT=schedule PLAN_PLATFORM=github \
   "${repository_root}/scripts/ci/plan-pipeline.sh" --workflow deep.yml)"
 expect_status 'deep workflow' session_owner_kvm required "${deep_workflow_plan}"
+expect_status 'deep workflow' systemd_control_plane required "${deep_workflow_plan}"
+expect_status 'deep workflow' concurrent_session_owners required "${deep_workflow_plan}"
 
 # ------------------------------------------------------ platform availability --
 

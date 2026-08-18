@@ -253,13 +253,27 @@ fn wait_for_guest_vsock(vsock: &Path) {
         let mut client = client
             .with_timeout(Duration::from_millis(200))
             .expect("test endpoint timeout must be valid");
-        let request = guest_request();
+        let request = bound_guest_request();
         match client.request(&ApiRequest {
             method: HttpMethod::Put,
-            path: GuestControlAction::StartWorkload.path().to_owned(),
-            body: request.canonical_body(),
+            path: GuestControlAction::StartWorkloadBound.path().to_owned(),
+            body: request.canonical_bound_body(),
         }) {
-            Ok(response) if response.status == 409 => return,
+            Ok(response) if response.status == 409 => {
+                let legacy = guest_request();
+                let legacy_response = client
+                    .request(&ApiRequest {
+                        method: HttpMethod::Put,
+                        path: GuestControlAction::StartWorkload.path().to_owned(),
+                        body: legacy.canonical_body(),
+                    })
+                    .expect("production guest control must answer the legacy-path probe");
+                assert_eq!(
+                    legacy_response.status, 404,
+                    "production guest control must hide the legacy unbound endpoint"
+                );
+                return;
+            }
             Err(RuntimeError::Io(_) | RuntimeError::Api(_)) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -490,21 +504,24 @@ fn real_firecracker_guest_cgroup_v2_exposes_required_controllers() {
     );
 
     wait_for_guest_vsock(&vsock);
-    let request = guest_request();
+    let request = bound_guest_request();
     let mut client = FirecrackerVsockApiClient::new(&vsock, GUEST_CID, GUEST_CONTROL_PORT)
         .expect("exact real guest endpoint must be valid");
     for action in [
-        GuestControlAction::InjectIdentity,
-        GuestControlAction::StartWorkload,
+        GuestControlAction::InjectIdentityBound,
+        GuestControlAction::StartWorkloadBound,
     ] {
         let response = client
             .request(&ApiRequest {
                 method: HttpMethod::Put,
                 path: action.path().to_owned(),
-                body: request.canonical_body(),
+                body: request.canonical_bound_body(),
             })
             .expect("guest identity action must reach the real guest");
-        assert_eq!(response.body, request.canonical_acknowledgement(action));
+        assert_eq!(
+            response.body,
+            request.canonical_bound_acknowledgement(action)
+        );
     }
 
     let marker = "cgroup-probe-controllers: ";

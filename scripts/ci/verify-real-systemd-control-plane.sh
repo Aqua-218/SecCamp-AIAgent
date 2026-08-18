@@ -177,38 +177,36 @@ kill -0 -- "${failed_resource_pid}"
 grep -Fq "/host-sessiond@${session_failed}.service" \
   "/proc/${failed_resource_pid}/cgroup"
 kill -KILL -- "${failed_pid}"
-recovery_started='0'
 recovery_result=''
 recovery_status=''
+recovery_marker=''
 for _attempt in {1..100}; do
-  recovery_started="$(systemctl show --property=ExecMainStartTimestampMonotonic --value \
-    "host-sessiond-recover@${session_failed}.service")"
   recovery_result="$(systemctl show --property=Result --value \
     "host-sessiond-recover@${session_failed}.service")"
   recovery_status="$(systemctl show --property=ExecMainStatus --value \
     "host-sessiond-recover@${session_failed}.service")"
+  if [[ -f "${test_runtime}/state/${session_failed}.recovered" ]]; then
+    recovery_marker="$(<"${test_runtime}/state/${session_failed}.recovered")"
+  fi
   if [[ "$(systemctl is-active "host-sessiond@${session_failed}.service" || true)" == failed \
-    && "${recovery_started}" =~ ^[1-9][0-9]*$ \
     && "${recovery_result}" == success \
     && "${recovery_status}" == 0 \
-    && -f "${test_runtime}/state/${session_failed}.recovered" ]] \
+    && "${recovery_marker}" == "${session_failed}" ]] \
     && ! kill -0 -- "${failed_resource_pid}" 2>/dev/null; then
     break
   fi
   sleep 0.02
 done
 if [[ "$(systemctl is-active "host-sessiond@${session_failed}.service" || true)" != failed \
-  || ! "${recovery_started}" =~ ^[1-9][0-9]*$ \
   || "${recovery_result}" != success \
   || "${recovery_status}" != 0 \
-  || ! -f "${test_runtime}/state/${session_failed}.recovered" \
+  || "${recovery_marker}" != "${session_failed}" \
   || "$(systemctl show --property=MainPID --value "host-sessiond@${session_failed}.service")" != 0 ]] \
   || kill -0 -- "${failed_resource_pid}" 2>/dev/null; then
   sed -n '1,160p' "${staging}/controller.log" >&2
   systemctl show --property=LoadState --property=ActiveState --property=Result --property=MainPID \
     "host-sessiond@${session_failed}.service" >&2
   systemctl show --property=ActiveState --property=Result --property=ExecMainStatus \
-    --property=ExecMainStartTimestampMonotonic \
     "host-sessiond-recover@${session_failed}.service" >&2
   printf '%s\n' 'failed worker was not stopped and reconciled through recovery' >&2
   exit 1

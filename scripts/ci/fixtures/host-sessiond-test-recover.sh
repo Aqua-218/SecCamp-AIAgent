@@ -32,4 +32,4 @@ while kill -0 "${resource_pid}" 2>/dev/null; do
   sleep 0.02
 done
 rm -f -- "${pid_file}"
-: >"${state}.recovered"
+printf '%s\n' "${session}" >"${state}.recovered"

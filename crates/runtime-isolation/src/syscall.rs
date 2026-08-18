@@ -65,6 +65,8 @@ pub enum Syscall {
     Linkat,
     /// Create a symbolic link by path.
     Symlink,
+    /// Create a symbolic link relative to a directory descriptor.
+    Symlinkat,
     /// Read a symbolic-link target by path.
     Readlink,
     /// Read a link target relative to a directory descriptor.
@@ -73,6 +75,8 @@ pub enum Syscall {
     Chmod,
     /// Change file mode through a descriptor.
     Fchmod,
+    /// Change file mode relative to a directory descriptor.
+    Fchmodat,
     /// Change the file size through a descriptor.
     Ftruncate,
     /// Query a file with extended metadata.
@@ -397,10 +401,12 @@ impl Syscall {
             Self::Renameat => 264,
             Self::Linkat => 265,
             Self::Symlink => 88,
+            Self::Symlinkat => 266,
             Self::Readlink => 89,
             Self::Readlinkat => 267,
             Self::Chmod => 90,
             Self::Fchmod => 91,
+            Self::Fchmodat => 268,
             Self::Ftruncate => 77,
             Self::Statx => 332,
             Self::Execve => 59,
@@ -425,7 +431,64 @@ impl Syscall {
         })
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) const fn number(self) -> Option<i32> {
+        // Linux aarch64 follows asm-generic/unistd.h and intentionally omits
+        // several legacy path-only syscalls. Its libc wrappers use the *at
+        // forms included here.
+        Some(match self {
+            Self::Read => 63,
+            Self::Write => 64,
+            Self::Close => 57,
+            Self::Poll => 73,
+            Self::Fstat => 80,
+            Self::Newfstatat => 79,
+            Self::Mmap => 222,
+            Self::Mprotect => 226,
+            Self::Munmap => 215,
+            Self::Madvise => 233,
+            Self::Brk => 214,
+            Self::RtSigaction => 134,
+            Self::RtSigprocmask => 135,
+            Self::RtSigreturn => 139,
+            Self::Pread64 => 67,
+            Self::Pwrite64 => 68,
+            Self::Getdents64 => 61,
+            Self::Chdir => 49,
+            Self::Getcwd => 17,
+            Self::Openat => 56,
+            Self::Mkdirat => 34,
+            Self::Unlinkat => 35,
+            Self::Renameat => 38,
+            Self::Linkat => 37,
+            Self::Symlinkat => 36,
+            Self::Readlinkat => 78,
+            Self::Fchmod => 52,
+            Self::Fchmodat => 53,
+            Self::Ftruncate => 46,
+            Self::Statx => 291,
+            Self::Execve => 221,
+            Self::Execveat => 281,
+            Self::Wait4 => 260,
+            Self::Futex => 98,
+            Self::SchedYield => 124,
+            Self::ClockGettime => 113,
+            Self::Getpid => 172,
+            Self::Gettid => 178,
+            Self::SchedGetaffinity => 123,
+            Self::Sigaltstack => 132,
+            Self::Getrandom => 278,
+            Self::SetRobustList => 99,
+            Self::SetTidAddress => 96,
+            Self::Rseq => 293,
+            Self::Prlimit64 => 261,
+            Self::Exit => 93,
+            Self::ExitGroup => 94,
+            _ => return None,
+        })
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(crate) const fn number(self) -> Option<i32> {
         let _ = self;
         None
@@ -473,10 +536,12 @@ impl FromStr for Syscall {
             "renameat" => Self::Renameat,
             "linkat" => Self::Linkat,
             "symlink" => Self::Symlink,
+            "symlinkat" => Self::Symlinkat,
             "readlink" => Self::Readlink,
             "readlinkat" => Self::Readlinkat,
             "chmod" => Self::Chmod,
             "fchmod" => Self::Fchmod,
+            "fchmodat" => Self::Fchmodat,
             "ftruncate" => Self::Ftruncate,
             "statx" => Self::Statx,
             "execve" => Self::Execve,
@@ -658,10 +723,12 @@ impl SeccompPolicy {
                 Syscall::Renameat,
                 Syscall::Linkat,
                 Syscall::Symlink,
+                Syscall::Symlinkat,
                 Syscall::Readlink,
                 Syscall::Readlinkat,
                 Syscall::Chmod,
                 Syscall::Fchmod,
+                Syscall::Fchmodat,
                 Syscall::Ftruncate,
                 Syscall::Statx,
                 Syscall::Execve,
@@ -682,7 +749,10 @@ impl SeccompPolicy {
                 Syscall::ArchPrctl,
                 Syscall::Exit,
                 Syscall::ExitGroup,
-            ],
+            ]
+            .into_iter()
+            .filter(|syscall| syscall.number().is_some())
+            .collect(),
         }
     }
 

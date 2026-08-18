@@ -771,7 +771,7 @@ impl SealedRecoveryTools {
 }
 
 pub(crate) struct SealedExecutable {
-    _file: File,
+    file: File,
     program: PathBuf,
 }
 
@@ -844,13 +844,26 @@ impl SealedExecutable {
         }
         let program = PathBuf::from(format!("/proc/self/fd/{}", sealed.as_raw_fd()));
         Ok(Self {
-            _file: sealed,
+            file: sealed,
             program,
         })
     }
 
     pub(crate) fn program(&self) -> &Path {
         &self.program
+    }
+
+    /// Allows a sealed helper to remain executable after a deliberate child UID transition.
+    ///
+    /// The bytes are already immutable and digest-verified. Read/execute permission for other
+    /// UIDs is needed only because the memfd remains owned by the unprivileged session daemon
+    /// while the narrowly marked veritysetup child changes to UID/GID 0 before `execve`.
+    pub(crate) fn allow_uid_transition_execution(&self) -> Result<(), RuntimeError> {
+        fchmod(
+            &self.file,
+            Mode::RUSR | Mode::XUSR | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+        )
+        .map_err(|error| RuntimeError::Io(error.to_string()))
     }
 }
 
@@ -1649,8 +1662,8 @@ fn next_removable_entry(
 mod tests {
     use super::*;
     use std::{
-        os::unix::fs::PermissionsExt,
         os::unix::fs::symlink,
+        os::unix::fs::{MetadataExt, PermissionsExt},
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -1969,6 +1982,41 @@ mod tests {
         runner
             .run(&CommandSpec::new(&executable.program, []))
             .expect("sealed original true executable must run");
+        fs::remove_dir_all(base).expect("remove test tree");
+    }
+
+    #[test]
+    fn sealed_executable_can_be_executed_after_a_uid_transition_without_unsealing() {
+        let base = temp_directory("sealed-tool-uid-transition");
+        let source = base.join("tool");
+        fs::copy("/bin/true", &source).expect("copy true executable");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o500))
+            .expect("protect executable");
+        let digest = super::super::digest_file(&source).expect("digest true executable");
+        let executable = SealedExecutable::load(
+            "test recovery tool",
+            &super::super::PinnedArtifact::new(&source, digest),
+        )
+        .expect("seal opened executable");
+
+        assert_eq!(
+            executable.file.metadata().expect("memfd metadata").mode() & 0o777,
+            0o500
+        );
+        executable
+            .allow_uid_transition_execution()
+            .expect("grant read and execute across the UID transition");
+        assert_eq!(
+            executable.file.metadata().expect("memfd metadata").mode() & 0o777,
+            0o555
+        );
+        let required = SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL;
+        assert!(
+            fcntl_get_seals(&executable.file)
+                .expect("read retained seals")
+                .contains(required)
+        );
+
         fs::remove_dir_all(base).expect("remove test tree");
     }
 

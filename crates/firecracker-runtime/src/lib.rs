@@ -2357,7 +2357,7 @@ fn command_output_error(readers: &[BoundedReadResult; 2]) -> Option<String> {
 fn seal_command_executable(
     command: &CommandSpec,
 ) -> Result<Option<recovery::SealedExecutable>, RuntimeError> {
-    command
+    let sealed = command
         .expected_digest
         .map(|digest| {
             recovery::SealedExecutable::load(
@@ -2365,7 +2365,18 @@ fn seal_command_executable(
                 &PinnedArtifact::new(&command.program, digest),
             )
         })
-        .transpose()
+        .transpose()?;
+    if command.run_as_root {
+        sealed
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::InvalidConfig(
+                    "elevated helper command is not digest-pinned".to_owned(),
+                )
+            })?
+            .allow_uid_transition_execution()?;
+    }
+    Ok(sealed)
 }
 
 fn spawn_detached(command: &CommandSpec) -> Result<Child, RuntimeError> {

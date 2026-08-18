@@ -12,6 +12,7 @@ readonly repository_root
 readonly worker_unit=/run/systemd/system/host-sessiond@.service
 readonly recovery_unit=/run/systemd/system/host-sessiond-recover@.service
 readonly polkit_rule=/etc/polkit-1/rules.d/99-host-controld-test.rules
+readonly test_runtime=/run/host-sessiond-control-test
 
 [[ "$(id -u)" -eq 0 ]] || {
   printf '%s\n' 'real systemd control-plane verification requires root' >&2
@@ -21,7 +22,7 @@ readonly polkit_rule=/etc/polkit-1/rules.d/99-host-controld-test.rules
   printf '%s\n' 'real systemd control-plane verification requires systemd as PID 1' >&2
   exit 2
 }
-for path in "${worker_unit}" "${recovery_unit}" "${polkit_rule}"; do
+for path in "${worker_unit}" "${recovery_unit}" "${polkit_rule}" "${test_runtime}"; do
   [[ ! -e "${path}" ]] || {
     printf 'real systemd control-plane verification refuses existing path: %s\n' "${path}" >&2
     exit 2
@@ -38,6 +39,8 @@ staging="$(mktemp -d /tmp/ai-agent-systemd-control.XXXXXX)"
 controller_pid=''
 session_one=''
 session_two=''
+session_anchor=''
+session_failed=''
 session_crash=''
 
 cleanup() {
@@ -45,13 +48,21 @@ cleanup() {
     kill -KILL -- "${controller_pid}" 2>/dev/null || true
     wait "${controller_pid}" 2>/dev/null || true
   fi
-  for session in "${session_one}" "${session_two}" "${session_crash}"; do
+  for session in \
+    "${session_one}" "${session_two}" "${session_anchor}" "${session_failed}" "${session_crash}"; do
     if [[ "${session}" =~ ^[0-9a-f]{32}$ ]]; then
       systemctl stop "host-sessiond@${session}.service" >/dev/null 2>&1 || true
+      if [[ -f "${test_runtime}/state/${session}.resource-pid" ]]; then
+        /bin/sh "${test_runtime}/recover" "${session}" >/dev/null 2>&1 || true
+      fi
+      systemctl reset-failed \
+        "host-sessiond@${session}.service" \
+        "host-sessiond-recover@${session}.service" >/dev/null 2>&1 || true
     fi
   done
   rm -f -- "${worker_unit}" "${recovery_unit}" "${polkit_rule}"
   systemctl daemon-reload >/dev/null 2>&1 || true
+  rm -rf -- "${test_runtime}"
   rm -rf -- "${staging}"
 }
 trap cleanup EXIT
@@ -67,6 +78,14 @@ install -m 0755 "${repository_root}/target/debug/host-control" "${staging}/bin/h
 install -m 0644 "${repository_root}/scripts/ci/fixtures/host-sessiond-test@.service" "${worker_unit}"
 install -m 0644 "${repository_root}/scripts/ci/fixtures/host-sessiond-recover-test@.service" "${recovery_unit}"
 install -m 0644 "${repository_root}/scripts/ci/fixtures/99-host-controld-test.rules" "${polkit_rule}"
+install -d -o root -g root -m 0755 "${test_runtime}"
+install -d -o daemon -g daemon -m 0700 "${test_runtime}/state"
+install -o root -g root -m 0555 \
+  "${repository_root}/scripts/ci/fixtures/host-sessiond-test-worker.sh" \
+  "${test_runtime}/worker"
+install -o root -g root -m 0555 \
+  "${repository_root}/scripts/ci/fixtures/host-sessiond-test-recover.sh" \
+  "${test_runtime}/recover"
 systemctl daemon-reload
 systemctl restart polkit.service
 
@@ -88,8 +107,8 @@ start_controller() {
       --client-gid "${client_gid}" \
       --systemctl /usr/bin/systemctl \
       --systemctl-sha256 "${systemctl_digest}" \
-      --max-sessions 4 \
-      --max-sessions-per-principal 4 \
+      --max-sessions 2 \
+      --max-sessions-per-principal 2 \
       --poll-millis 20 \
       >"${staging}/controller.log" 2>&1 &
   controller_pid=$!
@@ -132,8 +151,85 @@ control stop "${session_two}"
 [[ "$(systemctl is-active "host-sessiond@${session_one}.service" || true)" == inactive ]]
 [[ "$(systemctl is-active "host-sessiond@${session_two}.service" || true)" == inactive ]]
 
-session_crash="$(control start)"
+# Keep one healthy worker live so the failed worker fills the two-session quota. A replacement can
+# start only after the controller removes the failed owner from its live map.
+session_anchor="$(control start)"
+[[ "${session_anchor}" =~ ^[0-9a-f]{32}$ ]]
+
+# A non-zero worker exit is not a clean inactive result. The fixture leaves a separately tracked
+# process in the failed unit's cgroup. The adapter must observe `failed`, complete the exact
+# stop+recovery path, kill that resource, report a successful recovery unit, and preserve the
+# sticky failed tombstone.
+session_failed="$(control start)"
+failed_pid="$(systemctl show --property=MainPID --value "host-sessiond@${session_failed}.service")"
+[[ "${failed_pid}" =~ ^[1-9][0-9]*$ ]]
+failed_resource_pid=''
+for _attempt in {1..100}; do
+  if [[ -s "${test_runtime}/state/${session_failed}.resource-pid" ]]; then
+    failed_resource_pid="$(<"${test_runtime}/state/${session_failed}.resource-pid")"
+    break
+  fi
+  sleep 0.02
+done
+[[ "${failed_resource_pid}" =~ ^[1-9][0-9]*$ ]]
+kill -0 -- "${failed_resource_pid}"
+[[ "${failed_resource_pid}" != "${failed_pid}" ]]
+grep -Fq "/host-sessiond@${session_failed}.service" \
+  "/proc/${failed_resource_pid}/cgroup"
+kill -KILL -- "${failed_pid}"
+recovery_started='0'
+recovery_result=''
+recovery_status=''
+for _attempt in {1..100}; do
+  recovery_started="$(systemctl show --property=ExecMainStartTimestampMonotonic --value \
+    "host-sessiond-recover@${session_failed}.service")"
+  recovery_result="$(systemctl show --property=Result --value \
+    "host-sessiond-recover@${session_failed}.service")"
+  recovery_status="$(systemctl show --property=ExecMainStatus --value \
+    "host-sessiond-recover@${session_failed}.service")"
+  if [[ "$(systemctl is-active "host-sessiond@${session_failed}.service" || true)" == failed \
+    && "${recovery_started}" =~ ^[1-9][0-9]*$ \
+    && "${recovery_result}" == success \
+    && "${recovery_status}" == 0 \
+    && -f "${test_runtime}/state/${session_failed}.recovered" ]] \
+    && ! kill -0 -- "${failed_resource_pid}" 2>/dev/null; then
+    break
+  fi
+  sleep 0.02
+done
+if [[ "$(systemctl is-active "host-sessiond@${session_failed}.service" || true)" != failed \
+  || ! "${recovery_started}" =~ ^[1-9][0-9]*$ \
+  || "${recovery_result}" != success \
+  || "${recovery_status}" != 0 \
+  || ! -f "${test_runtime}/state/${session_failed}.recovered" \
+  || "$(systemctl show --property=MainPID --value "host-sessiond@${session_failed}.service")" != 0 ]] \
+  || kill -0 -- "${failed_resource_pid}" 2>/dev/null; then
+  sed -n '1,160p' "${staging}/controller.log" >&2
+  systemctl show --property=LoadState --property=ActiveState --property=Result --property=MainPID \
+    "host-sessiond@${session_failed}.service" >&2
+  systemctl show --property=ActiveState --property=Result --property=ExecMainStatus \
+    --property=ExecMainStartTimestampMonotonic \
+    "host-sessiond-recover@${session_failed}.service" >&2
+  printf '%s\n' 'failed worker was not stopped and reconciled through recovery' >&2
+  exit 1
+fi
+
+for _attempt in {1..100}; do
+  if candidate_session="$(control start 2>/dev/null)" \
+    && [[ "${candidate_session}" =~ ^[0-9a-f]{32}$ ]]; then
+    session_crash="${candidate_session}"
+    break
+  fi
+  sleep 0.02
+done
+if [[ ! "${session_crash}" =~ ^[0-9a-f]{32}$ ]]; then
+  sed -n '1,160p' "${staging}/controller.log" >&2
+  printf '%s\n' 'controller did not release quota after failed-worker recovery' >&2
+  exit 1
+fi
 [[ "$(systemctl is-active "host-sessiond@${session_crash}.service")" == active ]]
+control stop "${session_anchor}"
+[[ "$(systemctl is-active "host-sessiond@${session_anchor}.service" || true)" == inactive ]]
 kill -KILL -- "${controller_pid}"
 wait "${controller_pid}" 2>/dev/null || true
 controller_pid=''

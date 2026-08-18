@@ -305,8 +305,8 @@ impl CommandRunner for TestRunner {
             "--seccomp-filter".to_owned(),
             "/artifacts/seccomp".to_owned(),
         ];
-        if command.program != Path::new("/test/jailer")
-            || command.args != expected_args
+        if command.program() != Path::new("/test/jailer")
+            || command.arguments() != expected_args
             || ownership.cgroup_path.parent() != Some(Path::new("/sys/fs/cgroup/test"))
             || ownership
                 .cgroup_path

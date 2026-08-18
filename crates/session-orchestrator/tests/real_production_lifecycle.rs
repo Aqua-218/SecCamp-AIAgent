@@ -44,7 +44,7 @@ use session_orchestrator::{
         AuthorityAuditMode, PerSessionEgressFactory, PreparedEgressSession,
         ProductionBrokerEndpoint, ProductionBrokerLimits, ProductionDurabilityConfig,
         ProductionFirecrackerConfig, ProductionGuestControlEndpoint, ProductionSessionConfig,
-        ProductionSessionRuntimeBuilder, SessionEgressRequest,
+        ProductionSessionRuntime, ProductionSessionRuntimeBuilder, SessionEgressRequest,
     },
     recovery::DurableSessionRecoveryJournal,
     session_owner::{OwnerPollOutcome, OwnerPollRequest, ShutdownReason},
@@ -198,6 +198,11 @@ fn runtime_profile(
     veritysetup: &Path,
     formatter: &Path,
     seccomp: &Path,
+    seccomp_policy: &Path,
+    seccomp_compiler: &Path,
+    guest_cid: u32,
+    broker_port: u32,
+    hold_workload_after_probe: bool,
 ) -> (RuntimeConfig, PathBuf, PathBuf) {
     let jailer_base = root.join("jailer");
     let executable_parent = jailer_base.join("firecracker");
@@ -267,6 +272,11 @@ fn runtime_profile(
     });
     let cgroup = cgroup_parent.join(template_id);
 
+    let workload_hold = if hold_workload_after_probe {
+        " --hold-workload-after-probe"
+    } else {
+        ""
+    };
     let config = RuntimeConfig {
         firecracker: pinned(firecracker),
         kernel: pinned(&jail_kernel_path),
@@ -314,15 +324,15 @@ fn runtime_profile(
                 cpu_period_micros: CGROUP_CPU_PERIOD,
             },
             seccomp: SeccompConfig {
+                compiler: pinned(seccomp_compiler),
                 filter: pinned(&jail_seccomp_path),
+                policy: pinned(seccomp_policy),
                 blocked_syscalls: [
                     "bpf",
-                    "connect",
                     "mount",
                     "perf_event_open",
                     "ptrace",
                     "setns",
-                    "socket",
                     "unshare",
                 ]
                 .into_iter()
@@ -331,14 +341,14 @@ fn runtime_profile(
             },
         },
         vsock: VsockConfig {
-            guest_cid: GUEST_CID,
+            guest_cid,
             uds_path: jail_root.join("run/vsock.sock"),
         },
         network_devices: Vec::new(),
         vcpu_count: 1,
         memory_mib: GUEST_MEMORY_MIB,
         boot_args: format!(
-            "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/usr/local/libexec/guest-control-init -- --port {GUEST_CONTROL_PORT} --workload /usr/local/libexec/guest-supervisor-init --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port {BROKER_PORT} --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository workspace --file-effects read-data,list-directory,write-data,truncate,create-file,create-directory,remove-file,remove-directory,rename,set-metadata,read-link,create-symlink,create-hard-link --path-prefix /"
+            "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rootfstype=squashfs ro init=/usr/local/libexec/guest-control-init -- --port {GUEST_CONTROL_PORT} --workload /usr/local/libexec/guest-supervisor-init --workspace-device /dev/vdb --runtime-dir /run/guest-supervisor --cgroup-parent /sys/fs/cgroup --broker-port {broker_port} --isolation-launcher /usr/local/libexec/workload-isolation-launcher --workload /usr/local/libexec/agent-workload --repository workspace --file-effects read-data,list-directory,write-data,truncate,create-file,create-directory,remove-file,remove-directory,rename,set-metadata,read-link,create-symlink,create-hard-link --path-prefix /{workload_hold}"
         ),
     };
     (config, cgroup_parent, executable_parent)
@@ -512,6 +522,239 @@ impl PerSessionEgressFactory for ClosedEgressFactory {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_real_production_runtime(
+    durability_root: &Path,
+    template_runtime: RuntimeConfig,
+    snapshot_state: &Path,
+    snapshot_memory: &Path,
+    snapshot_id: u8,
+    guest_cid: u32,
+    broker_port: u32,
+    kernel: &Path,
+    seccomp: &Path,
+    veritysetup: &Path,
+    dmsetup: &Path,
+    grant: &AuthorityRootGrant,
+) -> (ProductionSessionRuntime, PathBuf) {
+    make_directory(durability_root, 0o700);
+    let broker_wal_root = durability_root.join("b");
+    make_directory(&broker_wal_root, 0o700);
+    let factory = FilesystemFirecrackerFactory::with_guest_artifacts(
+        session_orchestrator::SnapshotId::new([snapshot_id; session_orchestrator::ID_BYTES]),
+        template_runtime.clone(),
+        GuestArtifactTemplate::new(pinned(kernel), pinned(seccomp)),
+        SnapshotTemplate::new(
+            pinned(snapshot_state),
+            pinned(snapshot_memory),
+            grant.policy_digest(),
+        ),
+    );
+    let config = ProductionSessionConfig::new(
+        ProductionDurabilityConfig::new(
+            durability_root.join("i"),
+            durability_root.join("r"),
+            AuthorityAuditMode::CreateNew(durability_root.join("a")),
+            &broker_wal_root,
+        ),
+        IssuerId::new(format!("real-concurrent-{snapshot_id}")),
+        ProductionFirecrackerConfig::new(
+            template_runtime,
+            firecracker_runtime::recovery::RecoveryTools::new(pinned(veritysetup), pinned(dmsetup)),
+        ),
+        WorkspaceTemplateId::new(format!("real-concurrent-{snapshot_id}")),
+        ProductionBrokerEndpoint::new(2, guest_cid, broker_port, 16),
+        ProductionGuestControlEndpoint::new(GUEST_CONTROL_PORT),
+        ProductionBrokerLimits::new(
+            std::num::NonZeroUsize::new(8).unwrap(),
+            std::num::NonZeroU64::new(8).unwrap(),
+            1024 * 1024,
+            std::num::NonZeroUsize::new(1).unwrap(),
+            64 * 1024,
+            std::num::NonZeroUsize::new(8).unwrap(),
+        ),
+    );
+    let runtime = ProductionSessionRuntimeBuilder::new(config, factory, ClosedEgressFactory)
+        .build()
+        .unwrap_or_else(|error| panic!("concurrent production runtime build failed: {error}"));
+    (runtime, broker_wal_root)
+}
+
+fn sole_cgroup_process(path: &Path) -> u32 {
+    let body = fs::read_to_string(path.join("cgroup.procs"))
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    let pids = body
+        .lines()
+        .map(|line| line.parse::<u32>().expect("cgroup PID must be decimal"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pids.len(),
+        1,
+        "one Firecracker task must own {}",
+        path.display()
+    );
+    pids[0]
+}
+
+#[test]
+#[ignore = "requires root, KVM, cgroup-v2, dm-verity, AF_VSOCK, and two concurrent production guests"]
+#[allow(clippy::too_many_lines)]
+fn real_production_two_session_owners_run_concurrently_and_clean_independently() {
+    assert_eq!(
+        std::env::var("REAL_SESSION_OWNER_LIFECYCLE").as_deref(),
+        Ok("1")
+    );
+    let firecracker = required_file("REAL_SESSION_FIRECRACKER_BIN");
+    let jailer = required_file("REAL_SESSION_FIRECRACKER_JAILER");
+    let kernel = required_file("REAL_SESSION_KERNEL");
+    let rootfs = required_file("REAL_SESSION_ROOTFS");
+    let verity_hash = required_file("REAL_SESSION_VERITY_HASH");
+    let veritysetup = required_file("REAL_SESSION_VERITYSETUP");
+    let dmsetup = required_file("REAL_SESSION_DMSETUP");
+    let formatter = required_file("REAL_SESSION_WORKSPACE_FORMATTER");
+    let seccomp = required_file("REAL_SESSION_SECCOMP");
+    let seccomp_policy = required_file("REAL_SESSION_SECCOMP_POLICY");
+    let seccomp_compiler = required_file("REAL_SESSION_SECCOMP_COMPILER");
+    let staging = TemporaryDirectory::new();
+    let first_root = staging.path().join("a");
+    let second_root = staging.path().join("b");
+    make_directory(&first_root, 0o700);
+    make_directory(&second_root, 0o700);
+    let grant = authority_grant();
+    let second_guest_cid = GUEST_CID + 1;
+    let second_port = BROKER_PORT + 1;
+    let (first_template, cgroup_parent, _) = runtime_profile(
+        &first_root,
+        &firecracker,
+        &jailer,
+        &kernel,
+        &rootfs,
+        &verity_hash,
+        &veritysetup,
+        &formatter,
+        &seccomp,
+        &seccomp_policy,
+        &seccomp_compiler,
+        GUEST_CID,
+        BROKER_PORT,
+        true,
+    );
+    let (second_template, second_cgroup_parent, _) = runtime_profile(
+        &second_root,
+        &firecracker,
+        &jailer,
+        &kernel,
+        &rootfs,
+        &verity_hash,
+        &veritysetup,
+        &formatter,
+        &seccomp,
+        &seccomp_policy,
+        &seccomp_compiler,
+        second_guest_cid,
+        second_port,
+        true,
+    );
+    assert_eq!(cgroup_parent, second_cgroup_parent);
+    let (first_state, first_memory) = capture_clean_snapshot(&first_root, &first_template);
+    let (second_state, second_memory) = capture_clean_snapshot(&second_root, &second_template);
+    let (mut first, first_broker_root) = build_real_production_runtime(
+        &first_root.join("d"),
+        first_template.clone(),
+        &first_state,
+        &first_memory,
+        0xa1,
+        GUEST_CID,
+        BROKER_PORT,
+        &kernel,
+        &seccomp,
+        &veritysetup,
+        &dmsetup,
+        &grant,
+    );
+    let (mut second, second_broker_root) = build_real_production_runtime(
+        &second_root.join("d"),
+        second_template.clone(),
+        &second_state,
+        &second_memory,
+        0xb2,
+        second_guest_cid,
+        second_port,
+        &kernel,
+        &seccomp,
+        &veritysetup,
+        &dmsetup,
+        &grant,
+    );
+
+    let (first_result, second_result) = thread::scope(|scope| {
+        let first_start = scope.spawn(|| first.start(&grant));
+        let second_start = scope.spawn(|| second.start(&grant));
+        (
+            first_start
+                .join()
+                .expect("first start thread must not panic"),
+            second_start
+                .join()
+                .expect("second start thread must not panic"),
+        )
+    });
+    let first_started =
+        first_result.unwrap_or_else(|error| panic!("first concurrent owner failed: {error}"));
+    let second_started = second_result.unwrap_or_else(|error| {
+        let _ = first.stop();
+        panic!("second concurrent owner failed: {error}");
+    });
+    assert_eq!(
+        first.poll(OwnerPollRequest::Continue).unwrap(),
+        OwnerPollOutcome::Running(first_started)
+    );
+    assert_eq!(
+        second.poll(OwnerPollRequest::Continue).unwrap(),
+        OwnerPollOutcome::Running(second_started)
+    );
+    let first_workspace = first_started.identity().workspace_id().to_string();
+    let second_workspace = second_started.identity().workspace_id().to_string();
+    assert_ne!(first_workspace, second_workspace);
+    let first_cgroup = cgroup_parent.join(&first_workspace);
+    let second_cgroup = cgroup_parent.join(&second_workspace);
+    let first_firecracker_pid = sole_cgroup_process(&first_cgroup);
+    let second_firecracker_pid = sole_cgroup_process(&second_cgroup);
+    assert_ne!(first_firecracker_pid, second_firecracker_pid);
+    assert!(Path::new(&format!("/proc/{first_firecracker_pid}")).exists());
+    assert!(Path::new(&format!("/proc/{second_firecracker_pid}")).exists());
+
+    assert_eq!(
+        first.stop().unwrap(),
+        OwnerPollOutcome::Closed(ShutdownReason::ExternalRequest)
+    );
+    drop(wait_for_completed_guest_effect_probe(
+        &first_broker_root.join(format!(
+            "{}.wal",
+            first_started.identity().broker_session_id()
+        )),
+    ));
+    assert!(Path::new(&format!("/proc/{second_firecracker_pid}")).exists());
+    assert_eq!(
+        second.poll(OwnerPollRequest::Continue).unwrap(),
+        OwnerPollOutcome::Running(second_started)
+    );
+    assert_eq!(
+        second.stop().unwrap(),
+        OwnerPollOutcome::Closed(ShutdownReason::ExternalRequest)
+    );
+    drop(wait_for_completed_guest_effect_probe(
+        &second_broker_root.join(format!(
+            "{}.wal",
+            second_started.identity().broker_session_id()
+        )),
+    ));
+    assert!(!first_cgroup.exists());
+    assert!(!second_cgroup.exists());
+    fs::remove_dir(&cgroup_parent)
+        .unwrap_or_else(|error| panic!("concurrent cgroup parent retained residue: {error}"));
+}
+
 #[test]
 #[ignore = "requires root, KVM, cgroup-v2, dm-verity, AF_VSOCK, and pinned production guest artifacts"]
 #[allow(clippy::too_many_lines)]
@@ -530,6 +773,8 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
     let dmsetup = required_file("REAL_SESSION_DMSETUP");
     let formatter = required_file("REAL_SESSION_WORKSPACE_FORMATTER");
     let seccomp = required_file("REAL_SESSION_SECCOMP");
+    let seccomp_policy = required_file("REAL_SESSION_SECCOMP_POLICY");
+    let seccomp_compiler = required_file("REAL_SESSION_SECCOMP_COMPILER");
 
     eprintln!("real session-owner phase: preparing template");
     let staging = TemporaryDirectory::new();
@@ -544,6 +789,11 @@ fn real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_res
         &veritysetup,
         &formatter,
         &seccomp,
+        &seccomp_policy,
+        &seccomp_compiler,
+        GUEST_CID,
+        BROKER_PORT,
+        false,
     );
     let (snapshot_state, snapshot_memory) =
         capture_clean_snapshot(staging.path(), &template_runtime);

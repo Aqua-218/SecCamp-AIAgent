@@ -1,3 +1,4 @@
+// Keep the test controller on the same fixed start/stop vocabulary as the production policy.
 polkit.addRule(function(action, subject) {
     if (action.id !== "org.freedesktop.systemd1.manage-units" ||
         subject.user !== "nobody") {
@@ -13,4 +14,3 @@ polkit.addRule(function(action, subject) {
     }
     return polkit.Result.NOT_HANDLED;
 });
-

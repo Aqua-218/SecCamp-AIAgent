@@ -161,6 +161,19 @@ session_owner_kvm:
   script:
     - scripts/ci/run.sh real-session-owner
 
+session_owner_crash_recovery:
+  extends:
+    - .rust_job
+    - .deep_rules
+  stage: system
+  timeout: 90m
+  interruptible: false
+  tags:
+    - kvm
+    - ephemeral
+  script:
+    - scripts/ci/run.sh real-session-crash-recovery
+
 real_capfs:
   extends:
     - .rust_job

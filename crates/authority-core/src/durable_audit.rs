@@ -15,6 +15,8 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
+    thread,
+    time::{Duration, Instant},
 };
 
 #[cfg(target_os = "linux")]
@@ -67,6 +69,8 @@ pub const DEFAULT_MAX_JOURNAL_BYTES: u64 = MAX_JOURNAL_BYTES;
 /// without the instance an offline auditor cannot tell whether two records naming `cap-3` describe
 /// the same capability. Version 1 records are still readable and belong to instance 0.
 const ATTEMPT_PAYLOAD_VERSION: u8 = 2;
+const TRANSIENT_FORK_LOCK_RETRY: Duration = Duration::from_millis(250);
+const TRANSIENT_FORK_LOCK_POLL: Duration = Duration::from_millis(2);
 #[cfg(target_os = "linux")]
 const O_NOFOLLOW: i32 = 0o400_000;
 #[cfg(unix)]
@@ -1469,10 +1473,18 @@ fn durable_lock_name(journal_name: &OsStr) -> OsString {
 }
 
 fn acquire_exclusive_lock(file: &File) -> Result<(), DurableAuditError> {
-    match file.try_lock() {
-        Ok(()) => Ok(()),
-        Err(TryLockError::WouldBlock) => Err(DurableAuditError::Locked),
-        Err(TryLockError::Error(error)) => Err(DurableAuditError::from(error)),
+    let deadline = Instant::now() + TRANSIENT_FORK_LOCK_RETRY;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                // `fork` can retain a just-dropped CLOEXEC descriptor until `exec`. Retry only
+                // WouldBlock on this already-opened file; callers revalidate identity afterwards.
+                thread::sleep(TRANSIENT_FORK_LOCK_POLL);
+            }
+            Err(TryLockError::WouldBlock) => return Err(DurableAuditError::Locked),
+            Err(TryLockError::Error(error)) => return Err(DurableAuditError::from(error)),
+        }
     }
 }
 

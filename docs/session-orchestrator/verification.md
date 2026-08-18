@@ -26,12 +26,19 @@ test には、mock backend による state machine test、durable ledger を直�
 | 同一 process からの二重 open が拒否される | 実 file を使う直接 test |
 | `new_durable` の実 `start_session` が最初の backend effect より前に7 identityをcommitし、stop後も再openできる | `tests/ledger.rs` の実 durable orchestrator probe |
 | record-sync前後の crash 相当 staged tail、rename/length drift 後の poison と再試行拒否、write/sync fault 後の poison と reopen | `tests/ledger.rs` の実 file fault test + `lib.rs` の private deterministic seam |
-| cross-process contention と owner process kill 後の stale lock 再取得 | `tests/ledger.rs` の child process test |
+| cross-process contention、fork/exec間の一時的fd継承、owner process kill 後の stale lock 再取得 | `tests/ledger.rs` とlib/recoveryのchild process test |
 | request/header/file の capacity hard bound、最大件数ちょうどの実データ commit、malformed header/symlink/non-regular-file fail-closed | `tests/ledger.rs` の実 file test |
 | Linux kernel entropy source からの16 byte読出し、public `new_durable` の all-zero bounded retry/fail-closed | `tests/ledger.rs` の `OsEntropy` / durable orchestrator tests |
 | identity の 32 桁 hex 表現 | 単体 |
+| multi-session start/stop HMAC のaction・principal・request・session binding、zero identity拒否 | `control_plane` unit test |
+| global/per-principal quota、foreign stop、request replay、spawn失敗後のID burn | `control_plane` unit test |
+| append-only control journalのchecksum/sequence/transition、torn-tail回復、full-record破損拒否 | 実fileを使う`control_plane` unit test |
+| controller二重openのkernel lock fencing、再起動時のreserved/active worker cleanup、session ID非再利用 | 実fileとworker factoryを使う`control_plane` unit test |
+| live journalのpath消失・inode/length driftを恒久poisonし、start/stop/poll/shutdown/recoveryのworker effect前に拒否 | 実rename/appendを使う`control_plane` unit test |
+| worker health不能時の即時cleanup、cleanup失敗時のworker保持、任意error文字列を通さないclosed code | `control_plane` unit test |
 | workspace clone、listener 所有、snapshot binding、Firecracker identity 注入、Authority subject の閉包 | production adapter composition test（全境界 fake） |
 | production `SessionOwner` の build → 実 Firecracker snapshot restore → guest readiness → `Continue` poll → stop → `Closed` | `real_production_lifecycle.rs`（実 `Runtime`、jailer、dm-verity、filesystem、AF_VSOCK、durable Broker、guest supervisor。`REAL_SESSION_OWNER_LIFECYCLE=1` の ignored gate） |
+| production process をstartup 7点・cleanup 4点で外部`SIGKILL`し、同じdurable pathから再起動 | `verify-real-session-crash-recovery.sh`。各点で旧cgroup、exact dm-verity bind/mapper、jail/workspaceを限定回収し、fresh identityの新session完走とresidue不在を確認 |
 
 ## 実行コマンド
 
@@ -40,6 +47,17 @@ cargo fmt --manifest-path crates/session-orchestrator/Cargo.toml -- --check
 cargo test --manifest-path crates/session-orchestrator/Cargo.toml
 cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-targets -- -D warnings
 ```
+
+`MultiSessionController` は複数workloadを一つのownerへ押し込まず、各sessionを別の
+`ControlWorker`へ渡す。start requestはworker作成前に`Reserved`をsyncし、成功後に`Active`、
+cleanup完了後だけ`Closed`をsyncする。restart時は未closeの全sessionをstable ID順で
+`ControlWorkerFactory::recover`へ渡し、exact cleanupが成功しない限りcontrollerを開かない。
+HMAC keyはhost-only inputで、tag比較はHMAC実装のconstant-time verifyを使い、drop時に保持bufferを
+zeroizeする。journalとstable lockはowner-only fileであり、unsafe parent、symlink、mode変更、
+checksum/transition破損をfail closedにする。open後も各worker effect前とappend直前にpath/inode/lengthを
+再検査し、最初の不整合以後は同じcontroller handleを恒久poisonする。
+worker境界のerrorは4個のclosed codeだけで、任意長文字列やcredentialをcontroller logへ運べない。
+health pollが失敗した場合はそのworkerのstopを直ちに試し、cleanup完了だけをjournalへcloseする。
 
 ## 実機 production lifecycle gate
 
@@ -53,6 +71,7 @@ stop 後は subject 操作の durable audit、identity ledger、recovery journal
 
 ```bash
 scripts/ci/verify-real-session-owner.sh
+scripts/ci/verify-real-session-crash-recovery.sh
 ```
 
 これは root、x86_64 KVM、`/dev/vhost-vsock`、cgroup-v2、dm-verity、`mksquashfs`、および
@@ -65,6 +84,14 @@ mount flags と statfs、および全 ancestor の所有者・mode を検査し�
 CapFS/supervisor readiness後に全13 file effectを実行し、その後のBroker requestがdurable WALに
 Finalとして残ることで順序を固定する。これは対象操作の実FUSE/OS経路を実証するが、全kernel
 scheduling、VM escape、外部providerの安全性まで証明するものではない。
+
+2本目は通常経路を一度走らせるだけではなく、`identity-reserved`、`workspace-cloned`、
+`broker-established`、`vm-started`、`root-capability-injected`、`workload-released`、`running`、
+およびcleanup 4段階の成功直後でtest processのPIDとcommand lineを照合してから外部
+`SIGKILL`する。各caseは同じprivate directoryで再起動し、durable recoveryを完了させた後、
+別identityのproduction sessionを完走する。mapper recoveryはsealed jail親からexact deviceを
+開き、mount IDとmajor/minorを照合してbindをunmountしてから、UUID/devno/root hash/deviceを
+照合したmapperだけを閉じる。11 case全体は実KVM hostで完走済みである。
 
 ## 未検証の境界
 
@@ -101,6 +128,11 @@ Brokerのegressはclosedであり、外部providerの接続・mutationや全kern
 | `LifecycleState` の中間値 | `state()` から観測できないため、`WorkspaceCloned` 等を確認する test は存在しえない |
 
 ### この crate が構造的に確認しないこと
+
+`MultiSessionController` のscheduler coreは実装済みだが、production `host-sessiond` workerを
+生成・監視・復旧する特権分離adapterと、認証済みUnix control socket daemonは未接続である。
+従って複数のtest workerを同時所有できることは確認済みでも、複数の実Firecracker VMを同時に
+動かしたproduction証拠ではない。現行deployment unitは引き続きone-session ownerである。
 
 一般の`SnapshotDescriptor`は呼び出し側の申告であり、任意の第三者snapshotを意味解析しない。required KVM gateでは例外的に、このcheckoutからguest-control-readyなclean snapshotを作り、state/memoryのdigestをpinし、その同じartifactだけをrestoreしてfresh identityを注入する。従ってその生成経路は実証済みだが、descriptorだけを偽装した外部snapshotを安全化する機能ではない。
 

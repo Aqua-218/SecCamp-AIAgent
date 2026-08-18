@@ -31,6 +31,7 @@ use authority_core::policy::AuthorityPolicyDigest;
 
 pub mod authority_backend;
 pub mod control_plane;
+pub mod control_transport;
 pub mod egress_backend;
 pub mod filesystem_factory;
 pub mod firecracker_backend;
@@ -40,6 +41,7 @@ pub mod production_runtime;
 pub mod recovery;
 pub mod session_owner;
 pub mod system_egress;
+pub mod systemd_worker;
 
 use std::{
     collections::BTreeSet,

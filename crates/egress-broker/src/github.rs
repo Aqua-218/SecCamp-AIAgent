@@ -26,6 +26,7 @@ use egress_protocol::{
 };
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use reqwest::blocking::{Client, Response};
+use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
 use serde_json::Value;
 use zeroize::Zeroizing;
 
@@ -682,33 +683,23 @@ fn read_systemd_credential(path: &Path) -> Result<Zeroizing<String>, GitHubProvi
     {
         return Err(GitHubProviderError::Transport);
     }
-    let parent = path.parent().ok_or(GitHubProviderError::Transport)?;
-    let mut current = PathBuf::from("/");
-    for component in parent.components().skip(1) {
-        current.push(component.as_os_str());
-        let metadata =
-            fs::symlink_metadata(&current).map_err(|_| GitHubProviderError::Transport)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(GitHubProviderError::Transport);
-        }
-    }
-    let before = fs::symlink_metadata(path).map_err(|_| GitHubProviderError::Transport)?;
-    if before.file_type().is_symlink()
-        || !before.is_file()
-        || before.nlink() != 1
-        || before.len() == 0
-        || before.len() > 4096
-    {
-        return Err(GitHubProviderError::Transport);
-    }
-    let mut file = File::open(path).map_err(|_| GitHubProviderError::Transport)?;
+    let mut file = File::from(
+        openat2(
+            CWD,
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        )
+        .map_err(|_| GitHubProviderError::Transport)?,
+    );
     let opened = file
         .metadata()
         .map_err(|_| GitHubProviderError::Transport)?;
     if !opened.is_file()
-        || opened.dev() != before.dev()
-        || opened.ino() != before.ino()
         || opened.nlink() != 1
+        || opened.len() == 0
+        || opened.len() > MAX_GITHUB_TOKEN_BYTES as u64
     {
         return Err(GitHubProviderError::Transport);
     }
@@ -727,14 +718,43 @@ fn read_systemd_credential(path: &Path) -> Result<Zeroizing<String>, GitHubProvi
         }
     }
     let after = fs::symlink_metadata(path).map_err(|_| GitHubProviderError::Transport)?;
+    let opened_after = file
+        .metadata()
+        .map_err(|_| GitHubProviderError::Transport)?;
     if after.file_type().is_symlink()
-        || after.dev() != opened.dev()
-        || after.ino() != opened.ino()
-        || after.len() != opened.len()
+        || !after.is_file()
+        || !same_credential_snapshot(&opened, &opened_after)
+        || !same_credential_snapshot(&opened_after, &after)
     {
         return Err(GitHubProviderError::Transport);
     }
     Ok(token)
+}
+
+fn same_credential_snapshot(expected: &fs::Metadata, observed: &fs::Metadata) -> bool {
+    observed.is_file()
+        && observed.nlink() == 1
+        && observed.dev() == expected.dev()
+        && observed.ino() == expected.ino()
+        && observed.len() == expected.len()
+        && observed.uid() == expected.uid()
+        && observed.gid() == expected.gid()
+        && observed.mode() == expected.mode()
+        && observed.mtime() == expected.mtime()
+        && observed.mtime_nsec() == expected.mtime_nsec()
+        && observed.ctime() == expected.ctime()
+        && observed.ctime_nsec() == expected.ctime_nsec()
+}
+
+fn load_host_token(
+    environment_token: Option<String>,
+    credentials_directory: Option<PathBuf>,
+) -> Result<Zeroizing<String>, GitHubProviderError> {
+    if let Some(directory) = credentials_directory {
+        validate_token(read_systemd_credential(&directory.join("github-token"))?)
+    } else {
+        validate_environment_token(environment_token)
+    }
 }
 
 impl fmt::Debug for RustlsGitHubProvider {
@@ -747,24 +767,24 @@ impl fmt::Debug for RustlsGitHubProvider {
 }
 
 impl RustlsGitHubProvider {
-    /// Builds the fixed GitHub provider from the host-only environment secret.
+    /// Builds the fixed GitHub provider from a systemd credential or an explicit environment
+    /// fallback.
     ///
     /// The token is read inside the host adapter and is never part of a guest
     /// request, response, debug representation, or provider error.
     ///
     /// # Errors
     ///
-    /// Returns [`GitHubProviderError::Transport`] if the rustls client cannot
-    /// be constructed or the host-only variable is absent.
+    /// When `CREDENTIALS_DIRECTORY` is declared, `github-token` is mandatory and an ambient
+    /// `EGRESS_GITHUB_TOKEN` never overrides or replaces an invalid credential file.
+    ///
+    /// Returns [`GitHubProviderError::Transport`] if the rustls client cannot be constructed or
+    /// the selected host-only credential is absent or unsafe.
     pub fn from_environment() -> Result<Self, GitHubProviderError> {
-        let token = if let Ok(token) = std::env::var("EGRESS_GITHUB_TOKEN") {
-            validate_environment_token(Some(token))?
-        } else {
-            let directory = std::env::var_os("CREDENTIALS_DIRECTORY")
-                .map(PathBuf::from)
-                .ok_or(GitHubProviderError::Transport)?;
-            validate_token(read_systemd_credential(&directory.join("github-token"))?)?
-        };
+        let token = load_host_token(
+            std::env::var("EGRESS_GITHUB_TOKEN").ok(),
+            std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from),
+        )?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -1099,8 +1119,10 @@ const fn is_safe_repo_byte(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
-        env,
+        env, fs,
+        os::unix::fs::symlink,
         sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use authority_core::github::{
@@ -1114,7 +1136,7 @@ mod tests {
         CredentialHandle, GitHubAdapter, GitHubAdapterError, GitHubProvider, GitHubProviderError,
         GitHubResponse, GitObjectId, MAX_GITHUB_RESPONSE_BYTES, PublishBranchPlan,
         RustlsGitHubProvider, StaticCredentialProvider, StaticPublishPlanProvider,
-        TypedGitHubAdapter, validate_environment_token,
+        TypedGitHubAdapter, load_host_token, read_systemd_credential, validate_environment_token,
     };
     use reqwest::blocking::Client;
     use zeroize::Zeroizing;
@@ -1454,6 +1476,60 @@ mod tests {
                 .as_str(),
             "token-value"
         );
+    }
+
+    #[test]
+    fn systemd_credential_is_descriptor_sealed_and_rejects_links() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock must be after the epoch")
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "egress-broker-credential-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create credential fixture");
+        let credential = root.join("github-token");
+        fs::write(&credential, b"test-token\n").expect("write credential fixture");
+        assert_eq!(
+            read_systemd_credential(&credential)
+                .expect("a regular credential must load")
+                .as_str(),
+            "test-token"
+        );
+        assert_eq!(
+            load_host_token(
+                Some("ambient-token-must-not-win".to_owned()),
+                Some(root.clone())
+            )
+            .expect("declared systemd credential must take precedence")
+            .as_str(),
+            "test-token"
+        );
+        assert_eq!(
+            load_host_token(
+                Some("ambient-token-must-not-be-a-fallback".to_owned()),
+                Some(root.join("missing-directory"))
+            ),
+            Err(GitHubProviderError::Transport)
+        );
+
+        let alias = root.join("github-token.alias");
+        fs::hard_link(&credential, &alias).expect("create hard-link attack fixture");
+        assert_eq!(
+            read_systemd_credential(&credential),
+            Err(GitHubProviderError::Transport)
+        );
+        fs::remove_file(&alias).expect("remove hard-link fixture");
+
+        let linked_root = root.with_extension("link");
+        symlink(&root, &linked_root).expect("create ancestor-symlink attack fixture");
+        assert_eq!(
+            read_systemd_credential(&linked_root.join("github-token")),
+            Err(GitHubProviderError::Transport)
+        );
+        fs::remove_file(&linked_root).expect("remove ancestor-symlink fixture");
+        fs::remove_dir_all(root).expect("remove credential fixture");
     }
 
     // Requirement: token material is absent from provider debug output and

@@ -968,21 +968,57 @@ fn validate_safe_name(label: &str, value: &str) -> Result<(), RuntimeError> {
 }
 
 /// A command to execute through the command runner boundary.
+///
+/// The value is intentionally sealed: external crates can inspect it when implementing a test
+/// adapter, but cannot construct or alter a command for [`RealCommandRunner`].
+///
+/// ```compile_fail
+/// use firecracker_runtime::CommandSpec;
+/// use std::path::PathBuf;
+///
+/// let _injected = CommandSpec {
+///     program: PathBuf::from("/bin/rm"),
+///     args: vec!["-rf".to_owned(), "/".to_owned()],
+///     expected_digest: None,
+/// };
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
     /// Executable path.
-    pub program: PathBuf,
+    program: PathBuf,
     /// Positional arguments.
-    pub args: Vec<String>,
+    args: Vec<String>,
     /// Digest required from the exact executable bytes used by the production runner.
     ///
     /// When present, the production runner copies the opened, no-follow source into a sealed
     /// executable memfd and executes that descriptor. The source path therefore cannot be swapped
     /// between verification and `execve`.
-    pub expected_digest: Option<Sha256Digest>,
+    expected_digest: Option<Sha256Digest>,
 }
 
 impl CommandSpec {
+    /// Returns the sealed executable path for adapter observation.
+    ///
+    /// There is intentionally no public constructor or mutable accessor: only this crate's
+    /// closed runtime operations can create a production command.
+    #[must_use]
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// Returns the exact positional arguments for adapter observation.
+    #[must_use]
+    pub fn arguments(&self) -> &[String] {
+        &self.args
+    }
+
+    /// Returns the executable digest bound by the production runner, when the executable has not
+    /// already been sealed behind an inherited descriptor.
+    #[must_use]
+    pub const fn expected_digest(&self) -> Option<Sha256Digest> {
+        self.expected_digest
+    }
+
     fn new(program: impl Into<PathBuf>, args: impl IntoIterator<Item = String>) -> Self {
         Self {
             program: program.into(),
@@ -8507,6 +8543,59 @@ mod tests {
             .expect_err("replaced pinned command must not execute");
         assert!(matches!(error, RuntimeError::ArtifactDigestMismatch { .. }));
         fs::remove_dir_all(directory).expect("test directory must be removable");
+    }
+
+    #[test]
+    fn real_command_runner_captures_bounded_output_and_clears_the_environment() {
+        let mut runner = RealCommandRunner::new();
+        let output = runner
+            .run(&CommandSpec::new(
+                "/bin/sh",
+                [
+                    "-c".to_owned(),
+                    "test -z \"$(/usr/bin/env)\"; printf stdout; printf stderr >&2".to_owned(),
+                ],
+            ))
+            .expect("bounded command output must succeed with an empty environment");
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+    }
+
+    #[test]
+    fn real_command_runner_terminates_oversized_stdout_and_stderr() {
+        let mut runner = RealCommandRunner::new();
+        let stdout_error = runner
+            .run(&CommandSpec::new("/usr/bin/yes", Vec::<String>::new()))
+            .expect_err("unbounded stdout must be rejected");
+        assert!(
+            matches!(stdout_error, RuntimeError::Command(message) if message.contains("stdout") && message.contains(&MAX_COMMAND_OUTPUT_BYTES.to_string()))
+        );
+
+        let stderr_error = runner
+            .run(&CommandSpec::new(
+                "/bin/sh",
+                ["-c".to_owned(), "while :; do printf x >&2; done".to_owned()],
+            ))
+            .expect_err("unbounded stderr must be rejected");
+        assert!(
+            matches!(stderr_error, RuntimeError::Command(message) if message.contains("stderr") && message.contains(&MAX_COMMAND_OUTPUT_BYTES.to_string()))
+        );
+    }
+
+    #[test]
+    fn real_command_runner_reaps_an_already_exited_owned_child() {
+        let mut runner = RealCommandRunner::new();
+        let process = runner
+            .start(&CommandSpec::new(
+                "/bin/sh",
+                ["-c".to_owned(), "exit 0".to_owned()],
+            ))
+            .expect("owned child must start");
+        thread::sleep(Duration::from_millis(20));
+        runner
+            .stop(process)
+            .expect("already-exited owned child must be a successful stop");
     }
 
     #[test]

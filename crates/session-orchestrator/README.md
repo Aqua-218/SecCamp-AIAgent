@@ -63,3 +63,14 @@ restore 後の identity は必ず ledger から fresh に予約する。
 `tests/production_adapters.rs` はこれらを `start_session` から `stop_session` まで接続し、
 exact identity、snapshot、workspace、listener、Authority subject closure を検査する。
 外部 command runner / filesystem / API は fake なので、実 Firecracker、特権 isolation、guest 内 capfs の end-to-end 実行を示すものではない。Broker の Firecracker per-port Unix listener と closed request の往復は別の module / opt-in KVM test で確認する。
+
+## multi-session scheduler core
+
+`control_plane` moduleは、一つの`SessionOwner`を多重化せず、認証済みstartごとに別の
+`ControlWorker`を所有する。HMAC-SHA-256でaction/principal/request/sessionを束縛し、globalと
+principal別quotaをworker作成前に検査する。append-only control journalはrequest/session IDを
+作成前にsyncして恒久的にburnし、stable lockで二つ目のcontrollerをfenceする。restart時は
+closeされていない全workerのexact cleanupが完了しない限りopenに成功しない。
+
+これはhosted scheduler coreであり、現行`host-sessiond`を複数起動するproduction adapterや
+外部control socketではない。現行deploymentは引き続きone-session unitである。

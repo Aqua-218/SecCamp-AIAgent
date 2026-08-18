@@ -457,7 +457,7 @@ assert_worker_ready() {
   [[ "${main_pid}" =~ ^[1-9][0-9]*$ \
     && "$(stat -c '%u' "/proc/${main_pid}")" == "${worker_uid}" ]] \
     || fail "worker main process has the wrong identity: ${unit}"
-  grep -qxF "0::/system.slice/${unit}" "/proc/${main_pid}/cgroup" \
+  grep -qxF "0::/system.slice/${unit}/daemon" "/proc/${main_pid}/cgroup" \
     || fail "worker is outside its exact delegated system.slice cgroup: ${unit}"
   status_file="${worker_runtime_root}/instances/${session}/status"
   grep -q '"event":"ready"' "${status_file}" \

@@ -316,6 +316,7 @@ impl CommandRunner for TestRunner {
             "cpu.max=1 1".to_owned(),
             "--chroot-base-dir".to_owned(),
             "/test/jailer".to_owned(),
+            "--daemonize".to_owned(),
             "--new-pid-ns".to_owned(),
             "--".to_owned(),
             "--api-sock".to_owned(),
@@ -333,6 +334,8 @@ impl CommandRunner for TestRunner {
                 != Some(workspace.as_str())
             || ownership.firecracker_executable != Path::new("/test/firecracker")
             || ownership.firecracker_digest != sha256(&[])
+            || ownership.uid != 1000
+            || ownership.gid != 1000
         {
             return Err(RuntimeError::Command(
                 "test runner rejected inexact Firecracker ownership".to_owned(),

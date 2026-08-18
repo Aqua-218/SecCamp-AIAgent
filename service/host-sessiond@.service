@@ -51,6 +51,7 @@ ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=no
 Delegate=yes
+DelegateSubgroup=daemon
 ProtectClock=yes
 ProtectHostname=yes
 PrivateTmp=yes

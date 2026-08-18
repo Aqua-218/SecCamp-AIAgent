@@ -73,6 +73,7 @@ use session_orchestrator::{
 
 const TEMPLATE_CLONE_ID: &str = "template";
 const MAX_SHUTDOWN_TIMEOUT_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+const SYSTEMD_WORKER_SUBGROUP: &str = "daemon";
 const REQUIRED_SECCOMP_DENIES: [&str; 6] = [
     "bpf",
     "mount",
@@ -773,7 +774,7 @@ impl DaemonConfig {
             let own_cgroup = if recover_only {
                 scoped_recovery_cgroup_parent(&cgroup_base, control_session)
             } else {
-                cgroup_parent.clone()
+                cgroup_parent.join(SYSTEMD_WORKER_SUBGROUP)
             };
             verify_own_systemd_cgroup(&own_cgroup)?;
         }
@@ -1595,12 +1596,12 @@ mod tests {
     };
 
     use super::{
-        Arguments, ControlInstance, MAX_SHUTDOWN_TIMEOUT_MILLIS, ShutdownRequest, file_authority,
-        json_string, parse_branch_pattern, parse_cgroup_parent, parse_egress_profile,
-        parse_file_effects, parse_github_operations, parse_hex_16, parse_http_methods,
-        parse_path_prefix, scoped_cgroup_parent, scoped_file, scoped_jailer_directory,
-        scoped_recovery_cgroup_parent, status_line, stop_file_present, systemd_arguments,
-        validate_absolute_path, validate_shutdown_timeout,
+        Arguments, ControlInstance, MAX_SHUTDOWN_TIMEOUT_MILLIS, SYSTEMD_WORKER_SUBGROUP,
+        ShutdownRequest, file_authority, json_string, parse_branch_pattern, parse_cgroup_parent,
+        parse_egress_profile, parse_file_effects, parse_github_operations, parse_hex_16,
+        parse_http_methods, parse_path_prefix, scoped_cgroup_parent, scoped_file,
+        scoped_jailer_directory, scoped_recovery_cgroup_parent, status_line, stop_file_present,
+        systemd_arguments, validate_absolute_path, validate_shutdown_timeout,
     };
     use authority_core::{capability::AuthorityBody, repository::RepoId};
     use firecracker_runtime::firecracker_guest_port_path;
@@ -1653,6 +1654,10 @@ mod tests {
         assert_eq!(
             scoped_cgroup_parent(base, Some(instance)),
             Path::new("system.slice/host-sessiond@00112233445566778899aabbccddeeff.service")
+        );
+        assert_eq!(
+            scoped_cgroup_parent(base, Some(instance)).join(SYSTEMD_WORKER_SUBGROUP),
+            Path::new("system.slice/host-sessiond@00112233445566778899aabbccddeeff.service/daemon")
         );
         assert_eq!(
             scoped_recovery_cgroup_parent(base, instance),

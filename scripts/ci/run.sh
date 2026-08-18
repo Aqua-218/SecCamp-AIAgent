@@ -137,6 +137,9 @@ case "${command_name}" in
   real-session-owner)
     scripts/ci/verify-real-session-owner.sh
     ;;
+  real-session-crash-recovery)
+    scripts/ci/verify-real-session-crash-recovery.sh
+    ;;
   post-exec-isolation)
     # Backward-compatible entry point: the production-launcher post-exec
     # scenario is one of the required privileged-isolation scenarios.

@@ -92,6 +92,11 @@ scheduling、VM escape、外部providerの安全性まで証明するもので�
 別identityのproduction sessionを完走する。mapper recoveryはsealed jail親からexact deviceを
 開き、mount IDとmajor/minorを照合してbindをunmountしてから、UUID/devno/root hash/deviceを
 照合したmapperだけを閉じる。11 case全体は実KVM hostで完走済みである。
+panicやcheckpoint到達前failureに対するwrapper fallbackも、存在しない`dmsetup --exists`に依存せず、
+exact invocation prefixのmapperを`dmsetup info`で確認してbounded removeする。cgroupも仮想fileの
+見かけのsizeではなく`cgroup.procs`内容を読み、空になるまで待ってEBUSYをbounded retryする。
+2026-08-18の最終再走査では11 checkpointの復旧後に、対象prefixのmapper、deleted loop、cgroup、
+staging tree、processがすべて不在であることを別probeでも確認した。
 
 ## 未検証の境界
 

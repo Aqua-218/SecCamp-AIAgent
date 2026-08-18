@@ -120,6 +120,12 @@ pipeline_complete:
     - job: session_owner_crash_recovery
       artifacts: false
       optional: true
+    - job: systemd_control_plane
+      artifacts: false
+      optional: true
+    - job: concurrent_session_owners
+      artifacts: false
+      optional: true
     - job: real_capfs
       artifacts: false
       optional: true

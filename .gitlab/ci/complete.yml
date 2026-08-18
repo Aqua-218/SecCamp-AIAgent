@@ -114,6 +114,9 @@ pipeline_complete:
     - job: session_owner_kvm
       artifacts: false
       optional: true
+    - job: session_owner_crash_recovery
+      artifacts: false
+      optional: true
     - job: real_capfs
       artifacts: false
       optional: true

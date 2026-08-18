@@ -80,7 +80,7 @@ impl GuestWorkload {
                 r#"-c \"[ ${GUEST_SUPERVISOR_READINESS:-missing} = 1 ] || exit 126; printf guest-supervisor-ready/v1; exec /usr/local/libexec/sleep 600\""#
             }
             Self::CgroupProbe => {
-                r#"-c \"[ ${GUEST_SUPERVISOR_READINESS:-missing} = 1 ] || exit 126; printf guest-supervisor-ready/v1; exec 1>&2; /usr/bin/mount -t proc -o nosuid,nodev,noexec proc /proc; /usr/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup; printf 'cgroup-probe-proc:\\n'; /usr/bin/cat /proc/cgroups; printf 'cgroup-probe-controllers: '; /usr/bin/cat /sys/fs/cgroup/cgroup.controllers; /usr/bin/sleep 600\""#
+                r#"-c \"[ ${GUEST_SUPERVISOR_READINESS:-missing} = 1 ] || exit 126; printf guest-supervisor-ready/v1; exec 1>&2; /usr/bin/mount -t proc -o nosuid,nodev,noexec proc /proc || { printf 'cgroup-probe-error: proc-mount\\n'; exit 120; }; /usr/bin/mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup || { printf 'cgroup-probe-error: cgroup2-mount\\n'; exit 121; }; attempt=0; controllers=''; while [ ${attempt} -lt 100 ]; do controllers=$(/usr/bin/cat /sys/fs/cgroup/cgroup.controllers); if printf '%s\\n' \"${controllers}\" | /usr/bin/grep -qw memory && printf '%s\\n' \"${controllers}\" | /usr/bin/grep -qw pids; then break; fi; attempt=$((attempt + 1)); /usr/bin/sleep 0.01; done; printf 'cgroup-probe-proc:\\n'; /usr/bin/cat /proc/cgroups; printf 'cgroup-probe-controllers: %s\\n' \"${controllers}\"; /usr/bin/sleep 600\""#
             }
             Self::BrokerProbe => "--port 18081",
             Self::RuntimeBrokerProbe => {
@@ -520,7 +520,9 @@ fn real_firecracker_guest_cgroup_v2_exposes_required_controllers() {
             .expect("guest identity action must reach the real guest");
         assert_eq!(
             response.body,
-            request.canonical_bound_acknowledgement(action)
+            request.canonical_bound_acknowledgement(action),
+            "guest identity action failed; guest serial output:\n{}",
+            vm.guest_serial_log()
         );
     }
 

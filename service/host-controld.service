@@ -9,11 +9,10 @@ ConditionPathExists=/etc/host-controld/control.key
 [Service]
 Type=simple
 User=host-controld
-Group=host-controld
-SupplementaryGroups=host-control
+Group=host-control
 EnvironmentFile=/etc/host-controld/controld.env
 StateDirectory=host-controld
-StateDirectoryMode=0750
+StateDirectoryMode=0700
 RuntimeDirectory=host-controld
 RuntimeDirectoryMode=0750
 ExecStart=/usr/local/bin/host-controld \

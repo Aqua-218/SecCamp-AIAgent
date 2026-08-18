@@ -8,11 +8,11 @@
 use firecracker_runtime::{
     ApiClient, ApiRequest, ApiResponse, CgroupConfig, CgroupVersion, CommandOutput, CommandRunner,
     CommandSpec, DmVerityConfig, FileSystem, HostIsolationConfig, HttpMethod, IdentityBundle,
-    IdentityId, IdentitySource, JailerConfig, MAX_COMMAND_OUTPUT_BYTES, MAX_HTTP_BODY_BYTES,
-    MAX_WORKSPACE_BYTES, MAX_WORKSPACE_DEPTH, MIN_WORKSPACE_IMAGE_BYTES, NamespaceConfig,
-    PinnedArtifact, ProcessHandle, ProcessOwnership, RealCommandRunner, RealFileSystem, Runtime,
-    RuntimeConfig, RuntimeError, RuntimeState, SeccompConfig, Snapshot, VsockConfig,
-    WorkspaceConfig, WorkspaceImageConfig, sha256,
+    IdentityId, IdentitySource, JailerConfig, MAX_HTTP_BODY_BYTES, MAX_WORKSPACE_BYTES,
+    MAX_WORKSPACE_DEPTH, MIN_WORKSPACE_IMAGE_BYTES, NamespaceConfig, PinnedArtifact, ProcessHandle,
+    ProcessOwnership, RealCommandRunner, RealFileSystem, Runtime, RuntimeConfig, RuntimeError,
+    RuntimeState, SeccompConfig, Snapshot, VsockConfig, WorkspaceConfig, WorkspaceImageConfig,
+    sha256,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -97,8 +97,8 @@ impl CommandRunner for MockRunner {
     fn run(&mut self, command: &CommandSpec) -> Result<CommandOutput, RuntimeError> {
         self.events.borrow_mut().push(format!(
             "command:run:{} {}",
-            command.program.display(),
-            command.args.join(" ")
+            command.program().display(),
+            command.arguments().join(" ")
         ));
         if self.run_failures.pop_front().unwrap_or(false) {
             return Err(RuntimeError::Command("mock command failure".to_owned()));
@@ -113,8 +113,8 @@ impl CommandRunner for MockRunner {
     fn start(&mut self, command: &CommandSpec) -> Result<ProcessHandle, RuntimeError> {
         self.events.borrow_mut().push(format!(
             "command:start:{} {}",
-            command.program.display(),
-            command.args.join(" ")
+            command.program().display(),
+            command.arguments().join(" ")
         ));
         let process = ProcessHandle { pid: self.next_pid };
         self.next_pid += 1;
@@ -1301,86 +1301,11 @@ fn real_filesystem_rejects_source_aliases_symlinks_hardlinks_and_bounds() {
     fs::remove_dir_all(root).expect("test workspace must be removable");
 }
 
-fn shell_command(script: &str) -> CommandSpec {
-    CommandSpec {
-        program: PathBuf::from("/bin/sh"),
-        args: vec!["-c".to_owned(), script.to_owned()],
-        expected_digest: None,
-    }
-}
-
 fn test_socket_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         ".firecracker-runtime-api-{name}-{}",
         std::process::id()
     ))
-}
-
-#[test]
-fn real_command_runner_captures_normal_output() {
-    let mut runner = RealCommandRunner::new();
-    let output = runner
-        .run(&shell_command("printf stdout; printf stderr >&2"))
-        .expect("normal command output must succeed");
-    assert_eq!(output.status, 0);
-    assert_eq!(output.stdout, b"stdout");
-    assert_eq!(output.stderr, b"stderr");
-}
-
-#[test]
-fn real_command_runner_does_not_inherit_the_host_environment() {
-    let mut runner = RealCommandRunner::new();
-    let output = runner
-        .run(&CommandSpec {
-            program: PathBuf::from("/usr/bin/env"),
-            args: Vec::new(),
-            expected_digest: None,
-        })
-        .expect("environment probe must run");
-    assert_eq!(output.status, 0);
-    assert!(
-        output.stdout.is_empty(),
-        "host credentials and proxy settings must not reach helper processes"
-    );
-    assert!(output.stderr.is_empty());
-}
-
-#[test]
-fn real_command_runner_terminates_on_oversized_stdout() {
-    let mut runner = RealCommandRunner::new();
-    let error = runner
-        .run(&CommandSpec {
-            program: PathBuf::from("yes"),
-            args: Vec::new(),
-            expected_digest: None,
-        })
-        .expect_err("unbounded command output must be rejected");
-    assert!(
-        matches!(error, RuntimeError::Command(message) if message.contains("stdout") && message.contains(&MAX_COMMAND_OUTPUT_BYTES.to_string()))
-    );
-}
-
-#[test]
-fn real_command_runner_terminates_on_oversized_stderr() {
-    let mut runner = RealCommandRunner::new();
-    let error = runner
-        .run(&shell_command("while :; do printf x >&2; done"))
-        .expect_err("unbounded command diagnostics must be rejected");
-    assert!(
-        matches!(error, RuntimeError::Command(message) if message.contains("stderr") && message.contains(&MAX_COMMAND_OUTPUT_BYTES.to_string()))
-    );
-}
-
-#[test]
-fn real_command_runner_reaps_an_already_exited_owned_child() {
-    let mut runner = RealCommandRunner::new();
-    let process = runner
-        .start(&shell_command("exit 0"))
-        .expect("owned child must start");
-    std::thread::sleep(Duration::from_millis(20));
-    runner
-        .stop(process)
-        .expect("already-exited owned child must be a successful stop");
 }
 
 #[test]

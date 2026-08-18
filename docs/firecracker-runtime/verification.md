@@ -53,8 +53,13 @@ HTTP を自前で実装しているので、request smuggling の入口になり
 | stderr が上限を超えたらプロセスを終了させる | `real_command_runner_terminates_on_oversized_stderr` |
 | 所有する終了済み child を reap する | `real_command_runner_reaps_an_already_exited_owned_child` |
 | 所有しない PID に signal を送らない | `real_command_runner_rejects_unowned_pid_without_signalling_it` |
+| 外部crateが任意program/argvをproduction runnerへ組み立てられない | private-field `CommandSpec` と compile-fail doctest |
 
 最後の 1 つは、`ProcessHandle` の PID を偽造されても他プロセスを殺さないことを見ている。`children` map に無い PID は拒否する。
+`CommandSpec` は読み取りaccessorだけを公開し、constructorとfieldをcrate-privateにしている。
+そのためadapter testはexact program/argvを観測できるが、library利用者が`RealCommandRunner`へ
+`/bin/sh -c`や`rm -rf /`を新しく注入することはできない。runtime内部のcommandもpinned artifactか、
+既にopened bytesへ封印したdescriptorだけを使い、environment/stdinは継承しない。
 
 ### `RealFileSystem`（実 filesystem）
 
@@ -115,6 +120,12 @@ symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` �
 
 このgateが示すのは、指定host上でresource ownershipとjailer lifecycleが実際に成立し、shutdownがexact scopeを回収することまでである。さらに`scripts/ci/verify-real-session-owner.sh`はclean snapshotを実作成してproduction `SessionOwner`からrestoreし、guestの全13 CapFS effect、durable Broker/identity evidence、stopと全resource cleanupを一続きで検証する。VM escape proofや任意guest codeに対する完全な意味論証明は含まない。
 
+`scripts/ci/verify-real-runtime-version-matrix.sh` は同じ production lifecycle gate を
+Firecracker 1.15.1 と 1.16.1 の順で実行する。archive は version ごとの固定 SHA-256 と
+official release asset の checksum の両方で照合し、未知の version は download 前に拒否する。
+2026-08-18 の x86_64 KVM host では両 version が起動、観測、shutdown、residue 検査まで完走した。
+これは宣言した 2 version の互換性証拠であり、将来 version や全 host kernel の互換性を外挿しない。
+
 ## 実行コマンド
 
 ```bash
@@ -125,6 +136,7 @@ cargo clippy --manifest-path crates/firecracker-runtime/Cargo.toml --all-targets
 # root、KVM、vhost-vsock、device-mapper がある Linux host でだけ実行する
 scripts/ci/verify-real-guest-control.sh
 scripts/ci/verify-real-runtime-lifecycle.sh
+scripts/ci/verify-real-runtime-version-matrix.sh
 scripts/ci/verify-real-session-owner.sh
 ```
 
@@ -132,6 +144,7 @@ scripts/ci/verify-real-session-owner.sh
 
 | 未検証の対象 | なぜ未検証か | 何があれば検証できる |
 |---|---|---|
+| privileged host processの分離 | 外部crateから任意`CommandSpec`を作る経路は閉じたが、production `host-sessiond`自身がruntimeのmount/device-mapper/cgroup/filesystem操作を保持する | 固定operationだけを受ける別helper、unprivileged controller、相互認証されたbounded IPC、helper crash/replay/cleanupの実KVM gate |
 | VM escape を含む実 jailer の完全な隔離効果 | lifecycle gate は PID/mount namespace、UID、cgroup、seccomp installation を観測するが、攻撃者が escape できないことまでは証明しない | syscall deny と host boundary を含む hostile guest test |
 | seccomp filterの全syscall・全引数に対する意味論 | privileged post-exec gateは代表的deny、KVM guestは標準filesystem APIに必要なallowを実測するが、Linux全syscall/引数空間を列挙しない | syscall/argument corpusを持つhostile guest test |
 

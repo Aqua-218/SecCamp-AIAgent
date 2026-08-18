@@ -712,6 +712,28 @@ gates:
     workflow: deep.yml
     include: deep.yml
 
+  - id: systemd_control_plane
+    title: Authenticated systemd control-plane verification
+    stage: system
+    tier: deep
+    scopes: [rust, pipeline]
+    status: implemented
+    github: systemd_control_plane
+    gitlab: systemd_control_plane
+    workflow: deep.yml
+    include: deep.yml
+
+  - id: concurrent_session_owners
+    title: Concurrent SessionOwner KVM verification
+    stage: system
+    tier: deep
+    scopes: [rust, pipeline]
+    status: implemented
+    github: concurrent_session_owners
+    gitlab: concurrent_session_owners
+    workflow: deep.yml
+    include: deep.yml
+
   - id: external_provider_smoke
     title: Protected external provider smoke
     stage: security

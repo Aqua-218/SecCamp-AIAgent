@@ -48,7 +48,7 @@ sequenceDiagram
 
 ## session budget
 
-deduplication table は `NonZeroUsize` の capacity を持つ。無限に request identity を保持してメモリを使い切ることはできない。容量超過なら新しい外部副作用を dispatch せずに拒否する。
+deduplication table は `NonZeroUsize` の capacity を持つ。受理した新しい request identity を table から eviction する機能はなく、capacity は session の生涯に受理できる新規 request 数を定める。容量超過なら新しい外部副作用を dispatch せずに拒否する。完全一致の `Duplicate` は新規挿入ではないため capacity を消費しない。
 
 `budget.rs` は、Capability から分けるべき session-wide の消費予算を実装している。
 
@@ -86,7 +86,7 @@ response outcome の保持先と connection close は transport / Broker の責�
 envelope が保証するのは、1 つの session 内で要求の順序と同一性が判定できることだけ。
 
 - session そのものの認証はしていない。`BrokerSessionId` を持っていることが、その session の正当な所有者である証明にはならない。connection の identity は [transport 契約](../egress-broker/transport.md)の層が持つ。
-- replay 防止は bounded capacity の範囲でしか効かない。capacity を超えて古くなった `(session, sequence)` は cache から落ちる。sequence の単調性がその後の防波堤になる。
+- replay 防止は session の生涯で受理できる新規 request 数（`capacity`）の範囲で効く。古い entry の eviction や expiry は無いため、capacity を使い切った session は新しい request を受理できない。capacity 超過後に古い identity が再び受理される、という窓は存在しない。
 - payload hash は同一性の判定に使うだけで、完全性の証明ではない。改竄を検出する経路は TLS ではなく vsock の信頼に依存している。
 - budget は要求の受理前に予約するが、実際の消費量が予約と一致することは adapter 側の実装に依存する。
 - 時刻は扱わない。session の有効期間は Capability の[有効期間](../authority-core/validity-windows.md)が持つ。
@@ -97,7 +97,7 @@ envelope が保証するのは、1 つの session 内で要求の順序と同一
 - sequence の開始値 `0` と「直前の次だけ」の規則を緩めない。飛ばしを許すと、失われた要求と再送の区別が付かなくなる。
 - 完全一致 retry の判定から field を減らさない。`(session, sequence, request ID, payload hash)` の 4 つ揃いが条件で、payload hash を外すと別内容の要求が retry として通る。
 - 拒否 outcome の cache をやめない。再計算すると budget や時刻の変化で結果が変わる。
-- replay capacity を変えるときは、その値が session あたりの in-flight 要求数を上回っていることを確認する。下回ると正当な retry が cache から落ちる。
+- replay capacity を変えるときは、その値が session の生涯で受理する新規 request 数を覆うことを確認する。これは in-flight 要求数だけの窓ではなく、eviction のない identity table の上限である。
 - budget の予約と解放を非対称にしない。拒否された要求の予約が解放されないと、session が徐々に枯れる。
 - restore 後に新しい `BrokerSessionId` を確立する手順を省かない。[snapshot と identity gate](../firecracker-runtime/snapshot-and-identity.md)がこの前提に依存している。
 

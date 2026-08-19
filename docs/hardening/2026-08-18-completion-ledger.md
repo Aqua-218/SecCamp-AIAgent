@@ -8,7 +8,8 @@
 
 This ledger controls the post-verification hardening wave.  It is not evidence that a control is
 implemented: a track moves to `verified` only when the named gate succeeds in the required
-environment and the corresponding claim in `docs/verification-status.yml` is updated.
+environment and the corresponding claim in `docs/verification-status.yml` is updated.  The
+status is scope-limited; this ledger does not contain a CI run ID or an execution transcript.
 
 ## local test で確認したこと
 
@@ -25,8 +26,8 @@ scripts/ci/validate-pipelines.sh
 scripts/ci/check-pipeline-parity.sh
 scripts/ci/test-pipeline-planner.sh
 scripts/ci/tests/test-external-review.sh
-cargo test -p session-orchestrator --all-targets --features crash-test-hooks --locked
-uvx --from semgrep semgrep scan --config .semgrep.yml --error --metrics off --exclude target --exclude lean/.lake crates
+cargo test --locked -p session-orchestrator --all-targets --features crash-test-hooks
+docker run --rm --volume "${PWD}:/src" --workdir /src docker.io/semgrep/semgrep:1.172.0@sha256:a8298d1c09c84b9a0bbc75ec915e37023fc4657360b6dbfa645261d2353a366c semgrep scan --config .semgrep.yml --error --metrics off --exclude target --exclude lean/.lake crates
 # Every declared entry in ci/gates.yml was run through the matching bounded gate.
 while IFS=$'\t' read -r package filter; do scripts/ci/run-miri.sh "$package" "$filter"; done < <(.ci-tools/bin/yq -o=tsv '.matrices.miri_packages.values[] | [.package, .filter]' ci/gates.yml)
 scripts/ci/run-sanitizer.sh address egress-protocol
@@ -34,8 +35,6 @@ scripts/ci/run-sanitizer.sh leak egress-protocol
 scripts/ci/run-fuzz.sh authority-core canonical_path
 scripts/ci/run-fuzz.sh egress-protocol cbor_request_decode
 scripts/ci/run-fuzz.sh egress-protocol frame_decode
-scripts/ci/run-fuzz.sh egress-protocol response_decode
-scripts/ci/run-fuzz.sh egress-protocol session_accept
 scripts/ci/run-mutation.sh 1 authority-core
 scripts/ci/run-mutation.sh 2 egress-protocol
 scripts/ci/run.sh coverage
@@ -76,6 +75,8 @@ Release dry-run と reproducibility は、未commitのhardening差分をその�
   self-review.
 
 ## Acceptance tracks
+
+`Current state` は verification manifest の declared scope を写した分類であり、このファイルの読者に対する新しい実行証拠ではない。`Exit condition` は gate が満たすべき条件を示す。実際の run、revision、artifact は対応する gate の CI 証跡で確認し、条件を満たさない scope へ `verified` を拡張しない。
 
 | Track | Current state | Exit condition |
 |---|---|---|
@@ -136,12 +137,14 @@ parser, digest, disposition, and signature behavior; that fixture is never revie
 acceptance table の `partial`、`open`、`out of scope`、`blocked` は未検証境界である。実装だけで
 外部前提を満たしたことにはしない。特に protected runner が無い alternate architecture、
 operator credential が無い live provider、repository の作者と独立していない review は、
-local greenでも `verified` へ進めない。x86_64のexact installed production chainはこのhostで
-実行済みであり、これら外部境界には含めない。
+local greenでも `verified` へ進めない。x86_64の exact installed production chain は
+`verification-status.yml` が宣言する `kvm` scope の claim として扱うが、この台帳自体は
+その実行時刻や artifact を保持せず、別の環境へ結果を一般化しない。
 
 ## 関連
 
-- [検証ステータス](../verification-status.yml)
+- [検証ステータスの規約](../verification-status.md)
+- [検証ステータス manifest](../verification-status.yml)
 - [検証戦略](../design/verification.md)
 - [Firecracker runtime の検証](../firecracker-runtime/verification.md)
 - [Session orchestrator](../session-orchestrator/README.md)

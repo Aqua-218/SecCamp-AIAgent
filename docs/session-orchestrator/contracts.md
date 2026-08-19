@@ -6,7 +6,7 @@
 
 > **対象読者:** production adapter 実装者、host/guest 境界のレビュー担当者
 
-この文書は `session-orchestrator` の backend trait へ接続するための統合契約である。orchestrator 自身は trait を呼び出す以外の副作用を持たない。backend は effect が commit point に到達した後だけ lease を返し、要求と異なる session/resource identity の lease を返してはならない。
+この文書は `session-orchestrator` の backend trait へ接続するための統合契約である。state machine 本体が runtime resource に対して行う副作用は trait 経由に閉じるが、durable identity ledger と production recovery journal の file durability はそれぞれの crate abstraction が所有する。backend は effect が commit point に到達した後だけ lease を返し、要求と異なる session/resource identity の lease を返してはならない。
 
 ## 対象ソース
 
@@ -24,7 +24,7 @@
 | trait | production の所有者 | commit の責務 |
 | --- | --- | --- |
 | `WorkspaceBackend` | host workspace/block-image adapter | private workspace を clone し、`WorkspaceId` に bind し、isolation 時に再利用不能にする |
-| `BrokerBackend` | host vsock/Broker adapter | 新しい Broker connection を確立し、idempotent に close する |
+| `BrokerBackend` | host vsock/Broker adapter | 新しい Broker connection を確立し、running health を確認し、idempotent に close する |
 | `VmBackend` | Firecracker supervisor | exact workspace と Broker binding で一つの VM を起動し、VM と全 workload process を kill する |
 | `CapabilityBackend<G>` | Authority adapter | 生成済み subject を登録し、型付き root grant を注入する |
 | `CapabilityRevocationBackend` | Authority adapter | root を revoke し、後続 authorization を fail closed にする |
@@ -76,7 +76,7 @@ let broker_session = egress_protocol::session::BrokerSessionId::new(
 );
 ```
 
-connection ごとに新しい `egress_protocol::session::SessionReplayGuard` を作る。最初の control request は identity から作った fresh な `BrokerRequestId`、strict sequence、`PayloadHash::of_canonical_payload` を使う。restore 後の connection で以前の guard や sequence を再利用してはならない。
+connection ごとに新しい `egress_protocol::session::SessionReplayGuard` を作る。最初の control request は identity から作った fresh な `BrokerRequestId`、strict sequence、`PayloadHash::of_canonical_payload` を使う。restore 後の connection で以前の guard や sequence を再利用してはならない。`establish_broker_session` の成功は channel の確立だけを意味し、`ensure_broker_session_running` が health を確認するまでは workload release の commit point に進めない。
 
 返却される session binding を検査してから、次を返す。
 
@@ -127,11 +127,13 @@ root capability revoke
   -> Closed
 ```
 
+startup の最後の `release_workload` の前には `BrokerBackend::ensure_broker_session_running` を置く。これに失敗した場合は workload を解放せず、既に確保した resource を startup rollback の逆順で処理する。
+
 orchestrator は前段の cleanup が失敗しても、後段の safe な cleanup を試みる。ただし、VM kill が失敗した場合は workspace isolation を実行しない。全 stage が commit するまで `Closed` とせず、`Stopping` に保持して未完了 stage だけを retry する。startup rollback が失敗した場合も `Ready` へ戻して次の session を受け付けてはならない。revoke、VM kill、Broker close、workspace isolation は idempotent で、effect が commit point に到達しなかった場合は failure を返す。
 
 ## 検証状態
 
-この契約の state machine test に加え、production adapter composition test は実 `CapabilityKernel`、Broker / Firecracker / workspace adapter を同じ startup/stop 経路へ接続する。通常testの外部 command、filesystem、API は test double である。required KVM gateでは実CapFS mount、実`SessionOwner` lifecycle、特権guest isolation、全13 file effect、Broker WAL、shutdown residueを通し、concurrent gateでは2つの実ownerとBroker workerを同時にlive確認して独立cleanupを確認する。実systemd gateは非特権controller、polkitで閉じたworker operation、別process worker、failed unitの強制recovery、controller crash reconciliationを確認する。
+この契約の state machine test に加え、production adapter composition test は実 `CapabilityKernel`、Broker / Firecracker / workspace adapter を同じ startup/stop 経路へ接続する。通常testの外部 command、filesystem、API は test double である。required KVM gateでは実CapFS mount、実`SessionOwner` lifecycle、特権guest isolation、全13 file effect、Broker WAL、shutdown residueを通し、concurrent gateでは2つの実ownerとBroker workerを同時にlive確認して独立cleanupを確認する。実systemd gateは非特権controller、polkitで閉じたworker operation、別process worker、failed unitの強制recovery、controller crash reconciliationを確認する。process crash をまたぐ resource ownership は [`DurableSessionRecoveryJournal`](../../crates/session-orchestrator/src/recovery.rs) の stage と fingerprint によって別途検証する。
 
 ## 保証範囲外
 
@@ -149,4 +151,7 @@ adapter 実装者がこの契約から得られないもの。
 - [Firecracker runtime](../firecracker-runtime/README.md)
 - [Supervisor adapter](../supervisor/README.md)
 - [Host Egress Broker](../egress-broker/README.md)
+- [multi-session control plane](control-plane.md)
+- [systemd worker 境界](systemd-worker.md)
+- [session recovery journal](recovery.md)
 - [実装順序](../design/implementation-plan.md)

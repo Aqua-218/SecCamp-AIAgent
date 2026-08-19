@@ -18,7 +18,7 @@ authority-core = { path = "../authority-core" }
 egress-protocol = { path = "../egress-protocol" }
 rustix = { version = "1.1.4", features = ["fs", "mount"] }
 serde_json = "1.0.149"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 socket2 = { version = "0.6.5", features = ["all"] }
 tempfile = "3.27.0"
 

@@ -12,7 +12,7 @@
 
 | 境界 | 検証手段 | test |
 |---|---|---|
-| 13 step が定義順に実行される | 記録型 mock backend | `successful_apply_enforces_the_security_order` |
+| 13 step が定義順に実行される | 記録型 mock backend | `successful_child_spawn_enforces_the_security_order` |
 | 失敗時に完了済み step が逆順に rollback される | 記録型 mock backend | `a_failed_step_rolls_back_every_completed_step_in_reverse_order` |
 | capability 不足を mutation 前に検出する | mock backend | `insufficient_capabilities_are_reported_before_any_mutation` |
 | Landlock ABI が要求値未満なら起動しない | mock backend | `a_kernel_with_an_older_landlock_abi_is_rejected` |
@@ -98,7 +98,8 @@ wrapper は先に production の `workload-isolation-launcher` binary を build 
 `verify-runtime-isolation-soak.sh` は同じ no-skip privileged gate を既定 20 回繰り返す。
 `RUNTIME_ISOLATION_SOAK_ITERATIONS` は 1..100 の整数だけを受け入れ、無制限 run を作らない。
 各反復は enforce、post-exec、Landlock failure、実 mount rollback の 4 scenario と終了後の
-resource residue を再確認する。2026-08-18 の x86_64 KVM host では既定 20 回が完走した。
+resource residue を再確認する。これは実行時に指定 host の結果を得るための wrapper であり、
+リポジトリ内に全 host を代表する成功記録を持つものではない。
 
 syscall corpus は安全な不正引数を使う。filter が退行しても kernel object を作らない値で
 呼び出し、予期せず descriptor が返れば即座に close して test を失敗させる。これは選んだ
@@ -106,7 +107,7 @@ syscall corpus は安全な不正引数を使う。filter が退行しても ker
 
 `capability_detection.rs` と `privileged_isolation.rs` はどちらも `#[ignore]` を使っていない。権限や kernel feature が足りない環境では、`CapabilityReport` の不足理由を stderr に出したうえで detection 分岐そのものを検証する。CI で「skip されたので緑」という状態を作らないための書き方。
 
-`privileged_isolation.rs` が要求するのは、user namespace が許可された Linux host、`memory` と `pids` を子へ委譲している cgroup v2 hierarchy、Landlock ABI 3 以上、seccomp、`clone3` / `close_range` / `pidfd_open`、host local `AF_VSOCK`。root で走らせる必要がある。probe は自分専用の mount namespace と tmpfs の中に staged rootfs を組み立てるので、host の mount table や root filesystem は変えない。
+`privileged_isolation.rs` が要求するのは、user namespace が許可された Linux host、`memory` と `pids` を子へ委譲している cgroup v2 hierarchy、Landlock ABI 3 以上、seccomp、`clone3` / `close_range` / `pidfd_open`、host local `AF_VSOCK`。root で走らせる必要がある。config の access-mask schema は ABI 3 に固定される。probe は自分専用の mount namespace と tmpfs の中に staged rootfs を組み立てるので、host の mount table や root filesystem は変えない。
 
 ## 未検証の境界
 

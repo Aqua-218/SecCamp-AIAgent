@@ -61,7 +61,10 @@ FileEffect :=
   ReadData | ListDirectory | WriteData | Truncate
   | CreateFile | CreateDirectory
   | RemoveFile | RemoveDirectory | Rename | SetMetadata
+  | ReadLink | CreateSymlink | CreateHardLink
 ```
+
+`FileEffect::ALL` の wire order はこの 13 種で固定されている。`ReadLink`、`CreateSymlink`、`CreateHardLink` は link を扱うための独立した効果であり、`WriteData` に暗黙に含めない。policy digest と durable audit の tag は append-only なので、既存の effect を並べ替えない。
 
 create で見るのは親 directory ではなく、これから作る子のパス。rename は移動元と移動先の両方を見る。単に「書き込み可能」という一語でまとめない。
 
@@ -143,3 +146,4 @@ Authority には repository、host、操作、時刻を含める。`delegable` �
 - [状態機械と revoke](state-and-revocation.md)
 - [capfs](capfs.md)
 - [検証戦略](verification.md)
+- [検証ステータス manifest](../verification-status.md)

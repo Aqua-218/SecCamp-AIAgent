@@ -6,7 +6,7 @@
 
 > **対象読者:** boot artifact を差し替える運用担当者、供給経路をレビューする人
 
-`RuntimeConfig` の起動 profile に含まれる実行ファイルと image は 8 つある。firecracker、kernel、rootfs、dm-verity hash image、veritysetup、workspace image formatter、jailer、seccomp filter。[`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) はこの 8 つ全てを `PinnedArtifact`、つまり path と SHA-256 digest の組として受け取る。crash recovery の `RecoveryTools` はこれとは別に `veritysetup` と `dmsetup` を pinned artifact として検証する。
+`RuntimeConfig` の起動 profile に含まれる実行ファイルと image は 10 個ある。firecracker、kernel、rootfs、dm-verity hash image、veritysetup、workspace image formatter、jailer、seccomp compiler、seccomp filter、seccomp policy である。[`lib.rs`](../../crates/firecracker-runtime/src/lib.rs) はこの 10 個全てを `PinnedArtifact`、つまり path と SHA-256 digest の組として受け取る。crash recovery の `RecoveryTools` はこれとは別に `veritysetup` と `dmsetup` を pinned artifact として検証する。
 
 ## path だけで指定すると何が起きるか
 
@@ -18,13 +18,13 @@ digest を持っていれば、起動前に読んで照合できる。
 fn validate_artifact(label: &str, artifact: &PinnedArtifact) -> ...
 ```
 
-`Runtime::launch` は `config.validate()` の直後に `verify_artifacts(config)` を呼ぶ。ここで 8 つ全部を読み、`sha256()` の結果と `PinnedArtifact` の digest を比較する。1 つでも合わなければ、workspace を clone する前、dm-verity を開く前、jailer を起動する前に止まる。
+`Runtime::launch` は `config.validate()` の直後に `verify_artifacts(config)` を呼ぶ。ここで 10 個全部を読み、`sha256()` の結果と `PinnedArtifact` の digest を比較する。さらに seccomp policy JSON の形を検査し、pinned compiler で再生成した filter が pinned BPF と byte-for-byte 一致することを確認する。1 つでも合わなければ、workspace を clone する前、dm-verity を開く前、jailer を起動する前に止まる。
 
 ```mermaid
 flowchart TB
     start["launch(config)"] --> val["config.validate()<br/>純粋関数、副作用なし"]
     val -->|InvalidConfig| stop1["中断"]
-    val --> ver["verify_artifacts()<br/>8 artifact を読んで digest 照合"]
+    val --> ver["verify_artifacts()<br/>10 artifact を読んで digest 照合<br/>seccomp JSON/BPF を再検証"]
     ver -->|DigestMismatch| stop2["中断<br/>まだ何も作っていない"]
     ver --> clone["workspace clone"]
     clone --> verity["dm-verity open"]
@@ -60,10 +60,10 @@ if self.dm_verity.hash_device != self.verity_hash.path {
 
 ## config 全体の fingerprint
 
-`RuntimeConfig::fingerprint()` は config から 1 つの `Sha256Digest` を作る。用途は snapshot との突き合わせで、`Snapshot` は自分が作られたときの `artifact_fingerprint` を保持している。
+`RuntimeConfig::snapshot_fingerprint()` は restore 互換性に関わる config から 1 つの `Sha256Digest` を作る。用途は snapshot との突き合わせで、`Snapshot` は自分が作られたときの `artifact_fingerprint` を保持している。clone ID、cgroup leaf、mapper 名、session 固有 path は別の `instance_fingerprint()` で束縛される。
 
 ```rust
-if config.fingerprint() != snapshot.artifact_fingerprint {
+if config.snapshot_fingerprint() != snapshot.artifact_fingerprint {
     return Err(RuntimeError::StaleSnapshot(
         "snapshot artifact fingerprint does not match the requested runtime"));
 }
@@ -98,13 +98,13 @@ snapshot の互換性判定が 1 つの digest 比較になっているので、
 `verify_artifacts` は指定 path の digest を side effect の前に照合する。さらに、digest 付きで実行する host command と recovery tool は、実行時に `O_NOFOLLOW` で開いた regular file を sealed executable memfd へコピーし、`/proc/self/fd/<n>` を program として起動する。`RealCommandRunner` / detached launcher は ambient environment を `env_clear()` で消す。このため、以前の「照合後に path を再解決するため TOCTOU が残る」という説明は現状実装には当たらない。
 
 - digest 照合と memfd sealing は artifact の同一性を保証するが、artifact 自体の供給元・安全性は証明しない。信頼するのは供給元であり、この crate は同一性しか見ていない。
-- 実`veritysetup`／`dmsetup`のmapping、hash-tree検証、jailer配下の起動はreal lifecycle／KVM gateで確認済み。pinned commandのno-follow・memfd・環境消去も実装・テスト済み。ただしartifact供給元、device-mapper、kernel実装そのものの正しさはTCBである。
+- 実`veritysetup`／`dmsetup`のmapping、hash-tree検証、jailer配下の起動は real lifecycle／KVM gate で検証対象になる。pinned command の no-follow・memfd・環境消去は実装・test の対象である。ただし、この文書だけで全 host 上の実機実行を主張せず、artifact 供給元、device-mapper、kernel 実装そのものは TCB に残る。
 - `sha2` crate の実装の正しさは仮定している。test vector 2 本では、実装が壊れていないことの弱い証拠にしかならない。
 - config fingerprint の計算対象が「変わったら snapshot を無効にすべき全項目」を漏れなく含んでいることは、証明していない。
 
 ## 変更時の確認点
 
-- `RuntimeConfig` にフィールドを足すときは、それが `fingerprint()` に含まれるべきかを判断する。含めるべきものを漏らすと、古い snapshot が新しい config で restore できてしまう。
+- `RuntimeConfig` にフィールドを足すときは、それが `snapshot_fingerprint()` または `instance_fingerprint()` に含まれるべきかを判断する。含めるべきものを漏らすと、古い snapshot が新しい config で restore できてしまう。
 - artifact を増やすときは `validate_artifact` の呼び出しと `verify_artifacts` の両方に足す。前者だけだと path の形は見るが digest を照合しない状態になる。
 - `dm_verity.data_device` / `hash_device` と `rootfs` / `verity_hash` の一致検査は消さない。消すと digest 照合の意味が無くなる。
 - `is_zero()` による拒否を外すときは、`Default` 由来の値がどこから来うるかを先に確認する。

@@ -45,6 +45,24 @@ payload の唯一の item は、次のどちらかである。
 
 installation と repository は host が割り当てる opaque identity なので、この schema は文字列の意味を解釈しない。host / URL path / branch のように authority comparison に直接使う値だけを authority-core の validator で再構築する。
 
+## response schema は別の canonical item
+
+request と response は同じ CBOR item に詰めない。`response.rs` の単一 response は、次の 4 要素 array である。
+
+```text
+[version = 1, request_id (16-byte bytes), outcome tag, outcome payload]
+```
+
+成功 payload は `Public` なら `[status, host, path, body]`、`GitHub` なら `[operation, response_bytes, pull_request_number?, object_id?]` で、拒否 payload は stable な rejection code だけを持つ。いずれも固定 array、minimal encoding、trailing bytes 無しで decode される。public body は wire 上 32 MiB、GitHub provider bytes は 1 MiB が上限である。
+
+単一 response の canonical encoding が 1 MiB の control frame に収まらない場合、`CanonicalBrokerResponse::encoded_chunk_iter` は response 全体の SHA-256 を各 chunk に付け、次の 7 要素を持つ canonical chunk payload を順番に返す。
+
+```text
+[version = 1, request_id, index, count, total_length, response_digest, bytes]
+```
+
+各 chunk は 1 MiB 以下、展開後の canonical response も bounded である。`GuestBrokerClient` と Broker server は request ID、順序、count、total length、digest、最終 response schema を再検査してから結果を返す。chunk を response 自体の代替 schema として解釈したり、任意順序で連結したりはしない。
+
 ## reject する表現
 
 この decoder は汎用 CBOR parser ではない。次を全て reject する。
@@ -102,6 +120,8 @@ installation と repository は host が割り当てる opaque identity なの�
 ## 関連
 
 - [Broker session envelope](session-envelopes.md)
+- [guest / host server の response sequence](../egress-broker/server.md)
+- [transport 契約](../egress-broker/transport.md)
 - [ネットワークと外部副作用](../design/network-egress.md)
 - [HTTP fetch authority](../authority-core/http-fetch-authorities.md)
 - [GitHub authority](../authority-core/github-authorities.md)

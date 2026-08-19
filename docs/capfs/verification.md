@@ -82,17 +82,31 @@ link については、実 mount 上で次を確認している。
 
 ## 実行コマンド
 
+repository root から、workspace の pinned lockfile を使う wrapper を実行する。
+
 ```bash
-cargo fmt --manifest-path crates/capfs/Cargo.toml -- --check
-cargo test --manifest-path crates/capfs/Cargo.toml
-cargo clippy --manifest-path crates/capfs/Cargo.toml --all-targets -- -D warnings
+scripts/ci/run.sh test-package capfs
+scripts/ci/run.sh format
+scripts/ci/run.sh clippy
 # Linux / root / /dev/fuse が必要な no-skip gate
-scripts/ci/verify-real-capfs.sh
+scripts/ci/run.sh real-capfs
 ```
+
+`test-package capfs` は `cargo nextest run --profile ci --locked --package capfs`、`format` と
+`clippy` は workspace 全体の quality gate である。package 単体の `cargo test` を手元で使う場合も
+repository root の `Cargo.lock` に固定するため `cargo test --locked --package capfs` とする。
 
 通常の `cargo test` では、`/dev/fuse` が無い hosted 環境に限って実 mount test を skip する。実 kernel の証拠を作るときは `scripts/ci/verify-real-capfs.sh` を使う。この script は Linux、root、読み書き可能な `/dev/fuse` を先に確認し、`CAPFS_REQUIRE_FUSE=1` を設定して全22件の実FUSE testを一件もskipせずに実行する。device が無い、mount が拒否される、または test 側が skip を検出した場合は exit 2 または test failure になり、green にはならない。
 
-`scripts/ci/verify-real-guest-control.sh`と`scripts/ci/verify-real-session-owner.sh`は、guest内でCapFSをmountし、List/CreateDirectory/CreateFile/Write/SetMetadata/CreateHardLink/CreateSymlink/ReadLink/Rename/Truncate/Read/RemoveFile/RemoveDirectoryを実行する。最後のBroker requestが到達したことを、前の全操作が完了したsequencing evidenceとして使う。
+`scripts/ci/verify-real-guest-control.sh`と`scripts/ci/verify-real-session-owner.sh`は、guest内でCapFSをmountし、List/CreateDirectory/CreateFile/Write/SetMetadata/CreateHardLink/CreateSymlink/ReadLink/Rename/Truncate/Read/RemoveFile/RemoveDirectoryを実行する。最後のBroker requestが到達したことを、前の全操作が完了したsequencing evidenceとして使う。これらは `scripts/ci/run.sh real-session-owner` など上位の KVM / privileged gate から呼ばれるため、hosted local test の結果とは分けて扱う。
+
+benchmark gate は FUSE 層を標準では必須にせず、`/dev/fuse` が無い場合は `native` / `kernel` の測定だけを残す。capability-check baseline を比較するときは次を使う。
+
+```bash
+scripts/ci/run.sh benchmarks
+```
+
+`REQUIRE_FUSE=1 scripts/ci/run.sh benchmarks` は `/dev/fuse` が無い環境を失敗にするが、mount 自体は標準 benchmark の対象外である。測定項目、baseline、未検証の性能境界は [overhead benchmark](overhead-benchmark.md)を参照する。
 
 ## 未検証の境界
 

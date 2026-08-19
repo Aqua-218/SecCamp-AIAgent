@@ -21,6 +21,7 @@
 | Rust と Lean の判定一致 | 共通 corpus の差分テスト | 実装済み。corpus に含まれる入力のみ |
 | FileEffect の durable/policy tag | Rust unit + 全 variant round-trip | 13 種類の tag を同じ定義から encode/decode し、未知 tag は拒否 |
 | observer と revoke の境界 | CapabilityKernel contract test | observer の失敗を報告しつつ revoke を保持し、後続認可を拒否 |
+| Capability state / CapFS の refinement | Lean の proof-carrying checker と theorem | 提供された versioned observation が抽象遷移へ対応することを確認。Rust process がその observation を生成したこと自体は確認しない |
 
 「実装済み」は各手段が答える問いに答えたという意味で、手段ごとに保証範囲が違う。次の節でその差を書く。
 
@@ -35,9 +36,10 @@ Authority core では、1つの手段ですべてを保証しようとせず、�
 | Loom model | 小さく切った並行処理で、許される全 interleaving が不変条件を守るか |
 | Lean executable example | Lean の `Bool` 判定は、この具体的な境界入力で期待どおりか |
 | Lean theorem | Lean モデルのすべての型付き入力で、一般的な性質が成り立つか |
+| Lean refinement checker | 提供された state/event observation が有限の抽象遷移と不変条件に対応するか |
 | 共通 corpus の差分テスト | 同じ入力に対して Rust と Lean が同じ結果を返すか |
 
-unit test、Lean example・theorem、共通 corpus は file / HTTP fetch / GitHub の authority family に実装済みである。逐次 Capability state には Rust の transition test と stateful property test があり、effect commit と revoke の同期境界には loom model がある。ただし、具体例・生成列・bounded interleaving を実行する検査と、全入力を扱う Lean theorem では保証範囲が異なる。
+unit test、Lean example・theorem、共通 corpus は file / HTTP fetch / GitHub の authority family に実装済みである。逐次 Capability state には Rust の transition test と stateful property test があり、effect commit と revoke の同期境界には loom model がある。Lean の refinement module は、Rust の実行を直接読むのではなく、versioned な logical observation と候補遷移を受け取って照合する。ただし、具体例・生成列・bounded interleaving を実行する検査と、全入力を扱う Lean theorem では保証範囲が異なる。
 
 ```mermaid
 flowchart LR
@@ -193,6 +195,14 @@ parser 自体にも executable example があり、header 欠落、未知の判�
 
 `lake test` は `AuthorityTests` を import したこの runner を test driver として構築し、標準の共有 fixture を評価する。そのため、独立した境界 example と、共通入力による両実装の比較を併用できる。
 
+## Refinement module は何を確認するか
+
+[`lean/Authority/Refinement/CapabilityState.lean`](../../lean/Authority/Refinement/CapabilityState.lean) は、`CapabilityState` の versioned logical event を受け取り、`checkEvent` / `checkObservedTrace` が受理した event trace が `CapabilityState.Steps` の有限遷移へ forward-simulate することを証明する。対象には subject 登録、root 発行、root ID allocation、Derive、revoke、subject close、open handle、effect attempt が含まれ、rejection、allocator exhaustion、audit failure、propagation error、commit unknown も outcome として区別される。
+
+[`lean/Authority/Refinement/Capfs.lean`](../../lean/Authority/Refinement/Capfs.lean) は、staged namespace と backing namespace を分けた failure-aware CapFS machine を定義する。`checkObservation` は caller が渡した observation をこの machine の候補遷移へ照合し、`startupDecision` は未解決 attempt が残る startup を `rejectUnresolved` として扱う。`Committed`、`FailedBeforeCommit`、`CommittedButAudit`、`CommitUnknown` を別の抽象 step とし、後二者では repository を quarantine して通常 operation を止め、cleanup close だけを許可する。clean または reconciled state だけを `admitClean` する。
+
+これらの checker は Rust の journal や event stream を自動収集しない。caller が渡した schema version、候補 state、operation evidence を検査し、受理したデータについてだけ定理を返す。したがって「Rust がその event を実際に出力した」「実 filesystem が抽象 state と一致した」という end-to-end の事実は、この Lean module 単独からは言えない。
+
 ## Production theorem は何を確認するか
 
 production theorem は [`lean/Authority/Path.lean`](../../lean/Authority/Path.lean)、[`lean/Authority/File.lean`](../../lean/Authority/File.lean)、[`lean/Authority/Http.lean`](../../lean/Authority/Http.lean)、[`lean/Authority/GitHub.lean`](../../lean/Authority/GitHub.lean)、[`lean/Authority/Time.lean`](../../lean/Authority/Time.lean)、[`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) に置く。
@@ -234,33 +244,55 @@ Lean theorem は Lean モデル内の全入力を扱い、共通 corpus は両�
 
 ## 実行コマンド
 
-repository root から Rust を検証する。
+repository root から、CI と同じ locked wrapper を実行する。
 
 ```bash
-cargo fmt --all --check
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
-RUSTFLAGS='--cfg loom' cargo test --package authority-core --test authorization_kernel_loom
-RUSTFLAGS='--cfg loom' cargo clippy --package authority-core --test authorization_kernel_loom -- -D warnings
+scripts/ci/run.sh format
+scripts/ci/run.sh check
+scripts/ci/run.sh clippy
+scripts/ci/run.sh docs
+scripts/ci/run.sh test-package authority-core
+scripts/ci/run.sh loom
 ```
 
-`lean/` から Lean を検証する。
+`scripts/ci/run.sh loom` は `RUSTFLAGS=--cfg loom` の test と Clippy を順に実行する。通常の workspace test だけでは loom model は動かない。
+
+Lean の production library、refinement module、example を `lean/` から検証する。
 
 ```bash
+cd lean
 lake build
 lake check-test
 lake test
 ```
 
+CI wrapper では `scripts/ci/run.sh lean` が pinned toolchain で `lake build` を実行する。`lake check-test` と `lake test` を手元で追加すると、test driver の型検査と fixture 実行まで確認できる。
+
 repository root から両実装の共通 corpus を比較する。
 
 ```bash
+scripts/ci/run.sh differential
 scripts/check-authority-corpus.sh
 ```
 
 [`lean/lakefile.toml`](../../lean/lakefile.toml) は `authority_corpus` executable を `testDriver` に設定する。この executable は `AuthorityTests` を import するため、`lake check-test` では境界 example と parser example が一緒に型検査される。`lake test` はそれに加えて標準の共有 fixture を実行する。
+
+深い CI gate のうち Authority core に直接対応するものは次である。Miri は pure Rust unit subset だけを対象にし、CapFS の syscall / FUSE 境界は対象にしない。fuzz は `CanonicalPath` の入力 parser に限定した bounded run である。
+
+```bash
+scripts/ci/run.sh miri authority-core policy::tests
+scripts/ci/run.sh fuzz authority-core canonical_path
+```
+
+| CI gate | 現在の入口 | 範囲と制限 |
+|---|---|---|
+| `rust_quality` | `scripts/ci/run.sh format` / `check` / `clippy` / `docs` | workspace の format、locked check、warnings-as-errors Clippy、rustdoc |
+| `rust_tests` | `scripts/ci/run.sh test-package authority-core` | Authority core の nextest package shard |
+| `loom` | `scripts/ci/run.sh loom` | kernel の lock / revoke / effect model。全 CapFS lock を含まない |
+| `lean_proofs` | `scripts/ci/run.sh lean` | pinned Lean toolchain の `lake build`。proof hygiene は別 gate |
+| `differential_corpus` | `scripts/ci/run.sh differential` | authority と runtime の shared corpus。有限 fixture のみ |
+| `miri` | `scripts/ci/run.sh miri authority-core <filter>` | `ci/gates.yml` に列挙された pure module test のみ |
+| `fuzz` | `scripts/ci/run.sh fuzz authority-core canonical_path` | committed seed corpus、256 runs / 20 秒の bounded fuzz |
 
 ## 未検証の境界
 

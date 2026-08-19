@@ -34,7 +34,7 @@ const RESOLVE_WITHIN_ROOT: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_XDEV);
 ```
 
-全 `openat2` がこの flag で走る。7 箇所ある。
+runtime の全 `openat2` 呼び出し（現在 11 箇所）がこの flag を使う。backing の preflight 側にも同じ root-beneath 解決があるため、箇所数ではなく flag の不変条件を変更時に確認する。
 
 | flag | 塞ぐ経路 |
 |---|---|
@@ -146,7 +146,7 @@ fd 相対に統一されているので、rename と競合する経路が構造�
 - `RuntimeBackingError` は adapter でほぼ全部 `AdapterError::Internal`（EIO）に潰れる。guest からは失敗の理由が区別できない。
 - 検査は「認可の直前」と「syscall の直前」の 2 点で行うが、その間の窓は原理的に残る。窓を閉じているのは fd 相対 I/O のほうで、metadata 検査は入口を絞っているだけ。
 - `MNT_ID` を返さない kernel では起動できない。fail closed だが、対応 kernel の下限がこの検査で決まる。
-- 実 FUSE mount 上の変更系操作と revoke を同時に競合させる統合 test は無い。
+- 実 FUSE mount 上では `mounted_view_linearizes_backing_mutation_against_revoke` が write と revoke の bounded race を検査する。全変更系 operation・全 thread schedule・無制限の外部 mutation を網羅するものではない。
 - panic による lock poisoning は fail closed だが、その後 process を再起動する以外に復旧手段が無い。
 
 ## 変更時の確認点

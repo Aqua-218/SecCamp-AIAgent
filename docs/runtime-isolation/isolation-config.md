@@ -6,19 +6,19 @@
 
 > **対象読者:** 隔離ポリシーを組み立てる実装者、mount 構成をレビューする人
 
-[`IsolationConfig::validate`](../../crates/runtime-isolation/src/config.rs) は、`apply` が最初に呼ぶ純粋関数である。副作用を一切持たず、ポリシーの組み合わせだけを見て落とす。
+[`IsolationConfig::validate`](../../crates/runtime-isolation/src/config.rs) は、`RuntimeIsolation::apply` と `spawn_isolated` の事前検査で最初に呼ばれる純粋関数である。副作用を一切持たず、ポリシーの組み合わせだけを見て落とす。
 
 ## なぜ syscall の前に落とすのか
 
 13 step のうち最初の 2 つ、namespace 作成と UID/GID map は戻せない。そこを通過してから「tmpfs の target が `/` だった」と気付いても、もう元のプロセスには帰れない。設定ミスを検出する場所は、1 つでも syscall を叩く前でなければ意味がない。
 
-だから `validate()` は `apply` の 1 行目にある。
+だから `validate()` は mutation を開始する前の `preflight` の 1 行目にある。旧 `apply` はこの検査と capability detection の後に child handoff 必須エラーを返し、`spawn_isolated` だけが namespace child で後続 step を実行する。
 
 ```rust
-pub fn apply<B: IsolationBackend>(
+fn preflight<B: IsolationBackend>(
     backend: &mut B,
     config: &IsolationConfig,
-) -> Result<IsolationReceipt, IsolationError> {
+) -> Result<(), IsolationError> {
     config.validate()?;
     let report = backend.detect_capabilities(config);
 ```
@@ -39,7 +39,7 @@ tmpfs.target        = /mnt/stage/tmp    -> 拒否
 
 **Landlock の writable path が workspace の外にある。** Landlock は path 単位で access を宣言する。workspace の外に書き込みを許すと、capability filesystem を経由しない書き込み経路ができる。`validate()` は `writable_paths` の全要素が `workspace.target` 以下であることを要求する。
 
-**mount target が重複する。** workspace と tmpfs が同じ path、あるいはどちらかが `/proc` か `/dev` を指している場合は拒否する。step 7 と 8 で `/proc` と `/dev` を空の read-only tmpfs で覆うので、そこに workspace を置くと後から潰される。
+**mount target が重複する。** workspace と tmpfs が同じ path、あるいは一方が `/proc`、`/dev`、`/run`、`/sys` と同じか祖先・子孫関係にある場合は拒否する。step 7 と 8、および rootfs の immutable-root 分岐でこれらの runtime mount を覆うので、そこに workspace を置くと後から潰される。
 
 ```mermaid
 flowchart LR
@@ -49,7 +49,7 @@ flowchart LR
     stage -->|no| deny
     stage -->|yes| ll{"Landlock writable が<br/>workspace の内側?"}
     ll -->|no| deny
-    ll -->|yes| dup{"workspace / tmpfs /<br/>proc / dev が別 path?"}
+    ll -->|yes| dup{"workspace / tmpfs /<br/>proc / dev / run / sys が非重複?"}
     dup -->|no| deny
     dup -->|yes| sec{"seccomp allowlist が<br/>この arch で解決可能?"}
     sec -->|no| deny
@@ -77,18 +77,18 @@ symlink はこの段階では解決しない。path 文字列の形だけを見�
 | tmpfs size | 1 byte 以上 1 GiB 以下 | `MAX_TMPFS_BYTES = 1 << 30` |
 | cgroup 名の長さ | 1〜255 bytes | `MAX_CGROUP_NAME_BYTES = 255` |
 | cgroup 名の文字種 | ASCII 英数字と `.` `_` `-` のみ。`.` と `..` 単体は不可 | — |
-| Landlock ABI | 3 以上 | `MIN_LANDLOCK_ABI = 3` |
+| Landlock ABI 設定 | **3 と完全一致** | `SUPPORTED_LANDLOCK_ABI = 3` |
 | `memory.max` / `pids.max` | いずれも正 | — |
 
 cgroup 名の制約は path traversal 対策。`cgroup.root` に名前を連結して directory を作るので、`..` や `/` が入ると hierarchy の外に出られる。文字種を allowlist にして、`.` と `..` を別途弾いている。
 
-Landlock ABI 3 を最低値にしているのは、`LANDLOCK_ACCESS_FS_TRUNCATE` と `LANDLOCK_ACCESS_FS_REFER` が ABI 3 で入ったから。truncate を制御できないと、書き込み権を与えていない file を size 0 にできてしまう。詳細は [Landlock envelope](landlock-envelope.md)。
+Landlock の access-mask schema は ABI 3 に固定している。`LANDLOCK_ACCESS_FS_TRUNCATE` と `LANDLOCK_ACCESS_FS_REFER` が ABI 3 で入ったためで、truncate を制御できないと、書き込み権を与えていない file を size 0 にできてしまう。host capability detection は ABI が要求値以上かを確認するが、config 自体は ABI 3 以外を受け付けない。詳細は [Landlock envelope](landlock-envelope.md)。
 
 ## seccomp だけ検査の性質が違う
 
-`self.seccomp.validate_for_platform()` は、allowlist の全 syscall がこの target architecture で番号に解決できるかを見る。x86_64 以外では `Syscall::number()` が常に `None` を返すので、この検査は必ず失敗する。
+`self.seccomp.validate_for_platform()` は、allowlist の全 syscall がこの target architecture で番号に解決できるかを見る。実装済みの対象は x86_64 と aarch64 で、それ以外では `Syscall::number()` が `None` を返すため、この検査は必ず失敗する。
 
-つまり x86_64 以外では `validate()` が通らない。移植するときは `syscall.rs` の `number()` に arch 分岐を足す必要があり、その作業を忘れたまま動いてしまうことはない。
+つまり x86_64 と aarch64 以外では `validate()` が通らない。新しい architecture を追加するときは `syscall.rs` の `number()` と Linux seccomp の audit-arch check の両方に分岐を足す必要があり、片方を忘れたまま動いてしまうことはない。
 
 ## 何が助かるのか
 
@@ -110,7 +110,7 @@ Landlock ABI 3 を最低値にしているのは、`LANDLOCK_ACCESS_FS_TRUNCATE`
 - 検査を足すときは、それが純粋関数のままかを確認する。filesystem を読む検査を入れると `validate()` の性質が変わり、`apply` の 1 行目で呼べる保証が崩れる。
 - 上限定数を変えるときは、その値がどの攻撃を防いでいるのかを併記する。`MAX_TMPFS_BYTES` は host memory の枯渇、`MAX_CGROUP_NAME_BYTES` は path 長。
 - `Component::ParentDir` の拒否を緩めると、以降の `starts_with` による包含判定が全て信用できなくなる。緩めるなら包含判定を正規化ベースに書き換える。
-- `MIN_LANDLOCK_ABI` を下げるときは、失われる access bit が何かを [Landlock envelope](landlock-envelope.md) で確認する。
+- `SUPPORTED_LANDLOCK_ABI` を変更するときは、access-mask schema と `LANDLOCK_ALL_ACCESS` の対応、および `REFER` / `TRUNCATE` の保証を [Landlock envelope](landlock-envelope.md) で確認する。
 
 ## 関連
 

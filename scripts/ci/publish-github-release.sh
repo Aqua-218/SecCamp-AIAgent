@@ -47,7 +47,24 @@ find_release_ids() {
     --jq ".[] | select(.tag_name == \"${release_tag}\") | .id"
 }
 
-release_id_lines="$(find_release_ids)"
+find_release_ids_with_retry() {
+  local attempts="$1"
+  local attempt
+  local release_ids_found
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    release_ids_found="$(find_release_ids)"
+    if [[ -n "${release_ids_found}" ]]; then
+      printf '%s\n' "${release_ids_found}"
+      return 0
+    fi
+    if [[ "${attempt}" -lt "${attempts}" ]]; then
+      sleep 2
+    fi
+  done
+}
+
+release_id_lines="$(find_release_ids_with_retry 1)"
 release_ids=()
 if [[ -n "${release_id_lines}" ]]; then
   mapfile -t release_ids <<< "${release_id_lines}"
@@ -68,7 +85,9 @@ if [[ "${#release_ids[@]}" -eq 0 ]]; then
     create_arguments+=(--prerelease)
   fi
   gh release create "${create_arguments[@]}"
-  release_id_lines="$(find_release_ids)"
+  # Draft releases are eventually visible through the list API even though
+  # `gh release create` has already returned successfully.
+  release_id_lines="$(find_release_ids_with_retry 5)"
   release_ids=()
   if [[ -n "${release_id_lines}" ]]; then
     mapfile -t release_ids <<< "${release_id_lines}"

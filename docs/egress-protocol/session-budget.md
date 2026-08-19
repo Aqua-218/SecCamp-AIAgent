@@ -12,7 +12,7 @@
 
 Capability は「何をしてよいか」を決める。`GET docs.example /guide/** 1 MiB` を持つ subject は、その範囲の取得を許される。
 
-**範囲は決まっているが、回数は決まっていない。** しかも caller は妥当な子 capability をいくらでも作れる。親が許す範囲を狭めた子を 1 万個 derive しても、どれも[委譲判定](../authority-core/file-authorities.md)を通る。
+**範囲は決まっているが、回数は決まっていない。** しかも caller は妥当な子 capability をいくらでも作れる。親が許す範囲を狭めた子を 1 万個 derive しても、どれも[委譲判定](../authority-core/http-fetch-authorities.md)を通る。
 
 ```text
 capability が縛るもの: どの host の、どの path を、何 byte まで
@@ -23,7 +23,7 @@ capability が縛らないもの: 何回、同時に何本、session 全体で�
 
 ```mermaid
 flowchart LR
-    start["start(request_id, cap)"] --> c1{"request 数の token<br/>が残っているか"}
+    start["start(request_id, max_response_bytes)"] --> c1{"request 数の token<br/>が残っているか"}
     c1 -->|no| e1["RequestCountExhausted"]
     c1 --> c2{"並行 slot が<br/>空いているか"}
     c2 -->|no| e2["ConcurrentRequestLimitReached"]
@@ -83,7 +83,7 @@ Capability の委譲判定と、資源の総量が別の層に分かれている
 
 - 純粋な状態機械。時刻を持たないので、「1 分あたり何回」のような rate limit は表現できない。session の生涯合計だけ。
 - 実測 byte は呼び出し側の申告。`complete` に渡された値をそのまま計上する。adapter が過少申告すれば、その分は数えられない。
-- `HEAD` request は予約を取って 0 を計上する。応答 body が空だから。byte 予算では縛られず、request 数と並行数だけが効く。
+- `HEAD` request は adapter では 0 byte の body を返すため、`complete` では 0 を計上する。ただし `start` は宣言された `max_response_bytes` を先に予約するので、残り byte 予算がその予約に足りなければ adapter 前に拒否される。request 数と並行数も同じく適用される。
 - 並行 slot は `start` と `complete` / `abort` の対で管理する。`abort` を呼び忘れた経路があれば slot は戻らない。
 - 上限を超えたことの記録は残らない。監査は [Attempt / effect audit](../authority-core/audit-records.md) の担当。
 
@@ -92,7 +92,7 @@ Capability の委譲判定と、資源の総量が別の層に分かれている
 - `complete` が失敗したときに予約を解放する挙動へ変えない。現在の呼び出し側は直後に `abort` を呼ぶ前提で書かれている。両方が解放すると二重解放になる。
 - `start` に session 全体の request ID 一意性を持たせない。replay guard との責務が重複し、どちらが権威か曖昧になる。
 - `response_bytes` を `NonZeroU64` にすると、0 byte の session を表現できなくなる。現在の型の違いは意図的かどうか確認してから変える。
-- 上限を足すときは、それが session の生涯合計なのか、window なのかを決める。現在の 3 つはすべて生涯合計で、`concurrent` だけが増減する。
+- 上限を足すときは、それが session の生涯合計なのか、window なのかを決める。`requests` と committed `response_bytes` は生涯合計で、`concurrent` は active reservation の数として増減する。`response_bytes` の未使用 reservation は `complete` / `abort` で解放される。
 - fixture の値（`requests = 3`、`response_bytes = 100`、`concurrent = 2`）を変えると、既存 test の枯渇 assertion がすべてずれる。`60 + 40 = 100` のように値が計算に埋まっている。
 
 ## 関連

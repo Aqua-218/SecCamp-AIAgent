@@ -10,6 +10,8 @@
 
 実装が現在どうなっているかは各 crate の文書、なぜその構造にしたかは決定記録が正である。両者が食い違って見える場合、実装が変わって ADR が `Superseded` にされていない可能性を先に疑う。
 
+ADR 本文は追記のみの履歴なので、決定当時の名称や初期個数が現在の実装をそのまま表すとは限らない。たとえば 0002 は初期の 10 effect から現在の 13 effect へ拡張された経緯を本文に残し、0007 は Direct-I/O を決めた履歴である。現在の CapFS I/O は read-only handle の cache invalidation と writable handle の `FOPEN_DIRECT_IO` を組み合わせているため、現行仕様は [capfs 設計](../design/capfs.md) と [検証戦略](../design/verification.md) を参照する。この一覧の括弧書きは履歴と現行実装を区別するための注記であり、ADR 本文を書き換えるものではない。
+
 ## 記録の状態
 
 ADR は追記のみで、内容を書き換えない。覆すときは新しい記録を書いて元の `Status` を変える。
@@ -47,12 +49,12 @@ stateDiagram-v2
 |---|---|---|
 | [0000](0000-record-architecture-decisions.md) | 設計判断を MADR 形式の決定記録として残す | Accepted |
 | [0001](0001-limit-path-patterns-to-exact-and-prefix.md) | `PathPattern` を `Exact` と `Prefix` の 2 種類に限定する | Accepted |
-| [0002](0002-split-file-permissions-into-ten-effects.md) | file の権限を 10 種の `FileEffect` に分割する | Accepted |
+| [0002](0002-split-file-permissions-into-ten-effects.md) | file の権限を初期 10 種（現在 13 種）の `FileEffect` に分割する | Accepted |
 | [0003](0003-require-repository-and-path-match-for-empty-effects.md) | 空 effect の子にも repository と path の一致を要求する | Accepted |
 | [0004](0004-implement-authorization-twice-and-compare-with-a-corpus.md) | 認可判定を Rust と Lean で二重に実装し、共通 corpus で突き合わせる | Accepted |
 | [0005](0005-separate-object-identity-from-path.md) | object の identity を path から分離し `ObjectId` で持つ | Accepted |
 | [0006](0006-never-reuse-object-node-and-capability-ids.md) | `ObjectId`、`nodeid`、capability ID を再利用しない | Accepted |
-| [0007](0007-use-direct-io-so-revocation-cannot-be-bypassed.md) | FUSE adapter を Direct-I/O にし、page cache に revoke を迂回させない | Accepted |
+| [0007](0007-use-direct-io-so-revocation-cannot-be-bypassed.md) | FUSE adapter の Direct-I/O 方針（現在は read cache invalidation + writable direct I/O） | Accepted |
 | [0008](0008-expose-only-typed-closed-operations-from-the-broker.md) | Broker は型付きの閉じた操作だけを公開する | Accepted |
 | [0009](0009-reject-the-whole-dns-answer-on-any-non-public-address.md) | DNS 応答に非 public address が 1 つでもあれば応答全体を拒否する | Accepted |
 | [0010](0010-re-resolve-and-re-authorize-on-every-redirect.md) | redirect のたびに DNS を再解決し、同じ authority で再認可する | Accepted |

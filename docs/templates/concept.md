@@ -6,7 +6,7 @@
 
 > **対象読者:** <どの境界を触る人か。「実装者」だけでは足りない>
 
-このページは [`crates/<crate>/src/<module>.rs`](../../crates/<crate>/src/<module>.rs) が、<何をどう判定し、何を保証するか>を説明する。
+このページは [`crates/<crate>/src/<module>.rs`](../../crates/<crate>/src/<module>.rs) が、<何をどう判定し、何を保証するか>を説明する。mock、実 mount、KVM、外部 provider のどの scope の事実かを本文で区別し、検証 claim は[verification-status manifest](../verification-status.md)へ委ねる。
 
 ## 何を防ぎたいのか
 
@@ -62,4 +62,3 @@ flowchart LR
 - [<対応する設計ページ>](../design/.md)
 - [<関連する決定記録>](../decisions/.md)
 - [用語集](../glossary.md)
-

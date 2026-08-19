@@ -185,7 +185,7 @@ READ / WRITEが先: authorize -> pread / pwrite完了 -> revoke完了
 revokeが先: revoke完了 -> authorization denied -> backing I/Oを発行しない
 ```
 
-cached readはpage cacheだけで完了し、cached attributeは`LOOKUP` / `GETATTR`をadapterへ戻さない。これを止めるのはdirect I/Oではなく、revoke側の強制無効化である。`CapabilityKernel`のrevokeと`begin_subject_close`は、返る前に登録済み`RevocationObserver`を走らせる。adapterはmountごとにobserverを登録し、kernelへ渡した全nodeidを`FUSE_NOTIFY_INVAL_INODE`で無効化する。FUSE notificationはOS側でinlineに処理されるため、無効化が返った時点でcached pageとcached attributeは既に無い。よってrevoke復帰後のreadはcacheから答えられず、adapterへ戻って再認可され拒否される。無効化を確認できない場合はmountをfatalにし、revoke呼び出し元へ`RevocationNotPropagated`を返す。詳細は[capfs 設計](../design/capfs.md)の「revoke を page cache に抜かせない」を正とする。
+cached readはpage cacheだけで完了し、cached attributeは`LOOKUP` / `GETATTR`をadapterへ戻さない。これを止めるのはdirect I/Oではなく、revoke側の強制無効化である。`CapabilityKernel::revoke_held_by`と`begin_subject_close`は、返る前に登録済み`RevocationObserver`を走らせる。adapterはmountごとにobserverを登録し、kernelへ渡した全nodeidを`FUSE_NOTIFY_INVAL_INODE`で無効化する。FUSE notificationはOS側でinlineに処理されるため、無効化が返った時点でcached pageとcached attributeは既に無い。よってrevoke復帰後のreadはcacheから答えられず、adapterへ戻って再認可され拒否される。無効化を確認できない場合はmountをfatalにし、revoke呼び出し元へ`RevocationNotPropagated`を返す。詳細は[capfs 設計](../design/capfs.md)の「revoke を page cache に抜かせない」を正とする。
 
 `O_RDWR`はopen時に`ReadData`と`WriteData`の両方を同じshared guardで確認する。`O_TRUNC`があれば`Truncate`も同じrequest setへ加える。Capability kernelの複合認可は、これらを片方ずつ監査・commitするのではなく、全requestを1つのattempt/effect recordとして残す。open後の個々のread/writeは再び単独で認可するため、open時のallowがrevoke後のI/Oを許可し続けることはない。
 
@@ -258,7 +258,7 @@ executorへ入らず、open countとauthority handle countはcloseでゼロへ�
 race、実syscallを含む全rename / writeの物理的な競合、複数thread FUSE sessionはこのunit
 contractの対象外である。実FUSE mount testは`/dev/fuse`がない環境では実行不能理由を標準
 エラーへ記録して終了し、deviceが存在するのにmount設定または権限が壊れている場合は失敗
-として扱う。全21件をno-skipで走らせる証拠は`scripts/ci/verify-real-capfs.sh`に固定する。
+として扱う。全22件をno-skipで走らせる証拠は`scripts/ci/verify-real-capfs.sh`に固定する。
 
 ## linkをどう認可するのか
 

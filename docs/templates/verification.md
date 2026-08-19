@@ -6,7 +6,7 @@
 
 > **対象読者:** <この crate の実装者、レビュー担当者、統合 test の実行担当者>
 
-このページは `<crate>` について、local test で確認済みの境界と、未検証のまま残る境界を分けて記録する。mock / fake test の成功を、実機動作の根拠にしない。
+このページは `<crate>` について、local test で確認済みの境界と、未検証のまま残る境界を分けて記録する。mock / fake test の成功を、実機動作の根拠にしない。`verified` claim を書く場合も、[verification-status manifest](../verification-status.md) の declared scope と required gate に合わせる。
 
 ## local test で確認したこと
 
@@ -34,9 +34,10 @@ cargo clippy --manifest-path crates/<crate>/Cargo.toml --all-targets -- -D warni
 
 - `<trait 名>`: <fake の名前>。<実装が省いていること>
 
+manifest の checker は command を実行しない。KVM、root、外部 credential、別アーキテクチャが必要な境界は、実行 artifact が無い限り `verified` と記録しない。
+
 ## 関連
 
 - [<索引ページ>](README.md)
 - [検証戦略](../design/verification.md)
 - [用語集](../glossary.md)
-

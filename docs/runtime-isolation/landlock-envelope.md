@@ -37,6 +37,7 @@ const LANDLOCK_WORKSPACE_ACCESS: u64 = LANDLOCK_READ_ONLY_ACCESS
     | LANDLOCK_ACCESS_FS_REMOVE_FILE
     | LANDLOCK_ACCESS_FS_MAKE_DIR
     | LANDLOCK_ACCESS_FS_MAKE_REG
+    | LANDLOCK_ACCESS_FS_MAKE_SYM
     | LANDLOCK_ACCESS_FS_REFER
     | LANDLOCK_ACCESS_FS_TRUNCATE;
 ```
@@ -57,13 +58,13 @@ const LANDLOCK_WORKSPACE_ACCESS: u64 = LANDLOCK_READ_ONLY_ACCESS
 | `MAKE_BLOCK` | | | block device |
 | `MAKE_SOCK` | | | Unix domain socket |
 | `MAKE_FIFO` | | | 名前付き pipe |
-| `MAKE_SYM` | | | symlink |
+| `MAKE_SYM` | | ✓ | CapFS が認可した相対 symlink の作成 |
 
 宣言していない bit は、その path 以下で拒否される。`LANDLOCK_ALL_ACCESS` は全 bit の和で、ruleset を作るときの handled access として使う。handled に含めて rule に含めない、が「禁止」の表現になる。
 
-## 作らせないものが 5 つある
+## special file の作成は 4 種類とも拒否する
 
-workspace で唯一作れるのは regular file と directory。残り 5 種類を落としている理由はそれぞれ違う。
+workspace では regular file、directory、symlink を mask 上許可する。character device、block device、Unix socket、FIFO の作成は拒否する。symlink だけを例外にするのは、CapFS が認可済みの相対 symlink を表現するためであり、workspace source の clone が symlink を受け入れるという意味ではない。
 
 **device node（`MAKE_CHAR` / `MAKE_BLOCK`）。** workspace に `/dev/sda` 相当の block device node を作られると、Landlock も capability filesystem も経由せずに backing store へ到達できる。step 8 で `/dev` を空の tmpfs で覆っているが、覆っているのは `/dev` であって、workspace 内に node を作る経路は別に塞ぐ必要がある。seccomp 側でも `mknod` / `mknodat` を禁止しているので二重に閉じている。
 
@@ -71,19 +72,19 @@ workspace で唯一作れるのは regular file と directory。残り 5 種類�
 
 **FIFO（`MAKE_FIFO`）。** workload は単一プロセスなので使い道が無い。増える surface を減らす。
 
-**symlink（`MAKE_SYM`）。** これが一番効く。symlink を作れると、workspace 内の名前から workspace 外の実体を指せる。capfs は symlink を扱うが、target が repository の外へ出ないことを registry が保証している（[Backing repository の事前検証](../capfs/backing-preflight.md)）。workload が capfs を迂回して backing tree に直接 symlink を作れるなら、その保証が消える。
+**symlink（`MAKE_SYM`）。** workspace mask では意図的に許可する。CapFS の relative symlink effect を outer Landlock envelope が先に拒否すると、認可済みの CapFS 操作まで使えなくなるためである。実際の target と backing tree の境界は CapFS registry と [Backing repository の事前検証](../capfs/backing-preflight.md) が担い、Landlock の path rule だけで symlink target の意味論全体を保証するものではない。
 
-`REFER` は許可している。これが無いと workspace 内での rename ができない。ABI 3 未満の kernel では `REFER` そのものが存在せず、rename が一律拒否される。これが `MIN_LANDLOCK_ABI = 3` の理由の半分。
+`REFER` は許可している。これが無いと workspace 内での rename ができない。ABI 3 未満の kernel では `REFER` そのものが存在せず、rename が一律拒否される。設定が ABI 3 に固定されている理由の一つである。
 
 ## TRUNCATE を独立させる意味
 
-もう半分の理由が `TRUNCATE`。ABI 2 以前は truncate を制御する bit が無く、`WRITE_FILE` の一部として扱われていた。逆に言うと、書き込み権を与えていない file に対して `ftruncate` で size を 0 にできる状態だった。
+もう一つの理由が `TRUNCATE`。ABI 2 以前は truncate を制御する bit が無く、`WRITE_FILE` の一部として扱われていた。逆に言うと、書き込み権を与えていない file に対して `ftruncate` で size を 0 にできる状態だった。
 
 capfs 側では `Truncate` を `WriteData` とは別の `FileEffect` として持っている（[File authority](../authority-core/file-authorities.md)）。Landlock 側で分離できないと、Capability モデルで分けている区別が下位層で潰れる。ABI 3 を要求しているのは、この 2 層の粒度を揃えるため。
 
 ## ABI が足りない host では起動しない
 
-`detect_capabilities` が Landlock ABI を query し、`config.landlock.required_abi` 未満なら `CapabilityReport::is_sufficient` が `false` を返す。`apply` は `CapabilityUnavailable` で止まり、mutation を一切行わない。
+`detect_capabilities` が Landlock ABI を query し、`config.landlock.required_abi` 未満なら `CapabilityReport::is_sufficient` が `false` を返す。config の `required_abi` は `SUPPORTED_LANDLOCK_ABI = 3` と完全一致していなければならない。`apply` / `spawn_isolated` は `CapabilityUnavailable` で止まり、mutation を一切行わない。
 
 「Landlock が使えないので、その分は seccomp で頑張る」という縮退は無い。境界が 1 つ欠けた状態で workload を起動するくらいなら、起動しないほうがよい。
 
@@ -91,13 +92,13 @@ capfs 側では `Truncate` を `WriteData` とは別の `FileEffect` として�
 
 rootfs と workspace の権限差が定数 2 つに集約されているので、「workload はどこに何を書けるのか」がその 2 行を読めば分かる。個々の mount option や permission bit を追わなくてよい。
 
-作らせない 5 種類が bit の不在として表現されているため、レビューで「symlink を作れるか」を確認するとき、`MAKE_SYM` が `LANDLOCK_WORKSPACE_ACCESS` に含まれていないことを見れば済む。
+special file 4 種類の拒否が bit の不在として表現され、symlink は逆に bit の存在で CapFS の前提を満たす。レビューでは `MAKE_SYM` と special-file bits の両方を確認する。
 
 ## 正確な保証範囲
 
 ここで説明した access mask の定義と意図は、実 kernel probe でも確認する。`privileged_isolation` の direct `enforce` scenario は mount 上書き込める `/tmp` への作成が `EACCES` になること、production launcher の post-exec scenario は同じ拒否が `execve` 後にも残ることを観測する。
 
-- `LinuxBackend` の Landlock 適用は特権と ABI 3 以上の kernel を要する。実 kernel での証拠は scheduled privileged wrapper の host に限定される。
+- `LinuxBackend` の Landlock 適用は特権と ABI 3 以上を報告する kernel を要する。設定は ABI 3 固定であり、実 kernel での証拠は privileged wrapper を実行した host に限定される。
 - ruleset を張る path が `config.landlock.read_only_paths` / `writable_paths` と一致していること、rule の追加が全 path について成功していることは、mock backend では見ていない。
 - Landlock は `pivot_root` の後に張る。宣言した path が pivot 後の名前空間で正しく解決されることは direct probe と launcher の post-exec probe で確認する。
 - Landlock はすでに開いている fd には遡って効かない。step 9 で継承 fd を閉じているのはこのため。launcher probe は exec 後に marker / exec-status が消え、control/Broker だけが残ることも確認する。
@@ -107,8 +108,8 @@ rootfs と workspace の権限差が定数 2 つに集約されているので�
 ## 変更時の確認点
 
 - `LANDLOCK_WORKSPACE_ACCESS` に bit を足すときは、それが capfs 側の `FileEffect` のどれに対応するかを確認する。対応が無い bit を足すと、Capability を経由しない操作が生まれる。
-- `MAKE_SYM` を足そうとしている場合は、[Backing repository の事前検証](../capfs/backing-preflight.md)の symlink target 検査が前提を失うことを先に確認する。
-- `MIN_LANDLOCK_ABI` を上げるときは、新しい ABI で追加された bit を `LANDLOCK_ALL_ACCESS` に含める。handled access に入れ忘れると、その操作は制御されないまま通る。
+- `MAKE_SYM` を外そうとする場合は、CapFS の relative symlink effect が outer envelope で拒否されることを確認する。追加・拡張する場合は [Backing repository の事前検証](../capfs/backing-preflight.md)の symlink target 検査と同時に見直す。
+- `SUPPORTED_LANDLOCK_ABI` を上げるときは、新しい ABI で追加された bit を `LANDLOCK_ALL_ACCESS` と必要な path mask に含める。handled access に入れ忘れると、その操作は制御されないまま通る。
 - ABI を下げるときは `TRUNCATE` と `REFER` が失われる。前者は capfs の effect 分離が壊れ、後者は rename が使えなくなる。
 
 ## 関連

@@ -113,8 +113,11 @@ request 回数、累積 byte、同時 fetch 数は Capability ではなく sessi
 
 `egress-protocol` の `SessionBudget` はこの3つを実装済みである。request を start した時点で count token と最大 response byte reservation を取り、complete では実 byte だけを累積値へ確定して未使用 reservation を返す。abort は byte reservation と concurrency slot だけを返し、既に始めた request の count token は戻さない。
 
+ここで確認できるのは、closed operation、認可、DNS/redirect policy、budget の実装と、宣言された privileged/KVM fixture の境界である。`EGRESS_GITHUB_TOKEN` を使う live GitHub provider の成功は、この設計書から導かれない。外部 credential と disposable repository が揃う protected gate の結果だけを [検証ステータス manifest](../verification-status.md) の `external` claim として扱う。
+
 ## 関連
 
 - [Capability モデル](capability-model.md)
 - [状態機械と revoke](state-and-revocation.md)
 - [隔離基盤](runtime-isolation.md)
+- [検証ステータス manifest](../verification-status.md)

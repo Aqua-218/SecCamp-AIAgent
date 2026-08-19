@@ -69,6 +69,7 @@ flowchart TB
 | Firecracker / KVM / host kernel / Host Broker | 保証対象外 |
 
 supervisor は TCB なので、侵害後も細粒度 Capability が守られるとは言わない。その代わり、guest に認証情報を置かず、VM には専用 workspace しか接続しない。ここで被害の上限をもう一段作る。
+この表は設計上の TCB 仮定を示すもので、guest supervisor が正しく動くことを証明したものではない。KVM／privileged gate の成功は列挙した composition と代表的な拒否試行の evidence であり、VM escape、host kernel、全 syscall 空間を含む完全な隔離証明にはならない。検証の scope は [verification-status manifest](../verification-status.md) で分けて記録する。
 
 ## VM の切り方
 
@@ -86,11 +87,11 @@ supervisor は TCB なので、侵害後も細粒度 Capability が守られる�
 - supervisor 再起動後の Capability 復元。
 - Agent / Tool からの raw TCP / UDP。
 
-次は拒否を維持する。
+次の object と経路は拒否する。外部 alias だけは、境界を切る materialization が成功した場合に限って受け付ける。
 
 - device、FIFO、socket、`MKNOD`、`O_TMPFILE`、共有書き込み `mmap`。
 - repository の外へ解決される symlink target。絶対 path と、root より上へ climb する相対 path の両方。
-- inode の名前が repository の外にもある hard link。その名前は `capfs` が認可を検査できない。
+- CapFS backing preflight で inode の名前が repository の外にもある hard link は、既定の `ExternalAliasPolicy::Materialize` が上限内で repository 内の新しい inode へ内容を複製して境界を切る。startup が backing tree を変更できない policy では `Reject` とし、複製上限を越える場合も拒否する。外部 alias をそのまま共有した状態は受け付けない。なお Firecracker workspace clone adapter は別の境界で symlink と複数 link を拒否する。
 - directory への hard link。
 
 symlink と hard link を含む workspace 自体は扱う。symlink は registry が target を所有し、`READLINK` のたびに link の現在 path から再解決して、外へ出るなら本文を kernel へ渡さない。hard link を持つ inode は、その**全ての**名前に対して認可される。alias を増やして権限が広がることはなく、増えるのは要求される authority の方である。詳細は [capfs](capfs.md#symlink-は-registry-が-target-を所有する) と [ADR 0017](../decisions/0017-authorize-an-aliased-inode-on-every-name.md) を参照する。
@@ -101,3 +102,4 @@ symlink と hard link を含む workspace 自体は扱う。symlink は registry
 - [capfs](capfs.md)
 - [隔離基盤](runtime-isolation.md)
 - [ネットワークと外部副作用](network-egress.md)
+- [検証ステータス manifest](../verification-status.md)

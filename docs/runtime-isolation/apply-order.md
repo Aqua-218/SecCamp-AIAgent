@@ -6,7 +6,7 @@
 
 > **対象読者:** isolation backend を触る実装者、起動失敗時の後始末をレビューする人
 
-[`backend.rs`](../../crates/runtime-isolation/src/backend.rs) の `required_steps()` は 13 個の `IsolationStep` を配列リテラルで返す。設定で並べ替えられないし、一部だけ実行することもできない。この配列が固定されている理由と、途中で失敗したときに何が起きるかを書く。
+[`backend.rs`](../../crates/runtime-isolation/src/backend.rs) の `required_steps()` は 13 個の `IsolationStep` を配列リテラルで返す。設定で並べ替えられないし、一部だけ実行することもできない。この配列が固定されている理由と、途中で失敗したときに何が起きるかを書く。公開 API の `RuntimeIsolation::apply` はこの配列を実行せず、事前検査後に `ChildHandoffRequired` を返すため、実際の child transaction は `RuntimeIsolation::spawn_isolated` から始まる。
 
 ## 何を防ぎたいのか
 
@@ -29,8 +29,8 @@
 ```mermaid
 flowchart TB
     ns["1 Namespaces<br/>USER NS PID NET IPC UTS CGROUP"] --> idmap["2 IdentityMap<br/>setgroups=deny 後に単一 map"]
-    idmap --> cg["3 CgroupV2<br/>memory.max / pids.max"]
-    cg --> rootfs["4 ReadOnlyRootfs<br/>bind + remount ro + pivot_root"]
+    idmap --> cg["3 CgroupV2<br/>memory.max / pids.max（親が準備）"]
+    cg --> rootfs["4 ReadOnlyRootfs<br/>bind + staged workspace/proc + pivot_root"]
     rootfs --> ws["5 Workspace"]
     ws --> tmp["6 LimitedTmpfs"]
     tmp --> proc["7 MaskProc"]
@@ -46,13 +46,13 @@ flowchart TB
 
 ## なぜ user namespace が最初なのか
 
-`CLONE_NEWUSER` を含む `unshare` が成功すると、その namespace の中では root 相当の capability を持つ。以降の `mount`、`pivot_root`、cgroup への書き込みは、host の root 権限ではなくこの namespace 内の権限で行う。逆に言えば、user namespace を作れない host ではこの crate は何もできない。
+`clone3` に `CLONE_NEWUSER` などの namespace flag を渡して child handoff が成功すると、その namespace の中では root 相当の capability を持つ。以降の `mount`、`pivot_root`、cgroup の設定確認は、host の root 権限を child に引き継ぐのではなく、その namespace 内の権限で行う。逆に言えば、user namespace を作れない host ではこの crate は何もできない。
 
 `IdentityMap` で `/proc/self/setgroups` に `deny` を書いてから UID/GID map を書く順序は、kernel が要求する。`setgroups` を許可したまま map を書くと、supplementary group を落として権限を得る古い攻撃が成立するため、非特権 user namespace では書き込み自体が拒否される。
 
 ## 戻せる step と戻せない step
 
-`RuntimeIsolation::apply` は成功した step を `completed` に積み、どれかが失敗したら逆順に `rollback_step` を呼ぶ。
+child transaction は成功した step を `completed` に積み、どれかが失敗したら逆順に `rollback_step` を呼ぶ。`Namespaces` は親 launcher が準備し、child が PID namespace を検証した時点で完了済みとして扱う。
 
 ```rust
 Err(original) => {
@@ -69,8 +69,8 @@ Err(original) => {
 |---|---|
 | `Namespaces` | 不可 |
 | `IdentityMap` | 不可 |
-| `CgroupV2` | 可。作った cgroup を削除する |
-| `ReadOnlyRootfs` | `pivot_root` 前なら unmount 可、後は不可 |
+| `CgroupV2` | parent-owned。child の `rollback_step` は cgroup を保持し、launcher が child を reap した後に削除する |
+| `ReadOnlyRootfs` | 不可。pivot 前の staging 失敗は step 内で掃除するが、coordinator の `rollback_step` は安全な rootfs rollback を申告しない |
 | `Workspace` / `LimitedTmpfs` / `MaskProc` / `MaskDevices` | 可。unmount する |
 | `CloseInheritedFileDescriptors` | 不可 |
 | `Landlock` | 不可 |
@@ -82,7 +82,7 @@ production backend は戻せない step について `rollback_step` から `Bac
 
 ## 部分成功を成功として扱わない
 
-rollback に 1 つでも失敗すると `IsolationError::Rollback` が返り、元の失敗と rollback 失敗の一覧が両方入る。
+不可逆な step がまだ完了していない抽象 transaction では、rollback に 1 つでも失敗すると `IsolationError::Rollback` が返り、元の失敗と rollback 失敗の一覧が両方入る。実際の child transaction は `Namespaces` を完了済みとして開始するため、不可逆な失敗または rollback failure があると `IsolationError::TerminationRequired` に分類され、public `spawn_isolated` は process を継続させない。
 
 ```rust
 IsolationError::Rollback {
@@ -93,7 +93,7 @@ IsolationError::Rollback {
 
 呼び出し側がここでやってはいけないのは、「namespace は作れたし mount も済んでいるから、seccomp だけ諦めて続行する」という判断。境界が 1 つ欠けた状態は、境界が無い状態と同じくらい危険なことがある。seccomp が無ければ workload は `socket` を呼べるし、capability を消していなければ mount を張り直せる。
 
-supervisor は `Rollback` を受け取ったら child を再利用せず終了させる。この判断は [ADR 0016](../decisions/0016-terminate-the-child-after-an-unrollbackable-isolation-failure.md) に記録済みである。
+launcher/supervisor は `Rollback` または `TerminationRequired` を受け取ったら child を再利用せず終了させる。この判断は [ADR 0016](../decisions/0016-terminate-the-child-after-an-unrollbackable-isolation-failure.md) に記録済みである。
 
 実際の guest 起動では、親の `LinuxHostResources` が unnamed socketpair を launcher の stdin/stdout にだけ継承させる。launcher は `ready` → release byte → 13 step startup → close-on-exec の EOF という順序を守り、EOF を確認するまで親へ `isolated` attestation を返さない。partial/malformed marker、exec failure、timeout、isolation rollback failure は全て workload を再利用せず cleanup-required/fail-closed とする。
 
@@ -101,9 +101,9 @@ privileged probe の `limited-tmpfs-failure` は、debug build 限定の fault s
 
 ## `apply` を呼ぶ場所を間違えない
 
-`create_namespaces` は `CLONE_NEWPID` を unshare する。`unshare(CLONE_NEWPID)` は呼び出したプロセス自身を新しい PID namespace に入れず、次に `fork` した子から適用される。したがって、この取引は「workload を exec する側の child」で開始しなければならない。親 supervisor が自分のプロセスで `apply` を呼ぶと、PID namespace が意図した位置にできない。
+`prepare_namespaces` / `spawn_isolated` は `CLONE_NEWUSER`、`CLONE_NEWNS`、`CLONE_NEWPID`、`CLONE_NEWNET`、`CLONE_NEWIPC`、`CLONE_NEWUTS`、`CLONE_NEWCGROUP` を持つ child handoff を行う。PID namespace は child 側で有効になるため、この取引は「workload を exec する側の child」で開始しなければならない。親 supervisor が自分のプロセスで旧 `apply` を呼んでも、`ChildHandoffRequired` で止まる。
 
-同じ理由で、rootfs の staging directory は `apply` を呼ぶ前に親が用意しておく必要がある。
+同じ理由で、rootfs の staging directory は `spawn_isolated` の namespace handoff 前に親 launcher が用意しておく必要がある。
 
 ## 何が助かるのか
 
@@ -132,7 +132,7 @@ step 4 で staging しない場合:
 
 ## 正確な保証範囲
 
-mock backend が保証するのは、13 step が定義順に呼ばれ、失敗時に完了済み step が逆順に rollback されることだけ。
+mock backend が保証するのは、13 step が定義順に呼ばれ、失敗時に完了済み step が逆順に rollback されることだけ。`apply` が receipt を返すことや、実 kernel の namespace/mount 状態を保証するものではない。
 
 [`tests/privileged_isolation.rs`](../../crates/runtime-isolation/tests/privileged_isolation.rs) が実 kernel 上で 13 step を適用し、完成した境界の内側から観測することで、次を確認している。`enforce` は staged rootfs を API 直呼びし、`launcher-post-exec` は production launcher の start gate、connected control/Broker descriptors、`execve`、hostile workload を同じ probe で通す。
 

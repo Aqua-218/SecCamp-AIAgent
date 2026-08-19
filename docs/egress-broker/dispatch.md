@@ -15,7 +15,7 @@
 ```mermaid
 flowchart TB
     f["ControlFrame::decode_complete<br/>trailing bytes を許さない"] --> c["CanonicalBrokerRequest::decode<br/>payload hash を host が再計算"]
-    c --> r["SessionReplayGuard::accept<br/>session / sequence / request ID"]
+    c --> r["SessionReplayGuard::accept_payload<br/>session / sequence / request ID / hash"]
     r -->|Duplicate| cache["cache 済み outcome を返す"]
     r -->|New| b["SessionBudget::start<br/>request 数・並行数・byte を予約"]
     b --> k["CapabilityKernel::authorize_and_execute_classified"]
@@ -25,22 +25,15 @@ flowchart TB
 
 ## payload hash は host が計算し直す
 
-wire には payload hash が載っているが、それを信用しない。
+wire には payload hash が載っているが、それを申告値として使わない。`CanonicalBrokerRequest::decode` は embedded payload bytes から SHA-256 を計算し、wire の hash と一致しなければ decode の時点で拒否する。production の `dispatch_control_frame` はこの検査後に得た exact payload を admission に渡し、`SessionReplayGuard::accept_payload` も同じ binding を再検査する。
 
-```rust
-let payload_hash = PayloadHash::of_canonical_payload(&canonical_payload);
-if payload_hash.as_bytes() != &received_payload_hash {
-    return Err(CborError::PayloadHashMismatch);
-}
-```
-
-replay guard は `(session, sequence, request ID, payload hash)` の 4 つ揃いで retry を判定する。hash を wire から取ると、この判定が guest の申告になる。
-
-具体的な破れ方はこう。guest が request ID `R` に、以前受理された無害な payload の hash を載せて、中身だけ別の operation にする。guard は `RequestIdentityMismatch` ではなく `Duplicate` を返し、cache された outcome の経路に入る。frame が別の operation を主張しているのに、cache 済みの結果が返る。
+replay guard は `(session, sequence, request ID, payload hash)` の 4 つ揃いで retry を判定する。raw hash constructor と payload 無しの admission は `egress-protocol` で crate-private なので、通常の外部 ingress が payload と digest を別々に組み立てる API は無い。独自 ingress を追加するときもこの decoder / `accept_payload` の順序を維持する。
 
 ## budget を adapter より先に取る
 
 `budget.start` は request 数の token、並行 slot、応答 byte の予約を同時に取る。これが `executor.execute` より前にある。
+
+public request の宣言 `max_response_bytes` が canonical wire の 32 MiB を超える場合、dispatcher は adapter や budget reservation より前に `PublicFetch` rejection を確定する。GitHub request は host の response cap を `MAX_GITHUB_RESPONSE_BYTES`（1 MiB）以下に clamp してから予約する。
 
 逆にすると、`max_concurrent_requests` が in-flight な外部 I/O を縛らなくなる。fixture の `max_response_bytes = 128` に対して、32 MiB を宣言した fetch は、session の上限に当たる前に 32 MiB を network から読み終えている。
 
@@ -79,20 +72,13 @@ kernel の `state.authorizes` が既に `AuthorityRequest` の variant を比較
 
 ## 実測 byte を計上してから成功を返す
 
-```rust
-if self.budget.complete(request_id, effect.response_bytes()).is_err() {
-    let _ = self.budget.abort(request_id);
-    (Self::rejected(request_id, BrokerRejection::AccountingInvariant), None)
-}
-```
-
-`SessionBudget::complete` は予約を超える実測値に `ResponseExceedsReservation` を返し、**予約を解放しない。** だから直後の `abort` が要る。この 2 行は必ず対で置く。
+`SessionBudget::complete` は予約を超える実測値に `ResponseExceedsReservation` を返し、**予約を解放しない。** in-memory dispatcher は直後に `abort` して `AccountingInvariant` として session を閉じ、durable dispatcher は先に WAL の settlement を確定してから `complete` を行い、失敗時は dispatcher を sealed にする。どちらも、`complete` の失敗を成功として返したり予約を黙って残したりはしない。
 
 計上しないと `committed_response_bytes` が増えず、`max_response_bytes` が session 合計ではなく 1 request の上限に退化する。
 
 ## 完全一致 retry が adapter を再実行しない仕組み
 
-`dispatch_frame` は `New` 分岐でも `Duplicate` 分岐でも、`dispatch_new` の結果を `outcomes` に書き戻す。
+`dispatch_control_frame` は `New` 分岐でも、既存の `RetryableBudget` に対する `Duplicate` 分岐でも、`dispatch_new` の結果を `outcomes` に書き戻す。
 
 ```rust
 self.outcomes.insert(
@@ -101,9 +87,17 @@ self.outcomes.insert(
 );
 ```
 
-`dispatch_new` が `Some(CachedOutcome::RetryableBudget(_))` を返すのは、一時的な budget 拒否のときだけ。成功、executor の error、`AccountingInvariant` はいずれも `None` を返し、その場合は `Final` として確定する。
+`dispatch_new` が `Some(CachedOutcome::RetryableBudget)` を返すのは、一時的な budget 拒否のときだけ。成功、executor の error、`AccountingInvariant` は `None` を返し、その場合は呼び出し側が `Final` として確定する。
 
-**両分岐で同じ書き戻しをすることが要点。** `Duplicate` 分岐だけ「`Some` のときだけ書き戻す」形にすると、いったん `RetryableBudget` になった entry が二度と `Final` に置き換わらず、以降の完全一致 retry がすべて adapter を再実行する。`CreatePullRequest` なら retry 1 回につき pull request 1 つになる。実際にその欠陥があり、`dispatcher_retries_transient_budget_denial_without_double_charging` が 3 回目の dispatch で cache から返ることを固定している。
+**両分岐で同じ書き戻しをすることが要点。** `RetryableBudget` の retry が決着したときも `cached.unwrap_or(Final(response))` で entry を置き換えるため、以降の完全一致 retry は adapter を再実行しない。`dispatcher_retries_transient_budget_denial_without_double_charging` が、一時的拒否、決着した dispatch、続く cache hit の順序と二重 charge がないことを固定している。
+
+## durable dispatcher の状態
+
+`new_in_memory` は process 内だけの replay guard と outcome table を使う。process crash をまたぐ必要がある production path は `new_durable` で session WAL を新規作成し、再起動時は `open_durable` で WAL の final response、`AcceptedPending`、`RetryableBudget`、budget counter、active reservation を復元してから新しい frame を受け付ける。
+
+durable admission は replay table の代わりに WAL の `accept` を通り、admission 後に `AcceptedPending` を記録する。budget reservation、adapter の結果、canonical response と settlement は WAL の順序で永続化される。WAL の lock、checksum、frame 形状、最大 128 MiB、terminal record 用の headroom を満たせない場合は dispatcher を sealed にし、以後の dispatch を `DurableUnavailable` として止める。
+
+一時的な `RetryableBudget` は concurrent limit、または既存 reservation が残る response-byte exhaustion だけである。request count exhaustion、reservation の重複、未知 request、accounting invariant は final rejection になる。`AcceptedPending` を復元した場合は adapter を再実行せず、外部効果が存在しうる `CommittedButUnrecorded` として reservation を保守的に settle する。
 
 ## 監査の失敗を認可拒否と混ぜない
 
@@ -135,7 +129,7 @@ executor の失敗は 5 種類に分かれ、そのうち 2 つは「外部副�
 
 ## その他の既知の問題
 
-**HEAD が byte 予算を消費しない。** `BrokerEffect::response_bytes()` は public fetch で `response.body.len()` を返し、HEAD の応答は常に空。`start` で `max_response_bytes` を予約し、`complete` で 0 を計上する。HEAD は `max_requests` と並行 slot だけに縛られる。
+**HEAD は実測 byte 0でも予約を取る。** `BrokerEffect::response_bytes()` は public fetch で `response.body.len()` を返し、HEAD の応答は常に空。`start` で宣言された `max_response_bytes` を予約し、`complete` で 0 を計上するため、残り byte 予算が予約に足りない HEAD は adapter 前に拒否される。成功した HEAD の committed byte は 0 だが、request 数と並行 slot は消費する。
 
 **GitHub の byte 数は adapter の自己申告。** `response.response_bytes` をそのまま使う。検証するのは `TypedGitHubAdapter` だけで、別の `GitHubAdapter` 実装は過少申告できる。trait の signature には、この field が accounting の入力であることを示すものが無い。
 
@@ -152,7 +146,7 @@ executor の失敗は 5 種類に分かれ、そのうち 2 つは「外部副�
 - `budget.complete` の失敗と直後の `abort` は必ず対で置く。`complete` が失敗しても予約は解放されない。
 - `budget.start` を `executor.execute` の後ろへ動かさない。
 - adapter の選択を tuple match 以外に変えない。arm 漏れが panic か誤 adapter になる。
-- `MAX_GITHUB_RESPONSE_BYTES` を上げるときは `SessionBudgetLimits::max_response_bytes` も上げる。上げないと全 GitHub request が `budget.start` で `ResponseBytesExhausted` になる。clamp は `dispatch.rs` と `github.rs` の 3 箇所にあり、揃えて直す。
+- `MAX_GITHUB_RESPONSE_BYTES` を上げるときは `SessionBudgetLimits::max_response_bytes` も上げる。上げないと全 GitHub request が `budget.start` で `ResponseBytesExhausted` になる。dispatcher の各 construction path と `RustlsGitHubProvider` の各 provider response read が同じ cap を clamp することを確認する。
 - rejection の種類を増やすときは `dispatch.rs`、`server.rs`、`BrokerWireRejection` の 3 箇所を同時に直す。wire の code は追記のみで、既存の番号を再割り当てしない。
 - `CommittedButUnrecorded` の budget 処理を abort に変えない。副作用が起きた分の byte を guest が二度使える。
 

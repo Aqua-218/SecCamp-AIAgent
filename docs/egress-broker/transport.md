@@ -64,8 +64,10 @@ socket の生存時間を frame 数だけで制限すると、prefix の途中�
 |---|---|
 | 責務 | listener の bind と accept のみ |
 | 非責務 | request の decode、adapter の選択、Capability 認可 |
-| `AfVsockListener::bind(cid, port, backlog)` | `VMADDR_CID_ANY` と `VMADDR_PORT_ANY` は `u32::MAX` |
+| `AfVsockListener::bind(cid, port, backlog)` | CID は `VMADDR_CID_ANY` 以外、port は 0 / `VMADDR_PORT_ANY` 以外、backlog は正数。host が明示 endpoint を選ぶ |
 | accept 後 | stream に policy の socket timeout を適用する。deadline-aware server owner は `DeadlineFramedTransport` に渡し、connection owner が `BrokerDispatcher::dispatch_transport` を呼ぶ |
+
+listener には `bind_nonblocking` / `try_accept_peer` もあり、未接続時は `Ok(None)` を返して owner が cancellation を確認できる。accepted stream は通常の blocking framed I/O に戻され、`VsockStream::shutdown_handle` は owner-only の `SHUT_RDWR` interrupt capability だけを複製する（読み書き用 stream にはならない）。
 
 accept した connection の peer identity は listener が持つ。`PeerBoundListener` はその identity を伴う accept を表す。認可に使う subject は connection から解決するのであって、wire 上の申告からではない。同じ方針が [Supervisor adapter](../supervisor/README.md) にもある。
 
@@ -89,7 +91,7 @@ stateDiagram-v2
 | sequence | 1 session につき `0` から開始し、以降は直前の次だけを受理する |
 | 完全一致の retry | `(session, sequence, request ID, payload hash)` が一致すれば cache 済み `BrokerResponse` を返し、adapter を再実行しない |
 | 拒否する要求 | 別 payload での request ID 再利用、sequence の飛ばし、別 session、replay capacity 超過 |
-| response cache | replay capacity で上限を持つ。成功した型付き response と型付き拒否 outcome の両方を保持する |
+| response cache | in-memory path は eviction のない replay identity table に対応して成功 response と拒否 outcome を保持する。durable path は WAL の replay capacity / 128 MiB bounded WAL に保持する |
 
 拒否 outcome も cache するのが要点。拒否された要求を retry したとき、再計算せずに同じ拒否を返す。再計算すると、budget や時刻の変化で結果が変わりうる。
 

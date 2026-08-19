@@ -15,12 +15,12 @@
 | session binding | wrong session と request-ID rebinding を adapter I/O 前に拒否する | dispatcher module test |
 | authorization | capability mismatch を拒否として cache し、adapter を呼ばない | dispatcher module test、`CapabilityKernel` |
 | private IP と DNS rebinding | private/mixed answer を拒否し、redirect ごとに再解決する | fake resolver/connector |
-| DNS answer 上限 | 33 件目を保持・dispatch せず `AnswerLimitExceeded` で拒否する | oversized fake resolver |
-| resolver resource bound | 固定 1 worker / queue 8 の saturation、timeout 後の worker 再利用 | deterministic pool test |
+| DNS answer 上限 | 33 件目を保持せず、`AnswerLimitExceeded` で dispatch 前に拒否する | oversized fake resolver |
+| resolver resource bound | production は固定 1 worker / queue 8。unit test fixture は並列 test の干渉を避ける queue 64 で pool saturation、timeout 後の worker 再利用を確認する | deterministic pool test |
 | redirect 再検査 | path、scheme、userinfo、query、fragment が不正な redirect を拒否する | fake connector |
 | response cap | streaming 中に上限超過を拒否し、`HEAD` は本文を読まない | fake response stream |
 | GitHub 事前条件 | expected-old plan がなければ provider を呼ばずに拒否する | fake provider |
-| provider error | rate-limit metadata は型付きで保持し、生 body は outcome に出さない | fake provider |
+| provider error | rate-limit metadata は型付きで保持し、生 body は outcome に出さない。mutation 後の malformed / over-budget response は `CommitUnknown` に分類する | fake provider |
 | GitHub credential 境界 | 欠損 / 制御文字 credential を拒否し、systemd credentialをsymlink非追跡descriptorで開いてhard linkと読取中のmetadata driftを拒否する。`CREDENTIALS_DIRECTORY`指定時はambient tokenへ降格せず、provider `Debug` と typed error はtokenをredactする | `invalid_credential_environment_values_fail_closed`, `systemd_credential_is_descriptor_sealed_and_rejects_links`, `provider_debug_and_typed_errors_never_leak_the_token` |
 | durable WAL lock | writer/shared-reader排他を保持し、fork/exec間の一時的CLOEXEC fd継承だけを検証済みfile上で250ms以内再試行する | same-process/cross-process durable module tests |
 | transport policy | zero/過大 timeout を拒否し、read/write/absolute connection deadline を typed error として fail closed | `transport_policy_rejects_zero_and_excessive_deadlines`, `deadline_transport_reports_typed_read_timeout`, `deadline_transport_reports_typed_write_timeout`, `deadline_transport_reports_expired_connection_before_io` |
@@ -57,14 +57,26 @@ scripts/ci/verify-real-public-https.sh
 
 root、mount/network namespace、`dnsmasq`、`ip`、OpenSSL のいずれかが無ければ exit 2 で終了し、成功として扱わない。
 
+## 実 guest control と SessionOwner で確認したこと
+
+host 側の generic unit test は実 `AF_VSOCK` を bind しない。KVM gate は Firecracker の guest-to-host forwarding を使い、実 `BrokerDispatcher` に canonical request を通して authorization rejection、adapter 非実行、response の WAL / session owner 境界を確認する。
+
+```bash
+scripts/ci/verify-real-guest-control.sh
+scripts/ci/verify-real-session-owner.sh
+```
+
+前者は実 guest control 接続と host Broker の canonical rejection、後者は guest Supervisor / CapFS / isolation を経た request が SessionOwner と durable WAL の final rejection へ到達することを対象にする。KVM、Firecracker、root、必要な guest artifact が揃わない環境では未検証として扱う。
+
 ## 実行コマンド
 
 repository root から次を実行する。
 
 ```bash
-cargo fmt --manifest-path crates/egress-broker/Cargo.toml -- --check
-cargo test --manifest-path crates/egress-broker/Cargo.toml
-cargo clippy --manifest-path crates/egress-broker/Cargo.toml --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo test --locked -p egress-broker --all-targets
+cargo clippy --locked -p egress-broker --all-targets -- -D warnings
+cargo check --locked --workspace --all-targets
 ```
 
 実 GitHub provider の opt-in gate は、保護された disposable repository と credential を operator が用意した場合だけ実行する。
@@ -73,7 +85,7 @@ cargo clippy --manifest-path crates/egress-broker/Cargo.toml --all-targets -- -D
 scripts/ci/verify-live-github.sh
 ```
 
-この gate は `EGRESS_GITHUB_TOKEN`、installation、exact disposable `owner/name`、base/head、expected-old/new object ID、repository に結び付いた acknowledgement を全て要求する。不足や形式不正は exit 2 で終了し、token は表示しない。実行時は `RustlsGitHubProvider` を `TypedGitHubAdapter` 経由でだけ呼び、`PublishBranch` の non-force expected-old 更新と `CreatePullRequest` の typed response を検査する。pull request と branch の cleanup は自動化していないため、operator が専用 repository を手動で片付ける。
+この gate は `EGRESS_GITHUB_TOKEN`、installation、exact disposable `owner/name`、base/head、expected-old/new object ID、repository に結び付いた acknowledgement を全て要求する。不足や形式不正は exit 2 で終了し、token は表示しない。`CREDENTIALS_DIRECTORY` を指定した場合、provider は `<value>/github-token` を必須にして ambient token へ降格しない。directory を指定しない場合だけ `EGRESS_GITHUB_TOKEN` を provider が使う（wrapper が token 環境変数を要求する点は別の前提）。実行時は `RustlsGitHubProvider` を `TypedGitHubAdapter` 経由でだけ呼び、`PublishBranch` の non-force expected-old 更新と `CreatePullRequest` の typed response を検査する。mutation 後に結果を証明できない場合は `CommitUnknown` として扱う。pull request と branch の cleanup は自動化していないため、operator が専用 repository を手動で片付ける。
 
 ## 未検証の境界
 

@@ -18,6 +18,8 @@ bounded frame -> canonical CBOR -> session/replay guard -> session budget
              -> 最終 CapabilityKernel 認可 -> 型付き adapter
 ```
 
+adapter の結果は `egress-protocol::response` の canonical response に変換される。1 MiB の control frame に収まらない public response は、server が同じ request identity に束ねた canonical chunk frame 列として返し、guest client が順序・長さ・digest を検査して再構成する。
+
 ## crate の構造
 
 ```mermaid
@@ -27,7 +29,7 @@ flowchart TB
     subgraph eb["egress-broker（host 側）"]
         direction TB
         tr["transport<br/>AF_VSOCK listener<br/>bounded frame I/O"]
-        srv["server<br/>peer CID 照合<br/>1 request 1 response"]
+        srv["server<br/>peer CID 照合<br/>1 request / 1 response sequence"]
         disp["dispatch<br/>replay / budget /<br/>authorize_and_execute_classified"]
         pf["public_fetch<br/>GET / HEAD"]
         ip["ip_policy<br/>DNS 応答の全数検査"]
@@ -72,8 +74,9 @@ flowchart TB
 | モジュール | 現在の責務 |
 | --- | --- |
 | [`transport`](transport.md) | `AF_VSOCK` listener 抽象、1 MiB 上限を検査してから payload を確保する frame I/O、bounded read/write/connection deadline API |
-| [`server`](server.md) | accept、peer CID の照合、1 request 1 response、拒否詳細の遮断 |
+| [`server`](server.md) | accept、peer CID の照合、request ごとの response（大きな public response は複数 chunk frame）、拒否詳細の遮断 |
 | [`dispatch`](dispatch.md) | canonical CBOR 復元、replay cache、budget 予約、Capability の commit 境界、型付き adapter 呼び出し |
+| [`durable`](../../crates/egress-broker/src/durable.rs) | session WAL の排他、canonical response の永続化、再起動後の pending / retryable / final 復元、容量と tail 検査 |
 | `ip_policy` | DNS 応答全体の public-only 検査と host deny range |
 | `public_fetch` | rustls HTTPS の `GET`/`HEAD`、redirect ごとの再検査、DNS 再解決、本文上限付き streaming |
 | `github` | 型付き provider 操作、opaque credential handle、publish の事前条件、型付きエラー |
@@ -94,7 +97,7 @@ dispatch、DNS/IP policy、redirect、応答上限、GitHubのpublish事前条�
 
 | 文書 | 対象ソース | 内容 |
 |---|---|---|
-| [frame から adapter までの 1 本道](dispatch.md) | [`dispatch.rs`](../../crates/egress-broker/src/dispatch.rs) | 各段の検査、認可と副作用の線形化、既知の欠陥 |
+| [frame から adapter までの 1 本道](dispatch.md) | [`dispatch.rs`](../../crates/egress-broker/src/dispatch.rs) | 各段の検査、認可と副作用の線形化、retry と durable 状態 |
 | [connection を受けて frame を往復させる](server.md) | [`server.rs`](../../crates/egress-broker/src/server.rs) | peer CID の照合、拒否詳細の遮断、失敗時の切断 |
 | [transport 契約](transport.md) | [`transport.rs`](../../crates/egress-broker/src/transport.rs) | frame 境界、listener の責務、dispatch 側の義務 |
 | [公開 HTTPS policy](network-policy.md) | [`public_fetch.rs`](../../crates/egress-broker/src/public_fetch.rs)、[`ip_policy.rs`](../../crates/egress-broker/src/ip_policy.rs) | DNS 応答の全数検査、deny range、redirect ごとの再認可 |

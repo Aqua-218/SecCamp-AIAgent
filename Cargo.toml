@@ -16,7 +16,7 @@ edition = "2024"
 license = "AGPL-3.0-only"
 repository = "https://github.com/Aqua-218/SecCamp-AIAgent"
 rust-version = "1.93.1"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

@@ -125,7 +125,7 @@ else
   range_description="${resolved_base}..${resolved_head}"
 fi
 
-readonly subject_pattern='^(feat|fix|docs|test|refactor|perf|chore|build|ci|security|revert)(\([[:alnum:]][[:alnum:]./_-]*\))?(!)?: [^[:space:]].*$'
+readonly subject_pattern='^(feat|fix|docs|test|refactor|perf|style|bench|prove|chore|build|ci|security|revert)(\([[:alnum:]][[:alnum:]./_-]*\))?(!)?: [^[:space:]].*$'
 failures=0
 for commit in "${commits[@]}"; do
   subject="$(git -C "${repository_root}" show -s --format=%s "${commit}")"

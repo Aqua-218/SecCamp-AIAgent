@@ -25,15 +25,25 @@ head_revision="$(git -C "${git_fixture}" rev-parse HEAD)"
 
 "${checker}" --repo "${git_fixture}" --base "${base_revision}" --head "${head_revision}"
 
+domain_type_base="${head_revision}"
+for subject in \
+  'style(ci): format a workflow fixture' \
+  'bench(ci): measure a pipeline fixture' \
+  'prove(ci): verify a policy fixture'; do
+  git -C "${git_fixture}" commit --quiet --allow-empty -m "${subject}"
+done
+domain_type_head="$(git -C "${git_fixture}" rev-parse HEAD)"
+"${checker}" --repo "${git_fixture}" --base "${domain_type_base}" --head "${domain_type_head}"
+
 git -C "${git_fixture}" commit --quiet --allow-empty -m 'not a conventional commit'
 invalid_head="$(git -C "${git_fixture}" rev-parse HEAD)"
-if "${checker}" --repo "${git_fixture}" --base "${head_revision}" --head "${invalid_head}"; then
+if "${checker}" --repo "${git_fixture}" --base "${domain_type_head}" --head "${invalid_head}"; then
   fail 'invalid commit subject was accepted'
 fi
 
-git -C "${git_fixture}" reset --quiet --hard "${head_revision}"
+git -C "${git_fixture}" reset --quiet --hard "${domain_type_head}"
 zero_revision='0000000000000000000000000000000000000000'
-"${checker}" --repo "${git_fixture}" --base "${zero_revision}" --head "${head_revision}"
+"${checker}" --repo "${git_fixture}" --base "${zero_revision}" --head "${domain_type_head}"
 
 source_repo="${fixture_root}/source"
 git clone --quiet --no-local "${git_fixture}" "${source_repo}"

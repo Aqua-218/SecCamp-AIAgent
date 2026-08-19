@@ -31,19 +31,56 @@ fi
 
 readonly release_temp="$(mktemp -d)"
 trap 'rm -rf -- "${release_temp}"' EXIT
-readonly release_api="repos/${GITHUB_REPOSITORY}/releases/tags/${release_tag}"
 readonly release_assets=("${ARCHIVE_NAME}" "${SBOM_NAME}" "${CHECKSUM_NAME}")
-
-if ! gh release view "${release_tag}" > /dev/null 2>&1; then
-  gh release create "${release_tag}" \
-    --verify-tag \
-    --draft \
-    --title "${release_tag}" \
-    --generate-notes
-fi
 
 expected_asset_names="$(printf '%s\n' "${release_assets[@]}" | sort)"
 readonly expected_asset_names
+for asset_name in "${release_assets[@]}"; do
+  if [[ ! -f "dist/${asset_name}" ]]; then
+    printf 'release asset is missing: dist/%s\n' "${asset_name}" >&2
+    exit 1
+  fi
+done
+
+find_release_ids() {
+  gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+    --jq ".[] | select(.tag_name == \"${release_tag}\") | .id"
+}
+
+release_id_lines="$(find_release_ids)"
+release_ids=()
+if [[ -n "${release_id_lines}" ]]; then
+  mapfile -t release_ids <<< "${release_id_lines}"
+fi
+if [[ "${#release_ids[@]}" -gt 1 ]]; then
+  printf 'multiple releases exist for tag %s\n' "${release_tag}" >&2
+  exit 1
+fi
+if [[ "${#release_ids[@]}" -eq 0 ]]; then
+  create_arguments=(
+    "${release_tag}"
+    --verify-tag
+    --draft
+    --title "${release_tag}"
+    --generate-notes
+  )
+  if [[ "${release_tag}" == *-* ]]; then
+    create_arguments+=(--prerelease)
+  fi
+  gh release create "${create_arguments[@]}"
+  release_id_lines="$(find_release_ids)"
+  release_ids=()
+  if [[ -n "${release_id_lines}" ]]; then
+    mapfile -t release_ids <<< "${release_id_lines}"
+  fi
+fi
+if [[ "${#release_ids[@]}" -ne 1 || ! "${release_ids[0]}" =~ ^[0-9]+$ ]]; then
+  printf 'could not resolve the release id for tag %s\n' "${release_tag}" >&2
+  exit 1
+fi
+
+readonly release_id="${release_ids[0]}"
+readonly release_api="repos/${GITHUB_REPOSITORY}/releases/${release_id}"
 remote_asset_names="$(gh api "${release_api}" --jq '.assets[].name' | sort)"
 readonly remote_asset_names
 while IFS= read -r remote_name; do
@@ -57,11 +94,6 @@ done <<< "${remote_asset_names}"
 # Compare every existing asset before mutating the release.
 for asset_name in "${release_assets[@]}"; do
   local_asset="dist/${asset_name}"
-  if [[ ! -f "${local_asset}" ]]; then
-    printf 'release asset is missing: %s\n' "${local_asset}" >&2
-    exit 1
-  fi
-
   asset_id="$(gh api "${release_api}" \
     --jq ".assets[] | select(.name == \"${asset_name}\") | .id")"
   if [[ -z "${asset_id}" ]]; then
@@ -84,10 +116,14 @@ for asset_name in "${release_assets[@]}"; do
   asset_id="$(gh api "${release_api}" \
     --jq ".assets[] | select(.name == \"${asset_name}\") | .id")"
   if [[ -z "${asset_id}" ]]; then
-    gh release upload "${release_tag}" "${local_asset}"
+    gh api \
+      --method POST \
+      --header 'Content-Type: application/octet-stream' \
+      --input "${local_asset}" \
+      "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?name=${asset_name}" \
+      > /dev/null
   fi
 done
-
 
 final_asset_names="$(gh api "${release_api}" --jq '.assets[].name' | sort)"
 readonly final_asset_names
@@ -96,6 +132,21 @@ if [[ "${final_asset_names}" != "${expected_asset_names}" ]]; then
   exit 1
 fi
 
-if [[ "$(gh release view "${release_tag}" --json isDraft --jq '.isDraft')" == "true" ]]; then
-  gh release edit "${release_tag}" --draft=false
+release_is_prerelease=false
+if [[ "${release_tag}" == *-* ]]; then
+  release_is_prerelease=true
+fi
+gh api \
+  --method PATCH \
+  --field draft=false \
+  --field prerelease="${release_is_prerelease}" \
+  "${release_api}" > /dev/null
+
+if [[ "$(gh api "${release_api}" --jq '.draft')" != 'false' ]]; then
+  printf 'release remained a draft after publication\n' >&2
+  exit 1
+fi
+if [[ "$(gh api "${release_api}" --jq '.prerelease')" != "${release_is_prerelease}" ]]; then
+  printf 'release prerelease classification does not match tag %s\n' "${release_tag}" >&2
+  exit 1
 fi

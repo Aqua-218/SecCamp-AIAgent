@@ -73,16 +73,17 @@ flowchart LR
 
 ## 現在の実装位置
 
-[`crates/authority-core/src/state.rs`](../../crates/authority-core/src/state.rs) に逐次状態機械、[`crates/authority-core/src/kernel.rs`](../../crates/authority-core/src/kernel.rs) にそれを並行利用するための同期境界がある。現在は次の境界まで実装している。
+[`crates/authority-core/src/state.rs`](../../crates/authority-core/src/state.rs) に逐次状態機械、[`crates/authority-core/src/kernel.rs`](../../crates/authority-core/src/kernel.rs) にそれを並行利用するための同期境界がある。現在は次の境界まで実装している。右列は「未実装の作業」ではなく、この設計が別の証拠または別の trust boundary として残す範囲である。
 
-| 実装済み | 次に実装する |
+| 実装済み・対応する証拠 | 保証範囲外または別境界 |
 |---|---|
-| subject 登録、root 発行、held、caller binding、parent link、`delegable` を検査する Derive | supervisor / filesystem / Broker adapter との end-to-end 接続 |
-| `WeakerThan`、target envelope、逐次 revoke、祖先 chain、`auth_epoch` | durable audit backend と commit receipt |
-| Running→Closing→Closed、held revoke、open-handle registry、ID 非再利用 | 実 fd lifecycle と capfs registry を一体化する adapter |
-| shared effect / exclusive transition、executor の線形化点までの guard、attempt/effect audit | open handle、rename、unlink を含む capfs 競合 model |
-| capfs の path/object 対応、generation、open count、全file mutationのFUSE / backing接続 | revokeとrename / unlinkを同時に含むbounded競合 model |
-| direct / ancestor revokeの単一・compound effect、2 effects、negative control の Loom model | 4 thread 以上・複数 revoke / Capability tree の model |
+| subject 登録、root 発行、held、caller binding、parent link、`delegable` を検査する Derive | 分散した複数 host 間の Capability 委譲と revoke |
+| `WeakerThan`、target envelope、逐次 revoke、祖先 chain、`auth_epoch` | 全ての入力列に対する数学的証明。有限 property test と Lean model の範囲を越える判定 |
+| Running→Closing→Closed、held revoke、open-handle registry、ID 非再利用 | supervisor、filesystem、Broker の実 resource が停止しない場合の外部 provider 側の巻き戻し |
+| shared effect / exclusive transition、executor の線形化点までの guard、attempt/effect audit | writer fairness、revoke latency、4 thread 以上・複数 revoke の全 scheduler interleaving |
+| `DurableAuditLog` の WAL、reopen、checksum/replay validation、`Started` crash window、commit receipt | provider 固有の外部 receipt と `CommitUnknown` の照合、別 host への durable log 複製 |
+| capfs の path/object 対応、generation、open count、全 file mutation の FUSE / backing 接続 | kernel が発行する全 FORGET lifecycle、無制限 race、全 mount topology |
+| direct / ancestor revoke の単一・compound effect、2 effects、negative control の Loom model | open handle、rename、unlink を含む実 adapter の全 interleaving。実 mount の bounded test は別の検証 claim で追う |
 
 詳細は[Capability の発行と逐次状態機械](../authority-core/capability-state.md)と[Effect commit と revoke の authorization guard](../authority-core/authorization-guard.md)を参照する。
 
@@ -112,7 +113,7 @@ sequenceDiagram
 
 この順なら effect が先に成立する。逆に revoke が exclusive guard を先に取れば、その後の effect は再認可で落ちる。どちらに転んでも順序は曖昧にならない。
 
-現在の `CapabilityKernel::authorize_and_commit` は、最終認可、executor 呼び出し、revoke との線形化、in-memory の `AttemptRecord` / `EffectRecord` / `auth_epoch` を実装する。durable storage と provider 固有の commit receipt は adapter 側の次段階である。
+現在の `CapabilityKernel::authorize_and_commit` は、最終認可、executor 呼び出し、revoke との線形化、in-memory の `AttemptRecord` / `EffectRecord` / `auth_epoch` を実装する。`DurableAuditLog` は WAL、reopen、checksum/replay validation、`Started` crash window、commit receipt まで実装する。外部 provider 固有の receipt と `CommitUnknown` の突合、複製された durable state はこの repository の single-host 境界の外に残る。
 
 ```text
 CommitEffect(subject, effect):
@@ -169,3 +170,4 @@ Authority core の `begin_subject_close` は subject を `Closing` にして新�
 - [Attempt / effect audit](../authority-core/audit-records.md)
 - [capfs](capfs.md)
 - [ネットワークと外部副作用](network-egress.md)
+- [検証ステータス manifest](../verification-status.md)

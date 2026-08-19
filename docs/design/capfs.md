@@ -63,10 +63,10 @@ flowchart LR
 
 ## 現在の実装位置
 
-[`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) に起動時の backing repository 検査、[`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) にVM共通のnamespace registry、[`crates/capfs/src/node.rs`](../../crates/capfs/src/node.rs) にsubject mountごとのnode table、[`crates/capfs/src/runtime.rs`](../../crates/capfs/src/runtime.rs)と[`crates/capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs)にDirect-I/O FUSE adapterを実装している。
+[`crates/capfs/src/backing.rs`](../../crates/capfs/src/backing.rs) に起動時の backing repository 検査、[`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) にVM共通のnamespace registry、[`crates/capfs/src/node.rs`](../../crates/capfs/src/node.rs) にsubject mountごとのnode table、[`crates/capfs/src/runtime.rs`](../../crates/capfs/src/runtime.rs)と[`crates/capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs)に cache-aware FUSE adapterを実装している。
 
 - root を symlink follow なしで開き、mount ID と inode の再照合後に directory fd を保持する。
-- `statx` と `openat2` による fd-relative scan で special file と nested mount を拒否し、symlink の target を検証し、hard link の名前が全て repository 内にあることを確認する。
+- `statx` と `openat2` による fd-relative scan で special file と nested mount を拒否し、symlink の target を検証し、hard link の名前集合を確認する。repository 外にも名前がある inode は既定の `ExternalAliasPolicy::Materialize` で上限内に複製するか、`Reject` policy で拒否する。
 - UTF-8・canonical segment、entry 数、depth を検査し、path 順の初期 manifest を作る。
 - manifest全件へpath非依存の`ObjectId`を割り当て、root fdと完成したregistryを`ImportedRepository`で一緒に所有する。cloneしたmountは同じshared stateを参照する。
 - host-assigned `RepoId`も`ImportedRepository`へ束ね、mount authorityとidentityが違うbacking接続をconstructorで拒否する。
@@ -89,7 +89,7 @@ flowchart LR
 - runtime metadata/open/read/writeはroot fdから`openat2`で解決し、path途中のsymlink、mount越境、registryが知らない名前の出現をfail closedで拒否する。
 - FUSE handle、namespace open count、Authority open handleを同じ`ObjectId`へ結び、`RELEASE`で一緒に閉じる。
 
-詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。全13 `FileEffect`はFUSE operationへ接続済みである。directory streamはopen時のgenerationを保持し、途中でnamespaceが変われば`EAGAIN`を返してcookieの再利用を止める。
+詳しい API と保証範囲は[Backing repository の事前検証](../capfs/backing-preflight.md)、[共有 namespace registry](../capfs/namespace-registry.md)、[mount ごとの node table](../capfs/node-tables.md)、[FUSE adapter](../capfs/read-only-fuse.md)を参照する。全13 `FileEffect`はFUSE operationへ接続済みである。directory streamはopen時のgenerationを保持し、途中でnamespaceが変われば`EAGAIN`を返してcookieの再利用を止める。
 
 namespace writer lockとCapability kernelのshared / exclusive guardを組み合わせたbounded
 競合契約を[`crates/capfs/tests/concurrency.rs`](../../crates/capfs/tests/concurrency.rs)で
@@ -134,7 +134,7 @@ directory は alias を持てない。Linux 自身が禁じており、`..` と 
 
 名前が2つ以上ある object から1つを消しても inode は名前を失わないので、open handle の有無に依らず許される。最後の名前を消す場合だけ従来どおり `EBUSY` になる。「path を失ったまま生きる inode を作らない」という不変条件はそのまま保たれる。
 
-link count の検査は `nlink == 1` から `nlink == 名前の数` に変わった。`capfs` 経由で作られた link は registry が知っているので、**`capfs` の外で作られた名前は依然として検出される**。preflight も同じ形で、inode の名前が全て repository 内にあることを要求する。repository の外に名前がある inode は、repository が inode の部分的な view でしかないことを意味する。既定では **内容を repository 内の新しい inode へ複製し、repository 側の名前をその複製へ移す**。外の名前は元の inode を持ったまま触らない。repository 内で互いに alias だった名前は複製の alias として残り、切れるのは境界をまたぐ関係だけである。複製する総 byte 数には上限があり、実体化した名前は呼び出し側へ報告する。startup が backing tree へ一切書いてはならない場合は、policy を `Reject` にして repository 全体を拒否できる。
+link count の検査は `nlink == 1` から `nlink == 名前の数` に変わった。`capfs` 経由で作られた link は registry が知っているので、**`capfs` の外で作られた名前は依然として検出される**。repository の外に名前がある inode は、repository が inode の部分的な view でしかないことを意味する。既定では **内容を repository 内の新しい inode へ複製し、repository 側の名前をその複製へ移す**。外の名前は元の inode を持ったまま触らない。repository 内で互いに alias だった名前は複製の alias として残り、切れるのは境界をまたぐ関係だけである。複製する総 byte 数には上限があり、実体化した名前は呼び出し側へ報告する。startup が backing tree へ一切書いてはならない場合は、policy を `Reject` にして repository 全体を拒否できる。
 
 ## rename をどう閉じるか
 
@@ -170,7 +170,7 @@ unlink も open handle が残っている間は `EBUSY` にする。多少 POSIX
 
 cached FUSE read は page cache だけで完了する場合があり、cached attribute も同様に `LOOKUP` / `GETATTR` を `capfs` まで戻さない。放置すれば revoke 後の read も stat も止められない。[Linux FUSE I/O modes](https://docs.kernel.org/filesystems/fuse/fuse-io.html)
 
-当初はこれを `FOPEN_DIRECT_IO` と全 timeout 0 で塞いだ。それは正しかったが、代償が大きい。毎 operation が 2 回の context switch を伴う FUSE 往復になり、4 KiB read で 32 µs、stat で 95 µs を要した。実測では `capfs` 自身のコードはその 5% 未満で、残りは往復そのものである。
+当初はこれを `FOPEN_DIRECT_IO` と全 timeout 0 で塞いだ。それは正しかったが、代償が大きい。毎 operation が 2 回の context switch を伴う FUSE 往復になり、4 KiB read で 32 µs、stat で 95 µs を要したという旧 benchmark がある。これは測定環境に依存する履歴値であり、verification gate の性能保証ではない。
 
 現在は **cache を有効にし、revoke が cache を同期的に破棄してから返る**方式を採る。守る不変条件は変わらない。
 
@@ -239,4 +239,5 @@ backing ext4 は supervisor の mount namespace にしか置かない。操作�
 - [状態機械と revoke](state-and-revocation.md)
 - [隔離基盤](runtime-isolation.md)
 - [検証戦略](verification.md)
+- [検証ステータス manifest](../verification-status.md)
 - [実装順序](implementation-plan.md)

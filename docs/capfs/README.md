@@ -14,7 +14,7 @@
 | [共有 namespace registry](namespace-registry.md) | [`crates/capfs/src/namespace.rs`](../../crates/capfs/src/namespace.rs) | `ObjectId`割り当て、現在path、generation、open count、namespace変更の原子性 |
 | [mount ごとの node table](node-tables.md) | [`crates/capfs/src/node.rs`](../../crates/capfs/src/node.rs) | subject-local `nodeid -> ObjectId`、LOOKUP / FORGET参照数、nodeid非再利用 |
 | [backing への実 I/O](runtime-backing-io.md) | [`crates/capfs/src/runtime.rs`](../../crates/capfs/src/runtime.rs) | root fd 相対の解決、毎回の kind / mount / 名前数の検査、create と rename と link の原子性 |
-| [Direct-I/O FUSE adapter](read-only-fuse.md) | [`crates/capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs)、[`runtime.rs`](../../crates/capfs/src/runtime.rs) | metadata visibility、fd-relative I/O、file / directory handle lifecycle、全file mutationのtransaction、毎READ / WRITE / SETATTR / READDIRの再認可、実mount test |
+| [Direct-I/O FUSE adapter](read-only-fuse.md) | [`crates/capfs/src/lib.rs`](../../crates/capfs/src/lib.rs)、[`crates/capfs/src/read_only.rs`](../../crates/capfs/src/read_only.rs)、[`runtime.rs`](../../crates/capfs/src/runtime.rs) | 公開 `capfs::filesystem` alias、metadata visibility、fd-relative I/O、file / directory handle lifecycle、全file mutationのtransaction、毎READ / WRITE / SETATTR / READDIRの再認可、実mount test |
 | [overhead ベンチマーク](overhead-benchmark.md) | [`crates/capfs/benches/capfs_overhead.rs`](../../crates/capfs/benches/capfs_overhead.rs) | native / 認可なしFUSE / capfs / 認可判定単体の4層比較、対照条件、`cargo bench`の実行方法 |
 | [検証対応表](verification.md) | — | 実filesystem／実mount／KVM guestで見た範囲と、有限テスト外の境界 |
 
@@ -31,7 +31,7 @@ flowchart TB
 
     subgraph cf["capfs"]
         direction TB
-        ro["read_only<br/>FUSE opcode の入口<br/>操作ごとに再認可"]
+        ro["filesystem (read_only.rs)<br/>FUSE opcode の入口<br/>操作ごとに再認可"]
         node["node<br/>subject-local nodeid -> ObjectId"]
         ns["namespace<br/>ObjectId -> 現在 path<br/>generation / open count"]
         rt["runtime<br/>root fd 相対の syscall"]
@@ -59,7 +59,7 @@ flowchart TB
     class tree data;
 ```
 
-`ro` が認可の入口、`rt` が唯一 syscall を呼ぶ層。`ns` は VM 共通、`node` は subject ごと。この 2 段で kernel が保持する `nodeid` と VM 全体の identity を分離している。
+`capfs::filesystem`（実装は `read_only.rs`）が認可の入口、`rt` が唯一 syscall を呼ぶ層。`ns` は VM 共通、`node` は subject ごと。この 2 段で kernel が保持する `nodeid` と VM 全体の identity を分離している。旧 `capfs::read_only` module は移行互換の公開名として残る。
 
 ## 関連
 

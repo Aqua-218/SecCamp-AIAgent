@@ -64,7 +64,7 @@ restore 後の identity は必ず ledger から fresh に予約する。
 exact identity、snapshot、workspace、listener、Authority subject closure を検査する。
 外部 command runner / filesystem / API は fake なので、実 Firecracker、特権 isolation、guest 内 capfs の end-to-end 実行を示すものではない。Broker の Firecracker per-port Unix listener と closed request の往復は別の module / opt-in KVM test で確認する。
 
-## multi-session scheduler core
+## multi-session control plane
 
 `control_plane` moduleは、一つの`SessionOwner`を多重化せず、認証済みstartごとに別の
 `ControlWorker`を所有する。HMAC-SHA-256でaction/principal/request/sessionを束縛し、globalと
@@ -72,5 +72,23 @@ principal別quotaをworker作成前に検査する。append-only control journal
 作成前にsyncして恒久的にburnし、stable lockで二つ目のcontrollerをfenceする。restart時は
 closeされていない全workerのexact cleanupが完了しない限りopenに成功しない。
 
-これはhosted scheduler coreであり、現行`host-sessiond`を複数起動するproduction adapterや
-外部control socketではない。現行deploymentは引き続きone-session unitである。
+ローカル control socket は `control_transport` の固定 frame を使う。kernel の
+`SO_PEERCRED` から UID principal を導出し、controller は任意の program、unit、path、systemd
+property、guest credential を受け取らない。成功 response は opaque な session ID だけである。
+production adapter は `SystemdWorkerFactory` を使い、各 session を
+`host-sessiond@<32 lowercase hex>.service` に割り当てる。worker の `failed` state は clean close
+ではなく、exact stop と `host-sessiond-recover@<same-id>.service` の recovery を通してから
+`Closed` にする。したがって、現行 deployment は one-session unit を worker として維持し、
+controller がその固定 unit を複数 instance 管理する構成である。
+
+durable resource cleanup は controller journal と別の
+`DurableSessionRecoveryJournal` に保存される。startup effect 前に session identity と config
+fingerprint を publish し、cgroup、provisioning、mapper、jail、workspace の checkpoint を
+順に sync する。未完了 recovery、unsafe path、journal drift、quota超過は新規 admission や
+worker build を fail closed にする。
+
+詳細な protocol、systemd、recovery の境界は次を参照する。
+
+- [`docs/session-orchestrator/control-plane.md`](../../docs/session-orchestrator/control-plane.md)
+- [`docs/session-orchestrator/systemd-worker.md`](../../docs/session-orchestrator/systemd-worker.md)
+- [`docs/session-orchestrator/recovery.md`](../../docs/session-orchestrator/recovery.md)

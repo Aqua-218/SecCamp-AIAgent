@@ -1,10 +1,10 @@
 <!-- doc-type: concept -->
 
-# Effect commit と revoke の authorization guard
+# Effect execution と revoke の authorization guard
 
 [Authority core 実装ガイド](README.md) / Authorization guard
 
-> **対象読者:** 認可と effect commit の並行境界を触る実装者、loom test のレビュー担当者
+> **対象読者:** 認可と effect execution の並行境界を触る実装者、loom test のレビュー担当者
 
 このページは [`crates/authority-core/src/kernel.rs`](../../crates/authority-core/src/kernel.rs) が、Capability の最終認可から外部 effect の線形化点までを revoke とどう競合させるか説明する。Capability の発行・保持・祖先失効は[逐次状態機械](capability-state.md)を参照する。
 
@@ -48,7 +48,8 @@ flowchart LR
 |---|---|
 | `CapabilityKernel` | `CapabilityState` を同期境界に入れ、発行 transition、revoke、effect commit を直列化する |
 | `CapabilityKernelError` | lock poisoning と逐次状態機械の typed error を区別する |
-| `EffectCommitError<E>` | state/audit lock failure、認可拒否、executor の pre-commit 失敗を区別する |
+| `EffectCommitError<E>` | state/audit lock failure、認可拒否、pre-commit 失敗、commit 後の audit failure、完了不明を区別する |
+| `EffectExecution<T, E>` | executor が `FailedBeforeCommit`、`Committed`、`CommitUnknown` を明示する |
 | `DurableAuditLog` / `CommitReceipt` | Started WAL、terminal receipt、reopen 時の厳密な検証 |
 | `CapabilityInspectionError<E>` | effectを起こさないauthority inspectionのinactive、lock、callback errorを区別する |
 | `AttemptRecord` / `EffectRecord` | 全 checked request と、commit 済み effect を区別する |
@@ -57,26 +58,26 @@ flowchart LR
 
 ## 1件と複数条件の effect をどう扱うか
 
-`authorize_and_commit` は、1件の`CapabilityRequest`を持つ通常のoperation用の入口である。
+`authorize_and_execute_classified` は、1件の`CapabilityRequest`を持つ通常の operation 用の入口である。
 `READ`、単純な`WRITE`、1 pathの`UNLINK`などはこれでよい。
 
-一方、`O_RDWR`、`O_TRUNC`、`RENAME`、複合`SETATTR`のように、1回の外部操作が複数の権限境界をまたぐことがある。これを`authorize_and_commit`へ順番に渡すと、前半だけがcommit済みと監査される、checksの間にrevokeが完了する、といった中間状態を作ってしまう。
+一方、`O_RDWR`、`O_TRUNC`、`RENAME`、複合`SETATTR`のように、1回の外部操作が複数の権限境界をまたぐことがある。これを`authorize_and_execute_classified`へ順番に渡すと、前半だけがcommit済みと監査される、checksの間にrevokeが完了する、といった中間状態を作ってしまう。
 
-`CapabilityRequestSet`は必ず1件以上のrequestを持つ型である。`CapabilityKernel::authorize_all_and_commit`は、このset全件を次の1回の呼び出しに閉じ込める。
+`CapabilityRequestSet`は必ず1件以上の request を持ち、保持する request 数は `MAX_REQUESTS_PER_EFFECT`（現在16）までに制限される。入力 iterator が上限を越えた場合は `is_complete() == false` になり、kernel は audit や executor の前に `NotAuthorized` で拒否する。`CapabilityKernel::authorize_all_and_execute_classified` は、complete な set 全件を次の1回の呼び出しに閉じ込める。
 
 ```text
 shared guard を取得
 → `Started` audit entry を作成
 → caller / held / ancestor / time / request set全件を最終確認
 → 認可に使った Capability の参照を executor へ渡す
-→ executor が線形化点まで進む
-→ outcome を `Committed` に確定
+→ executor が `EffectExecution` を返す
+→ `Committed` / `FailedBeforeCommit` / `CommitUnknown` を分類して audit を確定
 → shared guard を解放
 ```
 
 Capability の参照は read guard 内の `CapabilityState` を借用している。この参照を executor 呼び出しへ渡すことで、lock の寿命が認可判定だけで終わらずexecutor完了まで続く。
 
-set内の1件でも認可が失敗した場合、executor は一度も呼ばれず `EffectCommitError::NotAuthorized` を返す。executor が線形化点より前に失敗した場合は `EffectCommitError::Effect(error)` となる。executor 前に audit entry を作れない場合は `EffectCommitError::Audit(error)` で fail closed にする。executor が成功した後に durable receipt を保存できなかった場合は `EffectCommitError::CommittedButAudit(error)` となる。この場合は外部 effect の可能性を失敗に偽装せず、provider の reconciliation が必要である。記録の仕組みは[Attempt / effect audit](audit-records.md)を参照する。
+set内の1件でも認可が失敗した場合、executor は一度も呼ばれず `EffectCommitError::NotAuthorized` を返す。executor が `EffectExecution::FailedBeforeCommit(error)` を返した場合は `EffectCommitError::Effect(error)` となる。executor 前に audit entry を作れない場合は `EffectCommitError::Audit(error)` で fail closed にする。`Committed` 後に terminal receipt を保存できなかった場合は `EffectCommitError::CommittedButAudit { attempt_id, receipt, source }` となる。`CommitUnknown { evidence }` は `EffectCommitError::CommitUnknown { attempt_id, evidence }` として durable に閉じ、evidence の保存にも失敗した場合は `CommitUnknownAndAudit { attempt_id, evidence, source }` になる。いずれも外部 effect の可能性を失敗に偽装せず、provider の reconciliation が必要である。記録の仕組みは[Attempt / effect audit](audit-records.md)を参照する。
 
 現在のsetは1つの`CapId`に対して使う。複数Capabilityを合成して権限を足し合わせない。mountへ固定したCapabilityが、操作に必要な全requestを単独で許可しなければならない。この制限により、どのCapabilityが副作用を許可したかをaudit recordから一意に追える。
 
@@ -101,8 +102,8 @@ filesystemのpath walkでは、file内容を読む前に「このpathのmetadata
 
 ```text
 with_active_capability: authority metadataからvisibilityを導く
-authorize_and_commit:  backing read/writeなど外部effectを実行する
-authorize_and_commit_with_receipt: external acceptance tokenをterminal WALへ保存する
+authorize_and_execute_classified: backing read/writeなど外部effectを実行する
+EffectExecution::Committed { receipt: Some(..) }: external acceptance tokenをterminal WALへ保存する
 ```
 
 この2つを混同しないことが契約である。現在のDirect-I/O capfsは、`LOOKUP` / `GETATTR`のvisibilityに前者、`OPEN` / `READ` / `WRITE`の実操作に後者を使う。[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)
@@ -116,7 +117,7 @@ lock は外部 syscall がどこで成立したかを自動判定できない。
 - 処理を別 thread へ投げただけで成功を返さない。
 - closure 内から同じ `CapabilityKernel` の `revoke`、`derive`、発行 API を呼ばない。shared guard を持ったまま exclusive guard を要求するとdeadlockし得る。
 
-そのため `authorize_and_commit` / `authorize_all_and_commit` が保証するのは、closureがこの契約を守る場合の認可とrevokeの順序である。filesystem adapter や Broker adapter が間違った線形化点でreturnすれば、その外部処理まで自動的に安全にはならない。
+そのため `authorize_and_execute_classified` / `authorize_all_and_execute_classified` が保証するのは、executor がこの契約に従って `EffectExecution` を返す場合の認可と revoke の順序である。filesystem adapter や Broker adapter が間違った線形化点で return したり、完了不明を `Committed` に分類したりすれば、その外部処理まで自動的に安全にはならない。
 
 ## Revoke と effect の2つの順序
 

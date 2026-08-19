@@ -6,7 +6,7 @@
 
 > **対象読者:** protocol を変更する実装者、レビュー担当者
 
-この crate は純粋な状態機械の集まりで、socket も HTTP も credential も持たない。test も同じ性質で、すべて in-process の unit test である。**外部依存が無いので test double も無い。**
+この crate は純粋な状態機械の集まりで、socket も HTTP も credential も持たない。test も同じ性質で、すべて in-process の unit test である。`client` の stream 境界は `Cursor` を使う deterministic fixture で検査し、実 socket の動作はこの crate の検証結果に含めない。
 
 ## local test で確認したこと
 
@@ -18,24 +18,31 @@
 | `budget` | 3 種の上限それぞれの枯渇、active な request ID の重複拒否、`complete` の超過時に予約が残ること |
 | `operation` | 閉じた union の discriminant、`public_response_byte_limit` が `PublicFetch` のみ `Some` を返すこと |
 | `response` | 型付き response の encode / decode、1 MiB の再検査、canonical chunk の wire round trip、chunk 境界、request / order / duplicate / missing / digest binding |
-| `fuzz` | bounded response / response chunk decoder と payload-bound session ingress の committed-seed smoke target |
+| `client` | bounded frame read/write、送信済み request identity の再利用拒否、response request binding、single response / chunk sequence の bounded reassembly |
+| `fuzz` | `cbor_request_decode`、`frame_decode`、`response_decode`、`session_accept` の4 targetを用意し、各 decoder の allocation / ingress 境界を fuzz する。fuzz 探索の完了は unit test からは言えない |
 
 budget の枯渇 assertion は fixture の値（`requests = 3`、`response_bytes = 100`、`concurrent = 2`）に合わせて書かれている。`60 + 40 = 100` のように、数値が計算に埋まっている。
 
 ## 実行コマンド
 
 ```bash
-cargo fmt --manifest-path crates/egress-protocol/Cargo.toml -- --check
-cargo test --manifest-path crates/egress-protocol/Cargo.toml
-cargo clippy --manifest-path crates/egress-protocol/Cargo.toml --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo test --locked -p egress-protocol --all-targets
+cargo clippy --locked -p egress-protocol --all-targets -- -D warnings
 cargo check --manifest-path fuzz/Cargo.toml --bins --locked
+cargo check --locked --workspace --all-targets
+```
+
+fuzz target の実行は `cargo-fuzz` と Linux 環境を要する。対象を個別に走らせるときは、次の4 targetを使う。
+
+```bash
+scripts/ci/run-fuzz.sh egress-protocol cbor_request_decode
+scripts/ci/run-fuzz.sh egress-protocol frame_decode
 scripts/ci/run-fuzz.sh egress-protocol response_decode
 scripts/ci/run-fuzz.sh egress-protocol session_accept
 ```
 
-`cargo-fuzz` が無い環境では、最後の 2 コマンドは実行せずに明示的な
-tooling failure となる。target の compile と committed seed の存在確認は
-独立して実行できる。
+`cargo check --manifest-path fuzz/Cargo.toml --bins --locked` は target の compile を確認するが、fuzz 探索の代わりにはならない。`cargo-fuzz`、root 権限、Linux の sanitizer 環境などが無い場合は、該当 target を実行せず未検証として扱う。
 
 ## 未検証の境界
 

@@ -208,6 +208,8 @@ on-disk format が固定長 record なので、破損した位置を offset で�
 - [Session orchestrator](README.md)
 - [session の commit 順序と cleanup](lifecycle.md)
 - [lease の binding](lease-binding.md)
+- [session recovery journal](recovery.md)
+- [multi-session control plane](control-plane.md)
 - [検証対応表](verification.md)
 - [0006](../decisions/0006-never-reuse-object-node-and-capability-ids.md)
 - [0015](../decisions/0015-persist-the-identity-ledger-across-restarts.md)

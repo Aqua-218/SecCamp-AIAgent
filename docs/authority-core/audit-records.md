@@ -6,7 +6,7 @@
 
 > **対象読者:** 認可試行と effect の記録を実装する人、fail closed 境界のレビュー担当者
 
-このページは [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs)、[`crates/authority-core/src/durable_audit.rs`](../../crates/authority-core/src/durable_audit.rs)、および [`CapabilityKernel::authorize_and_commit`](../../crates/authority-core/src/kernel.rs) が、認可の試行と実際に commit した effect をどう区別して記録するか説明する。
+このページは [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs)、[`crates/authority-core/src/durable_audit.rs`](../../crates/authority-core/src/durable_audit.rs)、および [`CapabilityKernel::authorize_and_execute_classified`](../../crates/authority-core/src/kernel.rs) が、認可の試行と実際に commit した effect をどう区別して記録するか説明する。
 
 ## 拒否された request と成立した effect は同じではない
 
@@ -29,6 +29,7 @@ stateDiagram-v2
     Started --> Denied: final authorization = false
     Started --> FailedBeforeCommit: executor error
     Started --> Committed: linearization point reached
+    Started --> CommitUnknown: external outcome unknown
 ```
 
 | Outcome | Executor | Effect record |
@@ -37,6 +38,7 @@ stateDiagram-v2
 | `Denied` | 呼ばない | なし |
 | `FailedBeforeCommit` | 呼んだが線形化点より前に失敗 | なし |
 | `Committed` | 線形化点を越えた | あり |
+| `CommitUnknown` | 完了状態を決定できず evidence を保存 | なし（reconciliation 待ち） |
 
 executor が panic した場合、stack unwind により通常の terminal update まで届かないため `Started` が残る。これは成功扱いにせず、「開始記録はあるが完了状態が確定しなかった」attempt として調査対象にできる。
 
@@ -85,9 +87,10 @@ Started frame + sync_all
 → terminal outcome + commit receipt frame + sync_all
 ```
 
-`authorize_and_commit_with_receipt` は adapter が返した provider の idempotency / acceptance
-token を receipt に保存する。token を返さない legacy 入口は「executor が成功を返した」ことを
-表す kernel receipt を保存するが、外部 provider の受理を証明するものではない。
+`authorize_and_execute_classified` の executor が `EffectExecution::Committed { receipt: Some(token), .. }`
+を返すと、adapter が返した provider の idempotency / acceptance token を receipt に保存する。
+receipt を返さない `Committed` は「executor が成功を返した」ことを表す kernel receipt を保存するが、
+外部 provider の受理を証明するものではない。
 
 外部 effect と terminal frame は同一 filesystem transaction ではない。したがって process が
 linearization point の後、receipt の `sync_all` の前に停止すると、reopen 後の record は
@@ -119,7 +122,7 @@ version 2 は先頭に instance を持ち、その値は attach 時点の attemp
 
 ## 分からなかったものを、後から確定させる
 
-`CommitUnknown` は「起きたかもしれないし起きていないかもしれない」という記録である。放置すると監査証跡に未確定が積み上がるので、provider に問い合わせて確定させる経路がある。
+`EffectExecution::CommitUnknown { evidence }` と recovery が付ける `CommitUnknown` は「起きたかもしれないし起きていないかもしれない」という記録である。放置すると監査証跡に未確定が積み上がるので、provider に問い合わせて確定させる経路がある。
 
 `reconcile_unknown_commits` が未解決の `CommitUnknown` を順に取り出し、`CommitReconciler` へ渡す。実装は provider 境界を持つ adapter が用意する。判定は record 自身から復号した `DurableAttemptMetadata`（caller、`CapId`、typed request、`auth_epoch`）だけで行えるので、別の帳簿と食い違う余地が無い。
 
@@ -208,7 +211,7 @@ replay、receipt grammar の拒否を確認する。
 
 ## 関連
 
-- [Effect commit と revoke の authorization guard](authorization-guard.md)
+- [Effect execution と revoke の authorization guard](authorization-guard.md)
 - [Subject lifecycle と open handle](subject-lifecycle-and-handles.md)
 - [Capability の発行と逐次状態機械](capability-state.md)
 - [検証とテスト](verification.md)

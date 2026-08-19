@@ -33,6 +33,7 @@ jobs:
     uses: ./.github/workflows/security.yml
     permissions:
       contents: read
+      id-token: write
       packages: read
       security-events: write
     with:

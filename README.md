@@ -1,102 +1,107 @@
 # Capability-based AI Agent Runtime
 
-AI Agent が生成したコードを、明示的な権限・隔離・監査の境界内で実行するための Linux / Firecracker 基盤です。Agent や Tool を信頼せず、ファイル操作と外部通信を副作用が発生する地点で Capability により認可します。
+[English](README.md) · [日本語](README-ja.md) · [简体中文](README-zh-CN.md) · [繁體中文](README-zh-TW.md) · [한국어](README-ko.md) · [Español](README-es.md) · [Français](README-fr.md) · [Deutsch](README-de.md) · [Português (Brasil)](README-pt-BR.md)
 
-> **重要:** production の実行単位は **1 worker = 1 session = 1 microVM** のままです。非特権 `host-controld` が認証・quota・no-reuse journal・controller fencingを担い、systemd/polkit越しに複数の特権分離workerを所有します。実systemdでのfailed-worker recoveryとcontroller crash reconciliation、x86_64 KVM上の2 worker/2 Broker同時生存・独立cleanupまで検証済みです。multi-host HA、分散revoke、複製Broker stateは現行single-host trust modelの対象外です。
+[![CI](https://github.com/Aqua-218/SecCamp-AIAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/Aqua-218/SecCamp-AIAgent/actions/workflows/ci.yml)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 
-## まず読む
+Run untrusted agent and tool workloads on Linux and Firecracker while capability checks,
+isolation, egress policy, audit, and recovery remain at the points where side effects occur.
 
-| 目的 | 読む場所 |
+> **Status:** This is a source repository, not a claim of absolute isolation. At this revision,
+> the verification manifest records 38 verified claims and 3 blocked claims. Read the scope table
+> below before treating any result as evidence for a different environment.
+
+## Start here
+
+| Goal | Read |
 |---|---|
-| まず local で検証する | [Quick start](#quick-start) |
-| 何を守り、どこを信頼するか知る | [Security model](#security-model) |
-| 実装済みと未検証の境界を確認する | [現在の到達点](#現在の到達点) |
-| `host-sessiond` を配置する | [Deployment guide](deploy/README.md) |
-| 設計全体を理解する | [Architecture](docs/design/architecture.md) |
-| ADR を読む | [Decision records](docs/decisions/README.md) |
-| 文書を横断して探す | [Documentation index](docs/README.md) |
+| Run a hosted smoke test | [Quick start](#quick-start) |
+| Understand the trust boundary | [Architecture and trust boundaries](#architecture-and-trust-boundaries) |
+| Check what is and is not verified | [Verification status](#verification-status) and [`docs/verification-status.yml`](docs/verification-status.yml) |
+| Deploy the production daemon | [`deploy/README.md`](deploy/README.md) |
+| Read the cross-crate design | [`docs/design/architecture.md`](docs/design/architecture.md) |
+| Browse all project documentation | [`docs/README.md`](docs/README.md) / [English docs hub](docs/i18n/en/README.md) |
 
-## この基盤が解く問題
+## Overview
 
-一般的な Agent sandbox では、process を隔離しても、workspace、credential、外部 API、副作用の完了と revoke の競合が別々の仕組みに散らばりがちです。この基盤は次の規則を一つの実行経路にまとめます。
+The runtime treats the agent, tools, and workload processes as untrusted. File operations,
+public HTTPS fetches, and typed GitHub operations are closed data types rather than arbitrary
+commands. `authority-core` makes the authorization decision; CapFS and the host Egress Broker
+enforce it immediately before filesystem or external effects.
 
-- **最小権限:** file、公開 HTTPS、GitHub 操作を closed な型として表し、許可されていない操作を任意文字列へ退避しません。
-- **効果地点での認可:** file syscall は CapFS、外部操作は host Egress Broker が、最終的な `CapabilityKernel` 認可を通してから実行します。
-- **revoke の線形化:** 認可から効果の commit point まで read guard を保持し、完了した revoke より後の副作用を失効済み Capability だけでは開始できません。
-- **guest credential なし:** GitHub token は host にのみ置き、guest へ渡しません。
-- **network device なし:** guest に `virtio-net` を付けず、外部通信を bounded `AF_VSOCK` protocol と host Broker に集約します。
-- **identity の非再利用:** session、request、workspace、VM、Broker session、subject、Capability の identity を永続 ledger に記録し、restart 後も再利用を拒否します。
-- **snapshot と権限の束縛:** snapshot manifest、host grant、guest start acknowledgement を同じ authority policy digest に結び付けます。
-- **失敗を成功扱いしない:** commit の成否が確定できない効果、途中まで進んだ shutdown、破損した WAL は fail closed で保持し、同じ identity と stage で復旧します。
+The production unit is one worker, one session, and one Firecracker microVM. An unprivileged
+`host-controld` admits multiple workers through authenticated, quota-limited start/stop requests.
+Each `host-sessiond@ID.service` owns one session and its cleanup records. The current trust model
+is single-host: multi-host HA, distributed revocation, and replicated Broker state are outside
+the repository's guarantee.
 
-## Security model
+## What the runtime enforces
 
-### Trust boundary
+- **Typed least privilege:** file effects, HTTP methods and paths, and GitHub operations are
+  represented by closed Rust types and bounded authority envelopes.
+- **Effect-point authorization:** CapFS re-authorizes each filesystem effect; the host Broker
+  authorizes typed external effects through the host `CapabilityKernel`.
+- **Revocation linearization:** the authorization read guard remains held through the effect's
+  commit point. After `revoke` returns, a later commit cannot rely only on the revoked capability
+  or one of its descendants. Effects committed before revocation are not rolled back.
+- **No guest credentials:** provider credentials stay on the host and are never put in the guest
+  image or returned in a response.
+- **No guest network device:** the guest has no `virtio-net`; egress uses a bounded `AF_VSOCK`
+  protocol and typed host adapters.
+- **Identity non-reuse:** session, request, workspace, VM, Broker session, subject, and capability
+  identities are recorded in durable ledgers and are not silently reused after restart.
+- **Bound guest startup:** pinned artifacts, dm-verity, paused restore, and policy-digest-bound
+  v2 guest acknowledgements gate workload release.
+- **Fail-closed recovery:** ambiguous effects are recorded as `CommitUnknown`; partial shutdown
+  and damaged durable records fail closed and leave typed recovery state for the next start.
 
-Agent と Tool は untrusted です。host kernel、`host-sessiond`、固定済み helper / VM artifact、各 trust domain の `CapabilityKernel` を trusted computing base として扱います。guest 内の防御だけに依存せず、guest が侵害された場合も host credential と別 session の workspace へ到達させない構成です。
+## Architecture and trust boundaries
 
-境界を越える経路は次に限定されます。
-
-| 境界 | 許可された経路 | 主な制約 |
-|---|---|---|
-| Agent → workspace | Direct-I/O FUSE | operation ごとの再認可、path / repository / effect の一致 |
-| Agent → guest supervisor | `SOCK_SEQPACKET` | request 4 KiB、closed tag、`SO_PEERCRED` による caller 束縛 |
-| guest → host | `AF_VSOCK` frame | payload 1 MiB、canonical CBOR、session / sequence / budget |
-| host → microVM | Firecracker API + guest-control API | artifact digest、dm-verity、paused restore、policy-bound v2 ACK |
-| host → external provider | typed Broker adapter | public HTTPS / GitHub のみ、redirect・response・deadline 上限 |
-
-生の guest TCP、guest への host filesystem 共有、credential の guest 配布は提供しません。GitHub の `publish-branch` は、expected-old object を含む host-owned plan がなければ実行できません。
-
-revoke の保証は次の範囲です。
-
-> revoke が返った後に commit される副作用は、失効した Capability またはその子孫だけを根拠には実行されない。
-
-revoke より前に commit point を越えた外部効果を巻き戻す保証ではありません。曖昧な完了は durable audit に `CommitUnknown` として残します。詳細は [状態機械と revoke](docs/design/state-and-revocation.md) と [threat model](docs/design/threat-model.md) を参照してください。
-
-## Architecture
+The host services, pinned artifacts, Firecracker/jailer, and host kernel are part of the trusted
+host boundary. Guest services enforce the guest-side contracts; the agent and tool processes are
+untrusted. The diagram shows the intended effect paths, not a proof of VM escape resistance.
 
 ```mermaid
 flowchart TB
-    operator["Operator / systemd"]
-    external["Public HTTPS / GitHub API"]
+    operator["Operator / host-control"]
+    external[["Public HTTPS / GitHub API"]]
 
     subgraph host["Trusted host"]
-        controller["host-controld<br/>authenticated multi-session admission"]
-        orchestrator["host-sessiond@.service<br/>one-session worker / durable recovery"]
-        hostAuthority["authority-core<br/>host CapabilityKernel"]
-        runtime["firecracker-runtime<br/>artifact / jailer / snapshot"]
-        broker["egress-broker<br/>typed provider adapters"]
-        ledger[("Identity ledger / audit / WAL")]
-        credential[("Host-only credential")]
-        workspace[("Per-session workspace clone")]
+        controller["host-controld<br/>unprivileged admission"]
+        worker["host-sessiond@ID<br/>one session owner"]
+        authority["authority-core<br/>host CapabilityKernel"]
+        runtime["firecracker-runtime<br/>Firecracker + jailer"]
+        broker["egress-broker<br/>typed adapters"]
+        ledger[("identity ledger / audit / WAL")]
+        workspace[("per-session workspace")]
+        credential[("host-only credential")]
     end
 
-    subgraph guest["Untrusted session microVM"]
-        guestControl["guest-control PID 1<br/>policy-bound start gate"]
-        supervisor["supervisor<br/>subject / handle lifecycle"]
-        guestAuthority["authority-core<br/>guest CapabilityKernel"]
+    subgraph guest["Guest microVM — workload boundary"]
+        guest_gate["guest-control + supervisor<br/>identity / subject gate"]
+        guest_authority["authority-core<br/>guest CapabilityKernel"]
         capfs["capfs<br/>Direct-I/O FUSE"]
-        isolation["runtime-isolation<br/>13-step launcher"]
-        agent["Agent / Tool process"]
+        isolation["runtime-isolation<br/>ordered Linux isolation"]
+        workload["Agent / Tool<br/>untrusted"]
     end
 
     operator -->|"authenticated start / stop"| controller
-    controller -->|"fixed systemd template + polkit"| orchestrator
-    orchestrator -->|"reserve / recover"| ledger
-    orchestrator -->|"restore paused VM"| runtime
-    orchestrator -->|"issue exact roots"| hostAuthority
-    orchestrator -->|"open bounded egress"| broker
-    runtime -->|"v2 identity + policy digest"| guestControl
-    guestControl -->|"release after exact ACK"| supervisor
-    supervisor -->|"register subjects"| guestAuthority
-    supervisor -->|"mount authorized view"| capfs
-    supervisor -->|"apply isolation"| isolation
-    isolation -->|"execve"| agent
-    agent -->|"file syscalls"| capfs
-    capfs -->|"authorize each effect"| guestAuthority
+    controller -->|"fixed systemd template + polkit"| worker
+    worker -->|"reserve / recover"| ledger
+    worker -->|"restore + identity binding"| runtime
+    worker -->|"issue exact authority"| authority
+    worker -->|"open bounded channel"| broker
+    runtime -->|"policy-bound v2 gate"| guest_gate
+    guest_gate -->|"register subject"| guest_authority
+    guest_gate -->|"mount authorized view"| capfs
+    guest_gate -->|"apply isolation"| isolation
+    isolation -->|"literal argv via execve"| workload
+    workload -->|"file syscalls"| capfs
+    capfs -->|"authorize each effect"| guest_authority
     capfs -->|"backing fd I/O"| workspace
-    agent -->|"bounded egress request"| broker
-    broker -->|"authorize external effect"| hostAuthority
+    workload -->|"bounded request"| broker
+    broker -->|"authorize external effect"| authority
     credential -->|"never enters guest"| broker
     broker -->|"TLS"| external
 
@@ -105,80 +110,99 @@ flowchart TB
     classDef untrusted fill:#b71c1c,color:#fff,stroke:#7f0000;
     classDef storage fill:#ef6c00,color:#fff,stroke:#e65100;
     classDef outside fill:#616161,color:#fff,stroke:#424242;
-    class controller,orchestrator,hostAuthority,runtime,broker trusted;
-    class guestControl,supervisor,guestAuthority,capfs,isolation guestService;
-    class agent untrusted;
-    class ledger,credential,workspace storage;
+    class controller,worker,authority,runtime,broker trusted;
+    class guest_gate,guest_authority,capfs,isolation guestService;
+    class workload untrusted;
+    class ledger,workspace,credential storage;
     class operator,external outside;
 ```
 
-startup は `workspace → Broker → VM → Capability → workload` の順に commit します。停止時は `Capability revoke → VM kill → Broker close → workspace isolation` の順で進みます。cleanup が失敗した session は `Stopping` に留まり、成功済み stage を繰り返さず、未完了 stage のみを retry します。
+The crossing points are intentionally narrow:
 
-## 現在の到達点
-
-「コードが存在する」「test double で契約を検証した」「実 kernel / VM で動かした」を区別しています。機械可読な正本は [`docs/verification-status.yml`](docs/verification-status.yml) です。
-
-| Scope | 状態 | 証拠 |
+| Boundary | Path | Important limits |
 |---|---|---|
-| Rust workspace | 検証済み | 全 target / feature の test、Clippy、rustdoc、API baseline |
-| Authority model | 検証済み | property test、Loom、Lean 4、Rust / Lean 共通 corpus 150件 |
-| CapFS | hosted + 実 mount + KVM guest で検証済み | `/dev/fuse` 上の22件と、guest内の全13 file effect |
-| Runtime isolation | 特権 host で検証済み | namespace、cgroup v2、seccomp、Landlock、read-only rootfs、device、fd、capability |
-| Firecracker guest path | 実 KVM で検証済み | dm-verity boot、v2 identity gate、guest Supervisor、全13 CapFS effect、isolation後のBroker channel |
-| production `Runtime::launch` / `SessionOwner` | 実 KVM で検証済み | 実jailer、clean snapshot create/restore、durable Broker/ledger、stopと全resource cleanup |
-| CI / supply chain | 実装済み | GitHub / GitLab 52 gate parity、audit、deny、SBOM、SAST、secret scan、再現可能 release、外部review署名取込 |
-| 外部 provider | 一部blocked | controlled DNS/HTTPS/TLSは実kernelで検証済み。実GitHub credential mutationは資格情報未提供のためblocked |
-| multi-session control plane | single-host components検証済み、exact installed chain未検証 | HMAC admission、`SO_PEERCRED`、quota、durable no-reuse、controller fencing、実systemd/polkit fixture、failed-worker/controller crash reconciliation、2つのlive KVM worker/Brokerと独立cleanup |
+| Workload → workspace | CapFS Direct-I/O FUSE | Re-authorization for each effect; repository, path, and effect must match |
+| Workload → supervisor | `SOCK_SEQPACKET` | 4 KiB request bound and kernel-derived `SO_PEERCRED` identity |
+| Guest → host | `AF_VSOCK` framed transport | 4-byte length prefix, 1 MiB payload bound, canonical CBOR, session/replay/budget checks |
+| Host → microVM | Firecracker API plus guest-control API | Pinned artifact digests, dm-verity, paused restore, policy-bound v2 ACKs |
+| Host → external provider | Typed Broker adapter | Public HTTPS or typed GitHub operations only; DNS/IP, redirect, response, and deadline policy |
 
-> **注意:** 「実 KVM test が通る」ことを VM 隔離全体の証明とは扱いません。crate ごとの仮定と残存境界は `docs/<crate>/verification.md` に明記しています。
+Raw guest TCP, arbitrary host filesystem sharing, and guest credential injection are not part of
+the interface. The launcher does not interpret shell strings: it executes the image-configured
+program with literal argv through `execve`. If a workload starts a shell itself, the namespace,
+cgroup, seccomp, Landlock, read-only rootfs, and capability boundaries still apply; this project
+does not claim to make shell parsing safe.
 
-### shell command の境界
+Startup commits resources in this order:
 
-このrepositoryはshell文字列を解析して「安全なコマンドか」を判定しない。production launcherは
-暗黙のshellを起動せず、image/configに固定されたprogramへ引数をliteralなargvとして`execve`
-するため、`;`、`$()`、空白はshell構文として展開されない。workload自身がshellや`rm`を実行する
-場合の安全性は、read-only guest root、mount/PID/user namespace、cgroup、seccomp、Landlock、
-CapFSのpath/effect authorityで閉じる。
+```text
+workspace → Broker → VM → capability → workload
+```
 
-従って、隔離済みguest内の`rm -rf /`がhostの`/`を削除することはなく、guest rootやmaskされた
-領域への変更も拒否される。一方で、sessionに`RemoveFile` / `RemoveDirectory`を付与したworkspace
-内の対象は、要求どおり削除できる。これは危険コマンドの意味解析による無害化ではなく、付与済み
-authorityの範囲だけ副作用を許す設計である。host kernel/KVM/Firecracker/jailer、runner管理権限、
-物理・microarchitectural side channelはTCBまたは非目標であり、絶対安全を主張しない。
+Shutdown proceeds in the dependency order below. A failed stage remains durable and only the
+unfinished stages are retried:
+
+```text
+capability revoke → VM kill → Broker close → workspace isolation → Closed
+```
+
+## Verification status
+
+The machine-readable source of truth is [`docs/verification-status.yml`](docs/verification-status.yml).
+Statuses are scoped claims, not a green-list of all possible environments. `verified` means that
+the required gate ran in the declared scope; `blocked` records a named prerequisite or external
+owner that is unavailable. At this revision the manifest contains 38 verified claims and 3 blocked
+claims, with no `unverified` claims.
+
+| Scope | Current manifest status | Evidence and boundary |
+|---|---|---|
+| Hosted | 14 verified | Locked Rust tests, Clippy, property tests, durable-state tests, and the Rust/Lean corpus where claimed |
+| Privileged Linux | 10 verified, 1 blocked | Real FUSE, Linux isolation, rollback, supervisor resources, and controlled HTTPS fixtures; the blocked claim is the aarch64 privileged architecture runner |
+| KVM | 14 verified | Pinned Firecracker guest, dm-verity, guest-control, production `Runtime::launch` / `SessionOwner`, all 13 declared CapFS effects, and multi-session cleanup gates |
+| External | 2 blocked | Live GitHub credential/provider mutation and independent external review evidence are unavailable in this checkout |
+
+These results do not establish VM escape resistance, host-kernel/KVM/Firecracker correctness,
+physical or microarchitectural side-channel resistance, or arbitrary external-provider behavior.
+The crate-specific verification pages list the assumptions and finite-test boundaries:
+
+- [`authority-core` verification](docs/authority-core/verification.md)
+- [`capfs` verification](docs/capfs/verification.md)
+- [`egress-broker` verification](docs/egress-broker/verification.md)
+- [`firecracker-runtime` verification](docs/firecracker-runtime/verification.md)
+- [`runtime-isolation` verification](docs/runtime-isolation/verification.md)
+- [`session-orchestrator` verification](docs/session-orchestrator/verification.md)
+- [`supervisor` verification](docs/supervisor/verification.md)
 
 ## Quick start
 
-### 必要なもの
+This path exercises hosted code only. It does not start a service, require root, mount FUSE, need
+`/dev/kvm`, or read provider credentials. A first checkout needs network access for Cargo's locked
+dependencies; subsequent runs use the local Cargo cache.
 
-- Git
-- `rustup`
-- Rust `1.93.1`（[`rust-toolchain.toml`](rust-toolchain.toml) が自動選択）
-- Linux（FUSE、特権 isolation、Firecracker の実機検証を行う場合）
+### Prerequisites
 
-clone 後、hosted test は追加の service や credential なしで実行できます。
+- Linux, Git, and `rustup`
+- Rust `1.93.1`, selected by [`rust-toolchain.toml`](rust-toolchain.toml)
+
+### Run a hosted smoke test
 
 ```bash
 git clone https://github.com/Aqua-218/SecCamp-AIAgent.git
 cd SecCamp-AIAgent
 
-cargo test --workspace --all-targets --all-features --locked
-scripts/ci/run.sh format
-scripts/ci/run.sh check
-scripts/ci/run.sh clippy
-scripts/ci/run.sh docs
-```
-
-`host-sessiond` の CLI 契約を確認する場合:
-
-```bash
+cargo test --locked -p authority-core --all-targets
 cargo run --locked -p session-orchestrator --bin host-sessiond -- --help
 ```
 
-`host-sessiond` は多数の artifact digest、snapshot、durable path を必須入力とします。placeholder のまま起動できる簡易 mode はありません。本番相当の配置は [Deployment guide](deploy/README.md) に従ってください。
+The first command runs the authority model and its corpus-facing tests. The second command
+prints the production daemon's required artifact, snapshot, authority, and egress configuration;
+`host-sessiond` intentionally has no placeholder mode that starts an incomplete production stack.
 
 ## Development and verification
 
-CI と local は同じ [`scripts/ci/run.sh`](scripts/ci/run.sh) を入口にします。追加 tool は repository 内の `.ci-tools/` へ version / digest 固定で導入されます。
+The same [`scripts/ci/run.sh`](scripts/ci/run.sh) entry point is used by local development and CI.
+Install only the tool groups needed for the gates you intend to run; tools are placed under the
+repository's private `.ci-tools/` directory.
 
 ```bash
 scripts/ci/install-cargo-tools.sh nextest coverage security public-api
@@ -186,7 +210,7 @@ scripts/ci/install-pipeline-tools.sh
 scripts/ci/install-lean.sh
 ```
 
-### Standard gates
+### Standard hosted gates
 
 ```bash
 scripts/ci/run.sh format
@@ -209,109 +233,131 @@ scripts/ci/run.sh deny
 scripts/ci/run.sh api-surface
 ```
 
-coverage gate は workspace の line coverage 75% を下限にします。`capfs` の実 mount test は `/dev/fuse` が無い環境では skip されるため、標準 test の green だけで privileged FUSE 境界を検証済みとは判断しません。
+The coverage gate uses a 75% workspace line-coverage floor. That threshold is a CI gate, not a
+coverage badge or a claim that every privileged or KVM path was exercised. The exact matrix for
+Miri, sanitizers, mutation testing, fuzzing, and benchmarks lives in [`ci/gates.yml`](ci/gates.yml).
 
-### Deep gates
+### Privileged and KVM gates
 
-Miri、sanitizer、mutation、fuzz、benchmark の正確な matrix は [`ci/gates.yml`](ci/gates.yml) が管理します。
-
-```bash
-scripts/ci/install-cargo-tools.sh miri sanitizers mutation fuzz
-scripts/ci/run.sh miri authority-core path::tests
-scripts/ci/run.sh sanitizers address egress-protocol
-scripts/ci/run.sh mutation 1 authority-core
-scripts/ci/run.sh fuzz egress-protocol frame_decode
-scripts/ci/run.sh benchmarks
-```
-
-### Privileged Linux and real KVM
+These commands need the prerequisites named by their scripts. Missing `/dev/fuse`, `/dev/kvm`,
+delegated cgroup v2, device-mapper tools, or pinned guest artifacts is a failed verification
+condition, not a successful skip.
 
 ```bash
-# root + delegated cgroup v2 が必要
+# Root and delegated cgroup v2
 scripts/ci/run.sh privileged-isolation
 
-# root、/dev/kvm、/dev/vhost-vsock、veritysetup、busybox、mkfs.ext4 が必要
+# Root, /dev/kvm, /dev/vhost-vsock, veritysetup, busybox, and mkfs.ext4
 scripts/ci/verify-real-guest-control.sh
+scripts/ci/verify-real-session-owner.sh
 ```
 
-どちらも前提不足を skip として成功扱いしません。実 KVM script は固定済み Firecracker / guest artifact を検証し、必要な guest kernel を pin 済み source と repository 内 config / patch から build します。
+Use the dedicated [crate verification pages](#verification-status) and [`docs/ci-cd.md`](docs/ci-cd.md)
+for the full protected-runner contract.
 
 ## Running `host-sessiond`
 
-deployable entry point は [`host-sessiond`](crates/session-orchestrator/src/bin/host-sessiond.rs) です。review 済み source revision から exact binary を build します。
+The deployable entry point is [`host-sessiond`](crates/session-orchestrator/src/bin/host-sessiond.rs).
+The production installation procedure requires an externally reviewed full commit and an
+externally authenticated SHA-256 manifest; it is not a generic `cargo install` target.
 
 ```bash
 cargo build --release --locked \
   -p session-orchestrator \
-  --bin host-sessiond
+  --bin host-sessiond --bin host-controld --bin host-control
 ```
 
-systemd 配置には次を使用します。
+For installation, artifact pinning, system accounts, systemd/polkit, device access, snapshots,
+credential handling, and recovery, follow [`deploy/README.md`](deploy/README.md). The checked-in
+examples are the source for the service contract:
 
-| Artifact | 用途 |
+| Artifact | Purpose |
 |---|---|
-| [`deploy/README.md`](deploy/README.md) | account、device access、snapshot、credential、停止・復旧手順 |
-| [`deploy/host-sessiond.env.example`](deploy/host-sessiond.env.example) | 全必須変数と安全な既定 profile |
-| [`service/host-sessiond.service`](service/host-sessiond.service) | dedicated account、capability / device / namespace 制約 |
+| [`deploy/host-sessiond-worker.env.example`](deploy/host-sessiond-worker.env.example) | Multi-session worker environment and pinned artifact fields |
+| [`deploy/host-sessiond.env.example`](deploy/host-sessiond.env.example) | Legacy single-session environment example |
+| [`service/host-sessiond@.service`](service/host-sessiond@.service) | One worker instance per session |
+| [`service/host-sessiond-recover@.service`](service/host-sessiond-recover@.service) | Recovery-only worker cleanup |
+| [`service/host-controld.service`](service/host-controld.service) | Unprivileged authenticated controller |
+| [`deploy/polkit-1/rules.d/50-host-controld.rules`](deploy/polkit-1/rules.d/50-host-controld.rules) | Narrow start/stop authorization |
 
-example unit は `--egress-authority none` で起動し、credential を読みません。公開 HTTPS または GitHub を有効化するには、profile とその profile 固有の authority を明示的に追加します。GitHub token は systemd encrypted credential `github-token` が優先され、非 systemd 実行に限って `EGRESS_GITHUB_TOKEN` を fallback として使用できます。
-
-daemon は `SIGTERM`、`SIGINT`、または stop file で dependency-order shutdown を開始します。timeout 時は非ゼロで終了し、identity ledger、authority audit、Broker WAL、recovery journal を次回起動のため保持します。readiness と lifecycle は JSON Lines と任意の owner-readable status file に出力されますが、credential、authority body、path、backend error text は記録しません。
+The example service selects `--egress-authority none` and reads no GitHub token. Public HTTPS or
+GitHub must be enabled explicitly with the corresponding authority and host-only credential
+profile. `EGRESS_GITHUB_TOKEN` is retained only as the explicit non-systemd fallback; production
+systemd deployments should use the encrypted `github-token` credential described in the deploy
+guide. A `publish-branch` operation also requires a host-owned expected-old-object plan.
 
 ## Workspace layout
 
 | Path | Responsibility |
 |---|---|
-| [`crates/authority-core/`](crates/authority-core/) | typed authority、delegation、revoke、audit、policy digest |
-| [`crates/capfs/`](crates/capfs/) | repository preflight、namespace / node table、Direct-I/O FUSE |
-| [`crates/egress-protocol/`](crates/egress-protocol/) | bounded frame、canonical CBOR、session / replay / budget |
-| [`crates/egress-broker/`](crates/egress-broker/) | public HTTPS / GitHub adapter、DNS / IP policy、durable dispatch |
-| [`crates/firecracker-runtime/`](crates/firecracker-runtime/) | artifact pin、dm-verity、jailer、snapshot、guest-control transport |
-| [`crates/runtime-isolation/`](crates/runtime-isolation/) | exec 前の13-step Linux isolation transaction |
-| [`crates/supervisor/`](crates/supervisor/) | guest subject / handle lifecycle、control socket、CapFS composition |
-| [`crates/session-orchestrator/`](crates/session-orchestrator/) | session lifecycle、lease、durable recovery、`host-sessiond` |
-| [`lean/`](lean/) | authority / runtime 判定の Lean 4 実装と定理 |
-| [`guest/`](guest/) | pin 済み guest kernel config と patch |
-| [`ci/`](ci/) | gate manifest、API baseline、benchmark baseline、test fixture |
-| [`scripts/ci/`](scripts/ci/) | GitHub / GitLab / local が共有する gate implementation |
-| [`docs/`](docs/README.md) | architecture、contract、verification、ADR、用語集 |
-| [`deploy/`](deploy/README.md), [`service/`](service/) | one-session owner の配置 artifact |
+| [`crates/authority-core/`](crates/authority-core/) | Typed authority families, delegation, policy digests, state, revocation, audit, and durable audit |
+| [`crates/capfs/`](crates/capfs/) | Repository preflight, namespace/node tables, backing I/O, and Direct-I/O FUSE |
+| [`crates/egress-protocol/`](crates/egress-protocol/) | Bounded frames, canonical CBOR, session/replay identity, and budgets |
+| [`crates/egress-broker/`](crates/egress-broker/) | Host vsock transport, public HTTPS policy, typed GitHub adapter, and durable dispatch |
+| [`crates/firecracker-runtime/`](crates/firecracker-runtime/) | Pinned artifacts, dm-verity, jailer, snapshot/restore, and guest-control transport |
+| [`crates/runtime-isolation/`](crates/runtime-isolation/) | Ordered Linux namespace, mount, cgroup, Landlock, capability, and seccomp transaction |
+| [`crates/supervisor/`](crates/supervisor/) | Guest subject and handle lifecycle, control socket, and CapFS composition |
+| [`crates/session-orchestrator/`](crates/session-orchestrator/) | Session lifecycle, leases, production adapters, durable recovery, and daemon binaries |
+| [`lean/`](lean/) | Lean 4 (`leanprover/lean4:v4.16.0`) authority/runtime model and proof corpus executables |
+| [`guest/`](guest/) | Pinned guest kernel configuration and patch |
+| [`ci/`](ci/) | Gate manifest, API baselines, benchmark baseline, and fixtures |
+| [`scripts/ci/`](scripts/ci/) | Shared GitHub, GitLab, and local gate implementations |
+| [`docs/`](docs/README.md) | Design, crate contracts, verification boundaries, decisions, and glossary |
+| [`deploy/`](deploy/README.md) and [`service/`](service/) | Production installation and systemd/polkit artifacts |
 
-`authority-core` と `runtime-isolation` は他の workspace crate に依存しない監査境界です。この独立性は [`check-crate-isolation.sh`](scripts/ci/check-crate-isolation.sh) が実 dependency graph に対して検査します。
+`authority-core` and `runtime-isolation` remain dependency-graph leaves so their authorization
+and isolation contracts do not depend on higher-level orchestration. The actual dependency graph
+and runtime placement are documented in [`docs/design/architecture.md`](docs/design/architecture.md).
 
 ## CI and release
 
-[`ci/gates.yml`](ci/gates.yml) が pipeline topology の single source of truth です。現在は 44 gate が `implemented`、`planned` は 0 で、GitHub Actions と GitLab CI の parity check が欠落・余分な job・空実装を拒否します。
+[`ci/gates.yml`](ci/gates.yml) is the single source of truth for pipeline topology. It currently
+declares 53 implemented gates across validation, quality, tests, analysis, security, and protected
+system verification. Four ordered release stages (`package`, `verify`, `publish`, and `record`) are
+tracked separately. GitHub Actions and GitLab CI must implement the same manifest-owned gates;
+parity and result reconciliation fail closed when a job is missing or unexpected.
 
-release 対象は、現在 repository が再現可能性を証明できる `authority-corpus` Linux binary に限定しています。release pipeline は clean tree から archive、AGPL license、build metadata、SPDX SBOM、checksum を生成し、独立した二つの target directory で byte-identical rebuild を要求します。GitHub は OIDC attestation、GitLab は keyless Sigstore bundle を使用し、既存 asset と異なる bytes を上書きしません。
+The deep workflow is scheduled or manually dispatched because real FUSE, KVM, device-mapper,
+systemd, and external-provider fixtures are not available on ordinary pull-request runners. The
+external-provider gate is opt-in and remains blocked in this checkout without the protected
+credential and disposable provider owner.
 
-詳細な trigger、runner contract、branch protection、署名、復旧手順は [CI/CD operations](docs/ci-cd.md) を参照してください。
+Release automation is restricted to semantic-version tags. It packages the reproducible
+`authority-corpus` Linux binary with license text, build metadata, SPDX SBOM, checksum, and the
+platform-specific provenance/signature record. This repository does not publish a version badge;
+the workspace version in [`Cargo.toml`](Cargo.toml) and the release workflow are the authoritative
+inputs.
+
+See [`docs/ci-cd.md`](docs/ci-cd.md) for runner contracts, branch protection, release recovery,
+and signature handling.
 
 ## Documentation
 
-文書入口は [`docs/README.md`](docs/README.md) です。
+[`docs/README.md`](docs/README.md) is the documentation index. The most useful entry points are:
 
 | Topic | Document |
 |---|---|
-| 設計原則と component 関係 | [`docs/design/README.md`](docs/design/README.md) |
-| system architecture | [`docs/design/architecture.md`](docs/design/architecture.md) |
-| capability / isolation / egress threat | [`docs/design/threat-model.md`](docs/design/threat-model.md) |
-| 実装・mock・実機証拠の区別 | [`docs/design/verification.md`](docs/design/verification.md) |
-| 用語 | [`docs/glossary.md`](docs/glossary.md) |
-| 設計判断 | [`docs/decisions/README.md`](docs/decisions/README.md) |
-| 文書の追加規約 | [`docs/document-conventions.md`](docs/document-conventions.md) |
+| Cross-crate architecture | [`docs/design/architecture.md`](docs/design/architecture.md) |
+| Threat model and non-goals | [`docs/design/threat-model.md`](docs/design/threat-model.md) |
+| Capability, isolation, and egress design | [`docs/design/README.md`](docs/design/README.md) |
+| Verification strategy | [`docs/design/verification.md`](docs/design/verification.md) |
+| Machine-readable verification claims | [`docs/verification-status.yml`](docs/verification-status.yml) |
+| Decision records | [`docs/decisions/README.md`](docs/decisions/README.md) |
+| Deployment and recovery | [`deploy/README.md`](deploy/README.md) |
+| CI/CD operations | [`docs/ci-cd.md`](docs/ci-cd.md) |
+| Terminology | [`docs/glossary.md`](docs/glossary.md) |
 
-文書変更は相対リンク、必須節、Mermaid、verification evidence の整合性を CI で検査します。
-
-```bash
-scripts/ci/run.sh docs-policy
-```
+Each crate's README and verification page separates implementation, hosted tests, privileged
+tests, KVM evidence, and external-provider gaps. Start with the relevant crate in the
+[workspace layout](#workspace-layout) when a change crosses only one subsystem.
 
 ## License
 
 Copyright © 2026 Aqua-218.
 
-この project は [GNU Affero General Public License v3.0 only](LICENSE)（`AGPL-3.0-only`）で公開されています。利用・改変・再配布、およびネットワーク越しの提供に伴う条件はライセンス本文を確認してください。
+This project is released under the [GNU Affero General Public License v3.0 only](LICENSE)
+(`AGPL-3.0-only`). Review the license text for the conditions that apply to use, modification,
+redistribution, and network service deployment.
 
 ## Related
 

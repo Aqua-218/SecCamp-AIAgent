@@ -24,9 +24,11 @@ sequenceDiagram
     participant API as ApiClient
 
     R->>R: config.validate()
-    R->>FS: 8 artifact を読んで digest 照合
+    R->>FS: 10 artifact を読んで digest 照合
     R->>FS: clone_workspace(source, clone)
-    Note over R,FS: ここで失敗したら remove_workspace のみ
+    R->>FS: sparse ext4 workspace image を作成
+    R->>CR: pinned workspace formatter で image を format
+    Note over R,FS: ここまでで失敗したら clone/image のみを削除
     R->>FS: register_jailer_root(root, parent identity)
     R->>CR: dm-verity open
     R->>FS: bind_block_device + verify exact binding
@@ -43,7 +45,7 @@ sequenceDiagram
 
 ## API 呼び出しの順序
 
-`configure_vm` は 5 本の PUT を決まった順に投げる。Firecracker の API は状態を持ち、`InstanceStart` の時点で device 構成が終わっている必要がある。
+`configure_vm` は 5 本の PUT を決まった順に投げる。Firecracker の API は状態を持ち、`InstanceStart` の時点で device 構成が終わっている必要がある。`launch` は `InstanceStart` 後にも process の running を確認し、返却 state を `WorkloadStopped` とする。
 
 | 順 | path | 内容 | 順序上の制約 |
 |---|---|---|---|
@@ -105,7 +107,7 @@ API 呼び出しが 1 関数に閉じているため、Firecracker の API 仕�
 
 fake adapter を使う限りにおいて、順序と rollback が上記のとおり動くことは test で確認している。
 
-- [`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) は実 Firecracker に `machine-config`、`boot-source`、read-only root drive、`vsock`、`InstanceStart` をこの順に送って boot する。workspace drive、`Runtime::launch` の jailer 経路、snapshot restore は同 test の対象外である。
+- [`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) は実 Firecracker に `machine-config`、`boot-source`、read-only root drive、workspace drive、`vsock`、`InstanceStart` をこの順に送って boot する。`Runtime::launch` の jailer 経路、snapshot restore は同 test の対象外である。
 - `scripts/ci/verify-real-runtime-lifecycle.sh` の opt-in gate は、実 `Runtime::launch`、pinned Firecracker/jailer、実 dm-verity、workspace image、cgroup v2、PID/mount namespace、UID、seccomp installation、shutdown cleanup を host 上で確認する。wrapper は generated mapper/cgroup scope を test に渡し、異常終了時にも exact scope を回収する。
 - この gate は実 helper と resource ownership の成立を確認するが、VM escape proof、各 seccomp syscall の deny 意味論、snapshot/restore、guest CapFS は保証しない。
 - `veritysetup` の host CLI によって `open --readonly` の受理可否が異なるため、production runner は open 時の optional flag に依存せず、`status` の exact mode が read-only であることを検証する。

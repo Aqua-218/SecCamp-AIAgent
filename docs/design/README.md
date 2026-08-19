@@ -10,7 +10,7 @@ Agent にコードを書かせるだけなら、それほど難しくない。�
 
 この基盤では、Agent と Tool を最初から信用しない。何をしてよいかは Capability で明示し、実際の副作用が起きる場所で強制する。
 
-この文書は設計の入口であり、実装の完了判定ではない。Cycle 2 の各 crate については、コードが存在すること、mock/contract test が通ること、実機・外部サービス境界を実行したことを分けて記録する。
+この文書は設計の入口であり、実装の完了判定ではない。Cycle 2 の各 crate については、コードが存在すること、mock/contract test が通ること、実機・外部サービス境界を実行したことを分けて記録する。実行 scope と残存理由は [検証ステータス manifest](../verification-status.md) と [完了台帳](../hardening/2026-08-18-completion-ledger.md) を参照する。
 
 ## 何を守るのか
 
@@ -118,8 +118,8 @@ flowchart LR
 
 | 境界 | 実装済み | mock/contract 検証済み | 実機・外部統合の状態 |
 |---|---|---|---|
-| Authority core と audit | typed authority、状態遷移、`auth_epoch`、in-memory audit、`DurableAuditLog` の WAL/receipt | Rust/Lean 共通 corpus、property test、loom、durable audit contract／cross-process test | provider receipt reconciliationは実装済み。live external providerの実行だけblocked |
-| capfs | preflight、namespace/node table、link を含む Direct-I/O FUSE adapter | module/contract、実mount 22件、KVM guest全13 effect | bounded race／backing差し替えも確認。全interleavingは有限テストの範囲外 |
+| Authority core と audit | typed authority、状態遷移、`auth_epoch`、in-memory audit、`DurableAuditLog` の WAL/receipt | Rust/Lean 共通 corpus、property test、loom、durable audit contract／cross-process test | `CommitUnknown` の reconciliation 記録機構は実装済み。provider 固有 adapter と live external provider の実行はこの scope の外／blocked |
+| capfs | preflight、namespace/node table、link を含む cache-aware FUSE adapter | module/contract、実mount 22件、KVM guest全13 effect | bounded race／backing差し替えも確認。read cache invalidation と writable direct I/O を分け、全interleavingは有限テストの範囲外 |
 | `egress-broker` | bounded transport、typed dispatch、DNS/IP policy、公開 HTTPS、型付き GitHub adapter | fake境界 + 実DNS/TLS/SNI/rebinding + KVM Broker | live GitHub APIだけoperator credential不在でblocked |
 | `runtime-isolation` | policy validation、`LinuxBackend`、13 段階の ordered apply/rollback | mock backend、privileged syscall／production launcher post-exec probe、KVM guest | staged rootfsの実apply／rollbackとreadonly guest rootの`/` branchを確認 |
 | `firecracker-runtime` | artifact pin、dm-verity/jailer/API 順序、workspace、snapshot/restore、identity/workload gate | fake境界、local Unix socket、実lifecycle／KVM test | 実Firecracker、jailer、dm-verity、snapshot capture／restore、guest-to-host Brokerを確認 |
@@ -152,3 +152,5 @@ flowchart LR
 - [Cycle 2 実装状況](#cycle-2-の実装状況)
 - [Cycle 2 実装順序](implementation-plan.md)
 - [Cycle 2 検証戦略](verification.md)
+- [検証ステータス manifest](../verification-status.md)
+- [完了台帳](../hardening/2026-08-18-completion-ledger.md)

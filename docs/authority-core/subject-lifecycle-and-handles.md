@@ -96,19 +96,11 @@ Authority core の `finish_subject_close` は、その subject に live handle �
 
 現在実装済みなのは、lifecycle transition、held Capability の shutdown revoke、epoch 更新、typed handle identity、subject/object binding、live count、close の冪等性、ID 非再利用、Closed 前の live-handle 検査である。
 
-Authority core 内で残るのは adapter 側の接続である。kernel の Loom model は open-handle 登録と
-shutdown の順序、および child effect と direct / ancestor の複数 revoke を検査する。
+Authority core 内では、kernel の Loom model が open-handle 登録と shutdown の順序、および child effect と direct / ancestor の複数 revoke を検査する。capfs adapter 側も、backing `open`、trusted `HandleId`、namespace count、FUSE release、rename / unlink / revoke の失敗処理を実装し、実 mount と bounded concurrency test で接続を検査している。
 
-次は adapter 側に残る。
+一方、cgroup stop、fd close、unmount を実行してから `finish_subject_close` を呼ぶ supervisor orchestration は Authority core の責務ではない。全 FUSE request lifecycle、全 scheduler interleaving、process crash 後の外部 resource 復元もこの module の保証外である。
 
-- backing `open` の成功と `register_open_handle` を失敗処理込みで接続すること。登録が拒否された場合は、adapter が開いた fd を必ず閉じる。
-- FUSE request の `fh` を trusted `HandleId` へ変換し、request payload の subject identity を信用しないこと。
-- 実装済みの[global namespace registry](../capfs/namespace-registry.md)と Authority core の handle 登録・close を、失敗処理込みで同じ adapter transition へ接続すること。
-- cgroup stop、fd close、unmount を実行してから `finish_subject_close` を呼ぶ supervisor orchestration。
-- open handle、rename、unlink、revoke を組み合わせた capfs の Loom・実 mount test。
-
-したがって、現在の model は stale handle ID の再束縛、Authority core 内の不正 transition、登録と
-shutdown の競合を防ぐが、OS fd や FUSE lifecycle との接続まで完成したという意味ではない。
+したがって、現在の model と adapter は stale handle ID の再束縛、Authority core 内の不正 transition、登録と shutdown の競合、実 mount 上の代表的な handle lifecycle を扱うが、OS resource manager 全体の end-to-end 証明ではない。
 
 ## どう検証しているか
 
@@ -125,7 +117,7 @@ shutdown の競合を防ぐが、OS fd や FUSE lifecycle との接続まで完�
 - OS の resource が実際に解放されることは扱わない。fd の close、mount の解除、cgroup の削除は [supervisor](../../docs/supervisor/README.md) の担当。
 - handle が指す object が存在し続けることは保証しない。binding は identity の対応であって、生存の保証ではない。
 - `auth_epoch` を cache の key に含めるかどうかは利用側の責務。この module は epoch を進めるだけ。
-- shutdown 中に進行中の操作が完了するのを待つ仕組みは無い。`Closing` は新規要求を拒否するが、実行中のものを止めはしない。
+- `CapabilityState` 単体には in-flight executor はない。`CapabilityKernel::begin_subject_close` は exclusive state guard を取得するため、kernel 経由では既に shared guard 内にある effect の線形化点を待つ。OS resource の停止・回収まで待つ保証は supervisor 側にある。
 
 ## 変更時の確認点
 
@@ -137,7 +129,7 @@ shutdown の競合を防ぐが、OS fd や FUSE lifecycle との接続まで完�
 ## 関連
 
 - [Capability の発行と逐次状態機械](capability-state.md)
-- [Effect commit と revoke の authorization guard](authorization-guard.md)
+- [Effect execution と revoke の authorization guard](authorization-guard.md)
 - [Attempt / effect audit](audit-records.md)
 - [状態機械と revoke の設計](../design/state-and-revocation.md)
 - [capfs](../design/capfs.md)

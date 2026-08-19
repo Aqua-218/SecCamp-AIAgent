@@ -23,7 +23,7 @@ if git rev-parse --verify HEAD > /dev/null 2>&1 \
 fi
 
 readonly expected_checksum_entries="$(printf '%s\n' \
-  "${ARCHIVE_NAME}" "${SBOM_NAME}" release.env | sort)"
+  "${ARCHIVE_NAME}" "${SBOM_NAME}" | sort)"
 actual_checksum_entries="$(awk '
   NF != 2 || $1 !~ /^[0-9a-f]{64}$/ || $2 !~ /^\*?[A-Za-z0-9][A-Za-z0-9._-]*$/ { exit 2 }
   { sub(/^\*/, "", $2); print $2 }

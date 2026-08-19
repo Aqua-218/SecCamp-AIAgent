@@ -40,7 +40,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "authority-core"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "loom",
  "proptest",
@@ -103,7 +103,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "capfs"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "authority-core",
  "criterion",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "egress-broker"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "authority-core",
  "egress-protocol",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "egress-protocol"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "authority-core",
  "sha2",
@@ -367,7 +367,7 @@ checksum = "26b73573e6edcd2af0cdf47bd6cb58f0b3839491263c314eaad1ccf24430e1de"
 
 [[package]]
 name = "firecracker-runtime"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "authority-core",
  "egress-broker",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-isolation"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "libc",
  "rustix",
@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "session-orchestrator"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "authority-core",
  "egress-broker",
@@ -1628,7 +1628,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "supervisor"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "authority-core",
  "capfs",

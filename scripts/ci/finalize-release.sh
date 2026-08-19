@@ -44,7 +44,7 @@ jq --exit-status \
   "${sbom_path}" > /dev/null
 (
   cd -- dist
-  sha256sum "${ARCHIVE_NAME}" "${SBOM_NAME}" release.env > "${CHECKSUM_NAME}"
+  sha256sum "${ARCHIVE_NAME}" "${SBOM_NAME}" > "${CHECKSUM_NAME}"
 )
 
 if [[ "${SIGN_RELEASE:-false}" == "true" ]]; then

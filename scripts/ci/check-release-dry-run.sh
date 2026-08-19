@@ -48,6 +48,25 @@ scripts/ci/finalize-release.sh
 # part that can catch a packaging mistake.
 scripts/ci/verify-release.sh
 
+# Prove the published checksum manifest is self-contained. `release.env` is
+# internal workflow metadata and is intentionally not a public release asset.
+# shellcheck source=scripts/ci/release-metadata-lib.sh
+source "${repository_root}/scripts/ci/release-metadata-lib.sh"
+release_metadata_load dist/release.env
+public_bundle="$(mktemp -d)"
+readonly public_bundle
+cleanup_public_bundle() { rm -rf -- "${public_bundle}"; }
+trap cleanup_public_bundle EXIT
+cp -- \
+  "dist/${ARCHIVE_NAME}" \
+  "dist/${SBOM_NAME}" \
+  "dist/${CHECKSUM_NAME}" \
+  "${public_bundle}/"
+(
+  cd -- "${public_bundle}"
+  sha256sum --check --strict "${CHECKSUM_NAME}"
+)
+
 failures=0
 
 require_artifact() {

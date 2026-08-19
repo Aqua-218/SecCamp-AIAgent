@@ -28,7 +28,7 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
 name = "authority-core"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "loom",
  "sha2",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "egress-protocol"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "authority-core",
  "sha2",

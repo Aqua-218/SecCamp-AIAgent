@@ -6,7 +6,7 @@
 
 > **対象読者:** host lifecycle 統合担当者、Firecracker/Broker/Authority adapter の設計者、レビュー担当者
 
-`session-orchestrator` は、隔離された一つの agent session のホスト側 lifecycle state machine である。resource の確保順序と identity binding を所有し、Authority Core、Broker listener、Firecracker runtime、workspace の production adapter を提供する。FUSE mount、provider request、特権 isolation の具体的な副作用は、それぞれの専用 adapter が所有する。
+`session-orchestrator` は、隔離された一つの agent session のホスト側 lifecycle state machine である。resource の確保順序と identity binding を所有し、Authority Core、Broker listener、Firecracker runtime、workspace の production adapter を提供する。FUSE mount、provider request、特権 isolation の具体的な副作用は、それぞれの専用 adapter が所有する。複数 session の admission は `host-controld` が担当し、各 session は固定 systemd template の一つの worker へ分離される。
 
 ## crate の構造
 
@@ -16,7 +16,7 @@ flowchart TB
 
     subgraph so["session-orchestrator（host 側）"]
         direction TB
-        sm["SessionOrchestrator<br/>5 stage の取得と逆順解放<br/>Ready / Running / Stopping / Closed"]
+        sm["SessionOrchestrator<br/>startup commit と逆順解放<br/>Ready / Running / Stopping / Closed"]
         ident["allocate_session_identity<br/>128-bit × 7"]
         ledger["IdentityLedger<br/>no-reuse ledger"]
         val["validate_*<br/>lease の identity 照合"]
@@ -70,11 +70,13 @@ flowchart TB
 
 | 文書 | 対象ソース | 内容 |
 |---|---|---|
-| [session の commit 順序と cleanup](lifecycle.md) | [`lib.rs`](../../crates/session-orchestrator/src/lib.rs) | 5 stage の取得順、逆順の解放、`Stopping` に留まる条件 |
+| [session の commit 順序と cleanup](lifecycle.md) | [`lib.rs`](../../crates/session-orchestrator/src/lib.rs) | startup の取得順、Broker health gate、逆順の解放、`Stopping` に留まる条件 |
 | [identity と ledger](identity-ledger.md) | [`lib.rs`](../../crates/session-orchestrator/src/lib.rs) | 7 つの identity、on-disk format、durability 順序、排他所有 |
+| [session recovery journal](recovery.md) | [`recovery.rs`](../../crates/session-orchestrator/src/recovery.rs) | config fingerprint、cleanup checkpoint、crash 後の再開 |
 | [lease の binding](lease-binding.md) | [`lib.rs`](../../crates/session-orchestrator/src/lib.rs) | backend が返す lease の照合、型で守る順序 |
 | [production backend 契約](contracts.md) | [`authority_backend.rs`](../../crates/session-orchestrator/src/authority_backend.rs) ほか | adapter 実装者の義務 |
-| multi-session control plane | [`control_plane.rs`](../../crates/session-orchestrator/src/control_plane.rs)、[`systemd_worker.rs`](../../crates/session-orchestrator/src/systemd_worker.rs)、[`host-controld.rs`](../../crates/session-orchestrator/src/bin/host-controld.rs) | HMAC admission、kernel peer UID、quota、durable no-reuse、controller fencing、固定systemd worker、restart reconciliation |
+| [multi-session control plane](control-plane.md) | [`control_plane.rs`](../../crates/session-orchestrator/src/control_plane.rs)、[`control_transport.rs`](../../crates/session-orchestrator/src/control_transport.rs) | HMAC admission、kernel peer UID、bounded frame、quota、controller fencing |
+| [systemd worker 境界](systemd-worker.md) | [`systemd_worker.rs`](../../crates/session-orchestrator/src/systemd_worker.rs)、[`host-controld.rs`](../../crates/session-orchestrator/src/bin/host-controld.rs) | 固定 unit、polkit、failed state、exact stop/recovery |
 | [検証対応表](verification.md) | — | mock、実systemd、実KVMで確認した範囲と、exact installed chainとして未検証の範囲 |
 
 ## 特に注意する点
@@ -88,6 +90,9 @@ flowchart TB
 ## 関連
 
 - [production backend 契約](contracts.md)
+- [multi-session control plane](control-plane.md)
+- [systemd worker 境界](systemd-worker.md)
+- [session recovery journal](recovery.md)
 - [Firecracker runtime](../firecracker-runtime/README.md)
 - [Supervisor adapter](../supervisor/README.md)
 - [Host Egress Broker](../egress-broker/README.md)

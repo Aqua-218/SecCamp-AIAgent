@@ -7,6 +7,7 @@
 > **対象読者:** CI の gate を保守する実装者、検証結果をレビューする担当者
 
 [`docs/verification-status.yml`](verification-status.yml) は、検証の主張を実行環境ごとに分けて記録する機械可読 manifest である。`verified` は、宣言した prerequisite が満たされた環境で、`gate.result: required` の command が成功し、その scope の evidence を得た意味だけを持つ。隣接する privileged、KVM、external の境界まで検証したことを意味しない。`unverified` は境界が既知だが証拠が足りない状態、`blocked` は prerequisite または外部 owner が使えず実行できない状態である。後者の2つを削除して green にすることは禁止する。
+この manifest は検証結果の台帳であって、CI 実行ログや成功した test の代替ではない。manifest 自体には gate の実行時刻、CI run ID、artifact の保存場所を持たせていないため、`verified` への変更は同じ変更で取得した scope 固有の CI artifact または operator 証跡と照合する。pipeline の gate 数と claim 数も一致させない。前者は実行する検査の topology、後者は実装境界について公開する主張の集合である。
 
 ## スキーマ
 
@@ -26,6 +27,8 @@
 | `claims[].residual_reasons` | `unverified` / `blocked` では必須。`verified` では空配列 |
 
 `sources` と `tests` は存在するパスでなければならず、絶対パスや `..` による runner 外部参照は許さない。コマンドの存在だけでは検証済みにならないため、status の変更は実際にその scope の証跡を取得した変更と同時に行う。
+
+`scope` は検査の対象環境を表し、`hosted` の成功を `privileged`、`kvm`、`external` の evidence と読み替えない。`verified` は named gate が成功した境界だけを示し、未記載の syscall、scheduler interleaving、hardware、provider 操作を含めない。
 
 ## checker の責務
 
@@ -47,12 +50,15 @@
 scripts/ci/check-doc-consistency.sh
 scripts/ci/check-doc-consistency.sh ci/fixtures/verification-status-missing-evidence.yml
 scripts/ci/check-verification-traceability.sh
+scripts/ci/run.sh docs-policy
 ```
 
 2 つ目は負の fixture であり、意図的に失敗する。新しい claim を追加するときは、status を先に `unverified` とし、検証できていない理由を具体的に書く。前提が外部 credential や別 runner でまだ得られない場合は `blocked` とし、前提と復旧条件を `prerequisites` と `residual_reasons` に残す。`verified` への変更は、同じ変更で evidence と required gate を追加し、wrapper を使う場合は前提不足を skip ではなく exit 2 にする。
+claim を降格する場合も理由を残す。runner の一時的な unavailable、credential の失効、gate の回帰を `blocked` または `unverified` のまま記録し、証跡が無いことだけを理由に claim を削除しない。status の更新後は、該当 verification page、`docs/README.md`、完了台帳の記述が同じ scope を指していることを確認する。
 
 ## 関連
 
 - [検証戦略](design/verification.md)
 - [CI/CD 運用](ci-cd.md)
 - [文書規約](document-conventions.md)
+- [完了台帳](hardening/2026-08-18-completion-ledger.md)

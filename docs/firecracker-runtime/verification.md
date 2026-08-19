@@ -6,7 +6,7 @@
 
 > **対象読者:** firecracker-runtime の実装者、レビュー担当者、実機で統合 test を回す人
 
-この crate の test は 4 層に分かれる。fake adapter を使う lifecycle test、実 Unix socket と実プロセスを使う adapter test、実 filesystem を使う workspace test、KVM host で実 Firecracker を boot する opt-in test である。最後の層だけは root、`/dev/kvm`、`/dev/vhost-vsock`、device-mapper、cgroup v2 を要求し、通常の `cargo test` では実行しない。実 Firecracker 層には、直接 API を構成する guest-control test と、production `Runtime::launch` を通る lifecycle gate の 2 本がある。
+この crate の test は 4 層に分かれる。fake adapter を使う lifecycle test、実 Unix socket と実プロセスを使う adapter test、実 filesystem を使う workspace test、KVM host で実 Firecracker を boot する opt-in test である。最後の層だけは root、`/dev/kvm`、`/dev/vhost-vsock`、device-mapper、cgroup v2、pinned artifact を要求し、通常の `cargo test` では実行しない。実 Firecracker 層には、直接 API を構成する guest-control test と、production `Runtime::launch` を通る launch/cleanup gate の 2 本がある。
 
 ## local test で確認したこと
 
@@ -48,9 +48,8 @@ HTTP を自前で実装しているので、request smuggling の入口になり
 
 | 境界 | test |
 |---|---|
-| 通常の出力を取得する | `real_command_runner_captures_normal_output` |
-| stdout が上限を超えたらプロセスを終了させる | `real_command_runner_terminates_on_oversized_stdout` |
-| stderr が上限を超えたらプロセスを終了させる | `real_command_runner_terminates_on_oversized_stderr` |
+| bounded output を取得し環境を消去する | `real_command_runner_captures_bounded_output_and_clears_the_environment` |
+| stdout / stderr が上限を超えたらプロセスを終了させる | `real_command_runner_terminates_oversized_stdout_and_stderr` |
 | 所有する終了済み child を reap する | `real_command_runner_reaps_an_already_exited_owned_child` |
 | 所有しない PID に signal を送らない | `real_command_runner_rejects_unowned_pid_without_signalling_it` |
 | 外部crateが任意program/argvをproduction runnerへ組み立てられない | private-field `CommandSpec` と compile-fail doctest |
@@ -107,7 +106,7 @@ symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` �
 
 ### production `Runtime::launch` lifecycle（opt-in）
 
-[`scripts/ci/verify-real-runtime-lifecycle.sh`](../../scripts/ci/verify-real-runtime-lifecycle.sh) は、pinned Firecracker/jailer、pinned kernel、pinned seccomp compiler/filter、実 `veritysetup`、実 cgroup v2 を用意し、[`real_runtime_launches_and_cleans_real_jailer_lifecycle`](../../crates/firecracker-runtime/tests/real_runtime_lifecycle.rs) を `Runtime::launch` 経由で実行する。wrapper は必須であり、環境が使えない場合も test を skip せず、root、KVM、vhost-vsock、cgroup v2、device-mapper、pinned artifact の不足を明示して終了する。guest image はこの host-side gate 専用に static BusyBox から作る最小 squashfs で、guest の CapFS や workload policy の検証を兼ねない。
+[`scripts/ci/verify-real-runtime-lifecycle.sh`](../../scripts/ci/verify-real-runtime-lifecycle.sh) は、pinned Firecracker/jailer、pinned kernel、pinned seccomp compiler/filter/policy、実 `veritysetup`、実 cgroup v2 を用意し、[`real_runtime_launches_and_cleans_real_jailer_lifecycle`](../../crates/firecracker-runtime/tests/real_runtime_lifecycle.rs) を `Runtime::launch` 経由で実行する。この gate は x86_64 専用で、wrapper は必須であり、環境が使えない場合も test を skip せず、root、KVM、vhost-vsock、cgroup v2、device-mapper、pinned artifact の不足を明示して終了する。guest image はこの host-side gate 専用に static BusyBox から作る最小 squashfs で、guest の CapFS や workload policy の検証を兼ねない。
 
 | 境界 | 実際に確認すること |
 |---|---|
@@ -119,13 +118,12 @@ symlink は「拒否」ではなく「unlink」である。`O_PATH | NOFOLLOW` �
 | API sequence | `/machine-config`、`/boot-source`、rootfs/workspace drive、vsock、`InstanceStart` が `Runtime::launch` の順序で成立し、返却 state は `WorkloadStopped` である |
 | shutdown residue | process、cgroup leaf/parent、mapper、bind target、workspace image/clone、jailer root/instance directory が shutdown 後に残らない |
 
-このgateが示すのは、指定host上でresource ownershipとjailer lifecycleが実際に成立し、shutdownがexact scopeを回収することまでである。さらに`scripts/ci/verify-real-session-owner.sh`はclean snapshotを実作成してproduction `SessionOwner`からrestoreし、guestの全13 CapFS effect、durable Broker/identity evidence、stopと全resource cleanupを一続きで検証する。VM escape proofや任意guest codeに対する完全な意味論証明は含まない。
+この gate が示すのは、wrapper を実行した指定 host 上で resource ownership と jailer lifecycle が成立し、shutdown が exact scope を回収することまでである。さらに [`scripts/ci/verify-real-session-owner.sh`](../../scripts/ci/verify-real-session-owner.sh) は、root、x86_64、KVM、vhost-vsock、device-mapper、cgroup v2、pinned artifact を要求する別の opt-in gate として、clean snapshot を実作成して production `SessionOwner` から restore し、guest の全13 CapFS effect、durable Broker/identity evidence、stop と全 resource cleanup を一続きで検証する。wrapper を実行していない host の結果や、VM escape proof、任意 guest code に対する完全な意味論証明は含まない。
 
 `scripts/ci/verify-real-runtime-version-matrix.sh` は同じ production lifecycle gate を
 Firecracker 1.15.1 と 1.16.1 の順で実行する。archive は version ごとの固定 SHA-256 と
 official release asset の checksum の両方で照合し、未知の version は download 前に拒否する。
-2026-08-18 の x86_64 KVM host では両 version が起動、観測、shutdown、residue 検査まで完走した。
-これは宣言した 2 version の互換性証拠であり、将来 version や全 host kernel の互換性を外挿しない。
+この wrapper は宣言した 2 version を順に実行するが、実行には上記の privileged host と各 version の pinned archive が必要である。実行結果はその host の artifact、kernel、Firecracker version に限った互換性証拠であり、将来 version や全 host kernel の互換性へ外挿しない。
 
 ## 実行コマンド
 

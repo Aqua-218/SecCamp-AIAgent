@@ -99,11 +99,19 @@ let request = connection.receive_request()?;        // bytes を読むのはこ�
 
 socket は bind 直後に mode 0600 へ絞る。node が出来るのは bind の後なので、connect され得る前に権限が閉じている。
 
+listener は lexical absolute path と安全な parent だけを受け付ける。backlog は `1..=128`、
+accepted connection の receive/send timeout は既定 30 秒で、それぞれ 300 秒を上限とする。同時に
+live な resolver binding は 4096 件までで、超過した accept は新しい caller identity を作らずに
+拒否する。request は 4 KiB を超える datagram を decode 前に捨て、response は 64 byte 以下の
+一つの `SOCK_SEQPACKET` datagram として bounded send timeout 内に送る。これらは認可判定ではなく、
+peer が resource を保持したまま待ち続ける時間とメモリ／connection 数を閉じる transport policy
+である。
+
 ## `ConnectionIdentity` の強さ
 
 `ConnectionIdentity` は 4 field を持ち、比較と hash はその全部を使う。identity の強度は host の socket ID 割り当てと peer credential の質で決まる。
 
-**connection を閉じた後に同じ socket ID が再利用されると、`StaticCallerResolver` の古い binding が黙って復活する。** socket ID の非再利用は host 側の責務で、この crate では保証していない。
+**production の `SubjectCredentialResolver` は accepted connection ごとに process-local な単調カウンタから socket ID を払い出し、`release` 後も同じ値を再利用しない。** 同じ resolver を複数の `SubjectControlListener` で共有すれば listener をまたいでも連番は一つであり、上限到達、counter exhaustion、重複 bind は fail closed になる。これは restart をまたぐ durable identity ではなく、resolver instance の寿命の範囲だけの性質である。`StaticCallerResolver` は caller が渡す in-memory map なので、この production allocation contract を持たない。
 
 `WireRequest` の bytes から `ConnectionIdentity` を組み立ててはならない、という制約は doc comment にしか書かれていない。型としては構築を止めていない。
 
@@ -135,7 +143,7 @@ socket は bind 直後に mode 0600 へ絞る。node が出来るのは bind の
 ## 正確な保証範囲
 
 - `StaticCallerResolver` は in-memory の map で、実 socket の peer credential を読まない。test と小さな host adapter 用である。
-- `SubjectControlListener` は実 `SOCK_SEQPACKET` socket に対して module test で検証済み。実 `SO_PEERCRED` の取得、socket ID の単調割り当てと非再利用、4 KiB 超 datagram の decode 前拒否、mode 0600、絶対 path 以外の拒否を確認している。
+- `SubjectControlListener` は実 `SOCK_SEQPACKET` socket に対して module test で検証済み。実 `SO_PEERCRED` の取得、resolver を共有した listener 間での socket ID の単調割り当てと非再利用、4 KiB 超 datagram の decode 前拒否、mode 0600、絶対 path 以外の拒否、backlog/timeout/binding 上限を確認している。
 - guest VM内の`guest-supervisor-init`からproduction listener／Supervisor／isolation launcher／workloadへ至るcompositionはKVM gateで確認済み。uid/gidを偽装したpeerの負試験は別uid processを使うhost module testの範囲に限られる。
 - `SubjectControlListener`を`Supervisor::create_subject`へ接続する組み立ては`guest-supervisor-init`にあり、実guest imageで起動確認する。
 - `ConnectionNotBoundToSubject`、`CallerBindingError`、`GrantSubjectMismatch`、`DuplicateSubject`、親の非 Running gate、`derive` の非 holder 拒否は supervisor level の test で確認している。

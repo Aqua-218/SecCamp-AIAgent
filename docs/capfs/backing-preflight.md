@@ -74,7 +74,7 @@ entry 数と深さには [`PreflightLimits`](../../crates/capfs/src/backing.rs) 
 
 ## repository の外に名前がある inode をどうするか
 
-外に名前がある inode は、repository が inode の**部分的な view** でしかないことを意味する。内側の名前への write は `capfs` が検査できない authority の下にある file を書き換え、内側の名前を全部消してもデータは外の名前で生き残る。この状態のまま mount することはできない。
+外に名前がある inode は、repository が inode の**部分的な view** でしかないことを意味する。内側の名前への write は `capfs` が検査できない authority の下にある file を書き換え、内側の名前を全部消してもデータは外の名前で生き残る。この状態のままでは mount できないため、`ExternalAliasPolicy` で拒否するか、境界をまたぐ共有だけを実体化してから再検査する。
 
 `ExternalAliasPolicy` で2つから選ぶ。
 

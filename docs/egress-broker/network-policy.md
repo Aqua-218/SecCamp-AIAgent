@@ -86,6 +86,7 @@ host は CIDR を追加できるが、組み込み範囲を削除できない。
 | `169.254.0.0/16` | link-local。cloud metadata を含む |
 | `192.0.0.0/24` | IETF protocol assignments |
 | `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` | documentation |
+| `192.31.196.0/24`, `192.52.193.0/24`, `192.175.48.0/24` | 組み込み拒否 range |
 | `192.88.99.0/24` | 6to4 relay anycast |
 | `198.18.0.0/15` | benchmarking |
 | `224.0.0.0/4` | multicast |
@@ -96,17 +97,18 @@ host は CIDR を追加できるが、組み込み範囲を削除できない。
 | `::/96`, `::/128` | unspecified、IPv4-compatible |
 | `::1/128` | loopback |
 | `64:ff9b::/96`, `64:ff9b:1::/48` | NAT64 |
-| `100::/64` | discard-only |
-| `2001::/32` | Teredo |
-| `2001:2::/48` | benchmarking |
-| `2001:10::/28` | ORCHID |
-| `2001:db8::/32` | documentation |
+| `100::/64`, `100:0:0:1::/64` | 組み込み拒否 range |
+| `2001::/23` | IANA IETF Protocol Assignments supernet（Teredo、benchmarking、AMT、AS112、ORCHID、DET などを含む） |
 | `2002::/16` | 6to4 |
+| `2620:4f:8000::/48` | 組み込み拒否 range |
+| `3fff::/20` | 組み込み拒否 range |
+| `5f00::/16` | 組み込み拒否 range |
 | `fc00::/7` | unique local |
 | `fe80::/10` | link-local |
 | `ff00::/8` | multicast |
+| `2001:db8::/32` | documentation |
 
-NAT64 と 6to4 と Teredo を落としているのは、いずれも IPv6 address の中に IPv4 address を埋め込む仕組みだから。mapped 形式と同じ理由で、変換の解釈に依存する値を通さない。
+上表は `built_in_denied_ranges` の現在の固定値で、host は `IpPolicy::strict` に追加 range だけを渡せる。IPv4-mapped / IPv4-compatible 形式は表の range 判定とは別に `address.to_ipv4().is_some()` で拒否される。range の意味を変更したり、表にない範囲を許可と推測したりせず、変更時は source と fixture を同時に確認する。
 
 ## エラーが解決結果を返さない
 
@@ -125,7 +127,7 @@ test 名が `special_purpose_and_mapped_addresses_are_denied_without_echoing_the
 | `MAX_TOTAL_TIMEOUT` | 60 秒 |
 | connector 接続 timeout | 既定 10 秒 |
 
-`Location` は canonical な HTTPS origin、port 443、userinfo 無し、query 無し、fragment 無しでなければ `RedirectRejected`。percent encoding と path 正規化を含む形も拒否する。この規則は [HTTP fetch authority](../authority-core/http-fetch-authorities.md) の `CanonicalUrlPath` と同じで、redirect 先も authority と同じ土俵に載せてから照合する。
+`Location` は HTTPS、port 443（省略可）、userinfo 無し、query 無し、fragment 無しで、empty / percent encoding / backslash / ASCII control を含まない値でなければ `RedirectRejected`。`Url::join` で現在 target から解決した path を `CanonicalUrlPath` に通し、redirect 先も authority と同じ土俵に載せてから照合する。相対 path はこの join を通るが、canonical path validator が拒否する別表記は受理しない。
 
 照合に通ってから DNS を再解決する。`redirect_outside_authority_is_rejected_before_second_connector_call` が確認しているのは順序で、authority 外の redirect では connector を 2 回目に呼ばない。DNS rebinding は `redirect_re_resolves_and_rejects_dns_rebinding_to_private_address` が扱う。
 

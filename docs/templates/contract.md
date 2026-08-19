@@ -6,7 +6,7 @@
 
 > **対象読者:** <この trait / wire format を実装する人、その境界のレビュー担当者>
 
-このページは [`crates/<crate>/src/<module>.rs`](../../crates/<crate>/src/<module>.rs) が要求する <trait 群 / メッセージ形式> の義務を定める。設計上の理由は <対応する概念ページ> を参照する。
+このページは [`crates/<crate>/src/<module>.rs`](../../crates/<crate>/src/<module>.rs) が要求する <trait 群 / メッセージ形式> の義務を定める。設計上の理由は <対応する概念ページ> を参照する。実機 gate の成立や外部 provider の成功はこの契約から導かれない。
 
 ## <trait 名 / メッセージ名>
 
@@ -47,4 +47,3 @@ stateDiagram-v2
 - [<対応する概念ページ>](.md)
 - [<検証対応表>](verification.md)
 - [用語集](../glossary.md)
-

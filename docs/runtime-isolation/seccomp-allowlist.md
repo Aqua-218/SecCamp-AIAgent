@@ -6,7 +6,7 @@
 
 > **対象読者:** allowlist を変更する実装者、syscall 境界のレビュー担当者
 
-[`syscall.rs`](../../crates/runtime-isolation/src/syscall.rs) の `Syscall` は 100 種類以上の variant を持つ enum で、そのうち allowlist に入れられるのは 41 個だけ。残りは列挙されているが、`SeccompPolicy::new` が受け取ると必ず `ForbiddenSyscall` を返す。
+[`syscall.rs`](../../crates/runtime-isolation/src/syscall.rs) の `Syscall` は 100 種類以上の variant を持つ enum で、危険な variant は `is_forbidden()` により allowlist へ入れられない。既定の `SeccompPolicy::conservative()` は x86_64 で 55 個の syscall を列挙し、aarch64 では番号を持つ 48 個へ絞り込む。`SeccompPolicy::new` はこの集合から任意の非空 subset を受け付けるが、forbidden variant は必ず `ForbiddenSyscall` を返す。
 
 なぜ「禁止するもの」をわざわざ enum に載せているのか、という話から始める。
 
@@ -57,13 +57,13 @@ flowchart LR
 
 `clone` / `fork` を閉じているので workload は単一プロセスになる。`wait4` は許可しているが、これは exec 前の init 側で使う想定。
 
-## 許可している 41 個
+## 既定の 55 個（x86_64）
 
-`SeccompPolicy::conservative()` が返す既定の allowlist が、そのまま許可可能な全集合になっている。動的リンクされた通常の workload が起動して file を読み書きし、終了するまでに必要な最小限。
+`SeccompPolicy::conservative()` が返す既定の allowlist は、動的リンクされた通常の workload が起動して file を読み書きし、終了するまでに必要な最小限を列挙する。x86_64 では 55 個すべてが残り、aarch64 では legacy path-only syscall の番号が無いため 48 個になる。
 
-内訳は、file I/O（`read`, `write`, `pread64`, `pwrite64`, `close`, `openat`, `getdents64`）、metadata（`fstat`, `newfstatat`, `statx`, `fchmod`, `ftruncate`）、directory 操作（`mkdirat`, `unlinkat`, `renameat`, `readlinkat`, `chdir`, `getcwd`）、memory（`mmap`, `mprotect`, `munmap`, `madvise`, `brk`）、signal（`rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`）、exec と終了（`execve`, `execveat`, `wait4`, `exit`, `exit_group`）、実行時に libc が必ず呼ぶもの（`futex`, `sched_yield`, `clock_gettime`, `getpid`, `getrandom`, `set_robust_list`, `set_tid_address`, `rseq`, `prlimit64`, `arch_prctl`）。
+内訳は、file I/O（`read`, `write`, `pread64`, `pwrite64`, `close`, `openat`, `getdents64`）、metadata（`fstat`, `newfstatat`, `statx`, `fchmod`, `ftruncate`）、directory 操作（`mkdir`, `mkdirat`, `unlink`, `unlinkat`, `rmdir`, `rename`, `renameat`, `linkat`, `symlink`, `symlinkat`, `readlink`, `readlinkat`, `chdir`, `getcwd`）、memory（`mmap`, `mprotect`, `munmap`, `madvise`, `brk`）、signal（`rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`）、exec と終了（`execve`, `execveat`, `wait4`, `exit`, `exit_group`）、実行時に libc が使うもの（`futex`, `sched_yield`, `clock_gettime`, `getpid`, `gettid`, `sched_getaffinity`, `sigaltstack`, `getrandom`, `set_robust_list`, `set_tid_address`, `rseq`, `prlimit64`, `arch_prctl`）である。
 
-path を取る syscall は `*at` 系だけを許可している。`open` や `stat` のような path 直接指定版は入っていない。fd 相対に統一しておくと、Landlock と組み合わせたときの解決基準が揃う。
+path を取る syscall は `*at` 系だけではない。x86_64 では `mkdir`、`unlink`、`rmdir`、`rename`、`symlink`、`readlink`、`chmod` という legacy path syscall も既定 allowlist に含まれる。一方、aarch64 の `number()` はこれらの legacy 番号を返さず、対応する `*at` 系を残す。path の許可は syscall の種類だけを示し、実際の path 境界は Landlock が担う。
 
 ## 空の allowlist を拒否する
 
@@ -81,17 +81,17 @@ default-deny なので、空 allowlist は「全 syscall を拒否」を意味�
 
 ## architecture 依存を隠さない
 
-`Syscall::number()` は x86_64 でだけ実数を返し、他の arch では `_ = self; None` を返す。
+`Syscall::number()` は x86_64 と aarch64 で実数を返し、その他の arch では `_ = self; None` を返す。
 
 ```rust
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) const fn number(self) -> Option<i32> {
     let _ = self;
     None
 }
 ```
 
-`validate_for_platform()` が allowlist 内の全 syscall について `number()` を確認するので、x86_64 以外では必ず `UnsupportedSyscall` で止まる。「番号が分からないので素通しする」という経路は無い。
+`validate_for_platform()` が allowlist 内の全 syscall について `number()` を確認するので、x86_64 と aarch64 以外では必ず `UnsupportedSyscall` で止まる。「番号が分からないので素通しする」という経路は無い。Linux BPF の architecture check も x86_64 と aarch64 の audit architecture を明示し、それ以外の target は filter compile を拒否する。
 
 生成する BPF filter には arch check が入る。想定外の arch で呼ばれた場合、filter は `EPERM` ではなく process kill を返す。x32 ABI のように同じ番号が別の syscall を指す環境で、番号だけ見て許可してしまうのを防ぐため。
 
@@ -106,13 +106,13 @@ allowlist を広げようとしたとき、危険なものは compile ではな�
 この module が保証するのは、`SeccompPolicy` を構築できた時点で、allowlist に禁止 syscall が含まれず、全要素がこの arch で番号に解決できることだけ。
 
 - 生成された BPF filter が kernel で意図どおり動くことは検証していない。`LinuxBackend` の seccomp 適用は特権環境が要る。
-- 許可した 41 個の組み合わせが安全であることは主張していない。`mmap` + `mprotect` で W^X を破る、`openat` で意図しない path に到達する、といった話はここでは扱わない。後者は [Landlock envelope](landlock-envelope.md) の担当。
+- 許可した 55 個（aarch64 では 48 個）の組み合わせが安全であることは主張していない。`mmap` + `mprotect` で W^X を破る、path syscall で意図しない tree に到達する、といった話はここでは扱わない。後者は [Landlock envelope](landlock-envelope.md) の担当。
 - syscall 番号の正しさは手で書いた表に依存する。x86_64 の番号を機械的に検証する仕組みは無い。
 - vDSO 経由で呼ばれる `clock_gettime` は syscall 境界を通らないことがある。filter があってもなくても動く場合がある。
 
 ## 変更時の確認点
 
-- `Syscall` に variant を足すときは、enum、`is_forbidden()`、`FromStr` の match（許可側か `parse_forbidden_syscall` のどちらか）、x86_64 の `number()` を同時に直す。`number()` を忘れると `validate_for_platform` が落ちるので、許可側に足した場合は気付ける。**禁止側に足した場合は `number()` 不要**。
+- `Syscall` に variant を足すときは、enum、`is_forbidden()`、`FromStr` の match（許可側か `parse_forbidden_syscall` のどちらか）、x86_64 / aarch64 の `number()` を同時に直す。`number()` を忘れると `validate_for_platform` が落ちるので、許可側に足した場合は気付ける。**禁止側に足した場合は `number()` 不要**。
 - 許可 syscall を増やすときは、[隔離基盤の設計](../design/runtime-isolation.md)の脅威モデルに照らして、その syscall で越えられる境界が無いかを見る。特に path を取るもの、fd を作るもの、他プロセスを参照するもの。
 - `conservative()` を変えると既定の挙動が変わる。ここは「動く最小限」であって「推奨構成」ではない。
 - arch を増やすときは `number()` の `cfg` 分岐と、BPF filter の arch check の両方を足す。片方だけだと、番号は解決できるが filter が kill する状態になる。

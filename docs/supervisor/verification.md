@@ -38,9 +38,14 @@ control socket は実 socket に対して確認する。
 | accept が kernel の `SO_PEERCRED` から identity を作り、listener の subject へ解決する | `accept_binds_the_listening_subject_from_the_kernel_credential` |
 | 4 KiB を超える datagram を decode 前に拒否する | `oversized_datagram_is_rejected_without_decoding` |
 | 受理した socket ID が単調で、release 後に解決不能になる | `accepted_socket_identities_are_not_reused_across_connections` |
+| resolver を共有する subject listener 間でも socket ID を非再利用にする | `accepted_socket_identities_are_global_across_subject_listeners` |
 | 未 bind の socket ID と、subject の credential と違う peer を拒否する | `resolution_fails_closed_for_unbound_and_foreign_credentials` |
+| duplicate bind 後も accepted socket を解放し listener を継続する | `resolver_rebind_failure_drops_accepted_socket_and_listener_remains_usable` |
 | 相対 path と root path を bind しない | `listener_rejects_paths_it_cannot_own` |
+| backlog を `1..=128` に、receive/send timeout を 300 秒以下に bounded する | `listener_rejects_zero_negative_and_excessive_backlogs`, `listener_rejects_zero_and_excessive_timeouts_before_socket_creation` |
+| idle receive と blocked send の deadline を typed error にする | `idle_peer_receive_timeout_is_typed_and_bounded`, `blocked_peer_send_timeout_is_typed_and_bounded` |
 | bind 直後の socket node が mode 0600 である | `bound_socket_is_owner_only` |
+| reply を一つの bounded datagram として送る | `a_reply_reaches_the_peer_as_one_bounded_datagram` |
 | unlink に失敗した control socket の token を保持し、stale node の除去を retry できる | `control_socket_cleanup_retains_token_until_stale_node_is_removed` |
 
 実 Linux resource は実 cgroup v2 と実 process に対して確認する。

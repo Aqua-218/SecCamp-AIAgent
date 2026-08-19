@@ -133,7 +133,7 @@ leaf window ⊆ root window
 - 比較する値を同じ session-local monotonic clock から供給する。
 - request の実行直前に現在時刻を取得して認可へ渡す。
 - VM セッションを跨いで Capability や tick を再利用しない。
-- revoke と effect commit の競合では、[Authorization guard](authorization-guard.md)へ実行直前の時刻を渡し、線形化点まで shared guard を保持する。
+- revoke と effect execution の競合では、[Authorization guard](authorization-guard.md)へ実行直前の時刻を渡し、線形化点まで shared guard を保持する。
 
 この証明は clock source や scheduler の実装を証明するものではない。与えられた単調 tick と有効な `TimeWindow` に対する membership と containment の正しさを証明する。
 

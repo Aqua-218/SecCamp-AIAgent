@@ -1,11 +1,15 @@
 schema: verification-status/v1
 
-# This is an inventory of claims, not a green-list of tests. A claim is
+# This is an inventory of claims, not a green-list of tests. It is intentionally
+# not a CI run log: timestamps, run IDs, and artifact URLs live in the gate's
+# execution evidence, not in this repository-owned manifest. A claim is
 # "verified" only after its gate command has run in the declared scope and the
 # gate reports a required result. "unverified" means that the boundary is
 # known but the repository has not established it yet. "blocked" means that
 # the boundary cannot currently be exercised because a named prerequisite or
 # external owner is unavailable. Both states are intentionally machine-visible.
+# A verified claim never widens its declared scope to a neighboring runner,
+# architecture, provider, syscall space, or scheduler interleaving.
 claims:
   - id: authority-core-hosted
     component: authority-core

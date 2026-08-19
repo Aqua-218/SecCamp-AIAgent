@@ -15,6 +15,55 @@ polkit rule accepts only start/stop of a 32-lowercase-hex worker instance and st
 recovery instance. A failed worker remains a visible systemd tombstone, but the controller releases
 ownership only after its exact stop transaction and recovery instance succeed.
 
+## 現行構成の境界（日本語）
+
+現行の multi-session 配置は、caller、controller、worker の三つの権限境界を持つ。
+
+```mermaid
+flowchart LR
+    c["host-control\nhost-control group"] -->|固定 start/stop frame| s(("/run/host-controld/control.sock"))
+    s --> d["host-controld\nSO_PEERCRED / HMAC / quota"]
+    d --> j[("control.journal\nReserved -> Active -> Closed")]
+    d --> u["固定 systemd operation"]
+    u --> w["host-sessiond@<ID>.service\n1 session / 1 microVM"]
+    u --> r["host-sessiond-recover@<ID>.service"]
+```
+
+caller の UID は kernel が返す `SO_PEERCRED` から `PrincipalId` へ導出される。socket の group
+membership や wire 上の claim だけで caller を指定することはできない。control frame は bounded
+な start/stop だけで、program、unit 名、path、systemd property、guest credential、任意 host
+command を受け付けない。controller の HMAC key は host-only であり、guest へ渡さない。
+
+`host-controld` は `control.journal` の lock を一つだけ保持する。worker 起動前に `Reserved`、
+起動確認後に `Active`、exact stop と recovery の完了後だけ `Closed` を durable にする。restart
+時に未完了 worker が一つでも残っていれば、全ての exact cleanup が証明されるまで新規 admission
+を止める。controller journal、worker 内の recovery journal、7 identity を保持する ledger は
+別の耐久境界であり、一つを削除して別の状態を進めてはならない。
+
+`host-sessiond@.service` は一つの session だけを所有し、`host-sessiond-recover@.service` は
+同じ instance の crash cleanup 専用である。systemd の `failed` state は clean close ではなく、
+worker stop と recovery unit の両方が成功してから ownership を解放する。unit は fixed template、
+fixed CLI、polkit の閉じた verb 集合、worker instance の scoped state/runtime path を使う。
+
+配置時の確認事項は次の通りである。
+
+- binary、unit、polkit、udev、environment は reviewed commit と外部認証済み digest manifest
+  から install する。checkout の値を期待 digest の source にしない。
+- `/etc/host-controld/control.key` は exact 32 byte、owner `host-controld`、group
+  `host-control`、mode `0440` とする。journal と lock は owner-only、socket parent と各
+  instance root は group/other writable にしない。
+- `HOST_SESSIOND_*_ROOT` / `*_BASE` は instance ID ごとの path separation を保つ。legacy の
+  `host-sessiond.env.example` と worker template の environment を混ぜない。
+- `host-sessiond` は KVM/vsock/device-mapper/loop/cgroup の bounded envelope だけを受ける。
+  device-mapper と loop の class-wide access は動的 minor のためであり、worker/Firecracker
+  TCB 侵害後の worker 間 containment は保証しない。
+- controller、journal、recovery file、Broker WAL、mapper、jail、cgroup を手動削除しない。
+  cleanup を証明できないときは fail closed で停止し、root での破壊的な回収を通常運用にしない。
+
+legacy の `service/host-sessiond.service` は single-session owner の経路であり、multi-session
+control socket API ではない。legacy unit と multi-session template を同一 instance root や
+同じ mutable environment に向けない。
+
 ## Production multi-session installation
 
 Build and install all three binaries only from an externally authenticated, reviewed full commit

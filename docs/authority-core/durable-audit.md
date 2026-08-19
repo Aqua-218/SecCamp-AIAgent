@@ -85,6 +85,8 @@ attempt A の provider token を attempt B の commit の証拠として綴じ�
 | `CHECKSUM_LEN` | `8`（FNV-1a、自身は対象外） |
 | `MAX_RECORD_PAYLOAD` | 8 MiB |
 | `MAX_JOURNAL_BYTES` | 128 MiB |
+| `MAX_COMMIT_RECEIPT_BYTES` | 64 KiB |
+| `MAX_COMMIT_UNKNOWN_EVIDENCE_BYTES` | 64 KiB |
 
 magic が file 単位ではなく frame 単位なので、**空 file は妥当な空 journal になる。**
 
@@ -125,7 +127,7 @@ crash 後に「分からない」を「分からない」として読める。�
 - 部分 frame を自動で切り詰める処理を足さない。commit 済みの副作用が `Started` に戻る。
 - `validate_finish` の 3 検査を lock の内側へ移さない。現在は lock を取る前に落ちるので、失敗が journal の状態に影響しない。
 - `HEADER_LEN` を変えるときは、inline test が `let sequence_offset = 8 + 2 + 1 + 1;` と layout を hard-code している箇所も直す。
-- `MAX_JOURNAL_BYTES` を append 時にも検査するようにする場合、超えたときの挙動を決める。現在は「開けなくなる」だけで、稼働中に気付く手段が無い。
+- `MAX_JOURNAL_BYTES` の値や容量エラーの契約を変更する場合は、open 時と append 時の両方、`JournalFull` の fail-closed 挙動、容量境界の test を同時に更新する。
 - FNV-1a を MAC に変えるなら、鍵の管理と、既存 journal の互換性を先に決める。
 
 ## 関連

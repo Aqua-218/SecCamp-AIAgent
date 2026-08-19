@@ -8,7 +8,7 @@
 
 全部を1つの形式手法で証明しようとはしない。純粋関数、状態遷移、並行処理、Linux kernel との接続では、効く道具が違うからである。
 
-この文書の「実装済み」はrepositoryにcode/APIがあること、「mock/contract検証済み」はfake、mock、module test、local contract testの結果である。privileged gateは実Linux syscallとDNS/TLS境界を、KVM gateはproduction `Runtime::launch`、jailer、dm-verity、clean snapshot capture／restore、v2 guest control、guest supervisor/isolation launcher、全13 CapFS effect、guest-to-host Broker、SessionOwner cleanupを通す。live external providerはblockedであり、VM escape耐性とhost kernel／hypervisor自体はTCBなので、VM境界全体を完全と判定しない。
+この文書の「実装済み」はrepositoryにcode/APIがあること、「mock/contract検証済み」はfake、mock、module test、local contract testの結果である。privileged gateは実Linux syscallとDNS/TLS境界を、KVM gateはproduction `Runtime::launch`、jailer、dm-verity、clean snapshot capture／restore、v2 guest control、guest supervisor/isolation launcher、全13 CapFS effect、guest-to-host Broker、SessionOwner cleanupを対象にする。個別の実行結果と scope は [検証ステータス manifest](../verification-status.md) に記録する。live external providerはblockedであり、VM escape耐性とhost kernel／hypervisor自体はTCBなので、VM境界全体を完全と判定しない。
 
 ## どの道具を、どこに当てるか
 
@@ -52,7 +52,7 @@ flowchart LR
 | revoke / commit | loom | 小さく切った model 内の全 interleaving | bounded model は検証済み、実 adapter は未検証 |
 | FUSE operation | 実 mount + KVM guest統合テスト | syscall が正しいeffectへ変換されること | host実FUSE 22件とKVM guestで全13 effectを確認。全kernel interleavingの証明ではない |
 | namespace race | loom + stress test | rename、unlink、open handle の競合 | 限定的 test、全 interleaving は未検証 |
-| link 対応 | 実 mount の攻撃テスト | 解決後 path での認可、root 脱出の拒否、rename 後の再解決、alias を持つ inode の全名前認可 | 深い chain と cycle（kernel の `ELOOP` に委譲）、体系的な backing 差し替え |
+| link 対応 | 実 mount の攻撃テスト | 解決後 path での認可、root 脱出の拒否、rename 後の再解決、alias を持つ inode の全名前認可、bounded な backing 差し替え拒否 | 深い chain と cycle（kernel の `ELOOP` に委譲）、無制限の race と全 topology |
 | SSRF | resolver / redirect test + 実HTTPS gate | 非公開宛先と rebinding の拒否 | fake境界に加えsystem DNS、TLS/SNI、address pin、rebindingを実socketで確認 |
 | Host Egress Broker | module/contract test + 実HTTPS／KVM test | frame、replay、budget、typed dispatch、公開 HTTPS、GitHub plan | 公開HTTPSとguest-to-host canonical rejectionは実機確認、operator資格情報を要するlive GitHubだけblocked |
 | runtime isolation | mock backend + privileged／KVM probe | ordered apply/rollback、policy validation、実kernelのnamespace/seccomp/Landlock/rootfs/device/fd/capability境界 | staged rootfsのdirect applyとproduction launcher post-exec、実rollback、KVM guestの`rootfs.source == "/"`を確認 |
@@ -77,7 +77,7 @@ backing repositoryのcontract testは実directory treeに対して、root fdの�
 
 subject-local node table の contract test は、root nodeの固定、同一objectへの反復LOOKUP、READDIR用の非加算live-node参照、最終FORGET後のnodeid非再利用、stale nodeと過剰FORGETの拒否、mount間の数値identity分離、32 threadの同時LOOKUPを検査する。module testはnode sequenceとlookup countの最終値・枯渇、writer panic後のfail closedを検査する。これはmemory内tableの並行性であり、kernelが発行する実FORGETやmount teardownを含むFUSE統合testではない。詳しい境界は[mount ごとの node table](../capfs/node-tables.md)を参照する。
 
-Direct-I/O FUSE adapterのmodule testは、許可範囲と祖先だけのmetadata visibility、backingとCapabilityのrepository identity不一致、namespace／Authorityのfile・directory handle対応、全13 `FileEffect`、generation付きdirectory offset cookie、revoke後再認可、malformed FORGET後のfail closedを検査する。Linux統合testは実際にFUSEへmountし、全effect、link、nested mount、backing replacement、mutation／revokeのbounded raceまで22件を実行する。KVM SessionOwner gateは同じ全effectをguest isolation内で実行する。実kernelのFORGET全lifecycle、無制限race、全scheduler interleavingは有限テストによる完全証明の範囲外である。詳しい境界は[Direct-I/O FUSE adapter](../capfs/read-only-fuse.md)を参照する。
+FUSE adapterのmodule testは、許可範囲と祖先だけのmetadata visibility、backingとCapabilityのrepository identity不一致、namespace／Authorityのfile・directory handle対応、全13 `FileEffect`、generation付きdirectory offset cookie、revoke後再認可、malformed FORGET後のfail closedを検査する。Linux統合testは実際にFUSEへmountし、全effect、link、nested mount、backing replacement、mutation／revokeのbounded raceまで22件を実行する。KVM SessionOwner gateは同じ全effectをguest isolation内で実行する。実kernelのFORGET全lifecycle、無制限race、全scheduler interleavingは有限テストによる完全証明の範囲外である。read-only handle の cache invalidation と writable handle の `FOPEN_DIRECT_IO` は異なる I/O mode である。詳しい境界は[FUSE adapter](../capfs/read-only-fuse.md)を参照する。
 
 ## Cycle 2 adapter の検証境界
 
@@ -169,3 +169,4 @@ TLA+ は使わない。分散 revoke、複数ホスト間の Capability 移送�
 - [Firecracker runtime](../firecracker-runtime/README.md)
 - [Supervisor adapter](../supervisor/README.md)
 - [Session orchestrator](../session-orchestrator/README.md)
+- [検証ステータス manifest](../verification-status.md)

@@ -44,7 +44,7 @@ flowchart TB
 <!-- doc-type: concept -->
 ```
 
-有効な値は `concept`（型A）、`contract`（型B）、`verification`（型C）、`decision`（型D）、`design`（型S）、`index`（型I）、`exempt`（このページや[用語集](glossary.md)のような、どの型にも属さない横断文書）。
+有効な値は `concept`（型A）、`contract`（型B）、`verification`（型C）、`decision`（型D）、`design`（型S）、`index`（型I）、`localized`（型L）、`exempt`（このページや[用語集](glossary.md)のような、どの型にも属さない横断文書）。
 
 ### 見出しの直後にパンくずを置く
 
@@ -78,6 +78,32 @@ rename 中でも各 object の現在 path を一意に決める仕組みを説�
 ### 末尾に `## 関連` を置く
 
 同じ crate の兄弟ページ、対応する設計ページ、関連する ADR を並べる。行き止まりのページを作らない。
+
+## 型L: 多言語ハブ（localized）
+
+多言語文書の親入口は [`docs/i18n/README.md`](i18n/README.md)、locale ごとの入口は `docs/i18n/<locale>/README.md` とする。root の [`README.md`](../README.md) は英語の翻訳元であり、`README-<locale>.md` はその全文翻訳である。詳細技術文書の正本は `docs/` 直下の各 canonical file で、現時点では日本語本文が多い。locale ごとのハブは詳細ページを機械的に翻訳した一覧ではなく、その言語で読める入口と、正本・対応ページの関係を示す。未翻訳のページを翻訳済みとして数えない。
+
+型Lの先頭には doc-type、locale、canonical の 3 marker をこの順序で置く。
+
+```markdown
+<!-- doc-type: localized -->
+<!-- locale: ja -->
+<!-- canonical: docs/README.md -->
+
+# 日本語の文書入口
+
+[ドキュメント一覧](../../README.md) / 多言語 / ja
+```
+
+`<locale>` はディレクトリ名と同じ BCP 47 形式の値を使う。3 行目の `canonical` marker は `docs/README.md` に固定し、翻訳ページが参照する共通の文書入口を示す。H1 の直後にはパンくず、対象読者、ハブの役割を置き、本文には次の言語ナビゲーションを必ず含める。
+
+| locale | ハブ | 原文・対応ページ |
+|---|---|---|
+| `ja` | `docs/i18n/ja/README.md` | 実在する対応ページへの相対リンク |
+
+言語ナビゲーションは存在するハブまたは詳細ページだけを指す。リンク先がない言語名を先に掲げない。原文が未確定の場合は「原文未確定」と明記し、リンクを捏造しない。型Lにも通常の `## 関連` を置き、少なくとも[ドキュメント一覧](README.md)、[文書規約](document-conventions.md)、同じ locale のハブまたは対応する原文ページへ戻れるようにする。
+
+型Lを追加・変更するときは、`docs/README.md` の多言語ハブ導線、locale marker、言語ナビゲーション、相互リンクを同じ変更で確認する。翻訳の網羅性や意味の同値性は `check-docs.sh` の構造検査では保証しない。
 
 ## 型A: 概念ページ（explanation）
 
@@ -207,18 +233,18 @@ rename 中でも各 object の現在 path を一意に決める仕組みを説�
 
 **目安は `src` の主要 module ごとに 1 ページ。** module が持つ不変条件を 1 ページで説明できないなら、その module が大きすぎるか、ページが足りない。
 
-現状の乖離は次のとおりである。この表は書き直しの作業リストでもある。
+行数は実装の追加、生成コード、test fixture の移動で頻繁に変わるため、文書の保証値として固定しない。現在の文書集合は次の入口と検証ページを持つ。詳細ページの不足を検出する作業では、`find docs/<crate> -maxdepth 1 -name '*.md'` と各 README の文書一覧を使い、行数ではなく module の不変条件と verification claim の対応を確認する。
 
-| crate | コード行数 | 現在の doc 行数 | 判定 |
-|---|---:|---:|---|
-| `authority-core` | 10,558 | 2,679 | 基準を満たす |
-| `capfs` | 10,810 | 756 | 概念ページの追加が必要 |
-| `session-orchestrator` | 6,379 | 192 | 分割が必要 |
-| `firecracker-runtime` | 4,028 | 56 | 全面的に不足 |
-| `egress-broker` | 3,852 | 182 | `dispatch` の概念ページが無い |
-| `egress-protocol` | 2,957 | 164 | 概念ページの追加が必要 |
-| `runtime-isolation` | 2,753 | 36 | 索引ページが存在しない |
-| `supervisor` | 2,268 | 72 | 分割が必要 |
+| crate | 索引 | 現在の詳細ページの構成 | 検証入口 |
+|---|---|---|---|
+| `authority-core` | あり | authority、state、guard、audit、各 authority family の reference | [`authority-core/verification.md`](authority-core/verification.md) |
+| `capfs` | あり | preflight、namespace、node table、runtime I/O、FUSE adapter、benchmark | [`capfs/verification.md`](capfs/verification.md) |
+| `egress-protocol` | あり | envelope、canonical CBOR、budget | [`egress-protocol/verification.md`](egress-protocol/verification.md) |
+| `egress-broker` | あり | transport、server、dispatch、network policy、GitHub adapter | [`egress-broker/verification.md`](egress-broker/verification.md) |
+| `firecracker-runtime` | あり | artifact、workspace、launch、host isolation、snapshot/identity | [`firecracker-runtime/verification.md`](firecracker-runtime/verification.md) |
+| `runtime-isolation` | あり | apply order、config、Landlock、seccomp | [`runtime-isolation/verification.md`](runtime-isolation/verification.md) |
+| `supervisor` | あり | caller identity、wire、subject、handle lifecycle | [`supervisor/verification.md`](supervisor/verification.md) |
+| `session-orchestrator` | あり | lifecycle、contracts、lease、ledger、recovery、control plane | [`session-orchestrator/verification.md`](session-orchestrator/verification.md) |
 
 ## 書き方
 
@@ -247,6 +273,8 @@ rename 中でも各 object の現在 path を一意に決める仕組みを説�
 | 検査 | 対象の型 |
 |---|---|
 | 1 行目の doc-type marker が有効な値 | 全型 |
+| `localized` 型の 2 行目が `<!-- locale: <locale> -->` である | `localized` |
+| `localized` 型の 3 行目が `<!-- canonical: docs/README.md -->` である | `localized` |
 | H1 が 1 つだけ存在する | 全型 |
 | パンくず行が H1 の直後にある | 全型 |
 | `> **対象読者:**` がある | 全型 |
@@ -261,6 +289,7 @@ rename 中でも各 object の現在 path を一意に決める仕組みを説�
 | MADR の必須節が揃っている | `decision` |
 | 行数が型ごとの下限以上 | `concept`, `contract`, `verification` |
 | 相対リンクの参照先が存在する | 全型 |
+| locale ハブの言語ナビゲーションと原文・対応ページへのリンクが存在する | `localized` |
 
 code fence の中身は検査対象から外す。骨格や例示として fence 内に書いた見出し・リンクが、実体として数えられることはない。`docs/templates/` 配下は骨格そのものなので、検査対象から除外する。
 
@@ -276,6 +305,7 @@ scripts/ci/check-docs.sh docs/capfs/namespace-registry.md
 ## 変更時の確認点
 
 - 型を増減するときは、この規約表、[`scripts/ci/check-docs.sh`](../scripts/ci/check-docs.sh) の型定義、`docs/templates/` の骨格ファイルを同時に更新する。
+- 多言語ハブを追加・移動するときは、`docs/i18n/<locale>/README.md` の先頭 3 行 marker、locale 間の言語ナビゲーション、[`docs/README.md`](README.md) の入口を同時に更新する。正本や翻訳範囲を推測で固定しない。
 - 必須節の名前を変えるときは、全既存文書を一括で追随させてから CI を変える。片方だけ変えると validate stage が全面的に落ちる。
 - crate を追加したら、索引ページと検証ページを最低限作り、[docs/README.md](README.md) の表に追加する。
 - 行数の下限を変えるときは、下限が品質の代理指標にすぎないことを忘れない。下限を満たすためだけの水増しはレビューで落とす。
@@ -288,4 +318,3 @@ scripts/ci/check-docs.sh docs/capfs/namespace-registry.md
 - [設計書](design/README.md)
 - [検証戦略](design/verification.md)
 - [CI/CD operations](ci-cd.md)
-

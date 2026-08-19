@@ -10,6 +10,8 @@
 
 <Proposed | Accepted (YYYY-MM-DD) | Deprecated by [NNNN](NNNN-<slug>.md) | Superseded by [NNNN](NNNN-<slug>.md)>
 
+決定記録は追記のみとする。現在の実装が変わった場合も本文を静かに書き換えず、後継 ADR または実装ページで差分を示す。
+
 ## 背景と課題
 
 <何を決めなければならなかったか。制約は何だったか。ここに解決策を書かない。>
@@ -60,4 +62,3 @@
 - [<実装を説明するページ>](../<crate>/.md)
 - [<関連する ADR>](NNNN-<slug>.md)
 - [用語集](../glossary.md)
-

@@ -30,17 +30,20 @@ test には、mock backend による state machine test、durable ledger を直�
 | request/header/file の capacity hard bound、最大件数ちょうどの実データ commit、malformed header/symlink/non-regular-file fail-closed | `tests/ledger.rs` の実 file test |
 | Linux kernel entropy source からの16 byte読出し、public `new_durable` の all-zero bounded retry/fail-closed | `tests/ledger.rs` の `OsEntropy` / durable orchestrator tests |
 | identity の 32 桁 hex 表現 | 単体 |
+| control socket の UID principal 導出、start/stop frame の exact length、response の closed union | `control_transport` unit test、`host-control` client tests |
 | multi-session start/stop HMAC のaction・principal・request・session binding、zero identity拒否 | `control_plane` unit test |
 | global/per-principal quota、foreign stop、request replay、spawn失敗後のID burn | `control_plane` unit test |
 | append-only control journalのchecksum/sequence/transition、torn-tail回復、full-record破損拒否 | 実fileを使う`control_plane` unit test |
 | controller二重openのkernel lock fencing、再起動時のreserved/active worker cleanup、session ID非再利用 | 実fileとworker factoryを使う`control_plane` unit test |
 | live journalのpath消失・inode/length driftを恒久poisonし、start/stop/poll/shutdown/recoveryのworker effect前に拒否 | 実rename/appendを使う`control_plane` unit test |
 | worker health不能時の即時cleanup、cleanup失敗時のworker保持、任意error文字列を通さないclosed code | `control_plane` unit test |
-| control journalの初期作成 | `create_new`で作成者を原子的に確定し、競合生成・metadata I/O error・dangling symlinkを新規journalとして初期化しない | `journal_creation_rejects_dangling_links_without_initializing_their_target` |
-| GitHub publish-plan manifest | symlinkを含む祖先とhard linkを拒否し、owner-only descriptorからbounded readした前後でinode/size/owner/mode/mtime/ctimeを再照合する | `system_egress` manifest tests |
-| daemon stop file | 不在とmetadata I/O failureを区別し、観測不能ならdependency-order cleanupを実行して非zero終了する | `stop_file_observation_distinguishes_absence_from_io_failure` |
-| 認証済みcontrol socketと特権process分離 | 実systemd、polkit、`SO_PEERCRED`、HMAC、非特権controller、固定unit adapterで2 workerを起動し、worker `SIGKILL`後の強制recoveryとquota解放、controller `SIGKILL`後のrestart reconciliationまで実行 | `scripts/ci/verify-real-systemd-control-plane.sh` |
-| 2つのproduction ownerの同時実行 | 異なるidentity、guest CID、Broker port、cgroup、mapper、jailを持つ2つの実Firecracker VM/Brokerがguest effectのdurable Final後も同時生存し、一方のstop中も他方がhealth pollを通してから独立cleanupする | `scripts/ci/verify-real-concurrent-session-owners.sh` |
+| fixed systemd unit の `active`/`inactive`/`failed` 解釈、failed worker の stop + recovery | `systemd_worker` unit test |
+| recovery intent、7 identity と config fingerprint の照合、単調な cleanup checkpoint | `recovery.rs` と `production_runtime` unit test |
+| control journalの初期作成 | `create_new`で作成者を原子的に確定し、競合生成・metadata I/O error・dangling symlinkを新規journalとして初期化しない。`journal_creation_rejects_dangling_links_without_initializing_their_target` |
+| GitHub publish-plan manifest | symlinkを含む祖先とhard linkを拒否し、owner-only descriptorからbounded readした前後でinode/size/owner/mode/mtime/ctimeを再照合する。`system_egress` manifest tests |
+| daemon stop file | 不在とmetadata I/O failureを区別し、観測不能ならdependency-order cleanupを実行して非zero終了する。`stop_file_observation_distinguishes_absence_from_io_failure` |
+| 認証済みcontrol socketと特権process分離 | 実systemd、polkit、`SO_PEERCRED`、HMAC、非特権controller、固定unit adapterで2 workerを起動し、worker `SIGKILL`後の強制recoveryとquota解放、controller `SIGKILL`後のrestart reconciliationまで実行する。`scripts/ci/verify-real-systemd-control-plane.sh` |
+| 2つのproduction ownerの同時実行 | 異なるidentity、guest CID、Broker port、cgroup、mapper、jailを持つ2つの実Firecracker VM/Brokerがguest effectのdurable Final後も同時生存し、一方のstop中も他方がhealth pollを通してから独立cleanupする。`scripts/ci/verify-real-concurrent-session-owners.sh` |
 | workspace clone、listener 所有、snapshot binding、Firecracker identity 注入、Authority subject の閉包 | production adapter composition test（全境界 fake） |
 | production `SessionOwner` の build → 実 Firecracker snapshot restore → guest readiness → `Continue` poll → stop → `Closed` | `real_production_lifecycle.rs`（実 `Runtime`、jailer、dm-verity、filesystem、AF_VSOCK、durable Broker、guest supervisor。`REAL_SESSION_OWNER_LIFECYCLE=1` の ignored gate） |
 | production process をstartup 7点・cleanup 4点で外部`SIGKILL`し、同じdurable pathから再起動 | `verify-real-session-crash-recovery.sh`。各点で旧cgroup、exact dm-verity bind/mapper、jail/workspaceを限定回収し、fresh identityの新session完走とresidue不在を確認 |
@@ -54,6 +57,7 @@ cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-target
 scripts/ci/check-service-boundaries.sh
 scripts/ci/verify-real-systemd-control-plane.sh
 scripts/ci/verify-real-concurrent-session-owners.sh
+systemd-analyze verify service/host-controld.service service/host-sessiond@.service service/host-sessiond-recover@.service
 ```
 
 `MultiSessionController` は複数workloadを一つのownerへ押し込まず、各sessionを別の
@@ -66,6 +70,10 @@ checksum/transition破損をfail closedにする。open後も各worker effect前
 再検査し、最初の不整合以後は同じcontroller handleを恒久poisonする。
 worker境界のerrorは4個のclosed codeだけで、任意長文字列やcredentialをcontroller logへ運べない。
 health pollが失敗した場合はそのworkerのstopを直ちに試し、cleanup完了だけをjournalへcloseする。
+control socket の client timeout は start 360 秒、stop 660 秒で、これは systemd worker と recovery
+の bounded deadline を含む。`failed` unit は poll 上の clean close ではなく、exact stop/recovery
+経路へ送られる。worker 内の crash recovery は controller journal の `Closed` と独立して
+`DurableSessionRecoveryJournal` の stage を進め、identity ledger の no-reuse を戻さない。
 
 ## 実機 production lifecycle gate
 

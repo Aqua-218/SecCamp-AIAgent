@@ -30,7 +30,7 @@ flowchart TB
         direction TB
         pure["純粋な判定<br/>path / repository / time /<br/>file / http / github / capability"]
         state["state<br/>subject / 発行 / 委譲 / revoke"]
-        kernel["kernel<br/>唯一の並行境界<br/>authorize_and_commit"]
+        kernel["kernel<br/>唯一の並行境界<br/>authorize_and_execute_classified"]
         audit["audit + durable_audit<br/>attempt と effect の記録"]
     end
 
@@ -91,6 +91,7 @@ flowchart LR
         rustGitHub["github.rs<br/>GitHub request / body decision"]
         rustTime["time.rs<br/>validity window"]
         rustCap["capability.rs<br/>envelope / weaker_than"]
+        rustPolicy["policy.rs<br/>canonical root-policy digest"]
         rustHandle["handle.rs<br/>handle / object identity"]
         rustState["state.rs<br/>issue / revoke / lifecycle"]
         rustAudit["audit.rs<br/>attempt / effect records"]
@@ -101,6 +102,7 @@ flowchart LR
         rustHttp -->|"typed HTTP body"| rustCap
         rustGitHub -->|"typed GitHub body"| rustCap
         rustTime -->|"validity"| rustCap
+        rustCap -->|"root policy"| rustPolicy
         rustCap -->|"checked grants"| rustState
         rustHandle -->|"live handles"| rustState
         rustState -->|"synchronized transitions"| rustKernel
@@ -167,18 +169,20 @@ Rust は実際の認可経路から呼ぶ純粋な `bool` 判定を担当する�
 | [`lean/Authority/GitHub.lean`](../../lean/Authority/GitHub.lean) | GitHub request 集合の意味論、matching / containment の健全性・完全性・推移性 | [GitHub authority](github-authorities.md) |
 | [`crates/authority-core/src/capability.rs`](../../crates/authority-core/src/capability.rs) | typed ID、metadata、3種の tagged body、時刻付き matching、`weaker_than`、複合effect用の非空 request set | [Capability](capabilities.md) / [Authorization guard](authorization-guard.md) |
 | [`lean/Authority/Capability.lean`](../../lean/Authority/Capability.lean) | Capability の集合意味論、matching 同値、`weakerThan` の健全性・完全性・推移性 | [Capability](capabilities.md) |
+| [`crates/authority-core/src/policy.rs`](../../crates/authority-core/src/policy.rs) | root authority の versioned canonical encoding と SHA-256 digest、lower-case hex parsing | [Capability](capabilities.md) / [検証とテスト](verification.md) |
 | [`crates/authority-core/src/state.rs`](../../crates/authority-core/src/state.rs) | subject 登録、静的 envelope、root 発行、保持、逐次 Derive、revoke、epoch、lifecycle、handle registry | [Capability state](capability-state.md) / [Subject lifecycle と open handle](subject-lifecycle-and-handles.md) |
 | [`crates/authority-core/tests/capability_state.rs`](../../crates/authority-core/tests/capability_state.rs) | 状態遷移の成功・拒否条件と失敗時の atomicity | [Capability state](capability-state.md) |
 | [`crates/authority-core/tests/capability_state_properties.rs`](../../crates/authority-core/tests/capability_state_properties.rs) | 生成した操作列を独立した参照モデルと比較する stateful property test | [Capability state](capability-state.md) |
 | [`crates/authority-core/src/handle.rs`](../../crates/authority-core/src/handle.rs) | `HandleId`、`ObjectId`、subject-bound `OpenHandle` | [Subject lifecycle と open handle](subject-lifecycle-and-handles.md) |
-| [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs) | attempt journal、terminal outcome、単一/複合requestを含むcommit済み effect snapshot | [Durable audit journal](durable-audit.md) | 2 phase WAL、crash 後の Started、frame 形式、改竄検出の限界 |
-| [Attempt / effect audit](audit-records.md) |
+| [`crates/authority-core/src/audit.rs`](../../crates/authority-core/src/audit.rs) | attempt journal、terminal outcome、単一/複合requestを含むcommit済み effect snapshot | [Attempt / effect audit](audit-records.md) / [Durable audit journal](durable-audit.md)（2 phase WAL、crash 後の Started、frame 形式、改竄検出の限界） |
 | [`crates/authority-core/src/kernel.rs`](../../crates/authority-core/src/kernel.rs) | shared/exclusive guard、active authority inspection、単一/複合effectの最終認可、同期 transition、audit integration | [Authorization guard](authorization-guard.md) / [Attempt / effect audit](audit-records.md) |
 | [`crates/authority-core/tests/authorization_kernel.rs`](../../crates/authority-core/tests/authorization_kernel.rs) | guard 公開 API の成功・拒否・error契約、inspection中のrevoke待機 | [Authorization guard](authorization-guard.md) |
 | [`crates/authority-core/tests/authorization_kernel_loom.rs`](../../crates/authority-core/tests/authorization_kernel_loom.rs) | revoke/commit interleaving と unlocked negative control | [Authorization guard](authorization-guard.md) |
 | [`crates/authority-core/src/lib.rs`](../../crates/authority-core/src/lib.rs) | Rust module の公開と `unsafe` 禁止 | 各 Rust ページ |
 | [`lean/Authority.lean`](../../lean/Authority.lean) | production Lean library の入口 | 各 Lean ページ |
 | [`lean/AuthorityTests.lean`](../../lean/AuthorityTests.lean) | 独立した具体的境界を固定する Lean の executable example | [検証とテスト](verification.md) |
+| [`lean/Authority/Refinement/CapabilityState.lean`](../../lean/Authority/Refinement/CapabilityState.lean) | versioned logical event を `CapabilityState.Steps` へ照合する proof-carrying checker | [検証とテスト](verification.md) |
+| [`lean/Authority/Refinement/Capfs.lean`](../../lean/Authority/Refinement/Capfs.lean) | CapFS の `checkObservation`、`startupDecision`、staged namespace、backing、quarantine、cleanup の failure-aware model | [検証とテスト](verification.md) |
 | [`tests/fixtures/authority-core.tsv`](../../tests/fixtures/authority-core.tsv) | Rust/Lean 共通の入力、期待値、versioned schema | [検証とテスト](verification.md) |
 | [`crates/authority-core/src/bin/authority-corpus.rs`](../../crates/authority-core/src/bin/authority-corpus.rs) | 共通 corpus を Rust の公開 API で評価する runner | [検証とテスト](verification.md) |
 | [`lean/AuthorityCorpus.lean`](../../lean/AuthorityCorpus.lean) | 共通 corpus を Lean の production 判定で評価する test driver | [検証とテスト](verification.md) |
@@ -211,7 +215,7 @@ flowchart LR
 
 実装済みなのは repository identity、repository-relative path、file effect と request、public HTTP fetch、閉じた GitHub operation、単調時刻の有効期間、typed metadata と3種の Capability、matching、`weakerThan` である。Rust 側にはさらに、subject と静的 envelope の登録、root 発行、保持、逐次 Derive、revoke、祖先失効、`auth_epoch`、subject lifecycle、open-handle registry、attempt/effect audit と、effect commit を revoke と線形化する `CapabilityKernel` がある。
 
-`DurableAuditLog` は write-ahead の `Started`、terminal outcome、commit receipt、checksum、reopen 時の replay/truncation 検査を実装している。writer lock は `flock` による排他で、別 process からの二重 writer を実 process を起動する test で確認済みである。既存 journal の recovery も実装済みで、`CapabilityKernel::try_recover_with_durable_audit` が `Started` のまま残った attempt を `CommitUnknown` として durable に閉じ、新しい capability state を別 instance として記録する。外部provider receiptとの照合経路も実装・contract検証済みで、live provider実行だけがcredential不在でblockedである。Supervisor／Broker／Firecracker／CapFS／isolationはKVM SessionOwner gateでend-to-end確認済み。Direct-I/O [`capfs` adapter](../capfs/read-only-fuse.md)はglobal namespace registry、Authority handle registry、実backing syscallを接続し、全13 `FileEffect`をFUSEへ対応付ける。host実mountとKVM guestで全effectを検査するが、全thread scheduleの完全証明は別の境界である。
+`DurableAuditLog` は write-ahead の `Started`、terminal outcome、commit receipt、checksum、reopen 時の replay/truncation 検査を実装している。writer lock は `flock` による排他で、別 process からの二重 writer を実 process を起動する test で確認済みである。既存 journal の recovery も実装済みで、`CapabilityKernel::try_recover_with_durable_audit` が `Started` のまま残った attempt を `CommitUnknown` として durable に閉じ、新しい capability state を別 instance として記録する。`reconcile_unknown_commits` と `CommitReconciler` は照合の記録・遷移を提供し、contract test もあるが、GitHub や公開 HTTPS へ問い合わせる provider 固有 adapter は Authority core の実装範囲外である。Supervisor／Broker／Firecracker／CapFS／isolation の統合 evidence は各 gate と [capfs 検証対応表](../capfs/verification.md)に分けて記録する。Direct-I/O [`capfs` adapter](../capfs/read-only-fuse.md)は global namespace registry、Authority handle registry、実 backing syscall を接続し、全13 `FileEffect`をFUSEへ対応付ける。host実mountとKVM guestの gate は bounded な実環境検査であり、全 thread schedule の完全証明ではない。
 
 150件の共通 corpus を両言語の production 判定へ流す自動差分テストがある。全13 `FileEffect`に加え、HTTP のmethod / host / path / response cap、GitHub のinstallation / repository / operation / base / head を個別に壊す境界を検査し、その後に出力同士も比較する。ただしこれは選んだ具体例についての回帰検査であり、Rust と Lean が全入力で等しいという証明ではない。
 

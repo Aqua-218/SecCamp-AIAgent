@@ -75,7 +75,7 @@ syscall は 1 つも呼ばない。namespace も cgroup も mount も `RuntimeRe
 
 lifecycle、順序、rollback、handle の所有権は `CapabilityKernel`（本物）と `FakeResources`（event log）を使う contract test で検証済み。`CleanupStep::BeginClose` / `FinishClose` の fault-injection retry も unit test で固定している。
 
-production の caller resolver と control socket は [`control_socket.rs`](../../crates/supervisor/src/control_socket.rs) にある。subject ごとの `SOCK_SEQPACKET` listener が `SO_PEERCRED` から `ConnectionIdentity` を組み立て、request bytes を読む前に subject を確定させる。実 socket を使った module test で検証済みである。
+production の caller resolver と control socket は [`control_socket.rs`](../../crates/supervisor/src/control_socket.rs) にある。subject ごとの `SOCK_SEQPACKET` listener が `SO_PEERCRED` から `ConnectionIdentity` を組み立て、request bytes を読む前に subject を確定させる。共有 resolver の socket ID は listener をまたいで単調に進み、close 後も再利用しない。backlog `1..=128`、既定 receive/send timeout 30 秒（上限 300 秒）、同時 binding 4096 件、request 4 KiB、response 64 byte の bounded policy も transport で検査する。実 socket を使った module test で検証済みである。
 
 cgroup、control socket、workload の実 Linux 実装は [`linux_host.rs`](../../crates/supervisor/src/linux_host.rs) の `LinuxHostResources` にある。subject ごとに cgroup v2 leaf を作り、`SOCK_SEQPACKET` の control socket を bind し、workload をその leaf に閉じ込めて起動し、停止時は `cgroup.kill` で subtree ごと落として reap する。capfs の実 mount と unmount は `CapfsRuntimeResources` が持つ。
 

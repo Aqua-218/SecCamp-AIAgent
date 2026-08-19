@@ -48,6 +48,8 @@
 | **effect commit** | 副作用が実際に確定すること。`CommitReceipt` が証拠になる |
 | **commit point** | effect が確定する境界。Capability の read guard はここまで保持する |
 | **fail closed** | 検査や記録が失敗した場合に、許可ではなく拒否へ倒すこと |
+| **`AuthorityPolicyDigest`** | host と guest が同じ authority policy を参照していることを束縛する digest。digest の一致は policy の内容を証明するものではなく、v2 control request と lease の対応を検査するために使う |
+| **revocation barrier** | revoke の完了を guest control ACK、VM 終了、Broker close などの境界と結び、後続の resource reuse を許す前に必要な完了点 |
 
 ## 証明で使う語
 
@@ -79,7 +81,9 @@
 | **`nodeid`** | subject-local な FUSE node identity。path でも `ObjectId` でもない。再利用しない |
 | **node table** | subject ごとの `nodeid -> ObjectId` 対応表 |
 | **open handle** | 開いたままの file / directory。rename と remove を止める根拠になる |
-| **Direct-I/O** | page cache を経由させない FUSE 動作。revoke 後の読み出しが cache を迂回しないようにする |
+| **Direct-I/O** | FUSE handle に `FOPEN_DIRECT_IO` を付け、page cache を経由させない I/O mode。現在の `capfs` では writable handle にだけ使い、read-only handle は page cache と同期的な revoke invalidation を使う。全操作が direct であることを意味しない |
+| **cache-aware FUSE adapter** | read-only handle の page cache を利用しつつ、`RevocationObserver` が revoke completion 前に cached inode/page を無効化する `capfs` の実装方式 |
+| **`ExternalAliasPolicy`** | backing repository の外にも名前を持つ inode の扱い。既定の `Materialize` は上限内で repository 内へ内容を複製し、`Reject` は repository 全体を拒否する |
 | **startup import** | 初期 manifest を registry へ原子的に取り込む処理 |
 
 ## Broker と egress
@@ -124,7 +128,19 @@
 | **実 mount 上で検証済み** | 実際の FUSE mount を伴う test で確認した |
 | **model 検査済み** | loom などで並行実行の順序を網羅探索した |
 | **証明済み** | Lean の定理として証明した。Rust バイナリを直接証明したという意味ではない |
-| **未検証** | この repository の test では実行していない |
+| **`verified`** | `verification-status.yml` の宣言 scope で required gate が成功し、その scope の evidence が記録された状態。別 scope、別 runner、未列挙の入力空間まで含めない |
+| **`unverified`** | 境界は既知だが、宣言した scope の required evidence がまだ揃っていない状態 |
+| **`blocked`** | credential、特権 runner、別アーキテクチャ、独立 reviewer など、名前付き prerequisite または外部 owner が不足して gate を実行できない状態 |
+| **evidence** | gate の実行を再現・追跡する command、source、test の組。manifest の checker は evidence command を実行しない |
+| **未検証の境界** | この repository の test、gate、または declared evidence が対象にしていない範囲。`verified` の隣接範囲を自動的に含めない |
+
+## 多言語文書で使う語
+
+| 語 | 定義 |
+|---|---|
+| **localized** | `docs/i18n/<locale>/README.md` の型。先頭 marker と locale marker を持つ言語別の入口であり、翻訳の完全性や正本の言語を意味しない |
+| **locale hub** | 一つの locale の詳細ページ、対応する原文、他 locale への言語ナビゲーションを集約する README |
+| **canonical source** | ある記述の意味を照合する source code または原文ページ。i18n 監査で言語ごとの対応を確認するまでは、英語正本と同義に扱わない |
 
 ## 関連
 

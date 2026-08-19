@@ -6,7 +6,7 @@
 
 > **対象読者:** listener を組み込む実装者、guest への情報流出をレビューする人
 
-[`server.rs`](../../crates/egress-broker/src/server.rs) は accept した 1 本の `AF_VSOCK` stream（または Firecracker が転送した host Unix stream）を、`max_requests` 回の request / response 往復として処理する。dispatch そのものは [dispatch.rs](dispatch.md) が持つ。
+[`server.rs`](../../crates/egress-broker/src/server.rs) は accept した 1 本の `AF_VSOCK` stream（または Firecracker が転送した host Unix stream）を、`max_requests` 回の request / logical response 往復として処理する。1 logical response は通常 1 frame だが、1 MiB を超える public response は canonical chunk frame 列になる。dispatch そのものは [dispatch.rs](dispatch.md) が持つ。
 
 ## peer CID を kernel から取る
 
@@ -31,18 +31,22 @@ flowchart TB
     rd --> ctx["clock を読んで<br/>DispatchContext を作り直す"]
     ctx --> disp["dispatch_request"]
     disp --> wire["response_to_wire<br/>内側の error を捨てる"]
-    wire --> enc["encode → ControlFrame::new<br/>1 MiB を再検査"]
-    enc --> wr["write_frame"]
+    wire --> enc{"encode が 1 MiB 以下?"}
+    enc -->|yes| one["ControlFrame::new → write_frame"]
+    enc -->|no| chunks["encoded_chunk_iter<br/>canonical chunk 列"]
+    chunks --> many["各 chunk を ControlFrame::new<br/>→ write_frame"]
+    one --> wr["response sequence 完了"]
+    many --> wr
     wr --> ai{"AccountingInvariant か<br/>CommittedButUnrecorded?"}
     ai -->|yes| close["応答は書いて切断"]
     ai -->|no| loop
 ```
 
-## 1 request につき必ず 1 response
+## 1 request につき必ず 1 logical response
 
-loop の中で `dispatch_request` を呼び、必ず 1 本の `write_frame` を行う。dispatch したが書かない経路も、2 回書く経路も無い。
+loop の中で `dispatch_request` を呼び、必ず 1 logical response を書く。response が 1 MiB 以下なら 1 本の `write_frame`、それを超える public response なら `encoded_chunk_iter` が返す canonical chunk ごとに 1 本の `write_frame` を行う。dispatch したのに response sequence を書かない経路も、同じ logical response を余分に書く経路も無い。
 
-transport 層に message ID の対応付けが無いので、ここがずれると request N の応答が N+1 のものとして届く。request identity は CBOR body の中にあるので、guest は decode するまで気付けない。
+transport 層に message ID の対応付けが無いので、logical response sequence がずれると request N の応答が N+1 のものとして届く。request identity は canonical response / chunk body の中にあり、guest client は decode と reassembly の時点で request binding を検査する。
 
 `max_requests` は `NonZeroUsize`。0 を表現できないので、「accept して 1 度も読まずに成功を返す」経路が型として存在しない。production の値はこの crate では決めず、[session-orchestrator](../session-orchestrator/README.md) が選ぶ。
 
@@ -82,11 +86,11 @@ framing、dispatch、encode、write のどれが失敗しても、`?` で return
 
 部分的な `write_all` や切り詰められた payload read の後に次の `read_frame` を行うと、message の途中の byte を length prefix として読む。**次の frame 境界を guest が選べる状態**になり、canonical CBOR 層に対する decoder confusion の道具になる。
 
-## 応答も 1 MiB を超えない
+## 各 response frame は 1 MiB、logical response は bounded chunk 列
 
-`response_to_wire` → `encode` → `ControlFrame::new` の 3 段で、いずれも size を見る。`CanonicalBrokerResponse::encode` 自身も `MAX_CONTROL_FRAME_BYTES` を再検査する。
+`response_to_wire` → `encode` → `ControlFrame::new` の 3 段で、単一 response の size を見る。`CanonicalBrokerResponse::encode` が `PayloadTooLarge` を返したときは、server は `encoded_chunk_iter` へ切り替え、各 canonical chunk を `ControlFrame::new` で再検査して順番に書く。chunk の byte 列は request ID、index/count、total length、complete response digest に束縛される。
 
-guest 側の `FramedTransport::read_frame` は 1 MiB 超の prefix を拒否するので、超える応答を書くと guest は desync するか無制限の確保を強いられる。
+guest 側の `FramedTransport::read_frame` は各 frame の 1 MiB 超 prefix を拒否するので、server が chunk 化せずに大きな応答を書く経路は持たない。guest 側の [`GuestBrokerClient`](../egress-protocol/README.md) は bounded chunk 数、順序、digest、最終 response schema を再検査する。
 
 ## 何が助かるのか
 
@@ -98,7 +102,7 @@ connection 単位の責務が 1 関数に収まっている。何回読むか、
 
 - direct kernel `AF_VSOCK` の bind / accept は未検証。module test は in-memory の stream を使うが、repository の opt-in KVM test は Firecracker が転送する Unix stream を使い、実 `BrokerDispatcher` の 1 request / 1 canonical rejection を確認する。
 - peer CID の照合は `accept_peer` が返す値に依存する。kernel から正しく取れることは、この crate では確認していない。
-- `ConnectionReport` は `requests_served` と `accounting_invariant_closed` を返すが、これを使った運用側の処理は無い。
+- `ConnectionReport` は `requests_served`、`close_reason`、互換用の `accounting_invariant_closed` を返すが、これを使った運用側の処理は無い。
 - `serve_connection_with_policy` / `serve_expected_peer_with_policy` は per-read/per-write と absolute connection deadline を `DeadlineStream` に適用し、期限到達時は typed error で fail closed する。generic `serve_connection` は互換の plain path であり timeout を主張しない。production `session-orchestrator::BuiltBrokerRuntime` は policy-aware path を使う。
 - `serve_connection` は caller / capability の identity と clock を別々に受け取り、request ごとに `DispatchContext` を作り直す。clock の実装が実時刻を返すことは、この crate では検証していない。
 
@@ -117,6 +121,7 @@ connection 単位の責務が 1 関数に収まっている。何回読むか、
 - [Host Egress Broker](README.md)
 - [frame から adapter までの 1 本道](dispatch.md)
 - [transport 契約](transport.md)
+- [egress-protocol の response / guest client](../egress-protocol/README.md)
 - [公開 HTTPS policy](network-policy.md)
 - [検証対応表](verification.md)
 - [session budget](../egress-protocol/session-budget.md)

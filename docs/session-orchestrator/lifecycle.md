@@ -6,7 +6,7 @@
 
 > **対象読者:** session lifecycle を触る実装者、失敗時に host へ何が残るかを確認する人
 
-[`lib.rs`](../../crates/session-orchestrator/src/lib.rs) は 1 つの microVM session を 5 段階で組み立て、失敗したら依存の逆順に解放する。cleanup 自体が失敗したら `Stopping` に留めて retry を待つ。
+[`lib.rs`](../../crates/session-orchestrator/src/lib.rs) は 1 つの microVM session を依存順に組み立て、失敗したら依存の逆順に解放する。Broker を確立しただけでは workload を解放せず、Broker backend が running health を確認した後にだけ commit する。cleanup 自体が失敗したら `Stopping` に留めて retry を待つ。
 
 ## 何を防ぎたいのか
 
@@ -31,7 +31,8 @@ flowchart TB
     g2 --> ledger["7 identity を抽選し ledger に予約"]
     ledger --> ws["workspace clone"]
     ws --> br["Broker session 確立"]
-    br --> vm["VM 起動"]
+    br --> health["Broker running health を確認"]
+    health --> vm["VM 起動"]
     vm --> cap["root capability 注入"]
     cap --> wl["workload 解放"]
     wl --> run["Running"]
@@ -39,7 +40,7 @@ flowchart TB
 
 **ledger の予約が clone より前にある。** 逆にすると、`<clone_root>/<workspace_id>` という directory が、まだ commit していない `workspace_id` で作られる。crash 後に同じ ID が再び払い出されると、新しい session が古い tree に clone する、あるいは再利用することになる。
 
-Broker が VM より前、capability が workload より前なのは trait の型が強制している。`start_vm` は `&BrokerLease` を、`release_workload` は `&CapabilityLease` を取る。入れ替えると compile が通らない。意味としても、Broker listener が無い VM には egress の相手がいないし、注入前に解放された workload は Authority Core の記録が無いまま無制限に動く。
+Broker が VM より前、capability が workload より前なのは trait の型が強制している。`start_vm` は `&BrokerLease` を、`release_workload` は `&CapabilityLease` を取る。さらに `ensure_broker_session_running(&BrokerLease)` が成功するまで workload release へ進まない。入れ替えると compile が通らないか、health gate を飛ばすことになる。意味としても、Broker listener が無い VM には egress の相手がいないし、注入前に解放された workload は Authority Core の記録が無いまま無制限に動く。
 
 **workspace が Broker より前なのは型で強制されていない。** cleanup 側が workspace の isolation を最後に行い、しかも `broker_closed` で gate しているので、取得順で workspace が最も外側にないと逆順解放が定義できない。ここは規約であって、compile では守られない。
 
@@ -109,7 +110,7 @@ clone_workspace が成功
 
 失敗時に host へ何が残るかが `CleanupProgress` の 4 つの bool で分かる。ただし読み方に注意が要る（下記）。
 
-`Stopping` が「未完了の resource がある」ことを 1 つの状態で表すので、orchestrator が次の session を受け付けないという判断が 1 箇所で決まる。
+`Stopping` が「未完了の resource がある」ことを 1 つの状態で表すので、orchestrator が次の session を受け付けないという判断が 1 箇所で決まる。process crash をまたぐ production resource cleanup は [session recovery journal](recovery.md) が別に記録し、controller の複数 session admission は [multi-session control plane](control-plane.md) が記録する。
 
 ## 正確な保証範囲
 
@@ -133,6 +134,8 @@ clone_workspace が成功
 - [identity と ledger](identity-ledger.md)
 - [lease の binding](lease-binding.md)
 - [production backend 契約](contracts.md)
+- [session recovery journal](recovery.md)
+- [multi-session control plane](control-plane.md)
 - [検証対応表](verification.md)
 - [0014](../decisions/0014-keep-the-workspace-when-vm-kill-fails.md)
 - [用語集](../glossary.md)

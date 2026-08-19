@@ -12,18 +12,16 @@ microVM を毎回 boot から起動すると数百 ms かかる。boot 済みの
 
 ## 何を防ぎたいのか
 
-snapshot を取った時点の guest memory には、その VM が持っていた identity が全部入っている。restore した VM は、その identity を持ったまま起動する。
+snapshot を取った時点の guest memory には、guest supervisor の状態が保存される。identity が memory に存在する可能性はあるが、この crate は guest memory を走査して一覧化しない。`Snapshot` の `forbidden_identities` は manifest 作成側が渡す値で、`create_snapshot` は instance に保持された bundle がある場合だけその5値をコピーし、launch 直後の instance では空の一覧になる。
 
 ```text
-snapshot 時点の guest memory
-  VM ID       = a1b2...
-  session ID  = c3d4...
-  subject ID  = e5f6...
+snapshot 時点の guest memory（identity が含まれる可能性）
+  VM / session / subject identity = guest state の一部
 
-restore すると、これが N 台に複製される
-  VM #1 : a1b2... c3d4... e5f6...
-  VM #2 : a1b2... c3d4... e5f6...   <- 同じ
-  VM #3 : a1b2... c3d4... e5f6...   <- 同じ
+restore すると、memory state は N 台に複製される
+  VM #1 : 同じ guest memory state
+  VM #2 : 同じ guest memory state   <- identity gate 前
+  VM #3 : 同じ guest memory state   <- identity gate 前
 ```
 
 identity が衝突すると、audit record がどの session のものか判別できなくなる。もっと悪いのは Broker 側で、session ID が同じなら replay guard の sequence 空間を共有してしまう。VM #2 が送った request を VM #1 の retry として扱う経路ができる。
@@ -38,9 +36,9 @@ stateDiagram-v2
     WorkloadStopped --> SnapshotPauseUnknown: pause response lost/error
     SnapshotPaused --> Snapshotted: snapshot files written
     SnapshotPaused --> Stopped: shutdown after snapshot failure
-    Snapshotted --> RestoredStopped: restore の途中
-    RestoredStopped --> IdentityRegenerated: 128-bit × 5 を再生成
-    IdentityRegenerated --> IdentityInjected: guest へ注入
+    Snapshotted --> IdentityRegenerated: paused restore + workspace/vsock 検証後に<br/>128-bit × 5 を再生成
+    IdentityRegenerated --> IdentityResumedAwaitingAck: PATCH /vm Resumed
+    IdentityResumedAwaitingAck --> IdentityInjected: exact identity ACK
     IdentityInjected --> Running: workload を明示的に解放
     Running --> Stopped: shutdown
     WorkloadStopped --> Stopped: shutdown
@@ -67,17 +65,17 @@ if instance.state != RuntimeState::WorkloadStopped {
 
 `create_snapshot` は `WorkloadStopped` だけを受け付け、先に Firecracker の `PATCH /vm` (`{"state":"Paused"}`) の成功応答を受けて `SnapshotPaused` へ遷移する。その後で `PUT /snapshot/create` と snapshot/memory の digest を保存する。pause の応答が失われた場合は VM が pause 済みか分からないため `SnapshotPauseUnknown` にして、別の snapshot や workload 操作を許さず shutdown へ進む。snapshot の書き込み・hash が失敗しても paused state を通常の pre-session VM として再利用しない。
 
-restore は `/snapshot/load` に `resume_vm:false` を明示し、workspace/vsock の bind と実行確認を終えてから resume/identity acknowledgement の順へ進む。これにより、復元直後に workload gate が先に開く経路を作らない。local test では [`snapshot_pauses_vm_before_writing_snapshot_files`](../../crates/firecracker-runtime/tests/runtime.rs)、[`snapshot_create_failure_keeps_instance_explicitly_paused`](../../crates/firecracker-runtime/tests/runtime.rs)、[`snapshot_pause_failure_enters_unknown_state_and_does_not_create_snapshot`](../../crates/firecracker-runtime/tests/runtime.rs) がこれを固定する。
+restore は `/snapshot/load` に `resume_vm:false` を明示し、workspace/vsock の bind と実行確認を終え、5 値の identity を生成して `IdentityRegenerated` で返る。restore 自体は VM を resume せず、`inject_identity` / `inject_identity_bound` が後で `PATCH /vm` (`Resumed`) を送り、`IdentityResumedAwaitingAck` から exact identity ACK を受けたときだけ `IdentityInjected` へ進む。これにより、復元直後に workload gate が先に開く経路を作らない。local test では [`snapshot_pauses_vm_before_writing_snapshot_files`](../../crates/firecracker-runtime/tests/runtime.rs)、[`snapshot_create_failure_keeps_instance_explicitly_paused`](../../crates/firecracker-runtime/tests/runtime.rs)、[`snapshot_pause_failure_enters_unknown_state_and_does_not_create_snapshot`](../../crates/firecracker-runtime/tests/runtime.rs) が pause 側を、[`restore_regenerates_all_identities_and_gates_workload_until_injection`](../../crates/firecracker-runtime/tests/runtime.rs) が restore 側を固定する。
 
 ## fingerprint が違う snapshot は restore しない
 
 ```rust
-if config.fingerprint() != snapshot.artifact_fingerprint {
+if config.snapshot_fingerprint() != snapshot.artifact_fingerprint {
     return Err(RuntimeError::StaleSnapshot(...));
 }
 ```
 
-`Snapshot` は作られた時点の config fingerprint を保持する。kernel を差し替えた後に古い snapshot を restore しようとすると、ここで止まる。
+`Snapshot` は作られた時点の `snapshot_fingerprint()` を保持する。kernel を差し替えた後に古い snapshot を restore しようとすると、ここで止まる。
 
 memory image は、それを作った kernel の構造を前提にしている。別の kernel で restore した場合に何が起きるかは予測できない。動いてしまう可能性があるのが一番まずい。詳細は [artifact の固定と fingerprint](pinned-artifacts.md)。
 
@@ -95,7 +93,7 @@ memory image は、それを作った kernel の構造を前提にしている�
 identities.validate(Some(&snapshot.forbidden_identities))?;
 ```
 
-snapshot に焼き込まれた古い identity の一覧を持っていて、再生成した値がそこに含まれていたら `StaleIdentity` を返す。確率的にはまず起きないが、entropy source が壊れて同じ値を返し続ける場合に検出できる。`duplicate_identity_generation_is_rejected_as_stale` がこの経路を見ている。
+manifest が提供した `forbidden_identities` の一覧に再生成した値が含まれていたら `StaleIdentity` を返す。確率的にはまず起きないが、entropy source が壊れて同じ値を返し続ける場合に検出できる。`duplicate_identity_generation_is_rejected_as_stale` がこの経路を見ている。runtime は guest memory から一覧を抽出しないため、一覧の完全性は snapshot を作る側の責務である。
 
 restore が identity 検査で失敗した場合、`rollback` が jailer プロセス、dm-verity mapping、workspace を逆順に片付ける。`stale_identity_is_rejected_and_restored_process_is_rolled_back` の名前どおり、プロセスを起動した後で拒否しても resource は残らない。
 
@@ -107,7 +105,7 @@ restore が identity 検査で失敗した場合、`rollback` が jailer プロ�
 
 ## 何が助かるのか
 
-state machine が pause/unknown と identity gate を明示するので、「この VM で workload を走らせてよいか」が 1 つの比較で判断できる。identity を注入したかどうかを別途追跡しなくてよい。
+state machine が pause/unknown と identity gate を明示するので、「この VM で workload を走らせてよいか」が 1 つの比較で判断できる。identity を注入したかどうかを別途追跡しなくてよい。`RestoredStopped` variant は enum に残るが、現行の restore 経路は検証済み workspace を bind して直ちに `IdentityRegenerated` を返す。
 
 snapshot 元を `WorkloadStopped` に限っているため、snapshot に何が含まれるかを都度検討する必要がない。含まれるのは常に「boot 直後、workload 実行前」の状態。
 
@@ -140,9 +138,9 @@ termination を確認するまで intent を完了しない。この実装によ
 
 state 遷移と identity 検査は fake adapter を使う test で確認している。
 
-- [`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は実 VM で pre-session gate を提供する。[`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) は注入前の start を拒否し、v2 policy digest 付き identity 注入後だけ固定 workload を release する。guest runtime image は guest-supervisor-init、workload-isolation-launcher、全13 CapFS effect、Broker channelまでを通す。さらに[`real_production_lifecycle`](../../crates/session-orchestrator/tests/real_production_lifecycle.rs)がclean snapshot capture/restoreから同じguest経路とproduction `SessionOwner` cleanupまでを一続きで実行する。
+- [`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) は実 VM で pre-session gate を提供する。[`real_guest_control`](../../crates/firecracker-runtime/tests/real_guest_control.rs) は注入前の start を拒否し、v2 policy digest 付き identity 注入後だけ固定 workload を release する。guest runtime image は guest-supervisor-init、workload-isolation-launcher、全13 CapFS effect、Broker channelまでを通す。さらに [`real_production_session_owner_runs_ready_poll_stop_and_cleans_every_owned_resource`](../../crates/session-orchestrator/tests/real_production_lifecycle.rs) が clean snapshot capture/restore から同じ guest 経路と production `SessionOwner` cleanup までを一続きで実行する。
 - raw bootのcontrol channel試験に加え、production SessionOwner gateが`Runtime::restore`とsnapshotのidentity injectionを同じlaunch経路で通す。
-- 実Firecrackerでpause → snapshot create → `/snapshot/load` (`resume_vm:false`) → workspace/vsock bind → resumeの一連動作をSessionOwner gateで確認済み。
+- `scripts/ci/verify-real-session-owner.sh` の opt-in gate は、実 Firecracker で pause → snapshot create → `/snapshot/load` (`resume_vm:false`) → workspace/vsock bind → identity injection/resume を一続きに確認する。root、KVM、vhost-vsock、device-mapper、cgroup v2、pinned artifact が必要で、wrapper を実行していない host の結果までは主張しない。
 - `forbidden_identities` の一覧が「snapshot に焼き込まれた全 identity」を漏れなく含んでいることは、この crate では保証できない。一覧を作るのは snapshot を取る側。
 - entropy source の品質は `IdentitySource` の実装依存。`SystemIdentitySource` は host kernel の entropy device を使うが、その品質はここでは検証していない。
 - 同じ snapshot から restore した 2 台の VM が、identity 以外で区別できることは主張していない。memory の内容は同じ。

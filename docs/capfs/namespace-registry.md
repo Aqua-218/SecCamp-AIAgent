@@ -72,7 +72,7 @@ backing root fdとregistryを同じ`ImportedRepository`が所有するのは、�
 
 ## Generation は何に使うのか
 
-startup import全体はworkloadへ公開される前の初期snapshotなのでgeneration 0になる。公開後のcreate、remove、renameは成功ごとに1ずつ進む。open / closeではpath対応が変わらないため増えない。
+startup import全体はworkloadへ公開される前の初期snapshotなのでgeneration 0になる。公開後のcreate、link、remove、renameは成功ごとに1ずつ進む。open / closeではpath対応が変わらないため増えない。
 
 ```text
 authorization cache key
@@ -96,12 +96,14 @@ flowchart LR
     lock["write lock"] --> validate["現在stateを検査"]
     validate --> stage["次stateを構築"]
     stage --> execute["backing executor"]
-    execute -->|"Err: commit前"| unchanged["現在stateを維持"]
-    execute -->|"Ok: 線形化点通過"| publish["次stateを公開"]
+    execute -->|"FailedBeforeCommit"| unchanged["現在stateを維持"]
+    execute -->|"Committed"| publish["次stateを公開"]
+    execute -->|"CommittedWithError"| quarantine["次stateを公開<br/>repository を in-doubt"]
     publish --> unlock["unlock"]
+    quarantine --> unlock
 ```
 
-executorが`Err`を返してよいのは、backing operationの線形化点をまだ越えていない場合だけである。syscallが成立した後に`Err`を返すadapterは、registryをrollbackしてbackingだけ変更した状態を作るため契約違反になる。
+通常の executor が `FailedBeforeCommit` を返してよいのは、backing operation の線形化点をまだ越えていない場合だけである。syscall が成立した後にそれを返す adapter は、registry を rollback して backing だけ変更した状態を作るため契約違反になる。結果が commit 済みだが追加処理で error になった場合は `NamespaceExecutorOutcome::CommittedWithError` を明示する。この outcome は staged state を公開して `repository_in_doubt` を立て、通常の操作を `RepositoryInDoubt` で止める。quarantine 中も、破棄のための close は許可される。
 
 executorがpanicした場合はwriter lockがpoisonされる。その後のlookupを含む全操作を`LockPoisoned`で拒否し、不一致かもしれないnamespaceを使い続けない。
 
@@ -128,7 +130,7 @@ Direct-I/O FUSE adapterは、fileとdirectoryのopen時にnamespace open count�
 ```text
 namespace read lock
   -> ObjectIdから現在pathを取得
-  -> CapabilityKernel::authorize_and_commit
+  -> CapabilityKernel::authorize_and_execute_classified
   -> backing read/writeの線形化点
 unlock
 ```
@@ -180,10 +182,13 @@ backing差し替え、実syscallを含むrename / writeの物理的な競合は�
 
 ## 正確な保証範囲
 
-- modeとtimestampを同時に求めるmetadata requestの原子性契約。
-- durable stateやsupervisor再起動後の復元。
+この registry が保証するのは、namespace lock 内で current path、alias、open count、generation を同じ staged state として扱い、executor outcome に応じて一度だけ公開することである。executor が commit 境界を正しく分類すること、runtime が backing identity を再検証すること、Capability kernel が認可を保持することが前提になる。
 
-したがって、initial file modelのread / write / truncate / metadata、create、remove、renameとdirectory streamはこのregistryを通る。残る複合metadataの原子性とdurable stateは、別途明示的な意味論を追加してから接続する。
+- `FailedBeforeCommit` では現在 state と generation を公開前のまま保つ。
+- `Committed` では staged namespace と generation を公開する。
+- `CommittedWithError` では staged namespace を公開し、`RepositoryInDoubt` として通常 operation を止める。これは backing と namespace のどちらが最終 view かを推測しないための quarantine である。
+- mode と timestamp を同時に求める metadata request の原子性、durable state、supervisor 再起動後の復元は、この registry 単独の保証外である。
+- registry 全体を Lean で証明したわけではない。有限の Rust test と bounded concurrency contract による検査である。
 
 ## 変更時の確認点
 

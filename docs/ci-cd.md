@@ -46,7 +46,7 @@ GitHub exposes truthful fan-in checks named `CI complete`, `Security complete`, 
 
 The distinction is load-bearing. Without it a gate that runs on every pipeline and a gate that exists only as an intention read identically, `check-pipeline-parity.sh` can never pass, and the claim that both platforms implement the same gates cannot be true. `plan-pipeline.sh` reports planned gates as `planned` rather than `unavailable`, because those are different statements: one says nobody has built the gate, the other blames the platform. Per-gate `events` further restrict eligibility: an event outside the allowlist is `skipped`, and `check-gate-results.sh` rejects any result for that gate. This is required for destructive external-provider checks, which must not appear in an unattended schedule.
 
-Promoting a gate is one field change plus the job it now demands. The manifest now has 53 implemented gates and no planned gates. The fast `service_boundaries` gate runs on every pipeline and locks the exact production service, polkit, udev, and environment contracts. The implemented deep gates use one pinned toolchain, execute non-empty supported subsets, and fail closed when a selection, baseline, corpus, tool, protected runner, or kernel device is missing. The `session_owner_kvm` gate drives the production composition from clean snapshot capture through all 13 CapFS effects, durable Broker evidence, stop, and exact resource cleanup; its separate crash matrix kills all 11 declared durable boundaries. `systemd_control_plane` exercises the authenticated non-privileged controller, forces a worker into `failed`, requires exact recovery before quota release, and repeats controller-crash reconciliation. `concurrent_session_owners` keeps two production KVM and Broker workers live after durable final responses and proves independent cleanup. `installed_production_chain` generates a clean snapshot bundle, installs the checked-in production binaries and host contracts, then drives the authenticated controller through two concurrent real KVM workers, normal stop, worker-crash recovery, quota release, controller restart, and residue-free cleanup. Production-launcher post-exec enforcement and the high-risk raw-syscall corpus are also covered independently by the `privileged_isolation` gate's four real scenarios and bounded 20-iteration soak. The benchmark gate deliberately measures the pure capability decision path; `/dev/fuse` availability is not converted into a fake green result.
+Promoting a gate is one field change plus the job it now demands. The manifest currently declares 53 implemented gates and no planned gates. This is the gate topology, not the number of verification claims in [`docs/verification-status.yml`](verification-status.yml). The fast `service_boundaries` gate runs on every pipeline and locks the exact production service, polkit, udev, and environment contracts. The implemented deep gates use one pinned toolchain, execute non-empty supported subsets, and fail closed when a selection, baseline, corpus, tool, protected runner, or kernel device is missing. The `session_owner_kvm` gate drives the production composition from clean snapshot capture through all 13 CapFS effects, durable Broker evidence, stop, and exact resource cleanup; its separate crash matrix kills all 11 declared durable boundaries. `systemd_control_plane` exercises the authenticated non-privileged controller, forces a worker into `failed`, requires exact recovery before quota release, and repeats controller-crash reconciliation. `concurrent_session_owners` keeps two production KVM and Broker workers live after durable final responses and proves independent cleanup. `installed_production_chain` generates a clean snapshot bundle, installs the checked-in production binaries and host contracts, then drives the authenticated controller through two concurrent real KVM workers, normal stop, worker-crash recovery, quota release, controller restart, and residue-free cleanup. Production-launcher post-exec enforcement and the high-risk raw-syscall corpus are also covered independently by the `privileged_isolation` gate's four real scenarios and bounded 20-iteration soak. The benchmark gate deliberately measures the pure capability decision path; `/dev/fuse` availability is not converted into a fake green result.
 
 No planned gate is given a job that trivially succeeds. An empty gate is worse than a missing one: it reports the same green as a real check while proving nothing, and it removes the pressure to build the thing it stands in for.
 
@@ -91,6 +91,8 @@ scripts/ci/run.sh format
 scripts/ci/run.sh check
 scripts/ci/run.sh clippy
 scripts/ci/run.sh docs
+scripts/ci/run.sh docs-policy
+scripts/ci/run.sh repository-policy
 
 scripts/ci/install-cargo-tools.sh nextest coverage security
 for shard in 1 2 3 4; do scripts/ci/run.sh test "$shard"; done
@@ -104,6 +106,12 @@ scripts/ci/install-lean.sh
 scripts/ci/run.sh lean
 scripts/ci/run.sh differential
 ```
+
+### 検証 claim と gate の読み分け
+
+`ci/gates.yml` は実行する gate の topology を定義し、[`docs/verification-status.yml`](verification-status.yml) はそのうち文書として公開する claim を `hosted`、`privileged`、`kvm`、`external` の scope に分けて記録する。gate が `implemented` であることは、対応する job と fail-closed wrapper が存在することを意味するだけで、直近の実行成功や全環境の動作を意味しない。`verified` の claim は、manifest に記載した required gate と evidence が同じ scope で成立した場合だけ付ける。checker は YAML と相対パスを検査するが、KVM、root、外部 credential が必要な command を実行しない。
+
+文書構造と claim の整合性をまとめて見る場合は `scripts/ci/run.sh docs-policy` を使う。これは `check-docs.sh`、verification manifest の consistency check、負の fixture test を実行する。実機・外部 gate の成功はこの command から推測せず、対応する CI artifact と verification page の「未検証の境界」を確認する。
 
 実 VM 検証だけは、hosted pipeline ではなく `/dev/kvm` を持つ host で行う。次の 2 本が必要な artifact を version-scoped の不変 directory へ置き、`RuntimeConfig` が pin する SHA-256 と dm-verity root hash を印字する。
 
@@ -129,8 +137,8 @@ The YAML is ready without repository secrets. Configure the following controls i
 Create and push a release tag only after changing `[workspace.package].version` to the same version:
 
 ```bash
-git tag -s v0.2.0 -m "v0.2.0"
-git push origin v0.2.0
+git tag -s v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
 ```
 
 The release workflow checks out the immutable tag commit, re-runs CI and security, creates a deterministic archive and SPDX document, and produces separate SLSA build-provenance and SBOM attestations through OIDC. The `release` environment then gates publication. A rerun downloads and compares any existing asset byte-for-byte; it never overwrites a conflicting asset.
@@ -139,7 +147,7 @@ Consumers can verify the downloaded archive with the GitHub CLI:
 
 ```bash
 sha256sum --check SHA256SUMS
-gh attestation verify authority-corpus-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify authority-corpus-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo Aqua-218/SecCamp-AIAgent
 ```
 
@@ -163,7 +171,7 @@ Consumers can verify GitLab release assets with:
 sha256sum --check SHA256SUMS
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity "https://gitlab.com/GROUP/PROJECT//.gitlab-ci.yml@refs/tags/v0.2.0" \
+  --certificate-identity "https://gitlab.com/GROUP/PROJECT//.gitlab-ci.yml@refs/tags/v0.1.0" \
   --certificate-oidc-issuer "https://gitlab.com" \
   SHA256SUMS
 ```
@@ -180,7 +188,7 @@ A failed package or signature job publishes nothing. A failed protected publicat
 
 The four test shards, quality checks, specialized verification, coverage, and security scanners run in parallel where their dependencies allow it. The first run compiles pinned Cargo tools; caches reduce subsequent latency. Expect approximately 15–35 minutes of wall time and 20–60 Linux runner-minutes for a cold full run, depending on runner size and registry performance. Release pipelines intentionally repeat all gates and therefore cost roughly another full run.
 
-The pipelines do not claim production deployment readiness. Hosted jobs do not exercise the privileged boundary, but protected deep jobs now exercise a real Firecracker host, the complete production SessionOwner composition, all 13 CapFS effects, a FUSE mount, AF_VSOCK transport, and a controlled external DNS/HTTPS fixture; the destructive live-provider path is separately restricted to protected on-demand execution. A cloud environment remains outside this repository's CI. Container digest and Action SHA updates still require human review, and a compromised hosted runner remains inside the trusted build boundary. The protected release environment, minimal job permissions, OIDC signing, immutable tag policy, provenance, checksums, and fail-closed rerun behavior reduce that boundary but do not eliminate it.
+The pipelines do not claim production deployment readiness. Hosted jobs do not exercise the privileged boundary, while the protected deep jobs are configured to exercise a real Firecracker host, the complete production SessionOwner composition, all 13 CapFS effects, a FUSE mount, AF_VSOCK transport, and a controlled external DNS/HTTPS fixture; the destructive live-provider path is separately restricted to protected on-demand execution. Whether a particular run supports a `verified` claim is recorded by scope in the manifest and its external artifacts, not inferred from this topology page. A cloud environment remains outside this repository's CI. Container digest and Action SHA updates still require human review, and a compromised hosted runner remains inside the trusted build boundary. The protected release environment, minimal job permissions, OIDC signing, immutable tag policy, provenance, checksums, and fail-closed rerun behavior reduce that boundary but do not eliminate it.
 
 ## 関連
 

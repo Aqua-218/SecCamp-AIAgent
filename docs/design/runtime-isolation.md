@@ -161,3 +161,4 @@ sequenceDiagram
 - [脅威モデル](threat-model.md)
 - [capfs](capfs.md)
 - [ネットワークと外部副作用](network-egress.md)
+- [検証ステータス manifest](../verification-status.md)

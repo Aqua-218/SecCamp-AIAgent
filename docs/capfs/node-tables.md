@@ -127,9 +127,9 @@ lock を保持した writer が panic した場合は table を回復したも�
 
 module test は nodeid と lookup count の `u64` 最終値、次の操作での枯渇拒否、writer panic 後の lock poison を直接検査する。
 
-memory内のnode identityと参照数は、現在[Direct-I/O FUSE adapter](read-only-fuse.md)の`LOOKUP`、`GETATTR`、`FORGET`、`READDIR`へ接続されている。namespace lookup中にnodeを公開し、`ObjectId`の現在pathに対するCapability判定とfd-relative backing I/Oまで同じoperationへつないだ。
+memory内のnode identityと参照数は、現在[Direct-I/O FUSE adapter](read-only-fuse.md)の`LOOKUP`、`GETATTR`、`FORGET`、`READDIR`へ接続されている。namespace lookup中にnodeを公開し、`ObjectId`の現在pathに対するCapability判定とfd-relative backing I/Oまで同じoperationへつないだ。実mount suite ではこれに加えて mutation と revoke 後の handle の拒否も検査する。
 
-basic `READDIR`はlookup済みobjectのlive nodeだけをinode hintとして使い、未lookupのentryには0を返す。directory reply自体はlookup referenceを発生させないため、`remember_lookup`を呼んで架空の参照数を増やさない。実mount testはlookup、read-after-revoke、readdir-after-revokeを通すが、kernelが送るFORGETの全順序やmount teardown時の参照状態まではまだ固定していない。変更系opcodeと複数thread sessionも後続である。
+basic `READDIR`はlookup済みobjectのlive nodeだけをinode hintとして使い、未lookupのentryには0を返す。directory reply自体はlookup referenceを発生させないため、`remember_lookup`を呼んで架空の参照数を増やさない。実mount testはlookup、read-after-revoke、readdir-after-revoke、変更系 opcode を通すが、kernelが送るFORGETの全順序やmount teardown時の参照状態、複数thread FUSE sessionの全組合せまではまだ固定していない。
 
 ## 正確な保証範囲
 

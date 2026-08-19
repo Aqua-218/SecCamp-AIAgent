@@ -24,7 +24,7 @@ flowchart LR
             frame["frame<br/>4 bytes prefix / 1 MiB"]
             cbor["cbor<br/>canonical v1 schema"]
             op["operation<br/>閉じた union"]
-            resp["response<br/>型付き応答"]
+            resp["response<br/>型付き応答 / canonical chunk"]
         end
         subgraph admit["受理の判定"]
             direction LR
@@ -41,7 +41,7 @@ flowchart LR
     op --> sess
     sess --> budget
     budget ==>|"認可へ"| hostside
-    hostside ==>|"型付き応答"| resp
+    hostside ==>|"型付き応答（必要なら chunk 列）"| resp
     op -.->|"capability_request_at"| ac
 
     classDef host fill:#1565c0,color:#fff,stroke:#0d47a1;
@@ -50,7 +50,7 @@ flowchart LR
     class guestside,hostside,ac external;
 ```
 
-socket も HTTP も credential も持たない。実際の I/O、outcome の cache、呼び出し順序は [egress-broker](../egress-broker/README.md) が持つ。
+実際の I/O、outcome の cache、呼び出し順序は [egress-broker](../egress-broker/README.md) が持つ。
 
 ## この crate が決めること
 
@@ -60,10 +60,13 @@ socket も HTTP も credential も持たない。実際の I/O、outcome の cac
 | 唯一許される request の綴り | [`cbor.rs`](../../crates/egress-protocol/src/cbor.rs) |
 | 閉じた operation の union | [`operation.rs`](../../crates/egress-protocol/src/operation.rs) |
 | 型付き response の形 | [`response.rs`](../../crates/egress-protocol/src/response.rs) |
+| guest 側の bounded request / response stream client | [`client.rs`](../../crates/egress-protocol/src/client.rs) |
 | session、sequence、request ID、payload hash による受理判定 | [`session.rs`](../../crates/egress-protocol/src/session.rs) |
 | session 全体の消費上限 | [`budget.rs`](../../crates/egress-protocol/src/budget.rs) |
 
 budget が別に要るのは、Capability の委譲では総量を縛れないから。caller は妥当な子 capability をいくらでも作れるので、「何回呼べるか」「何 byte 読めるか」「同時に何本走らせられるか」は capability の外側で数える必要がある。
+
+response は通常 1 MiB 以下の canonical payload なら 1 frame で返る。公開 HTTPS の大きな body は `response.rs` の canonical chunk 列に分割され、各 chunk が 1 MiB の frame 上限を守る。guest 側の [`GuestBrokerClient`](../../crates/egress-protocol/src/client.rs) は単一 response と chunk 列を同じ request identity に束ねて検証する。
 
 ## 文書一覧
 

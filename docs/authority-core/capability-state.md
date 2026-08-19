@@ -129,7 +129,7 @@ Capability が存在する
 
 ## Revoke
 
-`revoke` は発行済み ID を `revoked` set に追加し、`auth_epoch` を1増やす。2回目以降も成功するが `AlreadyRevoked` を返し、set から取り除く transition も epoch を余分に進める処理もない。
+逐次 state の `revoke` は発行済み ID を `revoked` set に追加し、`auth_epoch` を1増やす。並行 public API では `CapabilityKernel::revoke_held_by(caller, capability)` が holder check とこの transition を1つの exclusive guard に置く。2回目以降も成功するが `AlreadyRevoked` を返し、set から取り除く transition も epoch を余分に進める処理もない。
 
 child 自身を `revoked` に複製して入れる必要はない。`is_effectively_active` と `authorizes` が親 link を root まで辿るため、祖先を1件 revoke すると全子孫が即座に inactive になる。Capability record と held relation は監査可能な履歴として残る。
 
@@ -183,7 +183,7 @@ leaf ≤ root
 - supervisor の socket fd から caller identity を決める adapter。
 - HTTP redirect / DNS / response streaming と GitHub API call を実際に強制する Broker adapter。
 
-`CapabilityKernel` は executor closure と revoke の順序を線形化する。ただし closure が実際の filesystem や外部 effect の正しい線形化点まで進んでから return する責任は adapter 側にあり、現在は実 mount や Broker との end-to-end 検証まではない。
+`CapabilityKernel` は executor closure と revoke の順序を線形化する。ただし closure が実際の filesystem や外部 effect の正しい線形化点まで進んでから `EffectExecution` を返す責任は adapter 側にある。capfs の実 mount / bounded race test はこの境界を検査するが、Authority core の状態 module 単独が外部 provider や全 OS schedule を証明するわけではない。
 
 ## 変更時の確認点
 
@@ -197,7 +197,7 @@ leaf ≤ root
 
 - [Capability envelope と委譲証明](capabilities.md)
 - [検証とテスト](verification.md)
-- [Effect commit と revoke の authorization guard](authorization-guard.md)
+- [Effect execution と revoke の authorization guard](authorization-guard.md)
 - [Subject lifecycle と open handle](subject-lifecycle-and-handles.md)
 - [Attempt / effect audit](audit-records.md)
 - [状態機械と revoke の設計](../design/state-and-revocation.md)

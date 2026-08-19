@@ -39,9 +39,9 @@ if !self.isolation.namespaces.pid || !self.isolation.namespaces.mount
 
 network device は `RuntimeConfig::validate` が常に拒否する。従ってこの runtime profile は Firecracker に host network device を渡さず、外部通信の設計は vsock 越しの [Host Egress Broker](../egress-broker/README.md) に限定する。network namespace を作ることを、この crate の検査結果として主張しない。
 
-## cgroup で 2 つの上限を要求する
+## cgroup で 3 つの非ゼロ制約を要求する
 
-`CgroupConfig` は `path`、`memory_max_bytes`、`cpu_quota_micros` を持つ。検査は 2 つ。
+`CgroupConfig` は `path`、`memory_max_bytes`、`cpu_quota_micros`、`cpu_period_micros` を持つ。検査は host root を拒否することと、memory、CPU quota、CPU period をすべて非ゼロにすることである。
 
 ```rust
 if self.isolation.cgroup.path == Path::new("/") { /* 拒否 */ }
@@ -50,7 +50,7 @@ if self.isolation.cgroup.memory_max_bytes == 0
     || self.isolation.cgroup.cpu_period_micros == 0 { /* 拒否 */ }
 ```
 
-`path` が host の root であることを拒否するのは、cgroup 操作が host 全体に及ぶのを防ぐため。
+`path` が host の root であることを拒否するだけでなく、実 launch 用の cgroup path は `/sys/fs/cgroup` 配下で、workspace clone ID を leaf 名に持ち、非空の parent を含まなければならない。これらは `cgroup_parent()` が jailer へ渡す hierarchy を検査する境界である。
 
 上限がゼロの場合を拒否するのは、`0` が「制限なし」を意味しかねないから。cgroup v2 の `memory.max` は `max` という文字列で無制限を表すが、数値の `0` を書くとすべての割り当てが失敗する。どちらの解釈でも意図した動作にならないので、設定の時点で落とす。`Default` で初期化したまま渡す事故もここで止まる。
 
@@ -104,7 +104,7 @@ profile を緩める変更が起動失敗として現れる。静かに緩んだ
 - `scripts/ci/verify-real-runtime-lifecycle.sh` は実 jailer/Firecracker を通り、PID/mount namespace、cgroup leaf と memory/cpu 上限、dedicated UID、pinned executable digest、`Seccomp: 2` を観測する。
 - seccomp JSONの全threadを解析し、default-deny allowlist、6個の必須deny不在、exact Unix-stream `socket` ruleを検査する。pinned compilerで再生成したBPFはjailer入力とbyte一致を要求する。
 - allowlistに載る全syscallの全引数意味論を一般化して証明するものではない。引数を特別検査するのは`socket`であり、host kernelとpinned compilerはTCBに残る。
-- wrapper の gate は jailer の期待する CLI、workspace/mapper/bind、shutdown cleanup も確認するが、VM escape、snapshot restore、guest CapFS、host の AppArmor/SELinux/seccomp は対象外である。
+- wrapper の gate は jailer の期待する CLI、workspace/mapper/bind、shutdown cleanup も確認するが、VM escape、snapshot restore、guest CapFS、host の AppArmor/SELinux は対象外である。jailer が受け取る pinned seccomp filter の installation は `Seccomp: 2` と compiler/filter byte equality の範囲で確認するが、全 syscall の意味論は対象外である。
 - VM 脱出が起きたときに実際に被害が VM 1 台に留まるかは、上記が全部効いていることが前提。現時点でその前提は確認できていない。
 - host 側の他の防御（AppArmor、SELinux）はこの crate の対象外。
 

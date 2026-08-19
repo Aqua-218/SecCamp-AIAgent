@@ -8,7 +8,7 @@
 
 最初から microVM を起動しても、設計の難しい部分はほとんど検証できない。まず Authority、状態機械、`capfs` をホスト上で確定し、その後に runtime isolation、Broker、Firecracker、統合 adapter を接続する。
 
-この計画では、次の三つを混同しない。
+このページは実装順序の記録と、現在の残存境界をまとめる。次の三つを混同しない。
 
 - **実装済み:** 型、API、production adapter のコードが repository にある。
 - **mock/contract 検証済み:** fake、mock、module test、local contract test で境界を確認した。
@@ -35,11 +35,7 @@ flowchart LR
     p5 --> p7
 
     classDef completed fill:#2e7d32,color:#fff;
-    classDef boundary fill:#1565c0,color:#fff;
-    classDef integration fill:#6a1b9a,color:#fff;
-    class p1,p2,p3 completed;
-    class p4,p5,p6 boundary;
-    class p7 integration;
+    class p1,p2,p3,p4,p5,p6,p7 completed;
 ```
 
 ## 1. Authority core
@@ -58,7 +54,7 @@ loom は direct/ancestor revoke、単一/compound effect、2 effects/1 revoke �
 
 ## 3. capfs
 
-repository preflight、`RepoId` と backing root/namespace の binding、manifest の原子的 import、共有 namespace registry、subject-local node table、Direct-I/O FUSE adapter は実装済みである。`LOOKUP`、`GETATTR`、`FORGET`、`OPEN`、`READ`、`WRITE`、`SETATTR`、`CREATE`、`MKDIR`、`UNLINK`、`RMDIR`、`RENAME`、`RELEASE`、`OPENDIR`、`READDIR`、`RELEASEDIR` を root fd、node table、namespace registry、Authority kernel へ接続する。
+repository preflight、`RepoId` と backing root/namespace の binding、manifest の原子的 import、共有 namespace registry、subject-local node table、cache-aware FUSE adapter は実装済みである。`LOOKUP`、`GETATTR`、`FORGET`、`OPEN`、`READ`、`WRITE`、`SETATTR`、`CREATE`、`MKDIR`、`UNLINK`、`RMDIR`、`RENAME`、`RELEASE`、`OPENDIR`、`READDIR`、`RELEASEDIR` を root fd、node table、namespace registry、Authority kernel へ接続する。
 
 mock/contract 検証に加え、実mount 22件で権限外siblingの不可視化、open handleのrevoke後再認可、全13 effect、link、backing差し替え、nested mount、bounded mutation/revoke raceを確認する。KVM SessionOwner gateは隔離層内の同じ全effectをproduction経路で実行する。全thread scheduleとkernelのFORGET lifecycle全体は有限テストによる完全証明ではない。symlinkとhard linkの認可モデルも実装・実測済みである（[ADR 0017](../decisions/0017-authorize-an-aliased-inode-on-every-name.md)）。
 
@@ -105,26 +101,38 @@ fake command/filesystem/API/identity sourceによるcontract testとlocal Unix s
 
 設計の中心は `Authority core -> state machine -> capfs` にある。ここを通常の host test で速く回せる状態にしてから、runtime isolation と Broker を別の trust boundary として追加する。Firecracker はその両方を載せる境界であり、最後に supervisor と session orchestrator で resource identity と cleanup の順序を結ぶ。Firecracker を先に実機起動しても、Capability の意味論、rename race、revoke/commit の線形化は解決しない。
 
+## 現在の残存境界
+
+実装順序の全段階は repository の code と production adapter まで到達している。ただし、段階が完了したことは system 全体の保証を意味しない。現在の claim と残存理由は [検証ステータス manifest](../verification-status.md) と [完了台帳](../hardening/2026-08-18-completion-ledger.md) を正とする。
+
+| 境界 | 現在の扱い |
+|---|---|
+| live GitHub provider | disposable repository と operator credential が必要なため `external` scope で blocked |
+| privileged aarch64 | 実 runner が必要。cross-target check は runtime evidence ではない |
+| independent review | repository 外の reviewer と revision-bound report が必要。自己レビューで代替しない |
+| VM escape、host kernel、全 syscall／scheduler interleaving | upstream/physical TCB または有限 model の範囲外 |
+| 多 host の distributed revoke、replicated Broker state | single-host state machine の外。未実装の枝として扱わず、trust model が変わる設計課題として残す |
+
 ## 現在の検証コマンド
 
 各 standalone 境界を個別に検証する場合は、対象 crate の manifest を指定する。
 
 ```bash
 cargo fmt --manifest-path crates/egress-broker/Cargo.toml -- --check
-cargo test --manifest-path crates/egress-broker/Cargo.toml
-cargo clippy --manifest-path crates/egress-broker/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path crates/egress-broker/Cargo.toml --locked
+cargo clippy --manifest-path crates/egress-broker/Cargo.toml --all-targets --locked -- -D warnings
 
 cargo fmt --manifest-path crates/firecracker-runtime/Cargo.toml -- --check
-cargo test --manifest-path crates/firecracker-runtime/Cargo.toml
-cargo clippy --manifest-path crates/firecracker-runtime/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path crates/firecracker-runtime/Cargo.toml --locked
+cargo clippy --manifest-path crates/firecracker-runtime/Cargo.toml --all-targets --locked -- -D warnings
 
 cargo fmt --manifest-path crates/supervisor/Cargo.toml -- --check
-cargo test --manifest-path crates/supervisor/Cargo.toml
-cargo clippy --manifest-path crates/supervisor/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path crates/supervisor/Cargo.toml --locked
+cargo clippy --manifest-path crates/supervisor/Cargo.toml --all-targets --locked -- -D warnings
 
 cargo fmt --manifest-path crates/session-orchestrator/Cargo.toml -- --check
-cargo test --manifest-path crates/session-orchestrator/Cargo.toml
-cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path crates/session-orchestrator/Cargo.toml --locked
+cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-targets --locked -- -D warnings
 ```
 
 ## 関連
@@ -136,3 +144,5 @@ cargo clippy --manifest-path crates/session-orchestrator/Cargo.toml --all-target
 - [Firecracker runtime](../firecracker-runtime/README.md)
 - [Supervisor adapter](../supervisor/README.md)
 - [Session orchestrator](../session-orchestrator/README.md)
+- [検証ステータス manifest](../verification-status.md)
+- [完了台帳](../hardening/2026-08-18-completion-ledger.md)

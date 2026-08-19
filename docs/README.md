@@ -4,9 +4,9 @@
 
 > **対象読者:** この repository の設計・実装・検証を追う全員
 
-設計上の判断と現在の実装は別々に書いてある。「なぜこの構造か」を知りたいときは[設計書](design/README.md)、「なぜ別の案を採らなかったか」は[決定記録](decisions/README.md)、「今どこまで実装され、どこから未検証か」は各 crate の文書を読む。
+設計上の判断と現在の実装は別々に書いてある。「なぜこの構造か」を知りたいときは[設計書](design/README.md)、「なぜ別の案を採らなかったか」は[決定記録](decisions/README.md)、「今どこまで実装され、どこから未検証か」は各 crate の文書と[検証ステータス manifest](verification-status.md)を読む。
 
-**mock test の成功を、実機動作の根拠にしない。** コードと API が存在すること、mock / contract test が通ること、特権操作や外部サービスを含む実機検証を行ったことは、各 crate の検証対応表で区別して書く。production `Runtime::launch`、jailer、clean snapshot capture／restore、guest composition、全13 CapFS effect、SessionOwner cleanupまではKVM gateで検証済みである。VM escape耐性、外部live provider、Linux全syscall／全interleavingは別のTCBまたはblocked境界として残す。
+**mock test の成功を、実機動作の根拠にしない。** コードと API が存在すること、mock / contract test が通ること、特権操作や外部サービスを含む実機検証を行ったことは、各 crate の検証対応表で区別して書く。KVM gate と privileged gate の実行結果は、それぞれの claim が宣言する scope に限って読む。VM escape耐性、外部live provider、Linux全syscall／全interleavingは別のTCBまたはblocked境界として残す。manifest の `verified` は、記載された required gate と evidence がその scope で成立したことを表すが、隣接する scope や未記載の実行環境まで保証しない。
 
 ## 文書の地図
 
@@ -19,6 +19,7 @@ flowchart TB
         gloss["用語集"]
         adr["決定記録"]
         conv["文書規約"]
+        i18n["多言語ハブ<br/>docs/i18n/&lt;locale&gt;"]
     end
 
     subgraph design["設計（なぜこの構造か）"]
@@ -45,6 +46,7 @@ flowchart TB
     idx --> verif
     start -.->|"語の意味が分からない"| gloss
     start -.->|"なぜ別案を採らなかったか"| adr
+    start -.->|"別言語の入口"| i18n
     concept -.-> adr
     verif ==>|"動くのか を判断するときは<br/>ここの 未検証の境界 を先に読む"| start
     conv -.->|"新しく書くとき"| impl
@@ -65,13 +67,16 @@ flowchart TB
 | [決定記録](decisions/README.md) | 採用しなかった案とその理由。MADR 形式、1 決定 1 ファイル |
 | [文書規約](document-conventions.md) | ページ型ごとの骨格、粒度の目安、CI が検査する構造 |
 | [CI/CD operations](ci-cd.md) | GitHub Actions / GitLab CI のゲート、保護設定、署名付きリリース、障害復旧 |
+| [検証ステータス manifest](verification-status.md) | scope ごとの claim、required gate、evidence、未検証・blocked の残存理由 |
+| 完了台帳 | [`docs/hardening/2026-08-18-completion-ledger.md`](hardening/2026-08-18-completion-ledger.md)。実装完了ではなく、gate と残存境界の判定を記録 |
+| [多言語ハブ](i18n/README.md) | `docs/i18n/<locale>/README.md`。locale ごとの入口、言語ナビゲーション、原文・対応ページの関係を記録 |
 
 ## 設計
 
 | 文書 | 内容 |
 |---|---|
 | [設計書](design/README.md) | 入口。何を守るのか、選んだ形、文書の読み方 |
-| [全体アーキテクチャ](design/architecture.md) | 8 crate の実行時配置、境界を越える 5 つの手段、まだ繋がっていない線 |
+| [全体アーキテクチャ](design/architecture.md) | 8 crate の実行時配置、Cargo 依存グラフ、実装と evidence の境界 |
 | [脅威モデル](design/threat-model.md) | 想定する攻撃者と、防ぐ対象 |
 | [Capability モデル](design/capability-model.md) | 権限の表現と委譲 |
 | [状態機械と revoke](design/state-and-revocation.md) | 失効がいつから効くか |
@@ -86,7 +91,7 @@ flowchart TB
 | crate | 文書群 | 実装している境界 | 検証の境界 |
 |---|---|---|---|
 | `authority-core` | [Authority core](authority-core/README.md) | 権限の表現、委譲判定、状態、revoke、監査。Rust と Lean の二重実装 | unit / property / loom / Lean 定理 / 共通 corpus |
-| `capfs` | [capfs](capfs/README.md) | backing root、namespace registry、node table、Direct-I/O FUSE adapter | host実mount 22件と実KVM guestで全13 effectを確認 |
+| `capfs` | [capfs](capfs/README.md) | backing root、namespace registry、node table、cache-aware FUSE adapter | host実mount 22件と実KVM guestで全13 effectを確認。read は cache 無効化、write は direct I/O |
 | `egress-protocol` | [Broker session envelope](egress-protocol/session-envelopes.md)、[Canonical CBOR](egress-protocol/canonical-cbor.md) | bounded frame、canonical CBOR、session と sequence、budget | module test |
 | `egress-broker` | [Host Egress Broker](egress-broker/README.md) | frame、replay、budget、公開 HTTPS、型付き GitHub adapter | 実DNS/TLS/SNI/address pin/rebindingとFirecracker guest-to-host canonical rejectionを確認。live GitHubはblocked |
 | `firecracker-runtime` | [Firecracker runtime](firecracker-runtime/README.md) | artifact 固定、dm-verity、jailer、API 順序、snapshot / restore、identity gate、guest-control PID 1 | 実Firecracker、dm-verity、jailer、clean snapshot capture／restore、guest `AF_VSOCK` identity gateを確認 |
@@ -123,7 +128,7 @@ flowchart TB
 | [共有 namespace registry](capfs/namespace-registry.md) | `ObjectId` 割り当て、現在 path、generation、open handle、namespace lock 契約 |
 | [mount ごとの node table](capfs/node-tables.md) | subject-local `nodeid -> ObjectId`、LOOKUP / FORGET、nodeid 非再利用 |
 | [backing への実 I/O](capfs/runtime-backing-io.md) | root fd 相対の解決、毎回の kind / mount / nlink 検査、create と rename の原子性 |
-| [Direct-I/O FUSE adapter](capfs/read-only-fuse.md) | 各 FUSE operation、runtime backing I/O、revoke 後の再認可 |
+| [FUSE adapter](capfs/read-only-fuse.md) | 各 FUSE operation、runtime backing I/O、revoke 後の再認可。ページの旧称は Direct-I/O FUSE adapter |
 
 ## 文書の使い分け
 

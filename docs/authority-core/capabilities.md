@@ -264,5 +264,5 @@ Rust state には、`auth_epoch`、subject lifecycle、open-handle registry、at
 - [検証とテスト](verification.md)
 - [Capability モデル](../design/capability-model.md)
 - [Capability の発行と逐次状態機械](capability-state.md)
-- [Effect commit と revoke の authorization guard](authorization-guard.md)
+- [Effect execution と revoke の authorization guard](authorization-guard.md)
 - [状態機械と revoke](../design/state-and-revocation.md)

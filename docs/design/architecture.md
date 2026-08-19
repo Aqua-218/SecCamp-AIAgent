@@ -74,13 +74,13 @@ flowchart TB
 | 太い実線 | プロセスや VM をまたぐ。syscall、socket、HTTP のいずれか |
 | 点線 | 図に残る場合は実装不足ではなく、実装済み境界の実機検証が別途必要であることを示す。未検証項目は[実装と証拠の境界](#実装と証拠の境界)に集約する |
 
-## 境界を越える手段は 5 種類しかない
+## Agent/session data plane の境界を越える手段は 5 種類
 
-太い線はこの 5 つに限る。ここに無い経路（生の TCP socket、guest から host への任意 file 共有、credential の guest 配布）は作らない。
+この図で Agent / Tool の data plane と session resource が境界を越える太い線は、次の 5 つに限る。host の control-plane 管理 socket は別の運用境界であり、この表の「guest から host への data plane」と混同しない。ここに無い経路（生の TCP socket、guest から host への任意 file 共有、credential の guest 配布）は作らない。
 
 | 越える境界 | 手段 | 上限 | 誰が検査するか |
 |---|---|---|---|
-| Agent → 自分の workspace | FUSE operation | なし（操作ごとに認可） | [capfs](../capfs/read-only-fuse.md) が毎 `READ` / `WRITE` / `SETATTR` / `READDIR` で kernel を引く |
+| Agent → 自分の workspace | FUSE operation | `READ` / `WRITE` payload は 1 MiB 以下。その他は操作ごとに認可 | [capfs](../capfs/read-only-fuse.md) が毎 `READ` / `WRITE` / `SETATTR` / `READDIR` で kernel を引く |
 | Agent → subject 制御 | supervisor の bounded envelope | 4 KiB、version 1、tag は `CloseSubject` と `CloseHandle` の 2 つ | [supervisor](../supervisor/README.md)。wire 上の `claimed_subject` は認可に使わない |
 | guest → host egress | `AF_VSOCK` の length-prefixed frame | 4 bytes prefix、payload 1 MiB | [transport 契約](../egress-broker/transport.md) が長さを確保前に検査する |
 | host → VM | Firecracker API と guest control API | — | [firecracker-runtime](../firecracker-runtime/launch-sequence.md)。`network_devices` が空でなければ artifact を読む前に拒否 |
@@ -106,23 +106,25 @@ flowchart BT
     ep --> ac
     cf --> ac
     sv --> ac
+    sv --> cf
     eb --> ac
     eb --> ep
     fr --> ac
     fr --> ep
     so --> ac
     so --> eb
+    so --> ep
     so --> fr
 
     classDef leaf fill:#455a64,color:#fff,stroke:#263238;
     class ac,ri leaf;
 ```
 
-依存グラフの矢印は「依存する側 → 依存先」である。`authority-core` と `runtime-isolation` が依存木の葉で、`supervisor` は `capfs` を、`firecracker-runtime` は `authority-core` / `egress-protocol` を、`session-orchestrator` は Firecracker と Broker を参照する。実行時の supervisor → launcher → runtime-isolation の接続は Cargo の直接依存ではなく、immutable guest image に固定した executable path と inherited gate で構成される。
+依存グラフの矢印は「依存する側 → 依存先」である。`authority-core` と `runtime-isolation` が依存木の葉で、`supervisor` は Linux target で `capfs` と `authority-core` を、`firecracker-runtime` は `authority-core` / `egress-protocol` を、`session-orchestrator` は `authority-core` / `egress-broker` / `egress-protocol` / `firecracker-runtime` を参照する。実行時の supervisor → launcher → runtime-isolation の接続は Cargo の直接依存ではなく、immutable guest image に固定した executable path と inherited gate で構成される。
 
 `host-sessiond` は `ProductionSessionRuntimeBuilder`、実 workspace/Broker/Firecracker/authority backend を組み立てる deployable one-session daemon で、systemd unit と environment manifest も `deploy/` / `service/` にある。guest 側には [`guest-supervisor-init`](../../crates/supervisor/src/bin/guest-supervisor-init.rs) があり、固定 image の repository/effect/path policy から guest `CapabilityKernel`、CapFS runtime、`LinuxHostResources` を組み立て、`workload-isolation-launcher` へ接続する。[`guest-control-init`](../../crates/firecracker-runtime/src/bin/guest-control-init.rs) はその前段の PID 1 gate として、host-originated identity injection と image-configured supervisor release だけを受け付ける。どちらも host から任意 command、credential、authority body を受け取らない。
 
-この構成は実装済みで、productionと同じv2 policy-digest-bound guest gate、guest supervisor composition、`Runtime::launch`のjailer/workspace lifecycle、clean snapshot capture／restore、`rootfs.source == "/"`、mount rollback、全13 CapFS effectを実KVM SessionOwner gateでも確認している。これは列挙したproduction経路の実機証拠であり、Firecracker／KVM／host kernelそのもののVM escape耐性を証明するものではない。
+この構成は実装済みで、productionと同じv2 policy-digest-bound guest gate、guest supervisor composition、`Runtime::launch`のjailer/workspace lifecycle、clean snapshot capture／restore、`rootfs.source == "/"`、mount rollback、全13 CapFS effectを実KVM SessionOwner gateの対象としている。個別の実行結果は [検証ステータス manifest](../verification-status.md) の `kvm` claim と gate artifact で確認する。これは列挙したproduction経路の実機証拠であり、Firecracker／KVM／host kernelそのもののVM escape耐性を証明するものではない。
 
 ## 副作用は 1 つの API に集まる
 
@@ -178,7 +180,7 @@ startup は 4 つの state machine が噛み合って進む。orchestrator が c
 | orchestrator `LifecycleState` | firecracker `RuntimeState` | そこで確定すること |
 |---|---|---|
 | `Ready` | `New` | 7 つの 128-bit identity を ledger へ append。`sync_data` まで終わるまで backend を呼ばない |
-| `WorkspaceCloned` | — | capfs の backing になる tree を clone。symlink と hard link は許さない |
+| `WorkspaceCloned` | — | Firecracker workspace clone adapter が symlink と `nlink != 1` の file を拒否して、session 専用 tree を作る。CapFS backing の `ExternalAliasPolicy` は別の preflight 境界である |
 | `BrokerEstablished` | — | 新しい `BrokerSessionId`、sequence は 0 から、replay guard も作り直す |
 | `VmStarted` | `RestoredStopped` → `IdentityRegenerated` | pre-session snapshot を restore し、128-bit の identity を 5 つ作り直す |
 | `RootCapabilityInjected` | `IdentityInjected` | production は `/actions/inject-identity-v2` へ policy encoding version + digest + 5 IDs を canonical に渡し、`identity-injected-v2` ACK を受ける。v1 は compatibility-only |
@@ -259,5 +261,6 @@ orchestrator の `SubjectId` と `authority_core` の `SubjectId` は名前が�
 - [capfs](capfs.md)
 - [実装順序](implementation-plan.md)
 - [検証戦略](verification.md)
+- [検証ステータス manifest](../verification-status.md)
 - [用語集](../glossary.md)
 - [決定記録](../decisions/README.md)

@@ -16,7 +16,7 @@
 | --- | --- | --- |
 | `native` | backing filesystem 直接 | capfs が無いときにアプリが得るコスト |
 | `passthrough` | 同じ mount 設定の FUSE、認可を一切しない | FUSE 往復そのもののコスト |
-| `capfs` | 実際の [`CapabilityFilesystem`](../../crates/capfs/src/read_only.rs) mount | 実運用で払うコスト |
+| `capfs` | 実際の [`capfs::filesystem::CapabilityFilesystem`](../../crates/capfs/src/read_only.rs) mount | 実運用で払うコスト |
 | `kernel` | FUSE を通さない in-process の Capability 判定 | 認可判定単体のコスト |
 
 比の読み方は次の 3 つに固定する。
@@ -48,25 +48,25 @@
 | `stat/{層}` | `lstat` 1 回 | attribute cache に載る metadata 経路。revoke 時に無効化される側 |
 | `open_close/{層}` | `open` + `close` | `LOOKUP` → `OPEN` → `RELEASE` の handle lifecycle |
 | `readdir/{層}` | 32 entry の directory を 1 周 | `OPENDIR` → `READDIR` → `RELEASEDIR` |
-| `capability_check/commit` | `authorize_and_commit` 1 回 | `READ` / `WRITE` が通る data 経路の認可。audit attempt を記録し commit する |
+| `capability_check/commit` | `authorize_and_execute_classified` 1 回 | `READ` / `WRITE` が通る data 経路の認可。audit attempt を記録し `EffectExecution::Committed` を確定する |
 | `capability_check/observe` | `with_active_capability` 1 回 | `LOOKUP` / `GETATTR` が通る metadata 経路の認可。effect を記録しない |
 | `concurrent_read/{層}/{1..16}` | N client thread がそれぞれ自分の fd へ 4 KiB read | mount が並行要求を捌けているか。1 operation あたりの wall clock が thread 数と共に下がるか、直列化して横ばいになるか |
 
-benchmark ごとに backing tree と mount を作り直す。`authorize_and_commit` は commit 済み effect 1 件につき in-memory audit record を 1 件保持し続けるため、1 つの mount を全 benchmark で共有すると audit trail が run 全体に渡って伸び、測定対象がメモリ確保に移る。`capability_check/commit` は同じ理由で sample ごとに kernel を作り直す。
+benchmark ごとに backing tree と mount を作り直す。`authorize_and_execute_classified` は commit 済み effect 1 件につき in-memory audit record を 1 件保持し続けるため、1 つの mount を全 benchmark で共有すると audit trail が run 全体に渡って伸び、測定対象がメモリ確保に移る。`capability_check/commit` は同じ理由で sample ごとに kernel を作り直す。
 
 ## 実行コマンド
 
 repository root から次を実行する。`/dev/fuse` が無い環境では FUSE を使う 2 層を自動的に外し、`native` と `kernel` だけを測る。
 
 ```bash
-cargo bench --package capfs --bench capfs_overhead
+cargo bench --locked --package capfs --bench capfs_overhead
 
 # 1 group だけ、短時間で見る
-cargo bench --package capfs --bench capfs_overhead -- stat
+cargo bench --locked --package capfs --bench capfs_overhead -- stat
 
 # 変更前後を比較する（criterion が前回結果を target/criterion に保持する）
-cargo bench --package capfs --bench capfs_overhead -- --save-baseline before
-cargo bench --package capfs --bench capfs_overhead -- --baseline before
+cargo bench --locked --package capfs --bench capfs_overhead -- --save-baseline before
+cargo bench --locked --package capfs --bench capfs_overhead -- --baseline before
 ```
 
 ## 未検証の境界

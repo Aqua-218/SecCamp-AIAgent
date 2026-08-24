@@ -18,7 +18,7 @@ authority-core = { path = "../authority-core" }
 egress-broker = { path = "../egress-broker" }
 egress-protocol = { path = "../egress-protocol" }
 firecracker-runtime = { path = "../firecracker-runtime" }
-hmac = "0.12.1"
+hmac = "0.13.0"
 rustix = { version = "1.1.4", features = ["fs", "net", "process"] }
 sha2 = "0.10.9"
 zeroize = "1.8.2"

@@ -1,7 +1,9 @@
 <!-- locale: ko -->
 <!-- translation-source: README.md -->
 
-# Capability-based AI Agent Runtime
+# Airlock
+
+Capability-based AI Agent Runtime — capability 기반 AI 에이전트 런타임
 
 [English](README.md) · [日本語](README-ja.md) · [简体中文](README-zh-CN.md) · [繁體中文](README-zh-TW.md) · [한국어](README-ko.md) · [Español](README-es.md) · [Français](README-fr.md) · [Deutsch](README-de.md) · [Português (Brasil)](README-pt-BR.md)
 
